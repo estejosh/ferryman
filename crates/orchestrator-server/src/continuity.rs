@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::recovery_targets::{GitRecoveryTarget, Receipt, RecoveryTarget};
 
 const FORMAT: &str = "orchestrator-bridge-continuity-pack/v2";
 type HmacSha256 = Hmac<Sha256>;
@@ -361,6 +362,67 @@ pub async fn verify_and_recover(
     readonly_tree(&workspace)?;
     state.store.append_project_event(project_id, "recovery.pack_verified", serde_json::json!({"pack_id":manifest.pack_id,"bundle_sha256":manifest.bundle_sha256,"recovery_workspace":briefing.recovery_workspace}))?;
     Ok(briefing)
+}
+
+pub async fn load_manifest(
+    state: &AppState,
+    project_id: &str,
+    pack_hash: &str,
+) -> Result<PackManifest> {
+    if !pack_hash
+        .chars()
+        .all(|character| character.is_ascii_hexdigit())
+        || pack_hash.len() != 64
+    {
+        bail!("pack hash must be a SHA-256 hex digest");
+    }
+    let manifest: PackManifest = serde_json::from_slice(
+        &tokio::fs::read(
+            state
+                .recovery_root
+                .join("packs")
+                .join(project_id)
+                .join(pack_hash)
+                .join("manifest.json"),
+        )
+        .await?,
+    )?;
+    if manifest.format != FORMAT
+        || manifest.project_id != project_id
+        || manifest.bundle_sha256 != pack_hash
+    {
+        bail!("invalid pack manifest identity");
+    }
+    let master_key = state.recovery_key()?;
+    if manifest_hmac(&master_key, &manifest)? != manifest.manifest_hmac_sha256 {
+        bail!("pack manifest authentication failed");
+    }
+    Ok(manifest)
+}
+
+pub async fn deliver_to_git(
+    state: &AppState,
+    project_id: &str,
+    pack_hash: &str,
+    target: &GitRecoveryTarget,
+) -> Result<Receipt> {
+    let manifest = load_manifest(state, project_id, pack_hash).await?;
+    let directory = state
+        .recovery_root
+        .join("packs")
+        .join(project_id)
+        .join(pack_hash);
+    let bundle = tokio::fs::read(directory.join("bundle.obpack")).await?;
+    if sha(&bundle) != manifest.bundle_sha256 {
+        bail!("local bundle hash mismatch before recovery delivery");
+    }
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    target.availability().await?;
+    let receipt = target
+        .upload_pack_and_manifest(&manifest.bundle_sha256, &bundle, &manifest_bytes)
+        .await?;
+    target.verify_remote_hash(&receipt).await?;
+    Ok(receipt)
 }
 
 pub async fn recovery_drill(state: &AppState, project_id: &str) -> Result<serde_json::Value> {

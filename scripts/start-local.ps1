@@ -1,5 +1,6 @@
 param(
-  [string]$DataRoot = "$PSScriptRoot\..\.data"
+  [string]$DataRoot = "$PSScriptRoot\..\.data",
+  [string]$RecoveryGitRepository = 'https://github.com/estejosh/orchestrator-bridge-recovery.git'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,4 +15,4 @@ try {
 }
 
 Write-Host 'Starting a local-only Bridge. Nothing is exposed to the internet.'
-cargo run -p orchestrator-server -- --database "$DataRoot\bridge.db" --artifacts "$DataRoot\artifacts" --workspace-root "$DataRoot\projects" --memory-root "$DataRoot\memory" --recovery-root "$DataRoot\recovery"
+cargo run -p orchestrator-server -- --database "$DataRoot\bridge.db" --artifacts "$DataRoot\artifacts" --workspace-root "$DataRoot\projects" --memory-root "$DataRoot\memory" --recovery-root "$DataRoot\recovery" --recovery-git-repository "$RecoveryGitRepository"

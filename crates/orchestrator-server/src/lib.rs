@@ -40,6 +40,7 @@ pub struct AppState {
     memory_write_token: Option<Arc<String>>,
     max_artifact_bytes: u64,
     pub recovery_root: Arc<PathBuf>,
+    git_recovery: Option<Arc<recovery_targets::GitRecoveryTarget>>,
     recovery_key: Option<Arc<[u8; 32]>>,
     recovery_key_reference: Arc<String>,
 }
@@ -54,6 +55,7 @@ impl AppState {
             memory_write_token: None,
             max_artifact_bytes: 100 * 1024 * 1024,
             recovery_root: Arc::new(PathBuf::from("./.data/recovery")),
+            git_recovery: None,
             recovery_key: None,
             recovery_key_reference: Arc::new("unconfigured".into()),
         }
@@ -97,6 +99,17 @@ impl AppState {
     }
     pub fn recovery_key_reference(&self) -> &str {
         self.recovery_key_reference.as_ref()
+    }
+    pub fn with_git_recovery(mut self, repository: String, branch: String) -> Self {
+        self.git_recovery = Some(Arc::new(recovery_targets::GitRecoveryTarget {
+            repository,
+            branch,
+            work_root: self.recovery_root.join("git-delivery"),
+        }));
+        self
+    }
+    pub fn git_recovery(&self) -> Option<Arc<recovery_targets::GitRecoveryTarget>> {
+        self.git_recovery.clone()
     }
 }
 
@@ -152,6 +165,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/projects/{project_id}/continuity-packs/{pack_hash}/recover",
             post(recover_continuity_pack),
+        )
+        .route(
+            "/v1/projects/{project_id}/continuity-packs/{pack_hash}/delivery-consents",
+            post(create_recovery_delivery_consent),
+        )
+        .route(
+            "/v1/projects/{project_id}/continuity-packs/{pack_hash}/deliver",
+            post(deliver_recovery_pack),
         )
         .route(
             "/v1/projects/{project_id}/recovery-drill",
@@ -715,6 +736,85 @@ async fn recover_continuity_pack(
             .await
             .map_err(ApiError::internal)?
     )))
+}
+#[derive(Deserialize)]
+struct RecoveryDelivery {
+    target: String,
+    expires_at: Option<String>,
+}
+async fn create_recovery_delivery_consent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, pack_hash)): Path<(String, String)>,
+    Json(body): Json<RecoveryDelivery>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    checked(&state, &headers, &project)?;
+    if body.target != "private_git" {
+        return Err(ApiError::bad(
+            "only private_git is configured in this build; Drive and MEGA remain disabled until configured",
+        ));
+    }
+    if let Some(expiry) = &body.expires_at {
+        chrono::DateTime::parse_from_rfc3339(expiry)
+            .map_err(|_| ApiError::bad("expires_at must be RFC 3339"))?;
+    }
+    let target = state
+        .git_recovery()
+        .ok_or_else(|| ApiError::bad("private Git recovery is not configured"))?;
+    let manifest = continuity::load_manifest(&state, &project, &pack_hash)
+        .await
+        .map_err(ApiError::internal)?;
+    let payload = json!({"format":"orchestrator-bridge-recovery-delivery/v1","provider":"private_git","bundle_sha256":manifest.bundle_sha256,"manifest_hmac_sha256":manifest.manifest_hmac_sha256,"repository":target.repository,"branch":target.branch});
+    let consent = state
+        .store
+        .create_consent(
+            &project,
+            "recovery_upload",
+            payload,
+            body.expires_at.as_deref(),
+        )
+        .map_err(ApiError::internal)?;
+    Ok((StatusCode::CREATED, Json(json!(consent))))
+}
+#[derive(Deserialize)]
+struct DeliverRecovery {
+    consent_id: String,
+}
+async fn deliver_recovery_pack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, pack_hash)): Path<(String, String)>,
+    Json(body): Json<DeliverRecovery>,
+) -> ApiResult<Json<Value>> {
+    checked(&state, &headers, &project)?;
+    let consent = state
+        .store
+        .list_consents(&project)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .find(|item| {
+            item.id == body.consent_id
+                && item.status == "approved"
+                && item.kind == "recovery_upload"
+                && item.payload.get("bundle_sha256").and_then(Value::as_str)
+                    == Some(pack_hash.as_str())
+        })
+        .ok_or_else(ApiError::not_found)?;
+    let target = state
+        .git_recovery()
+        .ok_or_else(|| ApiError::bad("private Git recovery is not configured"))?;
+    if consent.payload.get("repository").and_then(Value::as_str) != Some(target.repository.as_str())
+        || consent.payload.get("branch").and_then(Value::as_str) != Some(target.branch.as_str())
+    {
+        return Err(ApiError::bad(
+            "configured Git recovery target differs from the approved delivery manifest",
+        ));
+    }
+    let receipt = continuity::deliver_to_git(&state, &project, &pack_hash, target.as_ref())
+        .await
+        .map_err(ApiError::internal)?;
+    state.store.append_project_event(&project,"recovery.delivery_succeeded",json!({"consent_id":consent.id,"target":receipt.target,"remote_id":receipt.remote_id,"bundle_sha256":receipt.sha256})).map_err(ApiError::internal)?;
+    Ok(Json(json!(receipt)))
 }
 async fn run_recovery_drill(
     State(state): State<AppState>,

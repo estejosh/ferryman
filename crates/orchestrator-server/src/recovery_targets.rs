@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use serde::Serialize;
 use sha2::Digest;
+use uuid::Uuid;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Receipt {
     pub target: String,
     pub remote_id: String,
@@ -111,4 +113,158 @@ pub fn is_named_target_policy(policy: &str, target: &str) -> bool {
 }
 pub fn target_path(root: &Path, name: &str) -> PathBuf {
     root.join(name)
+}
+
+/// A private Git repository is a portability target, not a project repository.
+/// It receives only already-encrypted bundles and their authenticated manifests.
+#[derive(Clone)]
+pub struct GitRecoveryTarget {
+    pub repository: String,
+    pub branch: String,
+    pub work_root: PathBuf,
+}
+impl GitRecoveryTarget {
+    async fn checkout(&self) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(&self.work_root).await?;
+        let directory = self.work_root.join(Uuid::new_v4().to_string());
+        git(
+            &self.work_root,
+            &[
+                "clone",
+                &self.repository,
+                directory.to_string_lossy().as_ref(),
+            ],
+        )
+        .await?;
+        let remote_branch = format!("origin/{}", self.branch);
+        if git(
+            &directory,
+            &["checkout", "-B", &self.branch, &remote_branch],
+        )
+        .await
+        .is_err()
+        {
+            git(&directory, &["checkout", "-B", &self.branch]).await?;
+        }
+        git(
+            &directory,
+            &["config", "user.name", "Orchestrator Bridge Recovery"],
+        )
+        .await?;
+        git(
+            &directory,
+            &["config", "user.email", "recovery@orchestrator-bridge.local"],
+        )
+        .await?;
+        Ok(directory)
+    }
+    pub async fn upload_pack_and_manifest(
+        &self,
+        sha256: &str,
+        bundle: &[u8],
+        manifest: &[u8],
+    ) -> Result<Receipt> {
+        let checkout = self.checkout().await?;
+        let packs = checkout.join("packs");
+        tokio::fs::create_dir_all(&packs).await?;
+        tokio::fs::write(packs.join(format!("{sha256}.obpack")), bundle).await?;
+        tokio::fs::write(packs.join(format!("{sha256}.manifest.json")), manifest).await?;
+        git(&checkout, &["add", "packs"]).await?;
+        let _ = git(
+            &checkout,
+            &["commit", "-m", &format!("bridge recovery {sha256}")],
+        )
+        .await;
+        git(
+            &checkout,
+            &["push", "origin", &format!("HEAD:{}", self.branch)],
+        )
+        .await?;
+        Ok(Receipt {
+            target: "private_git".into(),
+            remote_id: sha256.into(),
+            sha256: sha256.into(),
+        })
+    }
+}
+#[async_trait]
+impl RecoveryTarget for GitRecoveryTarget {
+    fn name(&self) -> &str {
+        "private_git"
+    }
+    async fn availability(&self) -> Result<()> {
+        git(&self.work_root, &["ls-remote", &self.repository])
+            .await
+            .map(|_| ())
+    }
+    async fn upload_pack(&self, sha256: &str, bundle: &[u8]) -> Result<Receipt> {
+        self.upload_pack_and_manifest(sha256, bundle, b"{}").await
+    }
+    async fn download_pack(&self, remote_id: &str) -> Result<Vec<u8>> {
+        let checkout = self.checkout().await?;
+        tokio::fs::read(checkout.join("packs").join(format!("{remote_id}.obpack")))
+            .await
+            .map_err(Into::into)
+    }
+    async fn verify_remote_hash(&self, receipt: &Receipt) -> Result<()> {
+        let bytes = self.download_pack(&receipt.remote_id).await?;
+        if hex::encode(sha2::Sha256::digest(bytes)) != receipt.sha256 {
+            bail!("private Git recovery hash mismatch")
+        };
+        Ok(())
+    }
+    async fn record_receipt(&self, _: &Receipt) -> Result<()> {
+        Ok(())
+    }
+}
+
+async fn git(directory: &Path, args: &[&str]) -> Result<()> {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Digest;
+    use std::process::Command;
+
+    #[tokio::test]
+    async fn private_git_target_round_trips_an_encrypted_blob() {
+        let root = std::env::temp_dir().join(format!("bridge-git-target-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let repository = root.join("recovery.git");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", repository.to_string_lossy().as_ref()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let target = GitRecoveryTarget {
+            repository: repository.to_string_lossy().into_owned(),
+            branch: "bridge/recovery".into(),
+            work_root: root.join("work"),
+        };
+        let bundle = b"opaque encrypted bundle";
+        let hash = hex::encode(sha2::Sha256::digest(bundle));
+        let receipt = target
+            .upload_pack_and_manifest(&hash, bundle, b"{\"format\":\"test\"}")
+            .await
+            .unwrap();
+        target.verify_remote_hash(&receipt).await.unwrap();
+        assert_eq!(target.download_pack(&hash).await.unwrap(), bundle);
+    }
 }

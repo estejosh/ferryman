@@ -42,6 +42,10 @@ enum Command {
         #[command(subcommand)]
         command: Artifacts,
     },
+    Consents {
+        #[command(subcommand)]
+        command: Consents,
+    },
     Continuity {
         #[command(subcommand)]
         command: Continuity,
@@ -144,6 +148,27 @@ enum Artifacts {
     },
 }
 #[derive(Subcommand, Clone)]
+enum Consents {
+    List {
+        #[arg(long)]
+        project: String,
+    },
+    Approve {
+        #[arg(long)]
+        project: String,
+        consent: String,
+        #[arg(long, default_value = "local-operator")]
+        approver: String,
+    },
+    Reject {
+        #[arg(long)]
+        project: String,
+        consent: String,
+        #[arg(long, default_value = "local-operator")]
+        approver: String,
+    },
+}
+#[derive(Subcommand, Clone)]
 enum Continuity {
     Pack {
         #[arg(long)]
@@ -157,6 +182,20 @@ enum Continuity {
     Drill {
         #[arg(long)]
         project: String,
+    },
+    /// Create the consent that authorizes one exact encrypted pack to private Git.
+    GitConsent {
+        #[arg(long)]
+        project: String,
+        pack_hash: String,
+    },
+    /// Deliver one consent-approved encrypted pack to the configured private Git branch.
+    DeliverGit {
+        #[arg(long)]
+        project: String,
+        pack_hash: String,
+        #[arg(long)]
+        consent: String,
     },
     Timeline {
         #[arg(long)]
@@ -266,6 +305,43 @@ async fn main() -> Result<()> {
                 output,
             } => download_artifact(&cli, &project, &artifact, &output).await?,
         },
+        Command::Consents { command } => match command {
+            Consents::List { project } => {
+                call(
+                    &cli,
+                    "GET",
+                    format!("/v1/projects/{project}/consents"),
+                    None,
+                )
+                .await?
+            }
+            Consents::Approve {
+                project,
+                consent,
+                approver,
+            } => {
+                call_approver(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/consents/{consent}/approve"),
+                    &approver,
+                )
+                .await?
+            }
+            Consents::Reject {
+                project,
+                consent,
+                approver,
+            } => {
+                call_approver(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/consents/{consent}/reject"),
+                    &approver,
+                )
+                .await?
+            }
+        },
         Command::Continuity { command } => match command {
             Continuity::Pack { project } => {
                 call(
@@ -291,6 +367,30 @@ async fn main() -> Result<()> {
                     "POST",
                     format!("/v1/projects/{project}/recovery-drill"),
                     None,
+                )
+                .await?
+            }
+            Continuity::GitConsent { project, pack_hash } => {
+                call(
+                    &cli,
+                    "POST",
+                    format!(
+                        "/v1/projects/{project}/continuity-packs/{pack_hash}/delivery-consents"
+                    ),
+                    Some(json!({"target":"private_git"})),
+                )
+                .await?
+            }
+            Continuity::DeliverGit {
+                project,
+                pack_hash,
+                consent,
+            } => {
+                call(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/continuity-packs/{pack_hash}/deliver"),
+                    Some(json!({"consent_id":consent})),
                 )
                 .await?
             }
@@ -441,6 +541,21 @@ async fn call_memory(cli: &Cli, method: &str, path: String, body: Option<Value>)
         request = request.json(&body)
     };
     let response = request.send().await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if !status.is_success() {
+        anyhow::bail!("bridge returned {status}: {text}")
+    };
+    println!("{text}");
+    Ok(())
+}
+async fn call_approver(cli: &Cli, method: &str, path: String, approver: &str) -> Result<()> {
+    let response = reqwest::Client::new()
+        .request(method.parse()?, format!("{}{}", cli.endpoint, path))
+        .bearer_auth(&cli.token)
+        .header("x-orchestrator-approver", approver)
+        .send()
+        .await?;
     let status = response.status();
     let text = response.text().await?;
     if !status.is_success() {

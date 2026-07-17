@@ -24,6 +24,15 @@ struct Args {
     /// Local root for encrypted continuity packs and read-only recovery workspaces.
     #[arg(long, default_value = "./.data/recovery")]
     recovery_root: PathBuf,
+    /// Private repository used only for encrypted recovery packs.
+    #[arg(long, env = "ORCHESTRATOR_RECOVERY_GIT_REPOSITORY")]
+    recovery_git_repository: Option<String>,
+    #[arg(
+        long,
+        env = "ORCHESTRATOR_RECOVERY_GIT_BRANCH",
+        default_value = "bridge/recovery"
+    )]
+    recovery_git_branch: String,
     #[arg(long, default_value_t = 104857600)]
     max_artifact_bytes: u64,
     #[arg(long, default_value = "127.0.0.1:8787")]
@@ -74,6 +83,9 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&args.recovery_root).await?;
     let recovery_key = load_recovery_key(args.production)?;
     state = state.with_recovery_key(args.recovery_root, recovery_key.0, recovery_key.1);
+    if let Some(repository) = args.recovery_git_repository {
+        state = state.with_git_recovery(repository, args.recovery_git_branch);
+    }
     match std::env::var("ORCHESTRATOR_MEMORY_WRITE_TOKEN") {
         Ok(memory_write_token) => state = state.with_memory_write_token(memory_write_token),
         Err(_) if args.production => {

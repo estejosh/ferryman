@@ -55,6 +55,8 @@ The bridge also maintains append-only project memory outside both the agent and 
 
 For recovery and portability, `POST /v1/projects/{project_id}/continuity-packs` creates an encrypted, compressed all-retained-artifact pack with authenticated manifest; import/recovery is verified and read-only, and `POST /v1/projects/{project_id}/recovery-drill` tests it without dispatching work. Set `ORCHESTRATOR_RECOVERY_KEY_HEX` only in explicit local development; production retrieves `ORCHESTRATOR_RECOVERY_KEY_REFERENCE=keychain:service:account` from the OS keychain. See [continuity and improvement](docs/CONTINUITY_AND_IMPROVEMENT.md).
 
+For two trusted Windows machines, the private Git recovery target is functional now: it stores only encrypted packs and authenticated manifests in a separate private repository. Pair the recovery key through a one-time encrypted file, then use the consent-approved CLI flow in [two-machine recovery](docs/TWO_MACHINE_RECOVERY.md). Google Drive and MEGA are planned optional targets, not yet enabled.
+
 Set `ORCHESTRATOR_MEMORY_WRITE_TOKEN` on the server and `ORCHESTRATOR_MEMORY_TOKEN` only for your trusted operator/client to prevent workers from appending memory. Existing entries are append-only either way.
 
 ## Security model

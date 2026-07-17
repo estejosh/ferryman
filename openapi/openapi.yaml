@@ -27,6 +27,10 @@ paths:
     post: {security: [{ProjectBearer: []}], summary: Create an authenticated encrypted local continuity pack, responses: {'201': {description: pack created}, '500': {description: recovery key unavailable or integrity failure}}}
   /v1/projects/{project_id}/continuity-packs/{pack_hash}/recover:
     post: {security: [{ProjectBearer: []}], summary: Verify and reconstruct a read-only recovery workspace without dispatching work, parameters: [{name: pack_hash, in: path, required: true, schema: {type: string}}], responses: {'200': {description: resume briefing}, '500': {description: corrupt or unauthenticated pack}}}
+  /v1/projects/{project_id}/continuity-packs/{pack_hash}/delivery-consents:
+    post: {security: [{ProjectBearer: []}], summary: Create the exact consent required to send an encrypted pack to configured private Git, responses: {'201': {description: pending recovery-upload consent}}}
+  /v1/projects/{project_id}/continuity-packs/{pack_hash}/deliver:
+    post: {security: [{ProjectBearer: []}], summary: Send an approved encrypted pack and manifest to the configured private Git recovery branch, responses: {'200': {description: verified remote receipt}}}
   /v1/projects/{project_id}/recovery-drill:
     post: {security: [{ProjectBearer: []}], summary: Create, verify, and recover a test continuity pack without dispatching work, responses: {'200': {description: drill result}}}
   /v1/projects/{project_id}/timeline:
