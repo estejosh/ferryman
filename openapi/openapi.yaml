@@ -1,0 +1,58 @@
+openapi: 3.1.0
+info:
+  title: Orchestrator Bridge API
+  version: 0.1.0
+servers: [{url: http://127.0.0.1:8787}]
+components:
+  securitySchemes: {ProjectBearer: {type: http, scheme: bearer}}
+  schemas:
+    Error: {type: object, required: [code, message], properties: {code: {type: string}, message: {type: string}}}
+    Job: {type: object, required: [id, project_id, status, input], properties: {id: {type: string}, project_id: {type: string}, status: {type: string, enum: [pending_approval, queued, leased, succeeded, failed, cancelled]}, input: {type: object}, policy: {type: object}}}
+    Artifact: {type: object, required: [id, job_id, sha256, content_type, byte_len], properties: {id: {type: string}, job_id: {type: string}, sha256: {type: string}, content_type: {type: string}, byte_len: {type: integer}}}
+paths:
+  /healthz: {get: {responses: {'200': {description: health}}}}
+  /v1/projects:
+    post: {summary: Create a project (local setup endpoint), requestBody: {required: true, content: {application/json: {schema: {type: object, required: [id,name,token]}}}}, responses: {'201': {description: created}, '400': {description: invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}}}
+  /v1/projects/{project_id}/jobs:
+    parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
+    post: {security: [{ProjectBearer: []}], summary: Submit an idempotent job, responses: {'202': {description: accepted, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}}}
+    get: {security: [{ProjectBearer: []}], summary: List jobs, parameters: [{name: limit, in: query, schema: {type: integer}}, {name: cursor, in: query, schema: {type: string}}, {name: status, in: query, schema: {type: string}}], responses: {'200': {description: jobs}}}
+  /v1/projects/{project_id}/agents:
+    post: {security: [{ProjectBearer: []}], summary: Create a project-role-derived agent and its Markdown profile, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [role,description,persistence], properties: {role: {type: string}, description: {type: string}, persistence: {type: string, enum: [temporal, permanent]}}}}}}, responses: {'201': {description: agent created}}}
+    get: {security: [{ProjectBearer: []}], summary: List project agents and profile paths, responses: {'200': {description: agents}}}
+  /v1/projects/{project_id}/memory:
+    post: {security: [{ProjectBearer: []}], summary: Append bridge-owned project recovery memory, requestBody: {required: true, content: {application/json: {schema: {type: object, required: [category,content], properties: {category: {type: string}, content: {type: string}, source: {type: string}}}}}}, responses: {'201': {description: entry created}}}
+    get: {security: [{ProjectBearer: []}], summary: Read project recovery memory, parameters: [{name: limit, in: query, schema: {type: integer}}], responses: {'200': {description: entries}}}
+  /v1/projects/{project_id}/continuity-packs:
+    post: {security: [{ProjectBearer: []}], summary: Create an authenticated encrypted local continuity pack, responses: {'201': {description: pack created}, '500': {description: recovery key unavailable or integrity failure}}}
+  /v1/projects/{project_id}/continuity-packs/{pack_hash}/recover:
+    post: {security: [{ProjectBearer: []}], summary: Verify and reconstruct a read-only recovery workspace without dispatching work, parameters: [{name: pack_hash, in: path, required: true, schema: {type: string}}], responses: {'200': {description: resume briefing}, '500': {description: corrupt or unauthenticated pack}}}
+  /v1/projects/{project_id}/recovery-drill:
+    post: {security: [{ProjectBearer: []}], summary: Create, verify, and recover a test continuity pack without dispatching work, responses: {'200': {description: drill result}}}
+  /v1/projects/{project_id}/timeline:
+    get: {security: [{ProjectBearer: []}], summary: Cursor-paginated append-only decision timeline, parameters: [{name: after, in: query, schema: {type: integer}}, {name: category, in: query, schema: {type: string}}, {name: job_id, in: query, schema: {type: string}}], responses: {'200': {description: ordered events}}}
+  /v1/projects/{project_id}/policy/simulate:
+    post: {security: [{ProjectBearer: []}], summary: Non-mutating capability, consent, quota, and retention-policy simulation, responses: {'200': {description: simulation result}}}
+  /v1/projects/{project_id}/outbound-submissions:
+    post: {security: [{ProjectBearer: []}], summary: Create an immutable pending-consent outbound manifest; performs no delivery, responses: {'201': {description: pending submission manifest}}}
+  /v1/projects/{project_id}/improvement-proposals:
+    post: {security: [{ProjectBearer: []}], summary: Create a reviewable improvement proposal and pending consent; never modifies source, responses: {'201': {description: proposal only}}}
+  /v1/projects/{project_id}/jobs/{job_id}/events:
+    get: {security: [{ProjectBearer: []}], summary: Stream job events with Server-Sent Events, responses: {'200': {description: event stream, content: {text/event-stream: {schema: {type: string}}}}}}
+  /v1/projects/{project_id}/jobs/{job_id}:
+    get: {security: [{ProjectBearer: []}], summary: Inspect one job, responses: {'200': {description: job, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}, '404': {description: missing}}}
+  /v1/projects/{project_id}/jobs/{job_id}/approve:
+    post: {security: [{ProjectBearer: []}], summary: Approve a pending job, responses: {'200': {description: approved job}, '404': {description: job is not awaiting approval}}}
+  /v1/projects/{project_id}/jobs/{job_id}/cancel:
+    post: {security: [{ProjectBearer: []}], summary: Cancel a queued or leased job, responses: {'200': {description: cancelled job}, '404': {description: job cannot be cancelled}}}
+  /v1/projects/{project_id}/jobs/{job_id}/artifacts:
+    post: {security: [{ProjectBearer: []}], summary: Store an artifact body, requestBody: {required: true, content: {application/octet-stream: {schema: {type: string, format: binary}}}}, responses: {'201': {description: stored artifact, content: {application/json: {schema: {$ref: '#/components/schemas/Artifact'}}}}}}
+    get: {security: [{ProjectBearer: []}], summary: List a job's artifact metadata, responses: {'200': {description: artifacts}}}
+  /v1/projects/{project_id}/artifacts/{artifact_id}:
+    get: {security: [{ProjectBearer: []}], summary: Inspect artifact metadata, responses: {'200': {description: artifact, content: {application/json: {schema: {$ref: '#/components/schemas/Artifact'}}}}}}
+  /v1/projects/{project_id}/artifacts/{artifact_id}/content:
+    get: {security: [{ProjectBearer: []}], summary: Download artifact bytes, responses: {'200': {description: artifact content, content: {application/octet-stream: {schema: {type: string, format: binary}}}}}}
+  /v1/metrics:
+    get: {summary: Local queue and worker-health metrics, responses: {'200': {description: metrics}}}
+  /v1/projects/{project_id}/workers/{worker_id}/lease:
+    post: {security: [{ProjectBearer: []}], summary: Atomically lease one ready job, responses: {'200': {description: lease}, '204': {description: no job}}}
