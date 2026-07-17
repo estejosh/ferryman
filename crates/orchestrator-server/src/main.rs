@@ -104,8 +104,9 @@ async fn main() -> Result<()> {
 /// from the operating-system keychain by reference so the key material never
 /// belongs in Bridge configuration, packs, SQLite, or logs.
 fn load_recovery_key(production: bool) -> Result<(String, [u8; 32])> {
-    let raw = if production {
-        let reference = std::env::var("ORCHESTRATOR_RECOVERY_KEY_REFERENCE").map_err(|_| anyhow::anyhow!("ORCHESTRATOR_RECOVERY_KEY_REFERENCE (keychain:service:account) is required with --production"))?;
+    let configured_reference = std::env::var("ORCHESTRATOR_RECOVERY_KEY_REFERENCE").ok();
+    let raw = if production || configured_reference.is_some() {
+        let reference = configured_reference.ok_or_else(|| anyhow::anyhow!("ORCHESTRATOR_RECOVERY_KEY_REFERENCE (keychain:service:account) is required with --production"))?;
         let fields: Vec<_> = reference.splitn(3, ':').collect();
         if fields.len() != 3 || fields[0] != "keychain" {
             anyhow::bail!("recovery key reference must use keychain:service:account")

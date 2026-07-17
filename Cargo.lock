@@ -1028,10 +1028,12 @@ dependencies = [
  "chrono",
  "clap",
  "futures-util",
+ "keyring",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
