@@ -14,6 +14,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub const API_VERSION: &str = "v1";
+/// Default job lease TTL and the window a worker heartbeat renews it by. Sized for
+/// multi-minute agent runs: comfortably above a worker's heartbeat interval so a couple of
+/// missed heartbeats don't cost the lease, while still reaping a genuinely dead worker
+/// within a couple of minutes.
+pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 120;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -521,11 +526,27 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
-    pub fn heartbeat(&self, project_id: &str, worker_id: &str) -> Result<bool> {
-        Ok(self.db()?.execute(
+    /// Records the worker's heartbeat and, if it currently holds a leased job, extends that
+    /// job's `lease_expires_at` by `lease_ttl_seconds` — this is the renewal path a
+    /// long-running job needs so the stale-lease reaper in `lease()` doesn't requeue it out
+    /// from under a worker that is still alive and heartbeating.
+    pub fn heartbeat(&self, project_id: &str, worker_id: &str, lease_ttl_seconds: i64) -> Result<bool> {
+        let now = now();
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let updated = tx.execute(
             "UPDATE workers SET last_heartbeat=?3 WHERE id=?1 AND project_id=?2",
-            params![worker_id, project_id, now()],
-        )? == 1)
+            params![worker_id, project_id, now],
+        )? == 1;
+        if updated {
+            let expires = (Utc::now() + chrono::Duration::seconds(lease_ttl_seconds)).to_rfc3339();
+            tx.execute(
+                "UPDATE jobs SET lease_expires_at=?3 WHERE project_id=?1 AND worker_id=?2 AND status='leased'",
+                params![project_id, worker_id, expires],
+            )?;
+        }
+        tx.commit()?;
+        Ok(updated)
     }
     pub fn lease(
         &self,
