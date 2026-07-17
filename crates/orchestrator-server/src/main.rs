@@ -58,6 +58,13 @@ async fn main() -> Result<()> {
             "production mode refuses a non-loopback listener without --tls-terminated; terminate TLS at a trusted reverse proxy"
         )
     }
+    let admin_token_env = std::env::var("ORCHESTRATOR_ADMIN_TOKEN").ok();
+    if !args.listen.ip().is_loopback() && admin_token_env.is_none() {
+        anyhow::bail!(
+            "refusing to bind {} (non-loopback) without ORCHESTRATOR_ADMIN_TOKEN set; without it, anyone reaching this port can create a project with a self-chosen token — set ORCHESTRATOR_ADMIN_TOKEN or use --production",
+            args.listen
+        )
+    }
     if let Some(parent) = args.database.parent() {
         tokio::fs::create_dir_all(parent).await?
     };
@@ -94,7 +101,7 @@ async fn main() -> Result<()> {
         Err(_) => {}
     }
     if args.production {
-        let admin_token = std::env::var("ORCHESTRATOR_ADMIN_TOKEN").map_err(|_| {
+        let admin_token = admin_token_env.clone().ok_or_else(|| {
             anyhow::anyhow!("ORCHESTRATOR_ADMIN_TOKEN is required with --production")
         })?;
         if std::env::var("ORCHESTRATOR_MEMORY_WRITE_TOKEN")
@@ -104,6 +111,8 @@ async fn main() -> Result<()> {
         {
             anyhow::bail!("production requires distinct admin and memory-write credentials")
         }
+        state = state.with_admin_token(admin_token);
+    } else if let Some(admin_token) = admin_token_env {
         state = state.with_admin_token(admin_token);
     }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
