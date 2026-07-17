@@ -26,3 +26,14 @@ cargo run -p orchestrator-server -- --production --no-demo-project
 ```
 
 This remains a single-node deployment. Do not use it with untrusted workers or high-sensitivity secrets.
+# Production preflight
+
+Production mode is intentionally strict:
+
+- bind to loopback, or use `--tls-terminated` behind a trusted TLS proxy;
+- set distinct `ORCHESTRATOR_ADMIN_TOKEN` and `ORCHESTRATOR_MEMORY_WRITE_TOKEN` values;
+- set `ORCHESTRATOR_RECOVERY_KEY_REFERENCE=keychain:service:account` and store a 32-byte hex recovery key in that OS-keychain entry;
+- use explicit database, artifact, project-workspace, memory, and recovery roots with access limited to the Bridge service identity;
+- start with `--production --no-demo-project`, run a recovery drill, and keep workers on their short-lived registration tokens.
+
+Do not use `ORCHESTRATOR_RECOVERY_KEY_HEX` outside explicit local development.

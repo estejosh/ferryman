@@ -7,12 +7,12 @@ Project inputs/results, artifact metadata and contents, project bearer tokens, s
 ## Trust boundaries and controls
 
 - **Client to API:** project bearer token is required; tokens are compared by SHA-256 hash. Run only behind TLS in production.
-- **API to worker:** a worker receives only a leased job and its policy envelope. Job completion requires its opaque lease ID.
+- **API to worker:** registration requires an operator project token once; it returns an 8-hour, worker-specific token exactly once. That token is stored only as a hash and can access worker protocol routes for its own worker ID—not operator, memory-write, recovery, consent, or outbound-submission routes. Job completion also requires its opaque lease ID.
 - **Artifacts:** content is hashed, written under the bridge-owned artifact root, and metadata is associated with one project. Paths from requests are never used as filesystem paths.
-- **Optional Google Drive mirror:** credentials come from environment variables, never the database or job inputs. The adapter writes only into a configured folder and never grants permissions. Local storage remains authoritative if Drive is unavailable.
+- **Recovery providers:** raw artifacts are never mirrored. Local-first continuity packs are encrypted before any configured network, Drive, MEGA, or private-Git recovery target receives them. External adapters fail closed until a target policy, credential reference, consent manifest, and remote hash verification are available.
 - **Sensitive data:** logs/events redact top-level keys containing `secret`; this is defense-in-depth, not a replacement for application-level data minimization.
 - **Destructive/external work:** project submits it with `requires_approval`; v0.1 requires a separate approve transition before dispatch.
 
 ## Non-goals and residual risks
 
-Workers are trusted execution environments. **Deferred:** workers currently use a project bearer token; short-lived worker/job tokens are a later security milestone. This bridge does not confine a malicious worker, prevent a valid bearer token from being copied, encrypt SQLite data, or prove that an external side effect is idempotent. Do not place production secrets in job input or run untrusted workers. Deploy with TLS, restricted database/artifact filesystem permissions, rotation, backups, and a real identity provider when v0.1 is extended for production use.
+Workers remain trusted execution environments: the Bridge does not sandbox their local execution or prove external effects are idempotent. Do not place production secrets in job input or run untrusted workers. SQLite at-rest encryption and a real identity provider remain deployment choices. Deploy with TLS, restrictive filesystem permissions, token rotation, backups, and a recovery drill before handling sensitive project data.

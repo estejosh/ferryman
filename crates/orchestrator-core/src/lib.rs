@@ -161,6 +161,14 @@ pub struct Worker {
     pub capabilities: Vec<String>,
     pub last_heartbeat: String,
 }
+/// The raw token is returned exactly once at registration and is never stored
+/// in plaintext.  It grants only worker protocol routes for this worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerRegistration {
+    pub worker: Worker,
+    pub worker_token: String,
+    pub expires_at: String,
+}
 #[derive(Debug, Clone)]
 pub struct NewJob {
     pub input: Value,
@@ -192,7 +200,7 @@ CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, wo
 CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), idempotency_key TEXT, status TEXT NOT NULL, input_json TEXT NOT NULL, policy_json TEXT NOT NULL, requires_approval INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, available_at TEXT NOT NULL, lease_id TEXT, lease_expires_at TEXT, worker_id TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(project_id, idempotency_key));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(id), job_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS events_project_job_idx ON events(project_id, job_id, id);
-CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), capabilities_json TEXT NOT NULL, last_heartbeat TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), capabilities_json TEXT NOT NULL, last_heartbeat TEXT NOT NULL, token_hash TEXT NOT NULL DEFAULT '', token_expires_at TEXT);
 CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), job_id TEXT NOT NULL REFERENCES jobs(id), sha256 TEXT NOT NULL, content_type TEXT NOT NULL, byte_len INTEGER NOT NULL, created_at TEXT NOT NULL);")?;
         let _ = conn.execute(
             "ALTER TABLE projects ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''",
@@ -214,6 +222,11 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             [],
         );
         let _ = conn.execute("ALTER TABLE consent_requests ADD COLUMN approver TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE workers ADD COLUMN token_hash TEXT NOT NULL DEFAULT ''",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE workers ADD COLUMN token_expires_at TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -417,15 +430,43 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             Ok(None)
         }
     }
-    pub fn register_worker(&self, project_id: &str, capabilities: Vec<String>) -> Result<Worker> {
+    pub fn register_worker(
+        &self,
+        project_id: &str,
+        capabilities: Vec<String>,
+    ) -> Result<WorkerRegistration> {
         let worker = Worker {
             id: Uuid::new_v4().to_string(),
             project_id: project_id.into(),
             capabilities,
             last_heartbeat: now(),
         };
-        self.db()?.execute("INSERT INTO workers(id,project_id,capabilities_json,last_heartbeat) VALUES(?1,?2,?3,?4)",params![worker.id,project_id,serde_json::to_string(&worker.capabilities)?,worker.last_heartbeat])?;
-        Ok(worker)
+        let worker_token = Uuid::new_v4().simple().to_string();
+        let expires_at = (Utc::now() + chrono::Duration::hours(8)).to_rfc3339();
+        self.db()?.execute("INSERT INTO workers(id,project_id,capabilities_json,last_heartbeat,token_hash,token_expires_at) VALUES(?1,?2,?3,?4,?5,?6)",params![worker.id,project_id,serde_json::to_string(&worker.capabilities)?,worker.last_heartbeat,hash(&worker_token),expires_at])?;
+        self.append_project_event(
+            project_id,
+            "worker.registered",
+            json!({"worker_id":worker.id,"expires_at":expires_at}),
+        )?;
+        Ok(WorkerRegistration {
+            worker,
+            worker_token,
+            expires_at,
+        })
+    }
+    pub fn authenticate_worker(
+        &self,
+        project_id: &str,
+        worker_id: &str,
+        token: &str,
+    ) -> Result<bool> {
+        let hash = hash(token);
+        let valid: Option<i64> = self.db()?.query_row(
+            "SELECT 1 FROM workers WHERE project_id=?1 AND id=?2 AND token_hash=?3 AND token_expires_at > ?4",
+            params![project_id, worker_id, hash, now()], |row| row.get(0),
+        ).optional()?;
+        Ok(valid.is_some())
     }
     pub fn ensure_agent(&self, agent: Agent) -> Result<Agent> {
         let db = self.db()?;

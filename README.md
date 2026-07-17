@@ -59,7 +59,7 @@ Set `ORCHESTRATOR_MEMORY_WRITE_TOKEN` on the server and `ORCHESTRATOR_MEMORY_TOK
 
 ## Security model
 
-Each project has its own bearer token. Tokens are stored as SHA-256 hashes, never returned after creation, and authorize only that project. In `--production` mode, project creation requires `ORCHESTRATOR_ADMIN_TOKEN` and the demo project is disabled. Workers receive a lease plus a policy envelope; v0.1 does not mint signed per-job tokens yet. Secrets are references (`env:NAME` or `keychain:NAME`), never values, and the API redacts fields named `secret` from event payloads. `shell` execution is not implemented; a future local shell adapter must require an explicit unsafe flag and a restrictive policy.
+Each project has its own bearer token. Tokens are stored as SHA-256 hashes, never returned after creation, and authorize only that project. In `--production` mode, project creation requires `ORCHESTRATOR_ADMIN_TOKEN` and the demo project is disabled. Worker registration returns a distinct eight-hour worker token exactly once; worker tokens are limited to worker protocol routes and cannot write memory, approve consent, access recovery keys, or create outbound submissions. Secrets are references (`env:NAME` or `keychain:NAME`), never values, and the API redacts sensitive fields from event payloads. `shell` execution is not implemented; a future local shell adapter must require an explicit unsafe flag and a restrictive policy.
 
 Approval is explicit for work marked `requires_approval`; a job cannot be leased until an authorized project client approves it. See [the threat model](docs/THREAT_MODEL.md) for limits and deployment guidance.
 

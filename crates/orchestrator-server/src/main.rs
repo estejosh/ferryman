@@ -85,6 +85,13 @@ async fn main() -> Result<()> {
         let admin_token = std::env::var("ORCHESTRATOR_ADMIN_TOKEN").map_err(|_| {
             anyhow::anyhow!("ORCHESTRATOR_ADMIN_TOKEN is required with --production")
         })?;
+        if std::env::var("ORCHESTRATOR_MEMORY_WRITE_TOKEN")
+            .ok()
+            .as_deref()
+            == Some(admin_token.as_str())
+        {
+            anyhow::bail!("production requires distinct admin and memory-write credentials")
+        }
         state = state.with_admin_token(admin_token);
     }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;

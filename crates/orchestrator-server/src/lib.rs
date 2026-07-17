@@ -312,6 +312,27 @@ fn checked_memory_write(state: &AppState, headers: &HeaderMap, project: &str) ->
         Err(ApiError::unauthenticated())
     }
 }
+fn checked_worker(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    worker: &str,
+) -> ApiResult<()> {
+    let token = headers
+        .get("authorization")
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .ok_or_else(ApiError::unauthenticated)?;
+    if state
+        .store
+        .authenticate_worker(project, worker, token)
+        .map_err(ApiError::internal)?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unauthenticated())
+    }
+}
 
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok","api_version":"v1"}))
@@ -919,7 +940,7 @@ async fn register_worker(
     headers: HeaderMap,
     Path(project): Path<String>,
     Json(body): Json<RegisterWorker>,
-) -> ApiResult<(StatusCode, Json<orchestrator_core::Worker>)> {
+) -> ApiResult<(StatusCode, Json<orchestrator_core::WorkerRegistration>)> {
     checked(&state, &headers, &project)?;
     Ok((
         StatusCode::CREATED,
@@ -936,7 +957,7 @@ async fn heartbeat(
     headers: HeaderMap,
     Path((project, worker)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
-    checked(&state, &headers, &project)?;
+    checked_worker(&state, &headers, &project, &worker)?;
     if state
         .store
         .heartbeat(&project, &worker)
@@ -952,7 +973,7 @@ async fn lease_job(
     headers: HeaderMap,
     Path((project, worker)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    checked(&state, &headers, &project)?;
+    checked_worker(&state, &headers, &project, &worker)?;
     match state
         .store
         .lease(&project, &worker, 60)
@@ -964,6 +985,7 @@ async fn lease_job(
 }
 #[derive(Deserialize)]
 struct WorkerEvent {
+    worker_id: String,
     kind: String,
     #[serde(default)]
     payload: Value,
@@ -974,7 +996,7 @@ async fn worker_event(
     Path((project, job)): Path<(String, String)>,
     Json(body): Json<WorkerEvent>,
 ) -> ApiResult<StatusCode> {
-    checked(&state, &headers, &project)?;
+    checked_worker(&state, &headers, &project, &body.worker_id)?;
     state
         .store
         .append_worker_event(&project, &job, &body.kind, body.payload)
@@ -983,6 +1005,7 @@ async fn worker_event(
 }
 #[derive(Deserialize)]
 struct Complete {
+    worker_id: String,
     lease_id: String,
     result: Value,
     #[serde(default)]
@@ -994,7 +1017,7 @@ async fn complete_job(
     Path((project, job)): Path<(String, String)>,
     Json(body): Json<Complete>,
 ) -> ApiResult<Json<orchestrator_core::Job>> {
-    checked(&state, &headers, &project)?;
+    checked_worker(&state, &headers, &project, &body.worker_id)?;
     state
         .store
         .complete(&project, &job, &body.lease_id, body.result, body.retryable)
@@ -1008,7 +1031,11 @@ async fn upload_artifact(
     Path((project, job)): Path<(String, String)>,
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Artifact>)> {
-    checked(&state, &headers, &project)?;
+    let worker = headers
+        .get("x-orchestrator-worker-id")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::bad("x-orchestrator-worker-id is required for artifact upload"))?;
+    checked_worker(&state, &headers, &project, worker)?;
     if state
         .store
         .get_job(&project, &job)
@@ -1268,12 +1295,22 @@ mod tests {
             .unwrap();
         let worker: Value =
             serde_json::from_slice(&lease.into_body().collect().await.unwrap().to_bytes()).unwrap();
-        let worker = worker["id"].as_str().unwrap();
+        let worker_id = worker["worker"]["id"].as_str().unwrap().to_string();
+        let worker_auth = format!("Bearer {}", worker["worker_token"].as_str().unwrap());
+        let worker_request = |method: &str, uri: String, body: String| {
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("authorization", &worker_auth)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
         let no_lease = api
             .clone()
-            .oneshot(request(
+            .oneshot(worker_request(
                 "POST",
-                format!("/v1/projects/p/workers/{worker}/lease"),
+                format!("/v1/projects/p/workers/{worker_id}/lease"),
                 "".into(),
             ))
             .await
@@ -1289,9 +1326,9 @@ mod tests {
             .unwrap();
         let leased = api
             .clone()
-            .oneshot(request(
+            .oneshot(worker_request(
                 "POST",
-                format!("/v1/projects/p/workers/{worker}/lease"),
+                format!("/v1/projects/p/workers/{worker_id}/lease"),
                 "".into(),
             ))
             .await
@@ -1302,10 +1339,10 @@ mod tests {
         let lease_id = data["lease_id"].as_str().unwrap();
         let retry = api
             .clone()
-            .oneshot(request(
+            .oneshot(worker_request(
                 "POST",
                 format!("/v1/projects/p/jobs/{job}/complete"),
-                json!({"lease_id":lease_id,"result":{"error":"temporary"},"retryable":true})
+                json!({"worker_id":worker_id,"lease_id":lease_id,"result":{"error":"temporary"},"retryable":true})
                     .to_string(),
             ))
             .await
@@ -1321,7 +1358,8 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/v1/projects/p/jobs/{job}/artifacts"))
-                    .header("authorization", auth)
+                    .header("authorization", &worker_auth)
+                    .header("x-orchestrator-worker-id", &worker_id)
                     .body(Body::from("artifact"))
                     .unwrap(),
             )

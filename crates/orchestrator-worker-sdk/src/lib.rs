@@ -27,14 +27,19 @@ impl WorkerClient {
             .await?
             .error_for_status()?;
         let body: Value = response.json().await?;
-        let worker_id = body["id"]
+        let worker_id = body["worker"]["id"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("bridge worker response lacked id"))?
             .to_string();
         Ok(Self {
             endpoint,
             project,
-            token,
+            token: body["worker_token"]
+                .as_str()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("bridge worker response lacked short-lived worker token")
+                })?
+                .to_string(),
             worker_id,
             client,
         })
@@ -61,7 +66,7 @@ impl WorkerClient {
                 self.endpoint, self.project
             ))
             .bearer_auth(&self.token)
-            .json(&json!({"kind":kind,"payload":payload}))
+            .json(&json!({"worker_id":self.worker_id,"kind":kind,"payload":payload}))
             .send()
             .await?
             .error_for_status()?;
@@ -80,7 +85,7 @@ impl WorkerClient {
                 self.endpoint, self.project
             ))
             .bearer_auth(&self.token)
-            .json(&json!({"lease_id":lease_id,"result":result,"retryable":retryable}))
+            .json(&json!({"worker_id":self.worker_id,"lease_id":lease_id,"result":result,"retryable":retryable}))
             .send()
             .await?
             .error_for_status()?;
