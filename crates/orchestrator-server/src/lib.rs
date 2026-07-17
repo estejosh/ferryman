@@ -1368,7 +1368,15 @@ mod tests {
         assert_eq!(uploaded.status(), StatusCode::CREATED);
         let memory = api.clone().oneshot(request("POST", "/v1/projects/p/memory".into(), r#"{"category":"decision","content":"Keep this fact after worker replacement.","source":"operator"}"#.into())).await.unwrap();
         assert_eq!(memory.status(), StatusCode::CREATED);
-        let mirror = std::fs::read_to_string(dir.join("memory/p/MEMORY.md")).unwrap();
+        let mirror_path = dir.join("memory/p/MEMORY.md");
+        let mut mirror = String::new();
+        for _ in 0..20 {
+            mirror = std::fs::read_to_string(&mirror_path).unwrap_or_default();
+            if mirror.contains("Keep this fact after worker replacement.") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         assert!(mirror.contains("Keep this fact after worker replacement."));
     }
     #[tokio::test]
