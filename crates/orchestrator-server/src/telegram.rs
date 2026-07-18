@@ -113,10 +113,56 @@ impl TelegramClient {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
-    async fn send_message(&self, text: &str) -> anyhow::Result<()> {
+    async fn send_message(&self, text: &str, reply_markup: Option<Value>) -> anyhow::Result<()> {
+        let mut body = json!({"chat_id": self.chat_id, "text": text});
+        if let Some(reply_markup) = reply_markup {
+            body["reply_markup"] = reply_markup;
+        }
         self.client
             .post(self.url("sendMessage"))
-            .json(&json!({"chat_id": self.chat_id, "text": text}))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Always answered so the tapped button stops spinning on the caller's phone,
+    /// regardless of whether the tap was authorized or acted upon.
+    async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut body = json!({"callback_query_id": callback_query_id});
+        if let Some(text) = text {
+            body["text"] = json!(text);
+        }
+        self.client
+            .post(self.url("answerCallbackQuery"))
+            .json(&body)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(())
+    }
+
+    /// Replaces the notify message's text and clears its inline keyboard so a resolved
+    /// gate can't be double-tapped.
+    async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.client
+            .post(self.url("editMessageText"))
+            .json(&json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": {"inline_keyboard": []}
+            }))
             .send()
             .await?
             .error_for_status()?;
@@ -157,6 +203,8 @@ struct TgUpdate {
     update_id: i64,
     #[serde(default)]
     message: Option<TgMessage>,
+    #[serde(default)]
+    callback_query: Option<TgCallbackQuery>,
 }
 #[derive(Deserialize)]
 struct TgMessage {
@@ -172,6 +220,20 @@ struct TgUser {
 #[derive(Deserialize)]
 struct TgChat {
     id: i64,
+}
+#[derive(Deserialize)]
+struct TgCallbackQuery {
+    id: String,
+    from: TgUser,
+    #[serde(default)]
+    data: Option<String>,
+    #[serde(default)]
+    message: Option<TgCallbackMessage>,
+}
+#[derive(Deserialize)]
+struct TgCallbackMessage {
+    message_id: i64,
+    chat: TgChat,
 }
 
 async fn notify_loop(client: TelegramClient, store: SqliteStore, interval: Duration) {
@@ -194,7 +256,13 @@ async fn notify_loop(client: TelegramClient, store: SqliteStore, interval: Durat
                 job.id,
                 job.id
             );
-            match client.send_message(&text).await {
+            let keyboard = json!({
+                "inline_keyboard": [[
+                    {"text": "✅ Approve", "callback_data": format!("approve:{}", job.id)},
+                    {"text": "🚫 Deny", "callback_data": format!("deny:{}", job.id)}
+                ]]
+            });
+            match client.send_message(&text, Some(keyboard)).await {
                 Ok(()) => {
                     if store
                         .mark_telegram_notified(&job.project_id, &job.id)
@@ -237,6 +305,18 @@ fn parse_command(text: &str) -> Option<(GateAction, String)> {
     None
 }
 
+/// Parses the `callback_data` sent with an inline-button tap: `approve:<job_id>` /
+/// `deny:<job_id>`, the button counterpart to `parse_command`'s `/approve_<id>` text form.
+fn parse_callback_data(data: &str) -> Option<(GateAction, String)> {
+    if let Some(job_id) = data.strip_prefix("approve:") {
+        return Some((GateAction::Approve, job_id.to_string()));
+    }
+    if let Some(job_id) = data.strip_prefix("deny:") {
+        return Some((GateAction::Deny, job_id.to_string()));
+    }
+    None
+}
+
 async fn poll_loop(
     client: TelegramClient,
     store: SqliteStore,
@@ -260,6 +340,10 @@ async fn poll_loop(
         }
         for update in updates {
             offset = offset.max(update.update_id + 1);
+            if let Some(callback_query) = update.callback_query {
+                handle_callback_query(&client, &store, approver_id, callback_query).await;
+                continue;
+            }
             let Some(message) = update.message else {
                 continue;
             };
@@ -294,10 +378,81 @@ async fn poll_loop(
                     "internal error processing gate command".to_string()
                 }
             };
-            if client.send_message(&reply).await.is_err() {
+            if client.send_message(&reply, None).await.is_err() {
                 tracing::warn!("telegram: failed to send gate-command reply");
             }
         }
+    }
+}
+
+/// Handles an inline-button tap. Always answers the callback query (so the tapped button
+/// stops spinning) and, on a successful approve/deny, edits the original message to show
+/// the outcome and drop the keyboard — the same fail-closed authorization and store
+/// transition as the `/approve_ /deny_` text path.
+async fn handle_callback_query(
+    client: &TelegramClient,
+    store: &SqliteStore,
+    approver_id: i64,
+    callback_query: TgCallbackQuery,
+) {
+    if callback_query.from.id != approver_id {
+        tracing::warn!(
+            from_id = callback_query.from.id,
+            "telegram: rejected callback_query from non-approver"
+        );
+        if client
+            .answer_callback_query(&callback_query.id, Some("Not authorized"))
+            .await
+            .is_err()
+        {
+            tracing::warn!("telegram: failed to answer unauthorized callback_query");
+        }
+        return;
+    }
+    let action_and_job = callback_query.data.as_deref().and_then(parse_callback_data);
+    let Some((action, job_id)) = action_and_job else {
+        if client
+            .answer_callback_query(&callback_query.id, None)
+            .await
+            .is_err()
+        {
+            tracing::warn!("telegram: failed to answer unrecognized callback_query");
+        }
+        return;
+    };
+    let outcome = match action {
+        GateAction::Approve => store.telegram_approve(&job_id, approver_id),
+        GateAction::Deny => store.telegram_deny(&job_id, approver_id),
+    };
+    let (answer_text, edit_text) = match (action, &outcome) {
+        (GateAction::Approve, Ok(Some(job))) => (
+            "Approved".to_string(),
+            Some(format!("Approved ✓ — job {} is now queued", job.id)),
+        ),
+        (GateAction::Deny, Ok(Some(job))) => (
+            "Denied".to_string(),
+            Some(format!("Denied ✗ — job {} will not run", job.id)),
+        ),
+        (_, Ok(None)) => ("no such pending gate".to_string(), None),
+        (_, Err(_)) => {
+            tracing::warn!(job_id = %job_id, "telegram: store error resolving gate callback");
+            ("internal error processing gate command".to_string(), None)
+        }
+    };
+    if client
+        .answer_callback_query(&callback_query.id, Some(&answer_text))
+        .await
+        .is_err()
+    {
+        tracing::warn!("telegram: failed to answer gate callback_query");
+    }
+    if let (Some(text), Some(message)) = (edit_text, callback_query.message.as_ref())
+        && client
+            .edit_message_text(message.chat.id, message.message_id, &text)
+            .await
+            .is_err()
+    {
+        tracing::warn!("telegram: failed to edit message after gate callback");
     }
 }
 
@@ -316,6 +471,8 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeTelegram {
         sent: Arc<Mutex<Vec<Value>>>,
+        answered: Arc<Mutex<Vec<Value>>>,
+        edited: Arc<Mutex<Vec<Value>>>,
         pending_updates: Arc<Mutex<Vec<Value>>>,
     }
 
@@ -335,12 +492,33 @@ mod tests {
         fake.sent.lock().unwrap().push(body);
         Json(json!({"ok": true, "result": {"message_id": 1}}))
     }
+    async fn fake_answer_callback_query(
+        State(fake): State<FakeTelegram>,
+        Path(_token): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        fake.answered.lock().unwrap().push(body);
+        Json(json!({"ok": true, "result": true}))
+    }
+    async fn fake_edit_message_text(
+        State(fake): State<FakeTelegram>,
+        Path(_token): Path<String>,
+        Json(body): Json<Value>,
+    ) -> Json<Value> {
+        fake.edited.lock().unwrap().push(body);
+        Json(json!({"ok": true, "result": true}))
+    }
 
     async fn start_fake_server() -> (String, FakeTelegram) {
         let fake = FakeTelegram::default();
         let app = Router::new()
             .route("/bot{token}/getUpdates", get(fake_get_updates))
             .route("/bot{token}/sendMessage", post(fake_send_message))
+            .route(
+                "/bot{token}/answerCallbackQuery",
+                post(fake_answer_callback_query),
+            )
+            .route("/bot{token}/editMessageText", post(fake_edit_message_text))
             .with_state(fake.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -420,6 +598,24 @@ mod tests {
             store.get_job("p", &job.id).unwrap().unwrap().status,
             JobStatus::PendingApproval
         );
+        let sent = fake.sent.lock().unwrap();
+        let notify_message = sent
+            .iter()
+            .find(|m| m["text"].as_str().unwrap_or("").contains(&job.id))
+            .unwrap();
+        let buttons = notify_message["reply_markup"]["inline_keyboard"][0]
+            .as_array()
+            .expect("notify message must carry an inline keyboard");
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(
+            buttons[0]["callback_data"].as_str().unwrap(),
+            format!("approve:{}", job.id)
+        );
+        assert_eq!(
+            buttons[1]["callback_data"].as_str().unwrap(),
+            format!("deny:{}", job.id)
+        );
+        drop(sent);
         notify.abort();
         poll.abort();
     }
@@ -520,6 +716,114 @@ mod tests {
                 .starts_with("approved")
                 && !m["text"].as_str().unwrap_or("").starts_with("denied")),
             "must not reply as if the command were honored"
+        );
+        notify.abort();
+        poll.abort();
+    }
+
+    /// Dry-run acceptance criterion (a): a tap on the inline "Approve" button from the
+    /// configured approver must queue the job, exactly like the `/approve_<id>` text path.
+    #[tokio::test]
+    async fn callback_query_approve_from_approver_queues_the_job() {
+        let (base, fake) = start_fake_server().await;
+        let store = test_store();
+        let job = gated_job(&store, "dry-run smoke test");
+        fake.pending_updates.lock().unwrap().push(json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": {"id": 999},
+                "data": format!("approve:{}", job.id),
+                "message": {"message_id": 42, "chat": {"id": 999}}
+            }
+        }));
+        let gate = TelegramGate::from_config(Some("t".into()), Some(999), None)
+            .unwrap()
+            .with_test_tuning(base);
+        let (notify, poll) = gate.spawn(store.clone());
+
+        let approved = wait_until(
+            || {
+                matches!(
+                    store.get_job("p", &job.id).unwrap().map(|j| j.status),
+                    Some(JobStatus::Queued)
+                )
+            },
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            approved,
+            "an approve callback_query from the approver must queue the job"
+        );
+        assert!(
+            wait_until(
+                || !fake.answered.lock().unwrap().is_empty(),
+                Duration::from_secs(3)
+            )
+            .await,
+            "must answerCallbackQuery so the tapped button stops spinning"
+        );
+        assert!(
+            wait_until(
+                || !fake.edited.lock().unwrap().is_empty(),
+                Duration::from_secs(3)
+            )
+            .await,
+            "must edit the notify message to prevent a double-tap"
+        );
+        let events = store
+            .timeline("p", 0, 50, Some(&job.id), Some("job.approved"))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["approver_telegram_id"], json!(999));
+        notify.abort();
+        poll.abort();
+    }
+
+    /// Dry-run acceptance criterion (b), button form: a tap from any id other than the
+    /// configured approver must be dropped — the job must not move and the message must
+    /// not be edited.
+    #[tokio::test]
+    async fn callback_query_from_a_different_telegram_user_is_ignored() {
+        let (base, fake) = start_fake_server().await;
+        let store = test_store();
+        let job = gated_job(&store, "dry-run smoke test");
+        fake.pending_updates.lock().unwrap().push(json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cbq-1",
+                "from": {"id": 12345},
+                "data": format!("approve:{}", job.id),
+                "message": {"message_id": 42, "chat": {"id": 12345}}
+            }
+        }));
+        let gate = TelegramGate::from_config(Some("t".into()), Some(999), None)
+            .unwrap()
+            .with_test_tuning(base);
+        let (notify, poll) = gate.spawn(store.clone());
+
+        let answered = wait_until(
+            || !fake.answered.lock().unwrap().is_empty(),
+            Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            answered,
+            "must still answerCallbackQuery for an unauthorized tap"
+        );
+        assert_eq!(
+            fake.answered.lock().unwrap()[0]["text"].as_str().unwrap(),
+            "Not authorized"
+        );
+        assert_eq!(
+            store.get_job("p", &job.id).unwrap().unwrap().status,
+            JobStatus::PendingApproval,
+            "a callback_query from a non-approver id must never approve/deny a job"
+        );
+        assert!(
+            fake.edited.lock().unwrap().is_empty(),
+            "must not edit the message for an unauthorized tap"
         );
         notify.abort();
         poll.abort();
