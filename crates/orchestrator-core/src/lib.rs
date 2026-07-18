@@ -19,6 +19,9 @@ pub const API_VERSION: &str = "v1";
 /// missed heartbeats don't cost the lease, while still reaping a genuinely dead worker
 /// within a couple of minutes.
 pub const DEFAULT_LEASE_TTL_SECONDS: i64 = 120;
+/// Default window a `pending_approval` job stays open for a gate (e.g. the Telegram
+/// approval gate) before an approve/deny command against it is refused as stale.
+pub const DEFAULT_APPROVAL_TTL_SECONDS: i64 = 900;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -181,6 +184,10 @@ pub struct NewJob {
     pub requires_approval: bool,
     pub max_attempts: u32,
     pub idempotency_key: Option<String>,
+    /// Only meaningful when `requires_approval` is set. `None` uses
+    /// `DEFAULT_APPROVAL_TTL_SECONDS`. After this window an approve/deny gate command
+    /// against the job is refused as stale.
+    pub approval_ttl_seconds: Option<i64>,
 }
 
 /// A stable adapter boundary. Adapters advertise and execute capabilities; the bridge owns state.
@@ -202,7 +209,7 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, workspace_path TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), idempotency_key TEXT, status TEXT NOT NULL, input_json TEXT NOT NULL, policy_json TEXT NOT NULL, requires_approval INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, available_at TEXT NOT NULL, lease_id TEXT, lease_expires_at TEXT, worker_id TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(project_id, idempotency_key));
+CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), idempotency_key TEXT, status TEXT NOT NULL, input_json TEXT NOT NULL, policy_json TEXT NOT NULL, requires_approval INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, available_at TEXT NOT NULL, lease_id TEXT, lease_expires_at TEXT, worker_id TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, approval_expires_at TEXT, UNIQUE(project_id, idempotency_key));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(id), job_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS events_project_job_idx ON events(project_id, job_id, id);
 CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), capabilities_json TEXT NOT NULL, last_heartbeat TEXT NOT NULL, token_hash TEXT NOT NULL DEFAULT '', token_expires_at TEXT);
@@ -232,6 +239,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             [],
         );
         let _ = conn.execute("ALTER TABLE workers ADD COLUMN token_expires_at TEXT", []);
+        let _ = conn.execute("ALTER TABLE jobs ADD COLUMN approval_expires_at TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -295,6 +303,12 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         } else {
             JobStatus::Queued
         };
+        let approval_expires_at = new.requires_approval.then(|| {
+            let ttl = new
+                .approval_ttl_seconds
+                .unwrap_or(DEFAULT_APPROVAL_TTL_SECONDS);
+            (Utc::now() + chrono::Duration::seconds(ttl)).to_rfc3339()
+        });
         let job = Job {
             id: id.clone(),
             project_id: project_id.into(),
@@ -310,7 +324,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         };
         let mut db = self.db()?;
         let tx = db.transaction()?;
-        tx.execute("INSERT INTO jobs (id,project_id,idempotency_key,status,input_json,policy_json,requires_approval,attempts,max_attempts,available_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?9,?9)", params![job.id, project_id, new.idempotency_key, status_text(&status), serde_json::to_string(&job.input)?, serde_json::to_string(&job.policy)?, i64::from(job.requires_approval), i64::from(job.max_attempts), now])?;
+        tx.execute("INSERT INTO jobs (id,project_id,idempotency_key,status,input_json,policy_json,requires_approval,attempts,max_attempts,available_at,created_at,updated_at,approval_expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?9,?9,?10)", params![job.id, project_id, new.idempotency_key, status_text(&status), serde_json::to_string(&job.input)?, serde_json::to_string(&job.policy)?, i64::from(job.requires_approval), i64::from(job.max_attempts), now, approval_expires_at])?;
         append_event(
             &tx,
             project_id,
@@ -401,6 +415,98 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         tx.commit()?;
         drop(db);
         self.get_job(project_id, job_id)
+    }
+    /// Looks a job up by id alone, across every project. Used by gates (e.g. Telegram)
+    /// whose incoming commands carry only a job id, not a project id.
+    pub fn get_job_any_project(&self, job_id: &str) -> Result<Option<Job>> {
+        let db = self.db()?;
+        read_job(
+            &db,
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs WHERE id=?1",
+            params![job_id],
+        )
+    }
+    /// `pending_approval` jobs that have not yet had a `telegram.notified` event recorded.
+    /// Used by the Telegram notify-on-park loop to send exactly one DM per parked job.
+    pub fn jobs_pending_telegram_notification(&self) -> Result<Vec<Job>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs
+             WHERE status='pending_approval'
+             AND id NOT IN (SELECT job_id FROM events WHERE kind='telegram.notified' AND job_id IS NOT NULL)
+             ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+    /// Approves a job via the Telegram gate. Only transitions a job that is currently
+    /// `pending_approval` and whose approval window has not expired; a re-approve or a
+    /// stale/unknown job id is a no-op (`Ok(None)`), which is exactly "no such pending
+    /// gate" from the caller's point of view.
+    pub fn telegram_approve(&self, job_id: &str, approver_telegram_id: i64) -> Result<Option<Job>> {
+        self.telegram_resolve(
+            job_id,
+            JobStatus::Queued,
+            "job.approved",
+            approver_telegram_id,
+        )
+    }
+    /// Denies a job via the Telegram gate; see `telegram_approve` for the shared semantics.
+    pub fn telegram_deny(&self, job_id: &str, approver_telegram_id: i64) -> Result<Option<Job>> {
+        self.telegram_resolve(
+            job_id,
+            JobStatus::Cancelled,
+            "job.denied",
+            approver_telegram_id,
+        )
+    }
+    fn telegram_resolve(
+        &self,
+        job_id: &str,
+        to: JobStatus,
+        event: &str,
+        approver_telegram_id: i64,
+    ) -> Result<Option<Job>> {
+        let Some(pending) = self.get_job_any_project(job_id)? else {
+            return Ok(None);
+        };
+        if pending.status != JobStatus::PendingApproval {
+            return Ok(None);
+        }
+        let action_payload_hash = sha256_json(&pending.input);
+        let now = now();
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let count = tx.execute(
+            "UPDATE jobs SET status=?4,updated_at=?3 WHERE project_id=?1 AND id=?2 AND status='pending_approval' AND (approval_expires_at IS NULL OR approval_expires_at > ?3)",
+            params![pending.project_id, job_id, now, status_text(&to)],
+        )?;
+        if count > 0 {
+            append_event(
+                &tx,
+                &pending.project_id,
+                Some(job_id),
+                event,
+                json!({
+                    "approver_channel": "telegram",
+                    "approver_telegram_id": approver_telegram_id,
+                    "action_payload_hash": action_payload_hash,
+                }),
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+        if count > 0 {
+            self.get_job(&pending.project_id, job_id)
+        } else {
+            Ok(None)
+        }
+    }
+    /// Records that a Telegram DM was sent for this parked job, so the notify loop
+    /// doesn't re-notify it every tick.
+    pub fn mark_telegram_notified(&self, project_id: &str, job_id: &str) -> Result<()> {
+        self.append_worker_event(project_id, job_id, "telegram.notified", json!({}))
     }
     fn transition(
         &self,
@@ -530,7 +636,12 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
     /// job's `lease_expires_at` by `lease_ttl_seconds` — this is the renewal path a
     /// long-running job needs so the stale-lease reaper in `lease()` doesn't requeue it out
     /// from under a worker that is still alive and heartbeating.
-    pub fn heartbeat(&self, project_id: &str, worker_id: &str, lease_ttl_seconds: i64) -> Result<bool> {
+    pub fn heartbeat(
+        &self,
+        project_id: &str,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<bool> {
         let now = now();
         let mut db = self.db()?;
         let tx = db.transaction()?;
@@ -1129,4 +1240,139 @@ fn is_sensitive_key(key: &str) -> bool {
     ]
     .iter()
     .any(|marker| key.contains(marker))
+}
+
+#[cfg(test)]
+mod telegram_gate_tests {
+    use super::*;
+
+    fn store() -> SqliteStore {
+        let dir = std::env::temp_dir().join(format!("orchestrator-core-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStore::open(dir.join("bridge.db")).unwrap();
+        store.create_project("p", "Project", "token", "").unwrap();
+        store
+    }
+
+    fn gated_job(store: &SqliteStore, approval_ttl_seconds: Option<i64>) -> Job {
+        store
+            .submit_job(
+                "p",
+                NewJob {
+                    input: json!({"marker": "dry-run"}),
+                    policy: PolicyEnvelope::default(),
+                    requires_approval: true,
+                    max_attempts: 1,
+                    idempotency_key: None,
+                    approval_ttl_seconds,
+                },
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn telegram_approve_transitions_pending_approval_to_queued_with_audit_event() {
+        let store = store();
+        let job = gated_job(&store, None);
+        let approved = store.telegram_approve(&job.id, 424242).unwrap().unwrap();
+        assert_eq!(approved.status, JobStatus::Queued);
+        let events = store
+            .timeline("p", 0, 50, Some(&job.id), Some("job.approved"))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["approver_telegram_id"], json!(424242));
+        assert_eq!(events[0].payload["approver_channel"], json!("telegram"));
+        assert_eq!(
+            events[0].payload["action_payload_hash"],
+            json!(sha256_json(&job.input))
+        );
+    }
+
+    #[test]
+    fn telegram_deny_transitions_pending_approval_to_cancelled_and_does_not_run() {
+        let store = store();
+        let job = gated_job(&store, None);
+        let denied = store.telegram_deny(&job.id, 424242).unwrap().unwrap();
+        assert_eq!(denied.status, JobStatus::Cancelled);
+        // A worker should never be able to lease a denied job.
+        let leased = store.lease("p", "worker-1", 60).unwrap();
+        assert!(leased.is_none());
+    }
+
+    #[test]
+    fn telegram_approve_on_unknown_job_id_is_no_such_pending_gate() {
+        let store = store();
+        assert!(
+            store
+                .telegram_approve("does-not-exist", 1)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn re_approving_an_already_approved_job_is_a_no_op() {
+        let store = store();
+        let job = gated_job(&store, None);
+        assert!(store.telegram_approve(&job.id, 1).unwrap().is_some());
+        // Second approve finds the job already 'queued', not 'pending_approval': no-op.
+        assert!(store.telegram_approve(&job.id, 1).unwrap().is_none());
+        let events = store
+            .timeline("p", 0, 50, Some(&job.id), Some("job.approved"))
+            .unwrap();
+        assert_eq!(events.len(), 1, "must not double-record the approval event");
+    }
+
+    #[test]
+    fn expired_pending_approval_refuses_both_approve_and_deny() {
+        let store = store();
+        let job = gated_job(&store, Some(-1)); // already expired the instant it was created
+        assert!(
+            store.telegram_approve(&job.id, 1).unwrap().is_none(),
+            "a stale approve command must be refused, not honored"
+        );
+        assert!(
+            store.telegram_deny(&job.id, 1).unwrap().is_none(),
+            "a stale deny command must be refused, not honored"
+        );
+        // Still sitting exactly where it was left: pending_approval, untouched.
+        let still_pending = store.get_job("p", &job.id).unwrap().unwrap();
+        assert_eq!(still_pending.status, JobStatus::PendingApproval);
+    }
+
+    #[test]
+    fn jobs_pending_telegram_notification_reports_once_then_stops() {
+        let store = store();
+        let job = gated_job(&store, None);
+        let pending = store.jobs_pending_telegram_notification().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, job.id);
+        store.mark_telegram_notified("p", &job.id).unwrap();
+        let pending_after = store.jobs_pending_telegram_notification().unwrap();
+        assert!(pending_after.is_empty());
+    }
+
+    #[test]
+    fn non_approval_jobs_are_never_surfaced_for_telegram_notification() {
+        let store = store();
+        store
+            .submit_job(
+                "p",
+                NewJob {
+                    input: json!({}),
+                    policy: PolicyEnvelope::default(),
+                    requires_approval: false,
+                    max_attempts: 1,
+                    idempotency_key: None,
+                    approval_ttl_seconds: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .jobs_pending_telegram_notification()
+                .unwrap()
+                .is_empty()
+        );
+    }
 }
