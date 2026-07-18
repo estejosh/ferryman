@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 pub mod continuity;
 pub mod recovery_targets;
+pub mod telegram;
 pub mod workspace;
 
 use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
@@ -931,6 +932,8 @@ struct SubmitJob {
     #[serde(default = "default_attempts")]
     max_attempts: u32,
     idempotency_key: Option<String>,
+    #[serde(default)]
+    approval_ttl_seconds: Option<i64>,
 }
 fn default_attempts() -> u32 {
     3
@@ -952,6 +955,7 @@ async fn submit_job(
                 requires_approval: input.requires_approval,
                 max_attempts: input.max_attempts,
                 idempotency_key: input.idempotency_key,
+                approval_ttl_seconds: input.approval_ttl_seconds,
             },
         )
         .map_err(ApiError::internal)?;
@@ -1060,7 +1064,11 @@ async fn heartbeat(
     checked_worker(&state, &headers, &project, &worker)?;
     if state
         .store
-        .heartbeat(&project, &worker, orchestrator_core::DEFAULT_LEASE_TTL_SECONDS)
+        .heartbeat(
+            &project,
+            &worker,
+            orchestrator_core::DEFAULT_LEASE_TTL_SECONDS,
+        )
         .map_err(ApiError::internal)?
     {
         Ok(StatusCode::NO_CONTENT)
@@ -1076,7 +1084,11 @@ async fn lease_job(
     checked_worker(&state, &headers, &project, &worker)?;
     match state
         .store
-        .lease(&project, &worker, orchestrator_core::DEFAULT_LEASE_TTL_SECONDS)
+        .lease(
+            &project,
+            &worker,
+            orchestrator_core::DEFAULT_LEASE_TTL_SECONDS,
+        )
         .map_err(ApiError::internal)?
     {
         Some(lease) => Ok((StatusCode::OK, Json(lease)).into_response()),
