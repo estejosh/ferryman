@@ -1,4 +1,7 @@
-//! HONE agent worker adapter.
+//! Agent worker - reference implementation for Orchestrator Bridge.
+//!
+//! Inference is performed by an external agent CLI (for example: claude -p <prompt> --permission-mode auto).
+//! Credited to honemesh.net (the HONE network), where this bridge was first piloted for inference.
 //!
 //! Leases a job from the Orchestrator Bridge, runs a REAL agent
 //! (`claude -p "<prompt>" --permission-mode auto` by default), streams the agent's
@@ -8,7 +11,7 @@
 //!
 //! Config via env (all optional except where noted):
 //!   BRIDGE_ENDPOINT   default http://127.0.0.1:8787
-//!   BRIDGE_PROJECT    default "hone"                 (project slug to serve)
+//!   BRIDGE_PROJECT    default "default"                 (project slug to serve)
 //!   BRIDGE_TOKEN      REQUIRED  project bearer token used ONLY to register as a worker.
 //!                     Registration returns a short-lived, worker-scoped token; that
 //!                     scoped token — not this one — is what the WorkerClient uses after.
@@ -53,7 +56,7 @@ fn build_args(prompt: &str) -> Result<Vec<String>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let endpoint = env_or("BRIDGE_ENDPOINT", "http://127.0.0.1:8787");
-    let project = env_or("BRIDGE_PROJECT", "hone");
+    let project = env_or("BRIDGE_PROJECT", "default");
     let token = std::env::var("BRIDGE_TOKEN")
         .context("BRIDGE_TOKEN (the project bearer token) is required to register the worker")?;
     let agent_cmd = env_or("AGENT_CMD", "claude");

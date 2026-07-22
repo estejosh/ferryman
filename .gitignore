@@ -4,3 +4,9 @@
 *.db-shm
 *.db-wal
 .env
+
+# Local runtime + evaluation artifacts (never commit)
+/.data/
+*.log
+key-bootstrap.out
+EVAL_FINDINGS.md

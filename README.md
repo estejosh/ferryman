@@ -90,3 +90,11 @@ cargo test --workspace
 ```
 
 Use `docker compose up --build` for a containerized local API. Review [deployment](docs/DEPLOYMENT.md), [backup/recovery](docs/BACKUP_AND_RECOVERY.md), and [upgrading](docs/UPGRADING.md) before running outside local preview. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
+
+## Acknowledgments
+
+Orchestrator Bridge is provider-neutral and does not run models itself. The reference agent
+worker (`crates/orchestrator-worker-sdk/examples/agent_worker.rs`) performs model inference
+through an external agent CLI. This project was first piloted on
+**[honemesh.net](https://honemesh.net)**, which is credited for the inference work that
+shaped this bridge.

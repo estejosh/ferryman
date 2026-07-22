@@ -17,5 +17,5 @@ name = "mock_worker"
 path = "examples/mock_worker.rs"
 
 [[example]]
-name = "hone_agent_worker"
-path = "examples/hone_agent_worker.rs"
+name = "agent_worker"
+path = "examples/agent_worker.rs"
