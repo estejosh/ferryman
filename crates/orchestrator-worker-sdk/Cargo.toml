@@ -15,3 +15,7 @@ tokio.workspace = true
 [[example]]
 name = "mock_worker"
 path = "examples/mock_worker.rs"
+
+[[example]]
+name = "dryrun_worker"
+path = "examples/dryrun_worker.rs"

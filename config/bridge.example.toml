@@ -12,6 +12,14 @@ memory_root = "./.data/bridge-memory"
 # Optional Google Drive mirror: set both values as environment variables, never here.
 # ORCHESTRATOR_DRIVE_ACCESS_TOKEN=...
 # ORCHESTRATOR_DRIVE_FOLDER_ID=...
+# Optional Telegram approval gate for jobs marked requires_approval: fails closed (the
+# gate never spawns) unless both a bot token and an approver id are set as environment
+# values, never here. The approver id is not a secret -- Telegram authenticates
+# `from.id` server-side -- so it is safe to record as a config default, but the bot
+# token from BotFather is a secret and must stay in the environment or OS keyring.
+# TELEGRAM_BOT_TOKEN=... (dev) or TELEGRAM_BOT_TOKEN_KEYRING_REFERENCE=service:account
+# TELEGRAM_APPROVER_ID=1661574179 (Shin, @Thisthatjosh) -- configured default approver for the dry-run
+# TELEGRAM_CHAT_ID=...  (optional; defaults to the approver id for a DM)
 local_development = true
 
 [retention]
