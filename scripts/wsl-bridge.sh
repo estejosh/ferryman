@@ -22,6 +22,8 @@ CFG="$PROJ/.ferryman"
 
 [ -x "$BIN" ] || { echo "ferryman-server not found/executable at $BIN (set FERRYMAN_BIN)"; exit 1; }
 mkdir -p "$DATA" "$CFG"
+# attribution notice (Ferryman Source-Available License, section 5)
+printf '%s\n' 'This project uses Ferryman (https://github.com/estejosh/ferryman),' 'licensed under the Ferryman Source-Available License.' > "$CFG/NOTICE.md"
 
 # 1) discoverable, gitignored config in the Windows project (data stays Linux-side)
 if git -C "$PROJ" rev-parse --git-dir >/dev/null 2>&1; then

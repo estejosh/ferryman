@@ -45,26 +45,44 @@ this license text, the copyright notice, and all notices; and (b) do not remove,
 weaken, or circumvent the Seat limitations. Any recipient receives the Software
 under this same license, with the same rights and the same limitations.
 
-5. NO AUTOMATIC CONVERSION
+5. ATTRIBUTION (NOTICE)
+If you deploy or redistribute the Software (including running it to coordinate or
+orchestrate work, whether or not you redistribute its source), you must include,
+in the source repository or distribution of any project that uses the Software, a
+short notice stating that the project uses Ferryman and linking to the Software's
+repository and this license. A file named NOTICE, ATTRIBUTION, or FERRYMAN.md
+placed in the project root or in a ".ferryman/" directory, containing text
+substantially as follows, satisfies this requirement:
+
+    This project uses Ferryman (https://github.com/estejosh/ferryman),
+    licensed under the Ferryman Source-Available License.
+
+This requirement does not apply to individual end users who merely interact with
+the outputs of a project that uses the Software; it applies to the party that
+deploys or redistributes the Software. It is separate from, and in addition to,
+the notice-retention requirement in Section 4. The standard Ferryman setup tooling
+writes such a notice automatically.
+
+6. NO AUTOMATIC CONVERSION
 This license has no Change Date and does not convert to any other license over
 time. The Licensor may, at its sole discretion, choose to release any version of
 the Software under different terms, but no such release is automatic or
 guaranteed by this license.
 
-6. TRADEMARKS
+7. TRADEMARKS
 This license does not grant you any right to use the Licensor's names, logos, or
 trademarks, including the name "Ferryman".
 
-7. TERMINATION
+8. TERMINATION
 Any use of the Software in violation of this license automatically terminates your
 rights under it. Rights may be reinstated in writing by the Licensor.
 
-8. DISCLAIMER OF WARRANTY
+9. DISCLAIMER OF WARRANTY
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
 FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
 
-9. LIMITATION OF LIABILITY
+10. LIMITATION OF LIABILITY
 IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
 OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE

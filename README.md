@@ -152,6 +152,10 @@ limited, and exact commands to verify all of it in the code yourself.
 
 Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE): free for any non-production use, and free for production use up to **3 Seats**. Production use beyond 3 Seats requires a per-Seat commercial license — see [COMMERCIAL.md](COMMERCIAL.md). This is a source-available license, not an OSI-approved open-source license.
 
+Projects that deploy or redistribute Ferryman must include a short attribution
+notice (License section 5) stating that the project uses Ferryman. The setup
+scripts write a `.ferryman/NOTICE.md` automatically to satisfy this.
+
 ## Acknowledgments
 
 Ferryman is provider-neutral and does not run models itself. The reference agent

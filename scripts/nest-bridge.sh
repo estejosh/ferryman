@@ -27,6 +27,8 @@ fi
 
 # 2) bridge folder + data + own git
 mkdir -p "$BRIDGE/.data"
+# attribution notice (Ferryman Source-Available License, section 5)
+printf '%s\n' 'This project uses Ferryman (https://github.com/estejosh/ferryman),' 'licensed under the Ferryman Source-Available License.' > "$BRIDGE/NOTICE.md"
 if [ ! -d "$BRIDGE/.git" ]; then
   git -C "$BRIDGE" init -q
   echo "git: initialized bridge sub-repo at $BRIDGE"
