@@ -159,6 +159,15 @@ its `bridge-project.toml` has `opt_in = true` (`ferryman-updater check` / `apply
 
 Agents should run **check-remote** and report; a human runs **update-bridge
 --confirm** to approve. Never wire auto-apply.
+
+**Auto-updateable, with permission.** `scripts/update-check.sh` runs on a daily
+`systemd` timer (`ferryman-update-check.timer`): it is read-only, and when the
+canonical repo is ahead it records `~/ferryman/UPDATE_AVAILABLE` with the pending
+commits — it never applies. Approving is one explicit command,
+`scripts/apply-update.sh --confirm`, which fast-forwards the source, rebuilds,
+swaps the binaries, and restarts the hub. Without `--confirm` it just shows what
+would change. So the machine notices updates on its own but only a human ever
+applies one.
 ## Migrating from a sibling bridge
 
 If a project was using a bridge in a sibling folder, you do not lose anything:
