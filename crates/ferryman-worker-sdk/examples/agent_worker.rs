@@ -152,26 +152,59 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Resolve a Windows program name to a concrete path using PATH + PATHEXT,
+/// exactly like the shell would (so `claude` -> `...\claude.cmd`).
+#[cfg(windows)]
+fn resolve_windows_program(agent_cmd: &str) -> std::path::PathBuf {
+    use std::path::{Path, PathBuf};
+    let p = Path::new(agent_cmd);
+    if p.is_file() {
+        return p.to_path_buf();
+    }
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let dirs: Vec<PathBuf> = if agent_cmd.contains('\\') || agent_cmd.contains('/') {
+        vec![p.parent().map(Path::to_path_buf).unwrap_or_default()]
+    } else {
+        std::env::var_os("PATH")
+            .map(|paths| std::env::split_paths(&paths).collect())
+            .unwrap_or_default()
+    };
+    let stem = p.file_name().and_then(|s| s.to_str()).unwrap_or(agent_cmd);
+    for dir in &dirs {
+        let exact = dir.join(stem);
+        if exact.is_file() {
+            return exact;
+        }
+        for ext in &exts {
+            let cand = dir.join(format!("{stem}{ext}"));
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from(agent_cmd)
+}
+
 /// Build the child-process command for the agent.
 ///
-/// On Windows, agent CLIs are frequently installed as `.cmd`/`.bat` shims
-/// (npm, claude, codex, ...). `CreateProcess` cannot launch a shim directly, so
-/// `Command::new("claude")` fails with "program not found" even when the shim is
-/// on PATH. Route anything that is not an explicit, existing `.exe` through
-/// `cmd /c` so PATHEXT resolution finds and runs the shim. Set `AGENT_CMD` to a
-/// full path ending in `.exe` to bypass this wrapper (recommended when job
-/// prompts may contain cmd metacharacters such as & | < > ^).
+/// On Windows, agent CLIs are frequently `.cmd`/`.bat` shims (npm, claude,
+/// codex, ...) that `CreateProcess` cannot launch by bare name. We resolve the
+/// name to its concrete path (e.g. `claude.cmd`) via PATH/PATHEXT and spawn THAT
+/// directly. We deliberately do NOT route through `cmd /c`: Rust's std
+/// (>=1.77.2, CVE-2024-24576) applies correct batch-file argument escaping when
+/// the program is a `.bat`/`.cmd`, which neutralizes `cmd` metacharacters
+/// (`& | < > ^ %`) in an untrusted job prompt. Routing through `cmd /c` would
+/// bypass that protection and let a no-space prompt like `hi&calc.exe` execute
+/// commands outside the agent. Set `AGENT_CMD` to an absolute `.exe` to skip
+/// resolution entirely.
 #[cfg(windows)]
 fn agent_command(agent_cmd: &str) -> Command {
-    let direct_exe = agent_cmd.to_ascii_lowercase().ends_with(".exe")
-        && std::path::Path::new(agent_cmd).is_file();
-    if direct_exe {
-        Command::new(agent_cmd)
-    } else {
-        let mut cmd = Command::new("cmd");
-        cmd.arg("/c").arg(agent_cmd);
-        cmd
-    }
+    Command::new(resolve_windows_program(agent_cmd))
 }
 
 #[cfg(not(windows))]

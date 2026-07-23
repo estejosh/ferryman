@@ -64,7 +64,10 @@ if [ -s "$CFG/token" ]; then
   echo "reusing existing token for '$SLUG'"
 else
   TOKEN="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)"
-  ADMIN="${HUB_ADMIN_TOKEN:-adminplaceholder}"
+  # the hub requires its admin token for project creation; read it from the
+  # hub's 0600 env file unless one is provided explicitly.
+  ADMIN="${HUB_ADMIN_TOKEN:-$(grep -m1 '^FERRYMAN_ADMIN_TOKEN=' "$HOME/ferryman/hub/hub.env" 2>/dev/null | cut -d= -f2-)}"
+  ADMIN="${ADMIN:-adminplaceholder}"
   if "$FERRY" --endpoint "$HUB" --token "$ADMIN" projects create --id "$SLUG" --name "$SLUG" --token "$TOKEN" >/dev/null 2>&1; then
     printf '%s' "$TOKEN" > "$CFG/token"; chmod 600 "$CFG/token"
     echo "registered project '$SLUG' in the hub"

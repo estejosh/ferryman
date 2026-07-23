@@ -44,7 +44,7 @@ Description=Ferryman bridge ($SLUG) - Linux-side data on WSL
 After=network.target
 [Service]
 User=$USER
-ExecStart=$BIN --database $DATA/bridge.db --artifacts $DATA/artifacts --workspace-root $DATA/projects --memory-root $DATA/bridge-memory --recovery-root $DATA/recovery --listen 127.0.0.1:$PORT
+ExecStart=$BIN --database $DATA/bridge.db --artifacts $DATA/artifacts --workspace-root $DATA/projects --memory-root $DATA/bridge-memory --recovery-root $DATA/recovery --listen 127.0.0.1:$PORT --no-demo-project
 Restart=always
 RestartSec=3
 [Install]

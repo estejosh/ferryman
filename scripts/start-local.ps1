@@ -1,6 +1,8 @@
 param(
   [string]$DataRoot = "$PSScriptRoot\..\.data",
-  [string]$RecoveryGitRepository = 'https://github.com/estejosh/ferryman-recovery.git'
+  # Recovery git target is OPT-IN. Supply your OWN private repo to enable
+  # encrypted-pack delivery; left empty, no external target is configured.
+  [string]$RecoveryGitRepository = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,4 +17,6 @@ try {
 }
 
 Write-Host 'Starting a local-only Bridge. Nothing is exposed to the internet.'
-cargo run -p ferryman-server -- --database "$DataRoot\bridge.db" --artifacts "$DataRoot\artifacts" --workspace-root "$DataRoot\projects" --memory-root "$DataRoot\memory" --recovery-root "$DataRoot\recovery" --recovery-git-repository "$RecoveryGitRepository"
+$serverArgs = @('-p','ferryman-server','--','--database',"$DataRoot\bridge.db",'--artifacts',"$DataRoot\artifacts",'--workspace-root',"$DataRoot\projects",'--memory-root',"$DataRoot\memory",'--recovery-root',"$DataRoot\recovery")
+if ($RecoveryGitRepository) { $serverArgs += @('--recovery-git-repository', $RecoveryGitRepository) }
+cargo run @serverArgs

@@ -115,8 +115,49 @@ async fn main() -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(address=%args.listen,"orchestrator bridge listening");
-    axum::serve(listener, app(state)).await?;
+    // On a loopback bind, reject requests whose Host header is not a loopback
+    // name/IP. A raw loopback bind is not a defense against DNS rebinding: a
+    // browser can resolve attacker.example to 127.0.0.1 and reach the API as
+    // "same-origin". Requiring a loopback Host blocks that. On a non-loopback
+    // bind (production behind a TLS reverse proxy that sets the public Host) the
+    // guard is skipped.
+    let router = app(state);
+    let router = if args.listen.ip().is_loopback() {
+        router.layer(axum::middleware::from_fn(loopback_host_guard))
+    } else {
+        router
+    };
+    axum::serve(listener, router).await?;
     Ok(())
+}
+
+async fn loopback_host_guard(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host_ok = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| {
+            let host = match raw.rsplit_once(':') {
+                Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) => h,
+                _ => raw,
+            };
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host == "localhost" || host == "127.0.0.1" || host == "::1" || host.starts_with("127.")
+        })
+        .unwrap_or(true); // no Host header at all -> allow (non-browser clients)
+    if host_ok {
+        next.run(request).await
+    } else {
+        use axum::response::IntoResponse;
+        (
+            axum::http::StatusCode::FORBIDDEN,
+            "host not allowed on loopback bridge",
+        )
+            .into_response()
+    }
 }
 
 /// Development accepts an explicitly named environment value. Production reads

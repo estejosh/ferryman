@@ -306,6 +306,19 @@ fn checked(state: &AppState, headers: &HeaderMap, project: &str) -> ApiResult<()
         Err(ApiError::unauthenticated())
     }
 }
+/// Constant-time comparison for raw secrets (admin / memory-write tokens) so
+/// authentication does not leak the secret one byte at a time via timing.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 fn checked_admin(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let Some(expected) = &state.admin_token else {
         return Ok(());
@@ -314,7 +327,7 @@ fn checked_admin(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
         .get("authorization")
         .and_then(|header| header.to_str().ok())
         .and_then(|header| header.strip_prefix("Bearer "));
-    if supplied == Some(expected.as_str()) {
+    if supplied.is_some_and(|s| ct_eq(s, expected.as_str())) {
         Ok(())
     } else {
         Err(ApiError::unauthenticated())
@@ -328,7 +341,7 @@ fn checked_memory_write(state: &AppState, headers: &HeaderMap, project: &str) ->
     let supplied = headers
         .get("x-ferryman-memory-token")
         .and_then(|header| header.to_str().ok());
-    if supplied == Some(expected.as_str()) {
+    if supplied.is_some_and(|s| ct_eq(s, expected.as_str())) {
         Ok(())
     } else {
         Err(ApiError::unauthenticated())
@@ -1122,6 +1135,15 @@ async fn worker_event(
     Json(body): Json<WorkerEvent>,
 ) -> ApiResult<StatusCode> {
     checked_worker(&state, &headers, &project, &body.worker_id)?;
+    // A worker may only post events onto a job it currently holds the lease on,
+    // so it cannot forge log/transcript entries on other jobs in the project.
+    if !state
+        .store
+        .worker_holds_active_lease(&project, &job, &body.worker_id)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found());
+    }
     state
         .store
         .append_worker_event(&project, &job, &body.kind, body.payload)

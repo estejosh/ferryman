@@ -724,6 +724,24 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             Ok(None)
         }
     }
+    /// True only if `worker_id` currently holds the active lease on this job.
+    /// Used to stop a worker from posting events onto jobs it does not lease.
+    pub fn worker_holds_active_lease(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        worker_id: &str,
+    ) -> Result<bool> {
+        let db = self.db()?;
+        db.query_row(
+            "SELECT 1 FROM jobs WHERE project_id=?1 AND id=?2 AND worker_id=?3 AND status='leased'",
+            params![project_id, job_id, worker_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map(|found| found.unwrap_or(false))
+        .map_err(Into::into)
+    }
     pub fn append_worker_event(
         &self,
         project_id: &str,
