@@ -111,6 +111,34 @@ Windows-native processes via WSL2 localhost forwarding. Manage it with
 Rule of thumb: **the SQLite database lives on the same OS that runs the server.**
 A Windows-native server keeps data on the Windows drive; a WSL server keeps data
 on the Linux filesystem.
+## Many repos, one instance (shared hub + attach)
+
+When a machine hosts a lot of repos, do not run a bridge per project — run **one**
+shared hub and attach each repo to it. Each repo still keeps a full, own-git
+`.ferryman/` directory (gitignored by the parent); it just holds the repo''s
+config + scoped token instead of a server. The `ferryman-server` software runs
+once; the directories are per-repo.
+
+```sh
+# once per machine: bring up the single hub (durable systemd, Linux-side data)
+export FERRYMAN_BIN=$HOME/ferryman/ferryman-server
+export FERRYMAN_SUDO_PW=...            # omit if passwordless sudo
+scripts/hub-up.sh 8796
+
+# per repo: attach it as a scoped project in the one hub
+scripts/attach-bridge.sh /mnt/x/myproject myproject
+```
+
+`attach-bridge.sh` ensures the one hub is up (idempotent — it never starts a
+second instance), creates the repo''s own-git `.ferryman/`, registers the repo as
+a project, and stores a scoped token in `.ferryman/token` (gitignored, local-only,
+never committed). Agents read `.ferryman/bridge.toml`, connect to the hub with
+that token, and are isolated to their project by the API.
+
+Trade-off: one instance means one process + one database for all projects
+(isolation is by token + workspace, not by separate processes). If a specific
+repo needs hard process/DB isolation, give it a dedicated bridge on its own port
+(`wsl-bridge.sh` / `nest-bridge.ps1`) instead — a hybrid is fine.
 ## Updates — approve/deny gate
 
 A nested bridge does not track `main` on its own, and nothing updates
