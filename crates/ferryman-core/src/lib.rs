@@ -282,6 +282,53 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         .optional()
         .map_err(Into::into)
     }
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT id,name,workspace_path,created_at FROM projects ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], project_from_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+    /// Delete a project and every row that belongs to it, in one transaction.
+    /// Foreign keys are ON but not ON DELETE CASCADE, so children are removed
+    /// first (child tables before the tables they reference). Returns false if
+    /// the project did not exist.
+    pub fn delete_project(&self, project_id: &str) -> Result<bool> {
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM projects WHERE id=?1",
+                params![project_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Ok(false);
+        }
+        for sql in [
+            "DELETE FROM artifacts WHERE project_id=?1",
+            "DELETE FROM artifact_bypasses WHERE project_id=?1",
+            "DELETE FROM memory_candidates WHERE project_id=?1",
+            "DELETE FROM consent_requests WHERE project_id=?1",
+            "DELETE FROM project_memory WHERE project_id=?1",
+            "DELETE FROM agents WHERE project_id=?1",
+            "DELETE FROM workers WHERE project_id=?1",
+            "DELETE FROM events WHERE project_id=?1",
+            "DELETE FROM jobs WHERE project_id=?1",
+            "DELETE FROM projects WHERE id=?1",
+        ] {
+            tx.execute(sql, params![project_id])?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
     pub fn submit_job(&self, project_id: &str, new: NewJob) -> Result<Job> {
         if let Some(key) = &new.idempotency_key
             && let Some(job) = self.find_by_idempotency(project_id, key)?

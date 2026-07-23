@@ -66,6 +66,13 @@ enum Projects {
         #[arg(long)]
         token: String,
     },
+    /// List projects (admin token when the server runs with --production).
+    List,
+    /// Delete a project and all of its jobs/events/artifacts (admin token in --production).
+    Delete {
+        #[arg(long)]
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -264,6 +271,10 @@ async fn main() -> Result<()> {
                     Some(json!({"id":id,"name":name,"token":token})),
                 )
                 .await?
+            }
+            Projects::List => call(&cli, "GET", "/v1/projects".to_string(), None).await?,
+            Projects::Delete { id } => {
+                call(&cli, "DELETE", format!("/v1/projects/{id}"), None).await?
             }
         },
         Command::Workers { command } => match command {

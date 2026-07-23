@@ -16,7 +16,7 @@ use axum::{
         IntoResponse, Response,
         sse::{Event as SseEvent, KeepAlive, Sse},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use ferryman_core::{
     Agent, AgentPersistence, Artifact, JobStatus, NewJob, PolicyEnvelope, Project,
@@ -117,7 +117,8 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(health))
         .route("/v1/metrics", get(metrics))
-        .route("/v1/projects", post(create_project))
+        .route("/v1/projects", post(create_project).get(list_projects))
+        .route("/v1/projects/{project_id}", delete(delete_project))
         .route(
             "/v1/projects/{project_id}/agents",
             post(create_agent).get(list_agents),
@@ -394,6 +395,30 @@ async fn create_project(
         )
         .map_err(ApiError::internal)?;
     Ok((StatusCode::CREATED, Json(project)))
+}
+async fn list_projects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    checked_admin(&state, &headers)?;
+    let projects = state.store.list_projects().map_err(ApiError::internal)?;
+    Ok(Json(json!({ "items": projects })))
+}
+async fn delete_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    checked_admin(&state, &headers)?;
+    let removed = state
+        .store
+        .delete_project(&project_id)
+        .map_err(ApiError::internal)?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found())
+    }
 }
 #[derive(Deserialize)]
 struct CreateAgent {

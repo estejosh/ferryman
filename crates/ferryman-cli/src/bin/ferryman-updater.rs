@@ -154,11 +154,15 @@ fn check_remote(checkout: &Path, branch: &str) -> Result<()> {
     let pending = run(checkout, &["log", "--oneline", "HEAD..FETCH_HEAD"])?;
     let pending = pending.trim();
     if pending.is_empty() {
-        println!("up to date: Bridge is at {current}; origin/{branch} has nothing newer. No action.");
+        println!(
+            "up to date: Bridge is at {current}; origin/{branch} has nothing newer. No action."
+        );
         return Ok(());
     }
     let count = pending.lines().count();
-    println!("UPDATE AVAILABLE: {current} -> {target} on origin/{branch} ({count} commit(s) pending)");
+    println!(
+        "UPDATE AVAILABLE: {current} -> {target} on origin/{branch} ({count} commit(s) pending)"
+    );
     println!("--- pending changes (review before approving) ---");
     println!("{pending}");
     println!("-------------------------------------------------");
