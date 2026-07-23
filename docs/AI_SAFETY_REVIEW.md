@@ -125,14 +125,21 @@ rebuild and restart from it (mitigated: ff-only, clean-tree, human-confirmed).
 
 - **Loopback by default.** The server is not on your network; production refuses a
   non-loopback bind without TLS termination and an admin token.
-- **Approval gate.** A job marked `requires_approval` is never leased until a human
-  approves it, so a worker never even sees it first.
+- **Approval gate.** A job marked `requires_approval` is never *leased by a worker*
+  until it is approved. Caveat (independent review #5): approval and submission
+  currently use the same project token, so the gate stops the worker but not the
+  token holder — an automation holding the project token can self-approve. For a
+  real human-in-the-loop, keep the project token as an automation identity
+  distinct from the human, or gate approvals behind the admin token.
 - **Scoped tokens.** A project token reaches only its own project; a worker token
   is short-lived and limited to worker routes — it cannot approve jobs, write
   memory, or read recovery keys.
-- **Policy envelope + least privilege guidance.** Jobs carry a policy
-  (filesystem/network/shell default to deny) and the docs stress running each
-  worker under a dedicated least-privilege account in its own disposable workdir.
+- **Least-privilege worker guidance.** The docs stress running each worker under a
+  dedicated least-privilege account in its own disposable workdir. NOTE (independent
+  review #6): the per-job **policy envelope** (filesystem/network/shell = deny) is
+  **advisory metadata only** — it is stored and can be simulated but is NOT enforced
+  against the agent at runtime. Do not treat it as a control; the least-privilege
+  account and the agent's own sandbox are the real boundary.
 - **The server spawns only `git`, with arguments passed directly (no shell).** It
   does not launch arbitrary programs.
 - **Update gate.** The auto-check is read-only; applying is ff-only on a clean
@@ -154,6 +161,36 @@ rebuild and restart from it (mitigated: ff-only, clean-tree, human-confirmed).
 - Confirm the update origin is the real repository before you `--confirm` an update.
 - Validate any externally-supplied project `id` before creating projects; ids
   become directory names under the workspace root.
+
+## Independent review & remediation (2026-07-23)
+
+An independent AI security reviewer audited a fresh clone with no project context.
+Its verdict: **the code you download and read is not malware** (no telemetry, no
+`unsafe`, no SQL injection, no path traversal, loopback default, sound recovery
+crypto); **running the worker is exactly as safe as letting your chosen agent run
+code as you** — the inherent risk this doc names. It found 3 High, 3 Medium, 4 Low,
+2 Info. Full report: `docs/reviews/2026-07-23-independent-review.md`. Every finding
+and its remediation:
+
+| # | Sev | Finding | Status |
+|---|-----|---------|--------|
+| 1 | High | Windows `cmd /c` argument injection from a job prompt | **Fixed** — the worker resolves the shim via PATH/PATHEXT and spawns it directly; Rust std batch-file escaping neutralizes cmd metacharacters. |
+| 2 | High | Worker runs the agent unsandboxed as the OS user; prompt attacker-influenced | **Inherent / documented** — the design and the top risk here. Bound it with a least-privilege account + disposable workdir + the agent's own sandbox; the bridge cannot remove it. |
+| 3 | High | Shipped hub ran dev-mode: open admin routes + public `demo-local-token` | **Fixed** — `hub-up.sh` generates an admin token (0600 EnvironmentFile) and ships `--no-demo-project`; the live hub was redeployed and the demo project removed. |
+| 4 | Med | No DNS-rebinding / Host protection on the loopback service | **Fixed** — a loopback bind rejects non-loopback `Host` headers (403); verified. |
+| 5 | Med | Approval gate shares the submission credential | **Mitigated / documented** — see the approval-gate caveat above; credential-separated approve route is tracked. |
+| 6 | Med | Policy envelope advisory-only but listed as a mitigation | **Fixed (doc)** — no longer credited as a runtime control (see above); enforcement is tracked. |
+| 7 | Low | Non-constant-time admin/memory-token compare | **Fixed** — constant-time comparison. |
+| 8 | Low | A worker could post events onto jobs it doesn't lease | **Fixed** — event posting now requires the active lease. |
+| 9 | Low | `start-local.ps1` defaulted to a third-party recovery remote | **Fixed** — recovery git target is opt-in; no default remote. |
+| 10 | Low | Agent stdout/transcripts not secret-scrubbed | **Documented** — redaction is key-name based; agent stdout and the transcript artifact are stored/streamed verbatim to project-token holders. Don't print secrets from agents; treat transcripts as sensitive. Pattern-scrubbing tracked. |
+| 11 | Info | Update-apply TOCTOU; ff-only still builds origin code on `--confirm` | **Documented** — mitigated by human confirm + ff-only + clean-tree; confirm the origin and reviewed commit before approving. Commit-hash pinning tracked. |
+| 12 | Info | `FERRYMAN_SUDO_PW` visible in the script environment | **Documented** — convenience only; prefer interactive sudo. Piped via `printf`, never on a command line. |
+
+Code fixes for #1/#3/#4/#7/#8/#9 shipped together and were verified (builds incl.
+the Windows worker path, server tests green, functional checks: admin gate 401,
+Host guard 403/200, no demo project). "Tracked" items are honest future work, not
+silent gaps.
 
 ## A short audit checklist
 
