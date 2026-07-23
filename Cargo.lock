@@ -485,6 +485,87 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 
 [[package]]
+name = "ferryman-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "futures-util",
+ "hex",
+ "keyring",
+ "pbkdf2",
+ "rand 0.9.5",
+ "reqwest",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "ferryman-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "hex",
+ "rand 0.9.5",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "ferryman-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "ferryman-core",
+ "futures-util",
+ "hex",
+ "hmac",
+ "http-body-util",
+ "keyring",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "zstd",
+]
+
+[[package]]
+name = "ferryman-worker-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ferryman-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,87 +1161,6 @@ name = "opaque-debug"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
-
-[[package]]
-name = "orchestrator-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chacha20poly1305",
- "chrono",
- "clap",
- "futures-util",
- "hex",
- "keyring",
- "pbkdf2",
- "rand 0.9.5",
- "reqwest",
- "rpassword",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "orchestrator-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "hex",
- "rand 0.9.5",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "thiserror",
- "uuid",
-]
-
-[[package]]
-name = "orchestrator-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "chacha20poly1305",
- "chrono",
- "clap",
- "futures-util",
- "hex",
- "hmac",
- "http-body-util",
- "keyring",
- "orchestrator-core",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "zstd",
-]
-
-[[package]]
-name = "orchestrator-worker-sdk"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "orchestrator-core",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
-]
 
 [[package]]
 name = "parking_lot"

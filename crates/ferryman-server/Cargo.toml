@@ -1,5 +1,5 @@
 [package]
-name = "orchestrator-server"
+name = "ferryman-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ axum.workspace = true
 chrono.workspace = true
 chacha20poly1305.workspace = true
 clap.workspace = true
-orchestrator-core = { path = "../orchestrator-core" }
+ferryman-core = { path = "../ferryman-core" }
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true

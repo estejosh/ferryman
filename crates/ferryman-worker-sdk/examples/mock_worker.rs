@@ -1,4 +1,4 @@
-use orchestrator_worker_sdk::WorkerClient;
+use ferryman_worker_sdk::WorkerClient;
 use serde_json::json;
 use std::time::Duration;
 

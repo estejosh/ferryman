@@ -530,7 +530,12 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
     /// job's `lease_expires_at` by `lease_ttl_seconds` — this is the renewal path a
     /// long-running job needs so the stale-lease reaper in `lease()` doesn't requeue it out
     /// from under a worker that is still alive and heartbeating.
-    pub fn heartbeat(&self, project_id: &str, worker_id: &str, lease_ttl_seconds: i64) -> Result<bool> {
+    pub fn heartbeat(
+        &self,
+        project_id: &str,
+        worker_id: &str,
+        lease_ttl_seconds: i64,
+    ) -> Result<bool> {
         let now = now();
         let mut db = self.db()?;
         let tx = db.transaction()?;

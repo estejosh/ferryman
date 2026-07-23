@@ -15,7 +15,7 @@ For example, the `Saturday 80s` project's `Visual QA` role becomes `saturday-80s
 Every agent has a Markdown profile in the project's private local repository:
 
 ```text
-<workspace>/<project-slug>/.orchestrator/agents/<project-slug>-<role-slug>.md
+<workspace>/<project-slug>/.ferryman/agents/<project-slug>-<role-slug>.md
 ```
 
 It describes the project, role, lifecycle, purpose, and the instructions a later orchestrator needs to use it. The database stores the profile path for discovery, but the Markdown file is the portable handoff when a project moves to another device.

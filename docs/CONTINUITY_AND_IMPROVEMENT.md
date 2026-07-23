@@ -4,7 +4,7 @@
 
 `POST /v1/projects/{project_id}/continuity-packs` writes a local content-addressed pack directory containing `manifest.json` and a compressed, XChaCha20-Poly1305 encrypted `bundle.obpack`. The payload contains the project manifest, agent profiles, approved and pending memory, consent history, policy snapshots, a decision timeline, safe job metadata, and all retained artifact blobs. Raw job inputs/results remain excluded unless a future retention policy explicitly includes them.
 
-Every pack has a fresh data-encryption key wrapped by the configured recovery key, a bundle hash, per-artifact hashes/byte counts, provenance, and an authenticated manifest HMAC. Key material is never stored in the pack, workspace, SQLite database, or logs. Local development uses `ORCHESTRATOR_RECOVERY_KEY_HEX`; production uses an operating-system keychain reference.
+Every pack has a fresh data-encryption key wrapped by the configured recovery key, a bundle hash, per-artifact hashes/byte counts, provenance, and an authenticated manifest HMAC. Key material is never stored in the pack, workspace, SQLite database, or logs. Local development uses `FERRYMAN_RECOVERY_KEY_HEX`; production uses an operating-system keychain reference.
 
 `POST /v1/projects/{project_id}/continuity-packs/{pack_hash}/recover` authenticates the manifest and ciphertext, validates all hashes, and creates a read-only recovery workspace plus a resume briefing. It never leases, resumes, or dispatches work. `POST /v1/projects/{project_id}/recovery-drill` performs that full loop and records a pass/fail event.
 

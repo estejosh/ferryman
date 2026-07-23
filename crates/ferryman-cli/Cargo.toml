@@ -1,9 +1,13 @@
 [package]
-name = "orchestrator-cli"
+name = "ferryman-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-default-run = "orchestrator-cli"
+default-run = "ferry"
+
+[[bin]]
+name = "ferry"
+path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true

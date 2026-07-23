@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 #[derive(Parser)]
 struct Cli {
-    #[arg(long, default_value = "OrchestratorBridge")]
+    #[arg(long, default_value = "Ferryman")]
     service: String,
     #[arg(long, default_value = "recovery")]
     account: String,
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
             let key = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
             entry.set_password(&key)?;
             println!(
-                "Recovery key created securely. Set ORCHESTRATOR_RECOVERY_KEY_REFERENCE=keychain:{}:{}",
+                "Recovery key created securely. Set FERRYMAN_RECOVERY_KEY_REFERENCE=keychain:{}:{}",
                 cli.service, cli.account
             );
         }
@@ -109,7 +109,7 @@ fn main() -> Result<()> {
         Command::PairingExport { output } => {
             let recovery_key = entry
                 .get_password()
-                .context("no local recovery key exists; run `orchestrator-key bootstrap` first")?;
+                .context("no local recovery key exists; run `ferryman-key bootstrap` first")?;
             if !valid_key(&recovery_key) {
                 bail!("keychain entry is not a 32-byte hexadecimal recovery key")
             }
@@ -123,7 +123,7 @@ fn main() -> Result<()> {
                 .encrypt(XNonce::from_slice(&nonce), recovery_key.as_bytes())
                 .map_err(|_| anyhow::anyhow!("could not encrypt recovery-key pairing file"))?;
             let pairing = PairingFile {
-                format: "orchestrator-bridge-key-pairing/v1".into(),
+                format: "ferryman-key-pairing/v1".into(),
                 salt_hex: hex::encode(salt),
                 nonce_hex: hex::encode(nonce),
                 ciphertext_hex: hex::encode(ciphertext),
@@ -156,7 +156,7 @@ fn main() -> Result<()> {
                 std::fs::File::open(&input)
                     .with_context(|| format!("could not open {}", input.display()))?,
             )?;
-            if pairing.format != "orchestrator-bridge-key-pairing/v1" {
+            if pairing.format != "ferryman-key-pairing/v1" {
                 bail!("unsupported pairing file format")
             }
             let salt = hex::decode(pairing.salt_hex)?;

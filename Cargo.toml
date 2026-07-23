@@ -1,9 +1,9 @@
 [workspace]
 members = [
-  "crates/orchestrator-core",
-  "crates/orchestrator-server",
-  "crates/orchestrator-cli",
-  "crates/orchestrator-worker-sdk",
+  "crates/ferryman-core",
+  "crates/ferryman-server",
+  "crates/ferryman-cli",
+  "crates/ferryman-worker-sdk",
 ]
 resolver = "2"
 
@@ -11,7 +11,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-repository = "https://github.com/estejosh/orchestrator-bridge"
+repository = "https://github.com/estejosh/ferryman"
 
 [workspace.dependencies]
 anyhow = "1.0"

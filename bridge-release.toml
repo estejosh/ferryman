@@ -1,6 +1,6 @@
 # Versioned compatibility declaration consumed by opt-in Bridge installations.
-format = "orchestrator-bridge-release/v1"
+format = "ferryman-release/v1"
 version = "0.1.0"
 channel = "preview"
-minimum_project_manifest = "orchestrator-bridge-project/v1"
+minimum_project_manifest = "ferryman-project/v1"
 release_notes = "Local-first encrypted continuity packs and explicit update controls."

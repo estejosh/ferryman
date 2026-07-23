@@ -9,9 +9,9 @@ use std::path::PathBuf;
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8787")]
     endpoint: String,
-    #[arg(long, env = "ORCHESTRATOR_TOKEN")]
+    #[arg(long, env = "FERRYMAN_TOKEN")]
     token: String,
-    #[arg(long, env = "ORCHESTRATOR_MEMORY_TOKEN")]
+    #[arg(long, env = "FERRYMAN_MEMORY_TOKEN")]
     memory_token: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -223,7 +223,7 @@ async fn main() -> Result<()> {
         Command::Init { path } => {
             std::fs::write(
                 &path,
-                "# Keep tokens in ORCHESTRATOR_TOKEN, not this file\nendpoint = \"http://127.0.0.1:8787\"\nproject = \"demo\"\n",
+                "# Keep tokens in FERRYMAN_TOKEN, not this file\nendpoint = \"http://127.0.0.1:8787\"\nproject = \"demo\"\n",
             )?;
             println!("wrote {}", path.display());
         }
@@ -535,7 +535,7 @@ async fn call_memory(cli: &Cli, method: &str, path: String, body: Option<Value>)
         .request(method.parse()?, format!("{}{}", cli.endpoint, path))
         .bearer_auth(&cli.token);
     if let Some(token) = &cli.memory_token {
-        request = request.header("x-orchestrator-memory-token", token);
+        request = request.header("x-ferryman-memory-token", token);
     };
     if let Some(body) = body {
         request = request.json(&body)
@@ -553,7 +553,7 @@ async fn call_approver(cli: &Cli, method: &str, path: String, approver: &str) ->
     let response = reqwest::Client::new()
         .request(method.parse()?, format!("{}{}", cli.endpoint, path))
         .bearer_auth(&cli.token)
-        .header("x-orchestrator-approver", approver)
+        .header("x-ferryman-approver", approver)
         .send()
         .await?;
     let status = response.status();

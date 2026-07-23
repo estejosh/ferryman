@@ -146,14 +146,10 @@ impl GitRecoveryTarget {
         {
             git(&directory, &["checkout", "-B", &self.branch]).await?;
         }
+        git(&directory, &["config", "user.name", "Ferryman Recovery"]).await?;
         git(
             &directory,
-            &["config", "user.name", "Orchestrator Bridge Recovery"],
-        )
-        .await?;
-        git(
-            &directory,
-            &["config", "user.email", "recovery@orchestrator-bridge.local"],
+            &["config", "user.email", "recovery@ferryman.local"],
         )
         .await?;
         Ok(directory)

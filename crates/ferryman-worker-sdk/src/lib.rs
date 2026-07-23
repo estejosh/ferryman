@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use anyhow::Result;
-use orchestrator_core::Lease;
+use ferryman_core::Lease;
 use serde_json::{Value, json};
 
 /// Minimal HTTP worker client. Keep the execution loop in the integrator's worker process.
@@ -90,5 +90,31 @@ impl WorkerClient {
             .await?
             .error_for_status()?;
         Ok(())
+    }
+
+    /// Upload an artifact body for a job and return the stored artifact metadata (the
+    /// bridge identifies artifacts by sha256 digest, not a name). Wraps
+    /// `POST /v1/projects/{project}/jobs/{job_id}/artifacts` (octet-stream), which the
+    /// worker protocol exposes but the SDK did not previously wrap. The `_name` is kept
+    /// for caller ergonomics/logging; the server does not consume it.
+    ///
+    /// Note the worker id goes in the `x-ferryman-worker-id` header here, unlike
+    /// `event`/`complete` which carry it in the JSON body — that asymmetry is the
+    /// server's contract, not a bug in this wrapper.
+    pub async fn artifact(&self, job_id: &str, _name: &str, bytes: Vec<u8>) -> Result<Value> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/projects/{}/jobs/{job_id}/artifacts",
+                self.endpoint, self.project
+            ))
+            .bearer_auth(&self.token)
+            .header("x-ferryman-worker-id", &self.worker_id)
+            .header("content-type", "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await?
+            .error_for_status()?;
+        Ok(response.json().await?)
     }
 }

@@ -13,11 +13,11 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
-use hmac::{Hmac, Mac};
-use orchestrator_core::{
+use ferryman_core::{
     Agent, Artifact, ConsentRequest, Event, Job, JobStatus, MemoryCandidate, Project,
     ProjectMemoryEntry,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::AppState;
 use crate::recovery_targets::{GitRecoveryTarget, Receipt, RecoveryTarget};
 
-const FORMAT: &str = "orchestrator-bridge-continuity-pack/v2";
+const FORMAT: &str = "ferryman-continuity-pack/v2";
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

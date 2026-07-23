@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
-use orchestrator_core::SqliteStore;
-use orchestrator_server::{
+use ferryman_core::SqliteStore;
+use ferryman_server::{
     AppState, app,
     workspace::{provision_private_repository, select_artifact_root},
 };
@@ -14,7 +14,7 @@ struct Args {
     #[arg(long, default_value = "./.data/artifacts")]
     artifacts: PathBuf,
     /// Use this existing mapped/network directory for artifacts when available.
-    #[arg(long, env = "ORCHESTRATOR_NETWORK_ARTIFACTS")]
+    #[arg(long, env = "FERRYMAN_NETWORK_ARTIFACTS")]
     network_artifacts: Option<PathBuf>,
     #[arg(long, default_value = "./.data/projects")]
     workspace_root: PathBuf,
@@ -25,11 +25,11 @@ struct Args {
     #[arg(long, default_value = "./.data/recovery")]
     recovery_root: PathBuf,
     /// Private repository used only for encrypted recovery packs.
-    #[arg(long, env = "ORCHESTRATOR_RECOVERY_GIT_REPOSITORY")]
+    #[arg(long, env = "FERRYMAN_RECOVERY_GIT_REPOSITORY")]
     recovery_git_repository: Option<String>,
     #[arg(
         long,
-        env = "ORCHESTRATOR_RECOVERY_GIT_BRANCH",
+        env = "FERRYMAN_RECOVERY_GIT_BRANCH",
         default_value = "bridge/recovery"
     )]
     recovery_git_branch: String,
@@ -39,7 +39,7 @@ struct Args {
     listen: SocketAddr,
     #[arg(long)]
     no_demo_project: bool,
-    /// Require ORCHESTRATOR_ADMIN_TOKEN for project creation and disable demo bootstrap.
+    /// Require FERRYMAN_ADMIN_TOKEN for project creation and disable demo bootstrap.
     #[arg(long)]
     production: bool,
     /// Required only when production mode binds directly to a non-loopback address.
@@ -58,10 +58,10 @@ async fn main() -> Result<()> {
             "production mode refuses a non-loopback listener without --tls-terminated; terminate TLS at a trusted reverse proxy"
         )
     }
-    let admin_token_env = std::env::var("ORCHESTRATOR_ADMIN_TOKEN").ok();
+    let admin_token_env = std::env::var("FERRYMAN_ADMIN_TOKEN").ok();
     if !args.listen.ip().is_loopback() && admin_token_env.is_none() {
         anyhow::bail!(
-            "refusing to bind {} (non-loopback) without ORCHESTRATOR_ADMIN_TOKEN set; without it, anyone reaching this port can create a project with a self-chosen token — set ORCHESTRATOR_ADMIN_TOKEN or use --production",
+            "refusing to bind {} (non-loopback) without FERRYMAN_ADMIN_TOKEN set; without it, anyone reaching this port can create a project with a self-chosen token — set FERRYMAN_ADMIN_TOKEN or use --production",
             args.listen
         )
     }
@@ -93,20 +93,18 @@ async fn main() -> Result<()> {
     if let Some(repository) = args.recovery_git_repository {
         state = state.with_git_recovery(repository, args.recovery_git_branch);
     }
-    match std::env::var("ORCHESTRATOR_MEMORY_WRITE_TOKEN") {
+    match std::env::var("FERRYMAN_MEMORY_WRITE_TOKEN") {
         Ok(memory_write_token) => state = state.with_memory_write_token(memory_write_token),
         Err(_) if args.production => {
-            anyhow::bail!("ORCHESTRATOR_MEMORY_WRITE_TOKEN is required with --production")
+            anyhow::bail!("FERRYMAN_MEMORY_WRITE_TOKEN is required with --production")
         }
         Err(_) => {}
     }
     if args.production {
-        let admin_token = admin_token_env.clone().ok_or_else(|| {
-            anyhow::anyhow!("ORCHESTRATOR_ADMIN_TOKEN is required with --production")
-        })?;
-        if std::env::var("ORCHESTRATOR_MEMORY_WRITE_TOKEN")
-            .ok()
-            .as_deref()
+        let admin_token = admin_token_env
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("FERRYMAN_ADMIN_TOKEN is required with --production"))?;
+        if std::env::var("FERRYMAN_MEMORY_WRITE_TOKEN").ok().as_deref()
             == Some(admin_token.as_str())
         {
             anyhow::bail!("production requires distinct admin and memory-write credentials")
@@ -125,9 +123,9 @@ async fn main() -> Result<()> {
 /// from the operating-system keychain by reference so the key material never
 /// belongs in Bridge configuration, packs, SQLite, or logs.
 fn load_recovery_key(production: bool) -> Result<(String, [u8; 32])> {
-    let configured_reference = std::env::var("ORCHESTRATOR_RECOVERY_KEY_REFERENCE").ok();
+    let configured_reference = std::env::var("FERRYMAN_RECOVERY_KEY_REFERENCE").ok();
     let raw = if production || configured_reference.is_some() {
-        let reference = configured_reference.ok_or_else(|| anyhow::anyhow!("ORCHESTRATOR_RECOVERY_KEY_REFERENCE (keychain:service:account) is required with --production"))?;
+        let reference = configured_reference.ok_or_else(|| anyhow::anyhow!("FERRYMAN_RECOVERY_KEY_REFERENCE (keychain:service:account) is required with --production"))?;
         let fields: Vec<_> = reference.splitn(3, ':').collect();
         if fields.len() != 3 || fields[0] != "keychain" {
             anyhow::bail!("recovery key reference must use keychain:service:account")
@@ -135,8 +133,8 @@ fn load_recovery_key(production: bool) -> Result<(String, [u8; 32])> {
         let entry = keyring::Entry::new(fields[1], fields[2])?;
         (reference, entry.get_password()?)
     } else {
-        let value=std::env::var("ORCHESTRATOR_RECOVERY_KEY_HEX").map_err(|_| anyhow::anyhow!("ORCHESTRATOR_RECOVERY_KEY_HEX is required to create or recover encrypted continuity packs in development"))?;
-        ("env:ORCHESTRATOR_RECOVERY_KEY_HEX".into(), value)
+        let value=std::env::var("FERRYMAN_RECOVERY_KEY_HEX").map_err(|_| anyhow::anyhow!("FERRYMAN_RECOVERY_KEY_HEX is required to create or recover encrypted continuity packs in development"))?;
+        ("env:FERRYMAN_RECOVERY_KEY_HEX".into(), value)
     };
     let bytes = hex::decode(raw.1)?;
     let key: [u8; 32] = bytes.try_into().map_err(|_| {
