@@ -101,12 +101,10 @@ async fn main() -> Result<()> {
         Err(_) => {}
     }
     if args.production {
-        let admin_token = admin_token_env.clone().ok_or_else(|| {
-            anyhow::anyhow!("FERRYMAN_ADMIN_TOKEN is required with --production")
-        })?;
-        if std::env::var("FERRYMAN_MEMORY_WRITE_TOKEN")
-            .ok()
-            .as_deref()
+        let admin_token = admin_token_env
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("FERRYMAN_ADMIN_TOKEN is required with --production"))?;
+        if std::env::var("FERRYMAN_MEMORY_WRITE_TOKEN").ok().as_deref()
             == Some(admin_token.as_str())
         {
             anyhow::bail!("production requires distinct admin and memory-write credentials")

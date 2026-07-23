@@ -13,11 +13,11 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
 };
-use hmac::{Hmac, Mac};
 use ferryman_core::{
     Agent, Artifact, ConsentRequest, Event, Job, JobStatus, MemoryCandidate, Project,
     ProjectMemoryEntry,
 };
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
