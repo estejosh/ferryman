@@ -1,0 +1,2 @@
+{"timestamp":"2026-07-18T16:12:01.519575Z","level":"INFO","fields":{"message":"telegram approval gate armed"},"target":"orchestrator_server"}
+{"timestamp":"2026-07-18T16:12:01.543221Z","level":"INFO","fields":{"message":"orchestrator bridge listening","address":"127.0.0.1:8787"},"target":"orchestrator_server"}

@@ -1,0 +1,8 @@
+{"timestamp":"2026-07-18T15:57:02.112624Z","level":"INFO","fields":{"message":"telegram approval gate armed"},"target":"orchestrator_server"}
+{"timestamp":"2026-07-18T15:57:02.136952Z","level":"INFO","fields":{"message":"orchestrator bridge listening","address":"127.0.0.1:8787"},"target":"orchestrator_server"}
+{"timestamp":"2026-07-18T15:57:15.955257Z","level":"WARN","fields":{"message":"telegram: getUpdates failed, backing off"},"target":"orchestrator_server::telegram"}
+{"timestamp":"2026-07-18T15:57:26.239883Z","level":"WARN","fields":{"message":"telegram: getUpdates failed, backing off"},"target":"orchestrator_server::telegram"}
+{"timestamp":"2026-07-18T15:57:36.620687Z","level":"WARN","fields":{"message":"telegram: getUpdates failed, backing off"},"target":"orchestrator_server::telegram"}
+{"timestamp":"2026-07-18T15:57:45.994054Z","level":"WARN","fields":{"message":"telegram: getUpdates failed, backing off"},"target":"orchestrator_server::telegram"}
+{"timestamp":"2026-07-18T15:57:59.355497Z","level":"WARN","fields":{"message":"telegram: getUpdates failed, backing off"},"target":"orchestrator_server::telegram"}
+{"timestamp":"2026-07-18T15:58:20.743558Z","level":"WARN","fields":{"message":"telegram: getUpdates failed, backing off"},"target":"orchestrator_server::telegram"}
