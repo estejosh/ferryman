@@ -90,11 +90,16 @@ the main project's history.
 See the Ferryman repo docs/NESTED_BRIDGE.md for the full model.
 "@ | Set-Content -Path (Join-Path $Bridge 'README.md') -Encoding ascii
 
-# attribution notice (Ferryman Source-Available License, section 5)
+# attribution notice at the project root (Ferryman Source-Available License, section 5)
+$ferrymanMd = Join-Path $Project 'FERRYMAN.md'
+if (-not (Test-Path $ferrymanMd)) {
 @"
+# Ferryman
+
 This project uses Ferryman (https://github.com/estejosh/ferryman),
 licensed under the Ferryman Source-Available License.
-"@ | Set-Content -Path (Join-Path $Bridge 'NOTICE.md') -Encoding ascii
+"@ | Set-Content -Path $ferrymanMd -Encoding ascii
+}
 
 Write-Host ""
 Write-Host "Nested bridge ready: $Bridge  (API http://127.0.0.1:$Port)"

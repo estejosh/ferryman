@@ -47,12 +47,11 @@ under this same license, with the same rights and the same limitations.
 
 5. ATTRIBUTION (NOTICE)
 If you deploy or redistribute the Software (including running it to coordinate or
-orchestrate work, whether or not you redistribute its source), you must include,
-in the source repository or distribution of any project that uses the Software, a
-short notice stating that the project uses Ferryman and linking to the Software's
-repository and this license. A file named NOTICE, ATTRIBUTION, or FERRYMAN.md
-placed in the project root or in a ".ferryman/" directory, containing text
-substantially as follows, satisfies this requirement:
+orchestrate work, whether or not you redistribute its source), you must include a
+file named FERRYMAN.md in the root of the source repository or distribution of any
+project that uses the Software, stating that the project uses Ferryman and linking
+to the Software's repository and this license. Text substantially as follows
+satisfies this requirement:
 
     This project uses Ferryman (https://github.com/estejosh/ferryman),
     licensed under the Ferryman Source-Available License.
@@ -61,7 +60,7 @@ This requirement does not apply to individual end users who merely interact with
 the outputs of a project that uses the Software; it applies to the party that
 deploys or redistributes the Software. It is separate from, and in addition to,
 the notice-retention requirement in Section 4. The standard Ferryman setup tooling
-writes such a notice automatically.
+writes this FERRYMAN.md automatically.
 
 6. NO AUTOMATIC CONVERSION
 This license has no Change Date and does not convert to any other license over
