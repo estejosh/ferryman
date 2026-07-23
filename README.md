@@ -16,6 +16,13 @@ flowchart LR
   P[Policy envelope] --> W
 ```
 
+## Prerequisites
+
+- A stable **Rust** toolchain (ustup recommended).
+- **Linux only:** the OS credential-store backend (the keyring crate) needs D-Bus development headers.
+  On Debian/Ubuntu: `sudo apt-get install -y libdbus-1-dev pkg-config`. On Fedora/RHEL: `sudo dnf install dbus-devel pkgconf`.
+  macOS and Windows use their native keychains and need no extra system packages.
+
 ## Quick start
 
 ```powershell
