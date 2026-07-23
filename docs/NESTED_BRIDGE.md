@@ -111,6 +111,26 @@ Windows-native processes via WSL2 localhost forwarding. Manage it with
 Rule of thumb: **the SQLite database lives on the same OS that runs the server.**
 A Windows-native server keeps data on the Windows drive; a WSL server keeps data
 on the Linux filesystem.
+## Updates — approve/deny gate
+
+A nested bridge does not track `main` on its own, and nothing updates
+automatically. The flow is an explicit gate (`ferryman-updater`):
+
+- **Check (read-only):** `ferryman-updater check-remote --checkout <bridge> --branch main`
+  fetches the canonical origin and lists the commits you would be pulling. It
+  changes nothing and exits 10 when an update is pending — so an agent can
+  surface "update available" to you without ever applying it.
+- **Approve:** `ferryman-updater update-bridge --checkout <bridge> --branch main --confirm`
+  fast-forwards the install (clean checkout + already-configured origin only).
+  Without `--confirm` it prints the pending diff and refuses, so it can never
+  apply blind.
+- **Deny:** do nothing. The bridge stays pinned where it is.
+
+Per-project opt-in is unchanged: a project only accepts a recorded release when
+its `bridge-project.toml` has `opt_in = true` (`ferryman-updater check` / `apply`).
+
+Agents should run **check-remote** and report; a human runs **update-bridge
+--confirm** to approve. Never wire auto-apply.
 ## Migrating from a sibling bridge
 
 If a project was using a bridge in a sibling folder, you do not lose anything:
