@@ -1,21 +1,74 @@
-MIT License
+Ferryman Source-Available License, Version 1.0
 
-Copyright (c) 2026 Ferryman contributors
+Licensor: Shin Devlin ("Licensor")
+Licensed Work: Ferryman (the "Software"), including all versions, components,
+and source code contained in this repository.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+SUMMARY (non-binding): Ferryman is free to use in production for up to three (3)
+Seats, and free for any non-production use. Using it in production beyond three
+Seats requires a paid, per-Seat commercial license from the Licensor. The full,
+binding terms are below.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+This license is derived from the Business Source License 1.1, modified to be a
+PERMANENT source-available license. Unlike the Business Source License, it has no
+Change Date and does NOT automatically convert to an open-source license. It is
+NOT an Open Source Initiative (OSI) approved "open source" license; it is a
+source-available license.
 
+DEFINITIONS
+
+"Seat" means each distinct human individual who operates, administers, deploys,
+or accesses the Software or its outputs on behalf of you or your organization.
+Automated agents, workers, or processes do not count as Seats in themselves; they
+are attributed to the Seat of the human individual on whose behalf they act.
+
+"Production use" means any use other than for personal experimentation,
+evaluation, development, or testing.
+
+1. GRANT OF RIGHTS
+Subject to the terms below, the Licensor grants you a non-exclusive, worldwide,
+royalty-free right to copy, modify, create derivative works of, and redistribute
+the Software, and to make non-production use of the Software without limit.
+
+2. FREE PRODUCTION USE (UP TO THREE SEATS)
+You may use the Software in production free of charge provided that your total
+number of Seats does not exceed three (3).
+
+3. COMMERCIAL LICENSE REQUIRED ABOVE THREE SEATS
+Any production use of the Software that exceeds three (3) Seats requires a paid
+commercial license from the Licensor, granted on a per-Seat basis. See
+COMMERCIAL.md for how to obtain one.
+
+4. REDISTRIBUTION
+You may redistribute the Software or derivative works provided that you (a) retain
+this license text, the copyright notice, and all notices; and (b) do not remove,
+weaken, or circumvent the Seat limitations. Any recipient receives the Software
+under this same license, with the same rights and the same limitations.
+
+5. NO AUTOMATIC CONVERSION
+This license has no Change Date and does not convert to any other license over
+time. The Licensor may, at its sole discretion, choose to release any version of
+the Software under different terms, but no such release is automatic or
+guaranteed by this license.
+
+6. TRADEMARKS
+This license does not grant you any right to use the Licensor's names, logos, or
+trademarks, including the name "Ferryman".
+
+7. TERMINATION
+Any use of the Software in violation of this license automatically terminates your
+rights under it. Rights may be reinstated in writing by the Licensor.
+
+8. DISCLAIMER OF WARRANTY
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+9. LIMITATION OF LIABILITY
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
+OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+Copyright (c) 2026 Shin Devlin. All rights reserved except as expressly granted
+above.

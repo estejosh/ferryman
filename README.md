@@ -98,6 +98,10 @@ cargo test --workspace
 
 Use `docker compose up --build` for a containerized local API. Review [deployment](docs/DEPLOYMENT.md), [backup/recovery](docs/BACKUP_AND_RECOVERY.md), and [upgrading](docs/UPGRADING.md) before running outside local preview. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
 
+## License
+
+Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE): free for any non-production use, and free for production use up to **3 Seats**. Production use beyond 3 Seats requires a per-Seat commercial license — see [COMMERCIAL.md](COMMERCIAL.md). This is a source-available license, not an OSI-approved open-source license.
+
 ## Acknowledgments
 
 Ferryman is provider-neutral and does not run models itself. The reference agent
