@@ -531,7 +531,13 @@ async fn jobs(cli: &Cli, command: Jobs) -> Result<()> {
             } else {
                 format!("?{}", query.join("&"))
             };
-            call(cli, "GET", format!("/v1/projects/{project}/jobs{suffix}"), None).await?
+            call(
+                cli,
+                "GET",
+                format!("/v1/projects/{project}/jobs{suffix}"),
+                None,
+            )
+            .await?
         }
         Jobs::Tail { project, job } => tail_events(cli, &project, &job).await?,
     };

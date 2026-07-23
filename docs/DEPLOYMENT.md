@@ -26,6 +26,25 @@ cargo run -p ferryman-server -- --production --no-demo-project
 ```
 
 This remains a single-node deployment. Do not use it with untrusted workers or high-sensitivity secrets.
+## Worker isolation
+
+The Bridge gates orchestration - leases, approvals, memory, recovery - but it does
+**not** sandbox the model itself. A leased worker runs its agent CLI (`claude`,
+`codex`, ...) with the full privileges of the OS user that started the worker, in that
+worker's working directory, regardless of any project policy. `codex` in particular
+runs shell commands and edits files on the host by default. Treat every worker host as
+capable of doing anything its OS account can do.
+
+- Run each worker under a dedicated, least-privilege OS account - never the Bridge's
+  service account and never an administrator.
+- Give each worker its **own disposable working directory** (one per worker/project).
+  Never point two workers at the same tree, and never launch a worker from a directory
+  that holds secrets or unrelated repositories.
+- Prefer the agent's own sandbox/approval flags (set through `AGENT_ARGS_JSON`) over
+  trusting the Bridge to contain the model. `AGENT_ARGS_JSON` is forwarded verbatim;
+  choose a permission mode that matches your trust level for the job prompts.
+
+
 # Production preflight
 
 Production mode is intentionally strict:

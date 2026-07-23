@@ -26,6 +26,23 @@
 //! write memory, or touch recovery keys (bridge-enforced). A `--requires-approval` job
 //! will not even be leased until an operator approves it — this worker never sees it
 //! until then.
+//!
+//! ISOLATION - READ BEFORE RUNNING REAL AGENTS. The agent CLI this worker spawns
+//! (claude, codex, ...) runs with the FULL privileges of the OS user that started the
+//! worker, in the worker's working directory, with NO sandbox from the bridge. codex
+//! in particular executes shell commands and file edits directly on the host by
+//! default. The bridge gates orchestration (leases, approvals, memory, recovery); it
+//! does NOT sandbox the model's own actions. Therefore:
+//!   - Run each worker under a dedicated, least-privilege OS account.
+//!   - Give each worker its OWN disposable working directory (one per worker/project);
+//!     never point two workers at the same tree, and never launch a worker from a
+//!     directory that holds secrets or unrelated repositories.
+//!   - Prefer the agent's own sandbox/approval flags (passed via AGENT_ARGS_JSON) over
+//!     trusting the bridge to contain the model.
+//!   - AGENT_ARGS_JSON is forwarded to the agent verbatim; pick a permission mode that
+//!     matches your trust level. For claude, `--permission-mode auto` (the default) is a
+//!     valid, current mode (verified against claude 2.x); tighten it when job prompts
+//!     are not fully trusted.
 
 use anyhow::{Context, Result, anyhow};
 use ferryman_worker_sdk::WorkerClient;
