@@ -1,0 +1,16 @@
+title = "Ferryman gitleaks configuration"
+
+# Keep all of gitleaks' default rules; only add documentation allowlist entries.
+[extend]
+useDefault = true
+
+# The security docs describe cryptography and auth, so gitleaks' generic-api-key
+# rule trips on public algorithm/terminology strings that are not secrets.
+# Allowlist those exact identifiers narrowly, so real secrets in docs are still
+# caught by every other rule.
+[allowlist]
+description = "Crypto/algorithm terminology in security docs (not secrets)"
+regexes = [
+  'XChaCha20-Poly1305',
+  'ephemeral/keychain',
+]
