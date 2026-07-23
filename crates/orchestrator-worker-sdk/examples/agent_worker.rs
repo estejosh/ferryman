@@ -110,10 +110,7 @@ async fn main() -> Result<()> {
             Ok(result) => {
                 // Non-retryable success completion. Idempotent: re-completing the same
                 // lease is a no-op on the bridge side.
-                if let Err(e) = client
-                    .complete(&job_id, &lease_id, result, false)
-                    .await
-                {
+                if let Err(e) = client.complete(&job_id, &lease_id, result, false).await {
                     eprintln!("[hone-agent-worker] complete(success) failed for {job_id}: {e}");
                 }
             }
@@ -216,7 +213,11 @@ async fn run_agent(
     // Upload the full transcript as an artifact regardless of exit status (a failed run's
     // transcript is exactly what you want to inspect).
     let artifact = client
-        .artifact(job_id, "agent-transcript.txt", transcript.clone().into_bytes())
+        .artifact(
+            job_id,
+            "agent-transcript.txt",
+            transcript.clone().into_bytes(),
+        )
         .await
         .map(|meta| meta.get("id").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or(None);
@@ -224,7 +225,11 @@ async fn run_agent(
     let code = status.code();
     if status.success() {
         client
-            .event(job_id, "worker.progress", json!({"percent":100,"message":"agent finished"}))
+            .event(
+                job_id,
+                "worker.progress",
+                json!({"percent":100,"message":"agent finished"}),
+            )
             .await
             .ok();
         Ok(json!({
@@ -235,9 +240,6 @@ async fn run_agent(
         }))
     } else {
         // Non-zero exit → let the completion path mark it retryable via the Err branch.
-        Err(anyhow!(
-            "agent exited with status {:?}",
-            code
-        ))
+        Err(anyhow!("agent exited with status {:?}", code))
     }
 }

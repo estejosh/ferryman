@@ -1060,7 +1060,11 @@ async fn heartbeat(
     checked_worker(&state, &headers, &project, &worker)?;
     if state
         .store
-        .heartbeat(&project, &worker, orchestrator_core::DEFAULT_LEASE_TTL_SECONDS)
+        .heartbeat(
+            &project,
+            &worker,
+            orchestrator_core::DEFAULT_LEASE_TTL_SECONDS,
+        )
         .map_err(ApiError::internal)?
     {
         Ok(StatusCode::NO_CONTENT)
@@ -1076,7 +1080,11 @@ async fn lease_job(
     checked_worker(&state, &headers, &project, &worker)?;
     match state
         .store
-        .lease(&project, &worker, orchestrator_core::DEFAULT_LEASE_TTL_SECONDS)
+        .lease(
+            &project,
+            &worker,
+            orchestrator_core::DEFAULT_LEASE_TTL_SECONDS,
+        )
         .map_err(ApiError::internal)?
     {
         Some(lease) => Ok((StatusCode::OK, Json(lease)).into_response()),
