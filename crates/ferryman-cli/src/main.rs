@@ -22,6 +22,10 @@ enum Command {
         #[arg(default_value = "orchestrator.toml")]
         path: PathBuf,
     },
+    Projects {
+        #[command(subcommand)]
+        command: Projects,
+    },
     Jobs {
         #[command(subcommand)]
         command: Jobs,
@@ -51,6 +55,19 @@ enum Command {
         command: Continuity,
     },
 }
+#[derive(Subcommand, Clone)]
+enum Projects {
+    /// Create a project. FERRYMAN_TOKEN must be the admin token when the server runs with --production.
+    Create {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        token: String,
+    },
+}
+
 #[derive(Subcommand, Clone)]
 enum Jobs {
     Submit {
@@ -84,6 +101,16 @@ enum Jobs {
         #[arg(long)]
         project: String,
         job: String,
+    },
+    List {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        #[arg(long)]
+        cursor: Option<String>,
     },
 }
 #[derive(Subcommand, Clone)]
@@ -228,6 +255,17 @@ async fn main() -> Result<()> {
             println!("wrote {}", path.display());
         }
         Command::Jobs { command } => jobs(&cli, command).await?,
+        Command::Projects { command } => match command {
+            Projects::Create { id, name, token } => {
+                call(
+                    &cli,
+                    "POST",
+                    "/v1/projects".to_string(),
+                    Some(json!({"id":id,"name":name,"token":token})),
+                )
+                .await?
+            }
+        },
         Command::Workers { command } => match command {
             Workers::Register {
                 project,
@@ -471,6 +509,29 @@ async fn jobs(cli: &Cli, command: Jobs) -> Result<()> {
                 None,
             )
             .await?
+        }
+        Jobs::List {
+            project,
+            status,
+            limit,
+            cursor,
+        } => {
+            let mut query = Vec::new();
+            if let Some(status) = status {
+                query.push(format!("status={status}"));
+            }
+            if let Some(limit) = limit {
+                query.push(format!("limit={limit}"));
+            }
+            if let Some(cursor) = cursor {
+                query.push(format!("cursor={cursor}"));
+            }
+            let suffix = if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", query.join("&"))
+            };
+            call(cli, "GET", format!("/v1/projects/{project}/jobs{suffix}"), None).await?
         }
         Jobs::Tail { project, job } => tail_events(cli, &project, &job).await?,
     };
