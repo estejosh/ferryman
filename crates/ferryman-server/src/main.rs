@@ -133,8 +133,25 @@ fn load_recovery_key(production: bool) -> Result<(String, [u8; 32])> {
         let entry = keyring::Entry::new(fields[1], fields[2])?;
         (reference, entry.get_password()?)
     } else {
-        let value=std::env::var("FERRYMAN_RECOVERY_KEY_HEX").map_err(|_| anyhow::anyhow!("FERRYMAN_RECOVERY_KEY_HEX is required to create or recover encrypted continuity packs in development"))?;
-        ("env:FERRYMAN_RECOVERY_KEY_HEX".into(), value)
+        match std::env::var("FERRYMAN_RECOVERY_KEY_HEX") {
+            Ok(value) => ("env:FERRYMAN_RECOVERY_KEY_HEX".into(), value),
+            Err(_) => {
+                // Development convenience: with no recovery key configured, mint an
+                // ephemeral random key so the server starts and the quickstart works
+                // out of the box. Continuity packs sealed with this key cannot be
+                // recovered after a restart. Set FERRYMAN_RECOVERY_KEY_HEX for a stable
+                // dev key, or run --production with a keychain reference.
+                let mut bytes = [0u8; 32];
+                bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                tracing::warn!(
+                    "FERRYMAN_RECOVERY_KEY_HEX not set; using an ephemeral dev recovery key. \
+                     Continuity packs created this run cannot be recovered after restart. \
+                     Set FERRYMAN_RECOVERY_KEY_HEX to a stable 64-hex value to persist recovery."
+                );
+                ("ephemeral:dev-random".into(), hex::encode(bytes))
+            }
+        }
     };
     let bytes = hex::decode(raw.1)?;
     let key: [u8; 32] = bytes.try_into().map_err(|_| {
