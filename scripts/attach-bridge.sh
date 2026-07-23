@@ -1,17 +1,30 @@
 #!/usr/bin/env bash
 # Attach a project to THE single shared Ferryman hub. The project keeps a full,
-# own-git .ferryman/ directory (gitignored by the parent) holding only its config
-# + scoped token; the server and database are the shared hub's. This is the
-# default for many repos on one machine — one running instance, N projects.
+# own-git .ferryman/ directory holding only its config + scoped token; the server
+# and database are the shared hub's. This is the default for many repos on one
+# machine — one running instance, N projects.
 #
-# Usage: scripts/attach-bridge.sh <project-mount-path> <slug> [hub-endpoint]
+# Usage: scripts/attach-bridge.sh [--exclude-mode] <project-mount-path> <slug> [hub-endpoint]
 #   e.g. scripts/attach-bridge.sh /mnt/x/hone hone
+#
+#   --exclude-mode  keep the parent repo's tracked .gitignore untouched; add the
+#                   ignore rule to .git/info/exclude (local-only) instead.
+#
 # Env: FERRYMAN_FERRY (default $HOME/ferryman/ferry), FERRYMAN_SUDO_PW,
 #      HUB_ADMIN_TOKEN (only if the hub runs with --production)
 set -eu
-PROJ="${1:?project mount path, e.g. /mnt/x/hone}"
-SLUG="${2:?project slug, e.g. hone}"
-HUB="${3:-http://127.0.0.1:8796}"
+
+EXCLUDE_MODE=0
+POS=()
+for a in "$@"; do
+  case "$a" in
+    --exclude-mode) EXCLUDE_MODE=1 ;;
+    *) POS+=("$a") ;;
+  esac
+done
+PROJ="${POS[0]:?project mount path, e.g. /mnt/x/hone}"
+SLUG="${POS[1]:?project slug, e.g. hone}"
+HUB="${POS[2]:-http://127.0.0.1:8796}"
 FERRY="${FERRYMAN_FERRY:-$HOME/ferryman/ferry}"
 CFG="$PROJ/.ferryman"
 
@@ -23,11 +36,21 @@ if ! curl -sf "$HUB/healthz" >/dev/null 2>&1; then
   curl -sf "$HUB/healthz" >/dev/null || { echo "hub still down at $HUB"; exit 1; }
 fi
 
-# 2) full own-git .ferryman/ directory, gitignored by the parent project
+# 2) full own-git .ferryman/ directory, ignored by the parent project
 mkdir -p "$CFG"
 if git -C "$PROJ" rev-parse --git-dir >/dev/null 2>&1; then
-  GI="$PROJ/.gitignore"; E="/.ferryman/"
-  grep -qxF "$E" "$GI" 2>/dev/null || printf '\n# Ferryman bridge attachment (own git repo; token is local-only)\n%s\n' "$E" >> "$GI"
+  E="/.ferryman/"
+  if [ "$EXCLUDE_MODE" -eq 1 ]; then
+    GITDIR="$(git -C "$PROJ" rev-parse --absolute-git-dir)"
+    EX="$GITDIR/info/exclude"
+    mkdir -p "$(dirname "$EX")"
+    grep -qxF "$E" "$EX" 2>/dev/null || printf '\n# Ferryman bridge attachment (local-only; not committed)\n%s\n' "$E" >> "$EX"
+    echo "NOTICE: added $E to $EX (local-only; your tracked .gitignore was NOT modified)"
+  else
+    GI="$PROJ/.gitignore"
+    grep -qxF "$E" "$GI" 2>/dev/null || printf '\n# Ferryman bridge attachment (own git repo; token is local-only)\n%s\n' "$E" >> "$GI"
+    echo "NOTICE: added $E to the tracked $GI (pass --exclude-mode to keep .gitignore untouched)"
+  fi
 fi
 [ -d "$CFG/.git" ] || git -C "$CFG" init -q
 cat > "$CFG/.gitignore" <<'EOF'

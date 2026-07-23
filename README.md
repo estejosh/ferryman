@@ -18,26 +18,70 @@ flowchart LR
 
 ## Prerequisites
 
-- A stable **Rust** toolchain (ustup recommended).
+- A stable **Rust** toolchain (
+ustup recommended).
 - **Linux only:** the OS credential-store backend (the keyring crate) needs D-Bus development headers.
   On Debian/Ubuntu: `sudo apt-get install -y libdbus-1-dev pkg-config`. On Fedora/RHEL: `sudo dnf install dbus-devel pkgconf`.
   macOS and Windows use their native keychains and need no extra system packages.
 
-## Quick start
+## Recommended setup: one hub, many projects
+
+On a machine that hosts several repos, run **one** shared Ferryman server (the
+"hub") and **attach** each repo to it as a scoped project — do not run a server
+per repo. The hub is durable (a systemd service); each repo keeps a small,
+own-git `.ferryman/` config directory pointing at the hub. See
+[nested bridge](docs/NESTED_BRIDGE.md) for the full model — WSL/Linux-side-data
+notes, the shared-hub + attach helpers, and the approve/deny update flow.
+
+```sh
+# once per machine: bring up the single hub (durable systemd, Linux-side data)
+export FERRYMAN_BIN=$HOME/ferryman/ferryman-server   # cargo build --release -p ferryman-server
+scripts/hub-up.sh 8796
+
+# per repo: attach it as a scoped project in the one hub
+scripts/attach-bridge.sh /path/to/myproject myproject
+# add --exclude-mode to use .git/info/exclude instead of editing the tracked .gitignore
+```
+
+## Try it locally (single server)
+
+For a quick look without the hub setup, run one server directly. Development
+needs no recovery key — the server mints an ephemeral one and warns (continuity
+packs from that run are not recoverable across restarts):
 
 ```powershell
 cargo run -p ferryman-server -- --database ./.data/bridge.db --artifacts ./.data/artifacts
-# In another terminal (the server starts with a seeded demo project):
+# In another terminal (the server seeds a demo project, token demo-local-token):
 cargo run -p ferryman-cli -- --token demo-local-token jobs submit --project demo --input '{"prompt":"make a report"}' --requires-approval
 cargo run -p ferryman-cli -- --token demo-local-token jobs approve --project demo <job-id>
-# Follow actual Server-Sent Event output:
 cargo run -p ferryman-cli -- --token demo-local-token jobs tail --project demo <job-id>
-# Start an intentionally harmless mock worker:
 cargo run -p ferryman-worker-sdk --example mock_worker
 ```
 
-The bridge listens on `127.0.0.1:8787` by default. Watch events with `GET /v1/projects/demo/jobs/<job-id>/events` and `Authorization: Bearer demo-local-token`.
-Copy `config/bridge.example.toml` into deployment configuration as a reference; the v0.1 CLI flags are the active server configuration surface.
+Create your own project — the caller supplies the project's bearer token:
+
+```powershell
+cargo run -p ferryman-cli -- --token <admin-or-any-in-dev> projects create --id myproj --name "My project" --token <choose-a-project-token>
+cargo run -p ferryman-cli -- --token <choose-a-project-token> jobs list --project myproj
+```
+
+Two token models, by design. A **project** token is chosen by the caller and
+passed to `projects create`; it authorizes that project thereafter. A **worker**
+token is different — `workers register` mints a short-lived, worker-scoped token
+and returns it once, limited to worker routes. In `--production`, `projects
+create` requires `FERRYMAN_ADMIN_TOKEN`; in dev any token is accepted.
+
+The server listens on `127.0.0.1:8787` by default (the hub on `8796`). Do not run
+it foreground for anything real — use a durable service; `docs/NESTED_BRIDGE.md`
+and `scripts/hub-up.sh` show the systemd pattern.
+
+## Terminology
+
+- **hub** — the one shared `ferryman-server` process that hosts many projects.
+- **project** — a repo/workspace attached to a hub, isolated by its scoped token.
+- **attach** — register a repo as a project in the hub (`attach-bridge.sh`).
+- "Bridge" appears in older text and API fields as the name for the server; read
+  it as the hub. It is not your own unrelated "bridge", if you have one.
 
 ## Public API and layout
 
