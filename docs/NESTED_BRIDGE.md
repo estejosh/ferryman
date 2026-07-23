@@ -83,6 +83,34 @@ project a **distinct port** (8795, 8796, …). Agents working in a project point
 that project's `http://127.0.0.1:<port>` and use its scoped project token — the
 same Ferryman HTTP API as always, just reachable from inside the sandbox.
 
+## Running the bridge in WSL / Ubuntu (Linux-side data)
+
+On Windows, running the bridge as a Linux process (WSL/Ubuntu) is often more
+robust: real daemonization via systemd, and agent CLIs launch as plain
+executables (no `.cmd`/`.ps1` shim handling). **One caveat matters:** SQLite on a
+Windows drive mounted into WSL (`/mnt/*`, DrvFs) has file-locking bugs that cause
+intermittent "database is locked/busy" failures. Keep the database on the Linux
+filesystem.
+
+`scripts/wsl-bridge.sh` does exactly that: it keeps a discoverable, gitignored
+`.ferryman/bridge.toml` inside the Windows project (so sandboxed agents find the
+endpoint), but puts the SQLite `.data/` on Linux (`~/ferryman/<slug>/.data`) and
+runs the server as a durable systemd service.
+
+```sh
+# inside WSL; build ferryman-server first: cargo build --release -p ferryman-server
+export FERRYMAN_BIN=$HOME/ferryman/ferryman-server
+export FERRYMAN_SUDO_PW=...        # omit if sudo is passwordless
+scripts/wsl-bridge.sh /mnt/x/myproject 8796 myproject
+```
+
+The API comes up on `http://127.0.0.1:8796`, reachable from **both** WSL and
+Windows-native processes via WSL2 localhost forwarding. Manage it with
+`systemctl status|restart ferryman-<slug>`. Give each project its own port.
+
+Rule of thumb: **the SQLite database lives on the same OS that runs the server.**
+A Windows-native server keeps data on the Windows drive; a WSL server keeps data
+on the Linux filesystem.
 ## Migrating from a sibling bridge
 
 If a project was using a bridge in a sibling folder, you do not lose anything:
