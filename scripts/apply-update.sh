@@ -34,6 +34,9 @@ fi
 echo "=== APPROVED: fast-forwarding source ==="
 "$UPDATER" update-bridge --checkout "$SRC" --branch main --confirm
 echo "=== rebuilding ==="
+# non-login shells (systemd, Start-Process) don't source the cargo env
+. "$HOME/.cargo/env" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null || { echo "cargo not found; install the Rust toolchain"; exit 1; }
 ( cd "$SRC" && cargo build --release -p ferryman-server -p ferryman-cli )
 cp -f "$SRC/target/release/ferryman-server" "$BIN_DIR/ferryman-server"
 cp -f "$SRC/target/release/ferry"           "$BIN_DIR/ferry"

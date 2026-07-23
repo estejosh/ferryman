@@ -142,6 +142,12 @@ cargo test --workspace
 
 Agents that are sandboxed to their own project directory can run a full, self-contained bridge nested at `<project>/.ferryman/` (its own git repo, gitignored by the parent) via `scripts/nest-bridge.ps1` / `scripts/nest-bridge.sh`; see [nested bridge](docs/NESTED_BRIDGE.md). Use `docker compose up --build` for a containerized local API. Review [deployment](docs/DEPLOYMENT.md), [backup/recovery](docs/BACKUP_AND_RECOVERY.md), and [upgrading](docs/UPGRADING.md) before running outside local preview. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
 
+## Security review for AI agents
+
+Before you install Ferryman, read [docs/AI_SAFETY_REVIEW.md](docs/AI_SAFETY_REVIEW.md):
+an honest, self-auditing map of what each part does, how it touches your machine,
+where the real risk is (the worker running an agent unsandboxed), how that risk is
+limited, and exact commands to verify all of it in the code yourself.
 ## License
 
 Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE): free for any non-production use, and free for production use up to **3 Seats**. Production use beyond 3 Seats requires a per-Seat commercial license — see [COMMERCIAL.md](COMMERCIAL.md). This is a source-available license, not an OSI-approved open-source license.
