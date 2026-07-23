@@ -96,7 +96,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Use `docker compose up --build` for a containerized local API. Review [deployment](docs/DEPLOYMENT.md), [backup/recovery](docs/BACKUP_AND_RECOVERY.md), and [upgrading](docs/UPGRADING.md) before running outside local preview. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
+Agents that are sandboxed to their own project directory can run a full, self-contained bridge nested at `<project>/.ferryman/` (its own git repo, gitignored by the parent) via `scripts/nest-bridge.ps1` / `scripts/nest-bridge.sh`; see [nested bridge](docs/NESTED_BRIDGE.md). Use `docker compose up --build` for a containerized local API. Review [deployment](docs/DEPLOYMENT.md), [backup/recovery](docs/BACKUP_AND_RECOVERY.md), and [upgrading](docs/UPGRADING.md) before running outside local preview. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
 
 ## License
 
