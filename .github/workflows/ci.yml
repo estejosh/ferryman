@@ -49,4 +49,4 @@ jobs:
         with:
           path: .
           format: spdx-json
-          artifact-name: orchestrator-bridge-sbom
+          artifact-name: ferryman-sbom

@@ -1,6 +1,6 @@
 # Contributing
 
-# Contributing to Orchestrator Bridge
+# Contributing to Ferryman
 
 Thank you for helping. The Bridge protects private project history, so changes
 are reviewed more carefully than ordinary application changes.

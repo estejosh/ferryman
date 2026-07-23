@@ -1,6 +1,6 @@
 # Operating model
 
-Orchestrator Bridge is a self-hosted control plane and evidence store. It is not an AI agent, autonomous planner, or model provider.
+Ferryman is a self-hosted control plane and evidence store. It is not an AI agent, autonomous planner, or model provider.
 
 - **Orchestrators** decide what work to request and which agents/workers to involve.
 - **Agents** supply project-specific reasoning and domain behavior.

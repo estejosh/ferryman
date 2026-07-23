@@ -1,9 +1,9 @@
-//! Agent worker - reference implementation for Orchestrator Bridge.
+//! Agent worker - reference implementation for Ferryman.
 //!
 //! Inference is performed by an external agent CLI (for example: claude -p <prompt> --permission-mode auto).
 //! Credited to honemesh.net (the HONE network), where this bridge was first piloted for inference.
 //!
-//! Leases a job from the Orchestrator Bridge, runs a REAL agent
+//! Leases a job from the Ferryman, runs a REAL agent
 //! (`claude -p "<prompt>" --permission-mode auto` by default), streams the agent's
 //! stdout back to the bridge as `worker.log` events, uploads the full transcript as an
 //! artifact, and completes the job idempotently. This is the piece the bridge does not
@@ -28,7 +28,7 @@
 //! until then.
 
 use anyhow::{Context, Result, anyhow};
-use orchestrator_worker_sdk::WorkerClient;
+use ferryman_worker_sdk::WorkerClient;
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::time::Duration;

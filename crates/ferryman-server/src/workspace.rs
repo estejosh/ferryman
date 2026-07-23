@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use orchestrator_core::{AgentPersistence, Project};
+use ferryman_core::{AgentPersistence, Project};
 
 pub fn project_directory(root: &Path, project_id: &str) -> Result<PathBuf> {
     let slug = slug(project_id);
@@ -23,7 +23,7 @@ pub fn provision_private_repository(
     project_name: &str,
 ) -> Result<PathBuf> {
     let directory = project_directory(root, project_id)?;
-    fs::create_dir_all(directory.join(".orchestrator/agents"))?;
+    fs::create_dir_all(directory.join(".ferryman/agents"))?;
     if !directory.join(".git").exists() {
         let status = Command::new("git")
             .args(["init", "-b", "main"])
@@ -42,12 +42,12 @@ pub fn provision_private_repository(
     if !remote.stdout.is_empty() {
         bail!("refusing workspace with a configured remote; bridge repositories stay local/private")
     }
-    let note = directory.join(".orchestrator/REPOSITORY.md");
+    let note = directory.join(".ferryman/REPOSITORY.md");
     if !note.exists() {
         fs::write(
             &note,
             format!(
-                "# Private local repository\n\n- Project: {project_name}\n- Project ID: {project_id}\n- Device: {}\n- Naming convention: `{}`\n\nThis repository was created by Orchestrator Bridge. It has no remote by design. The bridge must never publish it or add a remote automatically. On another device, the same project ID creates the same local directory name and a new private local Git repository.\n",
+                "# Private local repository\n\n- Project: {project_name}\n- Project ID: {project_id}\n- Device: {}\n- Naming convention: `{}`\n\nThis repository was created by Ferryman. It has no remote by design. The bridge must never publish it or add a remote automatically. On another device, the same project ID creates the same local directory name and a new private local Git repository.\n",
                 device_id(),
                 slug(project_id)
             ),
@@ -58,7 +58,7 @@ pub fn provision_private_repository(
         fs::write(
             &manifest,
             format!(
-                "# Orchestrator Bridge project policy. Keep this file in the private local repository.\nformat = \"orchestrator-bridge-project/v1\"\nproject_id = \"{project_id}\"\nproject_name = {project_name:?}\nretention = \"retained-artifacts-only\"\nartifact_quota_bytes = 104857600\nallowed_capabilities = []\n\n[portability]\n# External targets receive only opaque encrypted continuity packs.\nrecovery_order = [\"local\", \"network\", \"google_drive\", \"mega\", \"private_git\"]\npreapproved_encrypted_pack_fallback = false\napproved_targets = []\n\n[github]\n# Draft PR delivery only; never configure a default-branch push here.\ndraft_pr_only = true\nrecovery_branch = \"bridge/recovery\"\n\n[updates]\n# Each project must opt in before a system-wide Bridge update touches its metadata.\nopt_in = false\ncompatibility = \"minor\"\n",
+                "# Ferryman project policy. Keep this file in the private local repository.\nformat = \"ferryman-project/v1\"\nproject_id = \"{project_id}\"\nproject_name = {project_name:?}\nretention = \"retained-artifacts-only\"\nartifact_quota_bytes = 104857600\nallowed_capabilities = []\n\n[portability]\n# External targets receive only opaque encrypted continuity packs.\nrecovery_order = [\"local\", \"network\", \"google_drive\", \"mega\", \"private_git\"]\npreapproved_encrypted_pack_fallback = false\napproved_targets = []\n\n[github]\n# Draft PR delivery only; never configure a default-branch push here.\ndraft_pr_only = true\nrecovery_branch = \"bridge/recovery\"\n\n[updates]\n# Each project must opt in before a system-wide Bridge update touches its metadata.\nopt_in = false\ncompatibility = \"minor\"\n",
                 project_name = project_name
             ),
         )?;
@@ -77,7 +77,7 @@ pub fn write_agent_profile(
         bail!("agent role must contain letters or numbers")
     }
     let path = PathBuf::from(&project.workspace_path)
-        .join(".orchestrator/agents")
+        .join(".ferryman/agents")
         .join(format!("{name}.md"));
     if !path.exists() {
         let lifecycle = match persistence {

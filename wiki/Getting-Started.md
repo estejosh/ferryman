@@ -3,7 +3,7 @@
 ## Run the bridge (local)
 
 ```
-cargo run -p orchestrator-server -- --database ./.data/bridge.db --artifacts ./.data/artifacts
+cargo run -p ferryman-server -- --database ./.data/bridge.db --artifacts ./.data/artifacts
 ```
 
 It listens on `127.0.0.1:8787` and seeds a demo project with token `demo-local-token`.
@@ -11,10 +11,10 @@ It listens on `127.0.0.1:8787` and seeds a demo project with token `demo-local-t
 ## Submit and approve a job
 
 ```
-cargo run -p orchestrator-cli -- --token demo-local-token jobs submit --project demo \
+cargo run -p ferryman-cli -- --token demo-local-token jobs submit --project demo \
   --input '{"prompt":"make a report"}' --requires-approval
-cargo run -p orchestrator-cli -- --token demo-local-token jobs approve --project demo <job-id>
-cargo run -p orchestrator-cli -- --token demo-local-token jobs tail    --project demo <job-id>
+cargo run -p ferryman-cli -- --token demo-local-token jobs approve --project demo <job-id>
+cargo run -p ferryman-cli -- --token demo-local-token jobs tail    --project demo <job-id>
 ```
 
 ## Run a worker
@@ -22,13 +22,13 @@ cargo run -p orchestrator-cli -- --token demo-local-token jobs tail    --project
 A harmless mock worker:
 
 ```
-cargo run -p orchestrator-worker-sdk --example mock_worker
+cargo run -p ferryman-worker-sdk --example mock_worker
 ```
 
 A real agent worker (runs an external model CLI):
 
 ```
-cargo run -p orchestrator-worker-sdk --example agent_worker
+cargo run -p ferryman-worker-sdk --example agent_worker
 ```
 
 See [Writing a Worker](Writing-a-Worker) to point it at your own agent. Every project gets a

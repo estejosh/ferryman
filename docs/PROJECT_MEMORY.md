@@ -16,11 +16,11 @@ The default memory root is `./.data/bridge-memory`. It is never included in a wo
 
 Entries are append-only. Correct a bad entry with a new entry that identifies the correction; never rewrite history. The caller supplies a category and provenance `source` such as `operator`, `release-manager`, or `saturday-80s-visual-qa`.
 
-For a true recovery boundary, set `ORCHESTRATOR_MEMORY_WRITE_TOKEN` on the bridge and keep the matching `ORCHESTRATOR_MEMORY_TOKEN` only with the human/operator or trusted memory service. The bridge then requires that separate token for new memory entries; workers with only project tokens can read history but cannot add or alter it. Without this configuration, local development permits project-token memory writes for convenience.
+For a true recovery boundary, set `FERRYMAN_MEMORY_WRITE_TOKEN` on the bridge and keep the matching `FERRYMAN_MEMORY_TOKEN` only with the human/operator or trusted memory service. The bridge then requires that separate token for new memory entries; workers with only project tokens can read history but cannot add or alter it. Without this configuration, local development permits project-token memory writes for convenience.
 
 ## CLI
 
 ```powershell
-orchestrator-cli --token $env:ORCHESTRATOR_TOKEN memory add --project saturday-80s --category decision --content "Morning block remains family-safe." --source operator
-orchestrator-cli --token $env:ORCHESTRATOR_TOKEN memory list --project saturday-80s
+ferryman-cli --token $env:FERRYMAN_TOKEN memory add --project saturday-80s --category decision --content "Morning block remains family-safe." --source operator
+ferryman-cli --token $env:FERRYMAN_TOKEN memory list --project saturday-80s
 ```

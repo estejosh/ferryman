@@ -12,7 +12,7 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(about = "Opt-in Orchestrator Bridge updater")]
+#[command(about = "Opt-in Ferryman updater")]
 struct Cli {
     /// Root containing one private Bridge project directory per project.
     #[arg(long, default_value = "./.data/projects")]

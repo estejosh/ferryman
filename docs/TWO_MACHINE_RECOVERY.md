@@ -1,7 +1,7 @@
 # Two-machine recovery with private Git
 
 This is the first working cross-device recovery target. It uses a separate,
-private repository (`estejosh/orchestrator-bridge-recovery`) and stores only
+private repository (`estejosh/ferryman-recovery`) and stores only
 encrypted `.obpack` files plus authenticated manifests. It never receives a
 project workspace, raw artifact, prompt, token, or recovery key.
 
@@ -32,14 +32,14 @@ print IDs and hashes as JSON; copy the values shown in angle brackets:
 
 ```powershell
 # 1. Make the encrypted continuity pack and copy its bundle_sha256 value.
-cargo run -p orchestrator-cli -- --token <project-token> continuity pack --project <project>
+cargo run -p ferryman-cli -- --token <project-token> continuity pack --project <project>
 
 # 2. Create the private-Git delivery consent for that exact hash, then copy its id.
-cargo run -p orchestrator-cli -- --token <project-token> continuity git-consent --project <project> <bundle-sha256>
+cargo run -p ferryman-cli -- --token <project-token> continuity git-consent --project <project> <bundle-sha256>
 
 # 3. Explicitly approve it, then send it.
-cargo run -p orchestrator-cli -- --token <project-token> consents approve --project <project> <consent-id> --approver Josh
-cargo run -p orchestrator-cli -- --token <project-token> continuity deliver-git --project <project> <bundle-sha256> --consent <consent-id>
+cargo run -p ferryman-cli -- --token <project-token> consents approve --project <project> <consent-id> --approver Josh
+cargo run -p ferryman-cli -- --token <project-token> continuity deliver-git --project <project> <bundle-sha256> --consent <consent-id>
 ```
 
 The Bridge clones the recovery repository, commits `packs/<hash>.obpack` and

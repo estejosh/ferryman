@@ -1,12 +1,12 @@
 [package]
-name = "orchestrator-worker-sdk"
+name = "ferryman-worker-sdk"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-orchestrator-core = { path = "../orchestrator-core" }
+ferryman-core = { path = "../ferryman-core" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true

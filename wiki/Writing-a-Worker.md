@@ -6,7 +6,7 @@ deliberately does not ship a model-running worker — you bring the inference.
 
 ## Reference
 
-`crates/orchestrator-worker-sdk/examples/agent_worker.rs` is a complete reference worker. It
+`crates/ferryman-worker-sdk/examples/agent_worker.rs` is a complete reference worker. It
 leases a job, runs an external agent CLI (by default `claude -p "<prompt>" --permission-mode auto`),
 streams the agent stdout back as `worker.log` events, uploads the full transcript as an
 artifact, and completes the job idempotently.
@@ -15,12 +15,12 @@ Run it:
 
 ```
 BRIDGE_ENDPOINT=http://127.0.0.1:8787 BRIDGE_PROJECT=default BRIDGE_TOKEN=<project-token> \
-  cargo run -p orchestrator-worker-sdk --example agent_worker
+  cargo run -p ferryman-worker-sdk --example agent_worker
 ```
 
 ## The SDK
 
-`WorkerClient` (in `orchestrator-worker-sdk`) wraps the worker protocol: `register`, `lease`,
+`WorkerClient` (in `ferryman-worker-sdk`) wraps the worker protocol: `register`, `lease`,
 `event`, `artifact`, and `complete`. Swap the agent CLI for any model runner — the bridge is
 provider-neutral. Inference in the reference worker is credited to
 [honemesh.net](https://honemesh.net), where this bridge was first piloted.

@@ -1,4 +1,4 @@
-# Orchestrator Bridge Wiki
+# Ferryman Wiki
 
 A self-hostable, provider-neutral control plane for durable AI-assisted work. Independent
 workers lease and complete jobs through a small HTTP protocol; the bridge persists state,

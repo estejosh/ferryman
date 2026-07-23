@@ -18,7 +18,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use orchestrator_core::{
+use ferryman_core::{
     Agent, AgentPersistence, Artifact, JobStatus, NewJob, PolicyEnvelope, Project,
     ProjectMemoryEntry, SqliteStore,
 };
@@ -325,7 +325,7 @@ fn checked_memory_write(state: &AppState, headers: &HeaderMap, project: &str) ->
         return Ok(());
     };
     let supplied = headers
-        .get("x-orchestrator-memory-token")
+        .get("x-ferryman-memory-token")
         .and_then(|header| header.to_str().ok());
     if supplied == Some(expected.as_str()) {
         Ok(())
@@ -578,10 +578,10 @@ async fn approve_consent(
 ) -> ApiResult<Json<Value>> {
     checked(&state, &headers, &project)?;
     let approver = headers
-        .get("x-orchestrator-approver")
+        .get("x-ferryman-approver")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::bad("x-orchestrator-approver is required"))?;
+        .ok_or_else(|| ApiError::bad("x-ferryman-approver is required"))?;
     state
         .store
         .resolve_consent(&project, &id, true, approver)
@@ -596,10 +596,10 @@ async fn reject_consent(
 ) -> ApiResult<Json<Value>> {
     checked(&state, &headers, &project)?;
     let approver = headers
-        .get("x-orchestrator-approver")
+        .get("x-ferryman-approver")
         .and_then(|value| value.to_str().ok())
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ApiError::bad("x-orchestrator-approver is required"))?;
+        .ok_or_else(|| ApiError::bad("x-ferryman-approver is required"))?;
     state
         .store
         .resolve_consent(&project, &id, false, approver)
@@ -649,7 +649,7 @@ async fn propose_outbound_submission(
         chrono::DateTime::parse_from_rfc3339(expiry)
             .map_err(|_| ApiError::bad("expires_at must be RFC 3339"))?;
     }
-    let manifest = json!({"format":"orchestrator-bridge-outbound-manifest/v1","provider":body.provider,"destination":body.destination,"files":body.files,"patch":body.patch,"redactions":body.redactions,"reason":body.reason,"evidence_links":body.evidence_links,"expected_benefit":body.expected_benefit,"risk":body.risk,"rollback":body.rollback,"delivery":"draft_pr_only_or_opaque_encrypted_blob"});
+    let manifest = json!({"format":"ferryman-outbound-manifest/v1","provider":body.provider,"destination":body.destination,"files":body.files,"patch":body.patch,"redactions":body.redactions,"reason":body.reason,"evidence_links":body.evidence_links,"expected_benefit":body.expected_benefit,"risk":body.risk,"rollback":body.rollback,"delivery":"draft_pr_only_or_opaque_encrypted_blob"});
     let consent = state
         .store
         .create_consent(
@@ -686,7 +686,7 @@ async fn propose_improvement(
     if body.reason.trim().is_empty() {
         return Err(ApiError::bad("reason is required"));
     }
-    let proposal = json!({"format":"orchestrator-bridge-improvement-proposal/v1","reason":body.reason,"evidence_links":body.evidence_links,"proposed_patch":body.proposed_patch,"risk":body.risk,"source":"operator_or_readiness_evidence","autonomous_write":false});
+    let proposal = json!({"format":"ferryman-improvement-proposal/v1","reason":body.reason,"evidence_links":body.evidence_links,"proposed_patch":body.proposed_patch,"risk":body.risk,"source":"operator_or_readiness_evidence","autonomous_write":false});
     let consent = state
         .store
         .create_consent(&project, "improvement_proposal", proposal, None)
@@ -711,7 +711,7 @@ async fn continuity_pack(
         .ok_or_else(ApiError::not_found)?;
     let jobs=state.store.list_jobs(&project,500,None,None).map_err(ApiError::internal)?.into_iter().map(|job|json!({"id":job.id,"status":job.status,"attempts":job.attempts,"max_attempts":job.max_attempts,"created_at":job.created_at,"updated_at":job.updated_at})).collect::<Vec<_>>();
     Ok(Json(
-        json!({"format":"orchestrator-bridge-continuity-pack/v1","generated_at":chrono::Utc::now().to_rfc3339(),"project":project_record,"memory":state.store.project_memory(&project,500).map_err(ApiError::internal)?,"memory_candidates":state.store.list_memory_candidates(&project).map_err(ApiError::internal)?,"agents":state.store.list_agents(&project).map_err(ApiError::internal)?,"consents":state.store.list_consents(&project).map_err(ApiError::internal)?,"jobs":jobs}),
+        json!({"format":"ferryman-continuity-pack/v1","generated_at":chrono::Utc::now().to_rfc3339(),"project":project_record,"memory":state.store.project_memory(&project,500).map_err(ApiError::internal)?,"memory_candidates":state.store.list_memory_candidates(&project).map_err(ApiError::internal)?,"agents":state.store.list_agents(&project).map_err(ApiError::internal)?,"consents":state.store.list_consents(&project).map_err(ApiError::internal)?,"jobs":jobs}),
     ))
 }
 async fn create_continuity_pack(
@@ -764,7 +764,7 @@ async fn create_recovery_delivery_consent(
     let manifest = continuity::load_manifest(&state, &project, &pack_hash)
         .await
         .map_err(ApiError::internal)?;
-    let payload = json!({"format":"orchestrator-bridge-recovery-delivery/v1","provider":"private_git","bundle_sha256":manifest.bundle_sha256,"manifest_hmac_sha256":manifest.manifest_hmac_sha256,"repository":target.repository,"branch":target.branch});
+    let payload = json!({"format":"ferryman-recovery-delivery/v1","provider":"private_git","bundle_sha256":manifest.bundle_sha256,"manifest_hmac_sha256":manifest.manifest_hmac_sha256,"repository":target.repository,"branch":target.branch});
     let consent = state
         .store
         .create_consent(
@@ -880,13 +880,13 @@ async fn simulate_policy(
         ("network", &input.policy.network),
         ("shell", &input.policy.shell),
     ] {
-        if matches!(access, orchestrator_core::Access::Deny) {
+        if matches!(access, ferryman_core::Access::Deny) {
             denied.push(name);
         } else {
             allowed.push(name);
         }
     }
-    if input.outbound || !matches!(input.policy.network, orchestrator_core::Access::Deny) {
+    if input.outbound || !matches!(input.policy.network, ferryman_core::Access::Deny) {
         consents.push("external_communication");
     }
     if input.artifact_bytes > state.max_artifact_bytes {
@@ -940,7 +940,7 @@ async fn submit_job(
     headers: HeaderMap,
     Path(project): Path<String>,
     Json(input): Json<SubmitJob>,
-) -> ApiResult<(StatusCode, Json<orchestrator_core::Job>)> {
+) -> ApiResult<(StatusCode, Json<ferryman_core::Job>)> {
     checked(&state, &headers, &project)?;
     let job = state
         .store
@@ -987,7 +987,7 @@ async fn get_job(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((project, job)): Path<(String, String)>,
-) -> ApiResult<Json<orchestrator_core::Job>> {
+) -> ApiResult<Json<ferryman_core::Job>> {
     checked(&state, &headers, &project)?;
     state
         .store
@@ -1000,7 +1000,7 @@ async fn approve_job(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((project, job)): Path<(String, String)>,
-) -> ApiResult<Json<orchestrator_core::Job>> {
+) -> ApiResult<Json<ferryman_core::Job>> {
     checked(&state, &headers, &project)?;
     state
         .store
@@ -1013,7 +1013,7 @@ async fn cancel_job(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path((project, job)): Path<(String, String)>,
-) -> ApiResult<Json<orchestrator_core::Job>> {
+) -> ApiResult<Json<ferryman_core::Job>> {
     checked(&state, &headers, &project)?;
     state
         .store
@@ -1040,7 +1040,7 @@ async fn register_worker(
     headers: HeaderMap,
     Path(project): Path<String>,
     Json(body): Json<RegisterWorker>,
-) -> ApiResult<(StatusCode, Json<orchestrator_core::WorkerRegistration>)> {
+) -> ApiResult<(StatusCode, Json<ferryman_core::WorkerRegistration>)> {
     checked(&state, &headers, &project)?;
     Ok((
         StatusCode::CREATED,
@@ -1063,7 +1063,7 @@ async fn heartbeat(
         .heartbeat(
             &project,
             &worker,
-            orchestrator_core::DEFAULT_LEASE_TTL_SECONDS,
+            ferryman_core::DEFAULT_LEASE_TTL_SECONDS,
         )
         .map_err(ApiError::internal)?
     {
@@ -1083,7 +1083,7 @@ async fn lease_job(
         .lease(
             &project,
             &worker,
-            orchestrator_core::DEFAULT_LEASE_TTL_SECONDS,
+            ferryman_core::DEFAULT_LEASE_TTL_SECONDS,
         )
         .map_err(ApiError::internal)?
     {
@@ -1124,7 +1124,7 @@ async fn complete_job(
     headers: HeaderMap,
     Path((project, job)): Path<(String, String)>,
     Json(body): Json<Complete>,
-) -> ApiResult<Json<orchestrator_core::Job>> {
+) -> ApiResult<Json<ferryman_core::Job>> {
     checked_worker(&state, &headers, &project, &body.worker_id)?;
     state
         .store
@@ -1140,9 +1140,9 @@ async fn upload_artifact(
     body: Bytes,
 ) -> ApiResult<(StatusCode, Json<Artifact>)> {
     let worker = headers
-        .get("x-orchestrator-worker-id")
+        .get("x-ferryman-worker-id")
         .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::bad("x-orchestrator-worker-id is required for artifact upload"))?;
+        .ok_or_else(|| ApiError::bad("x-ferryman-worker-id is required for artifact upload"))?;
     checked_worker(&state, &headers, &project, worker)?;
     if state
         .store
@@ -1345,7 +1345,7 @@ mod tests {
         let accepted_memory = client
             .post(format!("http://{address}/v1/projects/alpha/memory"))
             .bearer_auth("alpha-token-1234")
-            .header("x-orchestrator-memory-token", "memory-token-1234")
+            .header("x-ferryman-memory-token", "memory-token-1234")
             .json(&json!({"category":"decision","content":"durable decision"}))
             .send()
             .await
@@ -1467,7 +1467,7 @@ mod tests {
                     .method("POST")
                     .uri(format!("/v1/projects/p/jobs/{job}/artifacts"))
                     .header("authorization", &worker_auth)
-                    .header("x-orchestrator-worker-id", &worker_id)
+                    .header("x-ferryman-worker-id", &worker_id)
                     .body(Body::from("artifact"))
                     .unwrap(),
             )
@@ -1494,7 +1494,7 @@ mod tests {
         std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(
             workspace.join("bridge-project.toml"),
-            "format = \"orchestrator-bridge-project/v1\"\n",
+            "format = \"ferryman-project/v1\"\n",
         )
         .unwrap();
         let store = SqliteStore::open(dir.join("bridge.db")).unwrap();

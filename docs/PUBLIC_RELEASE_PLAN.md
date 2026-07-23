@@ -2,7 +2,7 @@
 
 ## Goal
 
-Publish this repository as a transparent, self-hostable **reference implementation and blueprint** for Orchestrator Bridge—not as a hosted service, complete agent framework, or production-security guarantee. The first public tag should be `v0.1.0-alpha` or `v0.1.0-preview` until the acceptance criteria below are met.
+Publish this repository as a transparent, self-hostable **reference implementation and blueprint** for Ferryman—not as a hosted service, complete agent framework, or production-security guarantee. The first public tag should be `v0.1.0-alpha` or `v0.1.0-preview` until the acceptance criteria below are met.
 
 ## 1. Freeze and document the public v0.1 contract
 
