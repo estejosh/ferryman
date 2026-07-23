@@ -10,7 +10,7 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license-file = "LICENSE"
+license = "LicenseRef-Ferryman-Source-Available"
 repository = "https://github.com/estejosh/ferryman"
 
 [workspace.dependencies]
