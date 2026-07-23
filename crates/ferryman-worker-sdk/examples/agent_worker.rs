@@ -135,6 +135,33 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Build the child-process command for the agent.
+///
+/// On Windows, agent CLIs are frequently installed as `.cmd`/`.bat` shims
+/// (npm, claude, codex, ...). `CreateProcess` cannot launch a shim directly, so
+/// `Command::new("claude")` fails with "program not found" even when the shim is
+/// on PATH. Route anything that is not an explicit, existing `.exe` through
+/// `cmd /c` so PATHEXT resolution finds and runs the shim. Set `AGENT_CMD` to a
+/// full path ending in `.exe` to bypass this wrapper (recommended when job
+/// prompts may contain cmd metacharacters such as & | < > ^).
+#[cfg(windows)]
+fn agent_command(agent_cmd: &str) -> Command {
+    let direct_exe = agent_cmd.to_ascii_lowercase().ends_with(".exe")
+        && std::path::Path::new(agent_cmd).is_file();
+    if direct_exe {
+        Command::new(agent_cmd)
+    } else {
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/c").arg(agent_cmd);
+        cmd
+    }
+}
+
+#[cfg(not(windows))]
+fn agent_command(agent_cmd: &str) -> Command {
+    Command::new(agent_cmd)
+}
+
 /// Spawn the agent, stream stdout+stderr to the bridge as events, upload the transcript,
 /// return the structured result for completion.
 async fn run_agent(
@@ -154,7 +181,7 @@ async fn run_agent(
         .await
         .ok();
 
-    let mut child = Command::new(agent_cmd)
+    let mut child = agent_command(agent_cmd)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
