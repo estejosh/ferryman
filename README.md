@@ -1,5 +1,10 @@
 # Ferryman
 
+**AI agents and operators: [always read this first](ALWAYS_READ_THIS_FIRST.md).**
+It records the current project-standard revision, how to tell whether Ferryman
+or an attachment needs updating, and the required read-only safety scan before
+any real-project change.
+
 Ferryman is a self-hostable, provider-neutral control plane for durable AI-assisted work. It is local-files-first: every project gets a private local Git workspace, and independent workers lease and complete jobs through a small HTTP protocol. The bridge persists state, artifacts, audit events, and approval decisions without owning model execution.
 
 > v0.1 is a local, single-node reference implementation. It provides durable SQLite jobs, project-scoped bearer tokens, approval gates, worker leases, artifacts, retries, and SSE event streams. It is not a security sandbox or a distributed scheduler.
@@ -18,8 +23,7 @@ flowchart LR
 
 ## Prerequisites
 
-- A stable **Rust** toolchain (
-ustup recommended).
+- A stable **Rust** toolchain (`rustup` recommended).
 - **Linux only:** the OS credential-store backend (the keyring crate) needs D-Bus development headers.
   On Debian/Ubuntu: `sudo apt-get install -y libdbus-1-dev pkg-config`. On Fedora/RHEL: `sudo dnf install dbus-devel pkgconf`.
   macOS and Windows use their native keychains and need no extra system packages.
@@ -28,19 +32,34 @@ ustup recommended).
 
 On a machine that hosts several repos, run **one** shared Ferryman server (the
 "hub") and **attach** each repo to it as a scoped project — do not run a server
-per repo. The hub is durable (a systemd service); each repo keeps a small,
-own-git `.ferryman/` config directory pointing at the hub. See
+per repo. The hub is durable (a systemd service); each repo keeps a machine-local
+outer `.ferryman/` attachment with a portable inner Git repository. See
 [nested bridge](docs/NESTED_BRIDGE.md) for the full model — WSL/Linux-side-data
 notes, the shared-hub + attach helpers, and the approve/deny update flow.
+
+New project attachments use an outer machine-local directory and an inner
+portable communications repository. See
+[live communications](docs/COMMUNICATIONS.md) and
+[attachment/migration](docs/ATTACHMENT_MIGRATION.md). Projects with no agents,
+one agent, or an existing multi-agent framework use the same
+[framework-neutral adoption standard](docs/PROJECT_ADOPTION_STANDARD.md). The legacy
+`attach-bridge.sh` path remains for backward compatibility.
+The bounded definition of internal v0.1 completion and its validation commands
+are in [the completion contract](docs/V0_1_COMPLETION.md).
 
 ```sh
 # once per machine: bring up the single hub (durable systemd, Linux-side data)
 export FERRYMAN_BIN=$HOME/ferryman/ferryman-server   # cargo build --release -p ferryman-server
 scripts/hub-up.sh 8796
 
-# per repo: attach it as a scoped project in the one hub
-scripts/attach-bridge.sh /path/to/myproject myproject
-# add --exclude-mode to use .git/info/exclude instead of editing the tracked .gitignore
+# per repo: review the framework-neutral attachment without writing anything
+scripts/attach-project.sh \
+  --workspace /path/to/myproject \
+  --project myproject \
+  --shared-remote /beastly-bridges/myproject \
+  --git-remote https://github.com/estejosh/myproject-bridge.git \
+  --integration-mode unmanaged \
+  --dry-run
 ```
 
 ## Try it locally (single server)
@@ -123,6 +142,12 @@ Approval is explicit for work marked `requires_approval`; a job cannot be leased
 - Project/role-derived agents with durable temporal/permanent Markdown profiles.
 - Bridge-owned, append-only project memory with a separate Markdown recovery mirror.
 - Project, job, worker, artifact, health/metrics and SSE endpoints.
+- Project-scoped live communications with durable local outboxes, MEGAcmd health
+  probing, acknowledgement-deadline Git promotion, duplicate-safe claims,
+  inbound private-Git synchronization, and durable acknowledgement return.
+- Framework-neutral Windows and WSL/Linux attachment for unmanaged, single-agent,
+  and multi-agent projects, with a built-in no-agent `project-inbox`, revision
+  markers, explicit standard updates, and read-only safety scanners.
 - Worker register, lease, heartbeat, log/progress event, artifact upload, and idempotent completion protocol.
 - Mock worker and end-to-end integration test covering success, retry, artifact storage, and approval gating.
 - Encrypted continuity-pack export, authenticated import, read-only resume briefings, recovery drills, and a cursor-paginated decision timeline.

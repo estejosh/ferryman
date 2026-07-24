@@ -16,6 +16,7 @@ ferryman-core = { path = "../ferryman-core" }
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
+fs2.workspace = true
 hex.workspace = true
 hmac.workspace = true
 keyring.workspace = true
@@ -26,8 +27,10 @@ tower-http.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+wait-timeout.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
 tower.workspace = true
+tempfile = "3.20"

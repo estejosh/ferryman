@@ -1,16 +1,17 @@
 #![forbid(unsafe_code)]
+pub mod communications;
 pub mod continuity;
 pub mod recovery_targets;
 pub mod workspace;
 
-use std::{convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_stream::stream;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header::HeaderName},
     response::{
         IntoResponse, Response,
@@ -20,7 +21,7 @@ use axum::{
 };
 use ferryman_core::{
     Agent, AgentPersistence, Artifact, JobStatus, NewJob, PolicyEnvelope, Project,
-    ProjectMemoryEntry, SqliteStore,
+    ProjectCommunicationMapping, ProjectMemoryEntry, SqliteStore,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -43,6 +44,9 @@ pub struct AppState {
     git_recovery: Option<Arc<recovery_targets::GitRecoveryTarget>>,
     recovery_key: Option<Arc<[u8; 32]>>,
     recovery_key_reference: Arc<String>,
+    communication_engines:
+        Arc<tokio::sync::Mutex<HashMap<String, communications::SystemDeliveryEngine>>>,
+    wsl_distribution: Arc<String>,
 }
 impl AppState {
     pub fn new(store: SqliteStore, artifact_root: PathBuf) -> Self {
@@ -58,6 +62,8 @@ impl AppState {
             git_recovery: None,
             recovery_key: None,
             recovery_key_reference: Arc::new("unconfigured".into()),
+            communication_engines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            wsl_distribution: Arc::new("Ubuntu".into()),
         }
     }
     pub fn with_admin_token(mut self, admin_token: String) -> Self {
@@ -111,6 +117,10 @@ impl AppState {
     pub fn git_recovery(&self) -> Option<Arc<recovery_targets::GitRecoveryTarget>> {
         self.git_recovery.clone()
     }
+    pub fn with_wsl_distribution(mut self, distribution: String) -> Self {
+        self.wsl_distribution = Arc::new(distribution);
+        self
+    }
 }
 
 pub fn app(state: AppState) -> Router {
@@ -119,6 +129,40 @@ pub fn app(state: AppState) -> Router {
         .route("/v1/metrics", get(metrics))
         .route("/v1/projects", post(create_project).get(list_projects))
         .route("/v1/projects/{project_id}", delete(delete_project))
+        .route(
+            "/v1/projects/{project_id}/communications",
+            post(configure_communications)
+                .get(get_communications)
+                .delete(delete_communications),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/messages",
+            post(send_communication).get(list_communications),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/messages/{message_id}/claim",
+            post(claim_communication),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/messages/{message_id}/acknowledge",
+            post(acknowledge_communication),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/actors/{actor}/token",
+            post(mint_communication_actor_token),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/actors/{actor}/messages",
+            get(list_communication_actor_messages),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/reconcile",
+            post(reconcile_communications),
+        )
+        .route(
+            "/v1/projects/{project_id}/communications/status",
+            get(communications_status),
+        )
         .route(
             "/v1/projects/{project_id}/agents",
             post(create_agent).get(list_agents),
@@ -259,7 +303,7 @@ impl ApiError {
         Self(
             StatusCode::UNAUTHORIZED,
             "unauthenticated",
-            "missing or invalid project token".into(),
+            "missing, expired, or invalid bearer token".into(),
         )
     }
     fn not_found() -> Self {
@@ -268,6 +312,9 @@ impl ApiError {
             "not_found",
             "resource not found or not in the required state".into(),
         )
+    }
+    fn conflict(message: impl Into<String>) -> Self {
+        Self(StatusCode::CONFLICT, "conflict", message.into())
     }
     fn internal(error: anyhow::Error) -> Self {
         Self(
@@ -369,14 +416,57 @@ fn checked_worker(
     }
 }
 
+fn checked_communication_actor(
+    state: &AppState,
+    headers: &HeaderMap,
+    project: &str,
+    actor: &str,
+) -> ApiResult<()> {
+    let token = headers
+        .get("authorization")
+        .and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+        .ok_or_else(ApiError::unauthenticated)?;
+    if state
+        .store
+        .authenticate_communication_actor(project, actor, token)
+        .map_err(ApiError::internal)?
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unauthenticated())
+    }
+}
+
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok","api_version":"v1"}))
 }
 async fn metrics(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let (queue_depth, healthy_workers) = state.store.metrics().map_err(ApiError::internal)?;
-    Ok(Json(
-        json!({"queue_depth":queue_depth,"healthy_workers":healthy_workers}),
-    ))
+    let mut communications_outbox_depth = 0;
+    let mut communications_acknowledgement_outbox_depth = 0;
+    let mut communications_quarantine_files = 0;
+    for mapping in state
+        .store
+        .list_project_communications()
+        .map_err(ApiError::internal)?
+    {
+        if let Ok(route) = project_route_from_mapping(&mapping)
+            && let Ok((outbox, acknowledgement_outbox, _, quarantine)) =
+                communications::filesystem_metrics(&route)
+        {
+            communications_outbox_depth += outbox;
+            communications_acknowledgement_outbox_depth += acknowledgement_outbox;
+            communications_quarantine_files += quarantine;
+        }
+    }
+    Ok(Json(json!({
+        "queue_depth":queue_depth,
+        "healthy_workers":healthy_workers,
+        "communications_outbox_depth":communications_outbox_depth,
+        "communications_acknowledgement_outbox_depth":communications_acknowledgement_outbox_depth,
+        "communications_quarantine_files":communications_quarantine_files
+    })))
 }
 #[derive(Deserialize)]
 struct CreateProject {
@@ -433,6 +523,546 @@ async fn delete_project(
         Err(ApiError::not_found())
     }
 }
+
+#[derive(Deserialize)]
+struct ConfigureCommunications {
+    workspace: PathBuf,
+    attachment: PathBuf,
+    communications: PathBuf,
+    shared_remote: String,
+    git_remote: String,
+    #[serde(default = "private_visibility")]
+    git_visibility: String,
+    #[serde(default)]
+    agents: Vec<communications::AgentRoute>,
+}
+
+fn private_visibility() -> String {
+    "private".into()
+}
+
+fn project_route_from_mapping(
+    mapping: &ProjectCommunicationMapping,
+) -> Result<communications::ProjectRoute> {
+    let agents = serde_json::from_str(&mapping.agents_json)?;
+    let route = communications::ProjectRoute {
+        project_id: mapping.project_id.clone(),
+        workspace: path_for_current_os(&mapping.workspace_path),
+        attachment: path_for_current_os(&mapping.attachment_path),
+        communications: path_for_current_os(&mapping.communications_path),
+        shared_remote: mapping.shared_remote.clone(),
+        git_remote: mapping.git_remote.clone(),
+        git_visibility: mapping.git_visibility.clone(),
+        agents,
+    };
+    route.validate()?;
+    Ok(route)
+}
+
+fn path_for_current_os(value: &str) -> PathBuf {
+    let normalized = value.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if cfg!(windows) && normalized.starts_with("/mnt/") && bytes.len() > 6 {
+        let drive = bytes[5] as char;
+        return PathBuf::from(format!(
+            "{}:/{}",
+            drive.to_ascii_uppercase(),
+            &normalized[7..]
+        ));
+    }
+    if !cfg!(windows) && bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'/' {
+        let drive = (bytes[0] as char).to_ascii_lowercase();
+        return PathBuf::from(format!("/mnt/{drive}/{}", &normalized[3..]));
+    }
+    PathBuf::from(normalized)
+}
+
+fn project_route(state: &AppState, project_id: &str) -> ApiResult<communications::ProjectRoute> {
+    let mapping = state
+        .store
+        .get_project_communications(project_id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    project_route_from_mapping(&mapping).map_err(ApiError::internal)
+}
+
+fn registered_communication_participants(
+    state: &AppState,
+    project_id: &str,
+) -> Result<Vec<communications::AgentRoute>> {
+    let mut participants = state
+        .store
+        .list_agents(project_id)?
+        .into_iter()
+        .map(|agent| communications::AgentRoute {
+            name: agent.name,
+            role: agent.role,
+            capabilities: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    participants.extend(
+        state
+            .store
+            .list_workers(project_id)?
+            .into_iter()
+            .map(|worker| communications::AgentRoute {
+                name: worker.id,
+                role: "worker".into(),
+                capabilities: worker.capabilities,
+            }),
+    );
+    Ok(participants)
+}
+
+fn refresh_communication_participants(state: &AppState, project_id: &str) -> Result<()> {
+    let Some(mut mapping) = state.store.get_project_communications(project_id)? else {
+        return Ok(());
+    };
+    let mut routes: Vec<communications::AgentRoute> = serde_json::from_str(&mapping.agents_json)?;
+    for participant in registered_communication_participants(state, project_id)? {
+        if !routes.iter().any(|route| route.name == participant.name) {
+            routes.push(participant);
+        }
+    }
+    mapping.agents_json = serde_json::to_string(&routes)?;
+    state.store.set_project_communications(&mapping)
+}
+
+async fn configure_communications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<ConfigureCommunications>,
+) -> ApiResult<Json<communications::ProjectRoute>> {
+    checked(&state, &headers, &project_id)?;
+    let project = state
+        .store
+        .get_project(&project_id)
+        .map_err(ApiError::internal)?
+        .ok_or_else(ApiError::not_found)?;
+    let workspace = path_for_current_os(&input.workspace.to_string_lossy());
+    if path_for_current_os(&project.workspace_path) != workspace {
+        return Err(ApiError::bad(
+            "communications workspace must match the registered project workspace",
+        ));
+    }
+
+    let mut agents = input.agents;
+    for participant in
+        registered_communication_participants(&state, &project_id).map_err(ApiError::internal)?
+    {
+        if !agents
+            .iter()
+            .any(|registered| registered.name == participant.name)
+        {
+            agents.push(participant);
+        }
+    }
+    if !agents.iter().any(|route| route.name == "project-inbox") {
+        agents.push(communications::AgentRoute {
+            name: "project-inbox".into(),
+            role: "project".into(),
+            capabilities: vec!["messages.receive".into()],
+        });
+    }
+    let route = communications::ProjectRoute {
+        project_id: project_id.clone(),
+        workspace,
+        attachment: path_for_current_os(&input.attachment.to_string_lossy()),
+        communications: path_for_current_os(&input.communications.to_string_lossy()),
+        shared_remote: input.shared_remote,
+        git_remote: input.git_remote,
+        git_visibility: input.git_visibility,
+        agents,
+    };
+    route
+        .validate()
+        .map_err(|error| ApiError::bad(error.to_string()))?;
+    state
+        .store
+        .set_project_communications(&ProjectCommunicationMapping {
+            project_id: project_id.clone(),
+            workspace_path: route.workspace.to_string_lossy().into_owned(),
+            attachment_path: route.attachment.to_string_lossy().into_owned(),
+            communications_path: route.communications.to_string_lossy().into_owned(),
+            shared_remote: route.shared_remote.clone(),
+            git_remote: route.git_remote.clone(),
+            git_visibility: route.git_visibility.clone(),
+            agents_json: serde_json::to_string(&route.agents)
+                .map_err(|error| ApiError::internal(error.into()))?,
+        })
+        .map_err(ApiError::internal)?;
+    state.communication_engines.lock().await.remove(&project_id);
+    Ok(Json(route))
+}
+
+async fn get_communications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> ApiResult<Json<communications::ProjectRoute>> {
+    checked(&state, &headers, &project_id)?;
+    Ok(Json(project_route(&state, &project_id)?))
+}
+
+async fn delete_communications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> ApiResult<StatusCode> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    let (outbox_depth, acknowledgement_outbox_depth, _, _) =
+        communications::filesystem_metrics(&route).map_err(ApiError::internal)?;
+    if outbox_depth > 0 || acknowledgement_outbox_depth > 0 {
+        return Err(ApiError::conflict(format!(
+            "cannot unregister communications while {outbox_depth} message and \
+             {acknowledgement_outbox_depth} acknowledgement outbox item(s) remain"
+        )));
+    }
+    if !state
+        .store
+        .delete_project_communications(&project_id)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::not_found());
+    }
+    state.communication_engines.lock().await.remove(&project_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SendCommunication {
+    sender: String,
+    recipient: String,
+    #[serde(default = "inline_payload_reference")]
+    payload_reference: String,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    reply_required: bool,
+    idempotency_key: Option<String>,
+    #[serde(default = "default_ack_timeout")]
+    acknowledgement_timeout_seconds: u64,
+}
+
+fn inline_payload_reference() -> String {
+    "inline".into()
+}
+
+fn default_ack_timeout() -> u64 {
+    30
+}
+
+async fn send_communication(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<SendCommunication>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    checked(&state, &headers, &project_id)?;
+    if !(5..=3600).contains(&input.acknowledgement_timeout_seconds) {
+        return Err(ApiError::bad(
+            "acknowledgement_timeout_seconds must be between 5 and 3600",
+        ));
+    }
+    let route = project_route(&state, &project_id)?;
+    let mut engines = state.communication_engines.lock().await;
+    let message = if let Some(key) = input.idempotency_key.as_deref() {
+        match communications::find_message_by_idempotency_key(&route, key)
+            .map_err(ApiError::internal)?
+        {
+            Some(existing) => {
+                if existing.sender != input.sender
+                    || existing.recipient != input.recipient
+                    || existing.payload_reference != input.payload_reference
+                    || existing.payload != input.payload
+                    || existing.reply_required != input.reply_required
+                {
+                    return Err(ApiError::bad(
+                        "idempotency key already belongs to a different message",
+                    ));
+                }
+                existing
+            }
+            None => communications::Message::new_with_ack_deadline(
+                &project_id,
+                input.sender,
+                input.recipient,
+                input.payload_reference,
+                input.payload,
+                input.reply_required,
+                input.idempotency_key,
+                chrono::Duration::seconds(
+                    i64::try_from(input.acknowledgement_timeout_seconds)
+                        .map_err(|error| ApiError::bad(error.to_string()))?,
+                ),
+            ),
+        }
+    } else {
+        communications::Message::new_with_ack_deadline(
+            &project_id,
+            input.sender,
+            input.recipient,
+            input.payload_reference,
+            input.payload,
+            input.reply_required,
+            None,
+            chrono::Duration::seconds(
+                i64::try_from(input.acknowledgement_timeout_seconds)
+                    .map_err(|error| ApiError::bad(error.to_string()))?,
+            ),
+        )
+    };
+    let engine = engines.entry(project_id).or_insert_with(|| {
+        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+    });
+    let receipt = engine.send(&route, &message).map_err(ApiError::internal)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({"message":message,"delivery":receipt})),
+    ))
+}
+
+async fn list_communications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    let messages = communications::list_messages(&route).map_err(ApiError::internal)?;
+    Ok(Json(json!({"items":messages})))
+}
+
+#[derive(Deserialize)]
+struct ClaimCommunication {
+    recipient: String,
+}
+
+fn communication_actor_may_process(
+    route: &communications::ProjectRoute,
+    message: &communications::Message,
+    actor: &str,
+) -> bool {
+    actor == message.recipient
+        || route.agents.iter().any(|participant| {
+            participant.name == actor
+                && (participant.name == message.recipient || participant.role == message.recipient)
+        })
+}
+
+async fn claim_communication(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, message_id)): Path<(String, String)>,
+    Json(input): Json<ClaimCommunication>,
+) -> ApiResult<Json<Value>> {
+    checked_communication_actor(&state, &headers, &project_id, &input.recipient)?;
+    let route = project_route(&state, &project_id)?;
+    let message = communications::read_message(&route, &message_id).map_err(ApiError::internal)?;
+    if !communication_actor_may_process(&route, &message, &input.recipient) {
+        return Err(ApiError::bad(
+            "claimant is not the message's intended recipient or role",
+        ));
+    }
+    let claimed = communications::claim_message(&route, &message).map_err(ApiError::internal)?;
+    Ok(Json(json!({"message_id":message_id,"claimed":claimed})))
+}
+
+#[derive(Deserialize)]
+struct AcknowledgeCommunication {
+    recipient: String,
+}
+
+async fn acknowledge_communication(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, message_id)): Path<(String, String)>,
+    Json(input): Json<AcknowledgeCommunication>,
+) -> ApiResult<Json<Value>> {
+    checked_communication_actor(&state, &headers, &project_id, &input.recipient)?;
+    let route = project_route(&state, &project_id)?;
+    let message = communications::read_message(&route, &message_id).map_err(ApiError::internal)?;
+    if !communication_actor_may_process(&route, &message, &input.recipient) {
+        return Err(ApiError::bad(
+            "acknowledger is not the message's intended recipient or role",
+        ));
+    }
+    let acknowledgement = communications::Acknowledgement {
+        message_id,
+        project_id: project_id.clone(),
+        recipient: input.recipient,
+        processed_at: chrono::Utc::now(),
+        idempotency_key: message.idempotency_key,
+    };
+    let mut engines = state.communication_engines.lock().await;
+    let engine = engines.entry(project_id).or_insert_with(|| {
+        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+    });
+    let (acknowledgement, recorded, delivery) = engine
+        .acknowledge(&route, &acknowledgement)
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"acknowledgement":acknowledgement,"recorded":recorded,"delivery":delivery}),
+    ))
+}
+
+async fn mint_communication_actor_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, actor)): Path<(String, String)>,
+) -> ApiResult<(
+    StatusCode,
+    Json<ferryman_core::CommunicationActorRegistration>,
+)> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    if !route.agents.iter().any(|route| route.name == actor) {
+        return Err(ApiError::bad(
+            "actor is not registered for this project communications route",
+        ));
+    }
+    let registration = state
+        .store
+        .mint_communication_actor_token(&project_id, &actor)
+        .map_err(ApiError::internal)?;
+    Ok((StatusCode::CREATED, Json(registration)))
+}
+
+async fn list_communication_actor_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project_id, actor)): Path<(String, String)>,
+    Query(query): Query<ActorInboxQuery>,
+) -> ApiResult<Json<Value>> {
+    checked_communication_actor(&state, &headers, &project_id, &actor)?;
+    let route = project_route(&state, &project_id)?;
+    let participant = route
+        .agents
+        .iter()
+        .find(|participant| participant.name == actor)
+        .ok_or_else(ApiError::not_found)?
+        .clone();
+    let synchronized_via = if query.synchronize {
+        let mut engines = state.communication_engines.lock().await;
+        let engine = engines.entry(project_id.clone()).or_insert_with(|| {
+            communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+        });
+        engine
+            .synchronize_inbound(&route)
+            .map_err(ApiError::internal)?
+    } else {
+        communications::TransportKind::LocalFilesystem
+    };
+    let messages = communications::list_messages(&route)
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .filter(|message| {
+            (message.recipient == actor || message.recipient == participant.role)
+                && !communications::is_acknowledged(&route, &message.id)
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(
+        json!({"items":messages,"synchronized_via":synchronized_via}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ActorInboxQuery {
+    #[serde(default = "default_true")]
+    synchronize: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+async fn reconcile_communications(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    let mut engines = state.communication_engines.lock().await;
+    let engine = engines.entry(project_id).or_insert_with(|| {
+        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+    });
+    let receipts = engine
+        .reconcile_outbox(&route)
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({"items":receipts})))
+}
+
+async fn communications_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Query(query): Query<CommunicationsStatusQuery>,
+) -> ApiResult<Json<communications::CommunicationsStatus>> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    let mut engines = state.communication_engines.lock().await;
+    let engine = engines.entry(project_id).or_insert_with(|| {
+        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+    });
+    let status = engine
+        .status(&route, query.probe_external)
+        .map_err(ApiError::internal)?;
+    Ok(Json(status))
+}
+
+#[derive(Debug, Deserialize)]
+struct CommunicationsStatusQuery {
+    #[serde(default = "default_true")]
+    probe_external: bool,
+}
+
+pub fn start_communications_reconciler(state: AppState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            let mappings = match state.store.list_project_communications() {
+                Ok(mappings) => mappings,
+                Err(error) => {
+                    tracing::warn!(%error, "communications reconciliation registry read failed");
+                    continue;
+                }
+            };
+            let mut engines = state.communication_engines.lock().await;
+            for mapping in mappings {
+                let route = match project_route_from_mapping(&mapping) {
+                    Ok(route) => route,
+                    Err(error) => {
+                        tracing::warn!(
+                            project_id = %mapping.project_id,
+                            %error,
+                            "invalid communications route skipped"
+                        );
+                        continue;
+                    }
+                };
+                let engine = engines
+                    .entry(mapping.project_id.clone())
+                    .or_insert_with(|| {
+                        communications::system_delivery_engine(
+                            state.wsl_distribution.as_ref().clone(),
+                        )
+                    });
+                if let Err(error) = engine.reconcile_outbox(&route) {
+                    tracing::warn!(
+                        project_id = %mapping.project_id,
+                        %error,
+                        "communications reconciliation failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
 #[derive(Deserialize)]
 struct CreateAgent {
     role: String,
@@ -474,6 +1104,7 @@ async fn create_agent(
             created_at: chrono::Utc::now().to_rfc3339(),
         })
         .map_err(ApiError::internal)?;
+    refresh_communication_participants(&state, &agent.project_id).map_err(ApiError::internal)?;
     Ok((StatusCode::CREATED, Json(agent)))
 }
 async fn list_agents(
@@ -1080,15 +1711,12 @@ async fn register_worker(
     Json(body): Json<RegisterWorker>,
 ) -> ApiResult<(StatusCode, Json<ferryman_core::WorkerRegistration>)> {
     checked(&state, &headers, &project)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(
-            state
-                .store
-                .register_worker(&project, body.capabilities)
-                .map_err(ApiError::internal)?,
-        ),
-    ))
+    let registration = state
+        .store
+        .register_worker(&project, body.capabilities)
+        .map_err(ApiError::internal)?;
+    refresh_communication_participants(&state, &project).map_err(ApiError::internal)?;
+    Ok((StatusCode::CREATED, Json(registration)))
 }
 async fn heartbeat(
     State(state): State<AppState>,
@@ -1526,6 +2154,227 @@ mod tests {
         }
         assert!(mirror.contains("Keep this fact after worker replacement."));
     }
+
+    #[tokio::test]
+    async fn communication_claims_require_scoped_actor_tokens() {
+        let dir =
+            std::env::temp_dir().join(format!("ferryman-actor-test-{}", uuid::Uuid::new_v4()));
+        let workspace = dir.join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications_root = attachment.join("ferryman");
+        std::fs::create_dir_all(&communications_root).unwrap();
+        let store = SqliteStore::open(dir.join("bridge.db")).unwrap();
+        store
+            .create_project(
+                "alpha",
+                "Alpha",
+                "alpha-token-1234",
+                &workspace.to_string_lossy(),
+            )
+            .unwrap();
+        let state = AppState::new(store, dir.join("artifacts"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state)).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let configured = client
+            .post(format!("http://{address}/v1/projects/alpha/communications"))
+            .bearer_auth("alpha-token-1234")
+            .json(&json!({
+                "workspace": workspace.to_string_lossy(),
+                "attachment": attachment.to_string_lossy(),
+                "communications": communications_root.to_string_lossy(),
+                "shared_remote": "/beastly-bridges/alpha",
+                "git_remote": "https://github.com/estejosh/alpha-bridge.git",
+                "git_visibility": "private",
+                "agents": [{
+                    "name": "alpha-observer",
+                    "role": "observer",
+                    "capabilities": ["messages.receive"]
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(configured.status(), StatusCode::OK);
+
+        let registration = client
+            .post(format!(
+                "http://{address}/v1/projects/alpha/communications/actors/project-inbox/token"
+            ))
+            .bearer_auth("alpha-token-1234")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let actor_token = registration["actor_token"].as_str().unwrap();
+        let observer_registration = client
+            .post(format!(
+                "http://{address}/v1/projects/alpha/communications/actors/alpha-observer/token"
+            ))
+            .bearer_auth("alpha-token-1234")
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let observer_token = observer_registration["actor_token"].as_str().unwrap();
+        let sent = client
+            .post(format!(
+                "http://{address}/v1/projects/alpha/communications/messages"
+            ))
+            .bearer_auth("alpha-token-1234")
+            .json(&json!({
+                "sender": "operator",
+                "recipient": "project-inbox",
+                "payload": {"task":"fixture"},
+                "idempotency_key": "fixture-local-hub-smoke"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sent.status(), StatusCode::CREATED);
+        let sent = sent.json::<Value>().await.unwrap();
+        assert_eq!(sent["delivery"]["transport"], "local_filesystem");
+        let message_id = sent["message"]["id"].as_str().unwrap();
+        let repeated = client
+            .post(format!(
+                "http://{address}/v1/projects/alpha/communications/messages"
+            ))
+            .bearer_auth("alpha-token-1234")
+            .json(&json!({
+                "sender": "operator",
+                "recipient": "project-inbox",
+                "payload": {"task":"fixture"},
+                "idempotency_key": "fixture-local-hub-smoke"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::CREATED);
+        let repeated = repeated.json::<Value>().await.unwrap();
+        assert_eq!(repeated["message"]["id"], message_id);
+
+        let inbox_url = format!(
+            "http://{address}/v1/projects/alpha/communications/actors/project-inbox/messages?synchronize=false"
+        );
+        let project_token_inbox = client
+            .get(&inbox_url)
+            .bearer_auth("alpha-token-1234")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(project_token_inbox.status(), StatusCode::UNAUTHORIZED);
+        let actor_inbox = client
+            .get(&inbox_url)
+            .bearer_auth(actor_token)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(actor_inbox["items"].as_array().unwrap().len(), 1);
+        let observer_inbox = client
+            .get(format!(
+                "http://{address}/v1/projects/alpha/communications/actors/alpha-observer/messages?synchronize=false"
+            ))
+            .bearer_auth(observer_token)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert!(observer_inbox["items"].as_array().unwrap().is_empty());
+
+        let claim_url = format!(
+            "http://{address}/v1/projects/alpha/communications/messages/{}/claim",
+            message_id
+        );
+        let project_token_claim = client
+            .post(&claim_url)
+            .bearer_auth("alpha-token-1234")
+            .json(&json!({"recipient":"project-inbox"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(project_token_claim.status(), StatusCode::UNAUTHORIZED);
+        let actor_claim = client
+            .post(&claim_url)
+            .bearer_auth(actor_token)
+            .json(&json!({"recipient":"project-inbox"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(actor_claim.status(), StatusCode::OK);
+        let acknowledgement_url = format!(
+            "http://{address}/v1/projects/alpha/communications/messages/{}/acknowledge",
+            message_id
+        );
+        let wrong_actor_acknowledgement = client
+            .post(&acknowledgement_url)
+            .bearer_auth(observer_token)
+            .json(&json!({"recipient":"alpha-observer"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_actor_acknowledgement.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let detach_with_outbox = client
+            .delete(format!("http://{address}/v1/projects/alpha/communications"))
+            .bearer_auth("alpha-token-1234")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(detach_with_outbox.status(), StatusCode::CONFLICT);
+        let acknowledgement = client
+            .post(acknowledgement_url)
+            .bearer_auth(actor_token)
+            .json(&json!({"recipient":"project-inbox"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(acknowledgement.status(), StatusCode::OK);
+        let acknowledgement = acknowledgement.json::<Value>().await.unwrap();
+        assert_eq!(acknowledgement["delivery"]["transport"], "local_filesystem");
+        let status = client
+            .get(format!(
+                "http://{address}/v1/projects/alpha/communications/status?probe_external=false"
+            ))
+            .bearer_auth("alpha-token-1234")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = status.json::<Value>().await.unwrap();
+        assert_eq!(status["external_probes_performed"], false);
+        assert_eq!(status["local_health"], "healthy");
+        assert_eq!(status["outbox_depth"], 0);
+        assert_eq!(status["acknowledgement_outbox_depth"], 0);
+        let detached = client
+            .delete(format!("http://{address}/v1/projects/alpha/communications"))
+            .bearer_auth("alpha-token-1234")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(detached.status(), StatusCode::NO_CONTENT);
+        let revoked_actor = client
+            .get(&inbox_url)
+            .bearer_auth(actor_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(revoked_actor.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn encrypted_pack_round_trip_is_read_only_and_authenticated() {
         let dir = std::env::temp_dir().join(format!("bridge-pack-test-{}", uuid::Uuid::new_v4()));

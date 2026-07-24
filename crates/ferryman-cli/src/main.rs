@@ -54,6 +54,10 @@ enum Command {
         #[command(subcommand)]
         command: Continuity,
     },
+    Communications {
+        #[command(subcommand)]
+        command: Communications,
+    },
 }
 #[derive(Subcommand, Clone)]
 enum Projects {
@@ -72,6 +76,75 @@ enum Projects {
     Delete {
         #[arg(long)]
         id: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum Communications {
+    Send {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        sender: String,
+        #[arg(long)]
+        recipient: String,
+        #[arg(long, default_value = "null")]
+        payload: String,
+        #[arg(long)]
+        reply_required: bool,
+        #[arg(long)]
+        idempotency_key: Option<String>,
+        #[arg(long, default_value_t = 30)]
+        acknowledgement_timeout_seconds: u64,
+    },
+    List {
+        #[arg(long)]
+        project: String,
+    },
+    Inbox {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        actor: String,
+        /// Read only the local portable inbox without MEGA or Git synchronization.
+        #[arg(long)]
+        local_only: bool,
+    },
+    Claim {
+        #[arg(long)]
+        project: String,
+        message: String,
+        #[arg(long)]
+        recipient: String,
+    },
+    Acknowledge {
+        #[arg(long)]
+        project: String,
+        message: String,
+        #[arg(long)]
+        recipient: String,
+    },
+    Reconcile {
+        #[arg(long)]
+        project: String,
+    },
+    Status {
+        #[arg(long)]
+        project: String,
+        /// Report filesystem/cached state without running MEGA or Git probes.
+        #[arg(long)]
+        local_only: bool,
+    },
+    MintActorToken {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        actor: String,
+    },
+    /// Unregister the hub mapping and actor tokens; portable/local files are preserved.
+    Unregister {
+        #[arg(long)]
+        project: String,
     },
 }
 
@@ -275,6 +348,128 @@ async fn main() -> Result<()> {
             Projects::List => call(&cli, "GET", "/v1/projects".to_string(), None).await?,
             Projects::Delete { id } => {
                 call(&cli, "DELETE", format!("/v1/projects/{id}"), None).await?
+            }
+        },
+        Command::Communications { command } => match command {
+            Communications::Send {
+                project,
+                sender,
+                recipient,
+                payload,
+                reply_required,
+                idempotency_key,
+                acknowledgement_timeout_seconds,
+            } => {
+                let payload: Value =
+                    serde_json::from_str(&payload).context("payload must be valid JSON")?;
+                call(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/communications/messages"),
+                    Some(json!({
+                        "sender":sender,
+                        "recipient":recipient,
+                        "payload_reference":"inline",
+                        "payload":payload,
+                        "reply_required":reply_required,
+                        "idempotency_key":idempotency_key,
+                        "acknowledgement_timeout_seconds":acknowledgement_timeout_seconds
+                    })),
+                )
+                .await?
+            }
+            Communications::List { project } => {
+                call(
+                    &cli,
+                    "GET",
+                    format!("/v1/projects/{project}/communications/messages"),
+                    None,
+                )
+                .await?
+            }
+            Communications::Inbox {
+                project,
+                actor,
+                local_only,
+            } => {
+                let query = if local_only { "?synchronize=false" } else { "" };
+                call(
+                    &cli,
+                    "GET",
+                    format!("/v1/projects/{project}/communications/actors/{actor}/messages{query}"),
+                    None,
+                )
+                .await?
+            }
+            Communications::Claim {
+                project,
+                message,
+                recipient,
+            } => {
+                call(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/communications/messages/{message}/claim"),
+                    Some(json!({"recipient":recipient})),
+                )
+                .await?
+            }
+            Communications::Acknowledge {
+                project,
+                message,
+                recipient,
+            } => {
+                call(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/communications/messages/{message}/acknowledge"),
+                    Some(json!({"recipient":recipient})),
+                )
+                .await?
+            }
+            Communications::Reconcile { project } => {
+                call(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/communications/reconcile"),
+                    None,
+                )
+                .await?
+            }
+            Communications::Status {
+                project,
+                local_only,
+            } => {
+                let query = if local_only {
+                    "?probe_external=false"
+                } else {
+                    ""
+                };
+                call(
+                    &cli,
+                    "GET",
+                    format!("/v1/projects/{project}/communications/status{query}"),
+                    None,
+                )
+                .await?
+            }
+            Communications::MintActorToken { project, actor } => {
+                call(
+                    &cli,
+                    "POST",
+                    format!("/v1/projects/{project}/communications/actors/{actor}/token"),
+                    None,
+                )
+                .await?
+            }
+            Communications::Unregister { project } => {
+                call(
+                    &cli,
+                    "DELETE",
+                    format!("/v1/projects/{project}/communications"),
+                    None,
+                )
+                .await?
             }
         },
         Command::Workers { command } => match command {

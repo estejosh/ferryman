@@ -4,6 +4,13 @@
 
 The core orchestrates durable units of work; it does not execute models, decide a project's business logic, or claim to sandbox arbitrary native code. Local single-node correctness comes before distributed scale.
 
+Ferryman is one machine-wide application. Each attached project has an
+outer machine-local `.ferryman` attachment and an inner portable
+`.ferryman/ferryman` communications repository. Live message delivery uses
+local filesystem, then an existing MEGAcmd shared-folder sync, then private Git
+live fallback. This subsystem is separate from encrypted recovery-pack
+delivery; see [live communications](COMMUNICATIONS.md).
+
 ## v0.1 state machine
 
 ```mermaid
@@ -37,7 +44,7 @@ stateDiagram-v2
 
 ## Artifact mirrors
 
-Local disk (or an opted-in mapped/network HDD) is authoritative. Google Drive is an optional post-write mirror: it writes only to a pre-existing folder supplied by ID and does not create public links or permissions. A Drive mirror failure is visible as an event but does not erase or invalidate the local artifact. MEGA is reserved for the same interface; it is not implemented until an explicit, supportable authentication and private-folder design is selected.
+Local disk (or an opted-in mapped/network HDD) is authoritative. Google Drive is an optional post-write mirror: it writes only to a pre-existing folder supplied by ID and does not create public links or permissions. A Drive mirror failure is visible as an event but does not erase or invalidate the local artifact. MEGA artifact mirroring remains unimplemented. This is separate from live communications, which uses the already-running MEGAcmd filesystem sync and never implements a MEGA API client.
 
 ## Roadmap
 

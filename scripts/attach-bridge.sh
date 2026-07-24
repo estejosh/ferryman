@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Attach a project to THE single shared Ferryman hub. The project keeps a full,
-# own-git .ferryman/ directory holding only its config + scoped token; the server
-# and database are the shared hub's. This is the default for many repos on one
-# machine — one running instance, N projects.
+# Legacy Linux attachment helper. New installations should use
+# `scripts/attach-project.sh` (or `attach-project.ps1` on Windows), which creates
+# the outer-local / inner-portable layout and supports safe adoption, MEGAcmd
+# registration, framework-neutral routing, and dry-run. This helper retains the
+# old behavior for backward compatibility only.
 #
 # Usage: scripts/attach-bridge.sh [--exclude-mode] <project-mount-path> <slug> [hub-endpoint]
 #   e.g. scripts/attach-bridge.sh /mnt/x/hone hone

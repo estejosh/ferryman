@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use ferryman_core::SqliteStore;
 use ferryman_server::{
-    AppState, app,
+    AppState, app, start_communications_reconciler,
     workspace::{provision_private_repository, select_artifact_root},
 };
 use std::{net::SocketAddr, path::PathBuf};
@@ -37,6 +37,9 @@ struct Args {
     max_artifact_bytes: u64,
     #[arg(long, default_value = "127.0.0.1:8787")]
     listen: SocketAddr,
+    /// WSL distribution hosting the existing MEGAcmd service.
+    #[arg(long, env = "FERRYMAN_WSL_DISTRIBUTION", default_value = "Ubuntu")]
+    wsl_distribution: String,
     #[arg(long)]
     no_demo_project: bool,
     /// Require FERRYMAN_ADMIN_TOKEN for project creation and disable demo bootstrap.
@@ -86,7 +89,8 @@ async fn main() -> Result<()> {
     let mut state = AppState::new(store, artifacts)
         .with_workspace_root(args.workspace_root)
         .with_memory_root(args.memory_root)
-        .with_max_artifact_bytes(args.max_artifact_bytes);
+        .with_max_artifact_bytes(args.max_artifact_bytes)
+        .with_wsl_distribution(args.wsl_distribution);
     tokio::fs::create_dir_all(&args.recovery_root).await?;
     let recovery_key = load_recovery_key(args.production)?;
     state = state.with_recovery_key(args.recovery_root, recovery_key.0, recovery_key.1);
@@ -115,6 +119,7 @@ async fn main() -> Result<()> {
     }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(address=%args.listen,"orchestrator bridge listening");
+    let _communications_reconciler = start_communications_reconciler(state.clone());
     // On a loopback bind, reject requests whose Host header is not a loopback
     // name/IP. A raw loopback bind is not a defense against DNS rebinding: a
     // browser can resolve attacker.example to 127.0.0.1 and reach the API as

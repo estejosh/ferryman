@@ -72,6 +72,24 @@ pub struct Project {
     pub created_at: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectCommunicationMapping {
+    pub project_id: String,
+    pub workspace_path: String,
+    pub attachment_path: String,
+    pub communications_path: String,
+    pub shared_remote: String,
+    pub git_remote: String,
+    pub git_visibility: String,
+    pub agents_json: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunicationActorRegistration {
+    pub project_id: String,
+    pub actor: String,
+    pub actor_token: String,
+    pub expires_at: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentPersistence {
     Temporal,
@@ -207,6 +225,27 @@ CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project
 CREATE INDEX IF NOT EXISTS events_project_job_idx ON events(project_id, job_id, id);
 CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), capabilities_json TEXT NOT NULL, last_heartbeat TEXT NOT NULL, token_hash TEXT NOT NULL DEFAULT '', token_expires_at TEXT);
 CREATE TABLE IF NOT EXISTS artifacts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), job_id TEXT NOT NULL REFERENCES jobs(id), sha256 TEXT NOT NULL, content_type TEXT NOT NULL, byte_len INTEGER NOT NULL, created_at TEXT NOT NULL);")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_communications (
+                project_id TEXT PRIMARY KEY REFERENCES projects(id),
+                workspace_path TEXT NOT NULL,
+                attachment_path TEXT NOT NULL,
+                communications_path TEXT NOT NULL,
+                shared_remote TEXT NOT NULL,
+                git_remote TEXT NOT NULL,
+                git_visibility TEXT NOT NULL CHECK(git_visibility = 'private'),
+                agents_json TEXT NOT NULL DEFAULT '[]'
+            );",
+        )?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS communication_actor_tokens (
+                project_id TEXT NOT NULL REFERENCES projects(id),
+                actor TEXT NOT NULL,
+                token_hash TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY(project_id, actor)
+            );",
+        )?;
         let _ = conn.execute(
             "ALTER TABLE projects ADD COLUMN workspace_path TEXT NOT NULL DEFAULT ''",
             [],
@@ -294,6 +333,169 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         }
         Ok(out)
     }
+    pub fn set_project_communications(&self, mapping: &ProjectCommunicationMapping) -> Result<()> {
+        if mapping.git_visibility != "private" {
+            return Err(anyhow!("communications Git repository must be private"));
+        }
+        let expected_remote = format!("https://github.com/estejosh/{}-bridge", mapping.project_id)
+            .to_ascii_lowercase();
+        if normalize_git_remote(&mapping.git_remote) != expected_remote {
+            return Err(anyhow!(
+                "communications Git remote must match the exact expected project repository"
+            ));
+        }
+        if mapping.shared_remote != format!("/beastly-bridges/{}", mapping.project_id) {
+            return Err(anyhow!(
+                "shared remote must match the exact expected private project path"
+            ));
+        }
+        let workspace = normalize_path_text(&mapping.workspace_path);
+        let attachment = normalize_path_text(&mapping.attachment_path);
+        let communications = normalize_path_text(&mapping.communications_path);
+        if attachment != format!("{workspace}/.ferryman")
+            || communications != format!("{attachment}/ferryman")
+        {
+            return Err(anyhow!(
+                "communications paths must use <workspace>/.ferryman/ferryman"
+            ));
+        }
+        let _: Vec<serde_json::Value> =
+            serde_json::from_str(&mapping.agents_json).context("agents_json must be valid JSON")?;
+        self.db()?.execute(
+            "INSERT INTO project_communications
+             (project_id,workspace_path,attachment_path,communications_path,shared_remote,git_remote,git_visibility,agents_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(project_id) DO UPDATE SET
+             workspace_path=excluded.workspace_path,attachment_path=excluded.attachment_path,
+             communications_path=excluded.communications_path,shared_remote=excluded.shared_remote,
+             git_remote=excluded.git_remote,git_visibility=excluded.git_visibility,
+             agents_json=excluded.agents_json",
+            params![
+                mapping.project_id,
+                mapping.workspace_path,
+                mapping.attachment_path,
+                mapping.communications_path,
+                mapping.shared_remote,
+                mapping.git_remote,
+                mapping.git_visibility,
+                mapping.agents_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_project_communications(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectCommunicationMapping>> {
+        self.db()?
+            .query_row(
+                "SELECT project_id,workspace_path,attachment_path,communications_path,
+                 shared_remote,git_remote,git_visibility,agents_json
+                 FROM project_communications WHERE project_id=?1",
+                [project_id],
+                |row| {
+                    Ok(ProjectCommunicationMapping {
+                        project_id: row.get(0)?,
+                        workspace_path: row.get(1)?,
+                        attachment_path: row.get(2)?,
+                        communications_path: row.get(3)?,
+                        shared_remote: row.get(4)?,
+                        git_remote: row.get(5)?,
+                        git_visibility: row.get(6)?,
+                        agents_json: row.get(7)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_project_communications(&self) -> Result<Vec<ProjectCommunicationMapping>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT project_id,workspace_path,attachment_path,communications_path,
+             shared_remote,git_remote,git_visibility,agents_json
+             FROM project_communications ORDER BY project_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectCommunicationMapping {
+                project_id: row.get(0)?,
+                workspace_path: row.get(1)?,
+                attachment_path: row.get(2)?,
+                communications_path: row.get(3)?,
+                shared_remote: row.get(4)?,
+                git_remote: row.get(5)?,
+                git_visibility: row.get(6)?,
+                agents_json: row.get(7)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn delete_project_communications(&self, project_id: &str) -> Result<bool> {
+        let mut db = self.db()?;
+        let transaction = db.transaction()?;
+        transaction.execute(
+            "DELETE FROM communication_actor_tokens WHERE project_id=?1",
+            [project_id],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM project_communications WHERE project_id=?1",
+            [project_id],
+        )?;
+        transaction.commit()?;
+        Ok(deleted > 0)
+    }
+
+    pub fn mint_communication_actor_token(
+        &self,
+        project_id: &str,
+        actor: &str,
+    ) -> Result<CommunicationActorRegistration> {
+        if actor.is_empty()
+            || matches!(actor, "." | "..")
+            || !actor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(anyhow!("communication actor name is invalid"));
+        }
+        let actor_token = Uuid::new_v4().simple().to_string();
+        let expires_at = (Utc::now() + chrono::Duration::hours(8)).to_rfc3339();
+        self.db()?.execute(
+            "INSERT INTO communication_actor_tokens(project_id,actor,token_hash,expires_at)
+             VALUES(?1,?2,?3,?4)
+             ON CONFLICT(project_id,actor) DO UPDATE SET
+             token_hash=excluded.token_hash,expires_at=excluded.expires_at",
+            params![project_id, actor, hash(&actor_token), expires_at],
+        )?;
+        Ok(CommunicationActorRegistration {
+            project_id: project_id.into(),
+            actor: actor.into(),
+            actor_token,
+            expires_at,
+        })
+    }
+
+    pub fn authenticate_communication_actor(
+        &self,
+        project_id: &str,
+        actor: &str,
+        token: &str,
+    ) -> Result<bool> {
+        let valid: Option<i64> = self
+            .db()?
+            .query_row(
+                "SELECT 1 FROM communication_actor_tokens
+                 WHERE project_id=?1 AND actor=?2 AND token_hash=?3 AND expires_at>?4",
+                params![project_id, actor, hash(token), now()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(valid.is_some())
+    }
     /// Delete a project and every row that belongs to it, in one transaction.
     /// Foreign keys are ON but not ON DELETE CASCADE, so children are removed
     /// first (child tables before the tables they reference). Returns false if
@@ -313,6 +515,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             return Ok(false);
         }
         for sql in [
+            "DELETE FROM communication_actor_tokens WHERE project_id=?1",
             "DELETE FROM artifacts WHERE project_id=?1",
             "DELETE FROM artifact_bypasses WHERE project_id=?1",
             "DELETE FROM memory_candidates WHERE project_id=?1",
@@ -320,6 +523,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             "DELETE FROM project_memory WHERE project_id=?1",
             "DELETE FROM agents WHERE project_id=?1",
             "DELETE FROM workers WHERE project_id=?1",
+            "DELETE FROM project_communications WHERE project_id=?1",
             "DELETE FROM events WHERE project_id=?1",
             "DELETE FROM jobs WHERE project_id=?1",
             "DELETE FROM projects WHERE id=?1",
@@ -506,6 +710,24 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             worker_token,
             expires_at,
         })
+    }
+    pub fn list_workers(&self, project_id: &str) -> Result<Vec<Worker>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT id,project_id,capabilities_json,last_heartbeat
+             FROM workers WHERE project_id=?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([project_id], |row| {
+            let capabilities_json: String = row.get(2)?;
+            Ok(Worker {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                capabilities: serde_json::from_str(&capabilities_json).unwrap_or_default(),
+                last_heartbeat: row.get(3)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
     pub fn authenticate_worker(
         &self,
@@ -1147,6 +1369,14 @@ fn append_event(
 fn now() -> String {
     Utc::now().to_rfc3339()
 }
+
+fn normalize_path_text(value: &str) -> String {
+    value.replace('\\', "/").trim_end_matches('/').to_owned()
+}
+
+fn normalize_git_remote(value: &str) -> String {
+    value.trim().trim_end_matches(".git").to_ascii_lowercase()
+}
 fn hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
@@ -1199,4 +1429,80 @@ fn is_sensitive_key(key: &str) -> bool {
     ]
     .iter()
     .any(|marker| key.contains(marker))
+}
+
+#[cfg(test)]
+mod communication_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn project_communication_mapping_is_private_and_project_scoped() {
+        let store = SqliteStore::open(":memory:").unwrap();
+        store
+            .create_project("alpha", "Alpha", "not-a-real-token", r"X:\alpha")
+            .unwrap();
+        let mapping = ProjectCommunicationMapping {
+            project_id: "alpha".into(),
+            workspace_path: r"X:\alpha".into(),
+            attachment_path: r"X:\alpha\.ferryman".into(),
+            communications_path: r"X:\alpha\.ferryman\ferryman".into(),
+            shared_remote: "/beastly-bridges/alpha".into(),
+            git_remote: "https://github.com/estejosh/alpha-bridge.git".into(),
+            git_visibility: "private".into(),
+            agents_json: r#"[{"name":"alpha-builder","role":"builder","capabilities":["code"]}]"#
+                .into(),
+        };
+        store.set_project_communications(&mapping).unwrap();
+        assert_eq!(
+            store.get_project_communications("alpha").unwrap(),
+            Some(mapping.clone())
+        );
+        let mut public = mapping;
+        public.git_visibility = "public".into();
+        assert!(store.set_project_communications(&public).is_err());
+        assert!(
+            store
+                .get_project_communications("another-project")
+                .unwrap()
+                .is_none()
+        );
+        let actor = store
+            .mint_communication_actor_token("alpha", "project-inbox")
+            .unwrap();
+        assert!(
+            store
+                .authenticate_communication_actor("alpha", "project-inbox", &actor.actor_token)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .authenticate_communication_actor("alpha", "project-inbox", "wrong")
+                .unwrap()
+        );
+        let rotated = store
+            .mint_communication_actor_token("alpha", "project-inbox")
+            .unwrap();
+        assert!(
+            !store
+                .authenticate_communication_actor("alpha", "project-inbox", &actor.actor_token)
+                .unwrap()
+        );
+        assert!(
+            store
+                .authenticate_communication_actor("alpha", "project-inbox", &rotated.actor_token)
+                .unwrap()
+        );
+        assert!(
+            !store
+                .authenticate_communication_actor("other", "project-inbox", &rotated.actor_token)
+                .unwrap()
+        );
+        assert!(store.delete_project_communications("alpha").unwrap());
+        assert!(store.get_project_communications("alpha").unwrap().is_none());
+        assert!(
+            !store
+                .authenticate_communication_actor("alpha", "project-inbox", &rotated.actor_token)
+                .unwrap()
+        );
+    }
 }

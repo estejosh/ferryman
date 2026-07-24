@@ -4,15 +4,202 @@ info:
   version: 0.1.0
 servers: [{url: http://127.0.0.1:8787}]
 components:
-  securitySchemes: {ProjectBearer: {type: http, scheme: bearer}}
+  securitySchemes:
+    ProjectBearer:
+      type: http
+      scheme: bearer
+      description: Project-scoped operator token.
+    ActorBearer:
+      type: http
+      scheme: bearer
+      description: Eight-hour communications actor token returned once by the actor token endpoint.
   schemas:
     Error: {type: object, required: [code, message], properties: {code: {type: string}, message: {type: string}}}
     Job: {type: object, required: [id, project_id, status, input], properties: {id: {type: string}, project_id: {type: string}, status: {type: string, enum: [pending_approval, queued, leased, succeeded, failed, cancelled]}, input: {type: object}, policy: {type: object}}}
     Artifact: {type: object, required: [id, job_id, sha256, content_type, byte_len], properties: {id: {type: string}, job_id: {type: string}, sha256: {type: string}, content_type: {type: string}, byte_len: {type: integer}}}
+    CommunicationParticipant:
+      type: object
+      additionalProperties: false
+      required: [name, role, capabilities]
+      properties:
+        name: {type: string, pattern: '^[A-Za-z0-9._-]+$', maxLength: 128}
+        role: {type: string, pattern: '^[A-Za-z0-9._-]+$', maxLength: 128}
+        capabilities:
+          type: array
+          maxItems: 128
+          items: {type: string, minLength: 1, maxLength: 128}
+    CommunicationMessage:
+      type: object
+      required: [format, id, project_id, idempotency_key, sender, recipient, created_at, acknowledgement_deadline, payload_reference, payload, reply_required]
+      properties:
+        format: {type: string, const: ferryman-message/v1}
+        id: {type: string, format: uuid}
+        project_id: {type: string}
+        idempotency_key: {type: string, maxLength: 256}
+        sender: {type: string, maxLength: 128}
+        recipient: {type: string, maxLength: 128}
+        created_at: {type: string, format: date-time}
+        acknowledgement_deadline: {type: string, format: date-time}
+        payload_reference: {type: string, maxLength: 2048}
+        payload:
+          description: JSON limited to 256 KiB after serialization; credential-bearing keys are rejected recursively.
+        reply_required: {type: boolean}
+    CommunicationStatus:
+      type: object
+      required: [project_id, external_probes_performed, local_health, shared_health, git_health, git_live, git_inbound_active, preferred_successes, outbox_depth, acknowledgement_outbox_depth, quarantine_files, git_backoff_attempt, updated_at]
+      properties:
+        project_id: {type: string}
+        external_probes_performed: {type: boolean}
+        local_health: {type: string, enum: [healthy, unavailable, rate_limited]}
+        shared_health: {type: string, enum: [healthy, unavailable, rate_limited]}
+        git_health: {type: string, enum: [healthy, unavailable, rate_limited]}
+        git_live: {type: boolean}
+        git_inbound_active: {type: boolean}
+        preferred_successes: {type: integer, minimum: 0}
+        outbox_depth: {type: integer, minimum: 0}
+        acknowledgement_outbox_depth: {type: integer, minimum: 0}
+        oldest_outbox_age_seconds: {type: [integer, 'null'], minimum: 0}
+        quarantine_files: {type: integer, minimum: 0}
+        git_backoff_attempt: {type: integer, minimum: 0}
+        git_retry_after_unix_ms: {type: [integer, 'null'], minimum: 0}
+        updated_at: {type: string, format: date-time}
+    CommunicationActorRegistration:
+      type: object
+      required: [project_id, actor, actor_token, expires_at]
+      properties:
+        project_id: {type: string}
+        actor: {type: string}
+        actor_token: {type: string, writeOnly: true}
+        expires_at: {type: string, format: date-time}
 paths:
   /healthz: {get: {responses: {'200': {description: health}}}}
   /v1/projects:
     post: {summary: Create a project (local setup endpoint), requestBody: {required: true, content: {application/json: {schema: {type: object, required: [id,name,token]}}}}, responses: {'201': {description: created}, '400': {description: invalid, content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}}}}
+  /v1/projects/{project_id}/communications:
+    parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
+    post: {security: [{ProjectBearer: []}], summary: Configure the outer-local and inner-portable project communications mapping, responses: {'200': {description: project route}, '400': {description: unsafe or mismatched route}}}
+    get: {security: [{ProjectBearer: []}], summary: Read the project communications mapping, responses: {'200': {description: project route}, '404': {description: no mapping}}}
+    delete:
+      security: [{ProjectBearer: []}]
+      summary: Unregister the hub mapping and revoke actor tokens without deleting files
+      responses:
+        '204': {description: mapping removed; attachment files remain}
+        '409': {description: refused because durable outbox items remain}
+  /v1/projects/{project_id}/communications/messages:
+    parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
+    post:
+      security: [{ProjectBearer: []}]
+      summary: Durably enqueue and deliver a project-scoped message
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sender, recipient]
+              properties:
+                sender: {type: string, maxLength: 128}
+                recipient: {type: string, maxLength: 128}
+                payload_reference: {type: string, default: inline, maxLength: 2048}
+                payload: {default: null}
+                reply_required: {type: boolean, default: false}
+                idempotency_key: {type: [string, 'null'], maxLength: 256}
+                acknowledgement_timeout_seconds: {type: integer, minimum: 5, maximum: 3600, default: 30}
+      responses:
+        '201': {description: stable message and delivery receipt}
+        '400': {description: invalid route, payload, or idempotency conflict}
+    get: {security: [{ProjectBearer: []}], summary: List portable project messages, responses: {'200': {description: messages}}}
+  /v1/projects/{project_id}/communications/messages/{message_id}/claim:
+    parameters:
+      - {name: project_id, in: path, required: true, schema: {type: string}}
+      - {name: message_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      security: [{ActorBearer: []}]
+      summary: Atomically claim a message idempotency key before execution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipient]
+              properties: {recipient: {type: string}}
+      responses:
+        '200': {description: claim result; claimed false means do not execute}
+        '401': {description: missing, expired, or wrong actor token}
+  /v1/projects/{project_id}/communications/messages/{message_id}/acknowledge:
+    parameters:
+      - {name: project_id, in: path, required: true, schema: {type: string}}
+      - {name: message_id, in: path, required: true, schema: {type: string, format: uuid}}
+    post:
+      security: [{ActorBearer: []}]
+      summary: Record a separate acknowledgement and retire the outbox item
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [recipient]
+              properties: {recipient: {type: string}}
+      responses:
+        '200': {description: acknowledgement, idempotent record result, and durable delivery receipt}
+        '401': {description: missing, expired, or wrong actor token}
+  /v1/projects/{project_id}/communications/actors/{actor}/token:
+    parameters:
+      - {name: project_id, in: path, required: true, schema: {type: string}}
+      - {name: actor, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9._-]+$'}}
+    post:
+      security: [{ProjectBearer: []}]
+      summary: Mint an eight-hour token for one registered communications actor
+      responses:
+        '201':
+          description: actor token returned once
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CommunicationActorRegistration'}
+  /v1/projects/{project_id}/communications/actors/{actor}/messages:
+    parameters:
+      - {name: project_id, in: path, required: true, schema: {type: string}}
+      - {name: actor, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9._-]+$'}}
+    get:
+      security: [{ActorBearer: []}]
+      summary: List only messages addressed to this actor name or registered role
+      parameters:
+        - {name: synchronize, in: query, schema: {type: boolean, default: true}, description: Pull inbound private-Git state when shared delivery is unavailable or Git inbound mode is active.}
+      responses:
+        '200':
+          description: actor-scoped inbox
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, synchronized_via]
+                properties:
+                  items:
+                    type: array
+                    items: {$ref: '#/components/schemas/CommunicationMessage'}
+                  synchronized_via: {type: [string, 'null'], enum: [local_filesystem, shared_megacmd, private_git, null]}
+        '401': {description: missing, expired, or wrong actor token}
+  /v1/projects/{project_id}/communications/reconcile:
+    parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
+    post: {security: [{ProjectBearer: []}], summary: Reconcile the durable outbox and transport failover state immediately, responses: {'200': {description: delivery receipts}}}
+  /v1/projects/{project_id}/communications/status:
+    parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
+    get:
+      security: [{ProjectBearer: []}]
+      summary: Inspect transport health, failover state, queue age, and quarantine
+      parameters:
+        - {name: probe_external, in: query, schema: {type: boolean, default: true}, description: Set false for a strictly local snapshot without MEGAcmd or private-Git health commands.}
+      responses:
+        '200':
+          description: current communications status
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CommunicationStatus'}
   /v1/projects/{project_id}/jobs:
     parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
     post: {security: [{ProjectBearer: []}], summary: Submit an idempotent job, responses: {'202': {description: accepted, content: {application/json: {schema: {$ref: '#/components/schemas/Job'}}}}}}
@@ -57,6 +244,6 @@ paths:
   /v1/projects/{project_id}/artifacts/{artifact_id}/content:
     get: {security: [{ProjectBearer: []}], summary: Download artifact bytes, responses: {'200': {description: artifact content, content: {application/octet-stream: {schema: {type: string, format: binary}}}}}}
   /v1/metrics:
-    get: {summary: Local queue and worker-health metrics, responses: {'200': {description: metrics}}}
+    get: {summary: Local queue, acknowledgement queue, quarantine, and worker-health metrics, responses: {'200': {description: metrics}}}
   /v1/projects/{project_id}/workers/{worker_id}/lease:
     post: {security: [{ProjectBearer: []}], summary: Atomically lease one ready job, responses: {'200': {description: lease}, '204': {description: no job}}}
