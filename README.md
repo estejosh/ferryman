@@ -145,6 +145,8 @@ Approval is explicit for work marked `requires_approval`; a job cannot be leased
 - Project-scoped live communications with durable local outboxes, MEGAcmd health
   probing, acknowledgement-deadline Git promotion, duplicate-safe claims,
   inbound private-Git synchronization, and durable acknowledgement return.
+  Portable v1 envelopes remain unsigned; see
+  [communications readiness](docs/COMMUNICATIONS_READINESS.md) before use.
 - Framework-neutral Windows and WSL/Linux attachment for unmanaged, single-agent,
   and multi-agent projects, with a built-in no-agent `project-inbox`, revision
   markers, explicit standard updates, and read-only safety scanners.

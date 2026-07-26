@@ -26,6 +26,29 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
 const HEALTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const TRANSPORT_STATE_FORMAT: &str = "ferryman-transport-state/v1";
 const MAX_INLINE_PAYLOAD_BYTES: usize = 256 * 1024;
+const SENSITIVE_CHILD_ENVIRONMENT: &[&str] = &[
+    "FERRYMAN_ADMIN_TOKEN",
+    "FERRYMAN_MEMORY_WRITE_TOKEN",
+    "FERRYMAN_MEMORY_TOKEN",
+    "FERRYMAN_TOKEN",
+    "FERRYMAN_RECOVERY_KEY_HEX",
+    "FERRYMAN_DRIVE_ACCESS_TOKEN",
+    "FERRYMAN_SUDO_PW",
+    "HUB_ADMIN_TOKEN",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "HF_TOKEN",
+    "HUGGINGFACE_TOKEN",
+    "OMNIROUTE_API_KEY",
+    "ARENA_COOKIE",
+];
+#[cfg(windows)]
+const NULL_GIT_HOOKS_PATH: &str = "NUL";
+#[cfg(not(windows))]
+const NULL_GIT_HOOKS_PATH: &str = "/dev/null";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRoute {
@@ -468,6 +491,31 @@ fn run_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Re
         .with_context(|| format!("collect {label} output"))
 }
 
+fn scrub_sensitive_child_environment(command: &mut Command) {
+    for name in SENSITIVE_CHILD_ENVIRONMENT {
+        command.env_remove(name);
+    }
+}
+
+fn system_git_command(directory: &Path, arguments: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    scrub_sensitive_child_environment(&mut command);
+    command
+        .args([
+            "-c",
+            "http.lowSpeedLimit=1",
+            "-c",
+            "http.lowSpeedTime=30",
+            "-c",
+            &format!("core.hooksPath={NULL_GIT_HOOKS_PATH}"),
+        ])
+        .args(arguments)
+        .current_dir(directory)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never");
+    command
+}
+
 pub struct MegaCmdProbe {
     pub distribution: String,
 }
@@ -490,6 +538,7 @@ impl SharedHealthProbe for MegaCmdProbe {
             command.arg("--show-handles");
             command
         };
+        scrub_sensitive_child_environment(&mut command);
         let output = run_with_timeout(
             &mut command,
             HEALTH_COMMAND_TIMEOUT,
@@ -551,13 +600,7 @@ pub struct SystemGit;
 
 impl GitRunner for SystemGit {
     fn run(&mut self, directory: &Path, arguments: &[&str]) -> Result<()> {
-        let mut command = Command::new("git");
-        command
-            .args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"])
-            .args(arguments)
-            .current_dir(directory)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "Never");
+        let mut command = system_git_command(directory, arguments);
         let output = run_with_timeout(
             &mut command,
             GIT_COMMAND_TIMEOUT,
@@ -574,13 +617,7 @@ impl GitRunner for SystemGit {
     }
 
     fn output(&mut self, directory: &Path, arguments: &[&str]) -> Result<String> {
-        let mut command = Command::new("git");
-        command
-            .args(["-c", "http.lowSpeedLimit=1", "-c", "http.lowSpeedTime=30"])
-            .args(arguments)
-            .current_dir(directory)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "Never");
+        let mut command = system_git_command(directory, arguments);
         let output = run_with_timeout(
             &mut command,
             GIT_COMMAND_TIMEOUT,
@@ -598,6 +635,7 @@ impl GitRunner for SystemGit {
 
     fn verify_private(&mut self, expected_name: &str) -> Result<bool> {
         let mut command = Command::new("gh");
+        scrub_sensitive_child_environment(&mut command);
         command.args([
             "repo",
             "view",
@@ -1849,14 +1887,10 @@ fn retire_acknowledged_outbox(route: &ProjectRoute) -> Result<()> {
             continue;
         }
         let acknowledgement: Acknowledgement = serde_json::from_slice(&fs::read(&path)?)?;
-        acknowledgement.validate()?;
-        if acknowledgement.project_id != route.project_id {
-            bail!("acknowledgement crossed the project boundary")
-        }
-        let queued = outbox_path(route, &acknowledgement.message_id);
-        if queued.is_file() {
-            fs::remove_file(queued)?;
-        }
+        // Inbound acknowledgement files are transport input, not authority.
+        // Reuse the same stored-message binding checks as the API path before
+        // allowing one to retire a durable outbox entry.
+        record_acknowledgement(route, &acknowledgement)?;
     }
     Ok(())
 }
@@ -1936,6 +1970,37 @@ mod tests {
             deliveries: log,
             fail: false,
         }
+    }
+
+    #[test]
+    fn transport_children_drop_sensitive_environment_and_git_hooks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = system_git_command(directory.path(), &["status", "--short"]);
+        command.env("FERRYMAN_NON_SECRET_SETTING", "kept");
+
+        let removed = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect::<HashSet<_>>();
+        for name in SENSITIVE_CHILD_ENVIRONMENT {
+            assert!(removed.contains(*name), "{name} was not removed");
+        }
+        assert!(command.get_envs().any(|(name, value)| {
+            name == "FERRYMAN_NON_SECRET_SETTING" && value.is_some_and(|item| item == "kept")
+        }));
+
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let hooks_argument = format!("core.hooksPath={NULL_GIT_HOOKS_PATH}");
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair[0] == "-c" && pair[1] == hooks_argument)
+        );
+        assert!(arguments.ends_with(&["status".into(), "--short".into()]));
     }
 
     #[test]
@@ -2054,6 +2119,83 @@ mod tests {
             )));
         fs::remove_dir_all(claim).unwrap();
         assert!(!claim_message(&route, &first).unwrap());
+    }
+
+    #[test]
+    fn inbound_acknowledgement_must_match_stored_message_before_retiring_outbox() {
+        let (_temp, route) = fixture();
+        let message = Message::new(
+            "alpha",
+            "operator",
+            "builder",
+            "inline",
+            serde_json::json!({"task":"protected"}),
+            false,
+            Some("expected-key".into()),
+        );
+        LocalFilesystemTransport.deliver(&route, &message).unwrap();
+        persist_message(&outbox_path(&route, &message.id), &message).unwrap();
+
+        let forged = Acknowledgement {
+            message_id: message.id.clone(),
+            project_id: route.project_id.clone(),
+            recipient: "alpha-builder".into(),
+            processed_at: Utc::now(),
+            idempotency_key: "forged-key".into(),
+        };
+        atomic_json(&acknowledgement_path(&route, &message.id), &forged).unwrap();
+
+        let error = retire_acknowledged_outbox(&route).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("acknowledgement does not match the stored message")
+        );
+        assert!(outbox_path(&route, &message.id).is_file());
+
+        let forged_recipient = Acknowledgement {
+            message_id: message.id.clone(),
+            project_id: route.project_id.clone(),
+            recipient: "unauthorized-recipient".into(),
+            processed_at: Utc::now(),
+            idempotency_key: message.idempotency_key.clone(),
+        };
+        atomic_json(
+            &acknowledgement_path(&route, &message.id),
+            &forged_recipient,
+        )
+        .unwrap();
+
+        assert!(retire_acknowledged_outbox(&route).is_err());
+        assert!(outbox_path(&route, &message.id).is_file());
+    }
+
+    #[test]
+    fn valid_inbound_acknowledgement_retires_outbox() {
+        let (_temp, route) = fixture();
+        let message = Message::new(
+            "alpha",
+            "operator",
+            "builder",
+            "inline",
+            Value::Null,
+            false,
+            Some("expected-key".into()),
+        );
+        LocalFilesystemTransport.deliver(&route, &message).unwrap();
+        persist_message(&outbox_path(&route, &message.id), &message).unwrap();
+
+        let acknowledgement = Acknowledgement {
+            message_id: message.id.clone(),
+            project_id: route.project_id.clone(),
+            recipient: "alpha-builder".into(),
+            processed_at: Utc::now(),
+            idempotency_key: message.idempotency_key.clone(),
+        };
+        atomic_json(&acknowledgement_path(&route, &message.id), &acknowledgement).unwrap();
+
+        retire_acknowledged_outbox(&route).unwrap();
+        assert!(!outbox_path(&route, &message.id).exists());
     }
 
     #[test]

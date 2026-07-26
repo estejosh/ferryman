@@ -15,10 +15,13 @@ project.
    synchronization, and durable acknowledgement return.
 3. **Transport safety:** exact MEGAcmd sync health, hard subprocess deadlines,
    exact private-Git owner/name/visibility, exact inner origin, serialized Git
-   writers, fetch/rebase/push retry, and no mutation of a main project remote.
+   writers, fetch/rebase/push retry, disabled repository hooks, scrubbed child
+   process secrets, and no mutation of a main project remote.
 4. **Authorization and limits:** project-scoped operator routes, short-lived
    actor-scoped inbox and consume routes, recipient enforcement, field limits,
-   256 KiB payload cap, and portable secret-field rejection.
+   256 KiB payload cap, portable secret-field rejection, authenticated v2
+   portable messages and acknowledgements, signer-to-project/role grants,
+   replay rejection, and fail-closed quarantine of unsigned input.
 5. **Observability:** per-project communications status, aggregate queue and
    quarantine metrics, immutable delivery attempts, and actionable errors.
 6. **Framework-neutral adoption:** documented and scripted Windows and
@@ -65,4 +68,5 @@ project or GitHub repository.
 PostgreSQL, a dashboard, distributed consensus, worker sandboxing, hosted
 identity, scheduled healthy-state Git checkpoints, and framework-specific
 adapters remain roadmap work. They are not required for the bounded single-node
-v0.1 contract.
+v0.1 contract. Portable authentication is a required gate even for that
+single-node contract because MEGA and Git files cross the local trust boundary.

@@ -1,10 +1,10 @@
 # Communications readiness
 
-## Validation evidence — 2026-07-24
+## Validation evidence — 2026-07-26
 
 - `cargo fmt --check` passed.
 - `cargo clippy --workspace --all-targets -- -D warnings` passed.
-- `cargo test --workspace` passed: 27 tests, 0 failures.
+- `cargo test --workspace` passed: 30 tests, 0 failures.
 - The real Git test used a temporary bare repository and two independent
   checkouts. It proved per-message push, stale-checkout rebase, same-message
   duplicate suppression at the MEGA/Git boundary, inbound pull, private-Git
@@ -46,6 +46,9 @@ old communications checkout.
 - Failover and backoff state survives process restarts. Corrupt outbox entries
   are quarantined without blocking healthy entries, and external subprocesses
   have hard deadlines.
+- Inbound acknowledgement retirement reloads the exact stored message and
+  compares its recipient and idempotency key before removing the sender
+  outbox. Forged-field regression tests preserve the queued message.
 - Atomic, hashed execution claims suppress duplicate execution when the same
   message arrives through local, MEGA, and Git.
 - Claim and acknowledgement require an eight-hour token scoped to the exact
@@ -58,6 +61,9 @@ old communications checkout.
   after and refuses any change.
 - Git live writers serialize locally, fetch/rebase before commit, and retry one
   rejected push without creating duplicate message commits.
+- Automated Git disables repository hooks. Git, `gh`, MEGAcmd, and WSL
+  transport probes remove Ferryman control/recovery tokens and common model
+  credentials from their child environments.
 - Windows drive paths and WSL `/mnt/<drive>` paths are translated at the server
   boundary. Automated Windows adoption coverage proves idempotence, preserved
   source history, and an unchanged main-project remote.
@@ -79,10 +85,17 @@ old communications checkout.
 
 ## Security limitations
 
+- Portable v1 messages and acknowledgements are not yet cryptographically
+  authenticated. A process or peer with write access to the inner directory,
+  MEGA destination, or private Git repository can forge a structurally valid
+  message. Treat transport write access as work-authoring authority and do not
+  use portable messages for irreversible actions. Signed v2 enforcement is
+  specified in [portable authentication](PORTABLE_AUTHENTICATION.md).
 - Portable message payloads are not encrypted by Ferryman. The inner directory,
-  MEGA destination, and private Git repository are inside the trusted project
-  boundary. Payload validation blocks common secret-bearing fields but cannot
-  infer whether an arbitrary string is sensitive; use local references.
+  MEGA destination, and private Git repository must therefore be readable only
+  by trusted participants. Payload validation blocks common secret-bearing
+  fields but cannot infer whether an arbitrary string is sensitive; use local
+  references.
 - GitHub privacy verification relies on the authenticated `gh` CLI and is cached
   for ten minutes. A visibility-verification failure closes Git delivery and
   retains the local queue.

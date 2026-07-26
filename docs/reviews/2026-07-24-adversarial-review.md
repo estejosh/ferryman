@@ -30,6 +30,22 @@ single-node preview. Do not describe it as production-safe, exactly-once,
 provider-neutral, or a sandbox. Do not use portable messages for irreversible
 actions until findings F-01 through F-05 are fixed.
 
+## Remediation progress
+
+- **F-02 implemented:** inbound acknowledgement retirement now uses the
+  canonical stored-message match before removing an outbox item. Regression
+  coverage includes forged idempotency and valid acknowledgement cases.
+- **F-04 partially implemented:** communications Git disables repository
+  hooks; Git, `gh`, MEGAcmd, and WSL transport probes explicitly remove
+  Ferryman control/recovery tokens and common model credentials; generated
+  systemd services now apply safe baseline hardening. Dedicated accounts,
+  administrator-pinned executable paths, and a strict environment allowlist
+  remain open.
+- **F-01 designed:** the implementation design is in
+  [`PORTABLE_AUTHENTICATION.md`](../PORTABLE_AUTHENTICATION.md). It is not
+  fixed until signed v2 envelopes, trust grants, replay persistence, migration,
+  and fail-closed quarantine are implemented and tested.
+
 ## Priority summary
 
 | ID | Severity | Finding | Consequence |

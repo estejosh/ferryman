@@ -39,6 +39,18 @@ EnvironmentFile=$ENVFILE
 ExecStart=$BIN --database $DATA/bridge.db --artifacts $DATA/artifacts --workspace-root $DATA/projects --memory-root $DATA/bridge-memory --recovery-root $DATA/recovery --listen 127.0.0.1:$PORT --no-demo-project
 Restart=always
 RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 [Install]
 WantedBy=multi-user.target
 EOF
