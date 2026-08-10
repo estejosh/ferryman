@@ -13,7 +13,7 @@ project.
    persisted failover/backoff state, acknowledgement deadlines, bounded
    retries, corrupt-entry quarantine, duplicate-safe claims, inbound Git
    synchronization, and durable acknowledgement return.
-3. **Transport safety:** exact MEGAcmd sync health, hard subprocess deadlines,
+3. **Transport safety:** exact Syncthing folder health, hard subprocess deadlines,
    exact private-Git owner/name/visibility, exact inner origin, serialized Git
    writers, fetch/rebase/push retry, disabled repository hooks, scrubbed child
    process secrets, and no mutation of a main project remote.
@@ -55,7 +55,7 @@ bash scripts/attach-project.sh `
   --shared-remote /beastly-bridges/ferryman `
   --git-remote https://github.com/estejosh/ferryman-bridge.git `
   --integration-mode unmanaged `
-  --dry-run --skip-mega-registration --skip-hub-registration
+  --dry-run --skip-sync-registration --skip-hub-registration
 ```
 
 The real Git integration test creates only temporary local repositories. The
@@ -69,4 +69,4 @@ PostgreSQL, a dashboard, distributed consensus, worker sandboxing, hosted
 identity, scheduled healthy-state Git checkpoints, and framework-specific
 adapters remain roadmap work. They are not required for the bounded single-node
 v0.1 contract. Portable authentication is a required gate even for that
-single-node contract because MEGA and Git files cross the local trust boundary.
+single-node contract because synced and Git files cross the local trust boundary.

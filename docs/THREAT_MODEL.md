@@ -14,8 +14,8 @@ Project inputs/results, artifact metadata and contents, project bearer tokens, s
   registered recipient. Actor tokens are stored only as hashes.
 - **Portable messages:** inline JSON is limited to 256 KiB and recursively
   rejects common credential-bearing keys. The outer token, runtime state,
-  claims, locks, and quarantine never enter MEGA or the portable Git repository.
-- **Transport subprocesses:** MEGAcmd, Git, and GitHub checks have hard timeouts.
+  claims, locks, and quarantine never enter the synced folder or the portable Git repository.
+- **Transport subprocesses:** Git and GitHub checks have hard timeouts; the Syncthing API probe is loopback-only with a 5-second deadline.
   GitHub privacy and exact inner-origin checks fail closed; failed delivery
   stays in the durable local outbox.
 - **Artifacts:** content is hashed, written under the bridge-owned artifact root, and metadata is associated with one project. Paths from requests are never used as filesystem paths.

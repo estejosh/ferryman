@@ -13,7 +13,8 @@ param(
   [string[]]$Participant = @(),
   [switch]$UpdateStandard,
   [switch]$DryRun,
-  [switch]$SkipMegaRegistration,
+  [Alias('SkipMegaRegistration')]
+  [switch]$SkipSyncRegistration,
   [switch]$SkipHubRegistration
 )
 
@@ -282,15 +283,22 @@ task, CI job, one agent, or an existing multi-agent framework. Ferryman does
 not replace the project's scheduler, memory, model, or build system.
 
 Before depending on this route, verify the main remote, private inner remote,
-dedicated MEGA sync, hub status, duplicate claim, acknowledgement, restart
+Syncthing folder, hub status, duplicate claim, acknowledgement, restart
 recovery, and Git-live failover. Preserve any adopted checkout until those
 checks pass.
 '@
 $adoption = $adoptionTemplate.Replace('{{PROJECT}}', $Project)
 $adoption = $adoption.Replace('{{MODE}}', $IntegrationMode)
 $adoption = $adoption.Replace('{{ROUTES}}', $routeSummary)
-$megaIgnore = @"
+# Syncthing must never replicate a live .git directory: it copies whole files with no
+# idea a repository is one consistent set, and the result is a corrupt checkout.
+$stIgnore = @"
 .git
+.stfolder
+.stversions
+.stignore
+*.sync-conflict-*
+~syncthing~*.tmp
 *.lock
 *.tmp
 *.swp
@@ -325,7 +333,7 @@ integration_mode = "$IntegrationMode"
 "@
 
 if ($UpdateStandard -and (Test-Path -LiteralPath (Join-Path $communications '.git'))) {
-  $managedPaths = @('PROTOCOL.md','ADOPTION.md','STANDARD.toml','.megaignore','.gitignore')
+  $managedPaths = @('PROTOCOL.md','ADOPTION.md','STANDARD.toml','.stignore','.gitignore')
   $managedChanges = (& git -C $communications status --porcelain -- @managedPaths 2>&1) -join "`n"
   if ($LASTEXITCODE -ne 0) { throw "Unable to inspect managed files: $managedChanges" }
   if (-not [string]::IsNullOrWhiteSpace($managedChanges)) {
@@ -346,7 +354,7 @@ foreach ($directory in @(
 Write-ManagedText (Join-Path $communications 'PROTOCOL.md') $protocol
 Write-ManagedText (Join-Path $communications 'ADOPTION.md') $adoption
 Write-ManagedText (Join-Path $communications 'STANDARD.toml') $standardConfig
-Write-ManagedText (Join-Path $communications '.megaignore') $megaIgnore
+Write-ManagedText (Join-Path $communications '.stignore') $stIgnore
 Write-ManagedText (Join-Path $communications '.gitignore') $gitIgnore
 Write-ManagedText (Join-Path $attachment 'standard.toml') $standardConfig
 if ($UpdateStandard -and (Test-Path -LiteralPath (Join-Path $attachment 'bridge.toml'))) {
@@ -389,7 +397,7 @@ if ($UpdateStandard -and (Test-Path -LiteralPath (Join-Path $attachment 'bridge.
 if ($DryRun) {
   Write-Host 'DRY-RUN: commit portable protocol/adoption/ignore metadata and push the current named branch'
 } else {
-  $portableFiles = @('PROTOCOL.md','ADOPTION.md','STANDARD.toml','.megaignore','.gitignore')
+  $portableFiles = @('PROTOCOL.md','ADOPTION.md','STANDARD.toml','.stignore','.gitignore')
   Invoke-Checked `
     -Program 'git' `
     -Arguments (@('add','--') + $portableFiles) `
@@ -446,20 +454,52 @@ if (-not $hasRule) {
   else { Add-Content -LiteralPath $rootIgnore -Value "`n# Ferryman machine-local attachment`n$ignoreRule" }
 }
 
-if (-not $SkipMegaRegistration) {
-  $drive = $communications.Substring(0,1).ToLowerInvariant()
-  $wslLocal = "/mnt/$drive/" + $communications.Substring(3).Replace('\','/')
-  $syncs = Invoke-Checked `
-    -Program 'wsl.exe' `
-    -Arguments @('-d',$WslDistribution,'--','mega-sync','--show-handles') `
-    -WorkingDirectory $workspacePath
-  if ($DryRun -or $syncs -notmatch [regex]::Escape($wslLocal)) {
-    Invoke-Checked `
-      -Program 'wsl.exe' `
-      -Arguments @('-d',$WslDistribution,'--','mega-sync',$wslLocal,$SharedRemote) `
-      -WorkingDirectory $workspacePath | Out-Null
+# Register the channel with Syncthing over its local REST API. No WSL, no MEGAcmd:
+# Ferryman no longer depends on either, so this works on a plain Windows machine.
+if (-not $SkipSyncRegistration) {
+  $stApi = if ($env:SYNCTHING_API_BASE) { $env:SYNCTHING_API_BASE } else { 'http://127.0.0.1:8384' }
+  $stKey = $env:SYNCTHING_API_KEY
+  if (-not $stKey) {
+    $candidates = @()
+    if ($env:SYNCTHING_CONFIG_DIR) { $candidates += (Join-Path $env:SYNCTHING_CONFIG_DIR 'config.xml') }
+    if ($env:LOCALAPPDATA) { $candidates += (Join-Path $env:LOCALAPPDATA 'Syncthing\config.xml') }
+    foreach ($candidate in $candidates) {
+      if (Test-Path -LiteralPath $candidate) {
+        $match = Select-String -Path $candidate -Pattern '<apikey>(.*?)</apikey>' | Select-Object -First 1
+        if ($match) { $stKey = $match.Matches[0].Groups[1].Value; break }
+      }
+    }
+  }
+  if ($DryRun) {
+    Write-Host "DRY-RUN: register Syncthing folder '$SharedRemote' -> $communications"
+  } elseif (-not $stKey) {
+    Write-Warning "No Syncthing API key found; add folder '$SharedRemote' -> $communications by hand."
+    Write-Warning "Set SYNCTHING_API_KEY, or SYNCTHING_CONFIG_DIR to the directory holding config.xml."
   } else {
-    Write-Host 'OK existing MEGAcmd sync'
+    $headers = @{ 'X-API-Key' = $stKey }
+    $existing = $null
+    try {
+      $existing = Invoke-RestMethod -Uri "$stApi/rest/config/folders/$SharedRemote" -Headers $headers -ErrorAction Stop
+    } catch { $existing = $null }
+    if ($existing) {
+      Write-Host "OK    Syncthing folder '$SharedRemote' already registered"
+    } else {
+      # fsWatcher off with a 20s rescan: file watching is unreliable on network paths
+      # and on Windows drives seen through WSL, and a missed event looks exactly like
+      # a peer that has nothing to say.
+      $body = @{
+        id = $SharedRemote; label = $SharedRemote; path = $communications
+        type = 'sendreceive'; fsWatcherEnabled = $false; rescanIntervalS = 20
+      } | ConvertTo-Json -Compress
+      try {
+        Invoke-RestMethod -Uri "$stApi/rest/config/folders" -Method Post -Headers $headers `
+          -ContentType 'application/json' -Body $body -ErrorAction Stop | Out-Null
+        Write-Host "OK    registered Syncthing folder '$SharedRemote'"
+        Write-Host "      share it with the other machines in the fleet from the Syncthing UI"
+      } catch {
+        Write-Warning "Could not register '$SharedRemote' with Syncthing; add it by hand."
+      }
+    }
   }
 }
 

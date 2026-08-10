@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Legacy Linux attachment helper. New installations should use
 # `scripts/attach-project.sh` (or `attach-project.ps1` on Windows), which creates
-# the outer-local / inner-portable layout and supports safe adoption, MEGAcmd
+# the outer-local / inner-portable layout and supports safe adoption, Syncthing
 # registration, framework-neutral routing, and dry-run. This helper retains the
 # old behavior for backward compatibility only.
 #

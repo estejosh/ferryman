@@ -21,7 +21,7 @@ stop and update Ferryman before touching the project.
 
 ## Before any update: scan, then ask the user to review
 
-Never begin with `git pull`, attachment apply, MEGA registration, or a remote
+Never begin with `git pull`, attachment apply, Syncthing registration, or a remote
 change. First run the read-only directory safety scan and show the result to the
 user:
 
@@ -108,7 +108,7 @@ projects.
   Only the attachment helper may load an existing token directly into an
   authorization header; it must not display or persist the value elsewhere.
 - Never change the main project Git remote.
-- Never weaken the project root `.megaignore` to include hidden directories.
+- Never weaken the channel's `.stignore`; it is what stops Syncthing replicating `.git`.
 - Never make a GitHub repository public.
 - Never delete an old communications checkout during attachment/update.
 - Never unregister communications while either outbox is non-empty.
@@ -116,4 +116,4 @@ projects.
 
 NATV is the first designated real migration target. Its apply step still
 requires review of the current read-only scan and dry run before any filesystem,
-MEGA, hub, or GitHub mutation.
+Syncthing, hub, or GitHub mutation.

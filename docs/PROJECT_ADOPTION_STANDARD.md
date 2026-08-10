@@ -25,12 +25,12 @@ scheduler, model, memory, issue tracker, or build system.
     PROTOCOL.md
     ADOPTION.md
     STANDARD.toml                    portable standard revision marker
-    .megaignore
+    .stignore
     .gitignore
     .git/
 ```
 
-The outer directory is never synchronized or committed. MEGAcmd and private
+The outer directory is never synchronized or committed. Syncthing and private
 Git see only the inner directory. The main project repository ignores the whole
 outer `/.ferryman/` tree and its Git remote is never a communications target.
 
@@ -165,11 +165,11 @@ leave participants empty. Do not block migration on an agent redesign.
    `scripts/scan-project-safety.sh`, show the report to the user, and stop on
    any unexplained `FAIL`.
 2. Inventory the workspace path, project ID, existing agents/workers (if any),
-   intended MEGA destination, and exact private Git repository.
+   intended Syncthing folder id, and exact private Git repository.
 3. Verify that the main project Git working tree and remote are known.
 4. Choose `unmanaged`, `single-agent`, or `multi-agent`.
 5. Run attachment with `-DryRun`. Review every reported filesystem, GitHub,
-   MEGAcmd, ignore-file, and hub action.
+   Syncthing, ignore-file, and hub action.
 6. Run the apply command only after the dry run is correct.
    The apply step commits and pushes only the portable protocol, adoption, and
    ignore metadata; it never stages the outer attachment.
@@ -178,7 +178,7 @@ leave participants empty. Do not block migration on an agent redesign.
    - the main project ignores `/.ferryman/`;
    - inner `origin` is the exact private bridge repository;
    - GitHub visibility is `PRIVATE`;
-   - MEGAcmd sync maps only the inner directory;
+   - the Syncthing folder maps only the inner directory;
    - hub mapping contains `project-inbox` plus intended participants.
    - `communications status` reports the expected local/shared/Git health and
      no unexplained quarantine files.
@@ -225,7 +225,7 @@ scripts/attach-project.sh \
 ```
 
 Remove only `--dry-run` after review. Use `--adopt-from`, `--hub`,
-`--skip-mega-registration`, or `--skip-hub-registration` where their
+`--skip-sync-registration`, or `--skip-hub-registration` where their
 PowerShell counterparts would be used.
 
 ## Rollback
@@ -233,7 +233,7 @@ PowerShell counterparts would be used.
 Attachment is additive. Before project traffic begins, rollback means:
 
 1. stop the project's Ferryman consumers;
-2. unregister the dedicated MEGAcmd sync;
+2. remove the Syncthing folder;
 3. run `communications unregister --project <id>` with the project token; the
    hub refuses while any durable outbox item remains and revokes actor tokens
    when it succeeds;
@@ -252,7 +252,7 @@ or reconcile them first.
 - [ ] Token and runtime exist only in the outer directory.
 - [ ] Inner repository contains no credentials or database files.
 - [ ] Exact private Git owner/name and visibility verified.
-- [ ] Dedicated inner MEGAcmd sync verified healthy.
+- [ ] Syncthing folder verified healthy, with at least one connected peer.
 - [ ] `project-inbox` works even with no agents.
 - [ ] Every custom participant has a stable project-specific name and role.
 - [ ] Duplicate claim test passes.

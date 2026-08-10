@@ -89,7 +89,7 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
         .args(["--participant", participant])
         .args([
             "--dry-run",
-            "--skip-mega-registration",
+            "--skip-sync-registration",
             "--skip-hub-registration",
         ])
         .output()
@@ -195,7 +195,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
             .args(["--participant", participant])
             .args([
                 "--update-standard",
-                "--skip-mega-registration",
+                "--skip-sync-registration",
                 "--skip-hub-registration",
             ])
             .output()

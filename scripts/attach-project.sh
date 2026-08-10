@@ -12,7 +12,7 @@ HUB=http://127.0.0.1:8796
 INTEGRATION_MODE=unmanaged
 DRY_RUN=0
 UPDATE_STANDARD=0
-SKIP_MEGA=0
+SKIP_SYNC=0
 SKIP_HUB=0
 PARTICIPANTS=()
 
@@ -33,7 +33,7 @@ Options:
   --participant 'name|role|capability1,capability2'   repeatable
   --update-standard
   --dry-run
-  --skip-mega-registration
+  --skip-sync-registration     (--skip-mega-registration is accepted as an alias)
   --skip-hub-registration
 EOF
 }
@@ -50,7 +50,7 @@ while (($#)); do
     --participant) PARTICIPANTS+=("${2:?}"); shift 2 ;;
     --update-standard) UPDATE_STANDARD=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
-    --skip-mega-registration) SKIP_MEGA=1; shift ;;
+    --skip-sync-registration|--skip-mega-registration) SKIP_SYNC=1; shift ;;
     --skip-hub-registration) SKIP_HUB=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -252,11 +252,18 @@ The consumer can be a human workflow, script, scheduled task, CI job, one
 agent, or an existing multi-agent framework. Ferryman does not replace the
 project scheduler, memory, model, or build system.
 
-Verify the main remote, private inner remote, dedicated MEGA sync, hub status,
+Verify the main remote, private inner remote, Syncthing folder, hub status,
 duplicate claim, acknowledgement, restart recovery, and Git-live failover
 before depending on this route. Preserve any adopted checkout until those
 checks pass."
-MEGAIGNORE='.git
+# Syncthing must never replicate a live .git directory: it copies whole files with no
+# idea a repository is one consistent set, and the result is a corrupt checkout.
+STIGNORE='.git
+.stfolder
+.stversions
+.stignore
+*.sync-conflict-*
+~syncthing~*.tmp
 *.lock
 *.tmp
 *.swp
@@ -283,7 +290,7 @@ updated_at = \"2026-07-24\"
 project = \"$PROJECT\"
 integration_mode = \"$INTEGRATION_MODE\""
 
-managed_files=(PROTOCOL.md ADOPTION.md STANDARD.toml .megaignore .gitignore)
+managed_files=(PROTOCOL.md ADOPTION.md STANDARD.toml .stignore .gitignore)
 if ((UPDATE_STANDARD)) && [[ -d "$COMMUNICATIONS/.git" ]]; then
   managed_changes=$(git -C "$COMMUNICATIONS" status --porcelain -- "${managed_files[@]}")
   [[ -z "$managed_changes" ]] ||
@@ -293,7 +300,7 @@ fi
 write_managed "$COMMUNICATIONS/PROTOCOL.md" "$PROTOCOL"
 write_managed "$COMMUNICATIONS/ADOPTION.md" "$ADOPTION"
 write_managed "$COMMUNICATIONS/STANDARD.toml" "$STANDARD_CONFIG"
-write_managed "$COMMUNICATIONS/.megaignore" "$MEGAIGNORE"
+write_managed "$COMMUNICATIONS/.stignore" "$STIGNORE"
 write_managed "$COMMUNICATIONS/.gitignore" "$GITIGNORE"
 write_managed "$ATTACHMENT/standard.toml" "$STANDARD_CONFIG"
 if ((UPDATE_STANDARD)) && [[ -f "$ATTACHMENT/bridge.toml" ]]; then
@@ -364,14 +371,37 @@ if ! grep -qxF '/.ferryman/' "$WORKSPACE/.gitignore" 2>/dev/null; then
   fi
 fi
 
-if ((!SKIP_MEGA)); then
+# Register the channel with Syncthing, which is what carries it between machines.
+# The folder id is $SHARED_REMOTE. fsWatcher is off with a 20s rescan on purpose:
+# file watching is unreliable on network paths and on Windows drives seen through
+# WSL, and a missed event is indistinguishable from a peer with nothing to say.
+if ((!SKIP_SYNC)); then
+  st_api="${SYNCTHING_API_BASE:-http://127.0.0.1:8384}"
+  st_key="${SYNCTHING_API_KEY:-}"
+  if [[ -z "$st_key" ]]; then
+    for candidate in "${SYNCTHING_CONFIG_DIR:-}/config.xml" \
+                     "$HOME/.local/state/syncthing/config.xml" \
+                     "$HOME/.config/syncthing/config.xml"; do
+      [[ -f "$candidate" ]] || continue
+      st_key=$(sed -n 's:.*<apikey>\(.*\)</apikey>.*:\1:p' "$candidate" | head -1)
+      [[ -n "$st_key" ]] && break
+    done
+  fi
   if ((DRY_RUN)); then
-    echo "DRY-RUN: mega-sync --show-handles"
-    echo "DRY-RUN: mega-sync $COMMUNICATIONS $SHARED_REMOTE when not registered"
+    echo "DRY-RUN: register Syncthing folder '$SHARED_REMOTE' -> $COMMUNICATIONS"
+  elif [[ -z "$st_key" ]]; then
+    echo "WARN  no Syncthing API key found; add folder '$SHARED_REMOTE' -> $COMMUNICATIONS by hand" >&2
+    echo "      (set SYNCTHING_API_KEY, or SYNCTHING_CONFIG_DIR to where config.xml lives)" >&2
+  elif curl -fsS -H "X-API-Key: $st_key" "$st_api/rest/config/folders/$SHARED_REMOTE" >/dev/null 2>&1; then
+    echo "OK    Syncthing folder '$SHARED_REMOTE' already registered"
   else
-    syncs=$(mega-sync --show-handles)
-    if ! grep -F "$COMMUNICATIONS" <<<"$syncs" | grep -Fq "$SHARED_REMOTE"; then
-      mega-sync "$COMMUNICATIONS" "$SHARED_REMOTE"
+    if curl -fsS -X POST -H "X-API-Key: $st_key" -H 'Content-Type: application/json' \
+         -d "{\"id\":\"$SHARED_REMOTE\",\"label\":\"$SHARED_REMOTE\",\"path\":\"$COMMUNICATIONS\",\"type\":\"sendreceive\",\"fsWatcherEnabled\":false,\"rescanIntervalS\":20}" \
+         "$st_api/rest/config/folders" >/dev/null; then
+      echo "OK    registered Syncthing folder '$SHARED_REMOTE'"
+      echo "      share it with the other machines in the fleet from the Syncthing UI"
+    else
+      echo "WARN  could not register '$SHARED_REMOTE' with Syncthing; add it by hand" >&2
     fi
   fi
 fi

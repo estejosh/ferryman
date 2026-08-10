@@ -16,20 +16,22 @@ idempotent work envelopes.
     acknowledgement-outbox/        receipts awaiting remote delivery
     quarantine/outbox/             malformed entries isolated for inspection
     locks/git-live.lock             cross-process Git writer lock
-  ferryman/                        portable communications Git + MEGA root
+  ferryman/                        portable channel: the Syncthing-carried root
     messages/<project>/*.json
     acknowledgements/<project>/*.json
     agents/
     PROTOCOL.md
     STANDARD.toml
-    .megaignore
+    .stignore
     .gitignore
     .git/
 ```
 
 The main project Git remote is never inspected as a communications target and
-is never changed. MEGAcmd registers only the inner directory as a separate sync
-root, so a project-level rule excluding hidden paths remains intact.
+is never changed. Syncthing carries only the inner directory as its own folder, so
+a project-level rule excluding hidden paths remains intact. The generated
+`.stignore` keeps `.git` out of that folder: Syncthing copies whole files with no
+idea a repository is one consistent set, and a replicated `.git` corrupts.
 
 ## Message delivery state
 
@@ -37,8 +39,8 @@ root, so a project-level rule excluding hidden paths remains intact.
    envelope to the outer `runtime/outbox`.
 2. If the local communications root is healthy, the message is atomically written to
    the inner `messages/<project>/` directory.
-3. If local peer delivery is unavailable but the configured MEGAcmd sync reports
-   healthy, the inner write is allowed to propagate through MEGA.
+3. If local peer delivery is unavailable but Syncthing reports the folder healthy
+   and at least one peer connected, the inner write is allowed to propagate.
 4. Every envelope has an acknowledgement deadline. If the preferred routes are
    unavailable, or that deadline passes without an acknowledgement, the private
    inner repository enters Git live mode: every message is committed and pushed.
@@ -60,8 +62,8 @@ root, so a project-level rule excluding hidden paths remains intact.
 
 Malformed or cross-project outbox entries are moved to
 `runtime/quarantine/outbox` with an error sidecar. One corrupt file therefore
-does not stop reconciliation of the rest of the project. MEGAcmd probes have a
-15-second hard deadline; Git and GitHub subprocesses have a 45-second hard
+does not stop reconciliation of the rest of the project. Syncthing API probes have
+a 5-second hard deadline; Git and GitHub subprocesses have a 45-second hard
 deadline and are killed on expiry.
 
 Quarantine is evidence, not an automatic retry queue. Inspect the error sidecar
@@ -115,13 +117,22 @@ WSL, and the reverse when running as a Windows process.
 
 ## Health and Git safety
 
-MEGA health comes from `mega-sync --show-handles` inside the configured Ubuntu
-distribution, matching both the translated `/mnt/<drive>/...` path and the
-expected MEGA destination. On a WSL/Linux hub, Ferryman invokes `mega-sync`
-directly; on Windows it invokes it through `wsl.exe`. Directory existence alone
-is not shared-transport health. The acknowledgement deadline also detects a
-remote peer that is not consuming messages even when MEGAcmd itself reports a
-healthy sync.
+Shared-folder health comes from Syncthing's own REST API on loopback, not from the
+filesystem. Two things must hold: `/rest/db/status` reports the folder present and
+not in error, and `/rest/system/connections` reports at least one connected peer.
+
+That second check is the one a filesystem probe can never make. A folder can look
+perfectly healthy locally while no other machine is reachable, in which case a
+message written into it has been stored, not delivered.
+
+The API key is read from `SYNCTHING_API_KEY` or, failing that, from Syncthing's own
+`config.xml` at its platform-default location, so an operator who already runs
+Syncthing needs no extra configuration. With no key the probe reports the transport
+unavailable rather than assuming one exists.
+
+Directory existence alone is not shared-transport health. The acknowledgement
+deadline additionally detects a remote peer that is not consuming messages even
+when Syncthing itself reports a healthy folder.
 
 When a Git remote is configured, GitHub visibility must be verified as `PRIVATE`
 for the exact `$FERRYMAN_CHANNEL_GIT_OWNER/<project>-bridge` name before

@@ -114,7 +114,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
             .arg(&source)
             .args([
                 "-UpdateStandard",
-                "-SkipMegaRegistration",
+                "-SkipSyncRegistration",
                 "-SkipHubRegistration",
             ])
             .env("PATH", &child_path)
@@ -182,7 +182,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
     );
     assert_success(&remote_adoption);
     assert!(String::from_utf8_lossy(&remote_adoption.stdout).contains("alpha-builder"));
-    assert!(inner.join(".megaignore").is_file());
+    assert!(inner.join(".stignore").is_file());
     assert!(!inner.join("token").exists());
     assert!(!inner.join("runtime").exists());
 

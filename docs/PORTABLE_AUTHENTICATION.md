@@ -5,13 +5,13 @@ unsafe until this document's enforcement gate is complete.
 
 ## Security objective
 
-Possession of write access to the MEGA folder or private Git repository must
+Possession of write access to the synced folder or private Git repository must
 not grant authority to create work or report it complete. Ferryman must
 authenticate the origin and authorization of every portable message,
 acknowledgement, and future claim before it can affect local state.
 
 Transport encryption and transport authentication are different controls.
-Private Git and MEGA limit who can read or write the transport, but Ferryman
+Private Git and Syncthing limit who can read or write the transport, but Ferryman
 still verifies every envelope independently.
 
 ## Identity and key storage

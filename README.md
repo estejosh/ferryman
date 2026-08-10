@@ -164,7 +164,7 @@ Approval is explicit for work marked `requires_approval`; a job cannot be leased
 - Project/role-derived agents with durable temporal/permanent Markdown profiles.
 - Bridge-owned, append-only project memory with a separate Markdown recovery mirror.
 - Project, job, worker, artifact, health/metrics and SSE endpoints.
-- Project-scoped live communications with durable local outboxes, MEGAcmd health
+- Project-scoped live communications with durable local outboxes, Syncthing health
   probing, acknowledgement-deadline Git promotion, duplicate-safe claims,
   inbound private-Git synchronization, and durable acknowledgement return.
   Portable v1 envelopes remain unsigned; see

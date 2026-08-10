@@ -40,8 +40,8 @@ non-hardlinked local clone, verifies the source and clone `HEAD`, and then sets
 only the inner clone's origin. The source checkout is left unchanged and
 recoverable.
 
-MEGAcmd registers only the inner directory. Use `-SkipMegaRegistration` or
-`--skip-mega-registration` only for a fixture or when an operator intentionally
+Syncthing carries only the inner directory. Use `-SkipSyncRegistration` or
+`--skip-sync-registration` only for a fixture or when an operator intentionally
 plans to register the dedicated sync separately.
 
 Generic Windows dry run:
@@ -70,7 +70,7 @@ scripts/attach-project.sh \
 
 After review, remove only the dry-run flag. When adopting an old communications
 checkout, do not retire it as part of attachment. Retirement is a distinct,
-explicitly approved operation after history, remote, MEGA status, hub status,
+explicitly approved operation after history, remote, Syncthing status, hub status,
 and message round-trip verification.
 
 For an existing attachment below revision 2, retain all original parameters and

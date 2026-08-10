@@ -182,7 +182,7 @@ paths:
                   items:
                     type: array
                     items: {$ref: '#/components/schemas/CommunicationMessage'}
-                  synchronized_via: {type: [string, 'null'], enum: [local_filesystem, shared_megacmd, private_git, null]}
+                  synchronized_via: {type: [string, 'null'], enum: [local_filesystem, shared_folder, private_git, null]}
         '401': {description: missing, expired, or wrong actor token}
   /v1/projects/{project_id}/communications/reconcile:
     parameters: [{name: project_id, in: path, required: true, schema: {type: string}}]
@@ -193,7 +193,7 @@ paths:
       security: [{ProjectBearer: []}]
       summary: Inspect transport health, failover state, queue age, and quarantine
       parameters:
-        - {name: probe_external, in: query, schema: {type: boolean, default: true}, description: Set false for a strictly local snapshot without MEGAcmd or private-Git health commands.}
+        - {name: probe_external, in: query, schema: {type: boolean, default: true}, description: Set false for a strictly local snapshot without Syncthing or private-Git health probes.}
       responses:
         '200':
           description: current communications status
