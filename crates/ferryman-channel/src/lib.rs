@@ -1,6 +1,7 @@
 //! Durable, project-scoped live communications with local/shared-first delivery and
 //! private-Git failover. This is deliberately separate from encrypted continuity packs.
 
+#![forbid(unsafe_code)]
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},

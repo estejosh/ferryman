@@ -1,5 +1,6 @@
 [workspace]
 members = [
+  "crates/ferryman-channel",
   "crates/ferryman-core",
   "crates/ferryman-server",
   "crates/ferryman-cli",

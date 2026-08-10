@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-pub mod communications;
+/// The channel now lives in its own crate and runs without this server.
+/// Re-exported under the original path so the HTTP surface is unchanged.
+pub use ferryman_channel as communications;
 pub mod continuity;
 pub mod recovery_targets;
 pub mod telegram;

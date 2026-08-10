@@ -1,0 +1,20 @@
+[package]
+name = "ferryman-channel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Ferryman channel: portable agent messages and shared memory on a synced folder. No server, no database, no network listener."
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+fs2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+wait-timeout.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

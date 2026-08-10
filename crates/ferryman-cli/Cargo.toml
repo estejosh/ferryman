@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+ferryman-channel = { path = "../ferryman-channel" }
 clap.workspace = true
 chacha20poly1305.workspace = true
 futures-util.workspace = true
