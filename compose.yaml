@@ -1,6 +1,38 @@
+# Docker Compose / podman-compose. The single `podman run` in the README is the
+# recommended path; this is for people who already run everything through compose.
 services:
-  bridge:
-    build: .
-    ports: ["8787:8787"]
-    volumes: ["./.data:/data"]
-    command: ["ferryman-server", "--database", "/data/bridge.db", "--artifacts", "/data/artifacts"]
+  ferryman:
+    build:
+      context: .
+      dockerfile: Containerfile
+    image: ghcr.io/estejosh/ferryman:latest
+    container_name: ferryman
+    restart: unless-stopped
+    environment:
+      # bundled: run Syncthing in the container.
+      # external: use the host's - required if the host already syncs these folders,
+      # because two live sync engines on one folder cause conflict loops.
+      FERRYMAN_SYNCTHING: bundled
+      # SYNCTHING_API_BASE: http://host.docker.internal:8384
+      # SYNCTHING_API_KEY: ${SYNCTHING_API_KEY}
+    volumes:
+      # One subdirectory per project. Coordination and shared memory only - the work
+      # itself lives in each project's own repository and never travels here.
+      - ./channels:/channels
+      # Private, rebuildable index. Separate volume on purpose.
+      - ferryman-state:/state
+    ports:
+      - "22000:22000/tcp"     # Syncthing protocol
+      - "22000:22000/udp"     # Syncthing protocol (QUIC)
+      - "21027:21027/udp"     # local discovery
+      - "127.0.0.1:8384:8384" # Syncthing UI, loopback only
+      - "127.0.0.1:8787:8787" # Ferryman API, loopback only
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ferryman-entrypoint", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  ferryman-state:

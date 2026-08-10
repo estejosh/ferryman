@@ -1,0 +1,53 @@
+# Quadlet unit — systemd runs this rootless, as your user, with no daemon anywhere.
+#
+#   mkdir -p ~/.config/containers/systemd
+#   cp deploy/ferryman.container ~/.config/containers/systemd/
+#   systemctl --user daemon-reload && systemctl --user start ferryman
+#   loginctl enable-linger $USER                       # survive logout
+#   systemctl --user enable --now podman-auto-update.timer   # follow the repo
+#
+# The linger line matters. Syncthing on this project's own hub runs as a bare process
+# with no restart path, and the outage that caused is recorded in its history.
+
+[Unit]
+Description=Ferryman — agent channel and orchestrator
+Documentation=https://github.com/estejosh/ferryman
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=ghcr.io/estejosh/ferryman:latest
+ContainerName=ferryman
+# With podman-auto-update.timer enabled, a new image published by this repository's CI
+# is pulled and the container restarted on it. Pin to a :v1.2.3 tag instead if you would
+# rather approve each upgrade yourself.
+AutoUpdate=registry
+
+# One directory per project underneath. /channels/hone, /channels/ferryman, ...
+Volume=%h/ferryman-channels:/channels:z
+# This machine's private index. Disposable: it rebuilds from the channels.
+Volume=ferryman-state:/state:z
+
+Environment=FERRYMAN_SYNCTHING=bundled
+# Already running Syncthing on this host? Use these instead - never run two live sync
+# engines against one folder.
+# Environment=FERRYMAN_SYNCTHING=external
+# Environment=SYNCTHING_API_BASE=http://host.containers.internal:8384
+# Environment=SYNCTHING_API_KEY=...
+
+PublishPort=22000:22000/tcp
+PublishPort=22000:22000/udp
+PublishPort=21027:21027/udp
+PublishPort=127.0.0.1:8384:8384
+PublishPort=127.0.0.1:8787:8787
+
+NoNewPrivileges=true
+DropCapability=ALL
+
+[Service]
+Restart=always
+RestartSec=10
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

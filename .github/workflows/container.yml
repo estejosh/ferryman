@@ -1,0 +1,74 @@
+name: container
+
+# Auto-update path: every push to main publishes a new image. Instances running with
+# `AutoUpdate=registry` (see deploy/ferryman.container) pull it on the next
+# podman-auto-update timer tick, so a fleet follows this repository without anyone
+# logging into a machine.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Only publish from this repository's own main/tags - never from a fork's PR.
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # A PR must still prove the image runs, even though it is not published.
+      - name: Smoke test
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build -f Containerfile -t ferryman:pr .
+          docker run --rm --entrypoint /bin/sh ferryman:pr -c '
+            set -e
+            ferryman-server --help >/dev/null
+            ferry --help >/dev/null
+            syncthing --version
+            test -f /usr/share/licenses/syncthing/LICENSE
+            test -f /usr/share/licenses/THIRD_PARTY.md
+            echo "smoke ok"'
