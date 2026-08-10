@@ -39,8 +39,41 @@ fn posix_path(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// These tests exercise the POSIX attachment script. On Windows that means running it
+/// inside WSL, which a developer machine may have and a CI runner generally does not -
+/// GitHub's windows-latest image ships no WSL distribution at all.
+///
+/// Failing there would say nothing true about the code, so the tests skip instead. They
+/// still run for real on Linux and macOS, and on any Windows machine with Ubuntu under
+/// WSL, which is where they were failing silently in CI before this guard existed.
+#[cfg(windows)]
+fn posix_harness_available() -> bool {
+    Command::new("wsl.exe")
+        .args(["-d", "Ubuntu", "--", "true"])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn posix_harness_available() -> bool {
+    true
+}
+
+/// Returns true when the caller should stop, having explained why.
+fn skip_without_posix_harness(test: &str) -> bool {
+    if posix_harness_available() {
+        return false;
+    }
+    eprintln!("SKIP {test}: no WSL 'Ubuntu' distribution, so the POSIX attachment script cannot run here");
+    true
+}
+
 #[test]
 fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
+    if skip_without_posix_harness("posix_attachment_dry_run_is_framework_neutral_and_non_mutating") {
+        return;
+    }
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("alpha");
     fs::create_dir_all(&workspace).unwrap();
@@ -105,6 +138,9 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
 
 #[test]
 fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
+    if skip_without_posix_harness("posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap") {
+        return;
+    }
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("beta");
     let remote = fixture.path().join("beta-ferryman.git");
