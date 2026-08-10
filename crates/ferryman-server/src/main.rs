@@ -3,6 +3,7 @@ use clap::Parser;
 use ferryman_core::SqliteStore;
 use ferryman_server::{
     AppState, app, start_communications_reconciler,
+    telegram::TelegramGate,
     workspace::{provision_private_repository, select_artifact_root},
 };
 use std::{net::SocketAddr, path::PathBuf};
@@ -117,8 +118,24 @@ async fn main() -> Result<()> {
     } else if let Some(admin_token) = admin_token_env {
         state = state.with_admin_token(admin_token);
     }
+    let telegram_store = state.store.clone();
+    match TelegramGate::from_config(
+        load_telegram_bot_token()?,
+        telegram_approver_id(),
+        telegram_chat_id(),
+    ) {
+        Some(gate) => {
+            gate.spawn(telegram_store);
+            tracing::info!("telegram approval gate armed");
+        }
+        None => {
+            tracing::info!(
+                "telegram approval gate not configured (TELEGRAM_BOT_TOKEN/_KEYRING_REFERENCE or TELEGRAM_APPROVER_ID missing) - fails closed, no Telegram approval path opened"
+            );
+        }
+    }
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    tracing::info!(address=%args.listen,"orchestrator bridge listening");
+    tracing::info!(address=%args.listen,"ferryman bridge listening");
     let _communications_reconciler = start_communications_reconciler(state.clone());
     // On a loopback bind, reject requests whose Host header is not a loopback
     // name/IP. A raw loopback bind is not a defense against DNS rebinding: a
@@ -204,4 +221,35 @@ fn load_recovery_key(production: bool) -> Result<(String, [u8; 32])> {
         anyhow::anyhow!("recovery key must be exactly 32 bytes (64 hex characters)")
     })?;
     Ok((raw.0, key))
+}
+
+/// `TELEGRAM_BOT_TOKEN` (dev-friendly, an explicit secret in the environment) takes
+/// priority; otherwise `TELEGRAM_BOT_TOKEN_KEYRING_REFERENCE` (`service:account`) reads
+/// it from the OS keyring, mirroring `load_recovery_key`'s reference-by-name pattern so
+/// the token itself never has to live in bridge configuration or process arguments.
+/// Never logged, never returned in an error message.
+fn load_telegram_bot_token() -> Result<Option<String>> {
+    if let Ok(token) = std::env::var("TELEGRAM_BOT_TOKEN") {
+        return Ok(Some(token));
+    }
+    let Ok(reference) = std::env::var("TELEGRAM_BOT_TOKEN_KEYRING_REFERENCE") else {
+        return Ok(None);
+    };
+    let Some((service, account)) = reference.split_once(':') else {
+        anyhow::bail!("TELEGRAM_BOT_TOKEN_KEYRING_REFERENCE must use service:account");
+    };
+    let entry = keyring::Entry::new(service, account)?;
+    Ok(Some(entry.get_password()?))
+}
+
+fn telegram_approver_id() -> Option<i64> {
+    std::env::var("TELEGRAM_APPROVER_ID")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+}
+
+fn telegram_chat_id() -> Option<i64> {
+    std::env::var("TELEGRAM_CHAT_ID")
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
 }

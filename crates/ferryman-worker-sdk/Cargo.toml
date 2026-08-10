@@ -19,3 +19,7 @@ path = "examples/mock_worker.rs"
 [[example]]
 name = "agent_worker"
 path = "examples/agent_worker.rs"
+
+[[example]]
+name = "dryrun_worker"
+path = "examples/dryrun_worker.rs"

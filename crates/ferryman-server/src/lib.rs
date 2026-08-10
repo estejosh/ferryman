@@ -2,6 +2,7 @@
 pub mod communications;
 pub mod continuity;
 pub mod recovery_targets;
+pub mod telegram;
 pub mod workspace;
 
 use std::{collections::HashMap, convert::Infallible, path::PathBuf, sync::Arc, time::Duration};
@@ -1600,6 +1601,8 @@ struct SubmitJob {
     #[serde(default = "default_attempts")]
     max_attempts: u32,
     idempotency_key: Option<String>,
+    #[serde(default)]
+    approval_ttl_seconds: Option<i64>,
 }
 fn default_attempts() -> u32 {
     3
@@ -1621,6 +1624,7 @@ async fn submit_job(
                 requires_approval: input.requires_approval,
                 max_attempts: input.max_attempts,
                 idempotency_key: input.idempotency_key,
+                approval_ttl_seconds: input.approval_ttl_seconds,
             },
         )
         .map_err(ApiError::internal)?;
