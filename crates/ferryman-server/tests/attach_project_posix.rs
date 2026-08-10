@@ -65,13 +65,16 @@ fn skip_without_posix_harness(test: &str) -> bool {
     if posix_harness_available() {
         return false;
     }
-    eprintln!("SKIP {test}: no WSL 'Ubuntu' distribution, so the POSIX attachment script cannot run here");
+    eprintln!(
+        "SKIP {test}: no WSL 'Ubuntu' distribution, so the POSIX attachment script cannot run here"
+    );
     true
 }
 
 #[test]
 fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
-    if skip_without_posix_harness("posix_attachment_dry_run_is_framework_neutral_and_non_mutating") {
+    if skip_without_posix_harness("posix_attachment_dry_run_is_framework_neutral_and_non_mutating")
+    {
         return;
     }
     let fixture = tempfile::tempdir().unwrap();
@@ -138,7 +141,9 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
 
 #[test]
 fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
-    if skip_without_posix_harness("posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap") {
+    if skip_without_posix_harness(
+        "posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap",
+    ) {
         return;
     }
     let fixture = tempfile::tempdir().unwrap();
