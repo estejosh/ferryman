@@ -93,7 +93,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $communications '.git'))) {
 } else {
   $innerRemote = Invoke-GitRead $communications @('config','--get','remote.origin.url')
   $scanOwner = $env:FERRYMAN_CHANNEL_GIT_OWNER
-  $scanSuffix = if ($env:FERRYMAN_CHANNEL_GIT_SUFFIX) { $env:FERRYMAN_CHANNEL_GIT_SUFFIX } else { '-bridge' }
+  $scanSuffix = if ($env:FERRYMAN_CHANNEL_GIT_SUFFIX) { $env:FERRYMAN_CHANNEL_GIT_SUFFIX } else { '-ferryman' }
   $expectedPattern = '^https://github\.com/' + [regex]::Escape($scanOwner) + '/[A-Za-z0-9._-]+' + [regex]::Escape($scanSuffix) + '(?:\.git)?$'
   if (-not $innerRemote.Output) {
     # No upstream at all is the Syncthing-only channel, not a failure.

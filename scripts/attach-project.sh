@@ -20,11 +20,11 @@ usage() {
   cat <<'EOF'
 Usage:
   attach-project.sh --workspace PATH --project ID --shared-remote FOLDER_ID \
-    [--git-remote https://github.com/OWNER/ID-bridge.git] [options]
+    [--git-remote https://github.com/OWNER/ID-ferryman.git] [options]
 
 The Git rung is optional; omit --git-remote for a Syncthing-only channel. When a Git
 remote is supplied, FERRYMAN_CHANNEL_GIT_OWNER must name the account that owns the
-channel repositories (FERRYMAN_CHANNEL_GIT_SUFFIX overrides the "-bridge" suffix).
+channel repositories (FERRYMAN_CHANNEL_GIT_SUFFIX overrides the "-ferryman" suffix).
 
 Options:
   --adopt-from PATH
@@ -76,7 +76,7 @@ esac
 WORKSPACE=$(cd "$WORKSPACE" && pwd -P)
 ATTACHMENT="$WORKSPACE/.ferryman"
 COMMUNICATIONS="$ATTACHMENT/ferryman"
-GIT_SUFFIX="${FERRYMAN_CHANNEL_GIT_SUFFIX:--bridge}"
+GIT_SUFFIX="${FERRYMAN_CHANNEL_GIT_SUFFIX:--ferryman}"
 EXPECTED_NAME="$PROJECT$GIT_SUFFIX"
 normalize_remote() { printf '%s' "${1%.git}" | tr '[:upper:]' '[:lower:]'; }
 # Pinning the channel to a canonical location stops a tampered or mistaken mapping

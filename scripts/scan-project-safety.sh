@@ -58,7 +58,7 @@ fi
 
 if [[ -d "$COMMUNICATIONS/.git" ]]; then
   inner_remote=$(git -C "$COMMUNICATIONS" config --get remote.origin.url || true)
-  scan_suffix="${FERRYMAN_CHANNEL_GIT_SUFFIX:--bridge}"
+  scan_suffix="${FERRYMAN_CHANNEL_GIT_SUFFIX:--ferryman}"
   if [[ -z "$inner_remote" ]]; then
     # No upstream at all is the Syncthing-only channel, not a failure.
     result PASS inner_remote "(none; Syncthing-only)"

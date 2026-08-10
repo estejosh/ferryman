@@ -29,7 +29,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("alpha");
     let source = fixture.path().join("alpha-old-communications");
-    let remote = fixture.path().join("alpha-bridge.git");
+    let remote = fixture.path().join("alpha-ferryman.git");
     let tools = fixture.path().join("tools");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&source).unwrap();
@@ -71,13 +71,13 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
             "remote",
             "add",
             "origin",
-            "https://github.com/example-org/alpha-bridge.git",
+            "https://github.com/example-org/alpha-ferryman.git",
         ],
     ));
 
     fs::write(
         tools.join("gh.cmd"),
-        "@echo off\r\necho {\"nameWithOwner\":\"example-org/alpha-bridge\",\"visibility\":\"PRIVATE\"}\r\n",
+        "@echo off\r\necho {\"nameWithOwner\":\"example-org/alpha-ferryman\",\"visibility\":\"PRIVATE\"}\r\n",
     )
     .unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -102,9 +102,9 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
                 "-Project",
                 "alpha",
                 "-SharedRemote",
-                "alpha-bridge",
+                "alpha-ferryman",
                 "-GitRemote",
-                "https://github.com/example-org/alpha-bridge.git",
+                "https://github.com/example-org/alpha-ferryman.git",
                 "-IntegrationMode",
                 "single-agent",
                 "-Participant",
@@ -122,8 +122,12 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
             .env("GIT_CONFIG_KEY_0", format!("url.{remote_url}.insteadOf"))
             .env(
                 "GIT_CONFIG_VALUE_0",
-                "https://github.com/example-org/alpha-bridge.git",
+                "https://github.com/example-org/alpha-ferryman.git",
             )
+            // The channel location pin is fail-closed: supplying a remote without
+            // naming the owner it must belong to is refused, because an unpinned
+            // remote is exactly the redirection the check exists to prevent.
+            .env("FERRYMAN_CHANNEL_GIT_OWNER", "example-org")
             .output()
             .expect("run attachment script");
         assert_success(&output);
@@ -134,7 +138,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
         assert_success(&current_origin);
         assert_eq!(
             String::from_utf8_lossy(&current_origin.stdout).trim(),
-            "https://github.com/example-org/alpha-bridge.git"
+            "https://github.com/example-org/alpha-ferryman.git"
         );
     }
 
@@ -150,7 +154,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
     ));
     assert_eq!(
         String::from_utf8_lossy(&git(&inner, &["remote", "get-url", "origin"]).stdout).trim(),
-        "https://github.com/example-org/alpha-bridge.git"
+        "https://github.com/example-org/alpha-ferryman.git"
     );
     assert_eq!(
         String::from_utf8_lossy(&git(&workspace, &["remote", "get-url", "origin"]).stdout).trim(),
@@ -190,6 +194,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
         .arg(scanner)
         .arg("-Workspace")
         .arg(&workspace)
+        .env("FERRYMAN_CHANNEL_GIT_OWNER", "example-org")
         .output()
         .expect("run attachment safety scanner");
     assert_success(&scan);

@@ -2202,8 +2202,8 @@ mod tests {
                 "workspace": workspace.to_string_lossy(),
                 "attachment": attachment.to_string_lossy(),
                 "communications": communications_root.to_string_lossy(),
-                "shared_remote": "alpha-bridge",
-                "git_remote": "https://github.com/example-org/alpha-bridge.git",
+                "shared_remote": "alpha-ferryman",
+                "git_remote": "https://github.com/example-org/alpha-ferryman.git",
                 "git_visibility": "private",
                 "agents": [{
                     "name": "alpha-observer",

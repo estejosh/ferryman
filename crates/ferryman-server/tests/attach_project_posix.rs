@@ -73,13 +73,17 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
     };
     let output = command
         .env("FERRYMAN_CHANNEL_GIT_OWNER", "example-org")
+        // On Windows this spawns wsl.exe, and a Windows environment variable does not
+        // reach the Linux process unless WSLENV names it. Without this the variable is
+        // set on wsl.exe and never seen by the script.
+        .env("WSLENV", "FERRYMAN_CHANNEL_GIT_OWNER")
         .arg(posix_path(&script))
         .args(["--workspace", &posix_path(&workspace)])
         .args(["--project", "alpha"])
-        .args(["--shared-remote", "alpha-bridge"])
+        .args(["--shared-remote", "alpha-ferryman"])
         .args([
             "--git-remote",
-            "https://github.com/example-org/alpha-bridge.git",
+            "https://github.com/example-org/alpha-ferryman.git",
         ])
         .args(["--integration-mode", "multi-agent"])
         .args(["--participant", participant])
@@ -103,7 +107,7 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
 fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("beta");
-    let remote = fixture.path().join("beta-bridge.git");
+    let remote = fixture.path().join("beta-ferryman.git");
     let tools = fixture.path().join("tools");
     fs::create_dir_all(&workspace).unwrap();
     fs::create_dir_all(&tools).unwrap();
@@ -132,7 +136,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
     let fake_gh = tools.join("gh");
     fs::write(
         &fake_gh,
-        "#!/bin/sh\nprintf '%s\\n' 'example-org/beta-bridge|PRIVATE'\n",
+        "#!/bin/sh\nprintf '%s\\n' 'example-org/beta-ferryman|PRIVATE'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -176,16 +180,16 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
             .arg(format!("PATH={path}"))
             .arg("GIT_CONFIG_COUNT=1")
             .arg(format!("GIT_CONFIG_KEY_0=url.{remote_url}.insteadOf"))
-            .arg("GIT_CONFIG_VALUE_0=https://github.com/example-org/beta-bridge.git")
+            .arg("GIT_CONFIG_VALUE_0=https://github.com/example-org/beta-ferryman.git")
             .arg("FERRYMAN_CHANNEL_GIT_OWNER=example-org")
             .arg("bash")
             .arg(posix_path(&script))
             .args(["--workspace", &posix_path(&workspace)])
             .args(["--project", "beta"])
-            .args(["--shared-remote", "beta-bridge"])
+            .args(["--shared-remote", "beta-ferryman"])
             .args([
                 "--git-remote",
-                "https://github.com/example-org/beta-bridge.git",
+                "https://github.com/example-org/beta-ferryman.git",
             ])
             .args(["--integration-mode", "single-agent"])
             .args(["--participant", participant])
@@ -240,6 +244,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
     };
     let scan = scan
         .env("FERRYMAN_CHANNEL_GIT_OWNER", "example-org")
+        .env("WSLENV", "FERRYMAN_CHANNEL_GIT_OWNER")
         .arg(posix_path(&scanner))
         .args(["--workspace", &posix_path(&workspace)])
         .output()

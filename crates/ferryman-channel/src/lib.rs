@@ -22,7 +22,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const MESSAGE_FORMAT: &str = "ferryman-message/v1";
-const DEFAULT_GIT_SUFFIX: &str = "-bridge";
+const DEFAULT_GIT_SUFFIX: &str = "-ferryman";
 const DEFAULT_ACK_DEADLINE_SECONDS: i64 = 30;
 const VISIBILITY_CACHE_SECONDS: u64 = 600;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -61,10 +61,12 @@ const NULL_GIT_HOOKS_PATH: &str = "/dev/null";
 /// account it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelNamespace {
-    /// e.g. "acme" -> https://github.com/acme/<project>-bridge.git
+    /// e.g. "acme" -> https://github.com/acme/<project>-ferryman.git
     pub git_owner: Option<String>,
-    /// Repository name suffix. Defaults to "-bridge" for compatibility with
-    /// existing deployments.
+    /// Repository name suffix. Defaults to "-ferryman": Ferryman is the software
+    /// that carries communications *about* a project, so a project's channel is
+    /// `<project>-ferryman`. Deployments still on the older "-bridge" naming set
+    /// FERRYMAN_CHANNEL_GIT_SUFFIX and keep working.
     pub git_suffix: String,
 }
 
@@ -2261,8 +2263,8 @@ mod tests {
                 workspace,
                 attachment,
                 communications,
-                shared_remote: "alpha-bridge".into(),
-                git_remote: "https://github.com/example-org/alpha-bridge.git".into(),
+                shared_remote: "alpha-ferryman".into(),
+                git_remote: "https://github.com/example-org/alpha-ferryman.git".into(),
                 git_visibility: "private".into(),
                 agents: vec![AgentRoute {
                     name: "alpha-builder".into(),
@@ -2733,12 +2735,12 @@ mod tests {
     #[test]
     fn git_remote_under_a_foreign_owner_is_refused() {
         let (_temp, mut route) = fixture();
-        route.git_remote = "https://github.com/somebody-else/alpha-bridge.git".into();
+        route.git_remote = "https://github.com/somebody-else/alpha-ferryman.git".into();
         assert!(route.validate_in(&test_namespace()).is_err());
 
         // ...and the matching remote for this namespace is accepted, including the
         // usual .git / case-insensitivity normalisation.
-        route.git_remote = "https://github.com/Example-Org/alpha-bridge".into();
+        route.git_remote = "https://github.com/Example-Org/alpha-ferryman".into();
         route
             .validate_in(&test_namespace())
             .expect("the canonical remote for this namespace must be accepted");
@@ -2769,7 +2771,7 @@ mod tests {
         // component, and the old MEGA-style path no longer qualifies.
         route.shared_remote = "/shared-bridges/alpha".into();
         assert!(route.validate().is_err());
-        route.shared_remote = "alpha-bridge".into();
+        route.shared_remote = "alpha-ferryman".into();
         let message = Message::new(
             "beta",
             "operator",

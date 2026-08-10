@@ -1580,8 +1580,8 @@ mod communication_mapping_tests {
             workspace_path: r"X:\alpha".into(),
             attachment_path: r"X:\alpha\.ferryman".into(),
             communications_path: r"X:\alpha\.ferryman\ferryman".into(),
-            shared_remote: "alpha-bridge".into(),
-            git_remote: "https://github.com/example-org/alpha-bridge.git".into(),
+            shared_remote: "alpha-ferryman".into(),
+            git_remote: "https://github.com/example-org/alpha-ferryman.git".into(),
             git_visibility: "private".into(),
             agents_json: r#"[{"name":"alpha-builder","role":"builder","capabilities":["code"]}]"#
                 .into(),
@@ -1604,7 +1604,7 @@ mod communication_mapping_tests {
         // A remote that does not belong to this installation's namespace is refused,
         // and so is one that cannot be pinned at all.
         let mut foreign = mapping.clone();
-        foreign.git_remote = "https://github.com/somebody-else/alpha-bridge.git".into();
+        foreign.git_remote = "https://github.com/somebody-else/alpha-ferryman.git".into();
         assert!(
             store
                 .set_project_communications(&foreign, &namespace)
@@ -1674,7 +1674,7 @@ mod communication_mapping_tests {
             workspace_path: r"X:\gamma".into(),
             attachment_path: r"X:\gamma\.ferryman".into(),
             communications_path: r"X:\gamma\.ferryman\ferryman".into(),
-            shared_remote: "gamma-bridge".into(),
+            shared_remote: "gamma-ferryman".into(),
             git_remote: String::new(),
             // The project_communications table still carries
             // CHECK(git_visibility = 'private'), so the stored value stays 'private'

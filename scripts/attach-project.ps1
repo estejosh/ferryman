@@ -125,7 +125,7 @@ if (-not (Test-Path -LiteralPath $workspacePath -PathType Container)) {
 }
 $attachment = Join-Path $workspacePath '.ferryman'
 $communications = Join-Path $attachment 'ferryman'
-$gitSuffix = if ($env:FERRYMAN_CHANNEL_GIT_SUFFIX) { $env:FERRYMAN_CHANNEL_GIT_SUFFIX } else { '-bridge' }
+$gitSuffix = if ($env:FERRYMAN_CHANNEL_GIT_SUFFIX) { $env:FERRYMAN_CHANNEL_GIT_SUFFIX } else { '-ferryman' }
 $expectedName = "$Project$gitSuffix"
 $channelOwner = $env:FERRYMAN_CHANNEL_GIT_OWNER
 $participantRoutes = @(Convert-ParticipantRoutes)
