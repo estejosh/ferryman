@@ -1,6 +1,6 @@
 # Attachment and migration
 
-Read [`ALWAYS_READ_THIS_FIRST.md`](../ALWAYS_READ_THIS_FIRST.md) before using
+Read [the operator brief](OPERATOR_BRIEF.md) before using
 these commands. Run the read-only safety scanner first and show its result to
 the user:
 

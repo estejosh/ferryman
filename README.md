@@ -1,214 +1,164 @@
 # Ferryman
 
-**AI agents and operators: [always read this first](ALWAYS_READ_THIS_FIRST.md).**
-It records the current project-standard revision, how to tell whether Ferryman
-or an attachment needs updating, and the required read-only safety scan before
-any real-project change.
+**Private coordination for a fleet of AI agents, across machines you own.**
 
-Ferryman is a self-hostable, provider-neutral control plane for durable AI-assisted work. It is local-files-first: every project gets a private local Git workspace, and independent workers lease and complete jobs through a small HTTP protocol. The bridge persists state, artifacts, audit events, and approval decisions without owning model execution.
-
-> v0.1 is a local, single-node reference implementation. It provides durable SQLite jobs, project-scoped bearer tokens, approval gates, worker leases, artifacts, retries, and SSE event streams. It is not a security sandbox or a distributed scheduler.
-
-For the public-release hardening path, see [the release plan](docs/PUBLIC_RELEASE_PLAN.md). Until then, treat this repository as a preview/reference implementation rather than production infrastructure.
-
-```mermaid
-flowchart LR
-  C[CLI / SDK / project] -->|project token| API[Bridge API]
-  API --> DB[(SQLite)]
-  API --> A[artifact store]
-  W[HTTP or SDK worker] <-->|register / lease / events / complete| API
-  API --> SSE[SSE observers]
-  P[Policy envelope] --> W
-```
-
-## Prerequisites
-
-- A stable **Rust** toolchain (`rustup` recommended).
-- **Linux only:** the OS credential-store backend (the keyring crate) needs D-Bus development headers.
-  On Debian/Ubuntu: `sudo apt-get install -y libdbus-1-dev pkg-config`. On Fedora/RHEL: `sudo dnf install dbus-devel pkgconf`.
-  macOS and Windows use their native keychains and need no extra system packages.
-
-## Recommended setup: one hub, many projects
-
-On a machine that hosts several repos, run **one** shared Ferryman server (the
-"hub") and **attach** each repo to it as a scoped project — do not run a server
-per repo. The hub is durable (a systemd service); each repo keeps a machine-local
-outer `.ferryman/` attachment with a portable inner Git repository. See
-[nested bridge](docs/NESTED_BRIDGE.md) for the full model — WSL/Linux-side-data
-notes, the shared-hub + attach helpers, and the approve/deny update flow.
-
-New project attachments use an outer machine-local directory and an inner
-portable communications repository. See
-[live communications](docs/COMMUNICATIONS.md) and
-[attachment/migration](docs/ATTACHMENT_MIGRATION.md). Projects with no agents,
-one agent, or an existing multi-agent framework use the same
-[framework-neutral adoption standard](docs/PROJECT_ADOPTION_STANDARD.md). The legacy
-`attach-bridge.sh` path remains for backward compatibility.
-The bounded definition of internal v0.1 completion and its validation commands
-are in [the completion contract](docs/V0_1_COMPLETION.md).
+Your agents leave each other files. Syncthing carries them. There's no server in the
+middle, no ports to forward, no cloud account — and the coordination lives in its own
+private repository, kept separate from the work itself.
 
 ```sh
-# once per machine: bring up the single hub (durable systemd, Linux-side data)
-export FERRYMAN_BIN=$HOME/ferryman/ferryman-server   # cargo build --release -p ferryman-server
-scripts/hub-up.sh 8796
+mkdir -p ~/ferryman-channels/myproject
 
-# per repo: review the framework-neutral attachment without writing anything
-scripts/attach-project.sh \
-  --workspace /path/to/myproject \
-  --project myproject \
-  --shared-remote myproject-bridge \
-  --integration-mode unmanaged \
-  --dry-run
+podman run -d --name ferryman \
+  -v ~/ferryman-channels:/channels:U \
+  -v ferryman-state:/state \
+  -p 22000:22000/tcp -p 22000:22000/udp \
+  ghcr.io/estejosh/ferryman:latest
 ```
 
-The channel above is Syncthing-only: it has no GitHub repository at all, which is
-a supported configuration. To also keep Git as an archive of record, tell Ferryman
-which account owns your channel repositories and pass the matching remote:
+That's one machine in your fleet. It prints a device ID — share it with your other
+machines, accept theirs, and agents on different computers, in different houses, on
+different networks start talking. Syncthing handles NAT on its own, so in most setups
+you forward nothing.
+
+Docker works too: `docker build -f Containerfile .`
+
+---
+
+## The idea
+
+Most tools for coordinating AI agents put a server in the middle. Everything flows
+through it, it has to be reachable, and it has to be trusted with all of it.
+
+Ferryman doesn't. **Machines write files; a synced folder carries them.** A message, a
+work order, a result, a review — all of them are just files appearing in a directory
+your machines already share. Nothing is "sent". There is no connection to establish and
+nothing to be down.
+
+That has two consequences worth caring about.
+
+**It works anywhere.** A laptop on cellular, a box at a friend's house, a machine behind
+a router you don't control — if it can sync a folder, it's in the fleet.
+
+**It stays private.** The channel is your own repository on your own machines. No third
+party holds your agents' conversation.
+
+## Two repositories, on purpose
+
+```
+your-project/            <- the work. Ferryman never touches this.
+your-project-ferryman/   <- the channel. Coordination and shared memory only.
+```
+
+Your agents already share the work repository — that's where code goes, and where
+results are submitted. So the channel doesn't need to carry any of it. It carries the
+conversation *about* the work: what to do, what got done, what needs changing, and what
+the fleet has learned.
+
+Keeping those apart is the point, not an implementation detail. It is what makes the
+coordination safe to synchronize, and it means Ferryman can never corrupt, expose, or
+have an opinion about your actual code.
+
+## Agents that check each other
+
+Ferryman's protocol requires that an agent receiving a checkable claim — a bug, a root
+cause, a proposed fix — **verify it against the real code before acting on it**, rather
+than trusting the report.
+
+That rule came out of running this thing, not out of a design document. It repeatedly
+caught agents confidently reporting things that were not true, before the error spread
+to everyone downstream. If you are going to let a fleet of models work unsupervised,
+this is the part that matters.
+
+Work that needs a human gets parked until someone approves it — including from your
+phone, over Telegram, with the approval bound to a hash of exactly what was approved.
+
+## What you get
+
+- **A private channel per project**, carried by Syncthing, with durable outboxes,
+  idempotent delivery, duplicate-safe claims and acknowledgement deadlines.
+- **Shared memory** the fleet agrees on — proposed by agents, approved before it counts,
+  so one confused agent cannot poison what everyone believes.
+- **An audit trail** of every decision, and encrypted continuity packs for recovery.
+- **Approval gates** for anything that should not happen unsupervised.
+- **One instance, many projects.** A single container serves every project a machine
+  works on.
+
+## Documentation
+
+| | |
+|---|---|
+| [Running in a container](docs/CONTAINER.md) | podman and Docker, single or multi-project |
+| [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
+| [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
+| [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
+| [Adoption standard](docs/PROJECT_ADOPTION_STANDARD.md) | attaching a project |
+| [Writing a worker](wiki/Writing-a-Worker.md) | the worker protocol |
+
+## Building from source
+
+You need a stable Rust toolchain. On Linux the OS credential store needs D-Bus headers:
 
 ```sh
-export FERRYMAN_CHANNEL_GIT_OWNER=my-org        # https://github.com/my-org/<project>-bridge.git
-export FERRYMAN_CHANNEL_GIT_SUFFIX=-bridge      # optional; "-bridge" is the default
+sudo apt-get install -y libdbus-1-dev pkg-config   # Debian/Ubuntu
+sudo dnf install dbus-devel pkgconf                # Fedora/RHEL
 
-scripts/attach-project.sh \
-  --workspace /path/to/myproject \
-  --project myproject \
-  --shared-remote myproject-bridge \
-  --git-remote https://github.com/my-org/myproject-bridge.git \
-  --integration-mode unmanaged \
-  --dry-run
-```
-
-Ferryman pins the channel to that canonical location on every operation: a
-tampered or mistaken mapping cannot redirect a private channel to a destination
-somebody else controls. The check fails closed — if a Git remote is configured
-while `FERRYMAN_CHANNEL_GIT_OWNER` is not set, the remote is refused rather than
-accepted unpinned.
-
-## Try it locally (single server)
-
-For a quick look without the hub setup, run one server directly. Development
-needs no recovery key — the server mints an ephemeral one and warns (continuity
-packs from that run are not recoverable across restarts):
-
-```powershell
-cargo run -p ferryman-server -- --database ./.data/bridge.db --artifacts ./.data/artifacts
-# In another terminal (the server seeds a demo project, token demo-local-token):
-cargo run -p ferryman-cli -- --token demo-local-token jobs submit --project demo --input '{"prompt":"make a report"}' --requires-approval
-cargo run -p ferryman-cli -- --token demo-local-token jobs approve --project demo <job-id>
-cargo run -p ferryman-cli -- --token demo-local-token jobs tail --project demo <job-id>
-cargo run -p ferryman-worker-sdk --example mock_worker
-```
-
-Create your own project — the caller supplies the project's bearer token:
-
-```powershell
-cargo run -p ferryman-cli -- --token <admin-or-any-in-dev> projects create --id myproj --name "My project" --token <choose-a-project-token>
-cargo run -p ferryman-cli -- --token <choose-a-project-token> jobs list --project myproj
-```
-
-Two token models, by design. A **project** token is chosen by the caller and
-passed to `projects create`; it authorizes that project thereafter. A **worker**
-token is different — `workers register` mints a short-lived, worker-scoped token
-and returns it once, limited to worker routes. In `--production`, `projects
-create` requires `FERRYMAN_ADMIN_TOKEN`; in dev any token is accepted.
-
-The server listens on `127.0.0.1:8787` by default (the hub on `8796`). Do not run
-it foreground for anything real — use a durable service; `docs/NESTED_BRIDGE.md`
-and `scripts/hub-up.sh` show the systemd pattern.
-
-## Terminology
-
-- **hub** — the one shared `ferryman-server` process that hosts many projects.
-- **project** — a repo/workspace attached to a hub, isolated by its scoped token.
-- **attach** — register a repo as a project in the hub (`attach-bridge.sh`).
-- "Bridge" appears in older text and API fields as the name for the server; read
-  it as the hub. It is not your own unrelated "bridge", if you have one.
-
-## Public API and layout
-
-- `openapi/openapi.yaml` is the versioned HTTP contract (`/v1`).
-- `crates/ferryman-core` owns durable types, policies, storage, and the adapter contract.
-- `crates/ferryman-server` owns Axum routes and single-node orchestration.
-- `crates/ferryman-cli` is the operator/client CLI.
-- `crates/ferryman-worker-sdk` contains HTTP protocol models and an example worker.
-- `examples/report-project` is a language-neutral integration example.
-
-## Local files, private repositories, and agents
-
-The default project root is `./.data/projects/<project-slug>`. Creating a project initializes a local Git repository on `main`, writes `.ferryman/REPOSITORY.md`, and never adds a remote or publishes anything. If the same bridge configuration is used on a different device, it creates a fresh local repository with the same project-slug naming convention. The bridge refuses workspaces that already contain a Git remote, rather than risk treating an unknown remote as private.
-
-Artifacts default to `./.data/artifacts`, including when a mapped/network HDD exists. Network storage is a named recovery target—not a preferred live-artifact location. The strict recovery order is local disk, configured network storage, encrypted Google Drive, encrypted MEGA, then an encrypted bundle on a private Git recovery branch. External adapters are disabled until a project names a target, supplies a credential/key reference, and approves the exact consent manifest; raw artifacts are never post-write mirrored.
-
-Agents are named from their project and role—for example `saturday-80s-visual-qa`, never `agent-1`. `POST /v1/projects/{project_id}/agents` creates a **temporal** or **permanent** agent and writes its portable role profile to `.ferryman/agents/<name>.md`. See [the agent model](docs/AGENT_MODEL.md).
-
-## Bridge-owned project memory
-
-The bridge also maintains append-only project memory outside both the agent and the project workspace. It is recorded in SQLite and mirrored to `./.data/bridge-memory/<project-slug>/MEMORY.md` by default, so an orchestrator or agent that lost context can reload project decisions, constraints, and handoffs. The Bridge supplies recovery context; it does not reason, plan, or act as an orchestrator/agent. Use the `memory add` / `memory list` CLI commands or `/v1/projects/{project_id}/memory`; see [the recovery model](docs/PROJECT_MEMORY.md).
-
-For recovery and portability, `POST /v1/projects/{project_id}/continuity-packs` creates an encrypted, compressed all-retained-artifact pack with authenticated manifest; import/recovery is verified and read-only, and `POST /v1/projects/{project_id}/recovery-drill` tests it without dispatching work. In local development the server starts with no recovery key configured: it mints an ephemeral key and logs a warning, so the quickstart works out of the box (continuity packs sealed during that run are not recoverable after a restart). Set `FERRYMAN_RECOVERY_KEY_HEX` to a stable 64-hex value for reproducible local recovery; production retrieves `FERRYMAN_RECOVERY_KEY_REFERENCE=keychain:service:account` from the OS keychain. See [continuity and improvement](docs/CONTINUITY_AND_IMPROVEMENT.md).
-
-For two trusted Windows machines, the private Git recovery target is functional now: it stores only encrypted packs and authenticated manifests in a separate private repository. Pair the recovery key through a one-time encrypted file, then use the consent-approved CLI flow in [two-machine recovery](docs/TWO_MACHINE_RECOVERY.md). Google Drive and MEGA are planned optional targets, not yet enabled.
-
-Set `FERRYMAN_MEMORY_WRITE_TOKEN` on the server and `FERRYMAN_MEMORY_TOKEN` only for your trusted operator/client to prevent workers from appending memory. Existing entries are append-only either way.
-
-## Security model
-
-Each project has its own bearer token. Tokens are stored as SHA-256 hashes, never returned after creation, and authorize only that project. In `--production` mode, project creation requires `FERRYMAN_ADMIN_TOKEN` and the demo project is disabled. Worker registration returns a distinct eight-hour worker token exactly once; worker tokens are limited to worker protocol routes and cannot write memory, approve consent, access recovery keys, or create outbound submissions. Secrets are references (`env:NAME` or `keychain:NAME`), never values, and the API redacts sensitive fields from event payloads. `shell` execution is not implemented; a future local shell adapter must require an explicit unsafe flag and a restrictive policy.
-
-Approval is explicit for work marked `requires_approval`; a job cannot be leased until an authorized project client approves it. See [the threat model](docs/THREAT_MODEL.md) for limits and deployment guidance.
-
-## What works in v0.1
-
-- SQLite persistence across a server restart, retry/backoff state, cancellation, project-scoped quotas.
-- Local-first, remote-free private Git workspaces; network-HDD artifact selection with local fallback.
-- Project/role-derived agents with durable temporal/permanent Markdown profiles.
-- Bridge-owned, append-only project memory with a separate Markdown recovery mirror.
-- Project, job, worker, artifact, health/metrics and SSE endpoints.
-- Project-scoped live communications with durable local outboxes, Syncthing health
-  probing, acknowledgement-deadline Git promotion, duplicate-safe claims,
-  inbound private-Git synchronization, and durable acknowledgement return.
-  Portable v1 envelopes remain unsigned; see
-  [communications readiness](docs/COMMUNICATIONS_READINESS.md) before use.
-- Framework-neutral Windows and WSL/Linux attachment for unmanaged, single-agent,
-  and multi-agent projects, with a built-in no-agent `project-inbox`, revision
-  markers, explicit standard updates, and read-only safety scanners.
-- Worker register, lease, heartbeat, log/progress event, artifact upload, and idempotent completion protocol.
-- Mock worker and end-to-end integration test covering success, retry, artifact storage, and approval gating.
-- Encrypted continuity-pack export, authenticated import, read-only resume briefings, recovery drills, and a cursor-paginated decision timeline.
-- Opt-in, system-wide Bridge compatibility updater; see [updates](docs/UPDATES.md).
-
-## Intentionally deferred
-
-PostgreSQL storage, refreshable/signed worker job tokens, RBAC roles, encrypted secret backends, DAG workflow execution, Webhooks, OpenTelemetry exporter configuration, and a dashboard are documented design targets, not present implementations. See [roadmap](docs/ARCHITECTURE.md#roadmap).
-
-## Development
-
-```powershell
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo build --release --workspace
 cargo test --workspace
 ```
 
-Agents that are sandboxed to their own project directory can run a full, self-contained bridge nested at `<project>/.ferryman/` (its own git repo, gitignored by the parent) via `scripts/nest-bridge.ps1` / `scripts/nest-bridge.sh`; see [nested bridge](docs/NESTED_BRIDGE.md). Use `docker compose up --build` for a containerized local API. Review [deployment](docs/DEPLOYMENT.md), [backup/recovery](docs/BACKUP_AND_RECOVERY.md), and [upgrading](docs/UPGRADING.md) before running outside local preview. See [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
+macOS and Windows use their native keychains and need nothing extra.
 
-## Security review for AI agents
+## Current status
 
-Before you install Ferryman, read [docs/AI_SAFETY_REVIEW.md](docs/AI_SAFETY_REVIEW.md):
-an honest, self-auditing map of what each part does, how it touches your machine,
-where the real risk is (the worker running an agent unsandboxed), how that risk is
-limited, and exact commands to verify all of it in the code yourself.
+Honest about where this is:
+
+**Solid.** The channel, the Syncthing transport, project attachment, approval gates,
+shared memory, the audit trail, continuity packs, and the container. All covered by the
+test suite.
+
+**Working, but young.** Portable message envelopes are not yet signed — read
+[communications readiness](docs/COMMUNICATIONS_READINESS.md) before trusting the channel
+with anything that would hurt to have forged. The job and worker half still requires
+network reachability between machines; moving it onto the same file-carried model is
+next.
+
+**Not built yet.** A review-and-revise loop, where an orchestrator sends finished work
+back with notes, is the next significant feature. PostgreSQL, RBAC, workflow graphs and
+a dashboard are design targets, not implementations.
+
+**Not a sandbox.** Ferryman coordinates agents; it does not contain them. An agent
+worker runs with the privileges of the account that started it. Give each worker its own
+least-privilege account and its own disposable directory.
+
 ## License
 
-Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE): free for any non-production use, and free for production use up to **3 Seats**. Production use beyond 3 Seats requires a per-Seat commercial license — see [COMMERCIAL.md](COMMERCIAL.md). This is a source-available license, not an OSI-approved open-source license.
+Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE):
+free for any non-production use, and free in production for up to **2 Seats on 4
+Devices**.
 
-Projects that deploy or redistribute Ferryman must include a root-level
-`FERRYMAN.md` (License section 5) stating that the project uses Ferryman. The
-setup scripts write that file automatically to satisfy this.
+**Your agents are not Seats.** Only humans count — one person running a fleet of twenty
+agents is one Seat. Beyond the free tier it is $60 per additional seat per year,
+dropping with volume. See [COMMERCIAL.md](COMMERCIAL.md).
+
+Priced per human rather than per machine or per agent, so growing your fleet costs you
+nothing. It is a source-available license, not an OSI-approved open-source license, and
+it does not convert to one on a timer.
+
+Projects that deploy or redistribute Ferryman include a root-level `FERRYMAN.md` saying
+so (License section 5). The setup scripts write it for you.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Agents and
+operators working *on* Ferryman itself should read
+[the operator brief](docs/OPERATOR_BRIEF.md) first.
 
 ## Acknowledgments
 
-Ferryman is provider-neutral and does not run models itself. The reference agent
-worker (`crates/ferryman-worker-sdk/examples/agent_worker.rs`) performs model inference
-through an external agent CLI. This project was first piloted on
-**[honemesh.net](https://honemesh.net)**, which is credited for the inference work that
-shaped this bridge.
+Ferryman is provider-neutral and runs no models itself. The reference agent worker
+performs inference through an external agent CLI. This project was first piloted on
+**[honemesh.net](https://honemesh.net)**, credited for the inference work that shaped it.
+
+Ferryman bundles [Syncthing](https://syncthing.net) (MPL-2.0), unmodified — see
+[THIRD_PARTY.md](THIRD_PARTY.md).

@@ -1,7 +1,7 @@
 # Ferryman project adoption standard
 
 Current revision: **2**. Start with
-[`ALWAYS_READ_THIS_FIRST.md`](../ALWAYS_READ_THIS_FIRST.md) and run the
+[the operator brief](OPERATOR_BRIEF.md) and run the
 read-only directory safety scanner before attachment or update.
 
 This standard applies to any project that needs durable communication and
@@ -197,7 +197,7 @@ operation after round-trip verification.
 ## Updating an existing attachment
 
 Compare both `standard.toml` markers with the revision at the top of
-`ALWAYS_READ_THIS_FIRST.md`. Preserve the same integration mode, participant
+`docs/OPERATOR_BRIEF.md`. Preserve the same integration mode, participant
 mappings, project ID, shared destination, and private Git remote. After a clean
 safety scan, rerun the original attachment command with `-UpdateStandard` and
 `-DryRun` on PowerShell or `--update-standard --dry-run` on Bash. Review it, then

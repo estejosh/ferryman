@@ -1,13 +1,18 @@
-Ferryman Source-Available License, Version 1.0
+Ferryman Source-Available License, Version 1.1
 
-Licensor: Shin Devlin ("Licensor")
+Licensor: estejosh ("Licensor")
 Licensed Work: Ferryman (the "Software"), including all versions, components,
 and source code contained in this repository.
 
-SUMMARY (non-binding): Ferryman is free to use in production for up to three (3)
-Seats, and free for any non-production use. Using it in production beyond three
-Seats requires a paid, per-Seat commercial license from the Licensor. The full,
-binding terms are below.
+SUMMARY (non-binding): Ferryman is free to use in production for up to two (2)
+Seats running on up to four (4) Devices, and free for any non-production use.
+Using it in production beyond those limits requires a paid, per-Seat commercial
+license from the Licensor. The full, binding terms are below.
+
+CHANGES FROM VERSION 1.0: the free production allowance changed from three (3)
+Seats with no Device limit, to two (2) Seats on up to four (4) Devices. Anyone
+who obtained the Software under Version 1.0 may continue to rely on Version 1.0
+for that copy; this version applies to copies obtained under it.
 
 This license is derived from the Business Source License 1.1, modified to be a
 PERMANENT source-available license. Unlike the Business Source License, it has no
@@ -22,6 +27,11 @@ or accesses the Software or its outputs on behalf of you or your organization.
 Automated agents, workers, or processes do not count as Seats in themselves; they
 are attributed to the Seat of the human individual on whose behalf they act.
 
+"Device" means each distinct physical or virtual machine on which the Software,
+or any component of it, is installed or run on your behalf. A machine that only
+stores a synchronized channel directory, without running the Software, is not a
+Device.
+
 "Production use" means any use other than for personal experimentation,
 evaluation, development, or testing.
 
@@ -30,19 +40,21 @@ Subject to the terms below, the Licensor grants you a non-exclusive, worldwide,
 royalty-free right to copy, modify, create derivative works of, and redistribute
 the Software, and to make non-production use of the Software without limit.
 
-2. FREE PRODUCTION USE (UP TO THREE SEATS)
+2. FREE PRODUCTION USE (UP TO TWO SEATS ON FOUR DEVICES)
 You may use the Software in production free of charge provided that your total
-number of Seats does not exceed three (3).
+number of Seats does not exceed two (2) and your total number of Devices does not
+exceed four (4). Both limits apply; exceeding either one ends the free allowance.
 
-3. COMMERCIAL LICENSE REQUIRED ABOVE THREE SEATS
-Any production use of the Software that exceeds three (3) Seats requires a paid
-commercial license from the Licensor, granted on a per-Seat basis. See
-COMMERCIAL.md for how to obtain one.
+3. COMMERCIAL LICENSE REQUIRED ABOVE THOSE LIMITS
+Any production use of the Software that exceeds two (2) Seats or four (4) Devices
+requires a paid commercial license from the Licensor, granted on a per-Seat basis.
+A commercial license places no limit on Devices. See COMMERCIAL.md for how to
+obtain one.
 
 4. REDISTRIBUTION
 You may redistribute the Software or derivative works provided that you (a) retain
 this license text, the copyright notice, and all notices; and (b) do not remove,
-weaken, or circumvent the Seat limitations. Any recipient receives the Software
+weaken, or circumvent the Seat or Device limitations. Any recipient receives the Software
 under this same license, with the same rights and the same limitations.
 
 5. ATTRIBUTION (NOTICE)
