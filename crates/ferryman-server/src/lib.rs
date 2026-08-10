@@ -49,7 +49,6 @@ pub struct AppState {
     recovery_key_reference: Arc<String>,
     communication_engines:
         Arc<tokio::sync::Mutex<HashMap<String, communications::SystemDeliveryEngine>>>,
-    wsl_distribution: Arc<String>,
 }
 impl AppState {
     pub fn new(store: SqliteStore, artifact_root: PathBuf) -> Self {
@@ -66,7 +65,6 @@ impl AppState {
             recovery_key: None,
             recovery_key_reference: Arc::new("unconfigured".into()),
             communication_engines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            wsl_distribution: Arc::new("Ubuntu".into()),
         }
     }
     pub fn with_admin_token(mut self, admin_token: String) -> Self {
@@ -119,10 +117,6 @@ impl AppState {
     }
     pub fn git_recovery(&self) -> Option<Arc<recovery_targets::GitRecoveryTarget>> {
         self.git_recovery.clone()
-    }
-    pub fn with_wsl_distribution(mut self, distribution: String) -> Self {
-        self.wsl_distribution = Arc::new(distribution);
-        self
     }
 }
 
@@ -818,7 +812,7 @@ async fn send_communication(
         )
     };
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+        communications::system_delivery_engine()
     });
     let receipt = engine.send(&route, &message).map_err(ApiError::internal)?;
     Ok((
@@ -901,7 +895,7 @@ async fn acknowledge_communication(
     };
     let mut engines = state.communication_engines.lock().await;
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+        communications::system_delivery_engine()
     });
     let (acknowledgement, recorded, delivery) = engine
         .acknowledge(&route, &acknowledgement)
@@ -950,7 +944,7 @@ async fn list_communication_actor_messages(
     let synchronized_via = if query.synchronize {
         let mut engines = state.communication_engines.lock().await;
         let engine = engines.entry(project_id.clone()).or_insert_with(|| {
-            communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+            communications::system_delivery_engine()
         });
         engine
             .synchronize_inbound(&route)
@@ -990,7 +984,7 @@ async fn reconcile_communications(
     let route = project_route(&state, &project_id)?;
     let mut engines = state.communication_engines.lock().await;
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+        communications::system_delivery_engine()
     });
     let receipts = engine
         .reconcile_outbox(&route)
@@ -1008,7 +1002,7 @@ async fn communications_status(
     let route = project_route(&state, &project_id)?;
     let mut engines = state.communication_engines.lock().await;
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine(state.wsl_distribution.as_ref().clone())
+        communications::system_delivery_engine()
     });
     let status = engine
         .status(&route, query.probe_external)
@@ -1050,9 +1044,7 @@ pub fn start_communications_reconciler(state: AppState) -> tokio::task::JoinHand
                 let engine = engines
                     .entry(mapping.project_id.clone())
                     .or_insert_with(|| {
-                        communications::system_delivery_engine(
-                            state.wsl_distribution.as_ref().clone(),
-                        )
+                        communications::system_delivery_engine()
                     });
                 if let Err(error) = engine.reconcile_outbox(&route) {
                     tracing::warn!(

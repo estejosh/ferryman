@@ -38,9 +38,6 @@ struct Args {
     max_artifact_bytes: u64,
     #[arg(long, default_value = "127.0.0.1:8787")]
     listen: SocketAddr,
-    /// WSL distribution hosting the existing MEGAcmd service.
-    #[arg(long, env = "FERRYMAN_WSL_DISTRIBUTION", default_value = "Ubuntu")]
-    wsl_distribution: String,
     #[arg(long)]
     no_demo_project: bool,
     /// Require FERRYMAN_ADMIN_TOKEN for project creation and disable demo bootstrap.
@@ -90,8 +87,7 @@ async fn main() -> Result<()> {
     let mut state = AppState::new(store, artifacts)
         .with_workspace_root(args.workspace_root)
         .with_memory_root(args.memory_root)
-        .with_max_artifact_bytes(args.max_artifact_bytes)
-        .with_wsl_distribution(args.wsl_distribution);
+        .with_max_artifact_bytes(args.max_artifact_bytes);
     tokio::fs::create_dir_all(&args.recovery_root).await?;
     let recovery_key = load_recovery_key(args.production)?;
     state = state.with_recovery_key(args.recovery_root, recovery_key.0, recovery_key.1);

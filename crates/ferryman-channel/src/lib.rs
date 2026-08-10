@@ -5,7 +5,8 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::{self, File, OpenOptions},
-    io::ErrorKind,
+    io::{ErrorKind, Read, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -517,53 +518,209 @@ fn system_git_command(directory: &Path, arguments: &[&str]) -> Command {
     command
 }
 
-pub struct MegaCmdProbe {
-    pub distribution: String,
+/// Default address of the local Syncthing REST API.
+const SYNCTHING_DEFAULT_API: &str = "http://127.0.0.1:8384";
+/// Hard deadline for a single Syncthing API call. The API is on loopback, so a slow
+/// answer means Syncthing is wedged, not that the network is far away.
+const SYNCTHING_API_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Health of the Syncthing folder that carries this project's channel.
+///
+/// A shared folder is a usable transport only when Syncthing is running, is actually
+/// serving this folder, and is actually connected to at least one peer. A directory
+/// that merely exists proves none of those, which is why this asks Syncthing itself.
+///
+/// The peer check is the part MEGAcmd could never answer: a folder can look perfectly
+/// healthy locally while no other machine is reachable, in which case a message written
+/// into it is not delivered, it is only stored.
+pub struct SyncthingProbe {
+    /// Base URL of the local Syncthing REST API.
+    pub api_base: String,
+    /// `X-API-Key` for that API. Empty means "not configured": the probe then reports
+    /// `Unavailable` rather than guessing, so delivery fails over instead of silently
+    /// assuming a transport that may not exist.
+    pub api_key: String,
 }
 
-impl SharedHealthProbe for MegaCmdProbe {
+impl SyncthingProbe {
+    /// Reads `SYNCTHING_API_BASE` / `SYNCTHING_API_KEY`, falling back to the API key in
+    /// Syncthing's own `config.xml` at its platform-default location. That fallback is
+    /// what lets an operator who already runs Syncthing attach a project without
+    /// copying a key anywhere.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let api_base = std::env::var("SYNCTHING_API_BASE")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| SYNCTHING_DEFAULT_API.to_string());
+        let api_key = std::env::var("SYNCTHING_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(syncthing_api_key_from_config)
+            .unwrap_or_default();
+        Self { api_base, api_key }
+    }
+}
+
+impl SharedHealthProbe for SyncthingProbe {
     fn health(&mut self, route: &ProjectRoute) -> Result<Health> {
-        let local = windows_to_wsl(&route.communications)?;
-        let mut command = if cfg!(windows) {
-            let mut command = Command::new("wsl.exe");
-            command.args([
-                "-d",
-                &self.distribution,
-                "--",
-                "mega-sync",
-                "--show-handles",
-            ]);
-            command
-        } else {
-            let mut command = Command::new("mega-sync");
-            command.arg("--show-handles");
-            command
-        };
-        scrub_sensitive_child_environment(&mut command);
-        let output = run_with_timeout(
-            &mut command,
-            HEALTH_COMMAND_TIMEOUT,
-            "MEGAcmd sync health query",
-        )?;
-        if !output.status.success() {
+        if self.api_key.is_empty() || route.shared_remote.trim().is_empty() {
             return Ok(Health::Unavailable);
         }
-        let status = String::from_utf8_lossy(&output.stdout);
-        let matched = status
-            .lines()
-            .any(|line| line.contains(&local) && line.contains(&route.shared_remote));
-        let unhealthy = status.lines().any(|line| {
-            line.contains(&local)
-                && ["disabled", "failed", "error", "stalled"]
-                    .iter()
-                    .any(|word| line.to_ascii_lowercase().contains(word))
-        });
-        Ok(if matched && !unhealthy {
+        // The folder must exist in Syncthing and must not be in an error state.
+        let folder = urlencode(&route.shared_remote);
+        let Some(status) = syncthing_get(
+            &self.api_base,
+            &format!("/rest/db/status?folder={folder}"),
+            &self.api_key,
+        )?
+        else {
+            return Ok(Health::Unavailable);
+        };
+        if status.get("errors").and_then(Value::as_i64).unwrap_or(0) > 0 {
+            return Ok(Health::Unavailable);
+        }
+        let state = status.get("state").and_then(Value::as_str).unwrap_or("");
+        if state.eq_ignore_ascii_case("error") {
+            return Ok(Health::Unavailable);
+        }
+        // At least one peer must be connected, or nothing can actually be delivered.
+        let Some(connections) = syncthing_get(
+            &self.api_base,
+            "/rest/system/connections",
+            &self.api_key,
+        )?
+        else {
+            return Ok(Health::Unavailable);
+        };
+        let connected = connections
+            .get("connections")
+            .and_then(Value::as_object)
+            .is_some_and(|devices| {
+                devices
+                    .values()
+                    .any(|device| device.get("connected").and_then(Value::as_bool) == Some(true))
+            });
+        Ok(if connected {
             Health::Healthy
         } else {
             Health::Unavailable
         })
     }
+}
+
+/// Percent-encodes the characters a Syncthing folder id could plausibly contain.
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// A deliberately tiny loopback-only HTTP GET.
+///
+/// Syncthing's API is plain HTTP on localhost, so this needs no TLS, no redirects and
+/// no connection pooling. Keeping it dependency-free is what lets the channel crate
+/// stay free of an async runtime and an HTTP client: the whole point of the channel is
+/// that it runs with nothing else installed.
+///
+/// Returns `Ok(None)` for any non-200 answer (folder unknown, key rejected, Syncthing
+/// not running) because every one of those means the same thing to a caller: this
+/// transport is not usable right now.
+fn syncthing_get(api_base: &str, path: &str, api_key: &str) -> Result<Option<Value>> {
+    let authority = api_base
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("http://")
+        .context("SYNCTHING_API_BASE must be a plain http:// loopback address")?;
+    let authority = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:8384")
+    };
+    let Some(address) = authority.to_socket_addrs()?.next() else {
+        return Ok(None);
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, SYNCTHING_API_TIMEOUT) else {
+        return Ok(None);
+    };
+    stream.set_read_timeout(Some(SYNCTHING_API_TIMEOUT))?;
+    stream.set_write_timeout(Some(SYNCTHING_API_TIMEOUT))?;
+    // HTTP/1.0 so the answer is never chunked and the server closes when it is done.
+    let request = format!(
+        "GET {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\nAccept: application/json\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Ok(None);
+    }
+    let mut raw = Vec::new();
+    if stream.read_to_end(&mut raw).is_err() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let Some(status_line) = text.lines().next() else {
+        return Ok(None);
+    };
+    if !status_line.contains(" 200") {
+        return Ok(None);
+    }
+    // Slice the JSON body out directly; this tolerates a chunked answer without
+    // needing a full HTTP parser for a fixed loopback endpoint.
+    let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
+        return Ok(None);
+    };
+    Ok(serde_json::from_str(&text[start..=end]).ok())
+}
+
+/// Syncthing's config.xml holds `<apikey>...</apikey>`. Read it from the platform
+/// default location so an existing Syncthing install needs no extra configuration.
+fn syncthing_api_key_from_config() -> Option<String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(explicit) = std::env::var("SYNCTHING_CONFIG_DIR") {
+        candidates.push(PathBuf::from(explicit).join("config.xml"));
+    }
+    if cfg!(windows) {
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local).join("Syncthing").join("config.xml"));
+        }
+    } else if let Ok(home) = std::env::var("HOME") {
+        let home = PathBuf::from(home);
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            candidates.push(PathBuf::from(xdg).join("syncthing").join("config.xml"));
+        }
+        candidates.push(home.join(".config").join("syncthing").join("config.xml"));
+        candidates.push(
+            home.join(".local")
+                .join("state")
+                .join("syncthing")
+                .join("config.xml"),
+        );
+        candidates.push(
+            home.join("Library")
+                .join("Application Support")
+                .join("Syncthing")
+                .join("config.xml"),
+        );
+    }
+    for candidate in candidates {
+        let Ok(text) = fs::read_to_string(&candidate) else {
+            continue;
+        };
+        if let Some(start) = text.find("<apikey>")
+            && let Some(end) = text[start..].find("</apikey>")
+        {
+            let key = text[start + "<apikey>".len()..start + end].trim().to_string();
+            if !key.is_empty() {
+                return Some(key);
+            }
+        }
+    }
+    None
 }
 
 pub struct SharedFolderTransport<P> {
@@ -580,7 +737,7 @@ impl<P: SharedHealthProbe> MessageTransport for SharedFolderTransport<P> {
     }
 
     fn deliver(&mut self, route: &ProjectRoute, message: &Message) -> Result<()> {
-        // MEGAcmd observes this inner root. Replacing the already-local message is
+        // Syncthing observes this inner root. Replacing the already-local message is
         // unnecessary; successful probe means the durable inner write is shared.
         if message_path(&route.communications, message).is_file() {
             Ok(())
@@ -1002,17 +1159,20 @@ pub struct DeliveryEngine<L, S, G> {
 
 pub type SystemDeliveryEngine = DeliveryEngine<
     LocalFilesystemTransport,
-    SharedFolderTransport<MegaCmdProbe>,
+    SharedFolderTransport<SyncthingProbe>,
     PrivateGitTransport<SystemGit>,
 >;
 
-pub fn system_delivery_engine(distribution: impl Into<String>) -> SystemDeliveryEngine {
+/// Local filesystem first, then the Syncthing-carried shared folder, then private Git
+/// as a backstop. Git is deliberately last: it is an archive of record, not the live
+/// channel, and treating it as live is what let a bridge repository silently diverge
+/// while real traffic never reached it.
+#[must_use]
+pub fn system_delivery_engine() -> SystemDeliveryEngine {
     DeliveryEngine::new(
         LocalFilesystemTransport,
         SharedFolderTransport {
-            probe: MegaCmdProbe {
-                distribution: distribution.into(),
-            },
+            probe: SyncthingProbe::from_env(),
         },
         PrivateGitTransport::new(SystemGit),
     )
@@ -1139,7 +1299,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
                     None
                 } else {
                     Some(format!(
-                        "MEGAcmd shared transport unavailable; awaiting local acknowledgement until {}",
+                        "Syncthing shared transport unavailable; awaiting local acknowledgement until {}",
                         message.acknowledgement_deadline.to_rfc3339()
                     ))
                 };
@@ -1158,7 +1318,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
                     Some(if acknowledgement_overdue {
                         "acknowledgement deadline elapsed on preferred transports".into()
                     } else {
-                        "local peer and MEGAcmd shared transport unavailable".into()
+                        "local peer and Syncthing shared transport unavailable".into()
                     }),
                 ),
                 Err(error) => self.receipt(
@@ -1896,19 +2056,6 @@ fn retire_acknowledged_outbox(route: &ProjectRoute) -> Result<()> {
     Ok(())
 }
 
-pub fn windows_to_wsl(path: &Path) -> Result<String> {
-    let text = path.to_string_lossy().replace('\\', "/");
-    if text.starts_with("/mnt/") {
-        return Ok(text);
-    }
-    let bytes = text.as_bytes();
-    if bytes.len() < 3 || bytes[1] != b':' || bytes[2] != b'/' {
-        bail!("expected an absolute Windows drive path")
-    }
-    let drive = (bytes[0] as char).to_ascii_lowercase();
-    Ok(format!("/mnt/{drive}/{}", &text[3..]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2429,11 +2576,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_paths_translate_and_secrets_stay_outer() {
-        assert_eq!(
-            windows_to_wsl(Path::new(r"X:\alpha\.ferryman\ferryman")).unwrap(),
-            "/mnt/x/alpha/.ferryman/ferryman"
-        );
+    fn secrets_stay_outside_the_portable_repository() {
         let (_temp, route) = fixture();
         fs::create_dir_all(&route.communications).unwrap();
         fs::write(route.attachment.join("token"), "secret").unwrap();
@@ -2500,6 +2643,15 @@ mod tests {
         assert_eq!(receipts.len(), 1);
         assert_eq!(receipts[0].transport, TransportKind::PrivateGit);
         assert_eq!(git_log.lock().unwrap().as_slice(), &[message.id]);
+    }
+
+    /// These tests exercise Git failover state, not shared-folder health, so the
+    /// shared rung just needs to be reliably absent.
+    struct OfflineProbe;
+    impl SharedHealthProbe for OfflineProbe {
+        fn health(&mut self, _route: &ProjectRoute) -> Result<Health> {
+            Ok(Health::Unavailable)
+        }
     }
 
     struct FakeGitRunner {
@@ -2629,9 +2781,7 @@ mod tests {
         let mut state_writer = DeliveryEngine::new(
             LocalFilesystemTransport,
             SharedFolderTransport {
-                probe: MegaCmdProbe {
-                    distribution: "test".into(),
-                },
+                probe: OfflineProbe,
             },
             PrivateGitTransport::new(runner),
         );
@@ -2648,9 +2798,7 @@ mod tests {
         let mut state_reader = DeliveryEngine::new(
             LocalFilesystemTransport,
             SharedFolderTransport {
-                probe: MegaCmdProbe {
-                    distribution: "test".into(),
-                },
+                probe: OfflineProbe,
             },
             PrivateGitTransport::new(runner),
         );
@@ -2920,7 +3068,7 @@ mod tests {
             ),
             PrivateGitTransport::new(VerifiedLocalGit { system: SystemGit }),
         );
-        // Simulate the common handoff edge: MEGA wrote the message into this
+        // Simulate the common handoff edge: Syncthing wrote the message into this
         // stale checkout just before the receiver switched to Git inbound.
         persist_message(
             &message_path(&receiver_route.communications, &first),
