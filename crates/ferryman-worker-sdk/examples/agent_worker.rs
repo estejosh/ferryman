@@ -83,12 +83,12 @@ async fn main() -> Result<()> {
         endpoint.clone(),
         project.clone(),
         token,
-        vec!["hone-agent".into()],
+        vec!["agent".into()],
     )
     .await
     .context("worker registration failed — is the bridge up and the project token valid?")?;
 
-    eprintln!("[hone-agent-worker] registered on {endpoint} project={project}; polling for jobs");
+    eprintln!("[agent-worker] registered on {endpoint} project={project}; polling for jobs");
 
     loop {
         let lease = match client.lease().await {
@@ -98,7 +98,7 @@ async fn main() -> Result<()> {
                 continue;
             }
             Err(e) => {
-                eprintln!("[hone-agent-worker] lease error: {e}; backing off");
+                eprintln!("[agent-worker] lease error: {e}; backing off");
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 continue;
             }
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
 
         let job_id = lease.job.id.clone();
         let lease_id = lease.lease_id.clone();
-        eprintln!("[hone-agent-worker] leased job {job_id}");
+        eprintln!("[agent-worker] leased job {job_id}");
 
         // Job input contract: {"prompt": "<what the agent should do>"}.
         let prompt = lease
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
                 // Non-retryable success completion. Idempotent: re-completing the same
                 // lease is a no-op on the bridge side.
                 if let Err(e) = client.complete(&job_id, &lease_id, result, false).await {
-                    eprintln!("[hone-agent-worker] complete(success) failed for {job_id}: {e}");
+                    eprintln!("[agent-worker] complete(success) failed for {job_id}: {e}");
                 }
             }
             Err(e) => {
@@ -145,7 +145,7 @@ async fn main() -> Result<()> {
                 // safer than silently succeeding; the error is in the event log + result.
                 let result = json!({"ok": false, "error": e.to_string()});
                 if let Err(ce) = client.complete(&job_id, &lease_id, result, true).await {
-                    eprintln!("[hone-agent-worker] complete(failure) failed for {job_id}: {ce}");
+                    eprintln!("[agent-worker] complete(failure) failed for {job_id}: {ce}");
                 }
             }
         }

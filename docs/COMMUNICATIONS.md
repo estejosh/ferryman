@@ -123,8 +123,10 @@ is not shared-transport health. The acknowledgement deadline also detects a
 remote peer that is not consuming messages even when MEGAcmd itself reports a
 healthy sync.
 
-GitHub visibility must be verified as `PRIVATE` for the exact
-`estejosh/<project>-bridge` name before clone/configuration. Visibility is
+When a Git remote is configured, GitHub visibility must be verified as `PRIVATE`
+for the exact `$FERRYMAN_CHANNEL_GIT_OWNER/<project>-bridge` name before
+clone/configuration. A channel with no Git remote is Syncthing-only: the Git rung
+is simply unavailable and no visibility check applies. Visibility is
 cached for ten minutes by the live Git transport; the attachment command also
 verifies it once per run and refuses any public or mismatched repository. Before
 each Git delivery, Ferryman verifies that the inner repository's `origin`

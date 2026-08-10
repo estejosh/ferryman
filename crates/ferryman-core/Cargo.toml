@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
+ferryman-channel = { path = "../ferryman-channel" }
 hex.workspace = true
 rand.workspace = true
 rusqlite.workspace = true

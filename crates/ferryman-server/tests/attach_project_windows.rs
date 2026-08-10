@@ -71,13 +71,13 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
             "remote",
             "add",
             "origin",
-            "https://github.com/estejosh/alpha-bridge.git",
+            "https://github.com/example-org/alpha-bridge.git",
         ],
     ));
 
     fs::write(
         tools.join("gh.cmd"),
-        "@echo off\r\necho {\"nameWithOwner\":\"estejosh/alpha-bridge\",\"visibility\":\"PRIVATE\"}\r\n",
+        "@echo off\r\necho {\"nameWithOwner\":\"example-org/alpha-bridge\",\"visibility\":\"PRIVATE\"}\r\n",
     )
     .unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -102,9 +102,9 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
                 "-Project",
                 "alpha",
                 "-SharedRemote",
-                "/beastly-bridges/alpha",
+                "alpha-bridge",
                 "-GitRemote",
-                "https://github.com/estejosh/alpha-bridge.git",
+                "https://github.com/example-org/alpha-bridge.git",
                 "-IntegrationMode",
                 "single-agent",
                 "-Participant",
@@ -122,7 +122,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
             .env("GIT_CONFIG_KEY_0", format!("url.{remote_url}.insteadOf"))
             .env(
                 "GIT_CONFIG_VALUE_0",
-                "https://github.com/estejosh/alpha-bridge.git",
+                "https://github.com/example-org/alpha-bridge.git",
             )
             .output()
             .expect("run attachment script");
@@ -134,7 +134,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
         assert_success(&current_origin);
         assert_eq!(
             String::from_utf8_lossy(&current_origin.stdout).trim(),
-            "https://github.com/estejosh/alpha-bridge.git"
+            "https://github.com/example-org/alpha-bridge.git"
         );
     }
 
@@ -150,7 +150,7 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
     ));
     assert_eq!(
         String::from_utf8_lossy(&git(&inner, &["remote", "get-url", "origin"]).stdout).trim(),
-        "https://github.com/estejosh/alpha-bridge.git"
+        "https://github.com/example-org/alpha-bridge.git"
     );
     assert_eq!(
         String::from_utf8_lossy(&git(&workspace, &["remote", "get-url", "origin"]).stdout).trim(),

@@ -92,11 +92,18 @@ if (-not (Test-Path -LiteralPath (Join-Path $communications '.git'))) {
   Add-Result WARN inner_git 'Portable communications Git checkout is absent'
 } else {
   $innerRemote = Invoke-GitRead $communications @('config','--get','remote.origin.url')
-  if ($innerRemote.ExitCode -eq 0 -and
-      $innerRemote.Output -match '^https://github\.com/estejosh/[A-Za-z0-9._-]+-bridge(?:\.git)?$') {
+  $scanOwner = $env:FERRYMAN_CHANNEL_GIT_OWNER
+  $scanSuffix = if ($env:FERRYMAN_CHANNEL_GIT_SUFFIX) { $env:FERRYMAN_CHANNEL_GIT_SUFFIX } else { '-bridge' }
+  $expectedPattern = '^https://github\.com/' + [regex]::Escape($scanOwner) + '/[A-Za-z0-9._-]+' + [regex]::Escape($scanSuffix) + '(?:\.git)?$'
+  if (-not $innerRemote.Output) {
+    # No upstream at all is the Syncthing-only channel, not a failure.
+    Add-Result PASS inner_remote '(none; Syncthing-only)'
+  } elseif (-not $scanOwner) {
+    Add-Result FAIL inner_remote "$($innerRemote.Output) (set FERRYMAN_CHANNEL_GIT_OWNER to pin the expected owner)"
+  } elseif ($innerRemote.ExitCode -eq 0 -and $innerRemote.Output -match $expectedPattern) {
     Add-Result PASS inner_remote $innerRemote.Output
   } else {
-    Add-Result FAIL inner_remote $(if ($innerRemote.Output) { $innerRemote.Output } else { '(missing)' })
+    Add-Result FAIL inner_remote $innerRemote.Output
   }
   $innerStatus = Invoke-GitRead $communications @('status','--porcelain','--untracked-files=all')
   if ($innerStatus.ExitCode -ne 0) {

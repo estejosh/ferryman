@@ -111,8 +111,8 @@ Windows dry run:
 & X:\ferryman\scripts\attach-project.ps1 `
   -Workspace X:\example `
   -Project example `
-  -SharedRemote /beastly-bridges/example `
-  -GitRemote https://github.com/estejosh/example-bridge.git `
+  -SharedRemote example-bridge `
+  -GitRemote https://github.com/OWNER/example-bridge.git `
   -IntegrationMode unmanaged `
   -DryRun
 ```
@@ -123,8 +123,8 @@ WSL/Linux equivalent:
 scripts/attach-project.sh \
   --workspace /path/to/example \
   --project example \
-  --shared-remote /beastly-bridges/example \
-  --git-remote https://github.com/estejosh/example-bridge.git \
+  --shared-remote example-bridge \
+  --git-remote https://github.com/OWNER/example-bridge.git \
   --integration-mode unmanaged \
   --dry-run
 ```

@@ -58,10 +58,16 @@ fi
 
 if [[ -d "$COMMUNICATIONS/.git" ]]; then
   inner_remote=$(git -C "$COMMUNICATIONS" config --get remote.origin.url || true)
-  if [[ "$inner_remote" =~ ^https://github\.com/estejosh/[A-Za-z0-9._-]+-bridge(\.git)?$ ]]; then
+  scan_suffix="${FERRYMAN_CHANNEL_GIT_SUFFIX:--bridge}"
+  if [[ -z "$inner_remote" ]]; then
+    # No upstream at all is the Syncthing-only channel, not a failure.
+    result PASS inner_remote "(none; Syncthing-only)"
+  elif [[ -z "${FERRYMAN_CHANNEL_GIT_OWNER:-}" ]]; then
+    result FAIL inner_remote "$inner_remote (set FERRYMAN_CHANNEL_GIT_OWNER to pin the expected owner)"
+  elif [[ "$inner_remote" =~ ^https://github\.com/"$FERRYMAN_CHANNEL_GIT_OWNER"/[A-Za-z0-9._-]+"$scan_suffix"(\.git)?$ ]]; then
     result PASS inner_remote "$inner_remote"
   else
-    result FAIL inner_remote "${inner_remote:-"(missing)"}"
+    result FAIL inner_remote "$inner_remote"
   fi
   inner_status=$(git -C "$COMMUNICATIONS" status --porcelain --untracked-files=all)
   if [[ -z "$inner_status" ]]; then

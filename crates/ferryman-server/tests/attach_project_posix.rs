@@ -72,13 +72,14 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
         "alpha-builder|builder|code,test"
     };
     let output = command
+        .env("FERRYMAN_CHANNEL_GIT_OWNER", "example-org")
         .arg(posix_path(&script))
         .args(["--workspace", &posix_path(&workspace)])
         .args(["--project", "alpha"])
-        .args(["--shared-remote", "/beastly-bridges/alpha"])
+        .args(["--shared-remote", "alpha-bridge"])
         .args([
             "--git-remote",
-            "https://github.com/estejosh/alpha-bridge.git",
+            "https://github.com/example-org/alpha-bridge.git",
         ])
         .args(["--integration-mode", "multi-agent"])
         .args(["--participant", participant])
@@ -131,7 +132,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
     let fake_gh = tools.join("gh");
     fs::write(
         &fake_gh,
-        "#!/bin/sh\nprintf '%s\\n' 'estejosh/beta-bridge|PRIVATE'\n",
+        "#!/bin/sh\nprintf '%s\\n' 'example-org/beta-bridge|PRIVATE'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -175,15 +176,16 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
             .arg(format!("PATH={path}"))
             .arg("GIT_CONFIG_COUNT=1")
             .arg(format!("GIT_CONFIG_KEY_0=url.{remote_url}.insteadOf"))
-            .arg("GIT_CONFIG_VALUE_0=https://github.com/estejosh/beta-bridge.git")
+            .arg("GIT_CONFIG_VALUE_0=https://github.com/example-org/beta-bridge.git")
+            .arg("FERRYMAN_CHANNEL_GIT_OWNER=example-org")
             .arg("bash")
             .arg(posix_path(&script))
             .args(["--workspace", &posix_path(&workspace)])
             .args(["--project", "beta"])
-            .args(["--shared-remote", "/beastly-bridges/beta"])
+            .args(["--shared-remote", "beta-bridge"])
             .args([
                 "--git-remote",
-                "https://github.com/estejosh/beta-bridge.git",
+                "https://github.com/example-org/beta-bridge.git",
             ])
             .args(["--integration-mode", "single-agent"])
             .args(["--participant", participant])
@@ -237,6 +239,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
         Command::new("bash")
     };
     let scan = scan
+        .env("FERRYMAN_CHANNEL_GIT_OWNER", "example-org")
         .arg(posix_path(&scanner))
         .args(["--workspace", &posix_path(&workspace)])
         .output()

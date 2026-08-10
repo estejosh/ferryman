@@ -3,7 +3,8 @@ param(
   [Parameter(Mandatory)][string]$Workspace,
   [Parameter(Mandatory)][string]$Project,
   [Parameter(Mandatory)][string]$SharedRemote,
-  [Parameter(Mandatory)][string]$GitRemote,
+  # Optional: omit for a Syncthing-only channel with no Git rung at all.
+  [string]$GitRemote = '',
   [string]$AdoptFrom,
   [string]$Hub = 'http://127.0.0.1:8796',
   [string]$WslDistribution = 'Ubuntu',
@@ -124,17 +125,29 @@ if (-not (Test-Path -LiteralPath $workspacePath -PathType Container)) {
 }
 $attachment = Join-Path $workspacePath '.ferryman'
 $communications = Join-Path $attachment 'ferryman'
-$expectedName = "$Project-bridge"
+$gitSuffix = if ($env:FERRYMAN_CHANNEL_GIT_SUFFIX) { $env:FERRYMAN_CHANNEL_GIT_SUFFIX } else { '-bridge' }
+$expectedName = "$Project$gitSuffix"
+$channelOwner = $env:FERRYMAN_CHANNEL_GIT_OWNER
 $participantRoutes = @(Convert-ParticipantRoutes)
 if ($Project -in @('.','..') -or $Project -notmatch '^[A-Za-z0-9._-]+$') {
   throw 'Project must be a path-safe identifier'
 }
-if ($GitRemote -notmatch '^https://github\.com/estejosh/([^/]+?)(?:\.git)?$' -or $Matches[1] -ne $expectedName) {
-  throw "Git remote must be the exact expected repository: https://github.com/estejosh/$expectedName.git"
+# Pinning the channel to a canonical location stops a tampered or mistaken mapping from
+# redirecting a private channel somewhere else. Fail closed: a remote that cannot be
+# pinned is refused rather than accepted unpinned. An absent remote is the
+# Syncthing-only channel and is valid.
+if ($GitRemote) {
+  if (-not $channelOwner) {
+    throw 'A Git remote was supplied but FERRYMAN_CHANNEL_GIT_OWNER is not set; set it to the account that owns the channel repositories, or omit -GitRemote to run Syncthing-only'
+  }
+  $expectedRemote = "https://github.com/$channelOwner/$expectedName"
+  if ($GitRemote.TrimEnd('.git').ToLowerInvariant() -ne $expectedRemote.ToLowerInvariant()) {
+    throw "Git remote must be the exact expected repository: $expectedRemote.git"
+  }
 }
-$expectedSharedRemote = "/beastly-bridges/$Project"
-if ($SharedRemote -ne $expectedSharedRemote) {
-  throw "SharedRemote must be the exact project path: $expectedSharedRemote"
+# SharedRemote is a Syncthing folder ID since the transport swap, not a MEGA path.
+if ($SharedRemote -and ($SharedRemote -in @('.','..') -or $SharedRemote -notmatch '^[A-Za-z0-9._-]+$')) {
+  throw 'SharedRemote must be a path-safe Syncthing folder ID'
 }
 
 $mainRemoteBefore = ''
@@ -146,21 +159,23 @@ Write-Host "Project:        $Project"
 Write-Host "Workspace:      $workspacePath"
 Write-Host "Attachment:     $attachment"
 Write-Host "Communications: $communications"
-Write-Host "MEGA:           $SharedRemote"
-Write-Host "Git:            $GitRemote (must verify PRIVATE before clone/configure)"
+Write-Host "Shared folder:  $(if ($SharedRemote) { $SharedRemote } else { '(none)' })"
+Write-Host "Git:            $(if ($GitRemote) { "$GitRemote (must verify PRIVATE before clone/configure)" } else { '(none; Syncthing-only)' })"
 Write-Host "Integration:    $IntegrationMode ($($participantRoutes.Count) portable route(s))"
 
-if (-not $DryRun) {
+if (-not $GitRemote) {
+  Write-Host 'No Git remote configured; the Git rung is unavailable for this project.'
+} elseif (-not $DryRun) {
   $visibilityJson = Invoke-Checked `
     -Program 'gh' `
-    -Arguments @('repo','view',"estejosh/$expectedName",'--json','nameWithOwner,visibility') `
+    -Arguments @('repo','view',"$channelOwner/$expectedName",'--json','nameWithOwner,visibility') `
     -WorkingDirectory $workspacePath
   $visibility = $visibilityJson | ConvertFrom-Json
-  if ($visibility.nameWithOwner -ne "estejosh/$expectedName" -or $visibility.visibility -ne 'PRIVATE') {
-    throw "Refusing Git repository: expected estejosh/$expectedName with PRIVATE visibility"
+  if ($visibility.nameWithOwner -ne "$channelOwner/$expectedName" -or $visibility.visibility -ne 'PRIVATE') {
+    throw "Refusing Git repository: expected $channelOwner/$expectedName with PRIVATE visibility"
   }
 } else {
-  Write-Host "DRY-RUN: verify GitHub name estejosh/$expectedName and visibility PRIVATE"
+  Write-Host "DRY-RUN: verify GitHub name $channelOwner/$expectedName and visibility PRIVATE"
 }
 
 if ($DryRun) { Write-Host "DRY-RUN: ensure directory $attachment" }
@@ -189,14 +204,21 @@ if (-not (Test-Path -LiteralPath $communications)) {
         -Arguments @('remote','set-url','origin',$GitRemote) `
         -WorkingDirectory $communications | Out-Null
     }
-  } else {
+  } elseif ($GitRemote) {
     Invoke-Checked `
       -Program 'git' `
       -Arguments @('clone',$GitRemote,$communications) `
       -WorkingDirectory $workspacePath | Out-Null
+  } else {
+    # Syncthing-only: the channel is still its own repository (Git remains the archive
+    # of record), it just has no upstream to clone from or push to.
+    Invoke-Checked `
+      -Program 'git' `
+      -Arguments @('init','-q',$communications) `
+      -WorkingDirectory $workspacePath | Out-Null
   }
 } elseif (Test-Path -LiteralPath (Join-Path $communications '.git')) {
-  if (-not $DryRun) {
+  if (-not $DryRun -and $GitRemote) {
     $innerOrigin = (& git -C $communications config --get remote.origin.url 2>$null)
     if ((Normalize-GitRemote $innerOrigin) -ne (Normalize-GitRemote $GitRemote)) {
       throw 'Existing inner repository has an unexpected origin'

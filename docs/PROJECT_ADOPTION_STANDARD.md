@@ -53,8 +53,8 @@ architecture. Do not invent multiple agents merely to adopt Ferryman.
 & X:\ferryman\scripts\attach-project.ps1 `
   -Workspace X:\example `
   -Project example `
-  -SharedRemote /beastly-bridges/example `
-  -GitRemote https://github.com/estejosh/example-bridge.git `
+  -SharedRemote example-bridge `
+  -GitRemote https://github.com/OWNER/example-bridge.git `
   -IntegrationMode unmanaged `
   -DryRun
 ```
@@ -69,8 +69,8 @@ prompt runner, CLI, service, or CI system.
 & X:\ferryman\scripts\attach-project.ps1 `
   -Workspace X:\example `
   -Project example `
-  -SharedRemote /beastly-bridges/example `
-  -GitRemote https://github.com/estejosh/example-bridge.git `
+  -SharedRemote example-bridge `
+  -GitRemote https://github.com/OWNER/example-bridge.git `
   -IntegrationMode single-agent `
   -Participant 'example-builder|builder|code,test' `
   -DryRun
@@ -89,8 +89,8 @@ memory.
 & X:\ferryman\scripts\attach-project.ps1 `
   -Workspace X:\example `
   -Project example `
-  -SharedRemote /beastly-bridges/example `
-  -GitRemote https://github.com/estejosh/example-bridge.git `
+  -SharedRemote example-bridge `
+  -GitRemote https://github.com/OWNER/example-bridge.git `
   -IntegrationMode multi-agent `
   -Participant 'example-planner|planner|plan,route' `
   -Participant 'example-builder|builder|code,test' `
@@ -150,8 +150,8 @@ Record these values before running either attachment command:
 | Workspace | Canonical project root; its Git remote must remain unchanged |
 | Integration mode | `unmanaged`, `single-agent`, or `multi-agent` |
 | Participants | Stable name, role, and minimum capabilities for each consumer |
-| Shared remote | Dedicated absolute MEGA directory for this project |
-| Git remote | Exact private `estejosh/<project>-bridge` repository |
+| Shared remote | Dedicated Syncthing folder ID for this project |
+| Git remote | Optional; when set, the exact private `$FERRYMAN_CHANNEL_GIT_OWNER/<project>-bridge` repository |
 | Existing checkout | Optional old communications repository to adopt intact |
 | Hub endpoint | Machine-wide Ferryman endpoint |
 | Token owner | Operator responsible for the outer project token |
@@ -216,8 +216,8 @@ The Bash command has the same integration modes and participant format:
 scripts/attach-project.sh \
   --workspace /path/to/example \
   --project example \
-  --shared-remote /beastly-bridges/example \
-  --git-remote https://github.com/estejosh/example-bridge.git \
+  --shared-remote example-bridge \
+  --git-remote https://github.com/OWNER/example-bridge.git \
   --integration-mode multi-agent \
   --participant 'example-planner|planner|plan,route' \
   --participant 'example-builder|builder|code,test' \

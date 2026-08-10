@@ -56,11 +56,33 @@ scripts/hub-up.sh 8796
 scripts/attach-project.sh \
   --workspace /path/to/myproject \
   --project myproject \
-  --shared-remote /beastly-bridges/myproject \
-  --git-remote https://github.com/estejosh/myproject-bridge.git \
+  --shared-remote myproject-bridge \
   --integration-mode unmanaged \
   --dry-run
 ```
+
+The channel above is Syncthing-only: it has no GitHub repository at all, which is
+a supported configuration. To also keep Git as an archive of record, tell Ferryman
+which account owns your channel repositories and pass the matching remote:
+
+```sh
+export FERRYMAN_CHANNEL_GIT_OWNER=my-org        # https://github.com/my-org/<project>-bridge.git
+export FERRYMAN_CHANNEL_GIT_SUFFIX=-bridge      # optional; "-bridge" is the default
+
+scripts/attach-project.sh \
+  --workspace /path/to/myproject \
+  --project myproject \
+  --shared-remote myproject-bridge \
+  --git-remote https://github.com/my-org/myproject-bridge.git \
+  --integration-mode unmanaged \
+  --dry-run
+```
+
+Ferryman pins the channel to that canonical location on every operation: a
+tampered or mistaken mapping cannot redirect a private channel to a destination
+somebody else controls. The check fails closed — if a Git remote is configured
+while `FERRYMAN_CHANNEL_GIT_OWNER` is not set, the remote is refused rather than
+accepted unpinned.
 
 ## Try it locally (single server)
 

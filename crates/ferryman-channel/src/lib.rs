@@ -22,6 +22,7 @@ use uuid::Uuid;
 use wait_timeout::ChildExt;
 
 const MESSAGE_FORMAT: &str = "ferryman-message/v1";
+const DEFAULT_GIT_SUFFIX: &str = "-bridge";
 const DEFAULT_ACK_DEADLINE_SECONDS: i64 = 30;
 const VISIBILITY_CACHE_SECONDS: u64 = 600;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(45);
@@ -52,6 +53,99 @@ const NULL_GIT_HOOKS_PATH: &str = "NUL";
 #[cfg(not(windows))]
 const NULL_GIT_HOOKS_PATH: &str = "/dev/null";
 
+/// Where this installation's channel repositories are expected to live.
+///
+/// Pinning the channel to a canonical location is a real security control: it stops a
+/// tampered or mistaken mapping from redirecting a private channel to a destination
+/// somebody else controls. Ferryman keeps that control but stops assuming whose
+/// account it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelNamespace {
+    /// e.g. "acme" -> https://github.com/acme/<project>-bridge.git
+    pub git_owner: Option<String>,
+    /// Repository name suffix. Defaults to "-bridge" for compatibility with
+    /// existing deployments.
+    pub git_suffix: String,
+}
+
+impl Default for ChannelNamespace {
+    fn default() -> Self {
+        Self {
+            git_owner: None,
+            git_suffix: DEFAULT_GIT_SUFFIX.to_owned(),
+        }
+    }
+}
+
+impl ChannelNamespace {
+    /// Read the namespace from the environment. Call this at construction time —
+    /// never from inside a validation hot path, because Rust tests run in parallel
+    /// and share one process environment.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let git_owner = std::env::var("FERRYMAN_CHANNEL_GIT_OWNER")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        let git_suffix = std::env::var("FERRYMAN_CHANNEL_GIT_SUFFIX")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| DEFAULT_GIT_SUFFIX.to_owned());
+        Self {
+            git_owner,
+            git_suffix,
+        }
+    }
+
+    /// Build a namespace pinned to `owner`. Mostly useful in tests and for callers
+    /// that carry their own configuration rather than reading the environment.
+    #[must_use]
+    pub fn with_owner(owner: impl Into<String>) -> Self {
+        Self {
+            git_owner: Some(owner.into()),
+            git_suffix: DEFAULT_GIT_SUFFIX.to_owned(),
+        }
+    }
+
+    /// The canonical GitHub `owner/name` for a project, if an owner is configured.
+    #[must_use]
+    pub fn repository_name(&self, project_id: &str) -> Option<String> {
+        self.git_owner
+            .as_ref()
+            .map(|owner| format!("{owner}/{project_id}{}", self.git_suffix))
+    }
+
+    /// The canonical HTTPS remote for a project, if an owner is configured.
+    #[must_use]
+    pub fn git_remote(&self, project_id: &str) -> Option<String> {
+        self.repository_name(project_id)
+            .map(|name| format!("https://github.com/{name}.git"))
+    }
+
+    /// Check a configured remote against this namespace. Fails closed: a remote that
+    /// is set while no owner is configured is rejected rather than silently accepted,
+    /// because an unpinned remote is exactly the redirection this control exists to
+    /// prevent. An empty remote is valid — that is the Syncthing-only channel, which
+    /// simply has no git rung.
+    fn verify_git_remote(&self, project_id: &str, remote: &str) -> Result<()> {
+        if remote.trim().is_empty() {
+            return Ok(());
+        }
+        let Some(expected) = self.git_remote(project_id) else {
+            bail!(
+                "a communications Git remote is configured but this installation has no \
+                 channel namespace: set FERRYMAN_CHANNEL_GIT_OWNER to the account that owns \
+                 the channel repositories, or clear the remote to run Syncthing-only"
+            )
+        };
+        if normalize_git_remote(remote) != normalize_git_remote(&expected) {
+            bail!("communications Git remote must be the exact expected private project remote")
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentRoute {
     pub name: String,
@@ -74,6 +168,12 @@ pub struct ProjectRoute {
 }
 
 impl ProjectRoute {
+    /// Structural validation: everything that is true of a well-formed route
+    /// regardless of which installation it belongs to.
+    ///
+    /// This deliberately does *not* check the channel namespace. Operations that
+    /// route traffic must use [`ProjectRoute::validate_in`] so the canonical-location
+    /// pin is enforced; see [`ChannelNamespace`].
     pub fn validate(&self) -> Result<()> {
         if !is_safe_component(&self.project_id) {
             bail!("project ID must contain only letters, digits, '.', '-', or '_'")
@@ -102,16 +202,15 @@ impl ProjectRoute {
         if communications != format!("{attachment}/ferryman") {
             bail!("communications must be <attachment>/ferryman")
         }
-        if self.git_visibility != "private" {
+        // Visibility only matters when there is actually a remote to expose. A
+        // Syncthing-only channel has no GitHub repository whose visibility could leak.
+        if !self.git_remote.trim().is_empty() && self.git_visibility != "private" {
             bail!("communications Git repository must be private")
         }
-        let expected = format!("https://github.com/estejosh/{}-bridge.git", self.project_id);
-        if normalize_git_remote(&self.git_remote) != normalize_git_remote(&expected) {
-            bail!("communications Git remote must be the exact expected private project remote")
-        }
-        let expected_shared = format!("/beastly-bridges/{}", self.project_id);
-        if self.shared_remote != expected_shared {
-            bail!("shared remote must be the exact expected private project path")
+        // `shared_remote` is a Syncthing folder ID since the transport swap, not the
+        // MEGA path it used to be. Empty means no shared rung is configured.
+        if !self.shared_remote.is_empty() && !is_safe_component(&self.shared_remote) {
+            bail!("shared remote must be a path-safe Syncthing folder ID")
         }
         let mut names = HashSet::new();
         for agent in &self.agents {
@@ -134,6 +233,16 @@ impl ProjectRoute {
             }
         }
         Ok(())
+    }
+
+    /// Full validation for anything that routes traffic: structural invariants plus
+    /// the canonical-location pin for this installation.
+    ///
+    /// Fails closed. A route carrying a git remote that this installation cannot pin
+    /// is rejected, not accepted unpinned.
+    pub fn validate_in(&self, namespace: &ChannelNamespace) -> Result<()> {
+        self.validate()?;
+        namespace.verify_git_remote(&self.project_id, &self.git_remote)
     }
 
     pub fn permits(&self, recipient: &str, capability: Option<&str>) -> bool {
@@ -585,11 +694,8 @@ impl SharedHealthProbe for SyncthingProbe {
             return Ok(Health::Unavailable);
         }
         // At least one peer must be connected, or nothing can actually be delivered.
-        let Some(connections) = syncthing_get(
-            &self.api_base,
-            "/rest/system/connections",
-            &self.api_key,
-        )?
+        let Some(connections) =
+            syncthing_get(&self.api_base, "/rest/system/connections", &self.api_key)?
         else {
             return Ok(Health::Unavailable);
         };
@@ -714,7 +820,9 @@ fn syncthing_api_key_from_config() -> Option<String> {
         if let Some(start) = text.find("<apikey>")
             && let Some(end) = text[start..].find("</apikey>")
         {
-            let key = text[start + "<apikey>".len()..start + end].trim().to_string();
+            let key = text[start + "<apikey>".len()..start + end]
+                .trim()
+                .to_string();
             if !key.is_empty() {
                 return Some(key);
             }
@@ -826,15 +934,23 @@ impl GitRunner for SystemGit {
 
 pub struct PrivateGitTransport<G> {
     pub git: G,
+    pub namespace: ChannelNamespace,
     pub visibility_verified_until: Option<SystemTime>,
     pub backoff_attempt: u32,
     pub retry_after: Option<SystemTime>,
 }
 
 impl<G: GitRunner> PrivateGitTransport<G> {
+    /// Build a transport with no channel namespace configured. The git rung stays
+    /// unavailable until an owner is pinned; use [`PrivateGitTransport::with_namespace`].
     pub fn new(git: G) -> Self {
+        Self::with_namespace(git, ChannelNamespace::default())
+    }
+
+    pub fn with_namespace(git: G, namespace: ChannelNamespace) -> Self {
         Self {
             git,
+            namespace,
             visibility_verified_until: None,
             backoff_attempt: 0,
             retry_after: None,
@@ -992,7 +1108,7 @@ impl<G: GitRunner> MessageTransport for PrivateGitTransport<G> {
     }
 
     fn health(&mut self, route: &ProjectRoute) -> Result<Health> {
-        if route.git_visibility != "private" {
+        if route.git_visibility != "private" || route.git_remote.trim().is_empty() {
             return Ok(Health::Unavailable);
         }
         if self
@@ -1001,7 +1117,11 @@ impl<G: GitRunner> MessageTransport for PrivateGitTransport<G> {
         {
             return Ok(Health::RateLimited);
         }
-        let expected_name = format!("estejosh/{}-bridge", route.project_id);
+        // No configured namespace means there is no canonical repository to verify
+        // against. Report the rung unavailable rather than guessing at an owner.
+        let Some(expected_name) = self.namespace.repository_name(&route.project_id) else {
+            return Ok(Health::Unavailable);
+        };
         let now = SystemTime::now();
         if self
             .visibility_verified_until
@@ -1137,7 +1257,11 @@ fn normalize_path(path: &Path) -> String {
         .to_owned()
 }
 
-fn is_safe_component(value: &str) -> bool {
+/// A single path component that is safe to use as a directory or folder-ID segment:
+/// non-empty, not a traversal token, and restricted to ASCII alphanumerics plus
+/// `.`, `-`, `_`.
+#[must_use]
+pub fn is_safe_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."
@@ -1150,6 +1274,9 @@ pub struct DeliveryEngine<L, S, G> {
     pub local: L,
     pub shared: S,
     pub git: G,
+    /// Carried explicitly rather than read from the environment inside validation,
+    /// so parallel tests sharing one process environment stay deterministic.
+    pub namespace: ChannelNamespace,
     preferred_successes: HashMap<String, u8>,
     git_live: HashSet<String>,
     git_inbound_active: HashSet<String>,
@@ -1169,21 +1296,37 @@ pub type SystemDeliveryEngine = DeliveryEngine<
 /// while real traffic never reached it.
 #[must_use]
 pub fn system_delivery_engine() -> SystemDeliveryEngine {
-    DeliveryEngine::new(
+    system_delivery_engine_in(ChannelNamespace::from_env())
+}
+
+/// Same as [`system_delivery_engine`] but with an explicitly supplied namespace, for
+/// callers that already resolved their configuration.
+#[must_use]
+pub fn system_delivery_engine_in(namespace: ChannelNamespace) -> SystemDeliveryEngine {
+    DeliveryEngine::with_namespace(
         LocalFilesystemTransport,
         SharedFolderTransport {
             probe: SyncthingProbe::from_env(),
         },
-        PrivateGitTransport::new(SystemGit),
+        PrivateGitTransport::with_namespace(SystemGit, namespace.clone()),
+        namespace,
     )
 }
 
 impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngine<L, S, G> {
+    /// Build an engine with no channel namespace configured. Routes carrying a git
+    /// remote will be rejected until an owner is pinned; use
+    /// [`DeliveryEngine::with_namespace`].
     pub fn new(local: L, shared: S, git: G) -> Self {
+        Self::with_namespace(local, shared, git, ChannelNamespace::default())
+    }
+
+    pub fn with_namespace(local: L, shared: S, git: G, namespace: ChannelNamespace) -> Self {
         Self {
             local,
             shared,
             git,
+            namespace,
             preferred_successes: HashMap::new(),
             git_live: HashSet::new(),
             git_inbound_active: HashSet::new(),
@@ -1193,7 +1336,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
     }
 
     pub fn send(&mut self, route: &ProjectRoute, message: &Message) -> Result<DeliveryReceipt> {
-        route.validate()?;
+        route.validate_in(&self.namespace)?;
         message.validate()?;
         self.restore_state(route)?;
         if route.project_id != message.project_id {
@@ -1406,7 +1549,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
     }
 
     pub fn synchronize_inbound(&mut self, route: &ProjectRoute) -> Result<TransportKind> {
-        route.validate()?;
+        route.validate_in(&self.namespace)?;
         self.restore_state(route)?;
         if self.shared.health(route).unwrap_or(Health::Unavailable) == Health::Healthy {
             let mut git_sync_failed = false;
@@ -1458,7 +1601,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
         route: &ProjectRoute,
         acknowledgement: &Acknowledgement,
     ) -> Result<(Acknowledgement, bool, DeliveryReceipt)> {
-        route.validate()?;
+        route.validate_in(&self.namespace)?;
         acknowledgement.validate()?;
         self.restore_state(route)?;
         let canonical = canonical_acknowledgement(route, acknowledgement)?;
@@ -1590,7 +1733,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
     }
 
     pub fn reconcile_outbox(&mut self, route: &ProjectRoute) -> Result<Vec<DeliveryReceipt>> {
-        route.validate()?;
+        route.validate_in(&self.namespace)?;
         self.restore_state(route)?;
         let _ = self.synchronize_inbound(route)?;
         let outbox = route.attachment.join("runtime/outbox");
@@ -1639,7 +1782,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
         route: &ProjectRoute,
         probe_external: bool,
     ) -> Result<CommunicationsStatus> {
-        route.validate()?;
+        route.validate_in(&self.namespace)?;
         self.restore_state(route)?;
         let local_health = self.local.health(route).unwrap_or(Health::Unavailable);
         let shared_health = if probe_external {
@@ -2086,6 +2229,25 @@ mod tests {
         }
     }
 
+    /// The namespace the test fixtures are pinned to. Supplied explicitly so tests
+    /// never depend on the ambient process environment.
+    fn test_namespace() -> ChannelNamespace {
+        ChannelNamespace::with_owner("example-org")
+    }
+
+    fn test_engine<L, S, G>(local: L, shared: S, git: G) -> DeliveryEngine<L, S, G>
+    where
+        L: MessageTransport,
+        S: MessageTransport,
+        G: MessageTransport,
+    {
+        DeliveryEngine::with_namespace(local, shared, git, test_namespace())
+    }
+
+    fn test_git_transport<G: GitRunner>(git: G) -> PrivateGitTransport<G> {
+        PrivateGitTransport::with_namespace(git, test_namespace())
+    }
+
     fn fixture() -> (tempfile::TempDir, ProjectRoute) {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().join("project");
@@ -2099,8 +2261,8 @@ mod tests {
                 workspace,
                 attachment,
                 communications,
-                shared_remote: "/beastly-bridges/alpha".into(),
-                git_remote: "https://github.com/estejosh/alpha-bridge.git".into(),
+                shared_remote: "alpha-bridge".into(),
+                git_remote: "https://github.com/example-org/alpha-bridge.git".into(),
                 git_visibility: "private".into(),
                 agents: vec![AgentRoute {
                     name: "alpha-builder".into(),
@@ -2194,7 +2356,7 @@ mod tests {
     fn status_reports_transport_health_and_durable_queue_depth() {
         let (_temp, route) = fixture();
         let deliveries = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Healthy,
@@ -2350,7 +2512,7 @@ mod tests {
     fn inbound_git_mode_requires_stable_shared_and_git_synchronization() {
         let (_temp, route) = fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(TransportKind::LocalFilesystem, Health::Healthy, log.clone()),
             fake(
                 TransportKind::SharedFolder,
@@ -2399,7 +2561,7 @@ mod tests {
         );
         LocalFilesystemTransport.deliver(&route, &message).unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(TransportKind::LocalFilesystem, Health::Healthy, log.clone()),
             fake(
                 TransportKind::SharedFolder,
@@ -2435,7 +2597,7 @@ mod tests {
         let local_log = Arc::new(Mutex::new(Vec::new()));
         let shared_log = Arc::new(Mutex::new(Vec::new()));
         let git_log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Healthy,
@@ -2477,7 +2639,7 @@ mod tests {
         let (_temp, route) = fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
         let shared_log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
@@ -2506,15 +2668,108 @@ mod tests {
         assert_eq!(shared_log.lock().unwrap().as_slice(), &[message.id]);
     }
 
+    /// The case this whole change exists for: a channel carried entirely by Syncthing,
+    /// with no GitHub repository at all, must validate and must be able to send.
+    #[test]
+    fn syncthing_only_channel_validates_and_sends_without_any_git_remote() {
+        let (_temp, mut route) = fixture();
+        route.git_remote = String::new();
+        // With no remote there is no repository whose visibility could leak, so the
+        // "private" requirement does not apply.
+        route.git_visibility = String::new();
+
+        route.validate().expect("structural validation");
+        // Valid under a namespace-less installation and under a configured one alike:
+        // there is simply no git rung to pin.
+        route
+            .validate_in(&ChannelNamespace::default())
+            .expect("Syncthing-only route is valid with no namespace configured");
+        route
+            .validate_in(&test_namespace())
+            .expect("Syncthing-only route is valid with a namespace configured");
+
+        let message = Message::new(
+            "alpha",
+            "operator",
+            "alpha-builder",
+            "inline",
+            Value::Null,
+            false,
+            None,
+        );
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut engine = test_engine(
+            fake(
+                TransportKind::LocalFilesystem,
+                Health::Unavailable,
+                log.clone(),
+            ),
+            fake(TransportKind::SharedFolder, Health::Healthy, log.clone()),
+            fake(TransportKind::PrivateGit, Health::Unavailable, log.clone()),
+        );
+        let receipt = engine
+            .send(&route, &message)
+            .expect("Syncthing-only channel must be able to send");
+        assert_eq!(receipt.transport, TransportKind::SharedFolder);
+        assert_eq!(log.lock().unwrap().as_slice(), &[message.id]);
+    }
+
+    /// Fail closed: a remote that this installation cannot pin is refused outright
+    /// rather than accepted unpinned.
+    #[test]
+    fn git_remote_without_a_configured_namespace_is_refused() {
+        let (_temp, route) = fixture();
+        let error = route
+            .validate_in(&ChannelNamespace::default())
+            .expect_err("an unpinnable remote must be rejected, not silently accepted");
+        // The operator has to be told exactly which knob to set.
+        assert!(
+            error.to_string().contains("FERRYMAN_CHANNEL_GIT_OWNER"),
+            "error must name the variable to set, got: {error}"
+        );
+    }
+
+    /// The pin is still exact: a remote under somebody else's account is refused.
+    #[test]
+    fn git_remote_under_a_foreign_owner_is_refused() {
+        let (_temp, mut route) = fixture();
+        route.git_remote = "https://github.com/somebody-else/alpha-bridge.git".into();
+        assert!(route.validate_in(&test_namespace()).is_err());
+
+        // ...and the matching remote for this namespace is accepted, including the
+        // usual .git / case-insensitivity normalisation.
+        route.git_remote = "https://github.com/Example-Org/alpha-bridge".into();
+        route
+            .validate_in(&test_namespace())
+            .expect("the canonical remote for this namespace must be accepted");
+    }
+
+    #[test]
+    fn namespace_honours_a_configured_repository_suffix() {
+        let namespace = ChannelNamespace {
+            git_owner: Some("acme".into()),
+            git_suffix: "-channel".into(),
+        };
+        assert_eq!(
+            namespace.git_remote("alpha").unwrap(),
+            "https://github.com/acme/alpha-channel.git"
+        );
+        let (_temp, mut route) = fixture();
+        route.git_remote = "https://github.com/acme/alpha-channel.git".into();
+        route.validate_in(&namespace).expect("suffix is honoured");
+    }
+
     #[test]
     fn public_repository_and_cross_project_messages_are_refused() {
         let (_temp, mut route) = fixture();
         route.git_visibility = "public".into();
         assert!(route.validate().is_err());
         route.git_visibility = "private".into();
-        route.shared_remote = "/beastly-bridges/beta".into();
+        // `shared_remote` is a Syncthing folder ID now: it must be a path-safe
+        // component, and the old MEGA-style path no longer qualifies.
+        route.shared_remote = "/shared-bridges/alpha".into();
         assert!(route.validate().is_err());
-        route.shared_remote = "/beastly-bridges/alpha".into();
+        route.shared_remote = "alpha-bridge".into();
         let message = Message::new(
             "beta",
             "operator",
@@ -2525,7 +2780,7 @@ mod tests {
             None,
         );
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(TransportKind::LocalFilesystem, Health::Healthy, log.clone()),
             fake(TransportKind::SharedFolder, Health::Healthy, log.clone()),
             fake(TransportKind::PrivateGit, Health::Healthy, log),
@@ -2537,7 +2792,7 @@ mod tests {
     fn offline_queue_and_bounded_backoff() {
         let (_temp, route) = fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
@@ -2567,7 +2822,7 @@ mod tests {
             TransportKind::PrivateGit
         );
 
-        let mut git = PrivateGitTransport::new(SystemGit);
+        let mut git = test_git_transport(SystemGit);
         for _ in 0..20 {
             git.note_failure(SystemTime::now());
         }
@@ -2589,7 +2844,7 @@ mod tests {
         let (_temp, route) = fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
         let git_log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(TransportKind::LocalFilesystem, Health::Healthy, log.clone()),
             fake(TransportKind::SharedFolder, Health::Healthy, log),
             fake(TransportKind::PrivateGit, Health::Healthy, git_log.clone()),
@@ -2620,7 +2875,7 @@ mod tests {
         let (_temp, route) = fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
         let git_log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
@@ -2700,7 +2955,7 @@ mod tests {
             commands: Vec::new(),
             expected_origin: route.git_remote.clone(),
         };
-        let mut git = PrivateGitTransport::new(runner);
+        let mut git = test_git_transport(runner);
         assert_eq!(git.health(&route).unwrap(), Health::Healthy);
         assert_eq!(git.health(&route).unwrap(), Health::Healthy);
         assert_eq!(git.git.visibility_checks, 1);
@@ -2732,7 +2987,7 @@ mod tests {
         let (_temp, route) = fixture();
         let log = Arc::new(Mutex::new(Vec::new()));
         let git_log = Arc::new(Mutex::new(Vec::new()));
-        let mut first = DeliveryEngine::new(
+        let mut first = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
@@ -2754,7 +3009,7 @@ mod tests {
         );
 
         let local_log = Arc::new(Mutex::new(Vec::new()));
-        let mut restarted = DeliveryEngine::new(
+        let mut restarted = test_engine(
             fake(TransportKind::LocalFilesystem, Health::Healthy, local_log),
             fake(
                 TransportKind::SharedFolder,
@@ -2778,12 +3033,12 @@ mod tests {
             commands: Vec::new(),
             expected_origin: route.git_remote.clone(),
         };
-        let mut state_writer = DeliveryEngine::new(
+        let mut state_writer = test_engine(
             LocalFilesystemTransport,
             SharedFolderTransport {
                 probe: OfflineProbe,
             },
-            PrivateGitTransport::new(runner),
+            test_git_transport(runner),
         );
         state_writer.git.note_failure(SystemTime::now());
         state_writer.persist_state(&route).unwrap();
@@ -2795,12 +3050,12 @@ mod tests {
             commands: Vec::new(),
             expected_origin: route.git_remote.clone(),
         };
-        let mut state_reader = DeliveryEngine::new(
+        let mut state_reader = test_engine(
             LocalFilesystemTransport,
             SharedFolderTransport {
                 probe: OfflineProbe,
             },
-            PrivateGitTransport::new(runner),
+            test_git_transport(runner),
         );
         state_reader.restore_state(&route).unwrap();
         assert_eq!(state_reader.git.backoff_attempt, 1);
@@ -2817,7 +3072,7 @@ mod tests {
         fs::create_dir_all(&outbox).unwrap();
         fs::write(outbox.join("bad.json"), b"{not-json").unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(TransportKind::LocalFilesystem, Health::Healthy, log.clone()),
             fake(TransportKind::SharedFolder, Health::Healthy, log.clone()),
             fake(TransportKind::PrivateGit, Health::Healthy, log),
@@ -2983,14 +3238,14 @@ mod tests {
         );
 
         let log = Arc::new(Mutex::new(Vec::new()));
-        let mut engine = DeliveryEngine::new(
+        let mut engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
                 log.clone(),
             ),
             fake(TransportKind::SharedFolder, Health::Unavailable, log),
-            PrivateGitTransport::new(VerifiedLocalGit { system: SystemGit }),
+            test_git_transport(VerifiedLocalGit { system: SystemGit }),
         );
         let first = Message::new("alpha", "a", "builder", "inline", Value::Null, false, None);
         let first_receipt = engine.send(&route, &first).unwrap();
@@ -3029,14 +3284,14 @@ mod tests {
         assert_eq!(after_duplicate, "2");
 
         let peer_log = Arc::new(Mutex::new(Vec::new()));
-        let mut peer_engine = DeliveryEngine::new(
+        let mut peer_engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
                 peer_log.clone(),
             ),
             fake(TransportKind::SharedFolder, Health::Unavailable, peer_log),
-            PrivateGitTransport::new(VerifiedLocalGit { system: SystemGit }),
+            test_git_transport(VerifiedLocalGit { system: SystemGit }),
         );
         assert_eq!(
             peer_engine.send(&peer_route, &first).unwrap().transport,
@@ -3055,7 +3310,7 @@ mod tests {
         assert_eq!(after_peer_duplicate, "2");
 
         let receiver_log = Arc::new(Mutex::new(Vec::new()));
-        let mut receiver_engine = DeliveryEngine::new(
+        let mut receiver_engine = test_engine(
             fake(
                 TransportKind::LocalFilesystem,
                 Health::Unavailable,
@@ -3066,7 +3321,7 @@ mod tests {
                 Health::Unavailable,
                 receiver_log,
             ),
-            PrivateGitTransport::new(VerifiedLocalGit { system: SystemGit }),
+            test_git_transport(VerifiedLocalGit { system: SystemGit }),
         );
         // Simulate the common handoff edge: Syncthing wrote the message into this
         // stale checkout just before the receiver switched to Git inbound.

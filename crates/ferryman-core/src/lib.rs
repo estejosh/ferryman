@@ -7,6 +7,8 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use chrono::Utc;
+pub use ferryman_channel::ChannelNamespace;
+use ferryman_channel::is_safe_component;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -341,20 +343,46 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         }
         Ok(out)
     }
-    pub fn set_project_communications(&self, mapping: &ProjectCommunicationMapping) -> Result<()> {
-        if mapping.git_visibility != "private" {
+    /// Store a project's communications mapping.
+    ///
+    /// `namespace` pins where this installation's channel repositories live. Passing it
+    /// explicitly — rather than reading the environment here — keeps the check
+    /// deterministic under parallel tests.
+    pub fn set_project_communications(
+        &self,
+        mapping: &ProjectCommunicationMapping,
+        namespace: &ChannelNamespace,
+    ) -> Result<()> {
+        // The `project_communications` table still carries CHECK(git_visibility =
+        // 'private'), so every stored mapping records 'private' even when no remote is
+        // configured. The meaningful control is below: visibility is only *enforced*
+        // when a remote actually exists to be exposed.
+        if !mapping.git_remote.trim().is_empty() && mapping.git_visibility != "private" {
             return Err(anyhow!("communications Git repository must be private"));
         }
-        let expected_remote = format!("https://github.com/estejosh/{}-bridge", mapping.project_id)
-            .to_ascii_lowercase();
-        if normalize_git_remote(&mapping.git_remote) != expected_remote {
+        if !is_safe_component(&mapping.project_id) {
             return Err(anyhow!(
-                "communications Git remote must match the exact expected project repository"
+                "project ID must contain only letters, digits, '.', '-', or '_'"
             ));
         }
-        if mapping.shared_remote != format!("/beastly-bridges/{}", mapping.project_id) {
+        if mapping.git_remote.trim().is_empty() {
+            // Syncthing-only: no git rung to pin.
+        } else if let Some(expected) = namespace.git_remote(&mapping.project_id) {
+            if normalize_git_remote(&mapping.git_remote) != normalize_git_remote(&expected) {
+                return Err(anyhow!(
+                    "communications Git remote must match the exact expected project repository"
+                ));
+            }
+        } else {
             return Err(anyhow!(
-                "shared remote must match the exact expected private project path"
+                "a communications Git remote is configured but this installation has no \
+                 channel namespace: set FERRYMAN_CHANNEL_GIT_OWNER to the account that owns \
+                 the channel repositories, or clear the remote to run Syncthing-only"
+            ));
+        }
+        if !mapping.shared_remote.is_empty() && !is_safe_component(&mapping.shared_remote) {
+            return Err(anyhow!(
+                "shared remote must be a path-safe Syncthing folder ID"
             ));
         }
         let workspace = normalize_path_text(&mapping.workspace_path);
@@ -1552,20 +1580,41 @@ mod communication_mapping_tests {
             workspace_path: r"X:\alpha".into(),
             attachment_path: r"X:\alpha\.ferryman".into(),
             communications_path: r"X:\alpha\.ferryman\ferryman".into(),
-            shared_remote: "/beastly-bridges/alpha".into(),
-            git_remote: "https://github.com/estejosh/alpha-bridge.git".into(),
+            shared_remote: "alpha-bridge".into(),
+            git_remote: "https://github.com/example-org/alpha-bridge.git".into(),
             git_visibility: "private".into(),
             agents_json: r#"[{"name":"alpha-builder","role":"builder","capabilities":["code"]}]"#
                 .into(),
         };
-        store.set_project_communications(&mapping).unwrap();
+        let namespace = ChannelNamespace::with_owner("example-org");
+        store
+            .set_project_communications(&mapping, &namespace)
+            .unwrap();
         assert_eq!(
             store.get_project_communications("alpha").unwrap(),
             Some(mapping.clone())
         );
-        let mut public = mapping;
+        let mut public = mapping.clone();
         public.git_visibility = "public".into();
-        assert!(store.set_project_communications(&public).is_err());
+        assert!(
+            store
+                .set_project_communications(&public, &namespace)
+                .is_err()
+        );
+        // A remote that does not belong to this installation's namespace is refused,
+        // and so is one that cannot be pinned at all.
+        let mut foreign = mapping.clone();
+        foreign.git_remote = "https://github.com/somebody-else/alpha-bridge.git".into();
+        assert!(
+            store
+                .set_project_communications(&foreign, &namespace)
+                .is_err()
+        );
+        assert!(
+            store
+                .set_project_communications(&mapping, &ChannelNamespace::default())
+                .is_err()
+        );
         assert!(
             store
                 .get_project_communications("another-project")
@@ -1609,6 +1658,36 @@ mod communication_mapping_tests {
             !store
                 .authenticate_communication_actor("alpha", "project-inbox", &rotated.actor_token)
                 .unwrap()
+        );
+    }
+
+    /// A Syncthing-only project has no GitHub repository at all and must still be
+    /// storable, including on an installation with no namespace configured.
+    #[test]
+    fn syncthing_only_mapping_is_stored_without_a_git_remote() {
+        let store = SqliteStore::open(":memory:").unwrap();
+        store
+            .create_project("gamma", "Gamma", "not-a-real-token", r"X:\gamma")
+            .unwrap();
+        let mapping = ProjectCommunicationMapping {
+            project_id: "gamma".into(),
+            workspace_path: r"X:\gamma".into(),
+            attachment_path: r"X:\gamma\.ferryman".into(),
+            communications_path: r"X:\gamma\.ferryman\ferryman".into(),
+            shared_remote: "gamma-bridge".into(),
+            git_remote: String::new(),
+            // The project_communications table still carries
+            // CHECK(git_visibility = 'private'), so the stored value stays 'private'
+            // even though there is no repository for it to describe.
+            git_visibility: "private".into(),
+            agents_json: "[]".into(),
+        };
+        store
+            .set_project_communications(&mapping, &ChannelNamespace::default())
+            .expect("a Syncthing-only mapping needs no namespace");
+        assert_eq!(
+            store.get_project_communications("gamma").unwrap(),
+            Some(mapping)
         );
     }
 }

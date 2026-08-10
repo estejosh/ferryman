@@ -49,6 +49,9 @@ pub struct AppState {
     recovery_key_reference: Arc<String>,
     communication_engines:
         Arc<tokio::sync::Mutex<HashMap<String, communications::SystemDeliveryEngine>>>,
+    /// Resolved once at construction rather than per-request, so validation does not
+    /// depend on process environment mutated by concurrent tests.
+    channel_namespace: communications::ChannelNamespace,
 }
 impl AppState {
     pub fn new(store: SqliteStore, artifact_root: PathBuf) -> Self {
@@ -56,6 +59,7 @@ impl AppState {
             store,
             artifact_root: Arc::new(artifact_root),
             admin_token: None,
+            channel_namespace: communications::ChannelNamespace::from_env(),
             workspace_root: Arc::new(PathBuf::from("./.data/projects")),
             memory_root: Arc::new(PathBuf::from("./.data/bridge-memory")),
             memory_write_token: None,
@@ -66,6 +70,11 @@ impl AppState {
             recovery_key_reference: Arc::new("unconfigured".into()),
             communication_engines: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+    /// Pin the channel namespace explicitly instead of taking it from the environment.
+    pub fn with_channel_namespace(mut self, namespace: communications::ChannelNamespace) -> Self {
+        self.channel_namespace = namespace;
+        self
     }
     pub fn with_admin_token(mut self, admin_token: String) -> Self {
         self.admin_token = Some(Arc::new(admin_token));
@@ -448,7 +457,7 @@ async fn metrics(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         .list_project_communications()
         .map_err(ApiError::internal)?
     {
-        if let Ok(route) = project_route_from_mapping(&mapping)
+        if let Ok(route) = project_route_from_mapping(&mapping, &state.channel_namespace)
             && let Ok((outbox, acknowledgement_outbox, _, quarantine)) =
                 communications::filesystem_metrics(&route)
         {
@@ -540,6 +549,7 @@ fn private_visibility() -> String {
 
 fn project_route_from_mapping(
     mapping: &ProjectCommunicationMapping,
+    namespace: &communications::ChannelNamespace,
 ) -> Result<communications::ProjectRoute> {
     let agents = serde_json::from_str(&mapping.agents_json)?;
     let route = communications::ProjectRoute {
@@ -552,7 +562,7 @@ fn project_route_from_mapping(
         git_visibility: mapping.git_visibility.clone(),
         agents,
     };
-    route.validate()?;
+    route.validate_in(namespace)?;
     Ok(route)
 }
 
@@ -580,7 +590,7 @@ fn project_route(state: &AppState, project_id: &str) -> ApiResult<communications
         .get_project_communications(project_id)
         .map_err(ApiError::internal)?
         .ok_or_else(ApiError::not_found)?;
-    project_route_from_mapping(&mapping).map_err(ApiError::internal)
+    project_route_from_mapping(&mapping, &state.channel_namespace).map_err(ApiError::internal)
 }
 
 fn registered_communication_participants(
@@ -622,7 +632,9 @@ fn refresh_communication_participants(state: &AppState, project_id: &str) -> Res
         }
     }
     mapping.agents_json = serde_json::to_string(&routes)?;
-    state.store.set_project_communications(&mapping)
+    state
+        .store
+        .set_project_communications(&mapping, &state.channel_namespace)
 }
 
 async fn configure_communications(
@@ -673,21 +685,24 @@ async fn configure_communications(
         agents,
     };
     route
-        .validate()
+        .validate_in(&state.channel_namespace)
         .map_err(|error| ApiError::bad(error.to_string()))?;
     state
         .store
-        .set_project_communications(&ProjectCommunicationMapping {
-            project_id: project_id.clone(),
-            workspace_path: route.workspace.to_string_lossy().into_owned(),
-            attachment_path: route.attachment.to_string_lossy().into_owned(),
-            communications_path: route.communications.to_string_lossy().into_owned(),
-            shared_remote: route.shared_remote.clone(),
-            git_remote: route.git_remote.clone(),
-            git_visibility: route.git_visibility.clone(),
-            agents_json: serde_json::to_string(&route.agents)
-                .map_err(|error| ApiError::internal(error.into()))?,
-        })
+        .set_project_communications(
+            &ProjectCommunicationMapping {
+                project_id: project_id.clone(),
+                workspace_path: route.workspace.to_string_lossy().into_owned(),
+                attachment_path: route.attachment.to_string_lossy().into_owned(),
+                communications_path: route.communications.to_string_lossy().into_owned(),
+                shared_remote: route.shared_remote.clone(),
+                git_remote: route.git_remote.clone(),
+                git_visibility: route.git_visibility.clone(),
+                agents_json: serde_json::to_string(&route.agents)
+                    .map_err(|error| ApiError::internal(error.into()))?,
+            },
+            &state.channel_namespace,
+        )
         .map_err(ApiError::internal)?;
     state.communication_engines.lock().await.remove(&project_id);
     Ok(Json(route))
@@ -812,7 +827,7 @@ async fn send_communication(
         )
     };
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine()
+        communications::system_delivery_engine_in(state.channel_namespace.clone())
     });
     let receipt = engine.send(&route, &message).map_err(ApiError::internal)?;
     Ok((
@@ -895,7 +910,7 @@ async fn acknowledge_communication(
     };
     let mut engines = state.communication_engines.lock().await;
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine()
+        communications::system_delivery_engine_in(state.channel_namespace.clone())
     });
     let (acknowledgement, recorded, delivery) = engine
         .acknowledge(&route, &acknowledgement)
@@ -944,7 +959,7 @@ async fn list_communication_actor_messages(
     let synchronized_via = if query.synchronize {
         let mut engines = state.communication_engines.lock().await;
         let engine = engines.entry(project_id.clone()).or_insert_with(|| {
-            communications::system_delivery_engine()
+            communications::system_delivery_engine_in(state.channel_namespace.clone())
         });
         engine
             .synchronize_inbound(&route)
@@ -984,7 +999,7 @@ async fn reconcile_communications(
     let route = project_route(&state, &project_id)?;
     let mut engines = state.communication_engines.lock().await;
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine()
+        communications::system_delivery_engine_in(state.channel_namespace.clone())
     });
     let receipts = engine
         .reconcile_outbox(&route)
@@ -1002,7 +1017,7 @@ async fn communications_status(
     let route = project_route(&state, &project_id)?;
     let mut engines = state.communication_engines.lock().await;
     let engine = engines.entry(project_id).or_insert_with(|| {
-        communications::system_delivery_engine()
+        communications::system_delivery_engine_in(state.channel_namespace.clone())
     });
     let status = engine
         .status(&route, query.probe_external)
@@ -1030,7 +1045,7 @@ pub fn start_communications_reconciler(state: AppState) -> tokio::task::JoinHand
             };
             let mut engines = state.communication_engines.lock().await;
             for mapping in mappings {
-                let route = match project_route_from_mapping(&mapping) {
+                let route = match project_route_from_mapping(&mapping, &state.channel_namespace) {
                     Ok(route) => route,
                     Err(error) => {
                         tracing::warn!(
@@ -1044,7 +1059,7 @@ pub fn start_communications_reconciler(state: AppState) -> tokio::task::JoinHand
                 let engine = engines
                     .entry(mapping.project_id.clone())
                     .or_insert_with(|| {
-                        communications::system_delivery_engine()
+                        communications::system_delivery_engine_in(state.channel_namespace.clone())
                     });
                 if let Err(error) = engine.reconcile_outbox(&route) {
                     tracing::warn!(
@@ -2170,7 +2185,10 @@ mod tests {
                 &workspace.to_string_lossy(),
             )
             .unwrap();
-        let state = AppState::new(store, dir.join("artifacts"));
+        // Pin the namespace explicitly: tests share one process environment, so
+        // reading FERRYMAN_CHANNEL_GIT_OWNER here would be racy.
+        let state = AppState::new(store, dir.join("artifacts"))
+            .with_channel_namespace(communications::ChannelNamespace::with_owner("example-org"));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -2184,8 +2202,8 @@ mod tests {
                 "workspace": workspace.to_string_lossy(),
                 "attachment": attachment.to_string_lossy(),
                 "communications": communications_root.to_string_lossy(),
-                "shared_remote": "/beastly-bridges/alpha",
-                "git_remote": "https://github.com/estejosh/alpha-bridge.git",
+                "shared_remote": "alpha-bridge",
+                "git_remote": "https://github.com/example-org/alpha-bridge.git",
                 "git_visibility": "private",
                 "agents": [{
                     "name": "alpha-observer",

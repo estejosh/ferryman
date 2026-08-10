@@ -19,8 +19,12 @@ PARTICIPANTS=()
 usage() {
   cat <<'EOF'
 Usage:
-  attach-project.sh --workspace PATH --project ID --shared-remote /REMOTE \
-    --git-remote https://github.com/estejosh/ID-bridge.git [options]
+  attach-project.sh --workspace PATH --project ID --shared-remote FOLDER_ID \
+    [--git-remote https://github.com/OWNER/ID-bridge.git] [options]
+
+The Git rung is optional; omit --git-remote for a Syncthing-only channel. When a Git
+remote is supplied, FERRYMAN_CHANNEL_GIT_OWNER must name the account that owns the
+channel repositories (FERRYMAN_CHANNEL_GIT_SUFFIX overrides the "-bridge" suffix).
 
 Options:
   --adopt-from PATH
@@ -56,25 +60,35 @@ done
 : "${WORKSPACE:?--workspace is required}"
 : "${PROJECT:?--project is required}"
 : "${SHARED_REMOTE:?--shared-remote is required}"
-: "${GIT_REMOTE:?--git-remote is required}"
+# --git-remote is optional: a Syncthing-only channel has no Git rung at all.
 case "$INTEGRATION_MODE" in
   unmanaged|single-agent|multi-agent) ;;
   *) echo "invalid integration mode: $INTEGRATION_MODE" >&2; exit 2 ;;
 esac
 [[ "$PROJECT" != . && "$PROJECT" != .. && "$PROJECT" =~ ^[A-Za-z0-9._-]+$ ]] ||
   { echo "project ID is not path-safe" >&2; exit 2; }
-EXPECTED_SHARED_REMOTE="/beastly-bridges/$PROJECT"
-[[ "$SHARED_REMOTE" == "$EXPECTED_SHARED_REMOTE" ]] ||
-  { echo "shared remote must be $EXPECTED_SHARED_REMOTE" >&2; exit 2; }
+# The shared remote is a Syncthing folder ID since the transport swap, not the MEGA
+# path it used to be: require a path-safe identifier rather than a pinned path.
+[[ -z "$SHARED_REMOTE" || ( "$SHARED_REMOTE" != . && "$SHARED_REMOTE" != .. &&
+   "$SHARED_REMOTE" =~ ^[A-Za-z0-9._-]+$ ) ]] ||
+  { echo "shared remote must be a path-safe Syncthing folder ID" >&2; exit 2; }
 
 WORKSPACE=$(cd "$WORKSPACE" && pwd -P)
 ATTACHMENT="$WORKSPACE/.ferryman"
 COMMUNICATIONS="$ATTACHMENT/ferryman"
-EXPECTED_NAME="$PROJECT-bridge"
-EXPECTED_REMOTE="https://github.com/estejosh/$EXPECTED_NAME"
+GIT_SUFFIX="${FERRYMAN_CHANNEL_GIT_SUFFIX:--bridge}"
+EXPECTED_NAME="$PROJECT$GIT_SUFFIX"
 normalize_remote() { printf '%s' "${1%.git}" | tr '[:upper:]' '[:lower:]'; }
-[[ "$(normalize_remote "$GIT_REMOTE")" == "$(normalize_remote "$EXPECTED_REMOTE")" ]] ||
-  { echo "Git remote must be $EXPECTED_REMOTE.git" >&2; exit 2; }
+# Pinning the channel to a canonical location stops a tampered or mistaken mapping
+# from redirecting a private channel somewhere else. Fail closed: a remote that cannot
+# be pinned is refused rather than accepted unpinned.
+if [[ -n "$GIT_REMOTE" ]]; then
+  [[ -n "${FERRYMAN_CHANNEL_GIT_OWNER:-}" ]] ||
+    { echo "a Git remote was supplied but FERRYMAN_CHANNEL_GIT_OWNER is not set; set it to the account that owns the channel repositories, or pass an empty --git-remote to run Syncthing-only" >&2; exit 2; }
+  EXPECTED_REMOTE="https://github.com/$FERRYMAN_CHANNEL_GIT_OWNER/$EXPECTED_NAME"
+  [[ "$(normalize_remote "$GIT_REMOTE")" == "$(normalize_remote "$EXPECTED_REMOTE")" ]] ||
+    { echo "Git remote must be $EXPECTED_REMOTE.git" >&2; exit 2; }
+fi
 
 declare -A SEEN_PARTICIPANTS=(["project-inbox"]=1)
 for participant in "${PARTICIPANTS[@]}"; do
@@ -144,18 +158,20 @@ echo "Project:        $PROJECT"
 echo "Workspace:      $WORKSPACE"
 echo "Attachment:     $ATTACHMENT"
 echo "Communications: $COMMUNICATIONS"
-echo "MEGA:           $SHARED_REMOTE"
-echo "Git:            $GIT_REMOTE (PRIVATE required)"
+echo "Shared folder:  ${SHARED_REMOTE:-(none)}"
+echo "Git:            ${GIT_REMOTE:-(none; Syncthing-only)}${GIT_REMOTE:+ (PRIVATE required)}"
 echo "Integration:    $INTEGRATION_MODE"
 
-if ((DRY_RUN)); then
-  echo "DRY-RUN: verify GitHub name estejosh/$EXPECTED_NAME and visibility PRIVATE"
+if [[ -z "$GIT_REMOTE" ]]; then
+  echo "No Git remote configured; the Git rung is unavailable for this project."
+elif ((DRY_RUN)); then
+  echo "DRY-RUN: verify GitHub name $FERRYMAN_CHANNEL_GIT_OWNER/$EXPECTED_NAME and visibility PRIVATE"
 else
   command -v gh >/dev/null || { echo "gh is required" >&2; exit 2; }
-  visibility=$(gh repo view "estejosh/$EXPECTED_NAME" \
+  visibility=$(gh repo view "$FERRYMAN_CHANNEL_GIT_OWNER/$EXPECTED_NAME" \
     --json nameWithOwner,visibility \
     --jq '.nameWithOwner + "|" + .visibility')
-  [[ "$visibility" == "estejosh/$EXPECTED_NAME|PRIVATE" ]] ||
+  [[ "$visibility" == "$FERRYMAN_CHANNEL_GIT_OWNER/$EXPECTED_NAME|PRIVATE" ]] ||
     { echo "refusing mismatched or non-private GitHub repository" >&2; exit 2; }
 fi
 
@@ -178,11 +194,15 @@ if [[ ! -e "$COMMUNICATIONS" ]]; then
         { echo "adopted history verification failed" >&2; exit 2; }
       git -C "$COMMUNICATIONS" remote set-url origin "$GIT_REMOTE"
     fi
-  else
+  elif [[ -n "$GIT_REMOTE" ]]; then
     run git clone "$GIT_REMOTE" "$COMMUNICATIONS"
+  else
+    # Syncthing-only: the channel is still its own repository (git remains the
+    # archive of record), it just has no upstream to clone from or push to.
+    run git init -q "$COMMUNICATIONS"
   fi
 elif [[ -d "$COMMUNICATIONS/.git" ]]; then
-  if ((!DRY_RUN)); then
+  if ((!DRY_RUN)) && [[ -n "$GIT_REMOTE" ]]; then
     communications_remote=$(git -C "$COMMUNICATIONS" config --get remote.origin.url)
     normalized_communications_remote=$(normalize_remote "$communications_remote")
     normalized_git_remote=$(normalize_remote "$GIT_REMOTE")
