@@ -8,8 +8,10 @@ description = "The Ferryman channel: portable agent messages and shared memory o
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
 fs2.workspace = true
 hex.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

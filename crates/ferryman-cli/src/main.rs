@@ -1050,9 +1050,20 @@ fn channel(command: Channel) -> Result<()> {
                     .filter(|value| !value.is_empty())
                     .map(ToString::to_string)
                     .collect(),
+                public_key: None,
             };
-            let path = ferryman_channel::register_agent(&route, &agent)?;
+            // The private key is created here and stays in the attachment, which is
+            // machine-local and outside the folder Syncthing carries. Only the public
+            // half is published.
+            let identity =
+                ferryman_channel::AgentIdentity::load_or_create(&agent.name, &route.attachment)?;
+            let path = ferryman_channel::register_agent_key(&route, &agent, &identity)?;
             println!("registered '{}' as {}", agent.name, path.display());
+            println!("  public key  {}", identity.public_key_hex());
+            println!(
+                "  private key stays in {}",
+                route.attachment.join("keys").display()
+            );
             println!("it will appear on the other machines once Syncthing carries the folder");
         }
 
@@ -1090,15 +1101,24 @@ fn channel(command: Channel) -> Result<()> {
             } else {
                 json!({ "text": body })
             };
-            let message = ferryman_channel::Message::new(
+            let mut message = ferryman_channel::Message::new(
                 route.project_id.clone(),
-                sender,
+                sender.clone(),
                 to,
                 "text/plain",
                 payload,
                 reply_expected,
                 None,
             );
+            // Sign it if this agent has a key. Unsigned still works - a fleet that has
+            // not adopted signing keeps running - but anything that has joined gets
+            // attribution for free, which is the point: on a team, every contribution
+            // carries a fingerprint.
+            if let Ok(identity) =
+                ferryman_channel::AgentIdentity::load_or_create(&sender, &route.attachment)
+            {
+                identity.sign(&mut message);
+            }
             let mut engine = ferryman_channel::system_delivery_engine();
             let receipt = engine.send(&route, &message)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
@@ -1115,6 +1135,10 @@ fn channel(command: Channel) -> Result<()> {
                 .into_iter()
                 .filter(|m| m.recipient == agent || m.recipient == "all")
                 .filter(|m| all || !ferryman_channel::is_acknowledged(&route, &m.id))
+                .map(|m| {
+                    let verdict = ferryman_channel::verify_message(&m, &route.agents);
+                    serde_json::json!({ "message": m, "signature": format!("{verdict:?}") })
+                })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&mine)?);
         }

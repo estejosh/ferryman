@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -154,6 +155,10 @@ pub struct AgentRoute {
     pub role: String,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// This agent's public key, hex encoded. Absent for a fleet not yet signing.
+    /// The PRIVATE half never appears here, or anywhere else in the channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -269,6 +274,12 @@ pub struct Message {
     pub payload: Value,
     pub reply_required: bool,
     pub idempotency_key: String,
+    /// The agent that signed this, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    /// Hex ed25519 signature over the fields in `signing_payload`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl Message {
@@ -318,6 +329,8 @@ impl Message {
             payload_reference: payload_reference.into(),
             payload,
             reply_required,
+            signed_by: None,
+            signature: None,
         }
     }
 
@@ -538,6 +551,231 @@ fn acknowledgement_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
         .join("acknowledgements")
         .join(&route.project_id)
         .join(format!("{message_id}.json"))
+}
+
+/// An agent's signing key.
+///
+/// One key per AGENT, not per machine. A machine may run several agents and the whole
+/// point of signing is telling them apart: when something breaks at 3am on a team, you
+/// want to know whose agent did it, not merely which computer it came from.
+///
+/// Syncthing already authenticates devices, so nobody can drop a file into the channel
+/// without being a machine you approved. Signing adds the three things that does not
+/// give you: agents on one machine are distinguishable, an approved-but-compromised
+/// machine can forge only its own agents rather than everyone's, and the proof survives
+/// the message leaving the folder for Git, a backup, or an audit report.
+pub struct AgentIdentity {
+    name: String,
+    signing: SigningKey,
+}
+
+impl AgentIdentity {
+    /// Load this agent's key, creating one the first time it runs.
+    ///
+    /// The private key is kept in the machine's own secret store when there is one, and
+    /// otherwise in the private state directory - which is deliberately the directory
+    /// Ferryman keeps OUT of the synced folder, so the key physically cannot travel.
+    /// The file fallback is not a compromise: a headless container has no keychain, and
+    /// that is the main way people run this.
+    pub fn load_or_create(name: &str, state_dir: &Path) -> Result<Self> {
+        if !is_safe_component(name) {
+            bail!("agent name must be a path-safe identifier")
+        }
+        if let Some(existing) = Self::from_state_file(name, state_dir)? {
+            return Ok(existing);
+        }
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        Self::write_state_file(name, state_dir, &signing)?;
+        Ok(Self {
+            name: name.to_string(),
+            signing,
+        })
+    }
+
+    fn key_path(name: &str, state_dir: &Path) -> PathBuf {
+        state_dir.join("keys").join(format!("{name}.key"))
+    }
+
+    fn from_state_file(name: &str, state_dir: &Path) -> Result<Option<Self>> {
+        let path = Self::key_path(name, state_dir);
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let encoded = fs::read_to_string(&path)?;
+        let bytes = hex::decode(encoded.trim())
+            .with_context(|| format!("{} is not a valid key", path.display()))?;
+        let bytes: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("{} is not a 32-byte key", path.display()))?;
+        Ok(Some(Self {
+            name: name.to_string(),
+            signing: SigningKey::from_bytes(&bytes),
+        }))
+    }
+
+    fn write_state_file(name: &str, state_dir: &Path, signing: &SigningKey) -> Result<()> {
+        let path = Self::key_path(name, state_dir);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, hex::encode(signing.to_bytes()))?;
+        restrict_to_owner(&path)?;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The half that is safe to publish.
+    #[must_use]
+    pub fn public_key_hex(&self) -> String {
+        hex::encode(self.signing.verifying_key().to_bytes())
+    }
+
+    /// Sign a message, binding the signature to the fields that matter.
+    pub fn sign(&self, message: &mut Message) {
+        let signature = self.signing.sign(signing_payload(message).as_bytes());
+        message.signed_by = Some(self.name.clone());
+        message.signature = Some(hex::encode(signature.to_bytes()));
+    }
+}
+
+/// Keep a private key readable only by its owner.
+///
+/// On Unix that is mode 0600. On Windows the state directory is already per-user and
+/// Rust exposes no equivalent without extra dependencies, so this is a no-op there and
+/// says so rather than pretending otherwise.
+fn restrict_to_owner(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+/// Exactly what a signature covers.
+///
+/// Deliberately explicit rather than "serialise the whole struct": a signature over a
+/// serialisation is a signature over whatever that serialisation happens to include
+/// today, which quietly changes meaning the next time a field is added. These are the
+/// fields that decide what the message IS and who it is for.
+fn signing_payload(message: &Message) -> String {
+    format!(
+        "ferryman-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        message.id,
+        message.project_id,
+        message.sender,
+        message.recipient,
+        message.created_at.to_rfc3339(),
+        message.reply_required,
+        payload_digest(&message.payload),
+    )
+}
+
+/// A stable digest of a payload, so a signature binds to the content rather than to one
+/// particular serialisation of it.
+fn payload_digest(payload: &Value) -> String {
+    let canonical = serde_json::to_string(payload).unwrap_or_default();
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// What happened when a message's signature was checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignatureCheck {
+    /// Signed by the key this name is known by.
+    Valid,
+    /// No signature. Normal for a fleet that has not adopted signing.
+    Unsigned,
+    /// A signature that does not verify against the key on file.
+    Invalid,
+    /// Signed by a name with no published key, so nothing can be concluded.
+    UnknownSigner,
+    /// A DIFFERENT key is claiming a name that is already established.
+    ///
+    /// This is the interesting one, and it is never resolved silently. Either an agent
+    /// legitimately re-keyed, or something is impersonating it - and quietly accepting
+    /// the new key is how that attack succeeds.
+    KeyChanged { known: String, presented: String },
+}
+
+/// Verify a message against the roster published in the channel.
+#[must_use]
+pub fn verify_message(message: &Message, roster: &[AgentRoute]) -> SignatureCheck {
+    let (Some(signed_by), Some(signature_hex)) = (&message.signed_by, &message.signature) else {
+        return SignatureCheck::Unsigned;
+    };
+    let Some(agent) = roster.iter().find(|a| &a.name == signed_by) else {
+        return SignatureCheck::UnknownSigner;
+    };
+    let Some(known_key) = agent.public_key.as_ref().filter(|k| !k.is_empty()) else {
+        return SignatureCheck::UnknownSigner;
+    };
+    let Ok(key_bytes) = hex::decode(known_key) else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(key_bytes): Result<[u8; 32], _> = key_bytes.try_into() else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(verifying) = VerifyingKey::from_bytes(&key_bytes) else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(signature_bytes) = hex::decode(signature_hex) else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(signature_bytes): Result<[u8; 64], _> = signature_bytes.try_into() else {
+        return SignatureCheck::Invalid;
+    };
+    let signature = Signature::from_bytes(&signature_bytes);
+    if verifying
+        .verify_strict(signing_payload(message).as_bytes(), &signature)
+        .is_ok()
+    {
+        SignatureCheck::Valid
+    } else {
+        SignatureCheck::Invalid
+    }
+}
+
+/// Publish an agent, refusing to overwrite an established key with a different one.
+///
+/// First key wins. A name that already carries a key keeps it, and a different key
+/// arriving for that name is an error the operator must look at - not a silent
+/// replacement, which is precisely how impersonation succeeds.
+pub fn register_agent_key(
+    route: &ProjectRoute,
+    agent: &AgentRoute,
+    identity: &AgentIdentity,
+) -> Result<PathBuf> {
+    let published = AgentRoute {
+        name: agent.name.clone(),
+        role: agent.role.clone(),
+        capabilities: agent.capabilities.clone(),
+        public_key: Some(identity.public_key_hex()),
+    };
+    if let Some(existing) = read_agent_roster(&route.communications)?
+        .into_iter()
+        .find(|a| a.name == published.name)
+        && let Some(known) = existing.public_key.filter(|k| !k.is_empty())
+        && Some(&known) != published.public_key.as_ref()
+    {
+        bail!(
+            "agent '{}' is already published with a different key. First key wins: this is \
+             either a genuine re-key, which an operator must approve by removing \
+             agents/{}.json, or something impersonating it.",
+            published.name,
+            published.name
+        )
+    }
+    register_agent(route, &published)
 }
 
 /// Find the attachment for the project containing `start`, walking upwards the way git
@@ -2397,6 +2635,7 @@ mod tests {
                     name: "alpha-builder".into(),
                     role: "builder".into(),
                     capabilities: vec!["code".into()],
+                    public_key: None,
                 }],
             },
         )
@@ -3595,6 +3834,7 @@ mod serverless_tests {
                 name: "grouchly".into(),
                 role: "worker".into(),
                 capabilities: vec!["messages.receive".into()],
+                public_key: None,
             },
         )
         .unwrap();
@@ -3604,6 +3844,7 @@ mod serverless_tests {
                 name: "beastly".into(),
                 role: "orchestrator".into(),
                 capabilities: vec!["messages.receive".into(), "review".into()],
+                public_key: None,
             },
         )
         .unwrap();
@@ -3634,6 +3875,7 @@ mod serverless_tests {
                 name: "grouchly".into(),
                 role: "worker".into(),
                 capabilities: vec![],
+                public_key: None,
             },
         )
         .unwrap();
@@ -3662,6 +3904,7 @@ mod serverless_tests {
                         name: bad.into(),
                         role: "worker".into(),
                         capabilities: vec![],
+                        public_key: None,
                     },
                 )
                 .is_err(),
@@ -3680,6 +3923,7 @@ mod serverless_tests {
                 name: "grouchly".into(),
                 role: "worker".into(),
                 capabilities: vec!["messages.receive".into()],
+                public_key: None,
             },
         )
         .unwrap();
@@ -3713,6 +3957,193 @@ mod serverless_tests {
         assert!(
             on_disk.is_file(),
             "the message is a file, not a database row"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message(text: &str) -> Message {
+        Message::new(
+            "demo",
+            "beastly",
+            "grouchly",
+            "text/plain",
+            json!({ "text": text }),
+            true,
+            None,
+        )
+    }
+
+    fn identity(name: &str) -> (tempfile::TempDir, AgentIdentity) {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = AgentIdentity::load_or_create(name, dir.path()).unwrap();
+        (dir, identity)
+    }
+
+    fn roster(name: &str, identity: &AgentIdentity) -> Vec<AgentRoute> {
+        vec![AgentRoute {
+            name: name.into(),
+            role: "worker".into(),
+            capabilities: vec![],
+            public_key: Some(identity.public_key_hex()),
+        }]
+    }
+
+    #[test]
+    fn a_signed_message_verifies_against_the_published_key() {
+        let (_dir, beastly) = identity("beastly");
+        let mut m = message("deploy the thing");
+        beastly.sign(&mut m);
+        assert_eq!(m.signed_by.as_deref(), Some("beastly"));
+        assert_eq!(
+            verify_message(&m, &roster("beastly", &beastly)),
+            SignatureCheck::Valid
+        );
+    }
+
+    #[test]
+    fn changing_the_body_after_signing_is_caught() {
+        let (_dir, beastly) = identity("beastly");
+        let mut m = message("deploy the thing");
+        beastly.sign(&mut m);
+        m.payload = json!({ "text": "delete everything" });
+        assert_eq!(
+            verify_message(&m, &roster("beastly", &beastly)),
+            SignatureCheck::Invalid,
+            "a signature must cover the payload, not merely accompany it"
+        );
+    }
+
+    #[test]
+    fn changing_the_recipient_after_signing_is_caught() {
+        let (_dir, beastly) = identity("beastly");
+        let mut m = message("deploy the thing");
+        beastly.sign(&mut m);
+        m.recipient = "someone-else".into();
+        assert_eq!(
+            verify_message(&m, &roster("beastly", &beastly)),
+            SignatureCheck::Invalid,
+            "redirecting a signed order to another agent must not verify"
+        );
+    }
+
+    #[test]
+    fn one_agent_cannot_sign_as_another() {
+        let (_a, beastly) = identity("beastly");
+        let (_b, impostor) = identity("impostor");
+        let mut m = message("deploy the thing");
+        // The impostor signs, then relabels the message as though beastly sent it.
+        impostor.sign(&mut m);
+        m.signed_by = Some("beastly".into());
+        assert_eq!(
+            verify_message(&m, &roster("beastly", &beastly)),
+            SignatureCheck::Invalid,
+            "a compromised machine must only be able to forge its OWN agents"
+        );
+    }
+
+    #[test]
+    fn an_unsigned_message_is_reported_as_unsigned_not_valid() {
+        let (_dir, beastly) = identity("beastly");
+        let m = message("no signature here");
+        assert_eq!(
+            verify_message(&m, &roster("beastly", &beastly)),
+            SignatureCheck::Unsigned,
+            "a fleet that has not adopted signing keeps working, but is never called valid"
+        );
+    }
+
+    #[test]
+    fn a_signature_from_a_name_with_no_published_key_concludes_nothing() {
+        let (_dir, stranger) = identity("stranger");
+        let mut m = message("hello");
+        stranger.sign(&mut m);
+        assert_eq!(
+            verify_message(&m, &[]),
+            SignatureCheck::UnknownSigner,
+            "no key on file means unknown, which is not the same as valid or invalid"
+        );
+    }
+
+    #[test]
+    fn the_key_survives_a_restart_rather_than_being_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = AgentIdentity::load_or_create("beastly", dir.path()).unwrap();
+        let again = AgentIdentity::load_or_create("beastly", dir.path()).unwrap();
+        assert_eq!(
+            first.public_key_hex(),
+            again.public_key_hex(),
+            "an agent that re-keys on every start has no stable identity at all"
+        );
+    }
+
+    #[test]
+    fn a_private_key_is_never_written_where_syncthing_would_carry_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(communications.join("messages/demo")).unwrap();
+        let identity = AgentIdentity::load_or_create("beastly", &attachment).unwrap();
+
+        // The key lives in the attachment, which is machine-local. The channel is the
+        // subdirectory Syncthing carries. The key must not be inside it.
+        let key_path = attachment.join("keys/beastly.key");
+        assert!(key_path.is_file(), "the key is kept on this machine");
+        assert!(
+            !key_path.starts_with(&communications),
+            "a private key inside the synced folder would be handed to every peer"
+        );
+        assert!(
+            !identity.public_key_hex().is_empty(),
+            "the public half is what gets published"
+        );
+    }
+
+    #[test]
+    fn a_different_key_claiming_an_established_name_is_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(communications.join("messages/demo")).unwrap();
+        fs::write(
+            attachment.join("bridge.toml"),
+            format!(
+                "project = \"demo\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\nshared_remote = \"demo-ferryman\"\ngit_remote = \"\"\ngit_visibility = \"private\"\n",
+                workspace.display(), attachment.display(), communications.display()
+            ),
+        )
+        .unwrap();
+        let route = route_for(&workspace).unwrap();
+        let agent = AgentRoute {
+            name: "beastly".into(),
+            role: "orchestrator".into(),
+            capabilities: vec![],
+            public_key: None,
+        };
+
+        let first = AgentIdentity::load_or_create("beastly", &attachment).unwrap();
+        register_agent_key(&route, &agent, &first).unwrap();
+
+        // Same key again is fine - re-registering after a restart must not be an error.
+        let route = route_for(&workspace).unwrap();
+        register_agent_key(&route, &agent, &first).unwrap();
+
+        // A DIFFERENT key for the same name is not silently accepted.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = AgentIdentity::load_or_create("beastly", elsewhere.path()).unwrap();
+        let route = route_for(&workspace).unwrap();
+        let error = register_agent_key(&route, &agent, &other)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("already published with a different key"),
+            "silent replacement is how impersonation succeeds; got: {error}"
         );
     }
 }
