@@ -96,10 +96,31 @@ result     ->  "here it is, revised"
 review     ->  accepted
 ```
 
-Mark a job `requires_review` and finishing it is not the end — the result waits until
+Mark work `requires_review` and finishing it is not the end — the result waits until
 someone judges it. Sending it back returns it to the queue at the next revision with the
 reviewer's notes attached, so any worker can pick it up, not just the one that did it
 first.
+
+**And it all travels as files.** An order is a file, a claim is a file, a result is a
+file, a review is a file. Everything about one task lives in its own directory:
+
+```
+tasks/t-4f2a/
+  order.json                 written once, by whoever issued it
+  claim.grouchly.json        grouchly's claim; only grouchly writes it
+  result.grouchly.001.json   a result, at a revision
+  review.001.json            changes requested, with notes
+  result.grouchly.002.json   the revision
+  review.002.json            accepted
+```
+
+No path ever has two writers, which is the one rule a synced folder needs. So a worker at
+a friend's house or on a phone tether can be given work without anyone opening a port.
+
+Orders addressed to a machine have nothing to race over. Open ones — "whoever picks this
+up" — are settled by oldest claim, computed identically on every machine from the same
+files, so nobody has to be the authority. The loser finds out it lost and stops, having
+spent seconds rather than corrupted anything.
 
 Revisions are not failures. A job sent back five times has failed zero times and never
 exhausts its retries — retries are for crashes, revisions are for judgement. Every
@@ -111,6 +132,9 @@ be replayed against different work.
 - **A private channel per project**, carried by Syncthing, with durable outboxes,
   idempotent delivery, duplicate-safe claims and acknowledgement deadlines.
 - **Review and revision** — accept the work, or send it back with notes.
+- **Signed contributions.** Each agent has its own key, so every message and result
+  carries a fingerprint. On a team that means you can tell whose agent did what, not
+  merely which machine it came from.
 - **Shared memory** the fleet agrees on — proposed by agents, approved before it counts,
   so one confused agent cannot poison what everyone believes.
 - **An audit trail** of every decision, and encrypted continuity packs for recovery.
@@ -152,11 +176,10 @@ Honest about where this is:
 shared memory, the audit trail, continuity packs, and the container. All covered by the
 test suite.
 
-**Working, but young.** Portable message envelopes are not yet signed — read
-[communications readiness](docs/COMMUNICATIONS_READINESS.md) before trusting the channel
-with anything that would hurt to have forged. The job and worker half still requires
-network reachability between machines; moving it onto the same file-carried model is
-next.
+**Working, but young.** Messages, orders, results and reviews all travel as files and
+work across networks. The older HTTP job/worker protocol still exists alongside it for
+callers that want a server, and that half does still need machines to reach each other —
+see [communications readiness](docs/COMMUNICATIONS_READINESS.md).
 
 **Not built yet.** PostgreSQL, RBAC, workflow graphs and a dashboard are design targets,
 not implementations.

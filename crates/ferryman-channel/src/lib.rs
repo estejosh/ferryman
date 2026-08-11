@@ -553,6 +553,347 @@ fn acknowledgement_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
         .join(format!("{message_id}.json"))
 }
 
+/// Work carried as files, so it crosses networks the way messages already do.
+///
+/// The job/worker protocol over HTTP requires every worker to reach the orchestrator's
+/// machine. That is fine in one building and useless for a fleet spread across houses,
+/// which is the case Syncthing was chosen for. Here an order is a file, a claim is a
+/// file, a result is a file and a review is a file - so a laptop on cellular can be
+/// given work without anyone opening a port.
+///
+/// Everything about one task lives in its own directory:
+///
+/// ```text
+/// tasks/t-4f2a/
+///   order.json                 written once, by the orchestrator
+///   claim.grouchly.json        grouchly's claim; only grouchly writes it
+///   claim.nebra.json           nebra's claim; only nebra writes it
+///   result.grouchly.001.json   a result, at a revision
+///   review.001.json            accepted, or changes requested with notes
+/// ```
+///
+/// No path ever has two writers, which is the single rule that makes a synced folder
+/// safe. Conflicts are impossible by construction rather than unlikely in practice.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Order {
+    pub id: String,
+    pub project_id: String,
+    /// Who issued it.
+    pub issued_by: String,
+    /// The machine this is for, or `None` for "whoever picks it up first".
+    ///
+    /// An addressed order has NOTHING to race over: one agent is eligible, full stop.
+    /// Only open orders need the tie-break below, so the race applies to a minority of
+    /// cases rather than all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_to: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub payload: Value,
+    /// Whether the result must be reviewed before the task is done.
+    #[serde(default)]
+    pub requires_review: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// An agent staking a claim on an open order.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Claim {
+    pub order_id: String,
+    pub agent: String,
+    pub claimed_at: DateTime<Utc>,
+}
+
+/// A submitted result, at a revision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TaskResult {
+    pub order_id: String,
+    pub agent: String,
+    pub revision: u32,
+    pub submitted_at: DateTime<Utc>,
+    pub payload: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A verdict on a result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Review {
+    pub order_id: String,
+    pub revision: u32,
+    pub reviewer: String,
+    pub reviewed_at: DateTime<Utc>,
+    /// Accepted, or sent back.
+    pub accepted: bool,
+    /// Why it was sent back. Required when `accepted` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Where a task has got to, worked out by reading its directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskState {
+    /// Nobody has claimed it.
+    Open,
+    /// Claimed, being worked on.
+    Claimed { by: String },
+    /// A result is in, waiting on a reviewer.
+    AwaitingReview { by: String, revision: u32 },
+    /// Sent back; the next revision is owed.
+    ChangesRequested { revision: u32 },
+    /// Reviewed and kept.
+    Accepted,
+    /// Finished, with no review asked for.
+    Done,
+}
+
+/// Everything known about one task.
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub order: Order,
+    pub claims: Vec<Claim>,
+    pub results: Vec<TaskResult>,
+    pub reviews: Vec<Review>,
+}
+
+impl Task {
+    /// Who holds this task.
+    ///
+    /// An addressed order belongs to its assignee and nobody else. For an open order the
+    /// OLDEST claim wins - two machines can both claim in the seconds before Syncthing
+    /// tells each about the other, and a rule that every machine computes identically
+    /// from the same files resolves that without anyone having to be authoritative. The
+    /// loser discovers it lost and stops, having wasted seconds rather than corrupted
+    /// anything.
+    #[must_use]
+    pub fn holder(&self) -> Option<&str> {
+        if let Some(assignee) = &self.order.assigned_to {
+            return Some(assignee.as_str());
+        }
+        self.claims
+            .iter()
+            .min_by(|a, b| {
+                a.claimed_at
+                    .cmp(&b.claimed_at)
+                    // Identical timestamps are possible; agent name breaks the tie so
+                    // every machine reaches the same answer rather than each picking its
+                    // own favourite.
+                    .then_with(|| a.agent.cmp(&b.agent))
+            })
+            .map(|claim| claim.agent.as_str())
+    }
+
+    /// The highest revision anyone has submitted.
+    #[must_use]
+    pub fn latest_revision(&self) -> Option<u32> {
+        self.results.iter().map(|r| r.revision).max()
+    }
+
+    #[must_use]
+    pub fn state(&self) -> TaskState {
+        let Some(holder) = self.holder() else {
+            return TaskState::Open;
+        };
+        let Some(revision) = self.latest_revision() else {
+            return TaskState::Claimed {
+                by: holder.to_string(),
+            };
+        };
+        let verdict = self.reviews.iter().find(|r| r.revision == revision);
+        match verdict {
+            Some(review) if review.accepted => TaskState::Accepted,
+            Some(_) => TaskState::ChangesRequested {
+                revision: revision + 1,
+            },
+            None if self.order.requires_review => TaskState::AwaitingReview {
+                by: holder.to_string(),
+                revision,
+            },
+            None => TaskState::Done,
+        }
+    }
+}
+
+fn tasks_root(route: &ProjectRoute) -> PathBuf {
+    route.communications.join("tasks")
+}
+
+fn task_dir(route: &ProjectRoute, order_id: &str) -> PathBuf {
+    tasks_root(route).join(order_id)
+}
+
+/// Write a file nobody else writes, atomically.
+///
+/// Temp-then-rename because Syncthing may copy the directory at any instant, and a
+/// half-written order read by a peer is worse than no order at all.
+fn write_task_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// Issue an order into the channel.
+pub fn issue_order(route: &ProjectRoute, order: &Order) -> Result<PathBuf> {
+    if !is_safe_component(&order.id) {
+        bail!("order id must be a path-safe identifier")
+    }
+    let path = task_dir(route, &order.id).join("order.json");
+    if path.exists() {
+        bail!(
+            "order {} already exists; an order is written once",
+            order.id
+        )
+    }
+    write_task_file(&path, order)?;
+    Ok(path)
+}
+
+/// Stake a claim on an open order.
+///
+/// Each agent writes only its own claim file, so claiming can never collide. Whether the
+/// claim WINS is decided by reading the directory, not by writing it.
+pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<Claim> {
+    if !is_safe_component(agent) {
+        bail!("agent name must be a path-safe identifier")
+    }
+    let claim = Claim {
+        order_id: order_id.to_string(),
+        agent: agent.to_string(),
+        claimed_at: Utc::now(),
+    };
+    let path = task_dir(route, order_id).join(format!("claim.{agent}.json"));
+    // Re-claiming keeps the ORIGINAL timestamp: refreshing it would let a latecomer
+    // win a race it already lost by simply claiming again.
+    if !path.exists() {
+        write_task_file(&path, &claim)?;
+    }
+    Ok(claim)
+}
+
+/// Submit a result at a revision.
+pub fn submit_result(route: &ProjectRoute, result: &TaskResult) -> Result<PathBuf> {
+    if !is_safe_component(&result.agent) {
+        bail!("agent name must be a path-safe identifier")
+    }
+    let path = task_dir(route, &result.order_id).join(format!(
+        "result.{}.{:03}.json",
+        result.agent, result.revision
+    ));
+    write_task_file(&path, result)?;
+    Ok(path)
+}
+
+/// Record a verdict on a revision.
+pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
+    if !review.accepted
+        && review
+            .notes
+            .as_ref()
+            .is_none_or(|notes| notes.trim().is_empty())
+    {
+        bail!("sending work back requires notes saying what to change")
+    }
+    let path =
+        task_dir(route, &review.order_id).join(format!("review.{:03}.json", review.revision));
+    write_task_file(&path, review)?;
+    Ok(path)
+}
+
+/// Read one task by reading its directory.
+pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
+    let directory = task_dir(route, order_id);
+    let order: Order = serde_json::from_str(&fs::read_to_string(directory.join("order.json"))?)
+        .with_context(|| format!("order {order_id} is unreadable"))?;
+    let mut claims = Vec::new();
+    let mut results = Vec::new();
+    let mut reviews = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        // A single unreadable file must not hide the rest of the task.
+        if name.starts_with("claim.") {
+            if let Ok(value) = serde_json::from_str(&text) {
+                claims.push(value);
+            }
+        } else if name.starts_with("result.") {
+            if let Ok(value) = serde_json::from_str(&text) {
+                results.push(value);
+            }
+        } else if name.starts_with("review.") {
+            if let Ok(value) = serde_json::from_str(&text) {
+                reviews.push(value);
+            }
+        }
+    }
+    results.sort_by_key(|r: &TaskResult| r.revision);
+    reviews.sort_by_key(|r: &Review| r.revision);
+    Ok(Task {
+        order,
+        claims,
+        results,
+        reviews,
+    })
+}
+
+/// Every task in the channel.
+pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
+    let root = tasks_root(route);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut tasks = Vec::new();
+    for entry in fs::read_dir(&root)? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Ok(task) = read_task(route, id) {
+            tasks.push(task);
+        }
+    }
+    tasks.sort_by(|a, b| a.order.created_at.cmp(&b.order.created_at));
+    Ok(tasks)
+}
+
+/// Work this agent should pick up: addressed to it, or open and unclaimed by anyone
+/// ahead of it.
+pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
+    Ok(list_tasks(route)?
+        .into_iter()
+        .filter(|task| match task.state() {
+            TaskState::Open => task
+                .order
+                .assigned_to
+                .as_deref()
+                .is_none_or(|assignee| assignee == agent),
+            TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
+                task.holder() == Some(agent)
+            }
+            _ => false,
+        })
+        .collect())
+}
+
 /// An agent's signing key.
 ///
 /// One key per AGENT, not per machine. A machine may run several agents and the whole
@@ -4145,5 +4486,325 @@ mod identity_tests {
             error.contains("already published with a different key"),
             "silent replacement is how impersonation succeeds; got: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod work_over_files_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn channel() -> (tempfile::TempDir, ProjectRoute) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(communications.join("messages/demo")).unwrap();
+        fs::write(
+            attachment.join("bridge.toml"),
+            format!(
+                "project = \"demo\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\nshared_remote = \"demo-ferryman\"\ngit_remote = \"\"\ngit_visibility = \"private\"\n",
+                workspace.display(), attachment.display(), communications.display()
+            ),
+        )
+        .unwrap();
+        let route = route_for(&workspace).unwrap();
+        (temp, route)
+    }
+
+    fn order(id: &str, assigned_to: Option<&str>, requires_review: bool) -> Order {
+        Order {
+            id: id.into(),
+            project_id: "demo".into(),
+            issued_by: "beastly".into(),
+            assigned_to: assigned_to.map(ToString::to_string),
+            created_at: Utc::now(),
+            payload: json!({"task": "write the report"}),
+            requires_review,
+            signed_by: None,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn an_order_is_a_file_in_the_folder_syncthing_carries() {
+        let (_t, route) = channel();
+        let path = issue_order(&route, &order("t-1", None, false)).unwrap();
+        assert!(path.is_file());
+        assert!(
+            path.starts_with(&route.communications),
+            "work must ride the same synced folder as messages, or it cannot cross networks"
+        );
+    }
+
+    #[test]
+    fn an_order_is_written_once_and_never_rewritten() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        assert!(
+            issue_order(&route, &order("t-1", None, false)).is_err(),
+            "two writers on one path is the one thing a synced folder cannot survive"
+        );
+    }
+
+    #[test]
+    fn an_addressed_order_has_nothing_to_race_over() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        // Someone else claims it anyway. It changes nothing.
+        claim_order(&route, "t-1", "nebra").unwrap();
+        let task = read_task(&route, "t-1").unwrap();
+        assert_eq!(task.holder(), Some("grouchly"), "the assignee holds it");
+    }
+
+    #[test]
+    fn two_machines_claiming_at_once_resolve_to_the_same_winner_everywhere() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+
+        // Both claim before either has seen the other - exactly the sync-window race.
+        let early = Claim {
+            order_id: "t-1".into(),
+            agent: "grouchly".into(),
+            claimed_at: Utc::now() - chrono::Duration::seconds(3),
+        };
+        let late = Claim {
+            order_id: "t-1".into(),
+            agent: "nebra".into(),
+            claimed_at: Utc::now(),
+        };
+        write_task_file(&task_dir(&route, "t-1").join("claim.grouchly.json"), &early).unwrap();
+        write_task_file(&task_dir(&route, "t-1").join("claim.nebra.json"), &late).unwrap();
+
+        let task = read_task(&route, "t-1").unwrap();
+        assert_eq!(
+            task.holder(),
+            Some("grouchly"),
+            "oldest claim wins, and every machine computes that identically from the same files"
+        );
+    }
+
+    #[test]
+    fn a_tie_is_broken_the_same_way_on_every_machine() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        let at = Utc::now();
+        for agent in ["nebra", "grouchly"] {
+            write_task_file(
+                &task_dir(&route, "t-1").join(format!("claim.{agent}.json")),
+                &Claim {
+                    order_id: "t-1".into(),
+                    agent: agent.into(),
+                    claimed_at: at,
+                },
+            )
+            .unwrap();
+        }
+        let task = read_task(&route, "t-1").unwrap();
+        assert_eq!(
+            task.holder(),
+            Some("grouchly"),
+            "identical timestamps must not leave each machine picking its own favourite"
+        );
+    }
+
+    #[test]
+    fn re_claiming_does_not_let_a_latecomer_win_a_race_it_lost() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        write_task_file(
+            &task_dir(&route, "t-1").join("claim.grouchly.json"),
+            &Claim {
+                order_id: "t-1".into(),
+                agent: "grouchly".into(),
+                claimed_at: Utc::now() - chrono::Duration::seconds(10),
+            },
+        )
+        .unwrap();
+        claim_order(&route, "t-1", "nebra").unwrap();
+        // nebra claims again, later. Its original timestamp must stand.
+        claim_order(&route, "t-1", "nebra").unwrap();
+        let task = read_task(&route, "t-1").unwrap();
+        assert_eq!(task.holder(), Some("grouchly"));
+    }
+
+    #[test]
+    fn the_whole_review_cycle_is_just_more_files_in_one_directory() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), true)).unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::Claimed {
+                by: "grouchly".into()
+            }
+        );
+
+        submit_result(
+            &route,
+            &TaskResult {
+                order_id: "t-1".into(),
+                agent: "grouchly".into(),
+                revision: 1,
+                submitted_at: Utc::now(),
+                payload: json!({"draft": 1}),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::AwaitingReview {
+                by: "grouchly".into(),
+                revision: 1
+            }
+        );
+
+        submit_review(
+            &route,
+            &Review {
+                order_id: "t-1".into(),
+                revision: 1,
+                reviewer: "beastly".into(),
+                reviewed_at: Utc::now(),
+                accepted: false,
+                notes: Some("the summary contradicts the table".into()),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::ChangesRequested { revision: 2 }
+        );
+
+        submit_result(
+            &route,
+            &TaskResult {
+                order_id: "t-1".into(),
+                agent: "grouchly".into(),
+                revision: 2,
+                submitted_at: Utc::now(),
+                payload: json!({"draft": 2}),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        submit_review(
+            &route,
+            &Review {
+                order_id: "t-1".into(),
+                revision: 2,
+                reviewer: "beastly".into(),
+                reviewed_at: Utc::now(),
+                accepted: true,
+                notes: None,
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::Accepted
+        );
+    }
+
+    #[test]
+    fn work_without_review_is_done_when_the_result_lands() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        submit_result(
+            &route,
+            &TaskResult {
+                order_id: "t-1".into(),
+                agent: "grouchly".into(),
+                revision: 1,
+                submitted_at: Utc::now(),
+                payload: json!({"ok": true}),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(read_task(&route, "t-1").unwrap().state(), TaskState::Done);
+    }
+
+    #[test]
+    fn sending_work_back_without_notes_is_refused() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), true)).unwrap();
+        for notes in [None, Some(String::from("   "))] {
+            assert!(
+                submit_review(
+                    &route,
+                    &Review {
+                        order_id: "t-1".into(),
+                        revision: 1,
+                        reviewer: "beastly".into(),
+                        reviewed_at: Utc::now(),
+                        accepted: false,
+                        notes,
+                        signed_by: None,
+                        signature: None,
+                    }
+                )
+                .is_err(),
+                "a rejection with no reason is not actionable"
+            );
+        }
+    }
+
+    #[test]
+    fn an_agent_only_sees_work_that_is_actually_its_own() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-open", None, false)).unwrap();
+        issue_order(&route, &order("t-mine", Some("grouchly"), false)).unwrap();
+        issue_order(&route, &order("t-theirs", Some("nebra"), false)).unwrap();
+
+        let mine: Vec<_> = work_for(&route, "grouchly")
+            .unwrap()
+            .into_iter()
+            .map(|t| t.order.id)
+            .collect();
+        assert!(
+            mine.contains(&"t-open".to_string()),
+            "open work is available to anyone"
+        );
+        assert!(mine.contains(&"t-mine".to_string()));
+        assert!(
+            !mine.contains(&"t-theirs".to_string()),
+            "work addressed to another machine is not on offer"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_file_does_not_hide_the_rest_of_the_task() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        fs::write(
+            task_dir(&route, "t-1").join("claim.broken.json"),
+            "{ not json",
+        )
+        .unwrap();
+        let task = read_task(&route, "t-1").unwrap();
+        assert_eq!(
+            task.holder(),
+            Some("grouchly"),
+            "one bad file must not stall the task"
+        );
+    }
+
+    #[test]
+    fn an_order_id_cannot_escape_the_tasks_directory() {
+        let (_t, route) = channel();
+        for bad in ["../escape", "..", "with/slash"] {
+            assert!(
+                issue_order(&route, &order(bad, None, false)).is_err(),
+                "'{bad}' must be refused"
+            );
+        }
     }
 }

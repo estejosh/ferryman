@@ -212,6 +212,65 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Issue work into the channel. Addressed to a machine, or open to anyone.
+    Order {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Task id, e.g. t-4f2a.
+        #[arg(long)]
+        id: String,
+        /// The machine to do it. Omit for "whoever picks it up first".
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        task: String,
+        /// Hold the result for review before the task counts as done.
+        #[arg(long)]
+        requires_review: bool,
+    },
+    /// Work this agent can pick up.
+    Work {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+    },
+    /// Stake a claim on an open order.
+    Claim {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+        id: String,
+    },
+    /// Submit a result for an order.
+    Submit {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        result: String,
+        id: String,
+    },
+    /// Accept a result, or send it back with notes.
+    Review {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value = "orchestrator")]
+        reviewer: String,
+        /// Keep it. Without this, the work is sent back and --notes is required.
+        #[arg(long)]
+        accept: bool,
+        #[arg(long)]
+        notes: Option<String>,
+        id: String,
+    },
+    /// Every task and where it has got to.
+    Tasks {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
     /// Every message in the channel, oldest first.
     Log {
         #[arg(long)]
@@ -1141,6 +1200,167 @@ fn channel(command: Channel) -> Result<()> {
                 })
                 .collect();
             println!("{}", serde_json::to_string_pretty(&mine)?);
+        }
+
+        Channel::Order {
+            workspace,
+            id,
+            to,
+            task,
+            requires_review,
+        } => {
+            let route = here(workspace)?;
+            let issuer = default_agent_name();
+            let payload = if task.trim_start().starts_with('{') {
+                serde_json::from_str(&task).context("--task looked like JSON but did not parse")?
+            } else {
+                json!({ "task": task })
+            };
+            let mut order = ferryman_channel::Order {
+                id: id.clone(),
+                project_id: route.project_id.clone(),
+                issued_by: issuer.clone(),
+                assigned_to: to,
+                created_at: chrono::Utc::now(),
+                payload,
+                requires_review,
+                signed_by: None,
+                signature: None,
+            };
+            if let Ok(identity) =
+                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)
+            {
+                order.signed_by = Some(issuer.clone());
+                let _ = &identity;
+            }
+            let path = ferryman_channel::issue_order(&route, &order)?;
+            println!("issued {id} -> {}", path.display());
+            match order.assigned_to {
+                Some(ref who) => println!("  addressed to {who}: nothing to race over"),
+                None => println!("  open: whichever agent claims first wins"),
+            }
+        }
+
+        Channel::Work { workspace, agent } => {
+            let route = here(workspace)?;
+            let agent = agent.unwrap_or_else(default_agent_name);
+            let work = ferryman_channel::work_for(&route, &agent)?;
+            if work.is_empty() {
+                println!("nothing for {agent} right now");
+            }
+            for task in work {
+                println!(
+                    "  {:<12} {:<28} {:?}",
+                    task.order.id,
+                    task.order
+                        .payload
+                        .get("task")
+                        .and_then(Value::as_str)
+                        .unwrap_or("(structured)"),
+                    task.state()
+                );
+            }
+        }
+
+        Channel::Claim {
+            workspace,
+            agent,
+            id,
+        } => {
+            let route = here(workspace)?;
+            let agent = agent.unwrap_or_else(default_agent_name);
+            ferryman_channel::claim_order(&route, &id, &agent)?;
+            let task = ferryman_channel::read_task(&route, &id)?;
+            match task.holder() {
+                Some(holder) if holder == agent => println!("{agent} holds {id}"),
+                Some(holder) => println!(
+                    "{holder} holds {id} - claimed first. Backing off costs seconds, not correctness."
+                ),
+                None => println!("claim recorded; no holder yet"),
+            }
+        }
+
+        Channel::Submit {
+            workspace,
+            agent,
+            result,
+            id,
+        } => {
+            let route = here(workspace)?;
+            let agent = agent.unwrap_or_else(default_agent_name);
+            let task = ferryman_channel::read_task(&route, &id)?;
+            let revision = task.latest_revision().unwrap_or(0) + 1;
+            let payload = if result.trim_start().starts_with('{') {
+                serde_json::from_str(&result)
+                    .context("--result looked like JSON but did not parse")?
+            } else {
+                json!({ "text": result })
+            };
+            let path = ferryman_channel::submit_result(
+                &route,
+                &ferryman_channel::TaskResult {
+                    order_id: id.clone(),
+                    agent: agent.clone(),
+                    revision,
+                    submitted_at: chrono::Utc::now(),
+                    payload,
+                    signed_by: Some(agent.clone()),
+                    signature: None,
+                },
+            )?;
+            println!(
+                "submitted revision {revision} of {id} -> {}",
+                path.display()
+            );
+        }
+
+        Channel::Review {
+            workspace,
+            reviewer,
+            accept,
+            notes,
+            id,
+        } => {
+            let route = here(workspace)?;
+            let task = ferryman_channel::read_task(&route, &id)?;
+            let revision = task
+                .latest_revision()
+                .context("there is no result to review yet")?;
+            ferryman_channel::submit_review(
+                &route,
+                &ferryman_channel::Review {
+                    order_id: id.clone(),
+                    revision,
+                    reviewer: reviewer.clone(),
+                    reviewed_at: chrono::Utc::now(),
+                    accepted: accept,
+                    notes: notes.clone(),
+                    signed_by: Some(reviewer),
+                    signature: None,
+                },
+            )?;
+            if accept {
+                println!("accepted revision {revision} of {id}");
+            } else {
+                println!("sent {id} back for revision {}", revision + 1);
+                println!("  {}", notes.unwrap_or_default());
+            }
+        }
+
+        Channel::Tasks { workspace } => {
+            let route = here(workspace)?;
+            let tasks = ferryman_channel::list_tasks(&route)?;
+            if tasks.is_empty() {
+                println!("no tasks yet");
+            }
+            for task in tasks {
+                println!(
+                    "  {:<12} {:<14} {:?}",
+                    task.order.id,
+                    task.holder().unwrap_or("-"),
+                    task.state()
+                );
+            }
         }
 
         Channel::Log { workspace, limit } => {
