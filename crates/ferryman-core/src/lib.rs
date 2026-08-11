@@ -31,7 +31,11 @@ pub enum JobStatus {
     PendingApproval,
     Queued,
     Leased,
+    /// The worker finished. For a job with `requires_review` this is not the end: it is
+    /// waiting for the orchestrator to accept it or send it back.
     Succeeded,
+    /// Reviewed and kept. Terminal, and only reachable for a job with `requires_review`.
+    Accepted,
     Failed,
     Cancelled,
 }
@@ -153,6 +157,13 @@ pub struct Job {
     pub input: Value,
     pub policy: PolicyEnvelope,
     pub requires_approval: bool,
+    /// When set, finishing the work is not the end: the result waits in `Succeeded`
+    /// until it is accepted or sent back with notes.
+    pub requires_review: bool,
+    /// Increments each time the work is sent back. Revision 0 is the first attempt.
+    pub revision: u32,
+    /// Why the last reviewer sent it back. Cleared when the result is accepted.
+    pub review_notes: Option<String>,
     pub attempts: u32,
     pub max_attempts: u32,
     pub result: Option<Value>,
@@ -204,6 +215,9 @@ pub struct NewJob {
     pub requires_approval: bool,
     pub max_attempts: u32,
     pub idempotency_key: Option<String>,
+    /// When set, the orchestrator reviews the result before the job is done: it either
+    /// accepts it, or sends it back with notes for another revision.
+    pub requires_review: bool,
     /// Only meaningful when `requires_approval` is set. `None` uses
     /// `DEFAULT_APPROVAL_TTL_SECONDS`. After this window an approve/deny gate command
     /// against the job is refused as stale.
@@ -229,7 +243,7 @@ impl SqliteStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch("PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, workspace_path TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), idempotency_key TEXT, status TEXT NOT NULL, input_json TEXT NOT NULL, policy_json TEXT NOT NULL, requires_approval INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, available_at TEXT NOT NULL, lease_id TEXT, lease_expires_at TEXT, worker_id TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, approval_expires_at TEXT, UNIQUE(project_id, idempotency_key));
+CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), idempotency_key TEXT, status TEXT NOT NULL, input_json TEXT NOT NULL, policy_json TEXT NOT NULL, requires_approval INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, max_attempts INTEGER NOT NULL, available_at TEXT NOT NULL, lease_id TEXT, lease_expires_at TEXT, worker_id TEXT, result_json TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, approval_expires_at TEXT, requires_review INTEGER NOT NULL DEFAULT 0, revision INTEGER NOT NULL DEFAULT 0, review_notes TEXT, UNIQUE(project_id, idempotency_key));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL REFERENCES projects(id), job_id TEXT, kind TEXT NOT NULL, payload_json TEXT NOT NULL, occurred_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS events_project_job_idx ON events(project_id, job_id, id);
 CREATE TABLE IF NOT EXISTS workers (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), capabilities_json TEXT NOT NULL, last_heartbeat TEXT NOT NULL, token_hash TEXT NOT NULL DEFAULT '', token_expires_at TEXT);
@@ -281,6 +295,15 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         );
         let _ = conn.execute("ALTER TABLE workers ADD COLUMN token_expires_at TEXT", []);
         let _ = conn.execute("ALTER TABLE jobs ADD COLUMN approval_expires_at TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE jobs ADD COLUMN requires_review INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE jobs ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE jobs ADD COLUMN review_notes TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -595,6 +618,9 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
             input: new.input,
             policy: new.policy,
             requires_approval: new.requires_approval,
+            requires_review: new.requires_review,
+            revision: 0,
+            review_notes: None,
             attempts: 0,
             max_attempts: new.max_attempts.max(1),
             result: None,
@@ -603,7 +629,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         };
         let mut db = self.db()?;
         let tx = db.transaction()?;
-        tx.execute("INSERT INTO jobs (id,project_id,idempotency_key,status,input_json,policy_json,requires_approval,attempts,max_attempts,available_at,created_at,updated_at,approval_expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?9,?9,?10)", params![job.id, project_id, new.idempotency_key, status_text(&status), serde_json::to_string(&job.input)?, serde_json::to_string(&job.policy)?, i64::from(job.requires_approval), i64::from(job.max_attempts), now, approval_expires_at])?;
+        tx.execute("INSERT INTO jobs (id,project_id,idempotency_key,status,input_json,policy_json,requires_approval,attempts,max_attempts,available_at,created_at,updated_at,approval_expires_at,requires_review,revision) VALUES (?1,?2,?3,?4,?5,?6,?7,0,?8,?9,?9,?9,?10,?11,0)", params![job.id, project_id, new.idempotency_key, status_text(&status), serde_json::to_string(&job.input)?, serde_json::to_string(&job.policy)?, i64::from(job.requires_approval), i64::from(job.max_attempts), now, approval_expires_at, i64::from(job.requires_review)])?;
         append_event(
             &tx,
             project_id,
@@ -618,7 +644,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         let db = self.db()?;
         read_job(
             &db,
-            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs WHERE project_id=?1 AND id=?2",
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at,requires_review,revision,review_notes FROM jobs WHERE project_id=?1 AND id=?2",
             params![project_id, job_id],
         )
     }
@@ -630,7 +656,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         status: Option<&JobStatus>,
     ) -> Result<Vec<Job>> {
         let db = self.db()?;
-        let mut query = "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs WHERE project_id=?1".to_string();
+        let mut query = "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at,requires_review,revision,review_notes FROM jobs WHERE project_id=?1".to_string();
         if cursor.is_some() {
             query.push_str(" AND id > ?2");
         }
@@ -701,7 +727,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         let db = self.db()?;
         read_job(
             &db,
-            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs WHERE id=?1",
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at,requires_review,revision,review_notes FROM jobs WHERE id=?1",
             params![job_id],
         )
     }
@@ -710,7 +736,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
     pub fn jobs_pending_telegram_notification(&self) -> Result<Vec<Job>> {
         let db = self.db()?;
         let mut statement = db.prepare(
-            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at,requires_review,revision,review_notes FROM jobs
              WHERE status='pending_approval'
              AND id NOT IN (SELECT job_id FROM events WHERE kind='telegram.notified' AND job_id IS NOT NULL)
              ORDER BY created_at",
@@ -787,6 +813,126 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
     pub fn mark_telegram_notified(&self, project_id: &str, job_id: &str) -> Result<()> {
         self.append_worker_event(project_id, job_id, "telegram.notified", json!({}))
     }
+    /// Jobs whose work is finished and waiting on a reviewer. This is the orchestrator's
+    /// queue: everything here has a result to look at.
+    pub fn jobs_awaiting_review(&self, project_id: &str) -> Result<Vec<Job>> {
+        let db = self.db()?;
+        let mut statement = db.prepare(
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at,requires_review,revision,review_notes FROM jobs
+             WHERE project_id=?1 AND status='succeeded' AND requires_review=1
+             ORDER BY updated_at",
+        )?;
+        let rows = statement.query_map(params![project_id], job_from_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Keeps the result. Terminal.
+    ///
+    /// Only a job that is `succeeded` AND was submitted with `requires_review` can be
+    /// accepted; anything else is a no-op, so a duplicate accept cannot re-fire the
+    /// event or resurrect a job that has moved on.
+    pub fn accept_result(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        reviewer: &str,
+    ) -> Result<Option<Job>> {
+        let Some(current) = self.get_job(project_id, job_id)? else {
+            return Ok(None);
+        };
+        if current.status != JobStatus::Succeeded || !current.requires_review {
+            return Ok(None);
+        }
+        let result_hash = current.result.as_ref().map(sha256_json);
+        let now = now();
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let changed = tx.execute(
+            "UPDATE jobs SET status='accepted',review_notes=NULL,updated_at=?3 WHERE project_id=?1 AND id=?2 AND status='succeeded' AND requires_review=1",
+            params![project_id, job_id, now],
+        )?;
+        if changed > 0 {
+            append_event(
+                &tx,
+                project_id,
+                Some(job_id),
+                "job.result_accepted",
+                json!({
+                    "reviewer": reviewer,
+                    "revision": current.revision,
+                    "result_hash": result_hash,
+                }),
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+        if changed > 0 {
+            self.get_job(project_id, job_id)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Sends the work back for another go, with the reviewer's notes attached.
+    ///
+    /// The job returns to `queued` at the next revision, so any worker can pick it up
+    /// again - the same one is not required, and nothing is held open waiting for it.
+    /// The previous result stays on the job until a new one replaces it, so the worker
+    /// can see what was rejected.
+    ///
+    /// `attempts` is deliberately NOT incremented: attempts count crashes and retries,
+    /// and a revision is neither. A job sent back five times has failed zero times.
+    pub fn request_changes(
+        &self,
+        project_id: &str,
+        job_id: &str,
+        reviewer: &str,
+        notes: &str,
+    ) -> Result<Option<Job>> {
+        if notes.trim().is_empty() {
+            return Err(anyhow!(
+                "changes must come with notes explaining what to change"
+            ));
+        }
+        let Some(current) = self.get_job(project_id, job_id)? else {
+            return Ok(None);
+        };
+        if current.status != JobStatus::Succeeded || !current.requires_review {
+            return Ok(None);
+        }
+        let rejected_hash = current.result.as_ref().map(sha256_json);
+        let now = now();
+        let next_revision = i64::from(current.revision) + 1;
+        let mut db = self.db()?;
+        let tx = db.transaction()?;
+        let changed = tx.execute(
+            "UPDATE jobs SET status='queued',revision=?4,review_notes=?5,available_at=?3,lease_id=NULL,lease_expires_at=NULL,updated_at=?3 WHERE project_id=?1 AND id=?2 AND status='succeeded' AND requires_review=1",
+            params![project_id, job_id, now, next_revision, notes],
+        )?;
+        if changed > 0 {
+            append_event(
+                &tx,
+                project_id,
+                Some(job_id),
+                "job.changes_requested",
+                json!({
+                    "reviewer": reviewer,
+                    "notes": notes,
+                    "revision": next_revision,
+                    "rejected_result_hash": rejected_hash,
+                }),
+            )?;
+        }
+        tx.commit()?;
+        drop(db);
+        if changed > 0 {
+            self.get_job(project_id, job_id)
+        } else {
+            Ok(None)
+        }
+    }
+
     fn transition(
         &self,
         project_id: &str,
@@ -1040,7 +1186,10 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         let Some(current) = current else {
             return Ok(None);
         };
-        if current.status == JobStatus::Succeeded {
+        // A repeat completion of an already-finished job is idempotent. A job that was
+        // sent back for changes is 'queued', not 'succeeded', so this does not block the
+        // revised result from being submitted.
+        if matches!(current.status, JobStatus::Succeeded | JobStatus::Accepted) {
             return Ok(Some(current));
         }
         let mut db = self.db()?;
@@ -1072,7 +1221,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         tx.commit()?;
         drop(db);
         if changed > 0 {
-            if status == "succeeded" {
+            if status == "succeeded" && !current.requires_review {
                 let _ = self.propose_memory(project_id, Some(job_id), "job_completion", &format!("Job {job_id} completed successfully. Review its result and artifacts for durable project facts."), "bridge.flight_recorder");
             }
             self.get_job(project_id, job_id)
@@ -1231,7 +1380,7 @@ CREATE TABLE IF NOT EXISTS memory_candidates (id TEXT PRIMARY KEY, project_id TE
         let db = self.db()?;
         read_job(
             &db,
-            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
+            "SELECT id,project_id,status,input_json,policy_json,requires_approval,attempts,max_attempts,result_json,created_at,updated_at,requires_review,revision,review_notes FROM jobs WHERE project_id=?1 AND idempotency_key=?2",
             params![project_id, key],
         )
     }
@@ -1386,6 +1535,7 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         "queued" => JobStatus::Queued,
         "leased" => JobStatus::Leased,
         "succeeded" => JobStatus::Succeeded,
+        "accepted" => JobStatus::Accepted,
         "failed" => JobStatus::Failed,
         "cancelled" => JobStatus::Cancelled,
         _ => {
@@ -1403,6 +1553,9 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         input: serde_json::from_str(&row.get::<_, String>(3)?).unwrap_or(json!({})),
         policy: serde_json::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
         requires_approval: row.get::<_, i64>(5)? != 0,
+        requires_review: row.get::<_, i64>(11).unwrap_or(0) != 0,
+        revision: row.get::<_, i64>(12).unwrap_or(0) as u32,
+        review_notes: row.get::<_, Option<String>>(13).unwrap_or(None),
         attempts: row.get::<_, i64>(6)? as u32,
         max_attempts: row.get::<_, i64>(7)? as u32,
         result: row
@@ -1520,6 +1673,7 @@ fn status_text(status: &JobStatus) -> &'static str {
         JobStatus::Queued => "queued",
         JobStatus::Leased => "leased",
         JobStatus::Succeeded => "succeeded",
+        JobStatus::Accepted => "accepted",
         JobStatus::Failed => "failed",
         JobStatus::Cancelled => "cancelled",
     }
@@ -1714,6 +1868,7 @@ mod telegram_gate_tests {
                     requires_approval: true,
                     max_attempts: 1,
                     idempotency_key: None,
+                    requires_review: false,
                     approval_ttl_seconds,
                 },
             )
@@ -1814,6 +1969,7 @@ mod telegram_gate_tests {
                     requires_approval: false,
                     max_attempts: 1,
                     idempotency_key: None,
+                    requires_review: false,
                     approval_ttl_seconds: None,
                 },
             )
@@ -1823,6 +1979,235 @@ mod telegram_gate_tests {
                 .jobs_pending_telegram_notification()
                 .unwrap()
                 .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod review_loop_tests {
+    use super::*;
+
+    fn store() -> SqliteStore {
+        let dir = std::env::temp_dir().join(format!("ferryman-review-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = SqliteStore::open(dir.join("bridge.db")).unwrap();
+        store.create_project("p", "Project", "token", "").unwrap();
+        store
+    }
+
+    fn reviewed_job(store: &SqliteStore) -> Job {
+        store
+            .submit_job(
+                "p",
+                NewJob {
+                    input: json!({"task": "write the report"}),
+                    policy: PolicyEnvelope::default(),
+                    requires_approval: false,
+                    max_attempts: 3,
+                    idempotency_key: None,
+                    requires_review: true,
+                    approval_ttl_seconds: None,
+                },
+            )
+            .unwrap()
+    }
+
+    /// Lease and finish a job, returning it in whatever state completion left it.
+    fn work(store: &SqliteStore, worker: &str, result: Value) -> Job {
+        let lease = store
+            .lease("p", worker, 60)
+            .unwrap()
+            .expect("a job to lease");
+        store
+            .complete("p", &lease.job.id, &lease.lease_id, result, false)
+            .unwrap()
+            .expect("completion to land")
+    }
+
+    #[test]
+    fn finished_work_waits_for_a_reviewer_instead_of_being_done() {
+        let store = store();
+        let job = reviewed_job(&store);
+        let done = work(&store, "worker-1", json!({"draft": 1}));
+        assert_eq!(done.status, JobStatus::Succeeded, "not terminal yet");
+        assert_eq!(store.jobs_awaiting_review("p").unwrap().len(), 1);
+        assert_eq!(store.jobs_awaiting_review("p").unwrap()[0].id, job.id);
+    }
+
+    #[test]
+    fn a_job_without_review_is_untouched_by_any_of_this() {
+        let store = store();
+        store
+            .submit_job(
+                "p",
+                NewJob {
+                    input: json!({}),
+                    policy: PolicyEnvelope::default(),
+                    requires_approval: false,
+                    max_attempts: 1,
+                    idempotency_key: None,
+                    requires_review: false,
+                    approval_ttl_seconds: None,
+                },
+            )
+            .unwrap();
+        let done = work(&store, "worker-1", json!({"ok": true}));
+        assert_eq!(done.status, JobStatus::Succeeded);
+        assert!(
+            store.jobs_awaiting_review("p").unwrap().is_empty(),
+            "a job that asked for no review must never appear in the review queue"
+        );
+    }
+
+    #[test]
+    fn accepting_is_terminal_and_records_what_was_accepted() {
+        let store = store();
+        let job = reviewed_job(&store);
+        let done = work(&store, "worker-1", json!({"draft": 1}));
+        let accepted = store.accept_result("p", &job.id, "shin").unwrap().unwrap();
+        assert_eq!(accepted.status, JobStatus::Accepted);
+        assert!(store.jobs_awaiting_review("p").unwrap().is_empty());
+
+        let events = store
+            .timeline("p", 0, 50, Some(&job.id), Some("job.result_accepted"))
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["reviewer"], json!("shin"));
+        assert_eq!(
+            events[0].payload["result_hash"],
+            json!(sha256_json(&done.result.unwrap())),
+            "the event must bind to the exact result that was accepted"
+        );
+    }
+
+    #[test]
+    fn requesting_changes_sends_the_work_back_with_the_notes() {
+        let store = store();
+        let job = reviewed_job(&store);
+        work(&store, "worker-1", json!({"draft": 1}));
+
+        let returned = store
+            .request_changes("p", &job.id, "shin", "the summary contradicts the table")
+            .unwrap()
+            .unwrap();
+        assert_eq!(returned.status, JobStatus::Queued, "back in the queue");
+        assert_eq!(returned.revision, 1);
+        assert_eq!(
+            returned.review_notes.as_deref(),
+            Some("the summary contradicts the table")
+        );
+        assert!(
+            store.jobs_awaiting_review("p").unwrap().is_empty(),
+            "it is no longer awaiting review; it is being redone"
+        );
+    }
+
+    #[test]
+    fn a_returned_job_can_be_leased_again_and_resubmitted() {
+        let store = store();
+        let job = reviewed_job(&store);
+        work(&store, "worker-1", json!({"draft": 1}));
+        store
+            .request_changes("p", &job.id, "shin", "fix the summary")
+            .unwrap()
+            .unwrap();
+
+        // Any worker may pick it up - the loop does not depend on the original one.
+        let second = work(&store, "worker-2", json!({"draft": 2}));
+        assert_eq!(second.status, JobStatus::Succeeded);
+        assert_eq!(second.result, Some(json!({"draft": 2})));
+        assert_eq!(second.revision, 1);
+        assert_eq!(store.jobs_awaiting_review("p").unwrap().len(), 1);
+
+        let accepted = store.accept_result("p", &job.id, "shin").unwrap().unwrap();
+        assert_eq!(accepted.status, JobStatus::Accepted);
+        assert_eq!(accepted.review_notes, None, "notes clear once accepted");
+    }
+
+    #[test]
+    fn revisions_are_not_failures_and_do_not_burn_attempts() {
+        let store = store();
+        let job = reviewed_job(&store);
+        for round in 1..=3 {
+            work(&store, "worker-1", json!({ "draft": round }));
+            store
+                .request_changes("p", &job.id, "shin", "still not right")
+                .unwrap()
+                .unwrap();
+        }
+        let current = store.get_job("p", &job.id).unwrap().unwrap();
+        assert_eq!(current.revision, 3);
+        assert_eq!(
+            current.attempts, 3,
+            "attempts counts work done, and each revision is real work"
+        );
+        assert!(
+            current.attempts <= current.max_attempts,
+            "a job sent back three times has failed zero times and must not be exhausted"
+        );
+        assert_eq!(current.status, JobStatus::Queued, "still workable");
+    }
+
+    #[test]
+    fn changes_cannot_be_requested_without_saying_what_to_change() {
+        let store = store();
+        let job = reviewed_job(&store);
+        work(&store, "worker-1", json!({"draft": 1}));
+        assert!(store.request_changes("p", &job.id, "shin", "   ").is_err());
+        assert!(store.request_changes("p", &job.id, "shin", "").is_err());
+        let untouched = store.get_job("p", &job.id).unwrap().unwrap();
+        assert_eq!(untouched.status, JobStatus::Succeeded);
+        assert_eq!(untouched.revision, 0);
+    }
+
+    #[test]
+    fn reviewing_twice_is_a_no_op_rather_than_a_second_verdict() {
+        let store = store();
+        let job = reviewed_job(&store);
+        work(&store, "worker-1", json!({"draft": 1}));
+
+        assert!(store.accept_result("p", &job.id, "shin").unwrap().is_some());
+        assert!(
+            store.accept_result("p", &job.id, "shin").unwrap().is_none(),
+            "a repeated accept must not re-fire"
+        );
+        assert!(
+            store
+                .request_changes("p", &job.id, "shin", "actually no")
+                .unwrap()
+                .is_none(),
+            "accepted work cannot be reopened by asking for changes"
+        );
+        let events = store
+            .timeline("p", 0, 50, Some(&job.id), Some("job.result_accepted"))
+            .unwrap();
+        assert_eq!(events.len(), 1, "exactly one acceptance on the record");
+    }
+
+    #[test]
+    fn work_still_in_progress_cannot_be_reviewed() {
+        let store = store();
+        let job = reviewed_job(&store);
+        // Leased but not finished: there is no result to judge.
+        store.lease("p", "worker-1", 60).unwrap().unwrap();
+        assert!(store.accept_result("p", &job.id, "shin").unwrap().is_none());
+        assert!(
+            store
+                .request_changes("p", &job.id, "shin", "too slow")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn an_unknown_job_id_is_simply_not_found() {
+        let store = store();
+        assert!(store.accept_result("p", "nope", "shin").unwrap().is_none());
+        assert!(
+            store
+                .request_changes("p", "nope", "shin", "notes")
+                .unwrap()
+                .is_none()
         );
     }
 }

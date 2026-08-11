@@ -9,25 +9,60 @@
 # syncs these folders: two live sync engines on one folder produce conflict loops.
 
 # ---------------------------------------------------------------- build
-FROM docker.io/library/rust:1.90-bookworm AS build
+# --platform=$BUILDPLATFORM pins this stage to the machine doing the building, then we
+# CROSS-COMPILE to $TARGETARCH. The alternative - letting the builder emulate the target
+# - once took six and a half hours for arm64 and published nothing, because emulated
+# Rust compilation is roughly 10-20x slower. Cross-compiling takes minutes.
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.90-bookworm AS build
+ARG TARGETARCH
+ARG BUILDARCH
+
 # The keyring crate reads secrets from the OS credential store; on Linux that is the
-# D-Bus Secret Service, so the build needs its headers. Without these the build fails in
-# libdbus-sys, which is why the previous Dockerfile could never have produced an image.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libdbus-1-dev pkg-config \
- && rm -rf /var/lib/apt/lists/*
+# D-Bus Secret Service, so libdbus headers are needed - and when cross-compiling they
+# are needed for the TARGET architecture, not the builder's. dpkg's foreign-architecture
+# support provides exactly that.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) rust_target=x86_64-unknown-linux-gnu;  deb_arch=amd64; cross_pkgs="" ;; \
+      arm64) rust_target=aarch64-unknown-linux-gnu; deb_arch=arm64; cross_pkgs="gcc-aarch64-linux-gnu g++-aarch64-linux-gnu" ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "$rust_target" > /rust-target; \
+    dpkg --add-architecture "$deb_arch"; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends pkg-config $cross_pkgs "libdbus-1-dev:$deb_arch"; \
+    rm -rf /var/lib/apt/lists/*; \
+    rustup target add "$rust_target"
+
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
-RUN cargo build --release -p ferryman-server -p ferryman-cli
+
+# rusqlite bundles SQLite, so the C compiler must target the same architecture as Rust.
+RUN set -eux; \
+    rust_target="$(cat /rust-target)"; \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
+      export CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc; \
+      export CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++; \
+      export PKG_CONFIG_ALLOW_CROSS=1; \
+      export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig; \
+      export PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig; \
+    fi; \
+    cargo build --release --target "$rust_target" -p ferryman-server -p ferryman-cli; \
+    mkdir -p /out; \
+    cp "target/$rust_target/release/ferryman-server" /out/; \
+    cp "target/$rust_target/release/ferry" /out/
 
 # ------------------------------------------------- vendor Syncthing (MPL-2.0)
 # The stock upstream binary, unmodified, run as a subprocess and configured over its REST
 # API. Ferryman never patches Syncthing source: modifying an MPL-2.0 file would oblige us
 # to publish that file's changes. Wrap, don't fork.
-FROM docker.io/library/debian:bookworm-slim AS syncthing
+# Runs on the builder and fetches the TARGET architecture's Syncthing release, so no
+# emulation is needed here either.
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:bookworm-slim AS syncthing
 ARG SYNCTHING_VERSION=2.1.2
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl \
  && rm -rf /var/lib/apt/lists/*
@@ -77,8 +112,8 @@ RUN apt-get update \
 # Fixed non-root uid so the host can chown the channel directory to match.
 RUN useradd --uid 10001 --system --create-home --shell /usr/sbin/nologin ferryman
 
-COPY --from=build      /src/target/release/ferryman-server /usr/local/bin/
-COPY --from=build      /src/target/release/ferry           /usr/local/bin/
+COPY --from=build      /out/ferryman-server /usr/local/bin/
+COPY --from=build      /out/ferry           /usr/local/bin/
 COPY --from=syncthing  /usr/local/bin/syncthing            /usr/local/bin/
 COPY --from=syncthing  /usr/share/licenses/syncthing/      /usr/share/licenses/syncthing/
 COPY THIRD_PARTY.md    /usr/share/licenses/THIRD_PARTY.md

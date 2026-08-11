@@ -48,18 +48,17 @@ jobs:
             type=sha,format=short
             type=raw,value=latest,enable={{is_default_branch}}
 
-      # amd64 only, deliberately. Adding linux/arm64 here builds it under QEMU
-      # emulation, and emulated Rust compilation is roughly 10-20x slower: the first
-      # attempt at this ran for over six hours on the Build step alone before being
-      # cancelled, without ever publishing anything. ARM support wants either native
-      # arm64 runners or a proper cross-compilation toolchain, not emulation.
+      # Both architectures, built by CROSS-COMPILING on the amd64 runner - see the
+      # build stage in the Containerfile. Emulating arm64 instead once ran for over six
+      # hours and published nothing, so do not reintroduce a QEMU setup step here.
+      # arm64 matters: every Mac since 2020 is Apple Silicon.
       - name: Build and push
         uses: docker/build-push-action@v6
         timeout-minutes: 45
         with:
           context: .
           file: ./Containerfile
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

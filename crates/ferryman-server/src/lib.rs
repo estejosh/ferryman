@@ -248,6 +248,18 @@ pub fn app(state: AppState) -> Router {
             post(cancel_job),
         )
         .route(
+            "/v1/projects/{project_id}/jobs/awaiting-review",
+            get(jobs_awaiting_review),
+        )
+        .route(
+            "/v1/projects/{project_id}/jobs/{job_id}/accept",
+            post(accept_result),
+        )
+        .route(
+            "/v1/projects/{project_id}/jobs/{job_id}/request-changes",
+            post(request_changes),
+        )
+        .route(
             "/v1/projects/{project_id}/jobs/{job_id}/events",
             get(job_events),
         )
@@ -321,6 +333,9 @@ impl ApiError {
     }
     fn conflict(message: impl Into<String>) -> Self {
         Self(StatusCode::CONFLICT, "conflict", message.into())
+    }
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, "bad_request", message.into())
     }
     fn internal(error: anyhow::Error) -> Self {
         Self(
@@ -1612,6 +1627,9 @@ struct SubmitJob {
     idempotency_key: Option<String>,
     #[serde(default)]
     approval_ttl_seconds: Option<i64>,
+    /// When true the result is not final until a reviewer accepts it.
+    #[serde(default)]
+    requires_review: bool,
 }
 fn default_attempts() -> u32 {
     3
@@ -1634,6 +1652,7 @@ async fn submit_job(
                 max_attempts: input.max_attempts,
                 idempotency_key: input.idempotency_key,
                 approval_ttl_seconds: input.approval_ttl_seconds,
+                requires_review: input.requires_review,
             },
         )
         .map_err(ApiError::internal)?;
@@ -1678,6 +1697,70 @@ async fn get_job(
         .map(Json)
         .ok_or_else(ApiError::not_found)
 }
+/// The orchestrator's review queue: finished work waiting to be judged.
+async fn jobs_awaiting_review(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+) -> ApiResult<Json<Vec<ferryman_core::Job>>> {
+    checked(&state, &headers, &project)?;
+    state
+        .store
+        .jobs_awaiting_review(&project)
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+#[derive(Deserialize)]
+struct ReviewDecision {
+    /// Who is reviewing. Recorded on the audit event.
+    #[serde(default = "default_reviewer")]
+    reviewer: String,
+    /// Required when sending work back: a rejection with no reason is not actionable.
+    #[serde(default)]
+    notes: Option<String>,
+}
+fn default_reviewer() -> String {
+    "orchestrator".into()
+}
+
+/// Keep the result. Terminal.
+async fn accept_result(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, job)): Path<(String, String)>,
+    body: Option<Json<ReviewDecision>>,
+) -> ApiResult<Json<ferryman_core::Job>> {
+    checked(&state, &headers, &project)?;
+    let reviewer = body.map_or_else(default_reviewer, |Json(decision)| decision.reviewer);
+    state
+        .store
+        .accept_result(&project, &job, &reviewer)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+/// Send the work back for another revision, with notes saying what to change.
+async fn request_changes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((project, job)): Path<(String, String)>,
+    Json(decision): Json<ReviewDecision>,
+) -> ApiResult<Json<ferryman_core::Job>> {
+    checked(&state, &headers, &project)?;
+    let notes = decision
+        .notes
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ApiError::bad_request("notes are required when requesting changes"))?;
+    state
+        .store
+        .request_changes(&project, &job, &decision.reviewer, &notes)
+        .map_err(ApiError::internal)?
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
 async fn approve_job(
     State(state): State<AppState>,
     headers: HeaderMap,

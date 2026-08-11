@@ -546,6 +546,7 @@ mod tests {
                     requires_approval: true,
                     max_attempts: 1,
                     idempotency_key: None,
+                    requires_review: false,
                     approval_ttl_seconds: None,
                 },
             )

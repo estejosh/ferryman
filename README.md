@@ -27,6 +27,9 @@ machines, accept theirs, and agents on different computers, in different houses,
 different networks start talking. Syncthing handles NAT on its own, so in most setups
 you forward nothing.
 
+Runs on Intel/AMD and on ARM, so Apple Silicon Macs and Raspberry Pis are first-class,
+not emulated.
+
 Docker works too: `docker build -f Containerfile .`
 
 ---
@@ -79,10 +82,35 @@ this is the part that matters.
 Work that needs a human gets parked until someone approves it — including from your
 phone, over Telegram, with the approval bound to a hash of exactly what was approved.
 
+## Work goes back until it's right
+
+An orchestrator hands out work; a worker does it. The interesting part is what happens
+next: the orchestrator reads the result and either keeps it, or sends it back saying what
+to change.
+
+```
+order      ->  "write the report"
+result     ->  "here it is"
+review     ->  changes requested: "the summary contradicts the table"
+result     ->  "here it is, revised"
+review     ->  accepted
+```
+
+Mark a job `requires_review` and finishing it is not the end — the result waits until
+someone judges it. Sending it back returns it to the queue at the next revision with the
+reviewer's notes attached, so any worker can pick it up, not just the one that did it
+first.
+
+Revisions are not failures. A job sent back five times has failed zero times and never
+exhausts its retries — retries are for crashes, revisions are for judgement. Every
+verdict is recorded against a hash of the exact result it judged, so an approval cannot
+be replayed against different work.
+
 ## What you get
 
 - **A private channel per project**, carried by Syncthing, with durable outboxes,
   idempotent delivery, duplicate-safe claims and acknowledgement deadlines.
+- **Review and revision** — accept the work, or send it back with notes.
 - **Shared memory** the fleet agrees on — proposed by agents, approved before it counts,
   so one confused agent cannot poison what everyone believes.
 - **An audit trail** of every decision, and encrypted continuity packs for recovery.
@@ -130,9 +158,8 @@ with anything that would hurt to have forged. The job and worker half still requ
 network reachability between machines; moving it onto the same file-carried model is
 next.
 
-**Not built yet.** A review-and-revise loop, where an orchestrator sends finished work
-back with notes, is the next significant feature. PostgreSQL, RBAC, workflow graphs and
-a dashboard are design targets, not implementations.
+**Not built yet.** PostgreSQL, RBAC, workflow graphs and a dashboard are design targets,
+not implementations.
 
 **Not a sandbox.** Ferryman coordinates agents; it does not contain them. An agent
 worker runs with the privileges of the account that started it. Give each worker its own

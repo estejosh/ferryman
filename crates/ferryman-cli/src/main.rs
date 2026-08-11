@@ -157,6 +157,9 @@ enum Jobs {
         input: String,
         #[arg(long)]
         requires_approval: bool,
+        /// Hold the result for review: it is not done until accepted or sent back.
+        #[arg(long)]
+        requires_review: bool,
         #[arg(long, default_value_t = 3)]
         max_attempts: u32,
         #[arg(long)]
@@ -180,6 +183,30 @@ enum Jobs {
     Tail {
         #[arg(long)]
         project: String,
+        job: String,
+    },
+    /// Finished work waiting on a reviewer.
+    AwaitingReview {
+        #[arg(long)]
+        project: String,
+    },
+    /// Keep the result. Terminal.
+    Accept {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "orchestrator")]
+        reviewer: String,
+        job: String,
+    },
+    /// Send the work back for another revision, saying what to change.
+    RequestChanges {
+        #[arg(long)]
+        project: String,
+        #[arg(long, default_value = "orchestrator")]
+        reviewer: String,
+        /// What needs to change. Required: a rejection without a reason is not actionable.
+        #[arg(long)]
+        notes: String,
         job: String,
     },
     List {
@@ -683,11 +710,12 @@ async fn jobs(cli: &Cli, command: Jobs) -> Result<()> {
             project,
             input,
             requires_approval,
+            requires_review,
             max_attempts,
             idempotency_key,
         } => {
             let input: Value = serde_json::from_str(&input).context("--input must be JSON")?;
-            call(cli,"POST",format!("/v1/projects/{project}/jobs"),Some(json!({"input":input,"requires_approval":requires_approval,"max_attempts":max_attempts,"idempotency_key":idempotency_key}))).await?
+            call(cli,"POST",format!("/v1/projects/{project}/jobs"),Some(json!({"input":input,"requires_approval":requires_approval,"requires_review":requires_review,"max_attempts":max_attempts,"idempotency_key":idempotency_key}))).await?
         }
         Jobs::Get { project, job } => {
             call(
@@ -695,6 +723,42 @@ async fn jobs(cli: &Cli, command: Jobs) -> Result<()> {
                 "GET",
                 format!("/v1/projects/{project}/jobs/{job}"),
                 None,
+            )
+            .await?
+        }
+        Jobs::AwaitingReview { project } => {
+            call(
+                cli,
+                "GET",
+                format!("/v1/projects/{project}/jobs/awaiting-review"),
+                None,
+            )
+            .await?
+        }
+        Jobs::Accept {
+            project,
+            reviewer,
+            job,
+        } => {
+            call(
+                cli,
+                "POST",
+                format!("/v1/projects/{project}/jobs/{job}/accept"),
+                Some(serde_json::json!({ "reviewer": reviewer })),
+            )
+            .await?
+        }
+        Jobs::RequestChanges {
+            project,
+            reviewer,
+            notes,
+            job,
+        } => {
+            call(
+                cli,
+                "POST",
+                format!("/v1/projects/{project}/jobs/{job}/request-changes"),
+                Some(serde_json::json!({ "reviewer": reviewer, "notes": notes })),
             )
             .await?
         }
