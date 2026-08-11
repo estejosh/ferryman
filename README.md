@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+  <img src="docs/assets/logo.svg" alt="" width="88">
+</picture>
+
 # Ferryman
 
 [![CI](https://github.com/estejosh/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/ci.yml)
@@ -43,6 +48,25 @@ Ferryman doesn't. **Machines write files; a synced folder carries them.** A mess
 work order, a result, a review — all of them are just files appearing in a directory
 your machines already share. Nothing is "sent". There is no connection to establish and
 nothing to be down.
+
+```mermaid
+flowchart LR
+    subgraph D["desktop"]
+        DF["channel folder"]
+    end
+    subgraph L["laptop"]
+        LF["channel folder"]
+    end
+    subgraph F["friend's box"]
+        FF["channel folder"]
+    end
+    DF <-. syncthing .-> LF
+    LF <-. syncthing .-> FF
+    DF <-. syncthing .-> FF
+```
+
+*Three machines, one synced folder, nothing in the middle. Nothing here has to be up,
+reachable, or trusted.*
 
 That has two consequences worth caring about.
 

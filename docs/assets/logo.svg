@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" fill="none" stroke="#5980a6" stroke-width="2" stroke-linecap="butt">
+  <title>Ferryman</title>
+  <line x1="10" y1="15" x2="10" y2="49"></line>
+  <line x1="54" y1="15" x2="54" y2="49"></line>
+  <line x1="15" y1="32" x2="24" y2="32" stroke-dasharray="4 4"></line>
+  <line x1="40" y1="32" x2="49" y2="32" stroke-dasharray="4 4"></line>
+  <path d="M26.5 24 h7 l4 4 v12 h-11 z"></path>
+  <path d="M33.5 24 v4 h4"></path>
+</svg>
