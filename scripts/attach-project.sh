@@ -90,7 +90,9 @@ if [[ -n "$GIT_REMOTE" ]]; then
     { echo "Git remote must be $EXPECTED_REMOTE.git" >&2; exit 2; }
 fi
 
-declare -A SEEN_PARTICIPANTS=(["project-inbox"]=1)
+# bash 3.2 (still the system bash on macOS) has no associative arrays, so a
+# newline-delimited list stands in for the set of names already seen.
+SEEN_PARTICIPANTS=$'\nproject-inbox\n' 
 for participant in "${PARTICIPANTS[@]}"; do
   IFS='|' read -r name role capabilities extra <<<"$participant"
   [[ -n "$name" && -n "$role" && -z "${extra:-}" ]] ||
@@ -98,9 +100,9 @@ for participant in "${PARTICIPANTS[@]}"; do
   [[ "$name" != . && "$name" != .. && "$role" != . && "$role" != .. &&
      "$name" =~ ^[A-Za-z0-9._-]+$ && "$role" =~ ^[A-Za-z0-9._-]+$ ]] ||
     { echo "participant name and role must be path-safe" >&2; exit 2; }
-  [[ -z "${SEEN_PARTICIPANTS[$name]:-}" ]] ||
+  [[ "$SEEN_PARTICIPANTS" != *$'\n'"$name"$'\n'* ]] ||
     { echo "participant names must be unique and cannot replace project-inbox" >&2; exit 2; }
-  SEEN_PARTICIPANTS["$name"]=1
+  SEEN_PARTICIPANTS+="$name"$'\n' 
 done
 
 ROUTE_SUMMARY='- project-inbox (role project; capabilities: messages.receive)'
@@ -304,34 +306,41 @@ write_managed "$COMMUNICATIONS/.stignore" "$STIGNORE"
 write_managed "$COMMUNICATIONS/.gitignore" "$GITIGNORE"
 write_managed "$ATTACHMENT/standard.toml" "$STANDARD_CONFIG"
 if ((UPDATE_STANDARD)) && [[ -f "$ATTACHMENT/bridge.toml" ]]; then
-  declare -A existing_bridge=()
+  # Same bash 3.2 constraint: no associative arrays. `expected_value` is the lookup
+  # that `expected_bridge[$key]` used to be, and the existing file is compared a line
+  # at a time as it is read - so no map is needed on either side.
+  expected_value() {
+    case "$1" in
+      project)          printf '%s' "$PROJECT" ;;
+      workspace)        printf '%s' "$WORKSPACE" ;;
+      attachment)       printf '%s' "$ATTACHMENT" ;;
+      communications)   printf '%s' "$COMMUNICATIONS" ;;
+      shared_remote)    printf '%s' "$SHARED_REMOTE" ;;
+      git_remote)       printf '%s' "$GIT_REMOTE" ;;
+      git_visibility)   printf '%s' "private" ;;
+      endpoint)         printf '%s' "$HUB" ;;
+      integration_mode) printf '%s' "$INTEGRATION_MODE" ;;
+      *)                return 1 ;;
+    esac
+  }
+  saw_project=0
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "${line//[[:space:]]/}" || "$line" =~ ^[[:space:]]*# ]] && continue
     if [[ "$line" =~ ^[[:space:]]*([A-Za-z0-9_]+)[[:space:]]*=[[:space:]]*\"(.*)\"[[:space:]]*$ ]]; then
-      existing_bridge["${BASH_REMATCH[1]}"]="${BASH_REMATCH[2]}"
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+      [[ "$key" == project ]] && saw_project=1
+      expected=$(expected_value "$key") ||
+        { echo "existing bridge.toml does not match this update request: $key" >&2; exit 2; }
+      [[ "$value" == "$expected" ]] ||
+        { echo "existing bridge.toml does not match this update request: $key" >&2; exit 2; }
     else
       echo "existing bridge.toml contains an unsupported line: $line" >&2
       exit 2
     fi
   done <"$ATTACHMENT/bridge.toml"
-  declare -A expected_bridge=(
-    [project]="$PROJECT"
-    [workspace]="$WORKSPACE"
-    [attachment]="$ATTACHMENT"
-    [communications]="$COMMUNICATIONS"
-    [shared_remote]="$SHARED_REMOTE"
-    [git_remote]="$GIT_REMOTE"
-    [git_visibility]="private"
-    [endpoint]="$HUB"
-    [integration_mode]="$INTEGRATION_MODE"
-  )
-  [[ -n "${existing_bridge[project]:-}" ]] ||
+  ((saw_project)) ||
     { echo "existing bridge.toml does not identify a project" >&2; exit 2; }
-  for key in "${!existing_bridge[@]}"; do
-    [[ -n "${expected_bridge[$key]+set}" &&
-       "${existing_bridge[$key]}" == "${expected_bridge[$key]}" ]] ||
-      { echo "existing bridge.toml does not match this update request: $key" >&2; exit 2; }
-  done
   write_managed "$ATTACHMENT/bridge.toml" "$BRIDGE_CONFIG"
 else
   write_new "$ATTACHMENT/bridge.toml" "$BRIDGE_CONFIG"

@@ -37,7 +37,12 @@ jobs:
   supply-chain:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      # contents: write is needed only so the SBOM can be attached to a release as an
+      # asset. On a tag push the action finds the release and uploads to it; with
+      # read-only contents that step fails with "Resource not accessible by
+      # integration", which is why this job passed on every branch push and only broke
+      # on the first actual release.
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Secret scan (gitleaks)
