@@ -216,6 +216,11 @@ enum Channel {
     Order {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Who is issuing it. Defaults to this machine's name. Give the name this
+        /// agent joined under, or the order is signed by an identity the roster
+        /// does not know and every reader reports it as UnknownSigner.
+        #[arg(long)]
+        agent: Option<String>,
         /// Task id, e.g. t-4f2a.
         #[arg(long)]
         id: String,
@@ -1204,13 +1209,14 @@ fn channel(command: Channel) -> Result<()> {
 
         Channel::Order {
             workspace,
+            agent,
             id,
             to,
             task,
             requires_review,
         } => {
             let route = here(workspace)?;
-            let issuer = default_agent_name();
+            let issuer = agent.unwrap_or_else(default_agent_name);
             let payload = if task.trim_start().starts_with('{') {
                 serde_json::from_str(&task).context("--task looked like JSON but did not parse")?
             } else {
