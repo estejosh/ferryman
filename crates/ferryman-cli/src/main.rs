@@ -1227,11 +1227,12 @@ fn channel(command: Channel) -> Result<()> {
                 signed_by: None,
                 signature: None,
             };
+            // Actually sign it. Setting signed_by without a signature would claim
+            // attribution nothing could check, which is worse than claiming none.
             if let Ok(identity) =
                 ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)
             {
-                order.signed_by = Some(issuer.clone());
-                let _ = &identity;
+                identity.sign_order(&mut order);
             }
             let path = ferryman_channel::issue_order(&route, &order)?;
             println!("issued {id} -> {}", path.display());
@@ -1296,22 +1297,30 @@ fn channel(command: Channel) -> Result<()> {
             } else {
                 json!({ "text": result })
             };
-            let path = ferryman_channel::submit_result(
-                &route,
-                &ferryman_channel::TaskResult {
-                    order_id: id.clone(),
-                    agent: agent.clone(),
-                    revision,
-                    submitted_at: chrono::Utc::now(),
-                    payload,
-                    signed_by: Some(agent.clone()),
-                    signature: None,
-                },
-            )?;
+            let mut submission = ferryman_channel::TaskResult {
+                order_id: id.clone(),
+                agent: agent.clone(),
+                revision,
+                submitted_at: chrono::Utc::now(),
+                payload,
+                signed_by: None,
+                signature: None,
+            };
+            // The fingerprint on a contribution: this agent, this work, checkable later.
+            if let Ok(identity) =
+                ferryman_channel::AgentIdentity::load_or_create(&agent, &route.attachment)
+            {
+                identity.sign_result(&mut submission);
+            }
+            let signed = submission.signature.is_some();
+            let path = ferryman_channel::submit_result(&route, &submission)?;
             println!(
                 "submitted revision {revision} of {id} -> {}",
                 path.display()
             );
+            if signed {
+                println!("  signed by {agent}");
+            }
         }
 
         Channel::Review {
@@ -1326,19 +1335,23 @@ fn channel(command: Channel) -> Result<()> {
             let revision = task
                 .latest_revision()
                 .context("there is no result to review yet")?;
-            ferryman_channel::submit_review(
-                &route,
-                &ferryman_channel::Review {
-                    order_id: id.clone(),
-                    revision,
-                    reviewer: reviewer.clone(),
-                    reviewed_at: chrono::Utc::now(),
-                    accepted: accept,
-                    notes: notes.clone(),
-                    signed_by: Some(reviewer),
-                    signature: None,
-                },
-            )?;
+            let mut verdict = ferryman_channel::Review {
+                order_id: id.clone(),
+                revision,
+                reviewer: reviewer.clone(),
+                reviewed_at: chrono::Utc::now(),
+                accepted: accept,
+                notes: notes.clone(),
+                signed_by: None,
+                signature: None,
+            };
+            // A verdict is signed too, so an acceptance cannot later be denied or forged.
+            if let Ok(identity) =
+                ferryman_channel::AgentIdentity::load_or_create(&reviewer, &route.attachment)
+            {
+                identity.sign_review(&mut verdict);
+            }
+            ferryman_channel::submit_review(&route, &verdict)?;
             if accept {
                 println!("accepted revision {revision} of {id}");
             } else {
@@ -1360,13 +1373,33 @@ fn channel(command: Channel) -> Result<()> {
                     task.holder().unwrap_or("-"),
                     task.state()
                 );
+                println!(
+                    "               order {:?}",
+                    ferryman_channel::verify_order(&task.order, &route.agents)
+                );
+                for result in &task.results {
+                    println!(
+                        "               result r{} by {:<10} {:?}",
+                        result.revision,
+                        result.agent,
+                        ferryman_channel::verify_result(result, &route.agents)
+                    );
+                }
+                for review in &task.reviews {
+                    println!(
+                        "               review r{} by {:<10} {:?}",
+                        review.revision,
+                        review.reviewer,
+                        ferryman_channel::verify_review(review, &route.agents)
+                    );
+                }
             }
         }
 
         Channel::Log { workspace, limit } => {
             let route = here(workspace)?;
             let mut messages = ferryman_channel::list_messages(&route)?;
-            messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            messages.sort_by_key(|message| message.created_at);
             for message in messages.iter().rev().take(limit).rev() {
                 println!(
                     "{}  {} -> {}  {}{}",

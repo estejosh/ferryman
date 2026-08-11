@@ -828,18 +828,18 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             continue;
         };
         // A single unreadable file must not hide the rest of the task.
-        if name.starts_with("claim.") {
-            if let Ok(value) = serde_json::from_str(&text) {
-                claims.push(value);
-            }
-        } else if name.starts_with("result.") {
-            if let Ok(value) = serde_json::from_str(&text) {
-                results.push(value);
-            }
-        } else if name.starts_with("review.") {
-            if let Ok(value) = serde_json::from_str(&text) {
-                reviews.push(value);
-            }
+        if name.starts_with("claim.")
+            && let Ok(value) = serde_json::from_str(&text)
+        {
+            claims.push(value);
+        } else if name.starts_with("result.")
+            && let Ok(value) = serde_json::from_str(&text)
+        {
+            results.push(value);
+        } else if name.starts_with("review.")
+            && let Ok(value) = serde_json::from_str(&text)
+        {
+            reviews.push(value);
         }
     }
     results.sort_by_key(|r: &TaskResult| r.revision);
@@ -871,7 +871,7 @@ pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
             tasks.push(task);
         }
     }
-    tasks.sort_by(|a, b| a.order.created_at.cmp(&b.order.created_at));
+    tasks.sort_by_key(|task| task.order.created_at);
     Ok(tasks)
 }
 
@@ -983,6 +983,139 @@ impl AgentIdentity {
         message.signed_by = Some(self.name.clone());
         message.signature = Some(hex::encode(signature.to_bytes()));
     }
+
+    /// Sign an order. Whoever issues work is on the record for it.
+    pub fn sign_order(&self, order: &mut Order) {
+        let signature = self.signing.sign(order_payload(order).as_bytes());
+        order.signed_by = Some(self.name.clone());
+        order.signature = Some(hex::encode(signature.to_bytes()));
+    }
+
+    /// Sign a result. This is the one that matters most for accountability: it ties a
+    /// specific agent to specific work it produced.
+    pub fn sign_result(&self, result: &mut TaskResult) {
+        let signature = self.signing.sign(result_payload(result).as_bytes());
+        result.signed_by = Some(self.name.clone());
+        result.signature = Some(hex::encode(signature.to_bytes()));
+    }
+
+    /// Sign a verdict, so an acceptance cannot later be denied or forged.
+    pub fn sign_review(&self, review: &mut Review) {
+        let signature = self.signing.sign(review_payload(review).as_bytes());
+        review.signed_by = Some(self.name.clone());
+        review.signature = Some(hex::encode(signature.to_bytes()));
+    }
+}
+
+fn order_payload(order: &Order) -> String {
+    format!(
+        "ferryman-order-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        order.id,
+        order.project_id,
+        order.issued_by,
+        order.assigned_to.as_deref().unwrap_or(""),
+        order.created_at.to_rfc3339(),
+        order.requires_review,
+        payload_digest(&order.payload),
+    )
+}
+
+fn result_payload(result: &TaskResult) -> String {
+    format!(
+        "ferryman-result-v1\n{}\n{}\n{}\n{}\n{}",
+        result.order_id,
+        result.agent,
+        result.revision,
+        result.submitted_at.to_rfc3339(),
+        payload_digest(&result.payload),
+    )
+}
+
+fn review_payload(review: &Review) -> String {
+    format!(
+        "ferryman-review-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        review.order_id,
+        review.revision,
+        review.reviewer,
+        review.reviewed_at.to_rfc3339(),
+        review.accepted,
+        review.notes.as_deref().unwrap_or(""),
+    )
+}
+
+/// Shared verification: look the signer up in the roster and check the signature over
+/// the exact bytes that were signed.
+fn check_signature(
+    signed_by: Option<&String>,
+    signature: Option<&String>,
+    payload: &str,
+    roster: &[AgentRoute],
+) -> SignatureCheck {
+    let (Some(signed_by), Some(signature_hex)) = (signed_by, signature) else {
+        return SignatureCheck::Unsigned;
+    };
+    let Some(agent) = roster.iter().find(|a| &a.name == signed_by) else {
+        return SignatureCheck::UnknownSigner;
+    };
+    let Some(known_key) = agent.public_key.as_ref().filter(|k| !k.is_empty()) else {
+        return SignatureCheck::UnknownSigner;
+    };
+    let Ok(key_bytes) = hex::decode(known_key) else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(key_bytes): Result<[u8; 32], _> = key_bytes.try_into() else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(verifying) = VerifyingKey::from_bytes(&key_bytes) else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(signature_bytes) = hex::decode(signature_hex) else {
+        return SignatureCheck::Invalid;
+    };
+    let Ok(signature_bytes): Result<[u8; 64], _> = signature_bytes.try_into() else {
+        return SignatureCheck::Invalid;
+    };
+    if verifying
+        .verify_strict(payload.as_bytes(), &Signature::from_bytes(&signature_bytes))
+        .is_ok()
+    {
+        SignatureCheck::Valid
+    } else {
+        SignatureCheck::Invalid
+    }
+}
+
+/// Who issued this order, checkably.
+#[must_use]
+pub fn verify_order(order: &Order, roster: &[AgentRoute]) -> SignatureCheck {
+    check_signature(
+        order.signed_by.as_ref(),
+        order.signature.as_ref(),
+        &order_payload(order),
+        roster,
+    )
+}
+
+/// Who produced this result, checkably. The fingerprint on a contribution.
+#[must_use]
+pub fn verify_result(result: &TaskResult, roster: &[AgentRoute]) -> SignatureCheck {
+    check_signature(
+        result.signed_by.as_ref(),
+        result.signature.as_ref(),
+        &result_payload(result),
+        roster,
+    )
+}
+
+/// Who gave this verdict, checkably.
+#[must_use]
+pub fn verify_review(review: &Review, roster: &[AgentRoute]) -> SignatureCheck {
+    check_signature(
+        review.signed_by.as_ref(),
+        review.signature.as_ref(),
+        &review_payload(review),
+        roster,
+    )
 }
 
 /// Keep a private key readable only by its owner.
@@ -1051,39 +1184,12 @@ pub enum SignatureCheck {
 /// Verify a message against the roster published in the channel.
 #[must_use]
 pub fn verify_message(message: &Message, roster: &[AgentRoute]) -> SignatureCheck {
-    let (Some(signed_by), Some(signature_hex)) = (&message.signed_by, &message.signature) else {
-        return SignatureCheck::Unsigned;
-    };
-    let Some(agent) = roster.iter().find(|a| &a.name == signed_by) else {
-        return SignatureCheck::UnknownSigner;
-    };
-    let Some(known_key) = agent.public_key.as_ref().filter(|k| !k.is_empty()) else {
-        return SignatureCheck::UnknownSigner;
-    };
-    let Ok(key_bytes) = hex::decode(known_key) else {
-        return SignatureCheck::Invalid;
-    };
-    let Ok(key_bytes): Result<[u8; 32], _> = key_bytes.try_into() else {
-        return SignatureCheck::Invalid;
-    };
-    let Ok(verifying) = VerifyingKey::from_bytes(&key_bytes) else {
-        return SignatureCheck::Invalid;
-    };
-    let Ok(signature_bytes) = hex::decode(signature_hex) else {
-        return SignatureCheck::Invalid;
-    };
-    let Ok(signature_bytes): Result<[u8; 64], _> = signature_bytes.try_into() else {
-        return SignatureCheck::Invalid;
-    };
-    let signature = Signature::from_bytes(&signature_bytes);
-    if verifying
-        .verify_strict(signing_payload(message).as_bytes(), &signature)
-        .is_ok()
-    {
-        SignatureCheck::Valid
-    } else {
-        SignatureCheck::Invalid
-    }
+    check_signature(
+        message.signed_by.as_ref(),
+        message.signature.as_ref(),
+        &signing_payload(message),
+        roster,
+    )
 }
 
 /// Publish an agent, refusing to overwrite an established key with a different one.
@@ -4794,6 +4900,120 @@ mod work_over_files_tests {
             task.holder(),
             Some("grouchly"),
             "one bad file must not stall the task"
+        );
+    }
+
+    #[test]
+    fn a_signed_order_result_and_review_all_verify() {
+        let (_t, route) = channel();
+        let keys = tempfile::tempdir().unwrap();
+        let beastly = AgentIdentity::load_or_create("beastly", keys.path()).unwrap();
+        let grouchly = AgentIdentity::load_or_create("grouchly", keys.path()).unwrap();
+        let roster = vec![
+            AgentRoute {
+                name: "beastly".into(),
+                role: "orchestrator".into(),
+                capabilities: vec![],
+                public_key: Some(beastly.public_key_hex()),
+            },
+            AgentRoute {
+                name: "grouchly".into(),
+                role: "worker".into(),
+                capabilities: vec![],
+                public_key: Some(grouchly.public_key_hex()),
+            },
+        ];
+
+        let mut o = order("t-1", Some("grouchly"), true);
+        beastly.sign_order(&mut o);
+        assert_eq!(verify_order(&o, &roster), SignatureCheck::Valid);
+
+        let mut r = TaskResult {
+            order_id: "t-1".into(),
+            agent: "grouchly".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({"draft": 1}),
+            signed_by: None,
+            signature: None,
+        };
+        grouchly.sign_result(&mut r);
+        assert_eq!(verify_result(&r, &roster), SignatureCheck::Valid);
+
+        let mut v = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "beastly".into(),
+            reviewed_at: Utc::now(),
+            accepted: true,
+            notes: None,
+            signed_by: None,
+            signature: None,
+        };
+        beastly.sign_review(&mut v);
+        assert_eq!(verify_review(&v, &roster), SignatureCheck::Valid);
+    }
+
+    #[test]
+    fn tampering_with_submitted_work_is_caught() {
+        let (_t, route) = channel();
+        let _ = &route;
+        let keys = tempfile::tempdir().unwrap();
+        let grouchly = AgentIdentity::load_or_create("grouchly", keys.path()).unwrap();
+        let roster = vec![AgentRoute {
+            name: "grouchly".into(),
+            role: "worker".into(),
+            capabilities: vec![],
+            public_key: Some(grouchly.public_key_hex()),
+        }];
+        let mut r = TaskResult {
+            order_id: "t-1".into(),
+            agent: "grouchly".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({"finding": "no problems found"}),
+            signed_by: None,
+            signature: None,
+        };
+        grouchly.sign_result(&mut r);
+        r.payload = json!({"finding": "everything is broken"});
+        assert_eq!(
+            verify_result(&r, &roster),
+            SignatureCheck::Invalid,
+            "rewriting what an agent reported must not still verify as theirs"
+        );
+    }
+
+    #[test]
+    fn a_verdict_cannot_be_flipped_after_it_was_given() {
+        let (_t, route) = channel();
+        let _ = &route;
+        let keys = tempfile::tempdir().unwrap();
+        let beastly = AgentIdentity::load_or_create("beastly", keys.path()).unwrap();
+        let roster = vec![AgentRoute {
+            name: "beastly".into(),
+            role: "orchestrator".into(),
+            capabilities: vec![],
+            public_key: Some(beastly.public_key_hex()),
+        }];
+        let mut v = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "beastly".into(),
+            reviewed_at: Utc::now(),
+            accepted: false,
+            notes: Some("this is wrong".into()),
+            signed_by: None,
+            signature: None,
+        };
+        beastly.sign_review(&mut v);
+        // Turn a rejection into an approval.
+        v.accepted = true;
+        v.notes = None;
+        assert_eq!(
+            verify_review(&v, &roster),
+            SignatureCheck::Invalid,
+            "an approval nobody gave must never verify"
         );
     }
 
