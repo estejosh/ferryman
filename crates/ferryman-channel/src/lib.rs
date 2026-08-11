@@ -4905,7 +4905,6 @@ mod work_over_files_tests {
 
     #[test]
     fn a_signed_order_result_and_review_all_verify() {
-        let (_t, route) = channel();
         let keys = tempfile::tempdir().unwrap();
         let beastly = AgentIdentity::load_or_create("beastly", keys.path()).unwrap();
         let grouchly = AgentIdentity::load_or_create("grouchly", keys.path()).unwrap();
@@ -4956,8 +4955,6 @@ mod work_over_files_tests {
 
     #[test]
     fn tampering_with_submitted_work_is_caught() {
-        let (_t, route) = channel();
-        let _ = &route;
         let keys = tempfile::tempdir().unwrap();
         let grouchly = AgentIdentity::load_or_create("grouchly", keys.path()).unwrap();
         let roster = vec![AgentRoute {
@@ -4986,8 +4983,6 @@ mod work_over_files_tests {
 
     #[test]
     fn a_verdict_cannot_be_flipped_after_it_was_given() {
-        let (_t, route) = channel();
-        let _ = &route;
         let keys = tempfile::tempdir().unwrap();
         let beastly = AgentIdentity::load_or_create("beastly", keys.path()).unwrap();
         let roster = vec![AgentRoute {
