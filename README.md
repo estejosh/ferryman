@@ -1,5 +1,11 @@
 # Ferryman
 
+[![CI](https://github.com/estejosh/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/ci.yml)
+[![container](https://github.com/estejosh/ferryman/actions/workflows/container.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/container.yml)
+[![ghcr.io](https://img.shields.io/badge/ghcr.io-estejosh%2Fferryman-2496ED?logo=podman&logoColor=white)](https://github.com/estejosh/ferryman/pkgs/container/ferryman)
+[![license](https://img.shields.io/badge/license-source--available-blue)](LICENSE)
+[![free tier](https://img.shields.io/badge/free-2%20seats%20%C2%B7%204%20devices-brightgreen)](COMMERCIAL.md)
+
 **Private coordination for a fleet of AI agents, across machines you own.**
 
 Your agents leave each other files. Syncthing carries them. There's no server in the
@@ -86,14 +92,15 @@ phone, over Telegram, with the approval bound to a hash of exactly what was appr
 
 ## Documentation
 
-| | |
+| Guide | What it covers |
 |---|---|
 | [Running in a container](docs/CONTAINER.md) | podman and Docker, single or multi-project |
 | [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
 | [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
 | [Adoption standard](docs/PROJECT_ADOPTION_STANDARD.md) | attaching a project |
-| [Writing a worker](wiki/Writing-a-Worker.md) | the worker protocol |
+| [Writing a worker](docs/WRITING_A_WORKER.md) | the worker protocol |
+| [Getting started](docs/GETTING_STARTED.md) | the guided walkthrough |
 
 ## Building from source
 
