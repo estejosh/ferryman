@@ -638,6 +638,33 @@ pub struct Review {
     pub signature: Option<String>,
 }
 
+/// A reviewing agent's proposed verdict, which is NOT a verdict.
+///
+/// A `Review` is final: writing one moves the task. This does not move anything. It
+/// exists so an agent can do the reading and the judging - the slow part - and still
+/// leave the decision with a human, for operators whose risk tolerance says a model
+/// should not be the last word.
+///
+/// It carries `reasoning` rather than optional notes because a recommendation with no
+/// stated reason is worse than none: it invites the human to rubber-stamp it, which is
+/// the exact failure this type is meant to prevent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Recommendation {
+    pub order_id: String,
+    pub revision: u32,
+    /// The agent that judged it.
+    pub reviewer: String,
+    pub recommended_at: DateTime<Utc>,
+    /// What it suggests: keep the work, or send it back.
+    pub accept: bool,
+    /// Why. Never empty.
+    pub reasoning: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
 /// Where a task has got to, worked out by reading its directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskState {
@@ -662,6 +689,10 @@ pub struct Task {
     pub claims: Vec<Claim>,
     pub results: Vec<TaskResult>,
     pub reviews: Vec<Review>,
+    /// Proposed verdicts awaiting a human. Deliberately separate from `reviews`: these
+    /// never change `state()`, so a machine that does not understand them behaves
+    /// exactly as it did before.
+    pub recommendations: Vec<Recommendation>,
 }
 
 impl Task {
@@ -695,6 +726,23 @@ impl Task {
     #[must_use]
     pub fn latest_revision(&self) -> Option<u32> {
         self.results.iter().map(|r| r.revision).max()
+    }
+
+    /// A proposed verdict on the newest result that no human has settled yet.
+    ///
+    /// Returns nothing once a `Review` exists for that revision: the decision has been
+    /// made, and a stale recommendation sitting beside it would invite someone to
+    /// approve the same work twice.
+    #[must_use]
+    pub fn pending_recommendation(&self) -> Option<&Recommendation> {
+        let revision = self.latest_revision()?;
+        if self.reviews.iter().any(|r| r.revision == revision) {
+            return None;
+        }
+        self.recommendations
+            .iter()
+            .filter(|r| r.revision == revision)
+            .max_by_key(|r| r.recommended_at)
     }
 
     #[must_use]
@@ -811,6 +859,30 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Record a proposed verdict for a human to settle.
+///
+/// The path carries the reviewer's name as well as the revision, so two reviewing
+/// agents looking at the same result still write to two different paths - the
+/// one-writer-per-path rule holds, and a synced folder cannot produce a conflict out of
+/// two opinions.
+pub fn submit_recommendation(
+    route: &ProjectRoute,
+    recommendation: &Recommendation,
+) -> Result<PathBuf> {
+    if !is_safe_component(&recommendation.reviewer) {
+        bail!("reviewer name must be a path-safe identifier")
+    }
+    if recommendation.reasoning.trim().is_empty() {
+        bail!("a recommendation must say why, or it is just a rubber stamp waiting to happen")
+    }
+    let path = task_dir(route, &recommendation.order_id).join(format!(
+        "recommendation.{}.{:03}.json",
+        recommendation.reviewer, recommendation.revision
+    ));
+    write_task_file(&path, recommendation)?;
+    Ok(path)
+}
+
 /// Read one task by reading its directory.
 pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let directory = task_dir(route, order_id);
@@ -819,6 +891,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let mut claims = Vec::new();
     let mut results = Vec::new();
     let mut reviews = Vec::new();
+    let mut recommendations = Vec::new();
     for entry in fs::read_dir(&directory)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -840,15 +913,21 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             && let Ok(value) = serde_json::from_str(&text)
         {
             reviews.push(value);
+        } else if name.starts_with("recommendation.")
+            && let Ok(value) = serde_json::from_str(&text)
+        {
+            recommendations.push(value);
         }
     }
     results.sort_by_key(|r: &TaskResult| r.revision);
     reviews.sort_by_key(|r: &Review| r.revision);
+    recommendations.sort_by_key(|r: &Recommendation| r.revision);
     Ok(Task {
         order,
         claims,
         results,
         reviews,
+        recommendations,
     })
 }
 
@@ -1005,6 +1084,16 @@ impl AgentIdentity {
         review.signed_by = Some(self.name.clone());
         review.signature = Some(hex::encode(signature.to_bytes()));
     }
+
+    /// Sign a recommendation. A human is going to act on this, so it needs to be as
+    /// checkable as the verdict it is proposing.
+    pub fn sign_recommendation(&self, recommendation: &mut Recommendation) {
+        let signature = self
+            .signing
+            .sign(recommendation_payload(recommendation).as_bytes());
+        recommendation.signed_by = Some(self.name.clone());
+        recommendation.signature = Some(hex::encode(signature.to_bytes()));
+    }
 }
 
 fn order_payload(order: &Order) -> String {
@@ -1040,6 +1129,18 @@ fn review_payload(review: &Review) -> String {
         review.reviewed_at.to_rfc3339(),
         review.accepted,
         review.notes.as_deref().unwrap_or(""),
+    )
+}
+
+fn recommendation_payload(recommendation: &Recommendation) -> String {
+    format!(
+        "ferryman-recommendation-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        recommendation.order_id,
+        recommendation.revision,
+        recommendation.reviewer,
+        recommendation.recommended_at.to_rfc3339(),
+        recommendation.accept,
+        recommendation.reasoning,
     )
 }
 
@@ -1114,6 +1215,22 @@ pub fn verify_review(review: &Review, roster: &[AgentRoute]) -> SignatureCheck {
         review.signed_by.as_ref(),
         review.signature.as_ref(),
         &review_payload(review),
+        roster,
+    )
+}
+
+/// Check a recommendation's signature.
+///
+/// Worth doing even though a recommendation decides nothing: it is what a human reads
+/// before deciding, so a forged one steers the decision just as effectively.
+pub fn verify_recommendation(
+    recommendation: &Recommendation,
+    roster: &[AgentRoute],
+) -> SignatureCheck {
+    check_signature(
+        recommendation.signed_by.as_ref(),
+        recommendation.signature.as_ref(),
+        &recommendation_payload(recommendation),
         roster,
     )
 }

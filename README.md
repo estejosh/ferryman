@@ -18,6 +18,17 @@ middle, no ports to forward, no cloud account — and the coordination lives in 
 private repository, kept separate from the work itself.
 
 ```sh
+cargo install --git https://github.com/estejosh/ferryman ferryman-cli
+cd your-project && ferry enable      # that's setup, all of it
+ferry agent run                      # this machine now does work
+```
+
+**Point your agent at [docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md) and it can do
+that itself.** `ferry enable` never prompts, is safe to run twice, and reports in JSON —
+it is built to be run by an agent with nobody watching, because that is who usually
+installs this.
+
+```sh
 mkdir -p ~/ferryman-channels/myproject
 
 podman run -d --name ferryman \

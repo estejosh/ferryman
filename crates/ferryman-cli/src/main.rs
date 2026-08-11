@@ -1,4 +1,7 @@
 #![forbid(unsafe_code)]
+mod agent;
+mod enable;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
@@ -20,6 +23,41 @@ struct Cli {
 }
 #[derive(Subcommand, Clone)]
 enum Command {
+    /// Point a project at Ferryman. Run it once, in the project directory.
+    ///
+    /// Idempotent: it never overwrites a config you have edited, so re-running it after
+    /// a version bump is safe and is the intended way to repair a half-finished setup.
+    Enable {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Project id. Defaults to the directory's name.
+        #[arg(long)]
+        project: Option<String>,
+        /// This agent's name. Defaults to this machine's name.
+        #[arg(long)]
+        agent: Option<String>,
+        /// What this agent is here to do. Shown to every other machine in the roster.
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// The agent CLI that does the work.
+        #[arg(long, default_value = "claude")]
+        command: String,
+        /// How much authority a reviewing agent has: auto, confirm or off.
+        ///
+        /// Defaults to `confirm`, which is the cautious end. Ferryman does not decide
+        /// how much you trust a model to approve work unsupervised.
+        #[arg(long, default_value = "confirm")]
+        review: String,
+        /// Emit one JSON object describing the result, for a caller that is a program.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the agentic loop: pick work up, do it, and judge what comes back.
+    Agent {
+        #[command(subcommand)]
+        command: Agent,
+    },
     Init {
         #[arg(default_value = "orchestrator.toml")]
         path: PathBuf,
@@ -358,6 +396,34 @@ enum Jobs {
     },
 }
 #[derive(Subcommand, Clone)]
+/// The agentic loop. Every one of these runs unattended and needs no terminal.
+enum Agent {
+    /// Pick up work, run the configured agent CLI on it, submit a signed result.
+    Run {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Do one pass and exit, instead of looping. For cron, or for a caller that
+        /// wants to own the scheduling.
+        #[arg(long)]
+        once: bool,
+    },
+    /// Judge results that are waiting, as far as the config lets you.
+    Review {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        once: bool,
+    },
+    /// What a human has been asked to settle, and whether each is properly signed.
+    Pending {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum Workers {
     Register {
         #[arg(long)]
@@ -498,6 +564,26 @@ async fn main() -> Result<()> {
             )?;
             println!("wrote {}", path.display());
         }
+        Command::Enable {
+            workspace,
+            project,
+            agent: agent_name,
+            role,
+            command,
+            review,
+            json: as_json,
+        } => {
+            enable::run(enable::Request {
+                workspace,
+                project,
+                agent: agent_name,
+                role,
+                command,
+                review,
+                as_json,
+            })?;
+        }
+        Command::Agent { command } => agent_command(command).await?,
         Command::Jobs { command } => jobs(&cli, command).await?,
         Command::Projects { command } => match command {
             Projects::Create { id, name, token } => {
@@ -1055,6 +1141,91 @@ async fn call_approver(cli: &Cli, method: &str, path: String, approver: &str) ->
 /// directory tree, and delivering a message is writing a file that Syncthing then
 /// carries. The server offers the same operations over HTTP for callers that want them,
 /// but it was never doing anything a local process could not do for itself.
+/// The agentic loop.
+///
+/// A pass that fails does not stop the loop: an agent CLI that is briefly missing, or a
+/// single task whose reply cannot be parsed, must not take the whole machine off the
+/// fleet. The failure is printed and the next pass tries again.
+async fn agent_command(command: Agent) -> Result<()> {
+    let route_for = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    match command {
+        Agent::Run { workspace, once } => {
+            let route = route_for(workspace)?;
+            let config = agent::AgentConfig::load(&route.attachment)?;
+            println!(
+                "worker '{}' on {}, running '{}'",
+                config.agent, route.project_id, config.command
+            );
+            loop {
+                match agent::work_once(&route, &config).await {
+                    Ok(0) => {}
+                    Ok(count) => println!("did {count} task(s)"),
+                    Err(error) => eprintln!("pass failed, will retry: {error:#}"),
+                }
+                if once {
+                    break;
+                }
+                tokio::time::sleep(config.poll).await;
+            }
+        }
+        Agent::Review { workspace, once } => {
+            let route = route_for(workspace)?;
+            let config = agent::AgentConfig::load(&route.attachment)?;
+            println!(
+                "reviewer '{}' on {}, authority '{}'",
+                config.agent,
+                route.project_id,
+                config.review.as_str()
+            );
+            loop {
+                match agent::review_once(&route, &config).await {
+                    Ok(0) => {}
+                    Ok(count) => println!("judged {count} result(s)"),
+                    Err(error) => eprintln!("pass failed, will retry: {error:#}"),
+                }
+                if once {
+                    break;
+                }
+                tokio::time::sleep(config.poll).await;
+            }
+        }
+        Agent::Pending {
+            workspace,
+            json: as_json,
+        } => {
+            let route = route_for(workspace)?;
+            let waiting = agent::pending(&route)?;
+            if as_json {
+                let rows: Vec<Value> = waiting
+                    .iter()
+                    .map(|(check, r)| json!({ "signature": check, "recommendation": r }))
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if waiting.is_empty() {
+                println!("nothing waiting on a human");
+            } else {
+                for (check, r) in &waiting {
+                    println!(
+                        "  {} r{}  recommends {}  [{check}]",
+                        r.order_id,
+                        r.revision,
+                        if r.accept { "accept" } else { "changes" }
+                    );
+                    println!("      {}", r.reasoning);
+                }
+                println!("settle with: ferry channel review --accept <id>   (or --notes \"...\")");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn channel(command: Channel) -> Result<()> {
     let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
