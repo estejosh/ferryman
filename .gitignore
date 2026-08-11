@@ -10,3 +10,10 @@
 *.log
 key-bootstrap.out
 EVAL_FINDINGS.md
+
+# Scratch files used when authoring commits/releases locally - never part of the repo.
+/.m[0-9]*.txt
+/.rel.md
+/.verify.sh
+/.port*.patch
+/_build.log
