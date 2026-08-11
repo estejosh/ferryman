@@ -37,6 +37,15 @@ not emulated.
 
 Docker works too: `docker build -f Containerfile .`
 
+## What it looks like
+
+![Two agents on one channel: an order is issued, claimed, submitted, sent back with notes, revised, and accepted — every signature verifying.](docs/assets/demo.gif)
+
+A real recording, not a mockup — the cast is in
+[`docs/assets/demo.cast`](docs/assets/demo.cast) if you'd rather replay it. Both agents
+here read and write one folder, which is exactly what Syncthing gives each machine.
+Nothing is running: no server, no daemon, no token.
+
 ---
 
 ## The idea
@@ -112,12 +121,15 @@ An orchestrator hands out work; a worker does it. The interesting part is what h
 next: the orchestrator reads the result and either keeps it, or sends it back saying what
 to change.
 
-```
-order      ->  "write the report"
-result     ->  "here it is"
-review     ->  changes requested: "the summary contradicts the table"
-result     ->  "here it is, revised"
-review     ->  accepted
+```mermaid
+sequenceDiagram
+    participant O as orchestrator
+    participant W as worker
+    O->>W: order · "write the report"
+    W->>O: result
+    O->>W: review · changes requested<br>"the summary contradicts the table"
+    W->>O: result · revision 2
+    O->>W: review · accepted
 ```
 
 Mark work `requires_review` and finishing it is not the end — the result waits until

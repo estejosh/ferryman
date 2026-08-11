@@ -12,7 +12,7 @@ backstop. Git is deliberately last: it is an archive of record, not the live
 channel. This subsystem is separate from encrypted recovery-pack
 delivery; see [live communications](COMMUNICATIONS.md).
 
-## v0.1 state machine
+## Job state machine
 
 ```mermaid
 stateDiagram-v2
@@ -26,7 +26,23 @@ stateDiagram-v2
   Leased --> Failed: attempts exhausted
   Queued --> Cancelled: cancel
   Leased --> Cancelled: cancel observed
+  Succeeded --> Accepted: reviewer accepts
+  Succeeded --> Queued: reviewer requests changes
 ```
+
+The last two transitions exist only for a job created with `requires_review`.
+Without it, `Succeeded` is terminal and the review states are unreachable. With
+it, `Succeeded` means *the worker is finished*, not *the work is done* — the job
+waits for a reviewer to accept it or send it back.
+
+Sending work back increments `revision` and returns the job to `queued`, so any
+eligible worker can pick up the next round, not necessarily the one that did the
+last. `request_changes` refuses empty notes: work never comes back without a
+stated reason.
+
+A revision is **not** a failure. It leaves `attempts` untouched and does not
+count against `max_attempts`, because those exist to stop a job that keeps
+crashing. A job sent back five times has failed zero times.
 
 `jobs` and `events` are committed in one SQLite transaction. A lease is atomically claimed only when `available_at <= now`; expired leases become eligible for retry. Completion uses the lease ID as its idempotency key. This gives at-least-once delivery, so workers must make side effects idempotent.
 
