@@ -540,6 +540,133 @@ fn acknowledgement_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
         .join(format!("{message_id}.json"))
 }
 
+/// Find the attachment for the project containing `start`, walking upwards the way git
+/// looks for `.git`. Returns the `.ferryman` directory, not the workspace.
+///
+/// This is what lets a command locate the channel with nothing running: the attachment
+/// is on disk, so there is no daemon to ask.
+#[must_use]
+pub fn discover_attachment(start: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(directory) = current {
+        let candidate = directory.join(".ferryman");
+        if candidate.join("bridge.toml").is_file() {
+            return Some(candidate);
+        }
+        current = directory.parent();
+    }
+    None
+}
+
+/// Read the route an attachment describes.
+///
+/// `bridge.toml` is written by the attachment scripts and is deliberately a flat list of
+/// `key = "value"` lines, so reading it needs no TOML parser and the channel crate keeps
+/// its short dependency list. Anything richer is a signal the file has been hand-edited
+/// into a shape Ferryman did not write, which is worth refusing rather than guessing at.
+pub fn load_route(attachment: &Path) -> Result<ProjectRoute> {
+    let path = attachment.join("bridge.toml");
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut fields: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            bail!(
+                "{} contains a line that is not key = \"value\": {line}",
+                path.display()
+            )
+        };
+        let value = value.trim().trim_matches('"');
+        fields.insert(key.trim().to_string(), value.to_string());
+    }
+    let take = |key: &str| -> Result<String> {
+        fields
+            .get(key)
+            .cloned()
+            .with_context(|| format!("{} is missing '{key}'", path.display()))
+    };
+    let route = ProjectRoute {
+        project_id: take("project")?,
+        workspace: PathBuf::from(take("workspace")?),
+        attachment: PathBuf::from(take("attachment")?),
+        communications: PathBuf::from(take("communications")?),
+        shared_remote: fields.get("shared_remote").cloned().unwrap_or_default(),
+        git_remote: fields.get("git_remote").cloned().unwrap_or_default(),
+        git_visibility: fields
+            .get("git_visibility")
+            .cloned()
+            .unwrap_or_else(|| "private".into()),
+        agents: read_agent_roster(&PathBuf::from(take("communications")?))?,
+    };
+    route.validate()?;
+    Ok(route)
+}
+
+/// The agents taking part, read from the channel itself.
+///
+/// Each agent publishes one file under `agents/`, named for itself. One writer per file
+/// is the same rule the whole channel follows, so two machines registering at once can
+/// never collide - and it is where an agent's public key will live once envelopes are
+/// signed.
+///
+/// A malformed entry is skipped rather than fatal: one agent writing nonsense must not
+/// stop the rest of the fleet from talking.
+pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
+    let directory = communications.join("agents");
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut agents = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(agent) = serde_json::from_str::<AgentRoute>(&text) {
+            agents.push(agent);
+        }
+    }
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(agents)
+}
+
+/// Publish this agent into the channel so others may address it.
+///
+/// Writing is atomic - a temporary file then a rename - because Syncthing may copy the
+/// directory at any instant, and a half-written roster entry read by a peer is a fleet
+/// that cannot agree on who exists.
+pub fn register_agent(route: &ProjectRoute, agent: &AgentRoute) -> Result<PathBuf> {
+    if !is_safe_component(&agent.name) || !is_safe_component(&agent.role) {
+        bail!("agent name and role must be path-safe identifiers")
+    }
+    let directory = route.communications.join("agents");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join(format!("{}.json", agent.name));
+    let temporary = directory.join(format!(".{}.json.tmp", agent.name));
+    fs::write(&temporary, serde_json::to_vec_pretty(agent)?)?;
+    fs::rename(&temporary, &path)?;
+    Ok(path)
+}
+
+/// Locate the route for the project containing `start`, with a clear explanation when
+/// there is nothing to find - "no channel here" is a normal situation for a new user,
+/// not an error worth a backtrace.
+pub fn route_for(start: &Path) -> Result<ProjectRoute> {
+    let attachment = discover_attachment(start).with_context(|| {
+        format!(
+            "no Ferryman channel found in {} or any parent directory; attach one with scripts/attach-project.sh",
+            start.display()
+        )
+    })?;
+    load_route(&attachment)
+}
+
 pub fn is_acknowledged(route: &ProjectRoute, message_id: &str) -> bool {
     acknowledgement_path(route, message_id).is_file()
 }
@@ -3391,6 +3518,201 @@ mod tests {
             observer
                 .join(format!("acknowledgements/alpha/{}.json", first.id))
                 .is_file()
+        );
+    }
+}
+
+#[cfg(test)]
+mod serverless_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A channel on disk, exactly as the attachment scripts leave one.
+    fn attached() -> (tempfile::TempDir, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(communications.join("messages/demo")).unwrap();
+        fs::create_dir_all(communications.join("acknowledgements/demo")).unwrap();
+        let config = format!(
+            "project = \"demo\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\nshared_remote = \"demo-ferryman\"\ngit_remote = \"\"\ngit_visibility = \"private\"\n",
+            workspace.display(),
+            attachment.display(),
+            communications.display()
+        );
+        fs::write(attachment.join("bridge.toml"), config).unwrap();
+        (temp, workspace)
+    }
+
+    #[test]
+    fn the_channel_is_found_by_walking_up_from_a_subdirectory() {
+        let (_temp, workspace) = attached();
+        let deep = workspace.join("crates/thing/src");
+        fs::create_dir_all(&deep).unwrap();
+        let found = discover_attachment(&deep).expect("walk upwards like git does");
+        assert_eq!(found, workspace.join(".ferryman"));
+    }
+
+    #[test]
+    fn no_channel_anywhere_above_is_reported_plainly() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(discover_attachment(temp.path()).is_none());
+        let error = route_for(temp.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("no Ferryman channel found"),
+            "a new user with no channel deserves an explanation, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_route_loads_from_disk_with_no_server_involved() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        assert_eq!(route.project_id, "demo");
+        assert_eq!(route.shared_remote, "demo-ferryman");
+        assert!(
+            route.git_remote.is_empty(),
+            "a Syncthing-only channel has no Git remote and must still load"
+        );
+    }
+
+    #[test]
+    fn a_hand_mangled_bridge_file_is_refused_rather_than_guessed_at() {
+        let (_temp, workspace) = attached();
+        let attachment = workspace.join(".ferryman");
+        fs::write(attachment.join("bridge.toml"), "this is not a setting\n").unwrap();
+        assert!(load_route(&attachment).is_err());
+    }
+
+    #[test]
+    fn agents_register_themselves_and_everyone_sees_them() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        register_agent(
+            &route,
+            &AgentRoute {
+                name: "grouchly".into(),
+                role: "worker".into(),
+                capabilities: vec!["messages.receive".into()],
+            },
+        )
+        .unwrap();
+        register_agent(
+            &route,
+            &AgentRoute {
+                name: "beastly".into(),
+                role: "orchestrator".into(),
+                capabilities: vec!["messages.receive".into(), "review".into()],
+            },
+        )
+        .unwrap();
+
+        // Re-read from disk: this is what another machine does after Syncthing carries it.
+        let reloaded = route_for(&workspace).unwrap();
+        let names: Vec<_> = reloaded.agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["beastly", "grouchly"],
+            "sorted, and both present"
+        );
+        assert!(reloaded.permits("grouchly", None));
+        assert!(
+            reloaded.permits("orchestrator", None),
+            "role addressing works"
+        );
+        assert!(!reloaded.permits("nobody", None));
+    }
+
+    #[test]
+    fn one_agent_writing_nonsense_does_not_silence_the_fleet() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        register_agent(
+            &route,
+            &AgentRoute {
+                name: "grouchly".into(),
+                role: "worker".into(),
+                capabilities: vec![],
+            },
+        )
+        .unwrap();
+        fs::write(
+            route.communications.join("agents/broken.json"),
+            "{ not json at all",
+        )
+        .unwrap();
+        let reloaded = route_for(&workspace).unwrap();
+        assert_eq!(
+            reloaded.agents.len(),
+            1,
+            "the unreadable entry is skipped, the readable one survives"
+        );
+    }
+
+    #[test]
+    fn an_agent_cannot_take_a_name_that_would_escape_its_directory() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        for bad in ["../escape", "..", ".", "with/slash"] {
+            assert!(
+                register_agent(
+                    &route,
+                    &AgentRoute {
+                        name: bad.into(),
+                        role: "worker".into(),
+                        capabilities: vec![],
+                    },
+                )
+                .is_err(),
+                "'{bad}' must be refused as an agent name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_message_written_with_no_server_is_readable_as_a_plain_file() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        register_agent(
+            &route,
+            &AgentRoute {
+                name: "grouchly".into(),
+                role: "worker".into(),
+                capabilities: vec!["messages.receive".into()],
+            },
+        )
+        .unwrap();
+        let route = route_for(&workspace).unwrap();
+
+        let message = Message::new(
+            "demo",
+            "beastly",
+            "grouchly",
+            "text/plain",
+            json!({"text": "check this against the real code"}),
+            true,
+            None,
+        );
+        let mut transport = LocalFilesystemTransport;
+        transport.deliver(&route, &message).unwrap();
+
+        let listed = list_messages(&route).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].sender, "beastly");
+        assert!(
+            listed[0].reply_required,
+            "reply expectation is declared, not inferred"
+        );
+
+        // And it is genuinely just a file in the folder Syncthing carries.
+        let on_disk = route
+            .communications
+            .join("messages/demo")
+            .join(format!("{}.json", message.id));
+        assert!(
+            on_disk.is_file(),
+            "the message is a file, not a database row"
         );
     }
 }

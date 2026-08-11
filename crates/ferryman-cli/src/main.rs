@@ -9,8 +9,10 @@ use std::path::PathBuf;
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8787")]
     endpoint: String,
+    /// Required only by commands that talk to a server. The `channel` commands read
+    /// and write the synced folder directly and never need one.
     #[arg(long, env = "FERRYMAN_TOKEN")]
-    token: String,
+    token: Option<String>,
     #[arg(long, env = "FERRYMAN_MEMORY_TOKEN")]
     memory_token: Option<String>,
     #[command(subcommand)]
@@ -53,6 +55,15 @@ enum Command {
     Continuity {
         #[command(subcommand)]
         command: Continuity,
+    },
+    /// Talk to the channel directly, with nothing running.
+    ///
+    /// `communications` does the same things through a server. These do not: they read
+    /// and write the synced folder themselves, which is all the server was doing for a
+    /// local file write anyway. Syncthing carries it either way.
+    Channel {
+        #[command(subcommand)]
+        command: Channel,
     },
     Communications {
         #[command(subcommand)]
@@ -145,6 +156,68 @@ enum Communications {
     Unregister {
         #[arg(long)]
         project: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum Channel {
+    /// Where the channel for this directory lives, and what state it is in.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Write a message into the channel. No server, no token.
+    Send {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who it is from. Defaults to this machine's name.
+        #[arg(long)]
+        from: Option<String>,
+        #[arg(long)]
+        to: String,
+        /// The message body. Plain text, or JSON if it starts with '{'.
+        #[arg(long)]
+        body: String,
+        /// Say plainly whether an answer is expected, rather than leaving the
+        /// receiver to infer it from the message type - inference is what caused a
+        /// silent stall in this project's own history.
+        #[arg(long)]
+        reply_expected: bool,
+    },
+    /// Messages addressed to an agent.
+    Inbox {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: String,
+        /// Include messages that have already been acknowledged.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Announce this agent to the fleet so others can address it.
+    Join {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Defaults to this machine's name, so two agents cannot collide by accident.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// Comma-separated, e.g. "messages.receive,code".
+        #[arg(long, default_value = "messages.receive")]
+        capabilities: String,
+    },
+    /// Who is taking part in this channel.
+    Agents {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Every message in the channel, oldest first.
+    Log {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
 }
 
@@ -377,6 +450,7 @@ async fn main() -> Result<()> {
                 call(&cli, "DELETE", format!("/v1/projects/{id}"), None).await?
             }
         },
+        Command::Channel { command } => channel(command)?,
         Command::Communications { command } => match command {
             Communications::Send {
                 project,
@@ -819,7 +893,7 @@ async fn tail_events(cli: &Cli, project: &str, job: &str) -> Result<()> {
             "{}/v1/projects/{project}/jobs/{job}/events",
             cli.endpoint
         ))
-        .bearer_auth(&cli.token)
+        .bearer_auth(server_token(cli)?)
         .send()
         .await?
         .error_for_status()?;
@@ -840,7 +914,7 @@ async fn download_artifact(
             "{}/v1/projects/{project}/artifacts/{artifact}/content",
             cli.endpoint
         ))
-        .bearer_auth(&cli.token)
+        .bearer_auth(server_token(cli)?)
         .send()
         .await?
         .error_for_status()?;
@@ -849,11 +923,19 @@ async fn download_artifact(
     println!("wrote {}", output.display());
     Ok(())
 }
+/// The token for a server call, with an error that says what to do rather than a panic.
+fn server_token(cli: &Cli) -> Result<&str> {
+    cli.token.as_deref().filter(|t| !t.is_empty()).context(
+        "this command talks to a Ferryman server, which needs --token or FERRYMAN_TOKEN. \
+         The `ferry channel` commands need no server and no token.",
+    )
+}
+
 async fn call(cli: &Cli, method: &str, path: String, body: Option<Value>) -> Result<()> {
     let client = reqwest::Client::new();
     let mut request = client
         .request(method.parse()?, format!("{}{}", cli.endpoint, path))
-        .bearer_auth(&cli.token);
+        .bearer_auth(server_token(cli)?);
     if let Some(body) = body {
         request = request.json(&body)
     };
@@ -870,7 +952,7 @@ async fn call_memory(cli: &Cli, method: &str, path: String, body: Option<Value>)
     let client = reqwest::Client::new();
     let mut request = client
         .request(method.parse()?, format!("{}{}", cli.endpoint, path))
-        .bearer_auth(&cli.token);
+        .bearer_auth(server_token(cli)?);
     if let Some(token) = &cli.memory_token {
         request = request.header("x-ferryman-memory-token", token);
     };
@@ -889,7 +971,7 @@ async fn call_memory(cli: &Cli, method: &str, path: String, body: Option<Value>)
 async fn call_approver(cli: &Cli, method: &str, path: String, approver: &str) -> Result<()> {
     let response = reqwest::Client::new()
         .request(method.parse()?, format!("{}{}", cli.endpoint, path))
-        .bearer_auth(&cli.token)
+        .bearer_auth(server_token(cli)?)
         .header("x-ferryman-approver", approver)
         .send()
         .await?;
@@ -900,4 +982,178 @@ async fn call_approver(cli: &Cli, method: &str, path: String, approver: &str) ->
     };
     println!("{text}");
     Ok(())
+}
+
+/// Channel commands, all of which work with nothing running.
+///
+/// Every one of these reads or writes the synced folder directly. There is no server to
+/// start, no port to open and no token to mint: locating the channel is a walk up the
+/// directory tree, and delivering a message is writing a file that Syncthing then
+/// carries. The server offers the same operations over HTTP for callers that want them,
+/// but it was never doing anything a local process could not do for itself.
+fn channel(command: Channel) -> Result<()> {
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+
+    match command {
+        Channel::Status { workspace } => {
+            let route = here(workspace)?;
+            let (outbox, acknowledgements, oldest, quarantined) =
+                ferryman_channel::filesystem_metrics(&route)?;
+            let messages = ferryman_channel::list_messages(&route)?;
+            println!("project        {}", route.project_id);
+            println!("channel        {}", route.communications.display());
+            println!(
+                "syncthing      {}",
+                if route.shared_remote.is_empty() {
+                    "(no folder id configured)".to_string()
+                } else {
+                    format!("folder '{}'", route.shared_remote)
+                }
+            );
+            println!(
+                "git backstop   {}",
+                if route.git_remote.is_empty() {
+                    "(none; Syncthing-only)".to_string()
+                } else {
+                    route.git_remote.clone()
+                }
+            );
+            println!("messages       {}", messages.len());
+            println!("outbox         {outbox} waiting, {acknowledgements} acknowledgements");
+            if let Some(age) = oldest {
+                println!("oldest queued  {age}s");
+            }
+            if quarantined > 0 {
+                println!("quarantined    {quarantined} (inspect before retrying)");
+            }
+        }
+
+        Channel::Join {
+            workspace,
+            name,
+            role,
+            capabilities,
+        } => {
+            let route = here(workspace)?;
+            let agent = ferryman_channel::AgentRoute {
+                name: name.unwrap_or_else(default_agent_name),
+                role,
+                capabilities: capabilities
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+                    .collect(),
+            };
+            let path = ferryman_channel::register_agent(&route, &agent)?;
+            println!("registered '{}' as {}", agent.name, path.display());
+            println!("it will appear on the other machines once Syncthing carries the folder");
+        }
+
+        Channel::Agents { workspace } => {
+            let route = here(workspace)?;
+            if route.agents.is_empty() {
+                println!("no agents registered yet - run `ferry channel join`");
+            }
+            for agent in &route.agents {
+                println!(
+                    "  {:<20} role={:<12} {}",
+                    agent.name,
+                    agent.role,
+                    agent.capabilities.join(",")
+                );
+            }
+        }
+
+        Channel::Send {
+            workspace,
+            from,
+            to,
+            body,
+            reply_expected,
+        } => {
+            let route = here(workspace)?;
+            let sender = match from {
+                Some(name) => name,
+                None => default_agent_name(),
+            };
+            // A body that looks like JSON is kept as JSON; anything else is text. Guessing
+            // wrong in either direction would be worse than being explicit about the rule.
+            let payload = if body.trim_start().starts_with('{') {
+                serde_json::from_str(&body).context("--body looked like JSON but did not parse")?
+            } else {
+                json!({ "text": body })
+            };
+            let message = ferryman_channel::Message::new(
+                route.project_id.clone(),
+                sender,
+                to,
+                "text/plain",
+                payload,
+                reply_expected,
+                None,
+            );
+            let mut engine = ferryman_channel::system_delivery_engine();
+            let receipt = engine.send(&route, &message)?;
+            println!("{}", serde_json::to_string_pretty(&receipt)?);
+        }
+
+        Channel::Inbox {
+            workspace,
+            agent,
+            all,
+        } => {
+            let route = here(workspace)?;
+            let messages = ferryman_channel::list_messages(&route)?;
+            let mine: Vec<_> = messages
+                .into_iter()
+                .filter(|m| m.recipient == agent || m.recipient == "all")
+                .filter(|m| all || !ferryman_channel::is_acknowledged(&route, &m.id))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&mine)?);
+        }
+
+        Channel::Log { workspace, limit } => {
+            let route = here(workspace)?;
+            let mut messages = ferryman_channel::list_messages(&route)?;
+            messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            for message in messages.iter().rev().take(limit).rev() {
+                println!(
+                    "{}  {} -> {}  {}{}",
+                    message.created_at.format("%Y-%m-%d %H:%M:%SZ"),
+                    message.sender,
+                    message.recipient,
+                    message
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map_or_else(|| message.payload.to_string(), ToString::to_string),
+                    if message.reply_required {
+                        "  [reply expected]"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// An agent names itself after the machine it runs on, so two agents in a fleet cannot
+/// accidentally answer to the same name.
+fn default_agent_name() -> String {
+    std::env::var("FERRYMAN_AGENT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "agent".into())
+        .to_lowercase()
 }
