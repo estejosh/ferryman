@@ -18,10 +18,13 @@ middle, no ports to forward, no cloud account — and the coordination lives in 
 private repository, kept separate from the work itself.
 
 ```sh
-# a prebuilt binary from the latest release, or: cargo install --git <this repo> ferryman-cli
+npm install -g ferryman-cli                                # or the curl line below
 cd your-project && ferry enable --email you@example.com    # that's setup, all of it
 ferry agent run                                            # this machine now does work
 ```
+
+No Rust toolchain, no compile. Without node:
+`curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh`
 
 **Point your agent at [docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md) and it can do
 that itself.** `ferry enable` never prompts, is safe to run twice, and reports in JSON —

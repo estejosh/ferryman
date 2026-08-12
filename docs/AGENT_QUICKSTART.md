@@ -18,19 +18,21 @@ code or git history.
 
 ## Step 1 — install
 
-Prefer the prebuilt binary — no toolchain, no compile:
+One line, no toolchain and no compile:
 
 ```sh
-# pick the asset for your platform from the latest release
-curl -fsSLO https://github.com/estejosh/ferryman/releases/latest/download/ferry-x86_64-unknown-linux-gnu.tar.gz
-curl -fsSLO https://github.com/estejosh/ferryman/releases/latest/download/ferry-x86_64-unknown-linux-gnu.tar.gz.sha256
-shasum -a 256 -c ferry-x86_64-unknown-linux-gnu.tar.gz.sha256
-tar xzf ferry-x86_64-unknown-linux-gnu.tar.gz
-sudo install ferry-x86_64-unknown-linux-gnu/ferry /usr/local/bin/ferry
+npm install -g ferryman-cli
 ```
 
-Check the checksum rather than skipping it; you are about to run this thing with your
-own privileges.
+Or without node:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
+```
+
+Both verify the download's SHA-256 before installing anything, and abort on a mismatch
+rather than warning. If you are tempted to work around a checksum failure: don't, and
+report it.
 
 Building from source also works, and needs a Rust toolchain plus, on Linux, D-Bus
 headers for the OS credential store (`libdbus-1-dev pkg-config` on Debian/Ubuntu,
