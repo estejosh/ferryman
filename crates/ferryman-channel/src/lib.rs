@@ -1464,7 +1464,9 @@ pub fn register_agent(route: &ProjectRoute, agent: &AgentRoute) -> Result<PathBu
 pub fn route_for(start: &Path) -> Result<ProjectRoute> {
     let attachment = discover_attachment(start).with_context(|| {
         format!(
-            "no Ferryman channel found in {} or any parent directory; attach one with scripts/attach-project.sh",
+            // Names the command that fixes it, not a script in a repository the reader
+            // may not have checked out. An agent that hits this needs one runnable line.
+            "no Ferryman channel found in {} or any parent directory; run 'ferry enable --email you@example.com' here",
             start.display()
         )
     })?;
