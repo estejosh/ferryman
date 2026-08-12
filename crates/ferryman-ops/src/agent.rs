@@ -21,6 +21,7 @@
 //! least-privilege account and its own disposable directory, and prefer the agent's own
 //! sandbox flags over trusting this process to hold it back.
 
+use crate::Progress;
 use anyhow::{Context, Result, anyhow, bail};
 use ferryman_channel::{
     AgentIdentity, ProjectRoute, Recommendation, Review, Task, TaskResult, TaskState,
@@ -392,7 +393,11 @@ fn parse_verdict(output: &str) -> Result<Verdict> {
 ///
 /// Separate from the loop so it can be run once (`--once`) in a cron job or a test,
 /// rather than only as a daemon.
-pub async fn work_once(route: &ProjectRoute, config: &AgentConfig) -> Result<usize> {
+pub async fn work_once(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    report: &dyn Progress,
+) -> Result<usize> {
     let identity = AgentIdentity::load_or_create(&config.agent, &route.attachment)?;
     let mut acted = 0;
     for task in ferryman_channel::work_for(route, &config.agent)? {
@@ -405,17 +410,17 @@ pub async fn work_once(route: &ProjectRoute, config: &AgentConfig) -> Result<usi
                 // how two agents end up doing the same task.
                 let task = ferryman_channel::read_task(route, &id)?;
                 if task.holder() != Some(config.agent.as_str()) {
-                    println!(
+                    report.info(&format!(
                         "  {id}: {} claimed it first, backing off",
                         task.holder().unwrap_or("someone")
-                    );
+                    ));
                     continue;
                 }
-                do_work(route, config, &identity, &task).await?;
+                do_work(route, config, &identity, &task, report).await?;
                 acted += 1;
             }
             TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
-                do_work(route, config, &identity, &task).await?;
+                do_work(route, config, &identity, &task, report).await?;
                 acted += 1;
             }
             _ => {}
@@ -429,10 +434,14 @@ async fn do_work(
     config: &AgentConfig,
     identity: &AgentIdentity,
     task: &Task,
+    report: &dyn Progress,
 ) -> Result<()> {
     let id = &task.order.id;
     let revision = task.latest_revision().unwrap_or(0) + 1;
-    println!("  {id}: running {} (revision {revision})", config.command);
+    report.info(&format!(
+        "  {id}: running {} (revision {revision})",
+        config.command
+    ));
     let run = run_agent(config, &work_prompt(task)).await?;
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
@@ -457,17 +466,21 @@ async fn do_work(
     };
     identity.sign_result(&mut result);
     ferryman_channel::submit_result(route, &result)?;
-    println!(
+    report.info(&format!(
         "  {id}: submitted revision {revision}, signed by {}",
         config.agent
-    );
+    ));
     Ok(())
 }
 
 /// Judge whatever is waiting, according to the authority the operator granted.
-pub async fn review_once(route: &ProjectRoute, config: &AgentConfig) -> Result<usize> {
+pub async fn review_once(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    report: &dyn Progress,
+) -> Result<usize> {
     if config.review == ReviewMode::Off {
-        println!("review is off; results wait for a person");
+        report.info("review is off; results wait for a person");
         return Ok(0);
     }
     let identity = AgentIdentity::load_or_create(&config.agent, &route.attachment)?;
@@ -490,7 +503,7 @@ pub async fn review_once(route: &ProjectRoute, config: &AgentConfig) -> Result<u
             continue;
         }
         let id = task.order.id.clone();
-        println!("  {id}: judging revision {revision}");
+        report.info(&format!("  {id}: judging revision {revision}"));
         let run = run_agent(config, &review_prompt(&task, revision)).await?;
         if !run.ok {
             bail!(
@@ -515,7 +528,7 @@ pub async fn review_once(route: &ProjectRoute, config: &AgentConfig) -> Result<u
                 };
                 identity.sign_review(&mut review);
                 ferryman_channel::submit_review(route, &review)?;
-                println!(
+                report.info(&format!(
                     "  {id}: {} - {}",
                     if verdict.accept {
                         "accepted"
@@ -523,7 +536,7 @@ pub async fn review_once(route: &ProjectRoute, config: &AgentConfig) -> Result<u
                         "sent back"
                     },
                     verdict.reasoning
-                );
+                ));
             }
             ReviewMode::Confirm => {
                 let mut recommendation = Recommendation {
@@ -538,23 +551,25 @@ pub async fn review_once(route: &ProjectRoute, config: &AgentConfig) -> Result<u
                 };
                 identity.sign_recommendation(&mut recommendation);
                 ferryman_channel::submit_recommendation(route, &recommendation)?;
-                println!(
+                report.info(&format!(
                     "  {id}: recommends {} - {}",
                     if verdict.accept { "accept" } else { "changes" },
                     verdict.reasoning
-                );
-                println!("  {id}: waiting for a human; settle it with 'ferry channel review'");
+                ));
+                report.info(&format!(
+                    "  {id}: waiting for a human; settle it with 'ferry channel review'"
+                ));
             }
             ReviewMode::Off => unreachable!("returned above"),
         }
         acted += 1;
     }
     if acted == 0 && skipped_own > 0 {
-        println!(
+        report.info(&format!(
             "  {skipped_own} result(s) waiting, but all of them are '{}'s own work - \
              an agent does not review itself. Run the reviewer as a different agent.",
             config.agent
-        );
+        ));
     }
     Ok(acted)
 }

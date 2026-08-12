@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
-mod agent;
-mod enable;
 mod license;
+
+use ferryman_ops::agent;
+use ferryman_ops::enable;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -622,7 +623,7 @@ async fn main() -> Result<()> {
             no_syncthing,
             json: as_json,
         } => {
-            enable::run(enable::Request {
+            let outcome = enable::perform(enable::Request {
                 workspace,
                 project,
                 agent: agent_name,
@@ -633,6 +634,11 @@ async fn main() -> Result<()> {
                 no_syncthing,
                 as_json,
             })?;
+            if as_json {
+                report_enable_json(&outcome)?;
+            } else {
+                report_enable_human(&outcome);
+            }
         }
         Command::Agent { command } => agent_command(command).await?,
         Command::License { command } => license_command(command).await?,
@@ -980,6 +986,95 @@ async fn main() -> Result<()> {
     };
     Ok(())
 }
+
+/// The machine-readable half of `ferry enable`.
+///
+/// This lives in the binary rather than in `ferryman-ops` because it is a *presentation*
+/// of the outcome, and the library has other callers - a tray application wants the
+/// `Outcome` struct, not a string it has to parse back.
+fn report_enable_json(outcome: &enable::Outcome) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&json!({
+            "enabled": true,
+            "project": outcome.project,
+            "agent": outcome.agent,
+            "workspace": outcome.workspace.display().to_string(),
+            "channel": outcome.route.communications.display().to_string(),
+            "syncthing": outcome.syncthing,
+            "agent_command": outcome.config.command,
+            "review": outcome.config.review.as_str(),
+            "public_key": outcome.public_key,
+            "already_configured": outcome.steps.iter().all(|s| !s.created),
+            "license": {
+                "seats": outcome.counted.seats,
+                "computers": outcome.counted.computers,
+                "mobile_devices": outcome.counted.mobile_devices,
+                "agents": "unlimited",
+                "over_limit": outcome.counted.over_limit(),
+                "exceeded": outcome.counted.exceeded(),
+            },
+            "files": outcome.steps.iter().map(|s| json!({
+                "what": s.what,
+                "path": s.path.display().to_string(),
+                "created": s.created,
+            })).collect::<Vec<_>>(),
+            "next": {
+                "share_this_folder": outcome.route.communications.display().to_string(),
+                "with_folder_id": format!("{}-ferryman", outcome.project),
+                "then_run": ["ferry agent run", "ferry agent review"],
+            },
+        }))?
+    );
+    Ok(())
+}
+
+/// The same facts, for a person.
+fn report_enable_human(outcome: &enable::Outcome) {
+    println!("ferryman enabled for '{}'", outcome.project);
+    for step in &outcome.steps {
+        println!(
+            "  {:<16} {}  {}",
+            step.what,
+            if step.created { "created" } else { "present" },
+            step.path.display()
+        );
+    }
+    println!();
+    println!("  agent      {}", outcome.agent);
+    println!("  runs       {}", outcome.config.command);
+    println!("  review     {}", outcome.config.review.as_str());
+    println!("  public key {}", outcome.public_key);
+    println!();
+    match &outcome.syncthing {
+        Some(setup) if setup.available => {
+            println!("  syncthing  folder '{}' registered", setup.folder_id);
+            if setup.shared_with.is_empty() {
+                println!("             no other devices paired yet");
+            } else {
+                for peer in &setup.shared_with {
+                    println!("             shared with {}", peer.name);
+                }
+            }
+            if let Some(id) = &setup.device_id {
+                println!("             this device: {id}");
+            }
+        }
+        Some(setup) => println!("  syncthing  not wired: {}", setup.note),
+        None => println!("  syncthing  skipped (--no-syncthing)"),
+    }
+    println!();
+    println!("Then, on each machine:");
+    println!("  ferry agent run        # does work");
+    println!("  ferry agent review     # judges results");
+    if outcome.counted.over_limit() {
+        eprint!(
+            "{}",
+            ferryman_channel::licensing::over_limit_notice(&outcome.counted)
+        );
+    }
+}
+
 async fn jobs(cli: &Cli, command: Jobs) -> Result<()> {
     match command {
         Jobs::Submit {
@@ -1242,7 +1337,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 config.agent, route.project_id, config.command
             );
             loop {
-                match agent::work_once(&route, &config).await {
+                match agent::work_once(&route, &config, &ferryman_ops::Stdout).await {
                     Ok(0) => {}
                     Ok(count) => println!("did {count} task(s)"),
                     Err(error) => eprintln!("pass failed, will retry: {error:#}"),
@@ -1263,7 +1358,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 config.review.as_str()
             );
             loop {
-                match agent::review_once(&route, &config).await {
+                match agent::review_once(&route, &config, &ferryman_ops::Stdout).await {
                     Ok(0) => {}
                     Ok(count) => println!("judged {count} result(s)"),
                     Err(error) => eprintln!("pass failed, will retry: {error:#}"),

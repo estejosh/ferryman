@@ -23,7 +23,6 @@
 
 use anyhow::{Context, Result, bail};
 use ferryman_channel::{AgentRoute, ProjectRoute};
-use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
 
@@ -44,37 +43,27 @@ pub struct Request {
 }
 
 /// A file this run created, or found already correct.
-struct Step {
-    what: &'static str,
-    path: PathBuf,
-    created: bool,
+pub struct Step {
+    pub what: &'static str,
+    pub path: PathBuf,
+    pub created: bool,
 }
 
 /// Everything the caller needs to know, separated from how it is printed so the same
 /// facts drive the human output, the JSON and the tests.
-struct Outcome {
-    project: String,
-    syncthing: Option<ferryman_channel::SyncthingSetup>,
-    counted: ferryman_channel::licensing::FleetCount,
-    agent: String,
-    workspace: PathBuf,
-    route: ProjectRoute,
-    public_key: String,
-    config: AgentConfig,
-    steps: Vec<Step>,
+pub struct Outcome {
+    pub project: String,
+    pub syncthing: Option<ferryman_channel::SyncthingSetup>,
+    pub counted: ferryman_channel::licensing::FleetCount,
+    pub agent: String,
+    pub workspace: PathBuf,
+    pub route: ProjectRoute,
+    pub public_key: String,
+    pub config: AgentConfig,
+    pub steps: Vec<Step>,
 }
 
-pub fn run(request: Request) -> Result<()> {
-    let as_json = request.as_json;
-    let outcome = perform(request)?;
-    if as_json {
-        report_json(&outcome)
-    } else {
-        report_human(&outcome)
-    }
-}
-
-fn perform(request: Request) -> Result<Outcome> {
+pub fn perform(request: Request) -> Result<Outcome> {
     let workspace = match request.workspace {
         Some(path) => path,
         None => std::env::current_dir().context("read the current directory")?,
@@ -267,89 +256,6 @@ fn perform(request: Request) -> Result<Outcome> {
     })
 }
 
-fn report_json(outcome: &Outcome) -> Result<()> {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&json!({
-            "enabled": true,
-            "project": outcome.project,
-            "agent": outcome.agent,
-            "workspace": outcome.workspace.display().to_string(),
-            "channel": outcome.route.communications.display().to_string(),
-            "syncthing": outcome.syncthing,
-            "agent_command": outcome.config.command,
-            "review": outcome.config.review.as_str(),
-            "public_key": outcome.public_key,
-            "already_configured": outcome.steps.iter().all(|s| !s.created),
-            "license": {
-                "seats": outcome.counted.seats,
-                "computers": outcome.counted.computers,
-                "mobile_devices": outcome.counted.mobile_devices,
-                "agents": "unlimited",
-                "over_limit": outcome.counted.over_limit(),
-                "exceeded": outcome.counted.exceeded(),
-            },
-            "files": outcome.steps.iter().map(|s| json!({
-                "what": s.what,
-                "path": s.path.display().to_string(),
-                "created": s.created,
-            })).collect::<Vec<_>>(),
-            "next": {
-                "share_this_folder": outcome.route.communications.display().to_string(),
-                "with_folder_id": format!("{}-ferryman", outcome.project),
-                "then_run": ["ferry agent run", "ferry agent review"],
-            },
-        }))?
-    );
-    Ok(())
-}
-
-fn report_human(outcome: &Outcome) -> Result<()> {
-    println!("ferryman enabled for '{}'", outcome.project);
-    for step in &outcome.steps {
-        println!(
-            "  {:<16} {}  {}",
-            step.what,
-            if step.created { "created" } else { "present" },
-            step.path.display()
-        );
-    }
-    println!();
-    println!("  agent      {}", outcome.agent);
-    println!("  runs       {}", outcome.config.command);
-    println!("  review     {}", outcome.config.review.as_str());
-    println!("  public key {}", outcome.public_key);
-    println!();
-    match &outcome.syncthing {
-        Some(setup) if setup.available => {
-            println!("  syncthing  folder '{}' registered", setup.folder_id);
-            if setup.shared_with.is_empty() {
-                println!("             no other devices paired yet");
-            } else {
-                for peer in &setup.shared_with {
-                    println!("             shared with {}", peer.name);
-                }
-            }
-            if let Some(id) = &setup.device_id {
-                println!("             this device: {id}");
-            }
-        }
-        Some(setup) => println!("  syncthing  not wired: {}", setup.note),
-        None => println!("  syncthing  skipped (--no-syncthing)"),
-    }
-    println!();
-    println!("Then, on each machine:");
-    println!("  ferry agent run        # does work");
-    println!("  ferry agent review     # judges results");
-    if outcome.counted.over_limit() {
-        eprint!(
-            "{}",
-            ferryman_channel::licensing::over_limit_notice(&outcome.counted)
-        );
-    }
-    Ok(())
-}
-
 /// This machine's name, lowercased and made path-safe.
 fn default_agent_name() -> String {
     let raw = std::env::var("FERRYMAN_AGENT")
@@ -392,7 +298,7 @@ mod tests {
     use super::*;
 
     fn enable_in(dir: &std::path::Path) -> Result<()> {
-        run(Request {
+        perform(Request {
             workspace: Some(dir.to_path_buf()),
             project: Some("demo".into()),
             agent: Some("tester".into()),
@@ -402,7 +308,8 @@ mod tests {
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
-        })
+        })?;
+        Ok(())
     }
 
     #[test]

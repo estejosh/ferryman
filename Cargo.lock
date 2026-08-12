@@ -592,6 +592,7 @@ dependencies = [
  "chrono",
  "clap",
  "ferryman-channel",
+ "ferryman-ops",
  "futures-util",
  "hex",
  "keyring",
@@ -622,6 +623,18 @@ dependencies = [
  "sha2",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "ferryman-ops"
+version = "0.3.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ferryman-channel",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

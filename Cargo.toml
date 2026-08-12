@@ -4,6 +4,7 @@ members = [
   "crates/ferryman-core",
   "crates/ferryman-server",
   "crates/ferryman-cli",
+  "crates/ferryman-ops",
   "crates/ferryman-worker-sdk",
 ]
 resolver = "2"

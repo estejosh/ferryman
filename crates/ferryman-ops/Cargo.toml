@@ -1,0 +1,15 @@
+[package]
+name = "ferryman-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ferryman operations: enable a project, run the worker and reviewer loops."
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+ferryman-channel = { path = "../ferryman-channel" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
