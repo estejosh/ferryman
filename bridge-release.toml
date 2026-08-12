@@ -1,6 +1,6 @@
 # Versioned compatibility declaration consumed by opt-in Bridge installations.
 format = "ferryman-release/v1"
-version = "0.3.0"
+version = "0.3.1"
 channel = "preview"
 minimum_project_manifest = "ferryman-project/v1"
 release_notes = "Local-first encrypted continuity packs and explicit update controls."

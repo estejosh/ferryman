@@ -1,6 +1,6 @@
 {
   "name": "ferryman-cli",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Private coordination for a fleet of AI agents, across machines you own. No server, no ports, no cloud account.",
   "keywords": ["agents", "ai", "orchestration", "syncthing", "p2p", "cli"],
   "homepage": "https://github.com/estejosh/ferryman",
