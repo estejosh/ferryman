@@ -8,11 +8,25 @@ it will install Ferryman and put this project on it, without asking you anything
 ```
 Install Ferryman on this project and join it to my fleet.
 
-1. Install it:
-     npm install -g ferryman-cli
-   If npm is unavailable:
-     curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
+1. Install it, using whichever line fits this machine:
+
+     macOS / Linux:
+       curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
+
+     Windows (PowerShell):
+       irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex
+
+     If node is already here, either platform:
+       npm install -g ferryman-cli
+
+   Do not run the curl line on Windows: there is no `sh` on a default Windows
+   machine and it will fail with "'sh' is not recognized".
+
    Confirm with: ferry --version
+
+   Ferryman also needs Syncthing installed and running to reach other machines.
+   It does not install Syncthing, and it will tell you so if it cannot find it:
+   https://syncthing.net/downloads/
 
 2. From the project directory, run:
      ferry enable --email <MY_EMAIL> --json

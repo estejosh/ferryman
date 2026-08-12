@@ -136,8 +136,27 @@ pub fn perform(request: Request) -> Result<Outcome> {
     let ignore = communications.join(".stignore");
     let ignore_created = !ignore.exists();
     if ignore_created {
-        fs::write(&ignore, "keys\n*.tmp\n*.key\n")
-            .with_context(|| format!("write {}", ignore.display()))?;
+        fs::write(
+            &ignore,
+            // A 6 MB `ferry` binary turned up in a real channel. It was put there by an
+            // operator rather than by Ferryman, but a coordination channel has no reason
+            // to carry executables at all, and one that does is a way to hand every
+            // machine in a fleet a program to run. Refusing the whole class is cheap.
+            "keys\n\
+             *.tmp\n\
+             *.key\n\
+             *.exe\n\
+             *.dll\n\
+             *.so\n\
+             *.dylib\n\
+             *.msi\n\
+             *.bat\n\
+             *.cmd\n\
+             *.ps1\n\
+             *.sh\n\
+             local\n",
+        )
+        .with_context(|| format!("write {}", ignore.display()))?;
     }
     steps.push(Step {
         what: "sync exclusions",

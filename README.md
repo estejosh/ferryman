@@ -21,8 +21,11 @@ cd your-project && ferry enable --email you@example.com    # that's setup, all o
 ferry agent run                                            # this machine now does work
 ```
 
-No Rust toolchain, no compile. Without node:
+No Rust toolchain, no compile. Without node — macOS and Linux:
 `curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh`
+
+On Windows, in PowerShell:
+`irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex`
 
 **Or don't run it yourself.** [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) is a
 block you paste into any coding agent — it installs Ferryman, enables the project, wires

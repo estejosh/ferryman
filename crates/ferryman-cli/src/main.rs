@@ -4,7 +4,7 @@ mod license;
 use ferryman_ops::agent;
 use ferryman_ops::enable;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -1600,6 +1600,24 @@ fn channel(command: Channel) -> Result<()> {
             all,
         } => {
             let route = here(workspace)?;
+            // An inbox for a name nobody registered is not empty, it is a typo. Printing
+            // `[]` for both makes a misspelled name indistinguishable from silence.
+            let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+            if !roster.iter().any(|entry| entry.name == agent) {
+                let known = roster
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "no agent called '{agent}' has joined this channel{}",
+                    if known.is_empty() {
+                        "; nobody has joined yet".to_string()
+                    } else {
+                        format!("; the roster has: {known}")
+                    }
+                )
+            }
             let messages = ferryman_channel::list_messages(&route)?;
             let mine: Vec<_> = messages
                 .into_iter()
@@ -1610,7 +1628,11 @@ fn channel(command: Channel) -> Result<()> {
                     serde_json::json!({ "message": m, "signature": format!("{verdict:?}") })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&mine)?);
+            if mine.is_empty() {
+                println!("nothing waiting for {agent}");
+            } else {
+                println!("{}", serde_json::to_string_pretty(&mine)?);
+            }
         }
 
         Channel::Order {
