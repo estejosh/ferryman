@@ -18,9 +18,9 @@ middle, no ports to forward, no cloud account — and the coordination lives in 
 private repository, kept separate from the work itself.
 
 ```sh
-cargo install --git https://github.com/estejosh/ferryman ferryman-cli
-cd your-project && ferry enable      # that's setup, all of it
-ferry agent run                      # this machine now does work
+# a prebuilt binary from the latest release, or: cargo install --git <this repo> ferryman-cli
+cd your-project && ferry enable --email you@example.com    # that's setup, all of it
+ferry agent run                                            # this machine now does work
 ```
 
 **Point your agent at [docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md) and it can do
@@ -220,16 +220,27 @@ macOS and Windows use their native keychains and need nothing extra.
 Honest about where this is:
 
 **Solid.** The channel, the Syncthing transport, project attachment, approval gates,
-shared memory, the audit trail, continuity packs, and the container. All covered by the
-test suite.
+shared memory, the audit trail, continuity packs, and the container. Messages, orders,
+results and reviews all travel as files and cross networks without anything reachable.
+All covered by the test suite.
 
-**Working, but young.** Messages, orders, results and reviews all travel as files and
-work across networks. The older HTTP job/worker protocol still exists alongside it for
-callers that want a server, and that half does still need machines to reach each other —
-see [communications readiness](docs/COMMUNICATIONS_READINESS.md).
+**Working, but young.** The agentic loops — `ferry agent run` and `ferry agent review`,
+where an agent picks work up, does it, and another judges what comes back — work end to
+end and are new. They have been exercised against a real agent CLI across a shared
+channel, not only in tests, but they have not yet been run for weeks by strangers, which
+is the only thing that finds the last set of problems.
+
+Review authority is yours to set: `auto` lets the reviewing agent decide, `confirm` has
+it explain and leaves the decision with you, `off` keeps models out of it. `confirm` is
+the default because it is the cautious end, not because it is the recommendation.
+
+The older HTTP job/worker protocol still exists alongside the file model for callers who
+want a server, and that half does still need machines to reach each other — see
+[communications readiness](docs/COMMUNICATIONS_READINESS.md).
 
 **Not built yet.** PostgreSQL, RBAC, workflow graphs and a dashboard are design targets,
-not implementations.
+not implementations. A phone cannot register itself for licence counting, because by
+definition it does not run Ferryman; it has to be recorded from another machine for now.
 
 **Not a sandbox.** Ferryman coordinates agents; it does not contain them. An agent
 worker runs with the privileges of the account that started it. Give each worker its own

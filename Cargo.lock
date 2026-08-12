@@ -567,7 +567,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "ferryman-channel"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -660,7 +660,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-worker-sdk"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ferryman-core",

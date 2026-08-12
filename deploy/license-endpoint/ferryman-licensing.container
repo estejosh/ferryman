@@ -1,0 +1,42 @@
+# Quadlet unit for the check-in receiver.
+#
+# Install to ~/.config/containers/systemd/ferryman-licensing.container, then:
+#   systemctl --user daemon-reload
+#   systemctl --user start ferryman-licensing
+#
+# Rootless on purpose. This service accepts unauthenticated POSTs from the internet;
+# there is no reason for it to be able to do anything as root if it is ever broken into.
+
+[Unit]
+Description=Ferryman licence check-in receiver
+After=network-online.target
+
+[Container]
+Image=localhost/ferryman-licensing:latest
+ContainerName=ferryman-licensing
+
+# Bound to loopback: put a TLS-terminating proxy in front. Exposing this directly would
+# mean plaintext email addresses crossing the internet, which contradicts PRIVACY.md.
+PublishPort=127.0.0.1:8799:8799
+
+# The check-in history. Losing this loses every record of who is over the free tier.
+Volume=ferryman-licensing-data:/data
+
+# Alerting. Put the SMTP password in an environment file with 0600 permissions rather
+# than inline here - a unit file is world-readable by default.
+Environment=FERRYMAN_ALERT_TO=you@example.com
+Environment=FERRYMAN_SMTP_HOST=smtp.example.com
+Environment=FERRYMAN_SMTP_PORT=587
+EnvironmentFile=-%h/.config/ferryman-licensing.env
+
+# It holds no secret worth the blast radius of a writable filesystem, apart from the
+# check-in log, which lives on its own volume.
+ReadOnly=true
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

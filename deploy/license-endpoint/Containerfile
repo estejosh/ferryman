@@ -1,0 +1,27 @@
+# The check-in receiver. Python's own base image, no packages installed, because the
+# server is standard library only and every dependency added here is one more thing to
+# patch on a box nobody logs into.
+FROM docker.io/library/python:3.13-slim
+
+# Unbuffered so `podman logs` shows a check-in the moment it lands rather than when the
+# buffer happens to flush - this thing is watched by tailing its log.
+ENV PYTHONUNBUFFERED=1 \
+    FERRYMAN_STORE=/data/checkins.jsonl \
+    FERRYMAN_PORT=8799
+
+RUN useradd --system --uid 10001 --create-home ferryman
+WORKDIR /home/ferryman
+COPY server.py /home/ferryman/server.py
+
+# The record of who is using Ferryman lives here. Mount a volume on it or a container
+# rebuild takes your customer list with it.
+RUN mkdir -p /data && chown -R ferryman:ferryman /data /home/ferryman
+VOLUME ["/data"]
+
+USER ferryman
+EXPOSE 8799
+
+HEALTHCHECK --interval=60s --timeout=5s --start-period=5s \
+  CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8799/health', timeout=4).status==200 else 1)"
+
+CMD ["python3", "/home/ferryman/server.py"]

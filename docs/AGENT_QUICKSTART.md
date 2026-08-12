@@ -18,13 +18,29 @@ code or git history.
 
 ## Step 1 — install
 
+Prefer the prebuilt binary — no toolchain, no compile:
+
+```sh
+# pick the asset for your platform from the latest release
+curl -fsSLO https://github.com/estejosh/ferryman/releases/latest/download/ferry-x86_64-unknown-linux-gnu.tar.gz
+curl -fsSLO https://github.com/estejosh/ferryman/releases/latest/download/ferry-x86_64-unknown-linux-gnu.tar.gz.sha256
+shasum -a 256 -c ferry-x86_64-unknown-linux-gnu.tar.gz.sha256
+tar xzf ferry-x86_64-unknown-linux-gnu.tar.gz
+sudo install ferry-x86_64-unknown-linux-gnu/ferry /usr/local/bin/ferry
+```
+
+Check the checksum rather than skipping it; you are about to run this thing with your
+own privileges.
+
+Building from source also works, and needs a Rust toolchain plus, on Linux, D-Bus
+headers for the OS credential store (`libdbus-1-dev pkg-config` on Debian/Ubuntu,
+`dbus-devel pkgconf` on Fedora):
+
 ```sh
 cargo install --git https://github.com/estejosh/ferryman ferryman-cli
 ```
 
-Needs a Rust toolchain and, on Linux, D-Bus headers for the OS credential store
-(`libdbus-1-dev pkg-config` on Debian/Ubuntu, `dbus-devel pkgconf` on Fedora). If you
-would rather not build, the container carries everything:
+Or the container, which carries everything including Syncthing:
 
 ```sh
 podman run -d --name ferryman -v ~/ferryman-channels:/channels:U \

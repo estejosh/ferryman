@@ -1,0 +1,93 @@
+# Builds the binaries a release page needs, so adopting Ferryman does not require a
+# Rust toolchain and a two-minute compile.
+#
+# Runs on a v* tag. Each target builds on its own runner rather than cross-compiling,
+# because a binary built on the OS it targets is the one least likely to fail in a way
+# nobody sees until a stranger reports it.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  # Lets a release be re-cut without moving the tag, when only the packaging was wrong.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and attach to'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  binaries:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing must not delete the others' artefacts: a release with three
+      # of four platforms is worth publishing while the fourth is fixed.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      # The OS credential store needs D-Bus headers on Linux, and nowhere else. This is
+      # the same dependency the README tells people to install when building by hand.
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p ferryman-cli
+
+      # Packaged per-OS: tar.gz where tar is native, zip on Windows, so the download
+      # opens with a double click rather than needing a tool the user may not have.
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ferry-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/ferry" "dist/$name/"
+          cp README.md LICENSE PRIVACY.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "ferry-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/ferry.exe" "dist/$name/"
+          Copy-Item README.md, LICENSE, PRIVACY.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
+            Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ferry-*.tar.gz
+            ferry-*.tar.gz.sha256
+            ferry-*.zip
+            ferry-*.zip.sha256
+          fail_on_unmatched_files: true
