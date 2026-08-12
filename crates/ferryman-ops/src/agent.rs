@@ -244,10 +244,11 @@ async fn run_agent(config: &AgentConfig, prompt: &str) -> Result<AgentRun> {
     // spawn on Windows, where the API is safe to use, so there is no window at full
     // priority.
     #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(crate::priority::BELOW_NORMAL_PRIORITY_CLASS);
-    }
+    // tokio's Command carries its own inherent `creation_flags` on Windows, so the
+    // std CommandExt trait is deliberately not imported - doing so is an unused import
+    // that only a Windows build reports, which is exactly the kind of warning a
+    // Linux-only clippy run cannot catch.
+    command.creation_flags(crate::priority::BELOW_NORMAL_PRIORITY_CLASS);
     let mut child = command
         .spawn()
         .with_context(|| format!("start '{}'; is it installed and on PATH?", config.command))?;

@@ -135,6 +135,54 @@ fn device_id_path(attachment: &Path) -> PathBuf {
     attachment.join("device.json")
 }
 
+/// Where this *machine's* identity lives, outside any one project.
+///
+/// The id used to be stored per attachment, so enabling three projects on one computer
+/// minted three device ids and the fleet counted one machine as three. That number
+/// decides free-tier eligibility, and no output could tell "two computers" from "this
+/// computer, enabled twice".
+///
+/// `None` when no per-user directory can be determined, in which case the caller falls
+/// back to the per-attachment file - a machine with no home directory should still work,
+/// and over-counting is a far better failure than refusing to run.
+fn machine_id_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("FERRYMAN_STATE_DIR") {
+        return Some(PathBuf::from(explicit).join("device.json"));
+    }
+    if cfg!(windows) {
+        return std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|local| PathBuf::from(local).join("Ferryman").join("device.json"));
+    }
+    if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        return Some(PathBuf::from(state).join("ferryman").join("device.json"));
+    }
+    std::env::var("HOME").ok().map(|home| {
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("ferryman")
+            .join("device.json")
+    })
+}
+
+fn read_local_device(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let existing: LocalDevice = serde_json::from_str(&text).ok()?;
+    is_safe_component(&existing.id).then_some(existing.id)
+}
+
+fn write_local_device(path: &Path, id: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&LocalDevice { id: id.to_string() })?,
+    )
+    .with_context(|| format!("write {}", path.display()))
+}
+
 #[derive(Serialize, Deserialize)]
 struct LocalDevice {
     id: String,
@@ -146,24 +194,49 @@ struct LocalDevice {
 /// the machine to the Licensor, which is more than counting requires and more than
 /// `PRIVACY.md` promises.
 pub fn device_id(attachment: &Path) -> Result<String> {
-    let path = device_id_path(attachment);
-    if let Ok(text) = fs::read_to_string(&path)
-        && let Ok(existing) = serde_json::from_str::<LocalDevice>(&text)
-        && is_safe_component(&existing.id)
+    device_id_with(attachment, machine_id_path())
+}
+
+/// The same, with the machine-wide location given rather than discovered. Exists so the
+/// tests can exercise the real logic without reading or writing the identity of the
+/// machine running them.
+#[cfg(test)]
+fn device_id_with_machine_file(attachment: &Path, machine: &Path) -> Result<String> {
+    device_id_with(attachment, Some(machine.to_path_buf()))
+}
+
+fn device_id_with(attachment: &Path, machine: Option<PathBuf>) -> Result<String> {
+    let per_project = device_id_path(attachment);
+
+    // The machine-wide file is the answer whenever it exists.
+    if let Some(path) = &machine
+        && let Some(id) = read_local_device(path)
     {
-        return Ok(existing.id);
+        // Keep the per-project copy in step so an older `ferry` on the same machine
+        // reports the same identity rather than minting a second one.
+        if read_local_device(&per_project).as_deref() != Some(id.as_str()) {
+            let _ = write_local_device(&per_project, &id);
+        }
+        return Ok(id);
     }
+
+    // Adopt an id this project already had rather than renaming the machine. A machine
+    // that has been counted for weeks should not become a new computer because it was
+    // upgraded.
+    if let Some(id) = read_local_device(&per_project) {
+        if let Some(path) = &machine {
+            let _ = write_local_device(path, &id);
+        }
+        return Ok(id);
+    }
+
     let mut bytes = [0u8; 16];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
     let id = hex::encode(bytes);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    if let Some(path) = &machine {
+        let _ = write_local_device(path, &id);
     }
-    fs::write(
-        &path,
-        serde_json::to_vec_pretty(&LocalDevice { id: id.clone() })?,
-    )
-    .with_context(|| format!("write {}", path.display()))?;
+    write_local_device(&per_project, &id)?;
     Ok(id)
 }
 
@@ -327,6 +400,58 @@ fn looks_like_email(value: &str) -> bool {
         && !domain.starts_with('.')
         && !domain.ends_with('.')
         && !value.contains(char::is_whitespace)
+}
+
+#[cfg(test)]
+mod device_identity {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ferryman-devid-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The bug: the id lived per attachment, so enabling three projects on one computer
+    /// minted three ids and the fleet counted one machine as three.
+    #[test]
+    fn two_projects_on_one_machine_share_one_id() {
+        let root = temp("shared");
+        let state = root.join("state");
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+
+        // Point the machine-wide location at a temp dir rather than the real one, so the
+        // test neither reads nor writes the developer's own device identity.
+        let first = device_id_with_machine_file(&a, &state.join("device.json")).unwrap();
+        let second = device_id_with_machine_file(&b, &state.join("device.json")).unwrap();
+        assert_eq!(first, second, "one machine must count as one computer");
+    }
+
+    /// The upgrade path. A machine already registered under a per-project id must keep
+    /// it: becoming a "new computer" on upgrade would inflate the count it just fixed.
+    #[test]
+    fn an_existing_project_id_is_adopted_not_replaced() {
+        let root = temp("adopt");
+        let state = root.join("state");
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        write_local_device(&device_id_path(&project), "0123456789abcdef").unwrap();
+
+        let id = device_id_with_machine_file(&project, &state.join("device.json")).unwrap();
+        assert_eq!(
+            id, "0123456789abcdef",
+            "an upgrade must not rename the machine"
+        );
+        assert_eq!(
+            read_local_device(&state.join("device.json")).as_deref(),
+            Some("0123456789abcdef"),
+            "and the id should be promoted so other projects agree"
+        );
+    }
 }
 
 #[cfg(test)]

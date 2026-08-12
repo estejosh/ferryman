@@ -37,6 +37,16 @@ pub fn status(route: &ProjectRoute, as_json: bool) -> Result<()> {
                 "over_limit": counted.over_limit(),
                 "exceeded": counted.exceeded(),
                 "registered_emails": licensing::registered_emails(&devices),
+                "this_device": licensing::device_id(&route.attachment).ok(),
+                "counted": devices.iter().map(|device| serde_json::json!({
+                    "id": device.id,
+                    "kind": match device.kind {
+                        licensing::DeviceKind::Computer => "computer",
+                        licensing::DeviceKind::Mobile => "mobile",
+                    },
+                    "operator_email": device.operator_email,
+                    "registered_at": device.registered_at,
+                })).collect::<Vec<_>>(),
                 "free_tier": {
                     "seats": licensing::FREE_SEATS,
                     "computers": licensing::FREE_COMPUTERS,
@@ -50,6 +60,32 @@ pub fn status(route: &ProjectRoute, as_json: bool) -> Result<()> {
     println!("  computers       {}", counted.computers);
     println!("  phones/tablets  {}", counted.mobile_devices);
     println!("  agents          unlimited, and never counted");
+    // The counts alone are unauditable: "computers 2" reads the same whether that is
+    // two machines or one machine registered twice, and it is the number that decides
+    // free-tier eligibility. Listing what was counted is what makes it checkable.
+    if !devices.is_empty() {
+        println!("\ncounted:");
+        let mut sorted: Vec<_> = devices.iter().collect();
+        sorted.sort_by_key(|device| device.registered_at);
+        let mine = licensing::device_id(&route.attachment).ok();
+        for device in sorted {
+            println!(
+                "  {:<9} {}  {}  registered {}{}",
+                match device.kind {
+                    licensing::DeviceKind::Computer => "computer",
+                    licensing::DeviceKind::Mobile => "mobile",
+                },
+                &device.id[..device.id.len().min(12)],
+                device.operator_email,
+                device.registered_at.format("%Y-%m-%d"),
+                if mine.as_deref() == Some(device.id.as_str()) {
+                    "  <- this machine"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
     if devices.is_empty() {
         println!("\nNothing registered yet. Run 'ferry enable --email you@example.com'.");
         return Ok(());
