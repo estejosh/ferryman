@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod enable;
+pub mod governor;
 pub mod identity;
 pub mod priority;
 

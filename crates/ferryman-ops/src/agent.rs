@@ -84,6 +84,9 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     pub timeout: Duration,
     pub review: ReviewMode,
+    /// Megabytes of memory to leave available. Below this the agent does not claim, so
+    /// the task stays open for a machine with room. 0 turns the check off.
+    pub min_free_ram_mb: u64,
     pub poll: Duration,
 }
 
@@ -161,6 +164,7 @@ impl AgentConfig {
                     .unwrap_or_else(|| "confirm".to_string()),
             )?,
             poll: Duration::from_secs(number("poll_secs", 10)?),
+            min_free_ram_mb: number("min_free_ram_mb", 1024)?,
         })
     }
 
@@ -199,6 +203,13 @@ review = "{review}"
 
 # How often to look for new work, in seconds.
 poll_secs = "10"
+
+# Megabytes of memory to leave available on this machine. If less than this is
+# free, this agent does not claim - the task simply stays open, so another
+# machine can take it and nothing is failed or lost. Lowering the agent's
+# priority stops it fighting you for CPU; only declining to start stops it
+# taking the last of your memory. Set to 0 to turn the check off.
+min_free_ram_mb = "1024"
 "#,
             review = review.as_str()
         )
@@ -416,7 +427,17 @@ pub async fn work_once(
 ) -> Result<usize> {
     let identity = AgentIdentity::load_or_create(&config.agent, &route.attachment)?;
     let mut acted = 0;
-    for task in ferryman_channel::work_for(route, &config.agent)? {
+    let waiting = ferryman_channel::work_for(route, &config.agent)?;
+    // Checked here rather than at the top of the loop so an idle machine stays quiet:
+    // with nothing to claim there is nothing to decline, and repeating "not enough
+    // memory" every poll would be noise about a non-event.
+    if !waiting.is_empty()
+        && let crate::governor::Decision::Wait(reason) = crate::governor::may_claim(config)
+    {
+        report.warn(&format!("holding off: {reason}"));
+        return Ok(0);
+    }
+    for task in waiting {
         let id = task.order.id.clone();
         match task.state() {
             TaskState::Open => {
