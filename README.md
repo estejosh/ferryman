@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/brand/svg/ferryman-logo-dark.svg">
-  <img src="assets/brand/svg/ferryman-logo.svg" alt="Ferryman - private coordination for AI agents" width="360">
+  <img src="assets/brand/svg/ferryman-logo.svg" alt="Ferryman - private coordination for AI agents" width="480">
 </picture>
 
 [![CI](https://github.com/estejosh/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/ci.yml)

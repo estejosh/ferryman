@@ -46,6 +46,24 @@ def mark_small(fill=NAVY):
     )
 
 
+def mark_logo(fill=NAVY):
+    """The logo mark: the wheel with its interior connections drawn.
+
+    Chords are deliberately absent from every icon size - they turn to mush below
+    128px and crowd the F. The logo is the one place with room for them, and it is
+    where the mark has to say *network* rather than just *wheel*, because it is
+    seen once at the top of a page instead of a hundred times in a tray.
+
+    Every pair of nodes is joined except the adjacent ones, whose chords would
+    only trace the ring they already sit on. The F is drawn last and solid, so it
+    reads over the web rather than through it."""
+    n = BASE["n_nodes"]
+    chords = [(i, j) for i in range(n) for j in range(i + 1, n)
+              if min(j - i, n - (j - i)) > 1]
+    return wheel_masked(**BASE, chords=chords, chord_w=0.95, knockout=0.0,
+                        fill=fill, f=f_path(**FF), uid="lg")
+
+
 def for_size(px, fill=NAVY):
     return mark_small(fill) if px < CROSSOVER else mark_full(fill)
 
@@ -95,7 +113,7 @@ def lockup(fill=NAVY):
     tag, _ = text_path("private coordination for AI agents", INTER_REG,
                        tag_size, tx + 1.5, tag_base)
 
-    inner = mark_full(fill).split("\n", 1)[1].rsplit("</svg>", 1)[0]
+    inner = mark_logo(fill).split("\n", 1)[1].rsplit("</svg>", 1)[0]
     W = tx + max(ww, tw) + 6
 
     return "\n".join([
@@ -147,7 +165,7 @@ def write_icns(path, fill=NAVY):
 
 if __name__ == "__main__":
     for name, fn in (("ferryman-mark", mark_full), ("ferryman-mark-small", mark_small),
-                     ("ferryman-logo", lockup)):
+                     ("ferryman-mark-logo", mark_logo), ("ferryman-logo", lockup)):
         (SVG / f"{name}.svg").write_text(fn(NAVY))
         (SVG / f"{name}-dark.svg").write_text(fn(WHITE))
 

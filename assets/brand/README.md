@@ -21,10 +21,18 @@ detail of the same shape*, not a different shape — which is the test the round
 set for itself. The crossover was measured, not chosen: see `preview/crossover.png`,
 where the full wheel's F is unreadable at 20px, thin at 24px and solid at 32px.
 
-There are no interior chords at any size. The six node-handles are already the endpoints
-and the ring is already what joins them; drawing lines between them was the round-1
-mistake in a subtler form, and it crowded the F. `preview/tier-c-candidates.png` shows
-the three treatments that were tried.
+**The logo has interior chords. The icons do not.**
+
+The logo is seen once at the top of a page, at a size where the chord web resolves and
+the mark can say *network* rather than just *wheel*. The icons are seen a hundred times a
+day at 16–32px, where the same lines turn to grey mush and crowd the F. Two uses, two
+amounts of detail, one shape.
+
+That split has a number attached: **do not render `ferryman-mark-logo.svg` below 88px.**
+`preview/readme-width.png` is the check — at 56px the web is a smudge, at 72px it starts
+to separate, at 88px it reads, at 100px it is clean. The README header is set to
+`width="480"`, which puts the mark at 100px. Below 88px, use `ferryman-mark.svg`, which
+is the same wheel with the chords left out.
 
 ## Which file goes where
 
@@ -36,7 +44,8 @@ the three treatments that were tried.
 | Favicon | `icons/ferryman.ico` or `png/ferryman-32.png` |
 | GitHub org / repo avatar | `png/ferryman-512.png` |
 | README header, site | `svg/ferryman-logo.svg` |
-| Anywhere the mark stands alone | `svg/ferryman-mark.svg` |
+| Mark alone, 88px and up | `svg/ferryman-mark-logo.svg` — with chords |
+| Mark alone, below 88px | `svg/ferryman-mark.svg` — without |
 
 `*-dark.*` is the off-white version for dark backgrounds. Both `.ico` files embed art
 drawn *for* each size — 16, 20, 24, 32, 48, 64, 128, 256 — rather than one image
@@ -48,8 +57,9 @@ resampled eight times.
   a flat single colour whether you like it or not; nothing here breaks when they do.
 - **No gradients.** Ever. That treatment is the house style of every AI product of the
   last three years and this audience reads it as marketing.
-- **Do not scale the full mark below 32px.** Use the small mark. That is the entire point
-  of there being two.
+- **Do not scale the full mark below 32px.** Use the small mark. And do not scale the
+  chorded logo mark below 88px — use `ferryman-mark.svg`. Both are why there is more than
+  one file.
 - **The wordmark is outlined**, not `<text>`. It renders identically without Inter
   installed.
 
