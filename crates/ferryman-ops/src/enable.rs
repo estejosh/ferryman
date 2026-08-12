@@ -27,6 +27,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::agent::{AgentConfig, ReviewMode};
+use crate::identity::{machine_name, slug};
 
 pub struct Request {
     pub workspace: Option<PathBuf>,
@@ -86,7 +87,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
     }
     let agent_name = match request.agent {
         Some(name) => slug(&name),
-        None => default_agent_name(),
+        None => machine_name()?,
     };
     if !ferryman_channel::is_safe_component(&agent_name) {
         bail!("agent name '{agent_name}' is not a path-safe identifier")
@@ -254,43 +255,6 @@ pub fn perform(request: Request) -> Result<Outcome> {
         config: loaded,
         steps,
     })
-}
-
-/// This machine's name, lowercased and made path-safe.
-fn default_agent_name() -> String {
-    let raw = std::env::var("FERRYMAN_AGENT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "agent".into());
-    let slugged = slug(&raw);
-    if slugged.is_empty() {
-        "agent".to_string()
-    } else {
-        slugged
-    }
-}
-
-/// Make an arbitrary name usable as a path component.
-///
-/// A project directory can be called anything at all, and an unattended caller has no
-/// way to fix a rejected name. Mapping it is better than failing on it - but the result
-/// is still checked by `is_safe_component`, so this loosens nothing.
-fn slug(value: &str) -> String {
-    let mapped: String = value
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    mapped.trim_matches('-').to_string()
 }
 
 #[cfg(test)]

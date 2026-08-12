@@ -1,0 +1,177 @@
+//! Which agent this machine is acting as.
+//!
+//! # Why this is its own module
+//!
+//! There used to be two copies of this logic, one in the CLI and one in `enable`, and
+//! both were wrong in the same way: they read the `HOSTNAME` and `COMPUTERNAME`
+//! environment variables and fell back to the literal string `"agent"` when neither was
+//! set.
+//!
+//! `HOSTNAME` is a *shell* variable on Linux, not an exported one. It is absent from
+//! every non-interactive process - which is every process an agent runs in. So the
+//! documented default, "this machine's name", silently became `agent` on the machines
+//! that matter most. The first outside user hit it within an hour.
+//!
+//! That is not a cosmetic default. The roster is keyed by filename, so two machines that
+//! both take the fallback write `agents/agent.json` with *different public keys* into one
+//! synced folder, and sync order decides which key survives. A system whose whole value
+//! is signed provenance cannot have an identity that collides by default.
+//!
+//! Hence: ask the operating system for the hostname, and if that fails, **fail**. An
+//! invented name that collides is worse than an error naming the flag that fixes it.
+
+use anyhow::{Context, Result, bail};
+use std::path::Path;
+
+use crate::agent::AgentConfig;
+
+/// This machine's name, lowercased and made path-safe.
+///
+/// Checked in this order because each step is more specific than the next: an operator
+/// who set `FERRYMAN_AGENT` means it, and anyone else means their machine.
+pub fn machine_name() -> Result<String> {
+    let host = hostname::get()
+        .context("ask the operating system for this machine's name")?
+        .to_string_lossy()
+        .into_owned();
+    let forced = std::env::var("FERRYMAN_AGENT").ok();
+    choose(forced.as_deref(), &host)
+}
+
+/// The decision, separated from where the two inputs came from.
+///
+/// Kept pure so the behaviour that broke - what happens when the environment says
+/// nothing - can be tested without a test mutating the process environment, which under
+/// Rust 2024 needs `unsafe` and which this crate forbids for good reason.
+fn choose(forced: Option<&str>, host: &str) -> Result<String> {
+    if let Some(forced) = forced.filter(|v| !v.trim().is_empty()) {
+        let name = slug(forced);
+        if name.is_empty() {
+            bail!("FERRYMAN_AGENT is set to '{forced}', which has no usable characters")
+        }
+        return Ok(name);
+    }
+    // A hostname can be an FQDN; only the first label names the machine.
+    let name = slug(host.split('.').next().unwrap_or(host));
+    if name.is_empty() {
+        bail!(
+            "this machine's name ('{host}') has no characters usable in a path; \
+             pass --agent to choose one"
+        )
+    }
+    Ok(name)
+}
+
+/// The agent a command should act as.
+///
+/// The configured name is consulted *before* the hostname, which is the half of this the
+/// CLI was missing entirely: `ferry channel work` never read `agent.toml`, so on a
+/// correctly configured machine it announced "nothing for agent right now" while work sat
+/// waiting. Every command that acts on behalf of an agent now resolves it the same way.
+pub fn resolve(explicit: Option<String>, attachment: &Path) -> Result<String> {
+    if let Some(name) = explicit {
+        let slugged = slug(&name);
+        if slugged.is_empty() {
+            bail!("--agent '{name}' has no characters usable in a path")
+        }
+        return Ok(slugged);
+    }
+    if let Ok(config) = AgentConfig::load(attachment) {
+        let configured = slug(&config.agent);
+        if !configured.is_empty() {
+            return Ok(configured);
+        }
+    }
+    machine_name()
+}
+
+/// Make an arbitrary name usable as a path component.
+///
+/// A project directory can be called anything at all, and an unattended caller has no
+/// way to fix a rejected name. Mapping it is better than failing on it - but the result
+/// is still checked by `is_safe_component`, so this loosens nothing.
+pub fn slug(value: &str) -> String {
+    let mapped: String = value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    mapped.trim_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_maps_rather_than_rejects() {
+        assert_eq!(slug("Beastly"), "beastly");
+        assert_eq!(slug("  My Box!  "), "my-box");
+        assert_eq!(slug("a_b-c"), "a_b-c");
+        assert_eq!(slug("---"), "");
+    }
+
+    #[test]
+    fn with_no_environment_the_hostname_is_used_not_the_word_agent() {
+        // The exact bug: nothing in the environment, so the old code returned "agent"
+        // and two machines collided in the roster.
+        assert_eq!(choose(None, "Grouchly").unwrap(), "grouchly");
+        assert_eq!(choose(Some(""), "Beastly").unwrap(), "beastly");
+        assert_eq!(choose(None, "beastly.lan.example").unwrap(), "beastly");
+    }
+
+    #[test]
+    fn an_unusable_hostname_fails_instead_of_inventing_one() {
+        let err = choose(None, "---").unwrap_err().to_string();
+        assert!(
+            err.contains("--agent"),
+            "the error must name the way out: {err}"
+        );
+    }
+
+    #[test]
+    fn the_real_machine_resolves() {
+        let name = machine_name().expect("the OS knows this machine's name");
+        assert!(!name.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_name_wins_and_is_slugged() {
+        let dir = std::env::temp_dir().join("ferryman-identity-explicit");
+        assert_eq!(
+            resolve(Some("Grouchly".into()), &dir).unwrap(),
+            "grouchly",
+            "--agent should be taken as given, once path-safe"
+        );
+    }
+
+    #[test]
+    fn the_configured_agent_is_read_before_the_hostname() {
+        // The bug this exists to prevent: `channel work` resolved to the hostname (or
+        // worse) while agent.toml sat two directories up saying who this agent is.
+        let dir = std::env::temp_dir().join("ferryman-identity-configured");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            AgentConfig::path(&dir),
+            AgentConfig::render(
+                "grouchly",
+                "worker",
+                "claude",
+                &["-p".to_string(), "{prompt}".to_string()],
+                crate::agent::ReviewMode::Confirm,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(resolve(None, &dir).unwrap(), "grouchly");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

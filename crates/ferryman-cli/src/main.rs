@@ -1451,7 +1451,7 @@ fn channel(command: Channel) -> Result<()> {
         } => {
             let route = here(workspace)?;
             let agent = ferryman_channel::AgentRoute {
-                name: name.unwrap_or_else(default_agent_name),
+                name: ferryman_ops::identity::resolve(name, &route.attachment)?,
                 role,
                 capabilities: capabilities
                     .split(',')
@@ -1499,10 +1499,7 @@ fn channel(command: Channel) -> Result<()> {
             reply_expected,
         } => {
             let route = here(workspace)?;
-            let sender = match from {
-                Some(name) => name,
-                None => default_agent_name(),
-            };
+            let sender = ferryman_ops::identity::resolve(from, &route.attachment)?;
             // A body that looks like JSON is kept as JSON; anything else is text. Guessing
             // wrong in either direction would be worse than being explicit about the rule.
             let payload = if body.trim_start().starts_with('{') {
@@ -1561,7 +1558,7 @@ fn channel(command: Channel) -> Result<()> {
             requires_review,
         } => {
             let route = here(workspace)?;
-            let issuer = agent.unwrap_or_else(default_agent_name);
+            let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             let payload = if task.trim_start().starts_with('{') {
                 serde_json::from_str(&task).context("--task looked like JSON but did not parse")?
             } else {
@@ -1595,7 +1592,7 @@ fn channel(command: Channel) -> Result<()> {
 
         Channel::Work { workspace, agent } => {
             let route = here(workspace)?;
-            let agent = agent.unwrap_or_else(default_agent_name);
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             let work = ferryman_channel::work_for(&route, &agent)?;
             if work.is_empty() {
                 // "nothing for you" is ambiguous, and a first user read it as broken
@@ -1657,7 +1654,7 @@ fn channel(command: Channel) -> Result<()> {
             id,
         } => {
             let route = here(workspace)?;
-            let agent = agent.unwrap_or_else(default_agent_name);
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             ferryman_channel::claim_order(&route, &id, &agent)?;
             let task = ferryman_channel::read_task(&route, &id)?;
             match task.holder() {
@@ -1676,7 +1673,7 @@ fn channel(command: Channel) -> Result<()> {
             id,
         } => {
             let route = here(workspace)?;
-            let agent = agent.unwrap_or_else(default_agent_name);
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             let task = ferryman_channel::read_task(&route, &id)?;
             let revision = task.latest_revision().unwrap_or(0) + 1;
             let payload = if result.trim_start().starts_with('{') {
@@ -1809,16 +1806,4 @@ fn channel(command: Channel) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// An agent names itself after the machine it runs on, so two agents in a fleet cannot
-/// accidentally answer to the same name.
-fn default_agent_name() -> String {
-    std::env::var("FERRYMAN_AGENT")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "agent".into())
-        .to_lowercase()
 }

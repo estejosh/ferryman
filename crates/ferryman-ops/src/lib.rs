@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod enable;
+pub mod identity;
 
 /// Where a long-running operation reports what it is doing.
 ///
