@@ -222,13 +222,29 @@ async fn run_agent(config: &AgentConfig, prompt: &str) -> Result<AgentRun> {
         .iter()
         .map(|arg| arg.replace("{prompt}", prompt))
         .collect();
-    let mut child = Command::new(&config.command)
+    let mut command = Command::new(&config.command);
+    command
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // The agent CLI, not Ferryman, is what makes a machine unusable: the loop idles at
+    // about 5 MB, the thing it starts is measured in hundreds. Below-normal is set at
+    // spawn on Windows, where the API is safe to use, so there is no window at full
+    // priority.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(crate::priority::BELOW_NORMAL_PRIORITY_CLASS);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("start '{}'; is it installed and on PATH?", config.command))?;
+    // Elsewhere it is done just after spawn, which needs no unsafe and leaves the spawn
+    // itself - and so its error message - exactly as it was.
+    if let Some(pid) = child.id() {
+        crate::priority::lower(pid);
+    }
     let mut stdout_pipe = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let mut stderr_pipe = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
     let mut stdout = String::new();

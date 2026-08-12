@@ -18,6 +18,7 @@
 pub mod agent;
 pub mod enable;
 pub mod identity;
+pub mod priority;
 
 /// Where a long-running operation reports what it is doing.
 ///
