@@ -33,8 +33,18 @@ jobs:
             os: ubuntu-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          # Cross-compiled from the Apple Silicon runner rather than built on an Intel
+          # one. The macos-13 image sat queued indefinitely and never got a runner, so
+          # v0.3.0 shipped without an Intel Mac binary. Rust targets Intel from an ARM
+          # Mac with nothing but the target installed - the SDK carries both
+          # architectures - and this is a pure-Rust binary with no native build steps,
+          # so there is nothing that needs a matching host.
+          #
+          # The trade is that this artefact is never executed by CI before release.
+          # Acceptable here and not in general: an Intel Mac binary that exists and is
+          # untested beats one that does not exist.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     steps:
