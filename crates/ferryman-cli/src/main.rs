@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod agent;
 mod enable;
+mod license;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
+#[command(version, about = "Private coordination for a fleet of AI agents")]
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8787")]
     endpoint: String,
@@ -37,6 +39,11 @@ enum Command {
         /// This agent's name. Defaults to this machine's name.
         #[arg(long)]
         agent: Option<String>,
+        /// Contact email for this deployment. Required: free production use is
+        /// conditioned on registering one (LICENSE section 3). Nothing about your
+        /// code or your work is ever sent - see PRIVACY.md.
+        #[arg(long, env = "FERRYMAN_EMAIL")]
+        email: String,
         /// What this agent is here to do. Shown to every other machine in the roster.
         #[arg(long, default_value = "worker")]
         role: String,
@@ -57,6 +64,11 @@ enum Command {
     Agent {
         #[command(subcommand)]
         command: Agent,
+    },
+    /// What this deployment counts as under the licence.
+    License {
+        #[command(subcommand)]
+        command: License,
     },
     Init {
         #[arg(default_value = "orchestrator.toml")]
@@ -424,6 +436,36 @@ enum Agent {
 }
 
 #[derive(Subcommand, Clone)]
+enum License {
+    /// Seats, computers and phones on this channel, and whether that is within the
+    /// free tier.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Register this machine, or change the address it is registered under.
+    Register {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, env = "FERRYMAN_EMAIL")]
+        email: String,
+        /// computer (runs agents) or mobile (approves only).
+        #[arg(long, default_value = "computer")]
+        device: String,
+    },
+    /// Report the counts to the Licensor.
+    Checkin {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Print the exact payload and send nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum Workers {
     Register {
         #[arg(long)]
@@ -569,6 +611,7 @@ async fn main() -> Result<()> {
             project,
             agent: agent_name,
             role,
+            email,
             command,
             review,
             json: as_json,
@@ -578,12 +621,14 @@ async fn main() -> Result<()> {
                 project,
                 agent: agent_name,
                 role,
+                email,
                 command,
                 review,
                 as_json,
             })?;
         }
         Command::Agent { command } => agent_command(command).await?,
+        Command::License { command } => license_command(command).await?,
         Command::Jobs { command } => jobs(&cli, command).await?,
         Command::Projects { command } => match command {
             Projects::Create { id, name, token } => {
@@ -1141,6 +1186,33 @@ async fn call_approver(cli: &Cli, method: &str, path: String, approver: &str) ->
 /// directory tree, and delivering a message is writing a file that Syncthing then
 /// carries. The server offers the same operations over HTTP for callers that want them,
 /// but it was never doing anything a local process could not do for itself.
+/// Licence accounting.
+async fn license_command(command: License) -> Result<()> {
+    let route_for = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    match command {
+        License::Status { workspace, json } => license::status(&route_for(workspace)?, json)?,
+        License::Register {
+            workspace,
+            email,
+            device,
+        } => license::register(
+            &route_for(workspace)?,
+            &email,
+            ferryman_channel::licensing::DeviceKind::parse(&device)?,
+        )?,
+        License::Checkin { workspace, dry_run } => {
+            license::check_in(&route_for(workspace)?, dry_run).await?
+        }
+    }
+    Ok(())
+}
+
 /// The agentic loop.
 ///
 /// A pass that fails does not stop the loop: an agent CLI that is briefly missing, or a

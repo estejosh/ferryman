@@ -7,22 +7,37 @@ This page explains when it's free, when it isn't, and how to pay.
 
 - **Any non-production use** — evaluation, development, testing, personal projects,
   home labs. No limits, no seat count, no time limit.
-- **Production use up to 2 Seats on 4 Devices.**
+- **Production use up to 2 Seats, on 2 Computers and 2 phones/tablets.**
 
 A **Seat** is a distinct human who operates, administers, deploys, or accesses
-Ferryman or its outputs. Your agents and workers are *not* Seats — they roll up to
-the human they act for. A fleet of twenty agents run by one person is one Seat.
+Ferryman or its outputs.
 
-A **Device** is a machine that runs Ferryman. A machine that only holds a synced
-channel directory, without running Ferryman, doesn't count.
+An **Agent** is any automated process acting through Ferryman without a human deciding
+each step. **Agents are never Seats, never Devices, and never limited.** Run as many as
+you like on each computer. Twenty agents on two computers, run by one person, is one
+Seat and costs nothing.
 
-That means a solo operator, or two people running a handful of machines, never pays.
+A **Computer** is a machine that runs Ferryman or an agent — including each virtual
+machine and each long-lived container, even where several sit on one physical host. A
+machine that only holds a synced channel directory, without running Ferryman, doesn't
+count.
+
+A **phone or tablet** counts only if it's used to review or approve work (over
+Telegram, for example) and runs neither Ferryman nor an agent. One that runs either is
+a Computer.
+
+**The three limits are separate, not a pool of six.** Three computers and no phone is
+over the free tier, because the computer limit is two.
+
+Free production use asks you to register a contact email, so we can tell you when a
+deployment goes over. [PRIVACY.md](PRIVACY.md) states exactly what that sends — three
+integers and the address, never anything about your work.
 
 ## Paid
 
-Production use beyond 2 Seats or 4 Devices needs a per-Seat commercial license.
-Commercial licenses have **no Device limit** — run Ferryman on as many machines as
-you like.
+Production use beyond any of those three limits needs a per-Seat commercial license.
+Commercial licenses have **no limit on computers, phones or agents** — run Ferryman on
+as many machines as you like.
 
 | Total production Seats | Per billable Seat / year | ≈ per month |
 |---|---|---|

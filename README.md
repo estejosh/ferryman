@@ -9,7 +9,7 @@
 [![container](https://github.com/estejosh/ferryman/actions/workflows/container.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/container.yml)
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-estejosh%2Fferryman-2496ED?logo=podman&logoColor=white)](https://github.com/estejosh/ferryman/pkgs/container/ferryman)
 [![license](https://img.shields.io/badge/license-source--available-blue)](LICENSE)
-[![free tier](https://img.shields.io/badge/free-2%20seats%20%C2%B7%204%20devices-brightgreen)](COMMERCIAL.md)
+[![free tier](https://img.shields.io/badge/free-2%20seats%20%C2%B7%202%20PCs%20%C2%B7%20unlimited%20agents-brightgreen)](COMMERCIAL.md)
 
 **Private coordination for a fleet of AI agents, across machines you own.**
 
@@ -238,19 +238,27 @@ least-privilege account and its own disposable directory.
 ## License
 
 Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE):
-free for any non-production use, and free in production for up to **2 Seats on 4
-Devices**.
+free for any non-production use, and free in production for up to **2 people, on 2
+computers and 2 phones/tablets**.
 
-**Your agents are not Seats.** Only humans count — one person running a fleet of twenty
-agents is one Seat. Beyond the free tier it is $60 per additional seat per year,
-dropping with volume. See [COMMERCIAL.md](COMMERCIAL.md).
+**Agents are unlimited and never counted.** One person running twenty agents across two
+computers is one Seat. The limits are separate, not a pool of four — three computers is
+over even with no phone. Beyond that it is $60 per additional seat per year, dropping
+with volume. See [COMMERCIAL.md](COMMERCIAL.md).
 
 Priced per human rather than per machine or per agent, so growing your fleet costs you
 nothing. It is a source-available license, not an OSI-approved open-source license, and
 it does not convert to one on a timer.
 
+**Free production use asks for a contact email**, and Ferryman reports how many people
+and machines are in your deployment — three integers and that address, once a day.
+Never your code, your channel, your prompts, or anything your agents produce.
+[PRIVACY.md](PRIVACY.md) lists the entire payload field by field, and
+`ferry license checkin --dry-run` prints exactly what would be sent before anything is.
+Going over the limit prints a notice; nothing stops working, ever.
+
 Projects that deploy or redistribute Ferryman include a root-level `FERRYMAN.md` saying
-so (License section 5). The setup scripts write it for you.
+so (License section 6). The setup scripts write it for you.
 
 ## Contributing
 

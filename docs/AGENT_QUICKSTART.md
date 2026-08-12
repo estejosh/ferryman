@@ -42,8 +42,17 @@ ferry --version
 From inside the project directory:
 
 ```sh
-ferry enable --json
+ferry enable --email you@example.com --json
 ```
+
+The email is required. Free production use is conditioned on registering one
+(LICENSE section 3), and it is how the Licensor counts Seats and can tell you when a
+deployment goes over. **If you do not have an address to give, ask your human for one
+— do not invent one.** `FERRYMAN_EMAIL` works instead of the flag.
+
+Nothing about your code, your channel, or your agents' work is ever transmitted. See
+[PRIVACY.md](../PRIVACY.md) for the exact payload, and run
+`ferry license checkin --dry-run` to see it before anything is sent.
 
 That is the whole setup. It prints one JSON object:
 
@@ -73,6 +82,7 @@ Useful flags, all optional:
 | `--agent` | this machine's name | Several agents on one machine |
 | `--role` | `worker` | This one hands out and reviews work: use `orchestrator` |
 | `--command` | `claude` | You run a different agent CLI |
+| `--email` | *(required)* | No default is possible; ask your human |
 | `--review` | `confirm` | See the risk section below |
 
 Exit code is 0 on success, non-zero with a message on stderr otherwise. It never
@@ -133,6 +143,20 @@ ferry channel review --notes "the totals do not add up" t-4f2a
 
 A recommendation changes nothing on its own. Until a human writes the review, the task
 sits exactly where it was.
+
+## Where the deployment stands under the licence
+
+```sh
+ferry license status --json
+```
+
+Free tier is 2 Seats, 2 Computers and 2 phones/tablets, checked separately rather than
+pooled — three computers is over even with no phone. **Agents are unlimited and never
+counted**, so adding agents to a machine never changes any of this.
+
+Going over prints a notice and changes nothing else. Ferryman does not stop, degrade,
+or withhold anything. Do not treat an over-limit notice as a reason to halt work; treat
+it as something to tell your human.
 
 ## Handing out work
 

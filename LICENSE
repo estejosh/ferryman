@@ -1,18 +1,23 @@
-Ferryman Source-Available License, Version 1.1
+Ferryman Source-Available License, Version 1.2
 
 Licensor: estejosh ("Licensor")
 Licensed Work: Ferryman (the "Software"), including all versions, components,
 and source code contained in this repository.
 
-SUMMARY (non-binding): Ferryman is free to use in production for up to two (2)
-Seats running on up to four (4) Devices, and free for any non-production use.
-Using it in production beyond those limits requires a paid, per-Seat commercial
-license from the Licensor. The full, binding terms are below.
+SUMMARY (non-binding): Ferryman is free for any non-production use. It is free in
+production for up to two (2) Seats, on up to two (2) Computers and up to two (2)
+Mobile Devices. You may run as many Agents as you like on each Computer at no
+charge; Agents are never Seats. Free production use requires registering a
+contact email address. Using it in production beyond those limits requires a
+paid, per-Seat commercial license from the Licensor. The full, binding terms are
+below.
 
-CHANGES FROM VERSION 1.0: the free production allowance changed from three (3)
-Seats with no Device limit, to two (2) Seats on up to four (4) Devices. Anyone
-who obtained the Software under Version 1.0 may continue to rely on Version 1.0
-for that copy; this version applies to copies obtained under it.
+CHANGES FROM VERSION 1.1: the "four (4) Devices" allowance is replaced with the
+more precise "two (2) Computers and two (2) Mobile Devices"; "Agent" is defined
+and confirmed to be unlimited per Computer; and free production use now requires
+registering a contact email address (Section 3). Anyone who obtained the Software
+under Version 1.0 or 1.1 may continue to rely on that version for that copy; this
+version applies to copies obtained under it.
 
 This license is derived from the Business Source License 1.1, modified to be a
 PERMANENT source-available license. Unlike the Business Source License, it has no
@@ -24,13 +29,28 @@ DEFINITIONS
 
 "Seat" means each distinct human individual who operates, administers, deploys,
 or accesses the Software or its outputs on behalf of you or your organization.
-Automated agents, workers, or processes do not count as Seats in themselves; they
-are attributed to the Seat of the human individual on whose behalf they act.
+Seats count people, not machines and not software.
 
-"Device" means each distinct physical or virtual machine on which the Software,
-or any component of it, is installed or run on your behalf. A machine that only
-stores a synchronized channel directory, without running the Software, is not a
-Device.
+"Agent" means any automated process, worker, model, or script that acts through
+the Software without a human deciding each action. Agents are NOT Seats and are
+NOT Devices, and there is no limit on the number of Agents you may run on a
+Computer. One person running twenty Agents across two Computers is two Computers
+and one Seat. Every Agent is attributed to the Seat of the human individual on
+whose behalf it acts.
+
+"Computer" means each distinct physical or virtual machine, including servers,
+desktops, laptops, containers, and virtual machines, on which the Software or any
+component of it is installed or run on your behalf. Each distinct virtual machine
+or long-lived container counts separately, even where several run on one physical
+host. A machine that only stores a synchronized channel directory, without running
+the Software, is not a Computer.
+
+"Mobile Device" means each distinct phone or tablet used to review, approve,
+decline, or monitor work through the Software, including through a messaging
+integration, and which does not itself run the Software or any Agent. A phone or
+tablet that runs the Software or an Agent is a Computer, not a Mobile Device.
+
+"Device" means a Computer or a Mobile Device.
 
 "Production use" means any use other than for personal experimentation,
 evaluation, development, or testing.
@@ -40,24 +60,57 @@ Subject to the terms below, the Licensor grants you a non-exclusive, worldwide,
 royalty-free right to copy, modify, create derivative works of, and redistribute
 the Software, and to make non-production use of the Software without limit.
 
-2. FREE PRODUCTION USE (UP TO TWO SEATS ON FOUR DEVICES)
-You may use the Software in production free of charge provided that your total
-number of Seats does not exceed two (2) and your total number of Devices does not
-exceed four (4). Both limits apply; exceeding either one ends the free allowance.
+2. FREE PRODUCTION USE
+You may use the Software in production free of charge provided that all three of
+the following are true at the same time:
 
-3. COMMERCIAL LICENSE REQUIRED ABOVE THOSE LIMITS
-Any production use of the Software that exceeds two (2) Seats or four (4) Devices
-requires a paid commercial license from the Licensor, granted on a per-Seat basis.
-A commercial license places no limit on Devices. See COMMERCIAL.md for how to
-obtain one.
+    (a) your total number of Seats does not exceed two (2);
+    (b) your total number of Computers does not exceed two (2); and
+    (c) your total number of Mobile Devices does not exceed two (2).
 
-4. REDISTRIBUTION
+Each limit applies independently, and exceeding any one of them ends the free
+allowance even if the others are not reached. The three limits do not pool: three
+Computers and no Mobile Device exceeds this Section, because limit (b) is
+exceeded.
+
+There is no limit on the number of Agents.
+
+3. REGISTRATION FOR FREE PRODUCTION USE
+Free production use under Section 2 is conditioned on registering a working
+contact email address for your deployment, through the mechanism the Software
+provides, and keeping it current. The Software records that address and the count
+of Seats, Computers, and Mobile Devices in your deployment, and may report those
+counts and that address to the Licensor so that the Licensor can identify use
+beyond the free allowance.
+
+The Licensor collects this to administer this license and to contact you about
+licensing. What is collected and what is not is stated in PRIVACY.md, which forms
+part of the terms of this Section. The Software does not read, transmit, or
+inspect your projects, your code, your channel contents, or the work your Agents
+perform.
+
+This Section does not apply to non-production use under Section 1.
+
+4. COMMERCIAL LICENSE REQUIRED ABOVE THOSE LIMITS
+Any production use of the Software that exceeds any limit in Section 2 requires a
+paid commercial license from the Licensor, granted on a per-Seat basis. A
+commercial license places no limit on Computers, Mobile Devices, or Agents. See
+COMMERCIAL.md for how to obtain one.
+
+The Software will not stop working when a limit is exceeded, and will not delete,
+disable, or withhold your data. It states plainly that the deployment is beyond
+the free allowance. That statement is a notice, not a grant: continuing to use the
+Software beyond the limits in Section 2 without a commercial license is a
+violation of this license regardless of whether the Software continues to run.
+
+5. REDISTRIBUTION
 You may redistribute the Software or derivative works provided that you (a) retain
 this license text, the copyright notice, and all notices; and (b) do not remove,
-weaken, or circumvent the Seat or Device limitations. Any recipient receives the Software
-under this same license, with the same rights and the same limitations.
+weaken, or circumvent the Seat, Computer, Mobile Device, or registration
+requirements. Any recipient receives the Software under this same license, with
+the same rights and the same limitations.
 
-5. ATTRIBUTION (NOTICE)
+6. ATTRIBUTION (NOTICE)
 If you deploy or redistribute the Software (including running it to coordinate or
 orchestrate work, whether or not you redistribute its source), you must include a
 file named FERRYMAN.md in the root of the source repository or distribution of any
@@ -71,33 +124,33 @@ satisfies this requirement:
 This requirement does not apply to individual end users who merely interact with
 the outputs of a project that uses the Software; it applies to the party that
 deploys or redistributes the Software. It is separate from, and in addition to,
-the notice-retention requirement in Section 4. The standard Ferryman setup tooling
+the notice-retention requirement in Section 5. The standard Ferryman setup tooling
 writes this FERRYMAN.md automatically.
 
-6. NO AUTOMATIC CONVERSION
+7. NO AUTOMATIC CONVERSION
 This license has no Change Date and does not convert to any other license over
 time. The Licensor may, at its sole discretion, choose to release any version of
 the Software under different terms, but no such release is automatic or
 guaranteed by this license.
 
-7. TRADEMARKS
+8. TRADEMARKS
 This license does not grant you any right to use the Licensor's names, logos, or
 trademarks, including the name "Ferryman".
 
-8. TERMINATION
+9. TERMINATION
 Any use of the Software in violation of this license automatically terminates your
 rights under it. Rights may be reinstated in writing by the Licensor.
 
-9. DISCLAIMER OF WARRANTY
+10. DISCLAIMER OF WARRANTY
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
 FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
 
-10. LIMITATION OF LIABILITY
+11. LIMITATION OF LIABILITY
 IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
 OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-Copyright (c) 2026 Shin Devlin. All rights reserved except as expressly granted
+Copyright (c) 2026 estejosh. All rights reserved except as expressly granted
 above.

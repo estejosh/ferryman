@@ -34,6 +34,7 @@ pub struct Request {
     pub project: Option<String>,
     pub agent: Option<String>,
     pub role: String,
+    pub email: String,
     pub command: String,
     pub review: String,
     pub as_json: bool,
@@ -50,6 +51,7 @@ struct Step {
 /// facts drive the human output, the JSON and the tests.
 struct Outcome {
     project: String,
+    counted: ferryman_channel::licensing::FleetCount,
     agent: String,
     workspace: PathBuf,
     route: ProjectRoute,
@@ -201,6 +203,28 @@ fn perform(request: Request) -> Result<Outcome> {
         created: !roster_existed,
     });
 
+    // Register this machine so the fleet can be counted. Done here rather than in a
+    // separate step because a registration an operator has to remember is a
+    // registration that does not happen.
+    let device_id = ferryman_channel::licensing::device_id(&route.attachment)?;
+    let device = ferryman_channel::licensing::DeviceRecord {
+        id: device_id.clone(),
+        kind: ferryman_channel::licensing::DeviceKind::Computer,
+        operator_email: request.email.trim().to_string(),
+        registered_at: chrono::Utc::now(),
+    };
+    let device_existed = route
+        .communications
+        .join("devices")
+        .join(format!("{device_id}.json"))
+        .exists();
+    let device_path = ferryman_channel::licensing::register_device(&route, &device)?;
+    steps.push(Step {
+        what: "device record",
+        path: device_path,
+        created: !device_existed,
+    });
+
     // Prove it, rather than assert it: load the config the way the loops will, and read
     // the roster back the way a peer will.
     let loaded = AgentConfig::load(&route.attachment).context("the agent config is unreadable")?;
@@ -209,8 +233,12 @@ fn perform(request: Request) -> Result<Outcome> {
         bail!("the agent was registered but is not in the roster; this is a bug")
     }
 
+    let counted =
+        ferryman_channel::licensing::count(&ferryman_channel::licensing::read_devices(&route)?);
+
     Ok(Outcome {
         project,
+        counted,
         agent: agent_name,
         workspace,
         route,
@@ -234,6 +262,14 @@ fn report_json(outcome: &Outcome) -> Result<()> {
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
             "already_configured": outcome.steps.iter().all(|s| !s.created),
+            "license": {
+                "seats": outcome.counted.seats,
+                "computers": outcome.counted.computers,
+                "mobile_devices": outcome.counted.mobile_devices,
+                "agents": "unlimited",
+                "over_limit": outcome.counted.over_limit(),
+                "exceeded": outcome.counted.exceeded(),
+            },
             "files": outcome.steps.iter().map(|s| json!({
                 "what": s.what,
                 "path": s.path.display().to_string(),
@@ -272,6 +308,12 @@ fn report_human(outcome: &Outcome) -> Result<()> {
     println!("Then, on each machine:");
     println!("  ferry agent run        # does work");
     println!("  ferry agent review     # judges results");
+    if outcome.counted.over_limit() {
+        eprint!(
+            "{}",
+            ferryman_channel::licensing::over_limit_notice(&outcome.counted)
+        );
+    }
     Ok(())
 }
 
@@ -322,6 +364,7 @@ mod tests {
             project: Some("demo".into()),
             agent: Some("tester".into()),
             role: "worker".into(),
+            email: "tester@example.com".into(),
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
@@ -379,6 +422,7 @@ mod tests {
             project: Some("demo".into()),
             agent: Some("tester".into()),
             role: "worker".into(),
+            email: "tester@example.com".into(),
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
