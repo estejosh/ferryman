@@ -62,6 +62,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
+      # Belt and braces. The toolchain action takes a `targets` input and should have
+      # installed this already, but on the cross-compiled Intel Mac job it did not, and
+      # the build failed with "can't find crate for `core`" - the target's std was
+      # simply absent. Asking twice costs a second and is idempotent.
+      - name: Ensure the target's std is installed
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p ferryman-cli
 
