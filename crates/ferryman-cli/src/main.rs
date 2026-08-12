@@ -1503,7 +1503,44 @@ fn channel(command: Channel) -> Result<()> {
             let agent = agent.unwrap_or_else(default_agent_name);
             let work = ferryman_channel::work_for(&route, &agent)?;
             if work.is_empty() {
-                println!("nothing for {agent} right now");
+                // "nothing for you" is ambiguous, and a first user read it as broken
+                // identity resolution: their agent name was in the config, tasks existed,
+                // and this printed nothing. Saying what was skipped and why turns a
+                // suspected bug into an obvious explanation.
+                println!("nothing for {agent} to pick up right now");
+                let all = ferryman_channel::list_tasks(&route)?;
+                if all.is_empty() {
+                    println!("  the channel has no tasks at all");
+                } else {
+                    println!("  {} task(s) exist, none claimable by you:", all.len());
+                    for task in &all {
+                        let why = match task.state() {
+                            ferryman_channel::TaskState::AwaitingReview { by, revision } => {
+                                format!("revision {revision} by {by} is waiting on a reviewer")
+                            }
+                            ferryman_channel::TaskState::Accepted => "finished".to_string(),
+                            ferryman_channel::TaskState::Done => {
+                                "finished, no review asked for".to_string()
+                            }
+                            ferryman_channel::TaskState::Claimed { by } => {
+                                format!("held by {by}")
+                            }
+                            ferryman_channel::TaskState::ChangesRequested { revision } => {
+                                format!(
+                                    "revision {revision} owed by {}",
+                                    task.holder().unwrap_or("someone")
+                                )
+                            }
+                            ferryman_channel::TaskState::Open => {
+                                format!(
+                                    "open, but addressed to {}",
+                                    task.order.assigned_to.as_deref().unwrap_or("someone else")
+                                )
+                            }
+                        };
+                        println!("    {:<12} {why}", task.order.id);
+                    }
+                }
             }
             for task in work {
                 println!(

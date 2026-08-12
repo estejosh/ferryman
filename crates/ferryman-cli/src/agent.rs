@@ -262,14 +262,33 @@ async fn run_agent(config: &AgentConfig, prompt: &str) -> Result<AgentRun> {
 /// A revision deliberately repeats the original task, the rejected attempt and the
 /// reviewer's notes. Sending only the notes is the tempting shortcut and it is how you
 /// get an agent that fixes the complaint and quietly loses the requirement.
+/// Told to the agent on every task, before the work itself.
+///
+/// The first outside user ran a task, wrote its answer to stdout, and closed by saying
+/// "I have not submitted this, since that would be an outward-facing write." It had
+/// already been submitted - the loop captures stdout and publishes it. The agent was
+/// being careful about a boundary it could not see, and reported a state that was not
+/// true, into a signed artefact carrying its name.
+///
+/// An agent that does not know it is publishing will also write deliberation, ask
+/// clarifying questions, or hedge - all of which become the result. Saying so costs two
+/// sentences.
+const PUBLISHING_NOTICE: &str = "\
+Everything you print to stdout becomes your submitted result, signed with your name and \
+carried to the other machines on this channel. You do not need to submit it yourself and \
+you cannot take it back. Print the deliverable and nothing else - no preamble, no \
+commentary on whether you should submit, no questions.\n\n";
+
 fn work_prompt(task: &Task) -> String {
-    let request = task
-        .order
-        .payload
-        .get("task")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| task.order.payload.to_string());
+    let request = format!(
+        "{PUBLISHING_NOTICE}{}",
+        task.order
+            .payload
+            .get("task")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| task.order.payload.to_string())
+    );
     let Some(revision) = task.latest_revision() else {
         return request;
     };
@@ -601,9 +620,28 @@ mod tests {
     }
 
     #[test]
-    fn a_first_attempt_is_just_the_task() {
+    fn a_first_attempt_is_the_task_plus_the_publishing_notice() {
         let prompt = work_prompt(&task_with(Vec::new(), Vec::new()));
-        assert_eq!(prompt, "write the report");
+        assert!(prompt.ends_with("write the report"));
+        // The notice is not decoration: without it an agent reported that it had not
+        // submitted work that had already been published under its own signature.
+        assert!(prompt.contains("becomes your submitted result"));
+    }
+
+    #[test]
+    fn a_revision_still_tells_the_agent_it_is_publishing() {
+        let review = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "orchestrator".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: false,
+            notes: Some("wrong totals".into()),
+            signed_by: None,
+            signature: None,
+        };
+        let prompt = work_prompt(&task_with(vec![result(1, "first go")], vec![review]));
+        assert!(prompt.contains("becomes your submitted result"));
     }
 
     #[test]
