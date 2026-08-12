@@ -76,38 +76,51 @@ enum Command {
         #[command(subcommand)]
         command: License,
     },
+    /// Write an `orchestrator.toml` for SERVER mode. Almost nobody wants this.
+    ///
+    /// `ferry enable` is the command for the synced channel, which needs no server, no
+    /// token and no port. This one writes a config pointing at a server you would have
+    /// to run yourself, and it is the command people try first by mistake.
     Init {
         #[arg(default_value = "orchestrator.toml")]
         path: PathBuf,
     },
+    /// Server mode: projects on a running ferryman-server.
     Projects {
         #[command(subcommand)]
         command: Projects,
     },
+    /// Server mode: jobs on a running ferryman-server.
     Jobs {
         #[command(subcommand)]
         command: Jobs,
     },
+    /// Server mode: workers registered with a running ferryman-server.
     Workers {
         #[command(subcommand)]
         command: Workers,
     },
+    /// Server mode: agents registered with a running ferryman-server.
     Agents {
         #[command(subcommand)]
         command: Agents,
     },
+    /// Server mode: the shared memory store.
     Memory {
         #[command(subcommand)]
         command: Memory,
     },
+    /// Server mode: artifacts produced by jobs.
     Artifacts {
         #[command(subcommand)]
         command: Artifacts,
     },
+    /// Server mode: consent records.
     Consents {
         #[command(subcommand)]
         command: Consents,
     },
+    /// Server mode: continuity packs.
     Continuity {
         #[command(subcommand)]
         command: Continuity,
@@ -121,6 +134,7 @@ enum Command {
         #[command(subcommand)]
         command: Channel,
     },
+    /// Server mode: messaging through a server. `channel` does the same with none.
     Communications {
         #[command(subcommand)]
         command: Communications,
@@ -318,8 +332,11 @@ enum Channel {
     Review {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long, default_value = "orchestrator")]
-        reviewer: String,
+        /// Who is settling it. Defaults to this machine, not to a shared name: a
+        /// verdict signed "orchestrator" on every machine cannot be told apart from
+        /// any other machine's, which defeats the point of signing it.
+        #[arg(long)]
+        reviewer: Option<String>,
         /// Keep it. Without this, the work is sent back and --notes is required.
         #[arg(long)]
         accept: bool,
@@ -332,7 +349,11 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
-    /// Every message in the channel, oldest first.
+    /// Everything that has happened in this channel, oldest last.
+    ///
+    /// Orders, claims, results, reviews and messages, merged into one timeline with
+    /// each artifact's signer. This used to list messages only, so a channel full of
+    /// signed work printed nothing at all.
     Log {
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -424,6 +445,12 @@ enum Agent {
         /// wants to own the scheduling.
         #[arg(long)]
         once: bool,
+        /// Say what would be claimed, and as whom, without claiming anything.
+        ///
+        /// Resolves exactly what a real pass resolves - the agent name, the memory gate,
+        /// each task and what would happen to it - and then stops.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Judge results that are waiting, as far as the config lets you.
     Review {
@@ -1075,6 +1102,17 @@ fn report_enable_human(outcome: &enable::Outcome) {
     }
 }
 
+/// How an artifact's signature reads in a log line.
+///
+/// An unsigned artifact is not an error - older peers wrote them - but a log that does
+/// not distinguish them is a log that quietly implies provenance it cannot show.
+fn signed_suffix(signed_by: Option<&str>) -> String {
+    match signed_by {
+        Some(who) => format!("  [signed {who}]"),
+        None => "  [unsigned]".to_string(),
+    }
+}
+
 async fn jobs(cli: &Cli, command: Jobs) -> Result<()> {
     match command {
         Jobs::Submit {
@@ -1329,9 +1367,35 @@ async fn agent_command(command: Agent) -> Result<()> {
         ferryman_channel::route_for(&start)
     };
     match command {
-        Agent::Run { workspace, once } => {
+        Agent::Run {
+            workspace,
+            once,
+            dry_run,
+        } => {
             let route = route_for(workspace)?;
             let config = agent::AgentConfig::load(&route.attachment)?;
+            if dry_run {
+                let plan = agent::plan(&route, &config)?;
+                println!("would run as '{}' on {}", plan.agent, route.project_id);
+                println!("  command   {}", config.command);
+                match &plan.gate {
+                    ferryman_ops::governor::Decision::Go => {
+                        println!("  memory    enough free to start");
+                    }
+                    ferryman_ops::governor::Decision::Wait(reason) => {
+                        println!("  memory    would hold off: {reason}");
+                    }
+                }
+                if plan.would_do.is_empty() {
+                    println!("  nothing to do right now");
+                } else {
+                    for (id, what) in &plan.would_do {
+                        println!("  {id}  {what}");
+                    }
+                }
+                println!("nothing was claimed, written or sent");
+                return Ok(());
+            }
             println!(
                 "worker '{}' on {}, running '{}'",
                 config.agent, route.project_id, config.command
@@ -1716,6 +1780,7 @@ fn channel(command: Channel) -> Result<()> {
             id,
         } => {
             let route = here(workspace)?;
+            let reviewer = ferryman_ops::identity::resolve(reviewer, &route.attachment)?;
             let task = ferryman_channel::read_task(&route, &id)?;
             let revision = task
                 .latest_revision()
@@ -1783,25 +1848,104 @@ fn channel(command: Channel) -> Result<()> {
 
         Channel::Log { workspace, limit } => {
             let route = here(workspace)?;
-            let mut messages = ferryman_channel::list_messages(&route)?;
-            messages.sort_by_key(|message| message.created_at);
-            for message in messages.iter().rev().take(limit).rev() {
-                println!(
-                    "{}  {} -> {}  {}{}",
-                    message.created_at.format("%Y-%m-%d %H:%M:%SZ"),
-                    message.sender,
-                    message.recipient,
-                    message
-                        .payload
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .map_or_else(|| message.payload.to_string(), ToString::to_string),
-                    if message.reply_required {
-                        "  [reply expected]"
-                    } else {
-                        ""
-                    }
-                );
+            // This used to print messages only. The channel's actual history is its
+            // signed artifacts - orders, claims, results, reviews - and a first user
+            // watched it print zero bytes, exit 0, and say nothing, while four signed
+            // artifacts sat in the folder. Work had provably run and left no visible
+            // record. Everything that happened now appears, in the order it happened.
+            let mut entries: Vec<(chrono::DateTime<chrono::Utc>, String)> = Vec::new();
+            for task in ferryman_channel::list_tasks(&route)? {
+                let id = task.order.id.clone();
+                entries.push((
+                    task.order.created_at,
+                    format!("{id}  order issued by {}", task.order.issued_by),
+                ));
+                for claim in &task.claims {
+                    entries.push((
+                        claim.claimed_at,
+                        format!("{id}  claimed by {}", claim.agent),
+                    ));
+                }
+                for result in &task.results {
+                    entries.push((
+                        result.submitted_at,
+                        format!(
+                            "{id}  result r{} by {}{}",
+                            result.revision,
+                            result.agent,
+                            signed_suffix(result.signed_by.as_deref())
+                        ),
+                    ));
+                }
+                for recommendation in &task.recommendations {
+                    entries.push((
+                        recommendation.recommended_at,
+                        format!(
+                            "{id}  recommendation r{} by {}: {}{}",
+                            recommendation.revision,
+                            recommendation.reviewer,
+                            if recommendation.accept {
+                                "accept"
+                            } else {
+                                "reject"
+                            },
+                            signed_suffix(recommendation.signed_by.as_deref())
+                        ),
+                    ));
+                }
+                for review in &task.reviews {
+                    entries.push((
+                        review.reviewed_at,
+                        format!(
+                            "{id}  review r{} by {}: {}{}",
+                            review.revision,
+                            review.reviewer,
+                            if review.accepted {
+                                "accepted"
+                            } else {
+                                "changes requested"
+                            },
+                            signed_suffix(review.signed_by.as_deref())
+                        ),
+                    ));
+                }
+            }
+            for message in ferryman_channel::list_messages(&route)? {
+                entries.push((
+                    message.created_at,
+                    format!(
+                        "message   {} -> {}  {}{}",
+                        message.sender,
+                        message.recipient,
+                        message
+                            .payload
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map_or_else(|| message.payload.to_string(), ToString::to_string),
+                        if message.reply_required {
+                            "  [reply expected]"
+                        } else {
+                            ""
+                        }
+                    ),
+                ));
+            }
+            entries.sort_by_key(|(at, _)| *at);
+            if entries.is_empty() {
+                // Silence is indistinguishable from breakage. Say which channel was read.
+                println!("nothing has happened in this channel yet");
+                println!("  {}", route.communications.display());
+            } else {
+                let shown = entries.len().min(limit);
+                if shown < entries.len() {
+                    println!(
+                        "showing the last {shown} of {} entries; --limit for more",
+                        entries.len()
+                    );
+                }
+                for (at, line) in entries.iter().rev().take(limit).rev() {
+                    println!("{}  {line}", at.format("%Y-%m-%d %H:%M:%SZ"));
+                }
             }
         }
     }

@@ -420,6 +420,54 @@ fn parse_verdict(output: &str) -> Result<Verdict> {
 ///
 /// Separate from the loop so it can be run once (`--once`) in a cron job or a test,
 /// rather than only as a daemon.
+/// What `work_once` would do, without doing any of it.
+///
+/// The first outside user stopped here: having just found identity resolution broken,
+/// they had no way to check *which name the loop would claim as* without letting it
+/// claim. A loop that cannot be asked what it is about to do can only be trusted or
+/// avoided, and they reasonably chose to avoid it.
+///
+/// This resolves exactly what the real pass resolves and touches nothing.
+pub struct Plan {
+    /// The name this machine would sign and claim as.
+    pub agent: String,
+    /// Whether the machine has room to start, and why not if it does not.
+    pub gate: crate::governor::Decision,
+    /// Each task that would be acted on, and what would happen to it.
+    pub would_do: Vec<(String, String)>,
+}
+
+/// Resolve the same things the worker resolves, and report them.
+pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
+    let waiting = ferryman_channel::work_for(route, &config.agent)?;
+    let would_do = waiting
+        .iter()
+        .filter_map(|task| {
+            let id = task.order.id.clone();
+            match task.state() {
+                TaskState::Open => Some((id, "claim it, then run the agent".to_string())),
+                TaskState::Claimed { .. } => {
+                    Some((id, "already claimed here; run the agent".to_string()))
+                }
+                TaskState::ChangesRequested { revision, .. } => Some((
+                    id,
+                    format!("revision {revision} was rejected; run the agent again"),
+                )),
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Plan {
+        agent: config.agent.clone(),
+        gate: if would_do.is_empty() {
+            crate::governor::Decision::Go
+        } else {
+            crate::governor::may_claim(config)
+        },
+        would_do,
+    })
+}
+
 pub async fn work_once(
     route: &ProjectRoute,
     config: &AgentConfig,
