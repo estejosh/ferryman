@@ -81,13 +81,26 @@ jobs:
           (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
             Out-File -Encoding ascii "$name.zip.sha256"
 
-      - name: Attach to the release
+      # Split by OS so each job only claims the files it actually produced. Listing
+      # every pattern in every job means the zip patterns match nothing on Linux, and
+      # fail_on_unmatched_files - which is worth keeping, because a silently missing
+      # binary is worse than a failed build - turns that into a failure.
+      - name: Attach to the release (unix)
+        if: runner.os != 'Windows'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
-            ferry-*.tar.gz
-            ferry-*.tar.gz.sha256
-            ferry-*.zip
-            ferry-*.zip.sha256
+            ferry-${{ matrix.target }}.tar.gz
+            ferry-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+      - name: Attach to the release (windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ferry-${{ matrix.target }}.zip
+            ferry-${{ matrix.target }}.zip.sha256
           fail_on_unmatched_files: true
