@@ -108,12 +108,21 @@ prompts, never opens an editor, and never waits on a terminal.
 
 ## Step 3 — join the other machines
 
-The channel folder printed above is what Syncthing shares. On each machine, add that
-folder with the printed folder id. Ferryman does not do this for you: adding a Syncthing
-folder is a change to a program you own, and doing it behind your back would be wrong.
+**`enable` already did this.** It registered the channel folder with the local Syncthing
+and shared it with every device that Syncthing already trusts. Check `syncthing` in the
+JSON:
 
-One machine alone is still useful — you can issue and do work — but nothing crosses
-machines until the folder is shared.
+- `available: false` — Syncthing is not installed or not running. The channel still
+  works locally. Report the `note` field to your human; installing Syncthing is not
+  your call to make silently.
+- `shared_with: []` — nothing else is paired with this Syncthing yet. Normal on a first
+  machine.
+- `device_id` — this machine's Syncthing id. Your human needs it to pair another
+  machine.
+
+**What `enable` will not do is pair a new device.** Exchanging device IDs is a trust
+decision — it approves a machine that will then receive data — and it needs a human on
+both ends. Ferryman uses pairings that already exist and never creates one.
 
 ## Step 4 — run the loops
 

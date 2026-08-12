@@ -56,6 +56,11 @@ enum Command {
         /// how much you trust a model to approve work unsupervised.
         #[arg(long, default_value = "confirm")]
         review: String,
+        /// Do not touch the local Syncthing. By default `enable` registers the channel
+        /// folder and shares it with the devices Syncthing already trusts, because that
+        /// step is otherwise a trip through a web UI that an agent cannot make.
+        #[arg(long)]
+        no_syncthing: bool,
         /// Emit one JSON object describing the result, for a caller that is a program.
         #[arg(long)]
         json: bool,
@@ -614,6 +619,7 @@ async fn main() -> Result<()> {
             email,
             command,
             review,
+            no_syncthing,
             json: as_json,
         } => {
             enable::run(enable::Request {
@@ -624,6 +630,7 @@ async fn main() -> Result<()> {
                 email,
                 command,
                 review,
+                no_syncthing,
                 as_json,
             })?;
         }

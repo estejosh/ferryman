@@ -26,8 +26,9 @@ ferry agent run                                            # this machine now do
 No Rust toolchain, no compile. Without node:
 `curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh`
 
-**Point your agent at [docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md) and it can do
-that itself.** `ferry enable` never prompts, is safe to run twice, and reports in JSON —
+**Or don't run it yourself.** [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) is a
+block you paste into any coding agent — it installs Ferryman, enables the project, wires
+the Syncthing folder and starts working, without asking you anything. `ferry enable` never prompts, is safe to run twice, and reports in JSON —
 it is built to be run by an agent with nobody watching, because that is who usually
 installs this.
 

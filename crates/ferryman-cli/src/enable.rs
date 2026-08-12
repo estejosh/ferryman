@@ -37,6 +37,9 @@ pub struct Request {
     pub email: String,
     pub command: String,
     pub review: String,
+    /// Leave the local Syncthing alone. For a machine where the folder is managed by
+    /// something else, or where touching a running service is not wanted.
+    pub no_syncthing: bool,
     pub as_json: bool,
 }
 
@@ -51,6 +54,7 @@ struct Step {
 /// facts drive the human output, the JSON and the tests.
 struct Outcome {
     project: String,
+    syncthing: Option<ferryman_channel::SyncthingSetup>,
     counted: ferryman_channel::licensing::FleetCount,
     agent: String,
     workspace: PathBuf,
@@ -236,8 +240,23 @@ fn perform(request: Request) -> Result<Outcome> {
     let counted =
         ferryman_channel::licensing::count(&ferryman_channel::licensing::read_devices(&route)?);
 
+    // Wire Syncthing here rather than telling the operator to do it in a web UI. An
+    // agent cannot click a web UI, and this was the one step that kept adding a second
+    // machine a manual job while everything else was a single command.
+    //
+    // Shares with every device this Syncthing already trusts. That is the right default
+    // for a fleet someone has already paired: it never adds a device, so it cannot widen
+    // trust - it only uses trust that already exists.
+    let syncthing = if request.no_syncthing {
+        None
+    } else {
+        let peers = ferryman_channel::syncthing_peers().unwrap_or_default();
+        Some(ferryman_channel::syncthing_register_folder(&route, &peers)?)
+    };
+
     Ok(Outcome {
         project,
+        syncthing,
         counted,
         agent: agent_name,
         workspace,
@@ -257,7 +276,7 @@ fn report_json(outcome: &Outcome) -> Result<()> {
             "agent": outcome.agent,
             "workspace": outcome.workspace.display().to_string(),
             "channel": outcome.route.communications.display().to_string(),
-            "syncthing_folder_id": format!("{}-ferryman", outcome.project),
+            "syncthing": outcome.syncthing,
             "agent_command": outcome.config.command,
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
@@ -301,9 +320,23 @@ fn report_human(outcome: &Outcome) -> Result<()> {
     println!("  review     {}", outcome.config.review.as_str());
     println!("  public key {}", outcome.public_key);
     println!();
-    println!("To bring another machine in, share this folder over Syncthing:");
-    println!("  {}", outcome.route.communications.display());
-    println!("  folder id: {}-ferryman", outcome.project);
+    match &outcome.syncthing {
+        Some(setup) if setup.available => {
+            println!("  syncthing  folder '{}' registered", setup.folder_id);
+            if setup.shared_with.is_empty() {
+                println!("             no other devices paired yet");
+            } else {
+                for peer in &setup.shared_with {
+                    println!("             shared with {}", peer.name);
+                }
+            }
+            if let Some(id) = &setup.device_id {
+                println!("             this device: {id}");
+            }
+        }
+        Some(setup) => println!("  syncthing  not wired: {}", setup.note),
+        None => println!("  syncthing  skipped (--no-syncthing)"),
+    }
     println!();
     println!("Then, on each machine:");
     println!("  ferry agent run        # does work");
@@ -365,6 +398,7 @@ mod tests {
             agent: Some("tester".into()),
             role: "worker".into(),
             email: "tester@example.com".into(),
+            no_syncthing: true,
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
@@ -423,6 +457,7 @@ mod tests {
             agent: Some("tester".into()),
             role: "worker".into(),
             email: "tester@example.com".into(),
+            no_syncthing: true,
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,

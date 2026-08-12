@@ -7,6 +7,9 @@
 Go to **[docs/AGENT_QUICKSTART.md](docs/AGENT_QUICKSTART.md)**. It is written for you: an
 agent doing this unattended, with nobody to ask. Nothing below this section applies.
 
+If a human handed you [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md), follow that
+instead — it is the same thing, already sequenced.
+
 The whole of it is two commands:
 
 ```sh

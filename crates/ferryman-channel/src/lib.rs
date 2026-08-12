@@ -19,7 +19,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use wait_timeout::ChildExt;
@@ -1714,6 +1714,205 @@ fn syncthing_get(api_base: &str, path: &str, api_key: &str) -> Result<Option<Val
         return Ok(None);
     };
     Ok(serde_json::from_str(&text[start..=end]).ok())
+}
+
+/// POST to Syncthing's local API.
+///
+/// Same hand-rolled HTTP as `syncthing_get`, for the same reason: this talks to a fixed
+/// loopback address and pulling in an HTTP client for it would add a dependency tree to
+/// a crate that deliberately has almost none.
+fn syncthing_post(api_base: &str, path: &str, api_key: &str, body: &str) -> Result<Option<u16>> {
+    let authority = api_base
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("http://")
+        .context("SYNCTHING_API_BASE must be a plain http:// loopback address")?;
+    let authority = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:8384")
+    };
+    let Some(address) = authority.to_socket_addrs()?.next() else {
+        return Ok(None);
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, SYNCTHING_API_TIMEOUT) else {
+        return Ok(None);
+    };
+    stream.set_read_timeout(Some(SYNCTHING_API_TIMEOUT))?;
+    stream.set_write_timeout(Some(SYNCTHING_API_TIMEOUT))?;
+    let request = format!(
+        "POST {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Ok(None);
+    }
+    let mut raw = Vec::new();
+    if stream.read_to_end(&mut raw).is_err() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let Some(status_line) = text.lines().next() else {
+        return Ok(None);
+    };
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok());
+    Ok(code)
+}
+
+/// A peer Syncthing knows about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncthingPeer {
+    pub device_id: String,
+    pub name: String,
+}
+
+/// What wiring Syncthing did, or why it could not.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncthingSetup {
+    /// False when Syncthing is not installed or not running. Never an error: a channel
+    /// works locally without it, and an unattended caller should not fail setup because
+    /// a separate program is not up yet.
+    pub available: bool,
+    pub folder_id: String,
+    pub folder_path: String,
+    /// This machine's device id, to give to the other machines.
+    pub device_id: Option<String>,
+    /// Peers the folder is now shared with.
+    pub shared_with: Vec<SyncthingPeer>,
+    pub note: String,
+}
+
+/// Find the local Syncthing API key, honouring an explicit override first.
+pub fn syncthing_api_key() -> Option<String> {
+    std::env::var("SYNCTHING_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty())
+        .or_else(syncthing_api_key_from_config)
+}
+
+fn syncthing_api_base() -> String {
+    std::env::var("SYNCTHING_API_BASE").unwrap_or_else(|_| SYNCTHING_DEFAULT_API.to_string())
+}
+
+/// Every device this Syncthing already knows, minus itself.
+pub fn syncthing_peers() -> Result<Vec<SyncthingPeer>> {
+    let Some(key) = syncthing_api_key() else {
+        return Ok(Vec::new());
+    };
+    let base = syncthing_api_base();
+    let me = syncthing_get(&base, "/rest/system/status", &key)?
+        .and_then(|v| v.get("myID").and_then(Value::as_str).map(str::to_string));
+    // The devices endpoint returns an array, and syncthing_get slices out an object, so
+    // this asks for the config and reads the devices out of it instead.
+    let Some(config) = syncthing_get(&base, "/rest/config", &key)? else {
+        return Ok(Vec::new());
+    };
+    let mut peers = Vec::new();
+    if let Some(devices) = config.get("devices").and_then(Value::as_array) {
+        for device in devices {
+            let Some(id) = device.get("deviceID").and_then(Value::as_str) else {
+                continue;
+            };
+            if Some(id.to_string()) == me {
+                continue;
+            }
+            peers.push(SyncthingPeer {
+                device_id: id.to_string(),
+                name: device
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    Ok(peers)
+}
+
+/// Register this project's channel folder with the local Syncthing and share it.
+///
+/// This is the step that used to be left to the operator, and leaving it there was the
+/// single biggest reason setting up a second machine was hard: everything else is one
+/// command, and this was a trip through a web UI. An agent cannot click a web UI.
+///
+/// Idempotent. Syncthing's config POST replaces a folder with the same id, so running
+/// it again after adding a machine simply widens the share list.
+pub fn syncthing_register_folder(
+    route: &ProjectRoute,
+    share_with: &[SyncthingPeer],
+) -> Result<SyncthingSetup> {
+    let folder_id = if route.shared_remote.trim().is_empty() {
+        format!("{}-ferryman", route.project_id)
+    } else {
+        route.shared_remote.clone()
+    };
+    let folder_path = route.communications.display().to_string();
+    let unavailable = |note: &str| SyncthingSetup {
+        available: false,
+        folder_id: folder_id.clone(),
+        folder_path: folder_path.clone(),
+        device_id: None,
+        shared_with: Vec::new(),
+        note: note.to_string(),
+    };
+
+    let Some(key) = syncthing_api_key() else {
+        return Ok(unavailable(
+            "Syncthing config not found; the channel works locally, and other machines \
+             can be added once Syncthing is installed",
+        ));
+    };
+    let base = syncthing_api_base();
+    let Some(status) = syncthing_get(&base, "/rest/system/status", &key)? else {
+        return Ok(unavailable(
+            "Syncthing is installed but not answering on its API; start it and re-run",
+        ));
+    };
+    let device_id = status
+        .get("myID")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let mut devices: Vec<Value> = Vec::new();
+    if let Some(me) = &device_id {
+        devices.push(json!({ "deviceID": me }));
+    }
+    for peer in share_with {
+        devices.push(json!({ "deviceID": peer.device_id }));
+    }
+    let body = serde_json::to_string(&json!({
+        "id": folder_id,
+        "label": format!("{} ferryman channel", route.project_id),
+        "path": folder_path,
+        "type": "sendreceive",
+        "devices": devices,
+        "fsWatcherEnabled": true,
+        "fsWatcherDelayS": 1,
+        "rescanIntervalS": 30,
+    }))?;
+
+    match syncthing_post(&base, "/rest/config/folders", &key, &body)? {
+        Some(code) if (200..300).contains(&code) => Ok(SyncthingSetup {
+            available: true,
+            folder_id,
+            folder_path,
+            device_id,
+            shared_with: share_with.to_vec(),
+            note: if share_with.is_empty() {
+                "folder registered; no other devices are paired with this Syncthing yet".to_string()
+            } else {
+                "folder registered and shared".to_string()
+            },
+        }),
+        Some(code) => Ok(unavailable(&format!(
+            "Syncthing refused the folder (HTTP {code}); register it by hand"
+        ))),
+        None => Ok(unavailable("could not reach Syncthing's API")),
+    }
 }
 
 /// Syncthing's config.xml holds `<apikey>...</apikey>`. Read it from the platform
