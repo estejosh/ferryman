@@ -1797,7 +1797,12 @@ pub fn syncthing_api_key() -> Option<String> {
 }
 
 fn syncthing_api_base() -> String {
-    std::env::var("SYNCTHING_API_BASE").unwrap_or_else(|_| SYNCTHING_DEFAULT_API.to_string())
+    if let Ok(explicit) = std::env::var("SYNCTHING_API_BASE")
+        && !explicit.trim().is_empty()
+    {
+        return explicit;
+    }
+    syncthing_address_from_config().unwrap_or_else(|| SYNCTHING_DEFAULT_API.to_string())
 }
 
 /// Every device this Syncthing already knows, minus itself.
@@ -1870,9 +1875,13 @@ pub fn syncthing_register_folder(
     };
     let base = syncthing_api_base();
     let Some(status) = syncthing_get(&base, "/rest/system/status", &key)? else {
-        return Ok(unavailable(
-            "Syncthing is installed but not answering on its API; start it and re-run",
-        ));
+        // Naming the address matters more than it looks: when this fired on a machine
+        // where Syncthing was up on a different port, the old wording sent the operator
+        // to restart a healthy service instead of to the one line that explains it.
+        return Ok(unavailable(&format!(
+            "Syncthing did not answer at {base}; if its GUI is on another address, set \
+             SYNCTHING_API_BASE to it, otherwise start Syncthing and re-run",
+        )));
     };
     let device_id = status
         .get("myID")
@@ -1919,7 +1928,38 @@ pub fn syncthing_register_folder(
 
 /// Syncthing's config.xml holds `<apikey>...</apikey>`. Read it from the platform
 /// default location so an existing Syncthing install needs no extra configuration.
-fn syncthing_api_key_from_config() -> Option<String> {
+/// `canonicalize`, without Windows' extended-length prefix.
+///
+/// `std::fs::canonicalize` returns verbatim paths on Windows - `\\?\X:\project` - and
+/// Ferryman was putting them straight into `bridge.toml`, into every path in
+/// `enable --json`, and into the folder path handed to Syncthing. They are unreadable in
+/// output meant for a person, and tools that do not understand the prefix reject them.
+///
+/// The prefix is only dropped where doing so is lossless: a drive path, or a UNC share
+/// written back to its `\\server\share` form. A verbatim path that means something a
+/// normal path cannot express is left exactly as it is.
+pub fn real_path(path: &Path) -> PathBuf {
+    if !cfg!(windows) {
+        return path.to_path_buf();
+    }
+    let Some(text) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        // Only a drive-letter path round-trips; anything else keeps the prefix.
+        let mut chars = rest.chars();
+        if matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic()) {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Every place Syncthing is known to keep `config.xml`, most specific first.
+fn syncthing_config_paths() -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(explicit) = std::env::var("SYNCTHING_CONFIG_DIR") {
         candidates.push(PathBuf::from(explicit).join("config.xml"));
@@ -1947,22 +1987,60 @@ fn syncthing_api_key_from_config() -> Option<String> {
                 .join("config.xml"),
         );
     }
-    for candidate in candidates {
+    candidates
+}
+
+/// The text of one element inside Syncthing's `<gui>` block.
+///
+/// Scoped to `<gui>` deliberately: `<address>` also appears under every `<device>`
+/// entry, and the first one in the file is a peer's, not the API's.
+fn gui_element(config: &str, tag: &str) -> Option<String> {
+    let start = config.find("<gui")?;
+    let end = config[start..].find("</gui>")? + start;
+    let gui = &config[start..end];
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let from = gui.find(&open)? + open.len();
+    let to = gui[from..].find(&close)? + from;
+    let value = gui[from..to].trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn syncthing_config_field(tag: &str) -> Option<String> {
+    for candidate in syncthing_config_paths() {
         let Ok(text) = fs::read_to_string(&candidate) else {
             continue;
         };
-        if let Some(start) = text.find("<apikey>")
-            && let Some(end) = text[start..].find("</apikey>")
-        {
-            let key = text[start + "<apikey>".len()..start + end]
-                .trim()
-                .to_string();
-            if !key.is_empty() {
-                return Some(key);
-            }
+        if let Some(value) = gui_element(&text, tag) {
+            return Some(value);
         }
     }
     None
+}
+
+fn syncthing_api_key_from_config() -> Option<String> {
+    syncthing_config_field("apikey")
+}
+
+/// The address Syncthing's own config says its API is on.
+///
+/// Ferryman used to assume 8384. Syncthing 2.x picks a **random** free port on a fresh
+/// install - a clean Windows machine came up on 61103 - so the assumption made `enable`
+/// report "Syncthing is installed but not answering on its API; start it and re-run" for
+/// a Syncthing that was installed, running and answering. Telling someone to restart a
+/// service that is already up is worse than saying nothing: it is a confident instruction
+/// with no exit.
+///
+/// A wildcard bind is rewritten to loopback. `0.0.0.0` is a listen address, not a
+/// destination, and connecting to it is not portable.
+fn syncthing_address_from_config() -> Option<String> {
+    let address = syncthing_config_field("address")?;
+    let address = match address.rsplit_once(':') {
+        Some((host, port)) if host == "0.0.0.0" || host.is_empty() => format!("127.0.0.1:{port}"),
+        Some(("::", port)) | Some(("[::]", port)) => format!("127.0.0.1:{port}"),
+        _ => address,
+    };
+    Some(format!("http://{address}"))
 }
 
 pub struct SharedFolderTransport<P> {
@@ -5341,5 +5419,55 @@ mod work_over_files_tests {
                 "'{bad}' must be refused"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod windows_paths {
+    use super::*;
+
+    // These run everywhere. `real_path` is a no-op off Windows, so the assertions are
+    // written against the helper's decision rather than against the platform - the point
+    // is that the mapping is right, and a Linux CI box should still catch it breaking.
+    fn strip(text: &str) -> String {
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            let mut chars = rest.chars();
+            if matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+            {
+                return rest.to_string();
+            }
+        }
+        text.to_string()
+    }
+
+    #[test]
+    fn a_drive_path_loses_the_prefix() {
+        assert_eq!(strip(r"\\?\X:\ferryman"), r"X:\ferryman");
+        assert_eq!(
+            strip(r"\\?\C:\Users\me\.ferryman\ferryman"),
+            r"C:\Users\me\.ferryman\ferryman"
+        );
+    }
+
+    #[test]
+    fn a_unc_share_is_written_back_to_its_normal_form() {
+        assert_eq!(strip(r"\\?\UNC\server\share\dir"), r"\\server\share\dir");
+    }
+
+    #[test]
+    fn anything_that_would_not_round_trip_is_left_alone() {
+        // Device paths mean something no ordinary path can express; dropping the prefix
+        // would change where they point.
+        assert_eq!(strip(r"\\?\Volume{abc}\x"), r"\\?\Volume{abc}\x");
+        assert_eq!(strip(r"X:\already\plain"), r"X:\already\plain");
+    }
+
+    #[test]
+    fn the_helper_agrees_with_the_mapping_it_documents() {
+        let plain = real_path(Path::new(r"X:\already\plain"));
+        assert_eq!(plain, PathBuf::from(r"X:\already\plain"));
     }
 }

@@ -72,6 +72,9 @@ pub fn perform(request: Request) -> Result<Outcome> {
     let workspace = workspace
         .canonicalize()
         .with_context(|| format!("{} does not exist", workspace.display()))?;
+    // Windows canonicalisation yields \\?\X:\... , which then appeared in bridge.toml,
+    // in every path in --json, and in the folder path given to Syncthing.
+    let workspace = ferryman_channel::real_path(&workspace);
 
     let project = match request.project {
         Some(id) => id,
