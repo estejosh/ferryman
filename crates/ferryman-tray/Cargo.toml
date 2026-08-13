@@ -1,0 +1,21 @@
+[package]
+name = "ferryman-tray"
+version = "0.3.1"
+edition = "2024"
+license = "LicenseRef-Ferryman-Source-Available"
+repository = "https://github.com/estejosh/ferryman"
+description = "Ferryman in the system tray: what it is doing, and a switch to stop it."
+
+# Deliberately NOT a member of the workspace. This is a desktop application and its
+# dependencies need desktop libraries - GTK on Linux - which are absent from a headless
+# server, and a headless server is exactly what most Ferryman agents run on. Making it a
+# member would mean `cargo build --workspace` failing on the machines that matter most,
+# to build a tray nobody there can see.
+
+[dependencies]
+anyhow = "1.0"
+ferryman-channel = { path = "../ferryman-channel" }
+ferryman-ops = { path = "../ferryman-ops" }
+tray-icon = "0.19"
+winit = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
