@@ -1488,6 +1488,22 @@ async fn agent_command(command: Agent) -> Result<()> {
                 "worker '{}' started on {}, running '{}'",
                 config.agent, route.project_id, config.command
             ));
+            // Optional settings are announced because agent.toml ignores keys it does
+            // not recognise - which is what lets one machine run a newer Ferryman than
+            // another without either config breaking, and is worth keeping. The cost is
+            // that a misspelled key does nothing and says nothing. Printing what is
+            // actually in force turns that into something visible on the first line:
+            // set preamble_file, see no preamble line, check your spelling.
+            if let Some(preamble) = &config.preamble {
+                report.info(&format!(
+                    "  preamble  {} bytes at the front of every prompt, from {}",
+                    preamble.len(),
+                    config.preamble_file.as_deref().unwrap_or("?")
+                ));
+            }
+            if let Some(window) = &config.claim_window {
+                report.info(&format!("  hours     claims work {}", window.describe()));
+            }
             loop {
                 match agent::work_once(&route, &config, &report).await {
                     Ok(0) => {}
