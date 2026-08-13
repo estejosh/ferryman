@@ -31,7 +31,34 @@
 //! pressure becomes placement. On a single machine it becomes a delay, which is the
 //! honest outcome when there is genuinely no room to work.
 
+use std::time::Duration;
+
 use crate::agent::AgentConfig;
+
+/// Whether a person is using this machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Presence {
+    /// Someone touched the keyboard or mouse this recently.
+    Active(Duration),
+    /// There is no desktop session to ask about - a server, a container, a machine
+    /// nobody is sitting at. **Never a reason to pause**: the machines most likely to
+    /// report this are the ones whose whole job is running agents unattended.
+    Unknown,
+}
+
+/// How long since the last keyboard or mouse input.
+///
+/// The obvious crates for this link X11 at build time and fail to compile on a headless
+/// Linux box - which is a machine this product is specifically for. This one speaks the
+/// X11 protocol in Rust rather than linking the C library, so it builds anywhere and
+/// simply reports at runtime that there is no display to ask.
+#[must_use]
+pub fn presence() -> Presence {
+    match system_idle_time::get_idle_time() {
+        Ok(idle) => Presence::Active(idle),
+        Err(_) => Presence::Unknown,
+    }
+}
 
 /// What the loop should do, and - when the answer is no - what to tell the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,7 +95,30 @@ pub fn available_memory_mb() -> Option<u64> {
 /// Decide whether to claim, given how much room the operator asked to keep free.
 #[must_use]
 pub fn may_claim(config: &AgentConfig) -> Decision {
+    // Presence first: it is the cheap check, and it is the one whose answer a person
+    // recognises as being about them.
+    if config.pause_while_active {
+        let decision = judge_presence(presence(), config.idle_after);
+        if !decision.is_go() {
+            return decision;
+        }
+    }
     judge(config.min_free_ram_mb, available_memory_mb())
+}
+
+/// Whether someone being at the machine should stop it taking on more.
+fn judge_presence(presence: Presence, idle_after: Duration) -> Decision {
+    match presence {
+        // No session to ask about. A server has nobody to get in the way of.
+        Presence::Unknown => Decision::Go,
+        Presence::Active(idle) if idle >= idle_after => Decision::Go,
+        Presence::Active(idle) => Decision::Wait(format!(
+            "you used this machine {}s ago; work resumes after {}s idle, and anything \
+             already running is unaffected (pause_while_active in agent.toml)",
+            idle.as_secs(),
+            idle_after.as_secs()
+        )),
+    }
 }
 
 /// The decision, separated from where its inputs come from, so the thresholds can be
@@ -91,6 +141,42 @@ fn judge(min_free_mb: u64, available_mb: Option<u64>) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn someone_at_the_keyboard_stops_new_work() {
+        let Decision::Wait(reason) = judge_presence(
+            Presence::Active(Duration::from_secs(5)),
+            Duration::from_secs(300),
+        ) else {
+            panic!("input five seconds ago should hold work back")
+        };
+        assert!(
+            reason.contains("already running is unaffected"),
+            "the reason must say what is NOT interrupted: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_machine_left_alone_gets_on_with_it() {
+        assert_eq!(
+            judge_presence(
+                Presence::Active(Duration::from_secs(600)),
+                Duration::from_secs(300)
+            ),
+            Decision::Go
+        );
+    }
+
+    #[test]
+    fn a_machine_with_nobody_at_it_never_pauses() {
+        // Servers and containers report Unknown. They are the machines whose entire job
+        // is running agents unattended, so treating "no session" as "someone is here"
+        // would stop work exactly where it should never stop.
+        assert_eq!(
+            judge_presence(Presence::Unknown, Duration::from_secs(300)),
+            Decision::Go
+        );
+    }
 
     #[test]
     fn plenty_of_room_means_go() {

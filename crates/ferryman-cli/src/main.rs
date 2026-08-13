@@ -1378,6 +1378,16 @@ async fn agent_command(command: Agent) -> Result<()> {
                 let plan = agent::plan(&route, &config)?;
                 println!("would run as '{}' on {}", plan.agent, route.project_id);
                 println!("  command   {}", config.command);
+                match ferryman_ops::governor::presence() {
+                    ferryman_ops::governor::Presence::Active(idle) => println!(
+                        "  presence  last input {}s ago (pauses under {}s)",
+                        idle.as_secs(),
+                        config.idle_after.as_secs()
+                    ),
+                    ferryman_ops::governor::Presence::Unknown => {
+                        println!("  presence  no desktop session; nobody to wait for");
+                    }
+                }
                 match &plan.gate {
                     ferryman_ops::governor::Decision::Go => {
                         println!("  memory    enough free to start");

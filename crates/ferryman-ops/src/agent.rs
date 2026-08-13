@@ -87,6 +87,10 @@ pub struct AgentConfig {
     /// Megabytes of memory to leave available. Below this the agent does not claim, so
     /// the task stays open for a machine with room. 0 turns the check off.
     pub min_free_ram_mb: u64,
+    /// Stop taking work while someone is using this machine.
+    pub pause_while_active: bool,
+    /// How long the machine must be untouched before work resumes.
+    pub idle_after: Duration,
     pub poll: Duration,
 }
 
@@ -165,6 +169,12 @@ impl AgentConfig {
             )?,
             poll: Duration::from_secs(number("poll_secs", 10)?),
             min_free_ram_mb: number("min_free_ram_mb", 1024)?,
+            pause_while_active: match fields.get("pause_while_active").map(String::as_str) {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(other) => bail!("pause_while_active must be true or false, not '{other}'"),
+            },
+            idle_after: Duration::from_secs(number("idle_after_secs", 300)?),
         })
     }
 
@@ -210,6 +220,14 @@ poll_secs = "10"
 # priority stops it fighting you for CPU; only declining to start stops it
 # taking the last of your memory. Set to 0 to turn the check off.
 min_free_ram_mb = "1024"
+
+# Stop taking new work while you are using this machine, and start again once it
+# has been untouched for idle_after_secs. Work already running is never
+# interrupted - only the decision to pick up something new waits. On a machine
+# with no desktop session, such as a server, there is nobody to get in the way
+# and this does nothing.
+pause_while_active = "true"
+idle_after_secs = "300"
 "#,
             review = review.as_str()
         )
