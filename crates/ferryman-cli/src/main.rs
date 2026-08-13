@@ -1480,10 +1480,6 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("nothing was claimed, written or sent");
                 return Ok(());
             }
-            println!(
-                "worker '{}' on {}, running '{}'",
-                config.agent, route.project_id, config.command
-            );
             // Recorded, not only printed: a worker that started and a worker that
             // failed on every pass look the same in an empty log, and "why did nothing
             // happen last night" is the question this has to be able to answer.
