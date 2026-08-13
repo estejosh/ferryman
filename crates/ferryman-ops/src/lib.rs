@@ -20,6 +20,7 @@ pub mod enable;
 pub mod governor;
 pub mod identity;
 pub mod priority;
+pub mod runlog;
 
 /// Where a long-running operation reports what it is doing.
 ///

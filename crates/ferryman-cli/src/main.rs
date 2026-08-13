@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod license;
 
+use ferryman_ops::Progress;
 use ferryman_ops::agent;
 use ferryman_ops::enable;
 
@@ -77,6 +78,16 @@ enum Command {
     },
     /// Start taking work again after `ferry pause`.
     Resume,
+    /// What this machine's worker has been doing.
+    ///
+    /// The local diagnostic record - attempts, errors, and the reasons the loop declined
+    /// to claim. `ferry channel log` is the other half: what the *fleet* did, signed.
+    /// This one never leaves the machine, because it carries local paths and whatever
+    /// the agent CLI printed.
+    Log {
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
     /// Run the agentic loop: pick work up, do it, and judge what comes back.
     Agent {
         #[command(subcommand)]
@@ -701,6 +712,20 @@ async fn main() -> Result<()> {
                     println!("not paused; nothing to do");
                 }
                 Err(error) => return Err(error).context(format!("remove {}", path.display())),
+            }
+        }
+        Command::Log { lines } => {
+            let entries = ferryman_ops::runlog::tail(lines);
+            if entries.is_empty() {
+                println!("this machine's worker has not recorded anything yet");
+                match ferryman_ops::runlog::path() {
+                    Some(path) => println!("  it would be written to {}", path.display()),
+                    None => println!("  and there is no per-user directory to write it to"),
+                }
+            } else {
+                for entry in entries {
+                    println!("{entry}");
+                }
             }
         }
         Command::Agent { command } => agent_command(command).await?,
@@ -1394,6 +1419,16 @@ async fn license_command(command: License) -> Result<()> {
 /// A pass that fails does not stop the loop: an agent CLI that is briefly missing, or a
 /// single task whose reply cannot be parsed, must not take the whole machine off the
 /// fleet. The failure is printed and the next pass tries again.
+/// What the worker loops report through: the terminal, and this machine's run log.
+///
+/// The loops themselves did not change to gain a log - deciding where their output goes
+/// is the caller's job, which is what the `Progress` trait was separated out for.
+fn worker_progress() -> ferryman_ops::runlog::Logged<ferryman_ops::Stdout> {
+    ferryman_ops::runlog::Logged {
+        inner: ferryman_ops::Stdout,
+    }
+}
+
 async fn agent_command(command: Agent) -> Result<()> {
     let route_for = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
@@ -1449,11 +1484,19 @@ async fn agent_command(command: Agent) -> Result<()> {
                 "worker '{}' on {}, running '{}'",
                 config.agent, route.project_id, config.command
             );
+            // Recorded, not only printed: a worker that started and a worker that
+            // failed on every pass look the same in an empty log, and "why did nothing
+            // happen last night" is the question this has to be able to answer.
+            let report = worker_progress();
+            report.info(&format!(
+                "worker '{}' started on {}, running '{}'",
+                config.agent, route.project_id, config.command
+            ));
             loop {
-                match agent::work_once(&route, &config, &ferryman_ops::Stdout).await {
+                match agent::work_once(&route, &config, &report).await {
                     Ok(0) => {}
-                    Ok(count) => println!("did {count} task(s)"),
-                    Err(error) => eprintln!("pass failed, will retry: {error:#}"),
+                    Ok(count) => report.info(&format!("did {count} task(s)")),
+                    Err(error) => report.warn(&format!("pass failed, will retry: {error:#}")),
                 }
                 if once {
                     break;
@@ -1464,17 +1507,18 @@ async fn agent_command(command: Agent) -> Result<()> {
         Agent::Review { workspace, once } => {
             let route = route_for(workspace)?;
             let config = agent::AgentConfig::load(&route.attachment)?;
-            println!(
-                "reviewer '{}' on {}, authority '{}'",
+            let report = worker_progress();
+            report.info(&format!(
+                "reviewer '{}' started on {}, authority '{}'",
                 config.agent,
                 route.project_id,
                 config.review.as_str()
-            );
+            ));
             loop {
-                match agent::review_once(&route, &config, &ferryman_ops::Stdout).await {
+                match agent::review_once(&route, &config, &report).await {
                     Ok(0) => {}
-                    Ok(count) => println!("judged {count} result(s)"),
-                    Err(error) => eprintln!("pass failed, will retry: {error:#}"),
+                    Ok(count) => report.info(&format!("judged {count} result(s)")),
+                    Err(error) => report.warn(&format!("pass failed, will retry: {error:#}")),
                 }
                 if once {
                     break;
