@@ -17,19 +17,16 @@
 //! writes. Quitting it changes nothing about whether work happens - which is the point,
 //! because a tray that is load-bearing is a tray whose crash stops your fleet.
 //!
-//! # Status: does not yet appear on Windows 11
+//! # The icon must be the light mark
 //!
-//! It compiles, runs, stays alive, and reports no error - `TrayIconBuilder::build`
-//! returns `Ok` - but no icon shows up, in the notification area or in the overflow. The
-//! process runs in the same session as Explorer and is interactive, so the usual
-//! window-station explanation does not apply. Recorded here rather than left as a
-//! surprise for whoever opens this next: the CLI half (`ferry pause` / `ferry resume`)
-//! is complete and tested, and this shell over it is not finished.
+//! Built with the navy mark first, and it appeared to not work at all: the process ran,
+//! reported no error, and no icon was visible. It was visible - #0D132B on a dark
+//! taskbar is a dark shape on a dark background, and it read as another application's
+//! icon. The light mark is not a preference here, it is the difference between working
+//! and appearing not to.
 //!
-//! Next things to try: pump the tray's own event channel rather than relying on winit
-//! to service the hidden message window; and check whether Shell_NotifyIcon is being
-//! called before the taskbar is ready to accept it, which needs a WM_TASKBARCREATED
-//! retry.
+//! Confirmed the only way worth trusting: stop the process and watch the notification
+//! area reflow from fourteen icons to thirteen.
 
 #![forbid(unsafe_code)]
 
@@ -203,7 +200,10 @@ impl ApplicationHandler for Tray {
 /// survives at; below it the handles come off and a different file is used. Embedded in
 /// the binary rather than read from disk, so the tray cannot start up without its icon.
 fn icon() -> Result<tray_icon::Icon> {
-    const PNG: &[u8] = include_bytes!("../../../assets/brand/png/ferryman-32.png");
+    // The off-white mark, not the navy one. A tray sits on the taskbar, taskbars are
+    // dark far more often than not, and #0D132B on a dark taskbar is a dark smudge on a
+    // dark background. The brand ships both for exactly this reason.
+    const PNG: &[u8] = include_bytes!("../../../assets/brand/png/ferryman-32-dark.png");
     let image = image::load_from_memory(PNG)
         .context("decode the embedded tray icon")?
         .into_rgba8();
