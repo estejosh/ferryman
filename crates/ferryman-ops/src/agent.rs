@@ -91,7 +91,18 @@ pub struct AgentConfig {
     pub pause_while_active: bool,
     /// How long the machine must be untouched before work resumes.
     pub idle_after: Duration,
+    /// Hours during which this machine picks work up. `None` means any hour.
+    pub claim_window: Option<crate::governor::Window>,
     pub poll: Duration,
+    /// The preamble file as the operator wrote it, resolved relative to the attachment.
+    /// Kept separate from its contents so [`Self::parse`] stays a pure string function.
+    pub preamble_file: Option<String>,
+    /// Standing context placed at the very front of every prompt, unchanged between runs.
+    ///
+    /// Read once at startup rather than per task, so the bytes cannot change under the
+    /// cache mid-run, and so a file that has been moved or deleted is a loud failure
+    /// before any work is claimed rather than a quiet degradation forty tasks in.
+    pub preamble: Option<String>,
 }
 
 impl AgentConfig {
@@ -114,7 +125,42 @@ impl AgentConfig {
                 path.display()
             )
         })?;
-        Self::parse(&text).with_context(|| format!("{} is not valid", path.display()))
+        let mut config =
+            Self::parse(&text).with_context(|| format!("{} is not valid", path.display()))?;
+        config.load_preamble(attachment)?;
+        Ok(config)
+    }
+
+    /// Read the configured preamble, and refuse to start without it.
+    ///
+    /// A missing preamble is an error, not an empty string. The whole value of this file
+    /// is that its bytes are identical on every prompt: a machine that silently carried
+    /// on without it would produce work that is subtly less informed and prompts that
+    /// miss every cache, and nothing about either would look wrong. Failing here means
+    /// the operator finds out at startup, once, instead of from a bill.
+    fn load_preamble(&mut self, attachment: &Path) -> Result<()> {
+        let Some(configured) = &self.preamble_file else {
+            return Ok(());
+        };
+        // Relative paths resolve against the attachment, so the config and the file it
+        // names travel together and the loop does not depend on its working directory.
+        let path = {
+            let named = Path::new(configured);
+            if named.is_absolute() {
+                named.to_path_buf()
+            } else {
+                attachment.join(named)
+            }
+        };
+        let text = fs::read_to_string(&path).with_context(|| {
+            format!(
+                "read the preamble at {}, named by preamble_file in {}",
+                path.display(),
+                Self::path(attachment).display()
+            )
+        })?;
+        self.preamble = Some(text);
+        Ok(())
     }
 
     fn parse(text: &str) -> Result<Self> {
@@ -175,6 +221,15 @@ impl AgentConfig {
                 Some(other) => bail!("pause_while_active must be true or false, not '{other}'"),
             },
             idle_after: Duration::from_secs(number("idle_after_secs", 300)?),
+            claim_window: match fields.get("claim_window").map(String::as_str) {
+                None | Some("") => None,
+                Some(value) => Some(crate::governor::Window::parse(value)?),
+            },
+            preamble_file: fields
+                .get("preamble_file")
+                .cloned()
+                .filter(|p| !p.is_empty()),
+            preamble: None,
         })
     }
 
@@ -228,6 +283,40 @@ min_free_ram_mb = "1024"
 # and this does nothing.
 pause_while_active = "true"
 idle_after_secs = "300"
+
+# Hours during which this machine picks work up, as HH:MM-HH:MM. Unset means
+# any hour, which is the default and what you want unless you have a reason.
+#
+# The reasons people do have: electricity that is cheaper overnight, a metered
+# connection with a free window, a desktop in the same room as someone asleep, an
+# inference provider that discounts off-peak hours. Ferryman does not need to
+# know which; they are all "take work between these times".
+#
+# Times are this machine's LOCAL time unless you append UTC. Say which you mean:
+# a window that is off by your offset still looks like a working window, and you
+# find out from the fact that nothing happened last night.
+#
+# A window crossing midnight is fine and is the usual case. Work already running
+# when the window closes is never interrupted - only the decision to pick up
+# something new waits, so nothing part-finished is thrown away.
+# claim_window = "22:00-06:00"
+# claim_window = "16:30-00:30 UTC"
+
+# A file of standing context - the repo map, the conventions, whatever every task
+# on this project needs to know. Its contents go at the very front of every
+# prompt this machine sends, before anything task-specific, and do not change
+# between runs.
+#
+# That position is the point. Inference providers charge far less for a prefix
+# they have already seen: on some the cached rate is under a fiftieth of the
+# uncached one. The discount applies to the longest run of leading bytes that is
+# identical to last time, so context that would be useful anywhere in the prompt
+# is worth real money specifically at the front of it.
+#
+# It is also just better prompting, and it costs nothing when unset. Relative
+# paths resolve against this directory. If the file is named but cannot be read,
+# the agent refuses to start rather than quietly working without it.
+# preamble_file = "preamble.md"
 "#,
             review = review.as_str()
         )
@@ -326,7 +415,28 @@ carried to the other machines on this channel. You do not need to submit it your
 you cannot take it back. Print the deliverable and nothing else - no preamble, no \
 commentary on whether you should submit, no questions.\n\n";
 
-fn work_prompt(task: &Task) -> String {
+/// The standing context, if there is any, followed by whatever comes next.
+///
+/// Every prompt this machine sends goes through here, so the preamble occupies the same
+/// leading bytes in all of them - a work prompt and a review prompt share a prefix even
+/// though nothing else about them is alike.
+///
+/// Order matters and is not arbitrary. The preamble goes before the publishing notice,
+/// not after it, because the preamble is the large stable block and a cache discount is
+/// measured from the first byte: putting sixty tokens of notice in front of a
+/// four-thousand-token repo map would cost nothing on a work prompt and throw the entire
+/// shared prefix away on a review prompt, which has no notice.
+fn with_preamble(config: &AgentConfig, rest: String) -> String {
+    match &config.preamble {
+        // Two newlines whatever the file ends with, so a preamble saved with or without
+        // a trailing newline produces the same bytes. A prefix cache is a byte
+        // comparison; an editor's habits should not decide whether it hits.
+        Some(preamble) => format!("{}\n\n{rest}", preamble.trim_end()),
+        None => rest,
+    }
+}
+
+fn work_prompt(config: &AgentConfig, task: &Task) -> String {
     let request = format!(
         "{PUBLISHING_NOTICE}{}",
         task.order
@@ -337,7 +447,7 @@ fn work_prompt(task: &Task) -> String {
             .unwrap_or_else(|| task.order.payload.to_string())
     );
     let Some(revision) = task.latest_revision() else {
-        return request;
+        return with_preamble(config, request);
     };
     // Only a rejection asks for more work. Matching on "a review exists" would rewrite
     // an accepted task's prompt into "fix this", which is how an agent gets told to
@@ -347,7 +457,7 @@ fn work_prompt(task: &Task) -> String {
         .iter()
         .find(|r| r.revision == revision && !r.accepted)
     else {
-        return request;
+        return with_preamble(config, request);
     };
     let previous = task
         .results
@@ -355,18 +465,21 @@ fn work_prompt(task: &Task) -> String {
         .find(|r| r.revision == revision)
         .map(|r| r.payload.to_string())
         .unwrap_or_default();
-    format!(
-        "{request}\n\n\
-         Your previous attempt was sent back for revision.\n\n\
-         What you submitted:\n{previous}\n\n\
-         What the reviewer said to change:\n{}\n\n\
-         Produce a corrected version. Keep everything that was already right.",
-        sent_back.notes.as_deref().unwrap_or("(no notes given)")
+    with_preamble(
+        config,
+        format!(
+            "{request}\n\n\
+             Your previous attempt was sent back for revision.\n\n\
+             What you submitted:\n{previous}\n\n\
+             What the reviewer said to change:\n{}\n\n\
+             Produce a corrected version. Keep everything that was already right.",
+            sent_back.notes.as_deref().unwrap_or("(no notes given)")
+        ),
     )
 }
 
 /// Ask for a verdict in a shape that can be parsed without guessing.
-fn review_prompt(task: &Task, revision: u32) -> String {
+fn review_prompt(config: &AgentConfig, task: &Task, revision: u32) -> String {
     let request = task
         .order
         .payload
@@ -380,15 +493,18 @@ fn review_prompt(task: &Task, revision: u32) -> String {
         .find(|r| r.revision == revision)
         .map(|r| r.payload.to_string())
         .unwrap_or_default();
-    format!(
-        "You are reviewing another agent's work.\n\n\
-         The task was:\n{request}\n\n\
-         What was submitted:\n{submitted}\n\n\
-         Decide whether this should be accepted or sent back for another revision. \
-         Judge it against the task as stated, not against what you would have done.\n\n\
-         Reply with exactly one JSON object and nothing else:\n\
-         {{\"accept\": true|false, \"reasoning\": \"one or two sentences\"}}\n\
-         If you send it back, the reasoning must say specifically what to change."
+    with_preamble(
+        config,
+        format!(
+            "You are reviewing another agent's work.\n\n\
+             The task was:\n{request}\n\n\
+             What was submitted:\n{submitted}\n\n\
+             Decide whether this should be accepted or sent back for another revision. \
+             Judge it against the task as stated, not against what you would have done.\n\n\
+             Reply with exactly one JSON object and nothing else:\n\
+             {{\"accept\": true|false, \"reasoning\": \"one or two sentences\"}}\n\
+             If you send it back, the reasoning must say specifically what to change."
+        ),
     )
 }
 
@@ -546,7 +662,7 @@ async fn do_work(
         "  {id}: running {} (revision {revision})",
         config.command
     ));
-    let run = run_agent(config, &work_prompt(task)).await?;
+    let run = run_agent(config, &work_prompt(config, task)).await?;
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
         // does not have, and inventing one here would be a worse lie than silence.
@@ -608,7 +724,7 @@ pub async fn review_once(
         }
         let id = task.order.id.clone();
         report.info(&format!("  {id}: judging revision {revision}"));
-        let run = run_agent(config, &review_prompt(&task, revision)).await?;
+        let run = run_agent(config, &review_prompt(config, &task, revision)).await?;
         if !run.ok {
             bail!(
                 "'{}' failed reviewing {id}: {}",
@@ -698,6 +814,12 @@ mod tests {
     use super::*;
     use ferryman_channel::{Claim, Order, Review};
 
+    /// A config with no preamble, which is what every prompt test but the preamble ones
+    /// wants: they are asserting on the task text, not on what precedes it.
+    fn bare_config() -> AgentConfig {
+        AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\n").unwrap()
+    }
+
     fn order(id: &str) -> Order {
         Order {
             id: id.into(),
@@ -740,7 +862,7 @@ mod tests {
 
     #[test]
     fn a_first_attempt_is_the_task_plus_the_publishing_notice() {
-        let prompt = work_prompt(&task_with(Vec::new(), Vec::new()));
+        let prompt = work_prompt(&bare_config(), &task_with(Vec::new(), Vec::new()));
         assert!(prompt.ends_with("write the report"));
         // The notice is not decoration: without it an agent reported that it had not
         // submitted work that had already been published under its own signature.
@@ -759,7 +881,10 @@ mod tests {
             signed_by: None,
             signature: None,
         };
-        let prompt = work_prompt(&task_with(vec![result(1, "first go")], vec![review]));
+        let prompt = work_prompt(
+            &bare_config(),
+            &task_with(vec![result(1, "first go")], vec![review]),
+        );
         assert!(prompt.contains("becomes your submitted result"));
     }
 
@@ -775,7 +900,10 @@ mod tests {
             signed_by: None,
             signature: None,
         };
-        let prompt = work_prompt(&task_with(vec![result(1, "first go")], vec![review]));
+        let prompt = work_prompt(
+            &bare_config(),
+            &task_with(vec![result(1, "first go")], vec![review]),
+        );
         // All three, because notes alone produce an agent that fixes the complaint and
         // drops the original requirement.
         assert!(prompt.contains("write the report"));
@@ -795,8 +923,123 @@ mod tests {
             signed_by: None,
             signature: None,
         };
-        let prompt = work_prompt(&task_with(vec![result(1, "first go")], vec![review]));
+        let prompt = work_prompt(
+            &bare_config(),
+            &task_with(vec![result(1, "first go")], vec![review]),
+        );
         assert!(!prompt.contains("sent back for revision"));
+    }
+
+    fn config_with_preamble(preamble: &str) -> AgentConfig {
+        let mut config = bare_config();
+        config.preamble = Some(preamble.to_string());
+        config
+    }
+
+    #[test]
+    fn the_preamble_leads_every_prompt_and_is_byte_identical_across_them() {
+        // The property the whole feature rests on. A provider's cache discount is
+        // measured from the first byte of the prompt, so what matters is not that the
+        // preamble is present but that it is in front and the same every time.
+        let config = config_with_preamble("REPO MAP\nsrc/ is the code.");
+        let work = work_prompt(&config, &task_with(Vec::new(), Vec::new()));
+        let review = review_prompt(&config, &task_with(vec![result(1, "a")], Vec::new()), 1);
+
+        let expected = "REPO MAP\nsrc/ is the code.\n\n";
+        assert!(work.starts_with(expected), "work prompt: {work}");
+        assert!(review.starts_with(expected), "review prompt: {review}");
+
+        // Not merely "both contain it": a work prompt and a review prompt have nothing
+        // else in common, so this shared run of leading bytes is the entire cache hit.
+        let shared = work
+            .bytes()
+            .zip(review.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(
+            shared >= expected.len(),
+            "the two prompts must share the whole preamble, shared {shared} bytes"
+        );
+    }
+
+    #[test]
+    fn a_revision_prompt_also_leads_with_the_preamble() {
+        // The path most likely to be missed: the revision branch builds its prompt
+        // somewhere else entirely, and an agent doing the second attempt needs the
+        // standing context at least as much as one doing the first.
+        let sent_back = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "orchestrator".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: false,
+            notes: Some("wrong totals".into()),
+            signed_by: None,
+            signature: None,
+        };
+        let prompt = work_prompt(
+            &config_with_preamble("REPO MAP"),
+            &task_with(vec![result(1, "first go")], vec![sent_back]),
+        );
+        assert!(prompt.starts_with("REPO MAP\n\n"));
+        assert!(prompt.contains("sent back for revision"));
+    }
+
+    #[test]
+    fn a_trailing_newline_in_the_preamble_file_does_not_change_the_prompt() {
+        // Whether an editor saved a final newline must not decide whether every prompt
+        // for the next month misses the cache.
+        let task = task_with(Vec::new(), Vec::new());
+        assert_eq!(
+            work_prompt(&config_with_preamble("REPO MAP"), &task),
+            work_prompt(&config_with_preamble("REPO MAP\n"), &task)
+        );
+    }
+
+    #[test]
+    fn no_preamble_leaves_the_prompt_exactly_as_it_was() {
+        // The feature must cost nothing when unset: this is the prompt every existing
+        // deployment is already sending.
+        let prompt = work_prompt(&bare_config(), &task_with(Vec::new(), Vec::new()));
+        assert!(prompt.starts_with("Everything you print to stdout"));
+    }
+
+    #[test]
+    fn a_named_preamble_that_cannot_be_read_stops_the_agent_starting() {
+        // Loud at startup beats a machine that quietly works without the context it was
+        // configured to have, producing worse results and paying full price for them.
+        let dir = std::env::temp_dir().join(format!("ferryman-preamble-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            AgentConfig::path(&dir),
+            "agent = \"a\"\ncommand = \"c\"\npreamble_file = \"nope.md\"\n",
+        )
+        .unwrap();
+
+        let error = AgentConfig::load(&dir).unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("nope.md"), "must name the file: {text}");
+        assert!(
+            text.contains("preamble_file"),
+            "must name the setting that caused it: {text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preamble_is_read_from_beside_the_config() {
+        let dir = std::env::temp_dir().join(format!("ferryman-preamble-ok-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            AgentConfig::path(&dir),
+            "agent = \"a\"\ncommand = \"c\"\npreamble_file = \"preamble.md\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("preamble.md"), "STANDING CONTEXT").unwrap();
+
+        let config = AgentConfig::load(&dir).unwrap();
+        assert_eq!(config.preamble.as_deref(), Some("STANDING CONTEXT"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -175,6 +175,54 @@ ferry channel review --notes "the totals do not add up" t-4f2a
 A recommendation changes nothing on its own. Until a human writes the review, the task
 sits exactly where it was.
 
+## What every prompt starts with
+
+Point `preamble_file` at a file of standing context — the repo map, the conventions,
+whatever every task on this project needs to know — and its contents go at the front of
+every prompt this machine sends, before anything task-specific.
+
+```toml
+# .ferryman/agent.toml
+preamble_file = "preamble.md"
+```
+
+The position is not incidental. Providers charge far less for a prefix they have already
+seen, and the discount is measured over the longest run of *leading* bytes identical to
+last time. On some the cached rate is under a fiftieth of the uncached one, so context
+that would be useful anywhere in the prompt is worth real money specifically at the
+start of it. Both prompt kinds go through it, so a work prompt and a review prompt —
+which otherwise share nothing — share this prefix.
+
+Two consequences worth knowing:
+
+- **A named file that cannot be read stops the agent starting.** Not an empty string. A
+  machine silently working without the context it was configured to have produces
+  slightly worse work at full price, and nothing about it looks wrong.
+- **Edit it rarely.** Every change invalidates the cache for the next run. That is fine;
+  changing it every hour is not.
+
+It is also just better prompting, and it costs nothing when unset.
+
+## When this machine works
+
+```toml
+claim_window = "22:00-06:00"        # this machine's local time
+claim_window = "16:30-00:30 UTC"    # say UTC if you mean UTC
+```
+
+Unset means any hour, which is the default. People set it for cheaper overnight
+electricity, a metered connection with a free window, a desktop in the same room as
+someone asleep, or an inference provider that discounts off-peak hours — Ferryman does
+not need to know which.
+
+Times are **local unless you append `UTC`**. Say which you mean: a window that is off by
+your offset still looks like a working window, and you find out from the fact that
+nothing happened last night.
+
+A window crossing midnight is the usual case and works. Like every other check, it runs
+only before a claim — work already running when the window closes is never interrupted,
+and a task nobody claims simply stays open for a machine whose hours it is.
+
 ## Where the deployment stands under the licence
 
 ```sh

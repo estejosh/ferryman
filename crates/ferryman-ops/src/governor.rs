@@ -33,7 +33,110 @@
 
 use std::time::Duration;
 
+use anyhow::{Context, Result, bail};
+use chrono::{NaiveTime, Timelike};
+
 use crate::agent::AgentConfig;
+
+/// Hours of the day during which this machine will pick work up.
+///
+/// # Why a machine has opening hours
+///
+/// Several unrelated reasons, none of which Ferryman needs to know about:
+/// electricity that is cheaper overnight, a metered connection with a free window, a
+/// desktop that shares a room with someone asleep, an inference provider that discounts
+/// off-peak hours. All of them are the same instruction - *take work between these
+/// times* - so there is one setting rather than four, and no vendor is named anywhere.
+///
+/// # It is not a kill switch
+///
+/// Like every other check here it runs only before a claim. Work started inside the
+/// window and still going when the window closes runs to completion; the alternative is
+/// throwing away an hour of finished work to save a few cents of tokens.
+///
+/// # Local time by default, and why the suffix exists
+///
+/// "Don't run at 2am" is a statement about the clock on the wall. "The discount is
+/// 16:30-00:30 UTC" is not. Guessing wrong either way produces a machine that works at
+/// exactly the hours the operator asked it not to, and the failure is silent because a
+/// window that is off by eight hours looks exactly like a window that is working - so the
+/// operator says which they meant by appending `UTC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    start: NaiveTime,
+    end: NaiveTime,
+    /// Interpret against UTC rather than this machine's local time.
+    utc: bool,
+}
+
+impl Window {
+    /// Parse `HH:MM-HH:MM`, optionally followed by `UTC`.
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        let (span, utc) = match value
+            .strip_suffix("UTC")
+            .or_else(|| value.strip_suffix("utc"))
+        {
+            Some(span) => (span.trim_end(), true),
+            None => (value, false),
+        };
+        let (start, end) = span
+            .split_once('-')
+            .with_context(|| format!("a window looks like '22:00-06:00', not '{value}'"))?;
+        let time = |raw: &str| -> Result<NaiveTime> {
+            NaiveTime::parse_from_str(raw.trim(), "%H:%M")
+                .with_context(|| format!("'{}' is not a time of day like 09:30", raw.trim()))
+        };
+        let (start, end) = (time(start)?, time(end)?);
+        if start == end {
+            // Ambiguous between "always" and "never", and both readings are defensible.
+            // Refusing costs the operator one edit; guessing costs them a night of work
+            // or a night of noise, and they find out the next morning.
+            bail!(
+                "a window that starts and ends at the same time is ambiguous - remove it to work at any hour"
+            );
+        }
+        Ok(Self { start, end, utc })
+    }
+
+    /// Whether `now` falls inside, handling a window that crosses midnight.
+    ///
+    /// The overnight case is the common one - cheap electricity and quiet houses are both
+    /// nocturnal - so it is the case the arithmetic is arranged around rather than an
+    /// afterthought. Half-open: the closing minute is outside, so `00:00-12:00` and
+    /// `12:00-00:00` between them cover the day exactly once.
+    #[must_use]
+    fn contains(&self, now: NaiveTime) -> bool {
+        if self.start <= self.end {
+            now >= self.start && now < self.end
+        } else {
+            now >= self.start || now < self.end
+        }
+    }
+
+    /// The current time of day, in whichever frame this window is expressed in.
+    #[must_use]
+    fn now(&self) -> NaiveTime {
+        if self.utc {
+            chrono::Utc::now().time()
+        } else {
+            chrono::Local::now().time()
+        }
+    }
+
+    /// As the operator wrote it, for the message that explains a refusal.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{:02}:{:02}-{:02}:{:02}{}",
+            self.start.hour(),
+            self.start.minute(),
+            self.end.hour(),
+            self.end.minute(),
+            if self.utc { " UTC" } else { " local time" }
+        )
+    }
+}
 
 /// Whether a person is using this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +230,15 @@ pub fn may_claim(config: &AgentConfig) -> Decision {
     if let Some(note) = paused() {
         return Decision::Wait(format!("{note} - run 'ferry resume' to start again"));
     }
-    // Presence first: it is the cheap check, and it is the one whose answer a person
+    // The window before presence. Both can be true at once, and "this machine only works
+    // overnight" is the more useful thing to be told at three in the afternoon than "you
+    // are typing" - the second is temporary and obvious, the first is a setting somebody
+    // configured a month ago and has forgotten.
+    let window = judge_window(config.claim_window, config.claim_window.map(|w| w.now()));
+    if !window.is_go() {
+        return window;
+    }
+    // Presence next: it is the cheap check, and it is the one whose answer a person
     // recognises as being about them.
     if config.pause_while_active {
         let decision = judge_presence(presence(), config.idle_after);
@@ -136,6 +247,24 @@ pub fn may_claim(config: &AgentConfig) -> Decision {
         }
     }
     judge(config.min_free_ram_mb, available_memory_mb())
+}
+
+/// Whether the clock allows a claim. Separated from reading the clock so the boundaries
+/// can be tested at midnight without waiting until midnight.
+fn judge_window(window: Option<Window>, now: Option<NaiveTime>) -> Decision {
+    let (Some(window), Some(now)) = (window, now) else {
+        // No window configured means every hour is a working hour, which is what every
+        // deployment that has never heard of this setting already does.
+        return Decision::Go;
+    };
+    if window.contains(now) {
+        return Decision::Go;
+    }
+    Decision::Wait(format!(
+        "outside this machine's working hours of {}; the task stays open for another \
+         machine, and anything already running is unaffected (claim_window in agent.toml)",
+        window.describe()
+    ))
 }
 
 /// Whether someone being at the machine should stop it taking on more.
@@ -173,6 +302,114 @@ fn judge(min_free_mb: u64, available_mb: Option<u64>) -> Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(hour: u32, minute: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(hour, minute, 0).expect("a valid time of day")
+    }
+
+    #[test]
+    fn a_window_that_crosses_midnight_is_the_one_that_must_work() {
+        // Cheap electricity, quiet houses and off-peak inference are all nocturnal, so
+        // the wrapping case is the normal case rather than an edge one. The naive
+        // implementation - start <= now && now < end - is false for every hour of this.
+        let overnight = Window::parse("22:00-06:00").unwrap();
+        assert!(overnight.contains(at(23, 0)), "before midnight");
+        assert!(overnight.contains(at(2, 0)), "after midnight");
+        assert!(
+            overnight.contains(at(22, 0)),
+            "the opening minute is inside"
+        );
+        assert!(
+            !overnight.contains(at(6, 0)),
+            "the closing minute is outside"
+        );
+        assert!(
+            !overnight.contains(at(12, 0)),
+            "the middle of the day is out"
+        );
+    }
+
+    #[test]
+    fn a_daytime_window_is_the_simple_case_and_still_has_to_be_right() {
+        let daytime = Window::parse("09:00-17:00").unwrap();
+        assert!(daytime.contains(at(9, 0)));
+        assert!(daytime.contains(at(16, 59)));
+        assert!(!daytime.contains(at(17, 0)));
+        assert!(!daytime.contains(at(3, 0)));
+    }
+
+    #[test]
+    fn back_to_back_windows_cover_the_day_exactly_once() {
+        // Half-open at the close, so no minute is both inside two windows and outside
+        // both. This is the assertion that catches someone "fixing" the boundary to <=.
+        let morning = Window::parse("00:00-12:00").unwrap();
+        let afternoon = Window::parse("12:00-00:00").unwrap();
+        for hour in 0..24 {
+            let now = at(hour, 0);
+            assert_ne!(
+                morning.contains(now),
+                afternoon.contains(now),
+                "{hour}:00 must be in exactly one of the two"
+            );
+        }
+    }
+
+    #[test]
+    fn the_time_frame_is_stated_rather_than_guessed() {
+        assert_eq!(
+            Window::parse("16:30-00:30 UTC").unwrap().describe(),
+            "16:30-00:30 UTC"
+        );
+        // The default is local, because "not at 2am" is a statement about the clock on
+        // the wall, and the operator who meant UTC is the one who knows they did.
+        assert_eq!(
+            Window::parse("22:00-06:00").unwrap().describe(),
+            "22:00-06:00 local time"
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_or_malformed_window_is_refused_at_config_load() {
+        // Refusing costs one edit. Guessing costs a night of work or a night of noise,
+        // discovered the next morning.
+        assert!(
+            Window::parse("09:00-09:00")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert!(Window::parse("22:00").is_err(), "no end time");
+        assert!(Window::parse("22-06").is_err(), "not HH:MM");
+        assert!(Window::parse("25:00-06:00").is_err(), "not a real hour");
+    }
+
+    #[test]
+    fn no_window_means_every_hour_is_a_working_hour() {
+        // Every existing deployment has no window, and none of them should change
+        // behaviour by a single minute because this feature was added.
+        assert_eq!(judge_window(None, None), Decision::Go);
+    }
+
+    #[test]
+    fn outside_the_window_waits_and_names_the_setting() {
+        let window = Window::parse("22:00-06:00").unwrap();
+        let Decision::Wait(reason) = judge_window(Some(window), Some(at(14, 0))) else {
+            panic!("two in the afternoon is outside an overnight window")
+        };
+        assert!(
+            reason.contains("22:00-06:00 local time"),
+            "the reason must state the window, in the frame it was written in: {reason}"
+        );
+        assert!(
+            reason.contains("claim_window"),
+            "the reason must name the setting that changes it: {reason}"
+        );
+        assert!(
+            reason.contains("already running is unaffected"),
+            "a closing window must not read as though it kills work: {reason}"
+        );
+        assert_eq!(judge_window(Some(window), Some(at(23, 0))), Decision::Go);
+    }
 
     #[test]
     fn someone_at_the_keyboard_stops_new_work() {
