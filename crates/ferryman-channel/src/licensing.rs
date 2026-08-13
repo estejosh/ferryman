@@ -130,6 +130,33 @@ fn devices_dir(route: &ProjectRoute) -> PathBuf {
     route.communications.join("devices")
 }
 
+/// The fleet channel: what is true about this *fleet* rather than about one project.
+///
+/// A project channel answers "what is happening in this repository". Nothing in it can
+/// answer "how many computers do I have", because each project only ever sees its own
+/// `devices/` - which is why enabling three projects on one machine reported three
+/// computers even after the device id was made machine-wide. The count needs one place
+/// that spans projects, and so does the roster: an agent's public key should not depend
+/// on which repository you ask about.
+///
+/// It lives beside the machine's other state and is shared with the fleet as its own
+/// Syncthing folder, `ferryman-fleet`. The one-writer rule still holds: every machine
+/// writes only the file named after itself.
+///
+/// `None` when there is no per-user directory, in which case everything falls back to
+/// the project channel exactly as before.
+#[must_use]
+pub fn fleet_dir() -> Option<PathBuf> {
+    machine_state_dir().map(|dir| dir.join("fleet"))
+}
+
+/// The Syncthing folder id for the fleet channel.
+///
+/// Not `ferryman`: a project genuinely called "ferryman" already produces the folder id
+/// `ferryman-ferryman`, and a bare `ferryman` sitting next to it invites exactly the
+/// confusion this is meant to remove.
+pub const FLEET_FOLDER_ID: &str = "ferryman-fleet";
+
 /// Where this machine remembers its own id. Local, never synced.
 fn device_id_path(attachment: &Path) -> PathBuf {
     attachment.join("device.json")
@@ -323,24 +350,50 @@ pub fn register_device(route: &ProjectRoute, record: &DeviceRecord) -> Result<Pa
             record.operator_email
         )
     }
-    let path = devices_dir(route).join(format!("{}.json", record.id));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    let body = serde_json::to_vec_pretty(record)?;
+    // Written to the fleet channel as well as the project's. Additive on purpose: every
+    // existing channel keeps working unchanged, and there is no moment at which a fleet
+    // has to be upgraded all at once.
+    if let Some(fleet) = fleet_dir() {
+        let _ = write_device(&fleet.join("devices"), record, &body);
     }
+    write_device(&devices_dir(route), record, &body)
+}
+
+fn write_device(dir: &Path, record: &DeviceRecord, body: &[u8]) -> Result<PathBuf> {
+    let path = dir.join(format!("{}.json", record.id));
+    fs::create_dir_all(dir)?;
+    // Written as a temporary then renamed: Syncthing may copy the directory at any
+    // instant, and a half-written record read by a peer miscounts the fleet.
     let temporary = path.with_extension("tmp");
-    fs::write(&temporary, serde_json::to_vec_pretty(record)?)?;
+    fs::write(&temporary, body)?;
     fs::rename(&temporary, &path)?;
     Ok(path)
 }
 
 /// Every machine that has registered on this channel.
 pub fn read_devices(route: &ProjectRoute) -> Result<Vec<DeviceRecord>> {
-    let dir = devices_dir(route);
+    let mut devices = read_devices_in(&devices_dir(route))?;
+    // The fleet channel is the wider truth: it spans projects, which is the whole point.
+    // Merged rather than preferred, so a machine that has only ever registered against
+    // one project is still counted while the fleet channel is filling up.
+    if let Some(fleet) = fleet_dir() {
+        for record in read_devices_in(&fleet.join("devices"))? {
+            if !devices.iter().any(|known| known.id == record.id) {
+                devices.push(record);
+            }
+        }
+    }
+    devices.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(devices)
+}
+
+fn read_devices_in(dir: &Path) -> Result<Vec<DeviceRecord>> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }
     let mut devices = Vec::new();
-    for entry in fs::read_dir(&dir)? {
+    for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -353,7 +406,6 @@ pub fn read_devices(route: &ProjectRoute) -> Result<Vec<DeviceRecord>> {
             devices.push(record);
         }
     }
-    devices.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(devices)
 }
 
@@ -477,6 +529,59 @@ fn looks_like_email(value: &str) -> bool {
 #[cfg(test)]
 mod device_identity {
     use super::*;
+
+    /// Two machines that share a fleet channel - which is what Syncthing does to it -
+    /// must agree on the count, even from a project only one of them has ever touched.
+    /// This is the whole reason the fleet channel exists: a project channel structurally
+    /// cannot answer "how many computers do I have".
+    #[test]
+    fn a_shared_fleet_counts_every_machine_from_any_project() {
+        let root = temp("fleet-count");
+        // Within one test, fleet_dir() is a single directory - exactly the state
+        // Syncthing produces once two machines are sharing it.
+        use_machine_state_dir_per_thread(root.join("machine"));
+
+        let one = route_at(&root.join("projectA"), "a");
+        let two = route_at(&root.join("projectB"), "b");
+
+        register_device(&one, &record("1111111111111111", DeviceKind::Computer)).unwrap();
+        register_device(&two, &record("2222222222222222", DeviceKind::Computer)).unwrap();
+
+        // Project A never saw the second machine register, and still counts it.
+        let counted = count(&read_devices(&one).unwrap());
+        assert_eq!(
+            counted.computers, 2,
+            "a project channel alone would report 1 here, which is the bug"
+        );
+        assert!(
+            !counted.over_limit(),
+            "two computers is inside the free tier"
+        );
+    }
+
+    fn record(id: &str, kind: DeviceKind) -> DeviceRecord {
+        DeviceRecord {
+            id: id.to_string(),
+            kind,
+            operator_email: "someone@example.com".to_string(),
+            registered_at: chrono::Utc::now(),
+        }
+    }
+
+    fn route_at(dir: &Path, project: &str) -> ProjectRoute {
+        let communications = dir.join(".ferryman").join("ferryman");
+        fs::create_dir_all(&communications).unwrap();
+        ProjectRoute {
+            project_id: project.to_string(),
+            workspace: dir.to_path_buf(),
+            attachment: dir.join(".ferryman"),
+            communications,
+            shared_remote: format!("{project}-ferryman"),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ferryman-devid-{name}"));

@@ -1392,7 +1392,23 @@ pub fn register_agent_key(
             published.name
         )
     }
+    // Published to the fleet channel too, so identity is the same fact wherever it is
+    // asked about. Failure here is not fatal: a machine with no per-user directory must
+    // still be able to join a project.
+    if let Some(fleet) = licensing::fleet_dir() {
+        let _ = write_roster_entry(&fleet.join("agents"), &published);
+    }
     register_agent(route, &published)
+}
+
+/// One roster entry, written atomically.
+fn write_roster_entry(directory: &Path, agent: &AgentRoute) -> Result<PathBuf> {
+    let path = directory.join(format!("{}.json", agent.name));
+    fs::create_dir_all(directory)?;
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(agent)?)?;
+    fs::rename(&temporary, &path)?;
+    Ok(path)
 }
 
 /// Find the attachment for the project containing `start`, walking upwards the way git
@@ -1470,12 +1486,27 @@ pub fn load_route(attachment: &Path) -> Result<ProjectRoute> {
 /// A malformed entry is skipped rather than fatal: one agent writing nonsense must not
 /// stop the rest of the fleet from talking.
 pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
-    let directory = communications.join("agents");
+    let mut agents = read_roster_in(&communications.join("agents"))?;
+    // An agent's public key should not depend on which repository you ask about. The
+    // fleet channel is where identity belongs; the project copy stays authoritative for
+    // anyone already in it, so an existing channel keeps verifying exactly as it did.
+    if let Some(fleet) = licensing::fleet_dir() {
+        for entry in read_roster_in(&fleet.join("agents"))? {
+            if !agents.iter().any(|known| known.name == entry.name) {
+                agents.push(entry);
+            }
+        }
+    }
+    agents.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(agents)
+}
+
+fn read_roster_in(directory: &Path) -> Result<Vec<AgentRoute>> {
     if !directory.is_dir() {
         return Ok(Vec::new());
     }
     let mut agents = Vec::new();
-    for entry in fs::read_dir(&directory)? {
+    for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
@@ -1487,7 +1518,6 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
             agents.push(agent);
         }
     }
-    agents.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(agents)
 }
 
@@ -1908,7 +1938,58 @@ pub fn syncthing_register_folder(
     } else {
         route.shared_remote.clone()
     };
-    let folder_path = route.communications.display().to_string();
+    register_folder(
+        &folder_id,
+        &route.communications,
+        &format!("{} ferryman channel", route.project_id),
+        share_with,
+    )
+}
+
+/// Register the fleet channel, so identity and the device count actually travel.
+///
+/// A fleet channel that only exists on one machine answers the same question the project
+/// channel already answered badly. Shared with the devices Syncthing already trusts -
+/// the same rule as a project channel, so this never widens trust, it only uses trust
+/// that exists.
+pub fn syncthing_register_fleet(share_with: &[SyncthingPeer]) -> Result<Option<SyncthingSetup>> {
+    let Some(dir) = licensing::fleet_dir() else {
+        return Ok(None);
+    };
+    fs::create_dir_all(&dir)?;
+    // The fleet channel carries identity and device records - never keys, never
+    // executables, and never anything a project put there.
+    let ignore = dir.join(".stignore");
+    if !ignore.exists() {
+        fs::write(
+            &ignore,
+            "keys
+*.tmp
+*.key
+*.exe
+*.dll
+*.so
+*.dylib
+",
+        )?;
+    }
+    register_folder(
+        licensing::FLEET_FOLDER_ID,
+        &dir,
+        "ferryman fleet",
+        share_with,
+    )
+    .map(Some)
+}
+
+fn register_folder(
+    folder_id: &str,
+    path: &Path,
+    label: &str,
+    share_with: &[SyncthingPeer],
+) -> Result<SyncthingSetup> {
+    let folder_id = folder_id.to_string();
+    let folder_path = path.display().to_string();
     let unavailable = |note: &str| SyncthingSetup {
         available: false,
         folder_id: folder_id.clone(),
@@ -1948,7 +2029,7 @@ pub fn syncthing_register_folder(
     }
     let body = serde_json::to_string(&json!({
         "id": folder_id,
-        "label": format!("{} ferryman channel", route.project_id),
+        "label": label,
         "path": folder_path,
         "type": "sendreceive",
         "devices": devices,

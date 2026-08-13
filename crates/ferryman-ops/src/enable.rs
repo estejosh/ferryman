@@ -263,6 +263,10 @@ pub fn perform(request: Request) -> Result<Outcome> {
         None
     } else {
         let peers = ferryman_channel::syncthing_peers().unwrap_or_default();
+        // The fleet channel first: it is what makes identity and the device count mean
+        // the same thing on every machine. Best-effort, because a machine that cannot
+        // host one must still be able to join a project.
+        let _ = ferryman_channel::syncthing_register_fleet(&peers);
         Some(ferryman_channel::syncthing_register_folder(&route, &peers)?)
     };
 
