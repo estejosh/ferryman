@@ -999,16 +999,67 @@ impl AgentIdentity {
     /// Ferryman keeps OUT of the synced folder, so the key physically cannot travel.
     /// The file fallback is not a compromise: a headless container has no keychain, and
     /// that is the main way people run this.
+    /// This machine's signing identity.
+    ///
+    /// # One key per machine, not one per project
+    ///
+    /// The key used to live only under the project's `.ferryman/`, so a machine working
+    /// on three projects had three different keys under one name. Every project saw a
+    /// different public key for "beastly", and the roster - which is keyed by name -
+    /// could not tell that apart from an impostor. An identity that changes per directory
+    /// is not an identity.
+    ///
+    /// It now lives once per machine, beside the device id, and the project copy is kept
+    /// in step so an older `ferry` on the same machine signs as the same agent rather
+    /// than minting a second one.
+    ///
+    /// A machine already signing under a project key **keeps it**. Rotating on upgrade
+    /// would invalidate every signature that machine has already published, which is the
+    /// one thing this must not do.
     pub fn load_or_create(name: &str, state_dir: &Path) -> Result<Self> {
+        Self::load_or_create_in(name, state_dir, licensing::machine_state_dir())
+    }
+
+    /// The same, with the machine directory given rather than discovered. Exists so a
+    /// test can construct an identity belonging to a *different machine*, which is the
+    /// only way left to write one: two directories on one machine now correctly produce
+    /// one key.
+    pub(crate) fn load_or_create_in(
+        name: &str,
+        state_dir: &Path,
+        machine_dir: Option<PathBuf>,
+    ) -> Result<Self> {
         if !is_safe_component(name) {
             bail!("agent name must be a path-safe identifier")
         }
+        // An identity that has already signed things must never change. A project with
+        // its own key keeps it, even though a machine-wide key exists: swapping it would
+        // make this agent sign as a key the roster has not seen, and the roster - rightly
+        // - reports that as impersonation. Unification therefore happens for *new*
+        // attachments, never by re-keying an established one.
         if let Some(existing) = Self::from_state_file(name, state_dir)? {
+            if let Some(dir) = &machine_dir
+                && Self::from_state_file(name, dir)?.is_none()
+            {
+                Self::write_state_file(name, dir, &existing.signing)?;
+            }
             return Ok(existing);
         }
+
+        // No key here yet, so this attachment can join the machine's identity.
+        if let Some(dir) = &machine_dir
+            && let Some(existing) = Self::from_state_file(name, dir)?
+        {
+            Self::write_state_file(name, state_dir, &existing.signing)?;
+            return Ok(existing);
+        }
+
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = SigningKey::from_bytes(&seed);
+        if let Some(dir) = &machine_dir {
+            Self::write_state_file(name, dir, &signing)?;
+        }
         Self::write_state_file(name, state_dir, &signing)?;
         Ok(Self {
             name: name.to_string(),
@@ -4808,6 +4859,21 @@ mod serverless_tests {
 
 #[cfg(test)]
 mod identity_tests {
+    /// Keep this test binary's machine state out of the developer's home.
+    ///
+    /// `cfg(test)` is per crate, so a dependent crate's tests link ferryman-channel
+    /// compiled without it - which is how the suite came to write real signing keys into
+    /// ~/.local/state. First call wins, so every test here shares one temporary machine.
+    pub(crate) fn hermetic_machine() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferryman-test-machine-{}-{}",
+            env!("CARGO_CRATE_NAME"),
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        crate::licensing::use_machine_state_dir_per_thread(dir);
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -4980,8 +5046,16 @@ mod identity_tests {
         register_agent_key(&route, &agent, &first).unwrap();
 
         // A DIFFERENT key for the same name is not silently accepted.
+        // A different *machine* claiming the same name. Two directories on one machine
+        // deliberately no longer produce two keys, so the impostor needs its own.
         let elsewhere = tempfile::tempdir().unwrap();
-        let other = AgentIdentity::load_or_create("beastly", elsewhere.path()).unwrap();
+        let other_machine = tempfile::tempdir().unwrap();
+        let other = AgentIdentity::load_or_create_in(
+            "beastly",
+            elsewhere.path(),
+            Some(other_machine.path().to_path_buf()),
+        )
+        .unwrap();
         let route = route_for(&workspace).unwrap();
         let error = register_agent_key(&route, &agent, &other)
             .unwrap_err()
@@ -4999,6 +5073,7 @@ mod work_over_files_tests {
     use serde_json::json;
 
     fn channel() -> (tempfile::TempDir, ProjectRoute) {
+        super::identity_tests::hermetic_machine();
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("project");
         let attachment = workspace.join(".ferryman");

@@ -283,7 +283,23 @@ pub fn perform(request: Request) -> Result<Outcome> {
 mod tests {
     use super::*;
 
+    /// Keep this test binary's machine state out of the developer's home.
+    ///
+    /// `cfg(test)` is per crate, so a dependent crate's tests link ferryman-channel
+    /// compiled without it - which is how the suite came to write real signing keys into
+    /// ~/.local/state. First call wins, so every test here shares one temporary machine.
+    fn hermetic_machine() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferryman-test-machine-{}-{}",
+            env!("CARGO_CRATE_NAME"),
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir);
+    }
+
     fn enable_in(dir: &std::path::Path) -> Result<()> {
+        hermetic_machine();
         perform(Request {
             workspace: Some(dir.to_path_buf()),
             project: Some("demo".into()),
@@ -356,9 +372,15 @@ mod tests {
             as_json: false,
         };
         let outcome = perform(request).unwrap();
+        let created: Vec<&str> = outcome
+            .steps
+            .iter()
+            .filter(|step| step.created)
+            .map(|step| step.what)
+            .collect();
         assert!(
-            outcome.steps.iter().all(|step| !step.created),
-            "a repeat run claimed to create something"
+            created.is_empty(),
+            "a repeat run claimed to create: {created:?}"
         );
     }
 

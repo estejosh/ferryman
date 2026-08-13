@@ -145,25 +145,97 @@ fn device_id_path(attachment: &Path) -> PathBuf {
 /// `None` when no per-user directory can be determined, in which case the caller falls
 /// back to the per-attachment file - a machine with no home directory should still work,
 /// and over-counting is a far better failure than refusing to run.
-fn machine_id_path() -> Option<PathBuf> {
+/// The per-user directory that holds what belongs to this *machine* rather than to any
+/// one project: its device id, and its signing key.
+///
+/// `None` when no per-user directory can be determined. Callers fall back to
+/// per-project storage, because a machine with no home directory must still work.
+static MACHINE_STATE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static PER_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A directory unique to the calling test.
+///
+/// Tests in one binary run in parallel threads, and they share an agent name. Pointing
+/// them all at one machine directory makes them write the same key file at the same
+/// time - which raced, and which Windows rejects outright where Linux happened to get
+/// away with it. Scoping by thread gives each test its own machine.
+fn thread_scoped(base: &Path) -> PathBuf {
+    let who: String = std::thread::current()
+        .name()
+        .unwrap_or("main")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    base.join(who)
+}
+
+/// Point this machine's state at a given directory, for the rest of the process.
+///
+/// Exists because `cfg(test)` is per crate: a dependent crate's tests link this one
+/// compiled *without* it, so a cfg-based redirect cannot keep them hermetic, and they
+/// were writing real signing keys into the developer's home as a side effect of running
+/// the suite. A test that changes its own machine's identity is not a test.
+///
+/// First call wins, so a suite can set it once and every later call agrees. Also useful
+/// to anything embedding Ferryman that keeps state somewhere of its own choosing.
+pub fn use_machine_state_dir(dir: PathBuf) {
+    let _ = MACHINE_STATE_DIR.set(dir);
+}
+
+/// As [`use_machine_state_dir`], but each thread gets its own directory underneath.
+///
+/// For test binaries: the override is set once per process, yet tests run in parallel
+/// and share agent names, so one directory means concurrent writes to one key file.
+pub fn use_machine_state_dir_per_thread(base: PathBuf) {
+    PER_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = MACHINE_STATE_DIR.set(base);
+}
+
+/// The per-user directory that holds what belongs to this *machine* rather than to any
+/// one project: its device id, and its signing key.
+///
+/// `None` when no per-user directory can be determined. Callers fall back to
+/// per-project storage, because a machine with no home directory must still work.
+pub fn machine_state_dir() -> Option<PathBuf> {
+    // This crate's own tests, automatically - no per-module hook to forget. Dependent
+    // crates link this compiled without cfg(test), which is what the override above is
+    // for.
+    #[cfg(test)]
+    if MACHINE_STATE_DIR.get().is_none() {
+        use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-selftest-{}", std::process::id())),
+        );
+    }
+    if let Some(forced) = MACHINE_STATE_DIR.get() {
+        let dir = if PER_THREAD.load(std::sync::atomic::Ordering::Relaxed) {
+            thread_scoped(forced)
+        } else {
+            forced.clone()
+        };
+        let _ = fs::create_dir_all(&dir);
+        return Some(dir);
+    }
     if let Ok(explicit) = std::env::var("FERRYMAN_STATE_DIR") {
-        return Some(PathBuf::from(explicit).join("device.json"));
+        return Some(PathBuf::from(explicit));
     }
     if cfg!(windows) {
         return std::env::var("LOCALAPPDATA")
             .ok()
-            .map(|local| PathBuf::from(local).join("Ferryman").join("device.json"));
+            .map(|local| PathBuf::from(local).join("Ferryman"));
     }
     if let Ok(state) = std::env::var("XDG_STATE_HOME") {
-        return Some(PathBuf::from(state).join("ferryman").join("device.json"));
+        return Some(PathBuf::from(state).join("ferryman"));
     }
     std::env::var("HOME").ok().map(|home| {
         PathBuf::from(home)
             .join(".local")
             .join("state")
             .join("ferryman")
-            .join("device.json")
     })
+}
+
+fn machine_id_path() -> Option<PathBuf> {
+    machine_state_dir().map(|dir| dir.join("device.json"))
 }
 
 fn read_local_device(path: &Path) -> Option<String> {
