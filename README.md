@@ -16,16 +16,25 @@ middle, no ports to forward, no cloud account — and the coordination lives in 
 private repository, kept separate from the work itself.
 
 ```sh
-npm install -g ferryman-cli                                # or the curl line below
+# macOS and Linux
+curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
+
 cd your-project && ferry enable --email you@example.com    # that's setup, all of it
 ferry agent run                                            # this machine now does work
 ```
 
-No Rust toolchain, no compile. Without node — macOS and Linux:
-`curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh`
+On Windows, in PowerShell — there is no `sh` there, so the line above cannot run:
 
-On Windows, in PowerShell:
-`irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex`
+```powershell
+irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex
+```
+
+No Rust toolchain, no compile. Both scripts verify the release checksum before
+installing, and install for the current user without asking for administrator rights.
+
+Ferryman also needs [Syncthing](https://syncthing.net/downloads/) installed and running
+to reach your other machines. It does not install Syncthing, and it says so plainly if it
+cannot find it.
 
 **Or don't run it yourself.** [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) is a
 block you paste into any coding agent — it installs Ferryman, enables the project, wires

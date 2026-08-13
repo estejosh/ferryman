@@ -18,17 +18,21 @@ code or git history.
 
 ## Step 1 — install
 
-One line, no toolchain and no compile:
-
-```sh
-npm install -g ferryman-cli
-```
-
-Or without node:
+One line, no toolchain and no compile. On macOS or Linux:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
 ```
+
+On Windows, in PowerShell — the line above cannot run there, because a default
+Windows machine has no `sh`:
+
+```powershell
+irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex
+```
+
+Both verify the release checksum before installing, and install for the current user
+without asking for administrator rights.
 
 Both verify the download's SHA-256 before installing anything, and abort on a mismatch
 rather than warning. If you are tempted to work around a checksum failure: don't, and

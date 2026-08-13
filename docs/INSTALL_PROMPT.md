@@ -16,9 +16,6 @@ Install Ferryman on this project and join it to my fleet.
      Windows (PowerShell):
        irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex
 
-     If node is already here, either platform:
-       npm install -g ferryman-cli
-
    Do not run the curl line on Windows: there is no `sh` on a default Windows
    machine and it will fail with "'sh' is not recognized".
 
