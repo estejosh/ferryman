@@ -46,6 +46,34 @@ pub enum Presence {
     Unknown,
 }
 
+/// Where a deliberate pause is recorded.
+///
+/// A file rather than a running service or a socket: the tray application, the CLI and
+/// the worker loop are three separate processes that may not all be running, and a file
+/// is the only thing all three can agree on without any of them having to be up. It also
+/// means `ferry pause` works on a machine that has no tray at all, and that a pause
+/// survives a reboot - which is what someone who paused it meant.
+///
+/// Machine-wide, not per project: "stop working on this computer" is the thing people
+/// actually want, and pausing one repository while another keeps going is a surprise.
+#[must_use]
+pub fn pause_marker() -> Option<std::path::PathBuf> {
+    ferryman_channel::licensing::machine_state_dir().map(|dir| dir.join("paused"))
+}
+
+/// Why this machine was paused, if it was.
+#[must_use]
+pub fn paused() -> Option<String> {
+    let path = pause_marker()?;
+    let note = std::fs::read_to_string(&path).ok()?;
+    let note = note.trim();
+    Some(if note.is_empty() {
+        "paused".to_string()
+    } else {
+        note.to_string()
+    })
+}
+
 /// How long since the last keyboard or mouse input.
 ///
 /// The obvious crates for this link X11 at build time and fail to compile on a headless
@@ -95,6 +123,10 @@ pub fn available_memory_mb() -> Option<u64> {
 /// Decide whether to claim, given how much room the operator asked to keep free.
 #[must_use]
 pub fn may_claim(config: &AgentConfig) -> Decision {
+    // A deliberate pause outranks everything. Someone said stop.
+    if let Some(note) = paused() {
+        return Decision::Wait(format!("{note} - run 'ferry resume' to start again"));
+    }
     // Presence first: it is the cheap check, and it is the one whose answer a person
     // recognises as being about them.
     if config.pause_while_active {

@@ -66,6 +66,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Stop this machine taking on new work, until you resume it.
+    ///
+    /// Affects every project on this computer, not just this one, because "stop working
+    /// on this machine" is the thing people mean. Work already running is left alone.
+    Pause {
+        /// Why, shown wherever the pause is reported.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Start taking work again after `ferry pause`.
+    Resume,
     /// Run the agentic loop: pick work up, do it, and judge what comes back.
     Agent {
         #[command(subcommand)]
@@ -665,6 +676,31 @@ async fn main() -> Result<()> {
                 report_enable_json(&outcome)?;
             } else {
                 report_enable_human(&outcome);
+            }
+        }
+        Command::Pause { reason } => {
+            let Some(path) = ferryman_ops::governor::pause_marker() else {
+                bail!("this machine has no per-user directory, so a pause cannot be recorded")
+            };
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let note = reason.unwrap_or_else(|| "paused by hand".to_string());
+            std::fs::write(&path, &note).with_context(|| format!("write {}", path.display()))?;
+            println!("paused: {note}");
+            println!("  no new work will be claimed on this machine until 'ferry resume'");
+            println!("  anything already running is unaffected");
+        }
+        Command::Resume => {
+            let Some(path) = ferryman_ops::governor::pause_marker() else {
+                bail!("this machine has no per-user directory, so there is no pause to lift")
+            };
+            match std::fs::remove_file(&path) {
+                Ok(()) => println!("resumed; this machine will take work again"),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    println!("not paused; nothing to do");
+                }
+                Err(error) => return Err(error).context(format!("remove {}", path.display())),
             }
         }
         Command::Agent { command } => agent_command(command).await?,
@@ -1378,6 +1414,9 @@ async fn agent_command(command: Agent) -> Result<()> {
                 let plan = agent::plan(&route, &config)?;
                 println!("would run as '{}' on {}", plan.agent, route.project_id);
                 println!("  command   {}", config.command);
+                if let Some(note) = ferryman_ops::governor::paused() {
+                    println!("  paused    {note}");
+                }
                 match ferryman_ops::governor::presence() {
                     ferryman_ops::governor::Presence::Active(idle) => println!(
                         "  presence  last input {}s ago (pauses under {}s)",
