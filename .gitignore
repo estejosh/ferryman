@@ -1,4 +1,11 @@
 /target/
+# Unanchored as well: ferryman-tray is excluded from the workspace, so it has its own
+# target directory, and /target/ does not match it. Without this, building the tray
+# leaves hundreds of megabytes of artefacts showing as untracked - which is how they
+# eventually get committed.
+target/
+# Release packaging output.
+/dist/
 /.data/
 *.db
 *.db-shm
