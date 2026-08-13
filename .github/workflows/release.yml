@@ -121,3 +121,98 @@ jobs:
             ferry-${{ matrix.target }}.zip
             ferry-${{ matrix.target }}.zip.sha256
           fail_on_unmatched_files: true
+
+  # A separate job, not another entry in the matrix above, for two reasons.
+  #
+  # The tray is excluded from the workspace - it needs desktop libraries a headless
+  # agent box does not have - so it builds from its own manifest rather than with
+  # `-p`. And it is an extra, not the product: if it fails to build on some platform,
+  # the `ferry` binaries must still reach the release page. A separate job cannot take
+  # them down with it.
+  tray:
+    name: tray ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          targets: ${{ matrix.target }}
+
+      # This is the whole reason the tray is not in the workspace: a system tray on
+      # Linux is GTK and an appindicator, and neither is present on a server.
+      - name: Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libgtk-3-dev libxdo-dev \
+            libayatana-appindicator3-dev
+
+      - name: Ensure the target's std is installed
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: >
+          cargo build --release --target ${{ matrix.target }}
+          --manifest-path crates/ferryman-tray/Cargo.toml
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ferryman-tray-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          # Its own target directory, not the workspace's: a crate excluded from the
+          # workspace does not share the workspace build output. Verified by building
+          # it - the binary landed in crates/ferryman-tray/target, and packaging from
+          # the workspace path would have failed at release time, on a tag, in public.
+          cp "crates/ferryman-tray/target/${{ matrix.target }}/release/ferryman-tray" "dist/$name/"
+          cp LICENSE "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "ferryman-tray-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          # See the unix step: an excluded crate has its own target directory.
+          Copy-Item "crates/ferryman-tray/target/${{ matrix.target }}/release/ferryman-tray.exe" "dist/$name/"
+          Copy-Item LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" |
+            Out-File -Encoding ascii "$name.zip.sha256"
+
+      - name: Attach to the release (unix)
+        if: runner.os != 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ferryman-tray-${{ matrix.target }}.tar.gz
+            ferryman-tray-${{ matrix.target }}.tar.gz.sha256
+          fail_on_unmatched_files: true
+
+      - name: Attach to the release (windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ferryman-tray-${{ matrix.target }}.zip
+            ferryman-tray-${{ matrix.target }}.zip.sha256
+          fail_on_unmatched_files: true
