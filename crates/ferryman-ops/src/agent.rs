@@ -121,6 +121,43 @@ impl Runner {
     }
 }
 
+/// How much network the sandboxed agent gets. Borrowed from OpenSandbox's
+/// egress-control idea, in the smallest form a container flag can express.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkPolicy {
+    /// Full network - the historical default; a cloud agent needs its API.
+    Open,
+    /// No network at all - for local/offline models or hermetic work.
+    None,
+    /// A named, operator-configured network, e.g. one whose firewall already
+    /// enforces an egress allowlist, or Docker's `internal` network.
+    Named(String),
+}
+
+impl NetworkPolicy {
+    /// Parse the `net = "..."` config value: `open`, `none`, or a network name.
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("open") {
+            return Ok(Self::Open);
+        }
+        if value.eq_ignore_ascii_case("none") {
+            return Ok(Self::None);
+        }
+        Ok(Self::Named(value.to_string()))
+    }
+
+    /// The `--network` argument for podman/docker, or `None` for full access.
+    #[must_use]
+    pub fn network_arg(&self) -> Option<&str> {
+        match self {
+            Self::Open => None,
+            Self::None => Some("none"),
+            Self::Named(name) => Some(name.as_str()),
+        }
+    }
+}
+
 /// What this machine runs, and how far it is trusted.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -142,6 +179,9 @@ pub struct AgentConfig {
     /// Run each task in its own git worktree (branch derived from the signed
     /// order + agent) when the workspace is a git repo. Off by default.
     pub worktree: bool,
+    /// How much network the sandboxed agent gets. Only applies to the podman /
+    /// docker runners; the bare runner is unaffected.
+    pub network: NetworkPolicy,
     pub timeout: Duration,
     pub review: ReviewMode,
     /// Megabytes of memory to leave available. Below this the agent does not claim, so
@@ -272,6 +312,7 @@ impl AgentConfig {
                 Some("true") => true,
                 Some(other) => bail!("worktree must be true or false, not '{other}'"),
             },
+            network: NetworkPolicy::parse(&fields.get("net").cloned().unwrap_or_default())?,
             timeout: Duration::from_secs(number("timeout_secs", 900)?),
             review: ReviewMode::parse(
                 &fields
@@ -348,6 +389,15 @@ timeout_secs = "900"
 # worktree rather than a fresh one. Off by default; harmless on a non-git
 # workspace.
 worktree = "{worktree}"
+
+# How much network the sandboxed agent gets (podman/docker runners only):
+#   open      full network - the default, and what a cloud agent needs
+#   none      no network at all - for local/offline models or hermetic work
+#   <name>    a named, operator-configured network, e.g. one whose firewall
+#             already enforces an egress allowlist, or Docker's "internal"
+# A per-host domain allowlist is a firewall concern, not a flag - point this at
+# a network that your firewall has already restricted.
+# net = "open"
 
 # How much authority the reviewing agent has. This is YOUR call, not Ferryman's:
 #   auto    - the agent's verdict stands, and the loop runs unattended
@@ -434,16 +484,17 @@ fn run_command(config: &AgentConfig, workspace: &Path, prompt: &str) -> (String,
     match &config.runner {
         Runner::Bare => (config.command.clone(), args),
         Runner::Podman(image) | Runner::Docker(image) => {
-            let mut full = vec![
-                "run".to_string(),
-                "--rm".to_string(),
-                "-v".to_string(),
-                format!("{}:/workspace:Z", workspace.display()),
-                "-w".to_string(),
-                "/workspace".to_string(),
-                image.clone(),
-                config.command.clone(),
-            ];
+            let mut full = vec!["run".to_string(), "--rm".to_string()];
+            if let Some(network) = config.network.network_arg() {
+                full.push("--network".to_string());
+                full.push(network.to_string());
+            }
+            full.push("-v".to_string());
+            full.push(format!("{}:/workspace:Z", workspace.display()));
+            full.push("-w".to_string());
+            full.push("/workspace".to_string());
+            full.push(image.clone());
+            full.push(config.command.clone());
             full.extend(args);
             (config.runner.runtime().to_string(), full)
         }
@@ -1146,6 +1197,42 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn a_none_network_policy_blocks_egress_in_the_container() {
+        let config = AgentConfig::parse(
+            "agent = \"w\"\ncommand = \"codex\"\nsandbox = \"podman:local\"\nnet = \"none\"\n",
+        )
+        .unwrap();
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello");
+        assert_eq!(binary, "podman");
+        assert_eq!(args[..4], ["run", "--rm", "--network", "none"]);
+    }
+
+    #[test]
+    fn a_named_network_is_passed_through() {
+        let config = AgentConfig::parse(
+            "agent = \"w\"\ncommand = \"codex\"\nsandbox = \"docker:img\"\nnet = \"restricted\"\n",
+        )
+        .unwrap();
+        let (_, args) = run_command(&config, Path::new("/ws"), "hello");
+        assert_eq!(args[..4], ["run", "--rm", "--network", "restricted"]);
+    }
+
+    #[test]
+    fn the_network_policy_parses_open_none_and_named() {
+        use NetworkPolicy::*;
+        assert_eq!(NetworkPolicy::parse("").unwrap(), Open);
+        assert_eq!(NetworkPolicy::parse("open").unwrap(), Open);
+        assert_eq!(NetworkPolicy::parse("NONE").unwrap(), NetworkPolicy::None);
+        assert_eq!(
+            NetworkPolicy::parse("restricted").unwrap(),
+            Named("restricted".into())
+        );
+        assert_eq!(Open.network_arg(), Option::None);
+        assert_eq!(NetworkPolicy::None.network_arg(), Option::Some("none"));
+    }
+
 
     use ferryman_channel::{Claim, Order, Review};
 
