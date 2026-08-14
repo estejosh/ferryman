@@ -1421,16 +1421,6 @@ fn inspect_inbound_message_file(route: &ProjectRoute, path: &Path) -> Result<()>
         message
             .verify(&trusted)
             .context("v2 message failed verification")?;
-        let ledger = replay_ledger(route)?;
-        if ledger.contains(
-            &message.authentication.signer_id,
-            &message.authentication.nonce,
-        ) {
-            bail!(
-                "replayed nonce for signer {}",
-                message.authentication.signer_id
-            );
-        }
     } else if !trusted.signers.is_empty() {
         bail!("unsigned v1 message while enforcement is enabled");
     }
@@ -1665,7 +1655,7 @@ mod portable_auth_route_tests {
     }
 
     #[test]
-    fn inbound_scanner_quarantines_a_replayed_nonce() {
+    fn inbound_scanner_does_not_quarantine_a_claimed_message() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route(dir.path());
         let messages = route.communications.join("messages").join("ferryman");
@@ -1704,14 +1694,16 @@ mod portable_auth_route_tests {
         )
         .unwrap();
 
-        // Pre-record the nonce: the message now looks like a replay.
+        // A claimed message has its nonce recorded but stays on disk: it is the
+        // canonical copy acknowledgements bind to, not a replay to quarantine.
         let mut ledger = ReplayLedger::default();
         ledger.record(&v2.authentication.signer_id, &v2.authentication.nonce);
         ledger
             .save(&route.attachment.join("runtime/replay-ledger.json"))
             .unwrap();
 
-        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 1);
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 0);
+        assert!(messages.join(format!("{}.json", v2.id)).is_file());
     }
 
     #[test]
@@ -1810,7 +1802,7 @@ mod portable_auth_route_tests {
     }
 
     #[test]
-    fn read_message_v2_verifies_and_rejects_replay() {
+    fn read_message_v2_reads_a_claimed_message() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route(dir.path());
         let messages = route.communications.join("messages").join("ferryman");
@@ -1859,7 +1851,9 @@ mod portable_auth_route_tests {
         ledger
             .save(&route.attachment.join("runtime/replay-ledger.json"))
             .unwrap();
-        assert!(read_message_v2(&route, &message.id).is_err());
+        // A claimed message (nonce recorded) is still readable: its
+        // acknowledgement is bound to this exact file.
+        assert_eq!(read_message_v2(&route, &message.id).unwrap().id, message.id);
     }
 
     #[test]
@@ -1958,6 +1952,71 @@ mod portable_auth_route_tests {
             .unwrap();
 
         assert!(claim_message_v2(&route, &message).is_err());
+    }
+
+    #[test]
+    fn claim_then_acknowledge_survives_a_boundary_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route_with_agents(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let orchestrator = ed25519_dalek::SigningKey::from_bytes(&seed);
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let worker = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![
+                SignerGrant {
+                    public_key: hex::encode(orchestrator.verifying_key().as_bytes()),
+                    projects: vec!["ferryman".into()],
+                    roles: vec!["orchestrator".into()],
+                    capabilities: vec!["issue".into()],
+                    revoked: false,
+                },
+                SignerGrant {
+                    public_key: hex::encode(worker.verifying_key().as_bytes()),
+                    projects: vec!["ferryman".into()],
+                    roles: vec!["worker".into()],
+                    capabilities: vec![],
+                    revoked: false,
+                },
+            ],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&orchestrator).unwrap();
+        std::fs::write(
+            messages.join(format!("{}.json", message.id)),
+            serde_json::to_string(&message).unwrap(),
+        )
+        .unwrap();
+
+        // The server's claim handler: quarantine, read, then claim.
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 0);
+        assert_eq!(read_message_v2(&route, &message.id).unwrap().id, message.id);
+        assert!(claim_message_v2(&route, &message).unwrap());
+
+        // The server's acknowledge handler runs a boundary scan first. The
+        // claimed message is the canonical copy the acknowledgement binds to, so
+        // it must not be quarantined as a "replayed nonce".
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 0);
+        let mut acknowledgement = AcknowledgementV2::new(&message).unwrap();
+        acknowledgement.sign(&worker).unwrap();
+        assert!(acknowledge_v2(&route, &acknowledgement).unwrap());
     }
 
     #[test]
@@ -4217,6 +4276,8 @@ fn validate_v2_message(message: &MessageV2) -> Result<()> {
 /// Invalid or non-v2 files are skipped rather than failing the whole listing; the
 /// server boundary calls [`quarantine_invalid_inbound`] before this so invalid
 /// envelopes have already been moved aside. Returned messages are sorted by ID.
+/// Claimed messages are still listed: replay protection is enforced at claim
+/// time, not here, so a claimed message stays visible until acknowledged.
 pub fn list_messages_v2(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
     route.validate()?;
     let directory = route
@@ -4235,7 +4296,6 @@ pub fn list_messages_v2(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
         })
         .collect::<Vec<_>>();
     paths.sort();
-    let ledger = replay_ledger(route)?;
     let mut messages = Vec::new();
     for path in paths {
         let raw = match fs::read(&path) {
@@ -4259,19 +4319,16 @@ pub fn list_messages_v2(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
         {
             continue;
         }
-        if ledger.contains(
-            &message.authentication.signer_id,
-            &message.authentication.nonce,
-        ) {
-            continue;
-        }
         messages.push(message);
     }
     messages.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(messages)
 }
 
-/// Read one v2 message by ID, verifying its signature and rejecting a replayed nonce.
+/// Read one v2 message by ID, verifying its signature against the trust store.
+///
+/// Replay protection is enforced at claim time, not here: a claimed message is
+/// still readable because its acknowledgement is bound to this exact file.
 pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<MessageV2> {
     route.validate()?;
     if Uuid::parse_str(message_id).is_err() {
@@ -4294,16 +4351,6 @@ pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<Message
         bail!("stored message ID does not match its filename")
     }
     verify_v2_message(route, &message)?;
-    let ledger = replay_ledger(route)?;
-    if ledger.contains(
-        &message.authentication.signer_id,
-        &message.authentication.nonce,
-    ) {
-        bail!(
-            "replayed nonce for signer {}",
-            message.authentication.signer_id
-        )
-    }
     Ok(message)
 }
 
