@@ -3248,6 +3248,75 @@ fn acquire_git_live_lock(route: &ProjectRoute) -> Result<File> {
     Ok(file)
 }
 
+/// Commit the whole portable channel to the private-Git backstop.
+///
+/// Message delivery commits one file at a time; task orders, claims, results,
+/// reviews, and the attribution ledger accumulate independently and would
+/// otherwise be left to Syncthing alone — where any peer can delete them and
+/// have the deletion propagate everywhere. Staging everything here gives those
+/// files the same recovery backstop messages already have.
+///
+/// No-op when no private-Git backstop is configured. Callers that cannot afford
+/// to block on a remote should swallow the error: the channel remains correct,
+/// only the recovery copy is deferred.
+pub fn snapshot_channel_to_git(route: &ProjectRoute) -> Result<()> {
+    if route.git_visibility != "private" || route.git_remote.trim().is_empty() {
+        return Ok(());
+    }
+    let mut git = SystemGit;
+    let _lock = acquire_git_live_lock(route)?;
+
+    let actual_origin = git.output(
+        &route.communications,
+        &["config", "--get", "remote.origin.url"],
+    )?;
+    if normalize_git_remote(&actual_origin) != normalize_git_remote(&route.git_remote) {
+        bail!("inner repository origin does not match the registered project remote");
+    }
+    let branch = git.output(
+        &route.communications,
+        &["rev-parse", "--abbrev-ref", "HEAD"],
+    )?;
+    if branch.is_empty() || branch == "HEAD" {
+        bail!("inner communications repository must be on a named branch");
+    }
+
+    git.run(&route.communications, &["fetch", "--prune", "origin"])?;
+    // Stage before pulling so a new local file is already tracked and cannot be
+    // mistaken for an untracked collision with the remote.
+    git.run(&route.communications, &["add", "-A"])?;
+    let pending = git.output(&route.communications, &["status", "--porcelain"])?;
+    if !pending.is_empty() {
+        git.run(
+            &route.communications,
+            &[
+                "-c",
+                "user.name=Ferryman",
+                "-c",
+                "user.email=ferryman@localhost",
+                "commit",
+                "-m",
+                "snapshot portable channel",
+            ],
+        )?;
+    }
+    git.run(
+        &route.communications,
+        &["pull", "--rebase", "--autostash", "origin", &branch],
+    )?;
+    if let Err(first_push_error) = git.run(&route.communications, &["push", "origin", "HEAD"]) {
+        git.run(
+            &route.communications,
+            &["pull", "--rebase", "--autostash", "origin", &branch],
+        )?;
+        git.run(&route.communications, &["push", "origin", "HEAD"])
+            .with_context(|| {
+                format!("push retry after reconciliation; first error: {first_push_error}")
+            })?;
+    }
+    Ok(())
+}
+
 impl<G: GitRunner> MessageTransport for PrivateGitTransport<G> {
     fn kind(&self) -> TransportKind {
         TransportKind::PrivateGit

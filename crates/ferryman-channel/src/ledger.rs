@@ -137,6 +137,11 @@ pub fn append_ledger_entry(
     }
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     writeln!(file, "{line}")?;
+    drop(file);
+    // Backstop the ledger (and any task files written just before it) in the
+    // private-Git recovery repo, so a Syncthing deletion is recoverable. Best
+    // effort: a git outage must never block the recorded event itself.
+    let _ = crate::snapshot_channel_to_git(route);
     Ok(entry)
 }
 
