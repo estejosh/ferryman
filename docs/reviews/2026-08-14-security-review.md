@@ -1,6 +1,18 @@
 # Ferryman — Security Review of the Five Unmerged Branches
 
-Reviewed branches (stacked): `feat/portable-auth-v2`, `feat/groundcrew-borrows`, `feat/always-on-fleet`, `feat/learn-and-observe`, `feat/skills`. The cumulative tree is `feat/skills`; each branch's unique diff was also isolated. Findings below are verified against the actual branch code.
+_Reviewed by a clean-room agent (no memory context) 2026-08-14. Fix status
+noted below each finding by the session operator after the review._
+
+## Fix status summary (2026-08-14)
+
+- **#1 (critical)** — FIXED: `work_once`/`review_once` verify order/result signatures before acting.
+- **#2 (critical)** — OPEN: forged `review.*.json` is still trusted by `read_task`/`Task::state`. Needs signed-artifact enforcement at read (with test-suite rework).
+- **#3 (high)** — OPEN: interrupts are not signature-verified before the worker acts on them.
+- **#4 (high)** — FIXED: order-id validated at every consumer; `read_task` checks id == directory name.
+- **#5 (high)** — OPEN: root-of-trust (roster/master keys) lives in the attacker-writable shared folder; needs an out-of-band key store or append-only roster.
+- **#6 (medium)** — OPEN: skills are unsigned; needs signing or moving to operator-local (attachment) storage.
+- **#7 (medium)** — FIXED: agent CLI env is scrubbed of secret-named variables.
+
 
 ---
 
