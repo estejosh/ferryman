@@ -152,6 +152,19 @@ impl TrustedSigners {
             .iter()
             .find(|grant| grant.signer_id().is_ok_and(|id| id.as_str() == signer_id))
     }
+
+    /// Load the trust store, returning an empty store when the file is absent.
+    ///
+    /// A missing store means no trusted signers: v2 verification fails closed,
+    /// while the still-unsigned v1 transport keeps working until migration
+    /// flips the switch.
+    pub fn load_or_empty(path: &Path) -> Result<Self> {
+        if path.is_file() {
+            Self::load(path)
+        } else {
+            Ok(Self::default())
+        }
+    }
 }
 
 /// RFC 8785 canonical JSON of `value`, as bytes.
@@ -459,5 +472,12 @@ mod tests {
             store.grant_for(id.as_str()).unwrap().roles,
             vec!["orchestrator"]
         );
+    }
+
+    #[test]
+    fn missing_trust_store_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = TrustedSigners::load_or_empty(&dir.path().join("absent.toml")).unwrap();
+        assert!(store.signers.is_empty());
     }
 }

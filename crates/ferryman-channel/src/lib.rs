@@ -15,6 +15,8 @@ use std::{
 pub mod licensing;
 pub mod portable_auth;
 
+use portable_auth::{AcknowledgementV2, MessageV2, SignerId, TrustedSigners};
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -1361,6 +1363,89 @@ pub fn verify_message(message: &Message, roster: &[AgentRoute]) -> SignatureChec
         &signing_payload(message),
         roster,
     )
+}
+
+/// Load this project's trust store, or an empty store when none is configured.
+///
+/// A missing store means no trusted signers: v2 verification fails closed while
+/// the (still-unsigned) v1 transport keeps working until migration flips the
+/// switch. Wiring this into the inbound read/claim path is a later gate.
+pub fn trust_store(route: &ProjectRoute) -> Result<TrustedSigners> {
+    TrustedSigners::load_or_empty(&route.attachment.join("trusted-signers.toml"))
+}
+
+/// Verify a v2 message against this project's trust store.
+pub fn verify_v2_message(route: &ProjectRoute, message: &MessageV2) -> Result<SignerId> {
+    message.verify(&trust_store(route)?)
+}
+
+/// Verify a v2 acknowledgement against this project's trust store.
+pub fn verify_v2_acknowledgement(
+    route: &ProjectRoute,
+    acknowledgement: &AcknowledgementV2,
+) -> Result<SignerId> {
+    acknowledgement.verify(&trust_store(route)?)
+}
+
+#[cfg(test)]
+mod portable_auth_route_tests {
+    use super::*;
+    use crate::portable_auth::{MessageV2, SignerGrant, TrustedSigners};
+
+    fn test_route(dir: &std::path::Path) -> ProjectRoute {
+        ProjectRoute {
+            project_id: "ferryman".into(),
+            workspace: dir.join("workspace"),
+            attachment: dir.join("attachment"),
+            communications: dir.join("attachment").join("ferryman"),
+            shared_remote: "ferryman-ferryman".into(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn v2_message_verifies_against_the_route_trust_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        std::fs::create_dir_all(&route.attachment).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        verify_v2_message(&route, &message).unwrap();
+
+        // Fail closed: a route with no trust store trusts no one.
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = test_route(empty_dir.path());
+        std::fs::create_dir_all(&empty.attachment).unwrap();
+        assert!(verify_v2_message(&empty, &message).is_err());
+    }
 }
 
 /// Publish an agent, refusing to overwrite an established key with a different one.
