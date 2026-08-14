@@ -13,6 +13,7 @@ use std::{
 };
 
 pub mod licensing;
+pub mod portable_auth;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
