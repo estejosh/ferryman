@@ -267,6 +267,11 @@ args = {args}
 # Container image to run the agent CLI inside. Empty (the default) runs it
 # directly on the host, with your full privileges. Set it to an image that
 # contains the command above to sandbox the agent instead, e.g. a podman image.
+#
+# Overhead, so you can decide knowingly: on Linux the container costs roughly
+# 10-50 MB of RAM and a 1-2 second start per task. On macOS (podman machine) or
+# Windows (WSL2 / Docker Desktop) a Linux VM runs underneath and reserves about
+# 1-2 GB, shared across all containers.
 sandbox = "{sandbox}"
 timeout_secs = "900"
 

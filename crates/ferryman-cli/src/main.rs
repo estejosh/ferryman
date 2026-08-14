@@ -66,7 +66,8 @@ enum Command {
         /// Become this project's master. Ask the user first; this is an explicit choice.
         #[arg(long)]
         master: bool,
-        /// Container image to sandbox the agent CLI in; empty means run it bare.
+        /// Container image to sandbox the agent CLI in; empty runs it bare.
+        /// Overhead: ~10-50 MB + 1-2s per task on Linux; ~1-2 GB VM on macOS/Windows.
         #[arg(long)]
         sandbox: Option<String>,
         /// Emit one JSON object describing the result, for a caller that is a program.
