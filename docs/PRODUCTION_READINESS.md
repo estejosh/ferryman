@@ -148,6 +148,36 @@ Carried from section 0: fix the "single-node" framing everywhere.
 
 ---
 
+## Product roadmap (agreed 2026-08-13)
+
+Decisions from the "what would make it compelling" review, in build order.
+
+1. **Signed audit report** — BUILT (`ferry channel report`, commit `61989be`).
+   Signed, standalone, per-entry verification; JSON or human-readable.
+2. **Web dashboard** — build. Users are uncomfortable with a CLI; this is the
+   biggest usability unlock. Ledger, tasks, memory in one pane.
+3. **Cost/token accounting + reduction suggestions** — analysis of token usage
+   with suggestions to reduce (route selection to cheaper models). Reference
+   tools mentioned: omniroute/caveman, ponytail.
+4. **Multi-provider BYO-key manager** — per-agent keys, vendor independence.
+5. **At-rest / app-level payload encryption** — Syncthing already encrypts in
+   transit; the gap is at-rest. Use Syncthing "Receive Encrypted" for offsite
+   backup devices, plus per-project payload encryption (master mints the key,
+   shares it encrypted to members' device keys — ADR 0009 applied to content).
+6. **Cross-project master console + master memory** — one view over every
+   project the master runs, with persistent cross-project memory so the master
+   does not restart context per project.
+7. **Multi-messenger approval + 2FA** — keep Telegram; plan for other
+   messengers (Signal, etc.); a "confirm on a second channel" 2FA mode
+   (issue on Telegram, confirm on Signal).
+8. **Agent/memory marketplace via hone** — hone hosts the marketplace;
+   consider a "memory marketplace" (expert context from other work).
+9. **Autonomous orchestrator** — the long-term goal; build towards full
+   integration into hone. Must remain human-gated for destructive work.
+
+---
+
+
 ## 5. Quick answers to the questions asked Friday
 
 - **"Assuming all changes pass muster, are we ready?"** — The coordination and
