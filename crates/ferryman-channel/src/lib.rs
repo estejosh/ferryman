@@ -285,6 +285,16 @@ impl ProjectRoute {
     pub fn is_team(&self) -> bool {
         bridge_field(&self.attachment, "integration_mode") == "multi-agent"
     }
+
+    /// Whether this project requires a master grant before an agent may work.
+    ///
+    /// `grants = "required"` in `bridge.toml`; absent or `"open"` means full
+    /// permissions — the default for a user's own projects, who wants to work
+    /// without asking anyone.
+    #[must_use]
+    pub fn requires_grants(&self) -> bool {
+        bridge_field(&self.attachment, "grants") == "required"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

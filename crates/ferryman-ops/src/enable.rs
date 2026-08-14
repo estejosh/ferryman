@@ -120,7 +120,8 @@ pub fn perform(request: Request) -> Result<Outcome> {
                  workspace = \"{}\"\n\
                  attachment = \"{}\"\n\
                  communications = \"{}\"\n\
-                 shared_remote = \"{shared_remote}\"\n",
+                 shared_remote = \"{shared_remote}\"\n\
+                 grants = \"open\"\n",
                 workspace.display(),
                 attachment.display(),
                 communications.display(),

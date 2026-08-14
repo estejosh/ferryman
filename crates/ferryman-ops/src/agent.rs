@@ -620,6 +620,18 @@ pub async fn work_once(
         report.warn(&format!("holding off: {reason}"));
         return Ok(0);
     }
+    // In a grant-gated team, an agent may not work unless the master granted it
+    // its role. Full-permissions projects (`grants = "open"`) skip this.
+    if !waiting.is_empty() && route.requires_grants() {
+        let granted = ferryman_channel::master::is_granted(route, &config.agent, &config.role)?;
+        if !granted {
+            report.warn(&format!(
+                "holding off: {} is not granted the '{}' role in this team (ask the master)",
+                config.agent, config.role
+            ));
+            return Ok(0);
+        }
+    }
     for task in waiting {
         let id = task.order.id.clone();
         match task.state() {
