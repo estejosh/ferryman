@@ -48,6 +48,15 @@ repository banner, and the README.
 
 ### B1 — Worker sandboxing + independent approval (CRITICAL)
 
+**Status (2026-08-13):** the container-sandbox layer is implemented — set
+`sandbox = "<image>"` in `agent.toml` (or `ferry enable --sandbox <image>`) and
+the agent CLI runs inside it: `podman run --rm -v <workspace>:/workspace:Z -w
+/workspace <image> <command>`. Empty `sandbox` (default) runs bare. Image
+curation/maintenance is requested from the community in
+[issue #8](https://github.com/estejosh/ferryman/issues/8), reviewed before any
+merge. Remaining: the per-platform bind-mount wrinkles (SELinux/macOS/WSL),
+independent approval, and credential separation (B3).
+
 **Problem.** The reference worker runs a coding agent (`claude`/etc.) with the
 full privileges of its OS user. One bad or malicious prompt is machine-wide
 damage. This is the last thing standing between "works" and "safe to run on
