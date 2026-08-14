@@ -1387,6 +1387,82 @@ pub fn verify_v2_acknowledgement(
     acknowledgement.verify(&trust_store(route)?)
 }
 
+/// Inspect one inbound message file against the portable-authentication gate.
+///
+/// `Ok(())` means the file may be processed; `Err(reason)` means it must be
+/// quarantined: a v2 message that fails verification, or an unsigned v1 message
+/// once a trust store (enforcement) exists.
+fn inspect_inbound_message_file(route: &ProjectRoute, path: &Path) -> Result<()> {
+    let raw = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let value: Value = serde_json::from_slice(&raw).context("message is not valid JSON")?;
+    let format = value
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or("ferryman-message/v1");
+    let trusted = trust_store(route)?;
+    if format == portable_auth::MESSAGE_FORMAT_V2 {
+        let message: MessageV2 = serde_json::from_slice(&raw).context("v2 message is malformed")?;
+        message
+            .verify(&trusted)
+            .context("v2 message failed verification")?;
+    } else if !trusted.signers.is_empty() {
+        bail!("unsigned v1 message while enforcement is enabled");
+    }
+    Ok(())
+}
+
+/// Move an inbound message file to machine-local quarantine with a reason sidecar.
+fn quarantine_inbound_file(route: &ProjectRoute, path: &Path, reason: &str) -> Result<()> {
+    let quarantine = route.attachment.join("runtime/quarantine/outbox");
+    fs::create_dir_all(&quarantine)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("message.json");
+    fs::rename(path, quarantine.join(name))
+        .with_context(|| format!("quarantine {}", path.display()))?;
+    fs::write(quarantine.join(format!("{name}.error")), reason)?;
+    Ok(())
+}
+
+/// Scan this project's inbound messages, quarantining any that fail the
+/// portable-authentication gate. Returns how many were quarantined.
+///
+/// This is the enforcement primitive: call it at the authenticated inbound
+/// boundary (server inbox/claim, or a migration command) before listing or
+/// reading messages. It is intentionally not wired into the v1 `read_message`
+/// and `list_messages` yet, because those parse only v1 envelopes and a mixed
+/// v1/v2 directory must be migrated, not half-read.
+pub fn quarantine_invalid_inbound(route: &ProjectRoute) -> Result<usize> {
+    let directory = route
+        .communications
+        .join("messages")
+        .join(&route.project_id);
+    if !directory.is_dir() {
+        return Ok(0);
+    }
+    let mut paths = fs::read_dir(directory)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut quarantined = 0;
+    for path in paths {
+        let reason = match inspect_inbound_message_file(route, &path) {
+            Ok(()) => continue,
+            Err(error) => format!("{error:#}"),
+        };
+        if quarantine_inbound_file(route, &path, &reason).is_ok() {
+            quarantined += 1;
+        }
+    }
+    Ok(quarantined)
+}
+
 #[cfg(test)]
 mod portable_auth_route_tests {
     use super::*;
@@ -1445,6 +1521,103 @@ mod portable_auth_route_tests {
         let empty = test_route(empty_dir.path());
         std::fs::create_dir_all(&empty.attachment).unwrap();
         assert!(verify_v2_message(&empty, &message).is_err());
+    }
+
+    #[test]
+    fn inbound_scanner_quarantines_unsigned_v1_when_enforcing() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let message = Message::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+            None,
+        );
+        std::fs::write(
+            messages.join(format!("{}.json", message.id)),
+            serde_json::to_string(&message).unwrap(),
+        )
+        .unwrap();
+
+        // No trust store yet: the unsigned v1 message is accepted.
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 0);
+
+        // Enable enforcement by writing a trust store.
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 1);
+        assert!(!messages.join(format!("{}.json", message.id)).exists());
+        assert!(
+            route
+                .attachment
+                .join("runtime/quarantine/outbox")
+                .join(format!("{}.json.error", message.id))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn inbound_scanner_quarantines_a_tampered_v2_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut v2 = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        v2.sign(&signing).unwrap();
+        v2.payload = serde_json::json!({"tampered": true});
+        std::fs::write(
+            messages.join(format!("{}.json", v2.id)),
+            serde_json::to_string(&v2).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 1);
     }
 }
 
