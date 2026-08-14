@@ -72,17 +72,20 @@ replay-protection-critical.
 
 ### Next build sequence ("better", agreed 2026-08-14)
 
-1. Plan/spec artifact + dependency DAG.
-2. Session trajectory capture/replay (kept in channel memory).
-3. Credential injection (runner).
-4. Native event adapters (GitHub/Linear/webhook).
-5. Eval scorer command.
-6. Web dashboard.
-7. Cost/token accounting + reduction suggestions.
-8. BYO-key manager (easy key insertion, no `.env` hand-editing).
-9. At-rest/payload encryption.
-10. Cross-project master console + memory.
-11. hone integration (marketplace/orchestration) — see `docs/HONE_INTEGRATION.md`.
+1. ~~Plan/spec artifact + dependency DAG~~ — **BUILT**: `Order.depends_on` (signed);
+   `work_for` waits for dependencies (`--depends-on`).
+2. ~~Session trajectory capture/replay~~ — **BUILT**: `channel::trajectory` records
+   each run (prompt digest + output) to the synced channel.
+3. ~~Credential injection~~ — **BUILT**: `credentials.json` injected into the
+   sandboxed agent CLI (scrub-all-then-inject-listed).
+4. Native event adapters (GitHub/Linear/webhook) — **next**.
+5. ~~Eval scorer command~~ — **BUILT**: bench tasks accept a `scorer` (exit 0 = pass).
+6. Web dashboard — **next** (large: frontend).
+7. Cost/token accounting + reduction suggestions — **next**.
+8. BYO-key manager (easy key insertion, no `.env` hand-editing) — **next**.
+9. At-rest/payload encryption — **next** (large: crypto).
+10. Cross-project master console + memory — **next** (large).
+11. hone integration — **BUILT** (`docs/HONE_INTEGRATION.md`).
 
 ---
 
