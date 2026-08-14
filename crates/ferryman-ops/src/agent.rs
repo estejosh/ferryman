@@ -625,6 +625,14 @@ pub async fn work_once(
         match task.state() {
             TaskState::Open => {
                 ferryman_channel::claim_order(route, &id, &config.agent)?;
+                ferryman_channel::ledger::append_ledger_entry(
+                    route,
+                    &identity,
+                    "claim",
+                    &config.agent,
+                    &format!("claimed order {id}"),
+                    Some(&id),
+                )?;
                 // Re-read: another machine's claim may have arrived while this one was
                 // being written, and the older claim wins. Acting on a stale read is
                 // how two agents end up doing the same task.
@@ -686,6 +694,14 @@ async fn do_work(
     };
     identity.sign_result(&mut result);
     ferryman_channel::submit_result(route, &result)?;
+    ferryman_channel::ledger::append_ledger_entry(
+        route,
+        identity,
+        "result",
+        &config.agent,
+        &format!("submitted revision {revision} for {id}"),
+        Some(id),
+    )?;
     report.info(&format!(
         "  {id}: submitted revision {revision}, signed by {}",
         config.agent

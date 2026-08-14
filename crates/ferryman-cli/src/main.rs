@@ -1890,6 +1890,18 @@ fn channel(command: Channel) -> Result<()> {
                 identity.sign_order(&mut order);
             }
             let path = ferryman_channel::issue_order(&route, &order)?;
+            if let Ok(identity) =
+                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)
+            {
+                let _ = ferryman_channel::ledger::append_ledger_entry(
+                    &route,
+                    &identity,
+                    "order",
+                    &issuer,
+                    &format!("issued order {id}"),
+                    Some(&id),
+                );
+            }
             println!("issued {id} -> {}", path.display());
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),

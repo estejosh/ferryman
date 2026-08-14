@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod ledger;
 pub mod licensing;
 pub mod migration;
 pub mod portable_auth;
