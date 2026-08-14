@@ -31,8 +31,11 @@ Cross-cutting decisions (2026-08-13):
 3. **Worker sandbox (capability model)** (`F-03`). Grant folders/keys/actions
    per task; separate approval authority from execution. Multi-grant, not
    single-mount.
-4. **Credential store.** OS-keychain-backed, reference-by-name, scoped grants to
-   workers. Agents can access the keys their files need; nothing is scrubbed.
+4. **Credential store** (see ADR 0009). The orchestrator is only the *mint* — it
+   encrypts a scoped set of secrets to an agent's key and discards the plaintext;
+   Syncthing distributes; only the intended agent decrypts. Signed + encrypted,
+   short-lived, rotation as the revocation brake. Agents access the keys their
+   files need; nothing is scrubbed.
 
 ## Phase 1 — reliability
 
