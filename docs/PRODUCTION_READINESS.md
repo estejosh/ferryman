@@ -214,23 +214,38 @@ Reviewed `ClipboardHealth/groundcrew` and `prolego-team/groundcrew`
 4. Interrupt mode — `channel::interrupt` (kill/pause/steer, signed, acked),
    honored in `do_work`, `ferry channel interrupt`.
 
-## Broader competitive research → next upgrades
+## Broader competitive research → analysis and outcome
 
 A parallel agent reviewed 11 adjacent projects (`memory-bank/competitive-research.md`).
-Ranked for next cycles:
+Seven upgrades were assessed; two were built, five deferred.
 
-1. **Event/scheduled trigger adapter** (webhook/cron → signed order) — the gap
-   between Ferryman and an always-on fleet.
-2. **MCP tool/context providers** — leverage the MCP ecosystem; ACP later for
-   backend swapping.
-3. **Schema-validated deliverables** — machine-checkable handoffs; auto-reject
-   malformed work at the review gate.
-4. **Approval-mode ladder** — finer than the single Telegram approve/deny gate.
-5. **Worker eval harness** — measure which CLI solves tasks well (SWE-bench
-   batch model).
-6. **OTLP trace/metrics export** — observe *how* a run unfolded, not just
-   attribution.
-7. **Repo-map pre-context** — lower priority; many CLIs do it themselves.
+### Built (materially better, and self-contained)
+
+1. **Always-on triggers** (research #2) — the gap between Ferryman and an
+   "always-on fleet." `sources.toml` lists sources; `ferry agent` now re-polls
+   them on their interval and imports new tickets as signed orders, and
+   `ferry channel watch`/`sources` give a standalone path. Intervals survive
+   restarts via a last-import marker; imports are race-tolerant and idempotent.
+2. **Result contracts** (research #4) — an order can `--require` top-level keys
+   in its result. The contract is signed into the order (backward-compatible:
+   no contract → identical signature bytes), `ferry channel tasks` flags
+   missing keys, and `ferry channel review --accept` refuses malformed
+   deliverables mechanically.
+
+### Deferred (assessed, not built this cycle)
+
+3. **MCP providers** — real leverage, but needs an external MCP crate (none in
+   the dependency tree) and a trust decision on arbitrary MCP servers. Blocked
+   on a dependency/architecture decision, not effort.
+4. **Approval-mode ladder** — Ferryman already has `review = auto|confirm|off`
+   and, with the runner, `none|podman|docker`. The finer edit-permission ladder
+   belongs in the runner; no separate build this cycle.
+5. **Worker eval harness** — a separate project (dataset curation + scoring),
+   not a feature to bolt on. Roadmap, not this branch.
+6. **OTLP trace/metrics** — needs an OTLP dependency + a collector. The ledger
+   already answers *attribution*; trace observability is a later, larger piece.
+7. **Repo-map pre-context** — most agent CLIs build this themselves; marginal
+   for a provider-neutral shell wrapper. Lowest priority.
 
 ---
 

@@ -348,6 +348,10 @@ enum Channel {
         /// Hold the result for review before the task counts as done.
         #[arg(long)]
         requires_review: bool,
+        /// Require this key in the submitted result, e.g. --require output.
+        /// Repeatable; results missing any of these are flagged as malformed.
+        #[arg(long)]
+        require: Vec<String>,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -364,6 +368,27 @@ enum Channel {
         /// {"id": "...", "task": "...", "assigned_to": "..."} (the last is optional).
         #[arg(long)]
         command: String,
+    },
+    /// List the configured always-on sources (from sources.toml).
+    Sources {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Re-poll the configured sources forever, importing anything new. This is
+    /// the standalone "always-on" process; a running `ferry agent` already does
+    /// the same on its own poll loop.
+    Watch {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is importing. Defaults to this machine's name.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Seconds between polls when a source has no interval of its own.
+        #[arg(long, default_value_t = 60)]
+        interval: u64,
+        /// Do one poll and exit, instead of looping.
+        #[arg(long)]
+        once: bool,
     },
     /// Manage the per-task git worktrees.
     Worktree {
@@ -2012,6 +2037,7 @@ fn channel(command: Channel) -> Result<()> {
             to,
             task,
             requires_review,
+            require,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
@@ -2030,6 +2056,11 @@ fn channel(command: Channel) -> Result<()> {
                 requires_review,
                 signed_by: None,
                 signature: None,
+                result_contract: if require.is_empty() {
+                    None
+                } else {
+                    Some(ferryman_channel::contract::ResultContract { required: require })
+                },
             };
             // Actually sign it. Setting signed_by without a signature would claim
             // attribution nothing could check, which is worse than claiming none.
@@ -2071,6 +2102,60 @@ fn channel(command: Channel) -> Result<()> {
             let source = ferryman_channel::source::TaskSource::Shell { name, command };
             let imported = ferryman_channel::source::import(&route, &source, &issuer, &identity)?;
             println!("imported {imported} order(s) from {}", source.name());
+        }
+
+        Channel::Sources { workspace } => {
+            let route = here(workspace)?;
+            let triggers = ferryman_channel::source::load_triggers(&route)?;
+            if triggers.is_empty() {
+                println!(
+                    "no sources configured; write {} with [[source]] entries",
+                    route.attachment.join("sources.toml").display()
+                );
+            } else {
+                for trigger in &triggers {
+                    println!(
+                        "{}  every {}s  {}",
+                        trigger.name, trigger.interval_secs, trigger.command
+                    );
+                }
+            }
+        }
+
+        Channel::Watch {
+            workspace,
+            agent,
+            interval,
+            once,
+        } => {
+            let route = here(workspace)?;
+            let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity =
+                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)?;
+            let triggers = ferryman_channel::source::load_triggers(&route)?;
+            if triggers.is_empty() {
+                bail!(
+                    "no sources configured; write {} with [[source]] entries",
+                    route.attachment.join("sources.toml").display()
+                );
+            }
+            loop {
+                for trigger in &triggers {
+                    match ferryman_channel::source::poll_if_due(&route, trigger, &issuer, &identity)
+                    {
+                        Ok(0) => {}
+                        Ok(n) => println!(
+                            "imported {n} order(s) from {}",
+                            trigger.name
+                        ),
+                        Err(e) => eprintln!("source '{}' failed: {e:#}", trigger.name),
+                    }
+                }
+                if once {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval));
+            }
         }
 
         Channel::Worktree { workspace, action } => {
@@ -2261,6 +2346,17 @@ fn channel(command: Channel) -> Result<()> {
             let revision = task
                 .latest_revision()
                 .context("there is no result to review yet")?;
+            // A contract violation must be fixed before acceptance: this is the
+            // mechanical rejection a result schema exists to provide.
+            if accept
+                && let Some(missing) = task.contract_violations()
+                && !missing.is_empty()
+            {
+                bail!(
+                    "result for {id} does not satisfy the order's contract; missing keys: {}",
+                    missing.join(", ")
+                );
+            }
             let mut verdict = ferryman_channel::Review {
                 order_id: id.clone(),
                 revision,
@@ -2303,6 +2399,13 @@ fn channel(command: Channel) -> Result<()> {
                     "               order {:?}",
                     ferryman_channel::verify_order(&task.order, &route.agents)
                 );
+                if let Some(missing) = task.contract_violations() {
+                    if missing.is_empty() {
+                        println!("               contract satisfied");
+                    } else {
+                        println!("               contract MISSING: {}", missing.join(", "));
+                    }
+                }
                 for result in &task.results {
                     println!(
                         "               result r{} by {:<10} {:?}",

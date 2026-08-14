@@ -726,6 +726,16 @@ pub async fn work_once(
     report: &dyn Progress,
 ) -> Result<usize> {
     let identity = AgentIdentity::load_or_create(&config.agent, &route.attachment)?;
+    // Always-on imports: any running worker re-polls the project's configured
+    // sources and turns new external tickets into signed orders. This is what
+    // makes an idle-but-running fleet pick work up without a human issuing it.
+    for trigger in ferryman_channel::source::load_triggers(route)? {
+        match ferryman_channel::source::poll_if_due(route, &trigger, &config.agent, &identity) {
+            Ok(0) => {}
+            Ok(n) => report.info(&format!("imported {n} order(s) from {}", trigger.name)),
+            Err(e) => report.warn(&format!("source '{}' failed: {e:#}", trigger.name)),
+        }
+    }
     let mut acted = 0;
     let waiting = ferryman_channel::work_for(route, &config.agent)?;
     // Checked here rather than at the top of the loop so an idle machine stays quiet:
@@ -1105,6 +1115,7 @@ mod tests {
             requires_review: true,
             signed_by: None,
             signature: None,
+            result_contract: None,
         }
     }
 

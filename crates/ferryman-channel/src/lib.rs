@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod contract;
 pub mod interrupt;
 pub mod ledger;
 pub mod licensing;
@@ -635,6 +636,10 @@ pub struct Order {
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// The shape the result must have. Present when the issuer wants malformed
+    /// deliverables rejected mechanically rather than reviewed by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_contract: Option<crate::contract::ResultContract>,
 }
 
 /// An agent staking a claim on an open order.
@@ -765,6 +770,16 @@ impl Task {
     #[must_use]
     pub fn latest_revision(&self) -> Option<u32> {
         self.results.iter().map(|r| r.revision).max()
+    }
+
+    /// The keys the order's contract requires but the latest result is missing.
+    /// `None` means there is no contract to satisfy; `Some(vec![])` means the
+    /// contract is satisfied; otherwise it is the list of missing keys.
+    #[must_use]
+    pub fn contract_violations(&self) -> Option<Vec<String>> {
+        let contract = self.order.result_contract.as_ref()?;
+        let latest = self.results.iter().max_by_key(|r| r.revision)?;
+        Some(contract.violations(&latest.payload))
     }
 
     /// A proposed verdict on the newest result that no human has settled yet.
@@ -1206,7 +1221,7 @@ impl AgentIdentity {
 }
 
 fn order_payload(order: &Order) -> String {
-    format!(
+    let base = format!(
         "ferryman-order-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         order.id,
         order.project_id,
@@ -1215,7 +1230,16 @@ fn order_payload(order: &Order) -> String {
         order.created_at.to_rfc3339(),
         order.requires_review,
         payload_digest(&order.payload),
-    )
+    );
+    // The contract is bound to the signature only when present, so an order with
+    // no contract keeps the exact bytes it always had and still verifies.
+    match &order.result_contract {
+        None => base,
+        Some(contract) => format!(
+            "{base}\ncontract:{}",
+            serde_json::to_string(&contract.required).unwrap_or_else(|_| "[]".to_string())
+        ),
+    }
 }
 
 fn result_payload(result: &TaskResult) -> String {
@@ -6582,6 +6606,7 @@ mod work_over_files_tests {
             requires_review,
             signed_by: None,
             signature: None,
+            result_contract: None,
         }
     }
 
