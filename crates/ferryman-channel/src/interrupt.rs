@@ -121,6 +121,12 @@ pub fn pending_interrupts(
         let raw = std::fs::read_to_string(entry.path())?;
         let interrupt: Interrupt =
             serde_json::from_str(&raw).with_context(|| format!("parse {name}"))?;
+        // Trust boundary: only honour interrupts whose signature verifies. A
+        // peer can write to the shared folder, so an unsigned interrupt is a
+        // forged steer/kill/pause and must be ignored, not acted on.
+        if crate::verify_interrupt(&interrupt, &route.agents) != crate::SignatureCheck::Valid {
+            continue;
+        }
         out.push(interrupt);
     }
     out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -180,8 +186,16 @@ mod tests {
     #[test]
     fn an_interrupt_round_trips_and_acks() {
         let dir = tempfile::tempdir().unwrap();
-        let route = route(dir.path());
-        let interrupt = Interrupt {
+        let mut route = route(dir.path());
+        let identity =
+            crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
+        route.agents = vec![crate::AgentRoute {
+            name: "orchestrator".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+        }];
+        let mut interrupt = Interrupt {
             order_id: "t-1".into(),
             action: InterruptAction::Steer,
             note: "use the totals from page 2".into(),
@@ -190,6 +204,7 @@ mod tests {
             signed_by: None,
             signature: None,
         };
+        identity.sign_interrupt(&mut interrupt);
         write_interrupt(&route, &interrupt).unwrap();
         let pending = pending_interrupts(&route, "t-1", "worker").unwrap();
         assert_eq!(pending.len(), 1);
@@ -198,6 +213,26 @@ mod tests {
         assert!(pending_interrupts(&route, "t-1", "worker").unwrap().is_empty());
         // An ack is per-agent; another machine still sees the interrupt.
         assert_eq!(pending_interrupts(&route, "t-1", "nebra").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unsigned_interrupt_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        let interrupt = Interrupt {
+            order_id: "t-1".into(),
+            action: InterruptAction::Kill,
+            note: "forged".into(),
+            issued_by: "attacker".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        write_interrupt(&route, &interrupt).unwrap();
+        assert!(
+            pending_interrupts(&route, "t-1", "worker").unwrap().is_empty(),
+            "an unsigned interrupt must never reach the worker"
+        );
     }
 
     #[test]

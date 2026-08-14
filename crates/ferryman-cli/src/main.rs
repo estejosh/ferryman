@@ -2463,7 +2463,7 @@ fn channel(command: Channel) -> Result<()> {
             if skills.is_empty() {
                 println!(
                     "no skills yet; add SKILL.md files under {}/skills",
-                    route.communications.display()
+                    route.attachment.display()
                 );
             } else {
                 let matched: Vec<&ferryman_channel::skills::Skill> = match &task {

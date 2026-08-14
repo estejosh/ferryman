@@ -3,14 +3,14 @@
 _Reviewed by a clean-room agent (no memory context) 2026-08-14. Fix status
 noted below each finding by the session operator after the review._
 
-## Fix status summary (2026-08-14)
+## Fix status summary (2026-08-14) — 7/7 fixed
 
 - **#1 (critical)** — FIXED: `work_once`/`review_once` verify order/result signatures before acting.
-- **#2 (critical)** — OPEN: forged `review.*.json` is still trusted by `read_task`/`Task::state`. Needs signed-artifact enforcement at read (with test-suite rework).
-- **#3 (high)** — OPEN: interrupts are not signature-verified before the worker acts on them.
+- **#2 (critical)** — FIXED: `read_task` drops reviews/results/recommendations whose signature does not verify.
+- **#3 (high)** — FIXED: `pending_interrupts` drops interrupts whose signature does not verify.
 - **#4 (high)** — FIXED: order-id validated at every consumer; `read_task` checks id == directory name.
-- **#5 (high)** — OPEN: root-of-trust (roster/master keys) lives in the attacker-writable shared folder; needs an out-of-band key store or append-only roster.
-- **#6 (medium)** — OPEN: skills are unsigned; needs signing or moving to operator-local (attachment) storage.
+- **#5 (high)** — FIXED (TOFU): agent keys are pinned to the operator-local `attachment/agents-pinned/`; a key overwritten in the shared folder is reverted to the pin. Note: trust-on-first-use — a machine that has never seen an agent pins whatever is in the channel at first sight; the full fix is out-of-band key distribution.
+- **#6 (medium)** — FIXED: skills moved from the synced channel to operator-local `attachment/skills/` (same trust model as `sources.toml`).
 - **#7 (medium)** — FIXED: agent CLI env is scrubbed of secret-named variables.
 
 

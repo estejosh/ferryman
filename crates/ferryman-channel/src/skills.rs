@@ -7,8 +7,11 @@
 //! bloating every prompt - the "add tools without touching the agent core"
 //! pattern, in its lightweight markdown form.
 //!
-//! Skills live in the synced channel (`skills/`), so the whole team shares one
-//! body of expertise, the way it shares the ledger and the memory bank.
+//! Skills live in the attachment (`.ferryman/skills/`), not the synced channel:
+//! they are trusted instructions injected into agent prompts, so only the
+//! operator may author them. A skill in the synced channel would be a
+//! prompt-injection vector any peer could plant — the same reason `sources.toml`
+//! and `bench.json` are operator-local.
 
 use std::path::PathBuf;
 
@@ -27,7 +30,7 @@ pub struct Skill {
 }
 
 fn skills_dir(route: &ProjectRoute) -> PathBuf {
-    route.communications.join("skills")
+    route.attachment.join("skills")
 }
 
 /// Load every skill from the channel's `skills/` directory, named first.
@@ -233,7 +236,7 @@ mod tests {
     fn a_malformed_skill_is_skipped_not_fatal() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route(dir.path());
-        let skills = route.communications.join("skills");
+        let skills = route.attachment.join("skills");
         std::fs::create_dir_all(skills.join("good")).unwrap();
         std::fs::create_dir_all(skills.join("bad")).unwrap();
         std::fs::write(

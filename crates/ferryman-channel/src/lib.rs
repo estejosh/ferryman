@@ -1039,15 +1039,18 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         {
             claims.push(value);
         } else if name.starts_with("result.")
-            && let Ok(value) = serde_json::from_str(&text)
+            && let Ok(value) = serde_json::from_str::<TaskResult>(&text)
+            && verify_result(&value, &route.agents) == SignatureCheck::Valid
         {
             results.push(value);
         } else if name.starts_with("review.")
-            && let Ok(value) = serde_json::from_str(&text)
+            && let Ok(value) = serde_json::from_str::<Review>(&text)
+            && verify_review(&value, &route.agents) == SignatureCheck::Valid
         {
             reviews.push(value);
         } else if name.starts_with("recommendation.")
-            && let Ok(value) = serde_json::from_str(&text)
+            && let Ok(value) = serde_json::from_str::<Recommendation>(&text)
+            && verify_recommendation(&value, &route.agents) == SignatureCheck::Valid
         {
             recommendations.push(value);
         }
@@ -1430,6 +1433,18 @@ pub fn verify_review(review: &Review, roster: &[AgentRoute]) -> SignatureCheck {
         review.signed_by.as_ref(),
         review.signature.as_ref(),
         &review_payload(review),
+        roster,
+    )
+}
+
+/// Who issued this interrupt, checkably. An unsigned interrupt is a forged one:
+/// a peer could otherwise kill, pause, or steer another machine's work.
+#[must_use]
+pub fn verify_interrupt(interrupt: &crate::interrupt::Interrupt, roster: &[AgentRoute]) -> SignatureCheck {
+    check_signature(
+        interrupt.signed_by.as_ref(),
+        interrupt.signature.as_ref(),
+        &crate::interrupt::payload(interrupt),
         roster,
     )
 }
@@ -2454,8 +2469,40 @@ fn bridge_field(attachment: &Path, key: &str) -> String {
 ///
 /// A malformed entry is skipped rather than fatal: one agent writing nonsense must not
 /// stop the rest of the fleet from talking.
+fn pin_path(attachment: &Path, name: &str) -> PathBuf {
+    attachment.join("agents-pinned").join(format!("{name}.key"))
+}
+
 pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
+    // The attachment (`.ferryman`) is the operator-local, non-synced side of the
+    // channel; `communications` is its `ferryman` subdirectory.
+    let attachment = communications.parent().unwrap_or(communications);
     let mut agents = read_roster_in(&communications.join("agents"))?;
+    // Pin keys: an agent's public key is pinned to this operator's local store
+    // the first time it is seen, and a later change to agents/<name>.json in the
+    // shared folder (a peer overwriting a victim's key to forge as it) is
+    // reverted to the pinned key. Trust-on-first-use: a machine that has never
+    // seen an agent will pin whatever is in the channel at first sight.
+    for agent in &mut agents {
+        let Some(key) = agent.public_key.as_ref().filter(|k| !k.is_empty()) else {
+            continue;
+        };
+        let pin = pin_path(attachment, &agent.name);
+        match std::fs::read_to_string(&pin) {
+            Ok(pinned) if pinned.trim() != key.as_str() => {
+                agent.public_key = Some(pinned.trim().to_string());
+            }
+            Ok(_) => {}
+            Err(_) => {
+                // First sight: pin it. Best-effort; a read-only attachment must
+                // not break the roster.
+                if let Some(parent) = pin.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&pin, key);
+            }
+        }
+    }
     // An agent's public key should not depend on which repository you ask about. The
     // fleet channel is where identity belongs; the project copy stays authoritative for
     // anyone already in it, so an existing channel keeps verifying exactly as it did.
@@ -6697,6 +6744,26 @@ mod work_over_files_tests {
         (temp, route)
     }
 
+    /// A route whose roster carries real signing keys for the agents the tests
+    /// use, plus the identities, so results/reviews/interrupts can be signed.
+    fn signed_channel() -> (tempfile::TempDir, ProjectRoute, HashMap<String, AgentIdentity>) {
+        let (temp, mut route) = channel();
+        let mut identities = HashMap::new();
+        let mut roster = Vec::new();
+        for name in ["grouchly", "beastly", "nebra", "worker", "orchestrator"] {
+            let identity = AgentIdentity::load_or_create(name, &route.attachment).unwrap();
+            roster.push(AgentRoute {
+                name: name.to_string(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(identity.public_key_hex()),
+            });
+            identities.insert(name.to_string(), identity);
+        }
+        route.agents = roster;
+        (temp, route, identities)
+    }
+
     fn order(id: &str, assigned_to: Option<&str>, requires_review: bool) -> Order {
         Order {
             id: id.into(),
@@ -6736,11 +6803,11 @@ mod work_over_files_tests {
 
     #[test]
     fn an_approval_required_order_cannot_be_self_approved() {
-        let (_t, route) = channel();
+        let (_t, route, identities) = signed_channel();
         let mut order = order("t-1", None, true);
         order.requires_approval = true;
         issue_order(&route, &order).unwrap();
-        let result = TaskResult {
+        let mut result = TaskResult {
             order_id: "t-1".into(),
             agent: "worker".into(),
             revision: 1,
@@ -6749,9 +6816,10 @@ mod work_over_files_tests {
             signed_by: None,
             signature: None,
         };
+        identities["worker"].sign_result(&mut result);
         submit_result(&route, &result).unwrap();
         // The worker that produced the result tries to accept its own work.
-        let review = Review {
+        let mut review = Review {
             order_id: "t-1".into(),
             revision: 1,
             reviewer: "worker".into(),
@@ -6761,6 +6829,7 @@ mod work_over_files_tests {
             signed_by: None,
             signature: None,
         };
+        identities["worker"].sign_review(&mut review);
         let error = submit_review(&route, &review).unwrap_err().to_string();
         assert!(
             error.contains("cannot approve its own work"),
@@ -6851,7 +6920,7 @@ mod work_over_files_tests {
 
     #[test]
     fn the_whole_review_cycle_is_just_more_files_in_one_directory() {
-        let (_t, route) = channel();
+        let (_t, route, identities) = signed_channel();
         issue_order(&route, &order("t-1", Some("grouchly"), true)).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
@@ -6860,19 +6929,17 @@ mod work_over_files_tests {
             }
         );
 
-        submit_result(
-            &route,
-            &TaskResult {
-                order_id: "t-1".into(),
-                agent: "grouchly".into(),
-                revision: 1,
-                submitted_at: Utc::now(),
-                payload: json!({"draft": 1}),
-                signed_by: None,
-                signature: None,
-            },
-        )
-        .unwrap();
+        let mut result = TaskResult {
+            order_id: "t-1".into(),
+            agent: "grouchly".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({"draft": 1}),
+            signed_by: None,
+            signature: None,
+        };
+        identities["grouchly"].sign_result(&mut result);
+        submit_result(&route, &result).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
             TaskState::AwaitingReview {
@@ -6881,52 +6948,46 @@ mod work_over_files_tests {
             }
         );
 
-        submit_review(
-            &route,
-            &Review {
-                order_id: "t-1".into(),
-                revision: 1,
-                reviewer: "beastly".into(),
-                reviewed_at: Utc::now(),
-                accepted: false,
-                notes: Some("the summary contradicts the table".into()),
-                signed_by: None,
-                signature: None,
-            },
-        )
-        .unwrap();
+        let mut review = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "beastly".into(),
+            reviewed_at: Utc::now(),
+            accepted: false,
+            notes: Some("the summary contradicts the table".into()),
+            signed_by: None,
+            signature: None,
+        };
+        identities["beastly"].sign_review(&mut review);
+        submit_review(&route, &review).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
             TaskState::ChangesRequested { revision: 2 }
         );
 
-        submit_result(
-            &route,
-            &TaskResult {
-                order_id: "t-1".into(),
-                agent: "grouchly".into(),
-                revision: 2,
-                submitted_at: Utc::now(),
-                payload: json!({"draft": 2}),
-                signed_by: None,
-                signature: None,
-            },
-        )
-        .unwrap();
-        submit_review(
-            &route,
-            &Review {
-                order_id: "t-1".into(),
-                revision: 2,
-                reviewer: "beastly".into(),
-                reviewed_at: Utc::now(),
-                accepted: true,
-                notes: None,
-                signed_by: None,
-                signature: None,
-            },
-        )
-        .unwrap();
+        let mut result = TaskResult {
+            order_id: "t-1".into(),
+            agent: "grouchly".into(),
+            revision: 2,
+            submitted_at: Utc::now(),
+            payload: json!({"draft": 2}),
+            signed_by: None,
+            signature: None,
+        };
+        identities["grouchly"].sign_result(&mut result);
+        submit_result(&route, &result).unwrap();
+        let mut review = Review {
+            order_id: "t-1".into(),
+            revision: 2,
+            reviewer: "beastly".into(),
+            reviewed_at: Utc::now(),
+            accepted: true,
+            notes: None,
+            signed_by: None,
+            signature: None,
+        };
+        identities["beastly"].sign_review(&mut review);
+        submit_review(&route, &review).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
             TaskState::Accepted
@@ -6935,21 +6996,19 @@ mod work_over_files_tests {
 
     #[test]
     fn work_without_review_is_done_when_the_result_lands() {
-        let (_t, route) = channel();
+        let (_t, route, identities) = signed_channel();
         issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
-        submit_result(
-            &route,
-            &TaskResult {
-                order_id: "t-1".into(),
-                agent: "grouchly".into(),
-                revision: 1,
-                submitted_at: Utc::now(),
-                payload: json!({"ok": true}),
-                signed_by: None,
-                signature: None,
-            },
-        )
-        .unwrap();
+        let mut result = TaskResult {
+            order_id: "t-1".into(),
+            agent: "grouchly".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({"ok": true}),
+            signed_by: None,
+            signature: None,
+        };
+        identities["grouchly"].sign_result(&mut result);
+        submit_result(&route, &result).unwrap();
         assert_eq!(read_task(&route, "t-1").unwrap().state(), TaskState::Done);
     }
 
