@@ -361,15 +361,19 @@ else
       -c user.email=ferryman@localhost \
       commit -m "$commit_message"
   fi
-  branch=$(git -C "$COMMUNICATIONS" symbolic-ref --quiet --short HEAD)
-  [[ -n "$branch" ]] ||
-    { echo "inner communications repository must use a named branch" >&2; exit 2; }
-  remote_branch=$(git -C "$COMMUNICATIONS" ls-remote --heads origin "refs/heads/$branch")
-  if [[ -n "$remote_branch" ]]; then
-    git -C "$COMMUNICATIONS" pull --rebase --autostash origin "$branch"
+  if [[ -n "$GIT_REMOTE" ]]; then
+    branch=$(git -C "$COMMUNICATIONS" symbolic-ref --quiet --short HEAD)
+    [[ -n "$branch" ]] ||
+      { echo "inner communications repository must use a named branch" >&2; exit 2; }
+    remote_branch=$(git -C "$COMMUNICATIONS" ls-remote --heads origin "refs/heads/$branch")
+    if [[ -n "$remote_branch" ]]; then
+      git -C "$COMMUNICATIONS" pull --rebase --autostash origin "$branch"
+    fi
+    git -C "$COMMUNICATIONS" push -u origin "HEAD:$branch"
+    echo "OK portable adoption standard committed and pushed"
+  else
+    echo "OK portable adoption standard committed (Syncthing-only channel; no remote to push)"
   fi
-  git -C "$COMMUNICATIONS" push -u origin "HEAD:$branch"
-  echo "OK portable adoption standard committed and pushed"
 fi
 
 if ! grep -qxF '/.ferryman/' "$WORKSPACE/.gitignore" 2>/dev/null; then
