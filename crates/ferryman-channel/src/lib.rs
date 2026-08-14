@@ -901,6 +901,9 @@ pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<
     if !is_safe_component(agent) {
         bail!("agent name must be a path-safe identifier")
     }
+    if !is_safe_component(order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
     let claim = Claim {
         order_id: order_id.to_string(),
         agent: agent.to_string(),
@@ -920,6 +923,9 @@ pub fn submit_result(route: &ProjectRoute, result: &TaskResult) -> Result<PathBu
     if !is_safe_component(&result.agent) {
         bail!("agent name must be a path-safe identifier")
     }
+    if !is_safe_component(&result.order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
     let path = task_dir(route, &result.order_id).join(format!(
         "result.{}.{:03}.json",
         result.agent, result.revision
@@ -930,6 +936,9 @@ pub fn submit_result(route: &ProjectRoute, result: &TaskResult) -> Result<PathBu
 
 /// Record a verdict on a revision.
 pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
+    if !is_safe_component(&review.order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
     if !review.accepted
         && review
             .notes
@@ -1000,9 +1009,18 @@ pub fn submit_recommendation(
 
 /// Read one task by reading its directory.
 pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
+    if !is_safe_component(order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
     let directory = task_dir(route, order_id);
     let order: Order = serde_json::from_str(&fs::read_to_string(directory.join("order.json"))?)
         .with_context(|| format!("order {order_id} is unreadable"))?;
+    if order.id != order_id {
+        bail!(
+            "order {} does not match its directory name {order_id}",
+            order.id
+        );
+    }
     let mut claims = Vec::new();
     let mut results = Vec::new();
     let mut reviews = Vec::new();
@@ -2570,20 +2588,29 @@ fn run_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Re
 }
 
 fn scrub_sensitive_child_environment(command: &mut Command) {
-    for name in SENSITIVE_CHILD_ENVIRONMENT {
-        command.env_remove(name);
+    for name in scrub_child_environment_names() {
+        command.env_remove(&name);
     }
-    // Pattern sweep: anything that looks secret by name is removed too, so a
-    // provider key we have not listed is still never inherited by a child.
+}
+
+/// The environment variable names a child process must not inherit: the
+/// explicit secret list, plus anything whose name looks secret. Public so the
+/// agent loop can scrub the agent CLI it spawns the same way git is scrubbed.
+pub fn scrub_child_environment_names() -> Vec<String> {
+    let mut names: Vec<String> = SENSITIVE_CHILD_ENVIRONMENT
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     for (name, _) in std::env::vars() {
         let upper = name.to_ascii_uppercase();
         if SECRET_NAME_HINTS
             .iter()
             .any(|hint| upper.contains(hint) && !name.starts_with("GIT_"))
         {
-            command.env_remove(&name);
+            names.push(name);
         }
     }
+    names
 }
 
 fn system_git_command(directory: &Path, arguments: &[&str]) -> Command {

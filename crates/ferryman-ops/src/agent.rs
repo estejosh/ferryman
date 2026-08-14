@@ -514,6 +514,12 @@ async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Resu
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // The agent CLI is an untrusted, model-driven process. It must not inherit
+    // the operator's secret environment (tokens, keys) even in the bare runner;
+    // the containerized runner does not receive host env anyway.
+    for name in ferryman_channel::scrub_child_environment_names() {
+        command.env_remove(&name);
+    }
     // The agent CLI, not Ferryman, is what makes a machine unusable: the loop idles at
     // about 5 MB, the thing it starts is measured in hundreds. Below-normal is set at
     // spawn on Windows, where the API is safe to use, so there is no window at full
@@ -857,6 +863,15 @@ pub async fn work_once(
     }
     for task in waiting {
         let id = task.order.id.clone();
+        // Trust boundary: never act on an order whose signature does not verify.
+        // Any peer can write to the synced folder, so an unsigned or forged
+        // order must be skipped, not executed.
+        if ferryman_channel::verify_order(&task.order, &route.agents)
+            != ferryman_channel::SignatureCheck::Valid
+        {
+            report.warn(&format!("  {id}: order signature invalid, skipping"));
+            continue;
+        }
         match task.state() {
             TaskState::Open => {
                 ferryman_channel::claim_order(route, &id, &config.agent)?;
@@ -1042,6 +1057,32 @@ pub async fn review_once(
         let TaskState::AwaitingReview { by, revision } = task.state() else {
             continue;
         };
+        // Trust boundary: judge only work whose order and result signatures
+        // verify. A forged order or result must not be reviewed as if real.
+        if ferryman_channel::verify_order(&task.order, &route.agents)
+            != ferryman_channel::SignatureCheck::Valid
+        {
+            report.warn(&format!(
+                "  {}: order signature invalid, skipping",
+                task.order.id
+            ));
+            continue;
+        }
+        if !task
+            .results
+            .iter()
+            .any(|r| {
+                r.revision == revision
+                    && ferryman_channel::verify_result(r, &route.agents)
+                        == ferryman_channel::SignatureCheck::Valid
+            })
+        {
+            report.warn(&format!(
+                "  {}: result signature invalid, skipping",
+                task.order.id
+            ));
+            continue;
+        }
         // Reviewing your own work is not review. Saying so out loud matters: a single
         // machine configured as both worker and reviewer would otherwise look like a
         // reviewer that silently does nothing, and the operator would go hunting for a
