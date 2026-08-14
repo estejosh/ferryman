@@ -475,7 +475,12 @@ struct AgentRun {
 ///
 /// Compute the runtime binary and full argument list for a prompt, without
 /// spawning anything. Pure so it can be tested without a container runtime.
-fn run_command(config: &AgentConfig, workspace: &Path, prompt: &str) -> (String, Vec<String>) {
+fn run_command(
+    config: &AgentConfig,
+    workspace: &Path,
+    prompt: &str,
+    credentials: &[(String, String)],
+) -> (String, Vec<String>) {
     let args: Vec<String> = config
         .args
         .iter()
@@ -488,6 +493,12 @@ fn run_command(config: &AgentConfig, workspace: &Path, prompt: &str) -> (String,
             if let Some(network) = config.network.network_arg() {
                 full.push("--network".to_string());
                 full.push(network.to_string());
+            }
+            // Inject only the operator-listed credentials; the container gets
+            // nothing else of the host environment.
+            for (key, value) in credentials {
+                full.push("--env".to_string());
+                full.push(format!("{key}={value}"));
             }
             full.push("-v".to_string());
             full.push(format!("{}:/workspace:Z", workspace.display()));
@@ -503,8 +514,13 @@ fn run_command(config: &AgentConfig, workspace: &Path, prompt: &str) -> (String,
 
 /// stdout is the result. stderr is kept because a failed run's only explanation is
 /// usually there, and discarding it turns a diagnosable problem into a silent retry.
-async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Result<AgentRun> {
-    let (binary, args) = run_command(config, workspace, prompt);
+async fn run_agent(
+    config: &AgentConfig,
+    workspace: &Path,
+    prompt: &str,
+    credentials: &[(String, String)],
+) -> Result<AgentRun> {
+    let (binary, args) = run_command(config, workspace, prompt, credentials);
     let mut command = Command::new(&binary);
     command.args(&args);
     // Run in the workspace (or its per-task worktree) so the agent's files land
@@ -519,6 +535,13 @@ async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Resu
     // the containerized runner does not receive host env anyway.
     for name in ferryman_channel::scrub_child_environment_names() {
         command.env_remove(&name);
+    }
+    // Put back only the credentials the operator listed; the container got them
+    // via --env, the bare runner needs them set directly.
+    if matches!(config.runner, Runner::Bare) {
+        for (key, value) in credentials {
+            command.env(key, value);
+        }
     }
     // The agent CLI, not Ferryman, is what makes a machine unusable: the loop idles at
     // about 5 MB, the thing it starts is measured in hundreds. Below-normal is set at
@@ -589,7 +612,7 @@ pub async fn run_engine_prompt(
     ))?;
     let mut config = config;
     config.runner = runner.clone();
-    let run = run_agent(&config, workspace, prompt).await?;
+    let run = run_agent(&config, workspace, prompt, &[]).await?;
     if !run.ok {
         bail!(
             "'{}' failed: {}",
@@ -992,7 +1015,13 @@ async fn do_work(
             "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"
         );
     }
-    let run = run_agent(config, &workdir, &prompt).await?;
+    // Operator-listed credentials are the only secrets the agent CLI receives.
+    let credentials: Vec<(String, String)> =
+        ferryman_channel::credentials::load_credentials(&route.attachment)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+    let run = run_agent(config, &workdir, &prompt, &credentials).await?;
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
     // never fail the run itself.
@@ -1113,10 +1142,16 @@ pub async fn review_once(
         }
         let id = task.order.id.clone();
         report.info(&format!("  {id}: judging revision {revision}"));
+        let credentials: Vec<(String, String)> =
+            ferryman_channel::credentials::load_credentials(&route.attachment)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
         let run = run_agent(
             config,
             &route.workspace,
             &review_prompt(config, &task, revision),
+            &credentials,
         )
         .await?;
         if !run.ok {
@@ -1226,7 +1261,7 @@ mod tests {
     #[test]
     fn a_bare_runner_spawns_the_command_directly() {
         let config = AgentConfig::parse("agent = \"w\"\ncommand = \"claude\"\n").unwrap();
-        let (binary, args) = run_command(&config, Path::new("/ws"), "hello");
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(binary, "claude");
         assert_eq!(args, vec!["-p", "hello"]);
     }
@@ -1236,7 +1271,7 @@ mod tests {
         let config =
             AgentConfig::parse("agent = \"w\"\ncommand = \"codex\"\nsandbox = \"docker:node:22\"\n")
                 .unwrap();
-        let (binary, args) = run_command(&config, Path::new("/ws"), "hello");
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(binary, "docker");
         assert_eq!(
             args,
@@ -1261,7 +1296,7 @@ mod tests {
             "agent = \"w\"\ncommand = \"codex\"\nsandbox = \"podman:local\"\nnet = \"none\"\n",
         )
         .unwrap();
-        let (binary, args) = run_command(&config, Path::new("/ws"), "hello");
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(binary, "podman");
         assert_eq!(args[..4], ["run", "--rm", "--network", "none"]);
     }
@@ -1272,7 +1307,7 @@ mod tests {
             "agent = \"w\"\ncommand = \"codex\"\nsandbox = \"docker:img\"\nnet = \"restricted\"\n",
         )
         .unwrap();
-        let (_, args) = run_command(&config, Path::new("/ws"), "hello");
+        let (_, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(args[..4], ["run", "--rm", "--network", "restricted"]);
     }
 

@@ -13,6 +13,7 @@ use std::{
 };
 
 pub mod contract;
+pub mod credentials;
 pub mod interrupt;
 pub mod learning;
 pub mod ledger;
