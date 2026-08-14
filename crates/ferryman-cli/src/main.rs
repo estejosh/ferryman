@@ -530,6 +530,11 @@ enum MasterAction {
     },
     /// Show this project's master declaration, verifying its signature.
     Status,
+    /// Disclaim the master role to another user. Signed by the current master.
+    Transfer {
+        /// The name of the new master.
+        name: String,
+    },
 }
 #[derive(Subcommand, Clone)]
 /// The agentic loop. Every one of these runs unattended and needs no terminal.
@@ -2330,6 +2335,22 @@ fn channel(command: Channel) -> Result<()> {
                         println!("no master yet; run 'ferry channel master init' to choose one")
                     }
                 },
+                MasterAction::Transfer { name } => {
+                    let current = match ferryman_channel::master::read_master(&route)? {
+                        Some(declaration) => declaration.master,
+                        None => bail!("this project has no master yet"),
+                    };
+                    let identity = ferryman_channel::AgentIdentity::load_or_create(
+                        &current,
+                        &route.attachment,
+                    )?;
+                    let declaration =
+                        ferryman_channel::master::transfer_master(&route, &identity, &name)?;
+                    println!(
+                        "master role transferred to {} (disclaimed by {})",
+                        declaration.master, current
+                    );
+                }
             }
         }
     }

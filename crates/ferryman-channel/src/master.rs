@@ -39,7 +39,10 @@ pub struct MasterDeclaration {
 }
 
 fn declaration_path(route: &ProjectRoute) -> PathBuf {
-    route.master_dir().join("master.json")
+    // The declaration is public: it lives in the shared channel so every member
+    // can see and verify who the master is. The master's *private* records
+    // (grants, checkpoints) belong in the master-only folder (`master_dir`).
+    route.communications.join("master.json")
 }
 
 /// Exactly what a master declaration signature covers.
@@ -120,6 +123,46 @@ pub fn read_master(route: &ProjectRoute) -> Result<Option<MasterDeclaration>> {
     Ok(Some(declaration))
 }
 
+/// Transfer the master role to another user. Signed by the current master.
+///
+/// The chain of authority stays verifiable: the new declaration names the new
+/// master but is signed by the key of the master it replaces, so anyone can see
+/// the role was disclaimed, not seized.
+pub fn transfer_master(
+    route: &ProjectRoute,
+    current: &AgentIdentity,
+    new_master: &str,
+) -> Result<MasterDeclaration> {
+    if !crate::is_safe_component(new_master) {
+        bail!("new master name must be a path-safe identifier");
+    }
+    let Some(existing) = read_master(route)? else {
+        bail!("this project has no master yet; run 'ferry enable' first");
+    };
+    if existing.master != current.name() {
+        bail!(
+            "only the current master ({}) may transfer the role",
+            existing.master
+        );
+    }
+
+    let mut declaration = MasterDeclaration {
+        project_id: route.project_id.clone(),
+        master: new_master.to_owned(),
+        folder: master_folder_name(&route.project_id),
+        created_at: Utc::now(),
+        signed_by: None,
+        signature: None,
+    };
+    let signature = current
+        .signing
+        .sign(master_payload(&declaration).as_bytes());
+    declaration.signed_by = Some(current.name().to_owned());
+    declaration.signature = Some(hex::encode(signature.to_bytes()));
+    crate::atomic_json(&declaration_path(route), &declaration)?;
+    Ok(declaration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,12 +232,39 @@ mod tests {
 
         // Rewrite the declaration with a different master; the signature no
         // longer matches.
-        let path = route.master_dir().join("master.json");
+        let path = route.communications.join("master.json");
         let mut declaration: MasterDeclaration =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         declaration.master = "mallory".into();
         fs::write(&path, serde_json::to_vec_pretty(&declaration).unwrap()).unwrap();
 
         assert!(read_master(&route).is_err());
+    }
+
+    #[test]
+    fn master_may_disclaim_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        fs::create_dir_all(&route.attachment).unwrap();
+        let johnny = AgentIdentity::load_or_create_in("johnny", &route.attachment, None).unwrap();
+        route.agents = vec![AgentRoute {
+            name: "johnny".into(),
+            role: "worker".into(),
+            capabilities: vec![],
+            public_key: Some(johnny.public_key_hex()),
+        }];
+
+        initialize_master(&route, &johnny, "johnny").unwrap();
+
+        let transferred = transfer_master(&route, &johnny, "bob").unwrap();
+        assert_eq!(transferred.master, "bob");
+        assert_eq!(transferred.signed_by.as_deref(), Some("johnny"));
+
+        let read = read_master(&route).unwrap().expect("declaration");
+        assert_eq!(read.master, "bob");
+
+        // A non-master cannot transfer.
+        let mallory = AgentIdentity::load_or_create_in("mallory", &route.attachment, None).unwrap();
+        assert!(transfer_master(&route, &mallory, "carol").is_err());
     }
 }
