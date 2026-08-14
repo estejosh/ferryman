@@ -425,6 +425,21 @@ enum Channel {
         #[command(subcommand)]
         action: MasterAction,
     },
+    /// Export a signed audit report of the attribution ledger.
+    ///
+    /// A standalone, verifiable record of who did what and when — signed by the
+    /// exporter, each entry carrying its own verification status. Usable by a
+    /// client or regulator without running Ferryman.
+    Report {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is exporting. Defaults to this machine's name.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Emit JSON instead of a human-readable report.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -2441,6 +2456,57 @@ fn channel(command: Channel) -> Result<()> {
                             check
                         );
                     }
+                }
+            }
+        }
+        Channel::Report {
+            workspace,
+            agent,
+            json,
+        } => {
+            let route = here(workspace)?;
+            let exporter = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity =
+                ferryman_channel::AgentIdentity::load_or_create(&exporter, &route.attachment)?;
+            let report = ferryman_channel::ledger::build_report(&route, &identity)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("project   {}", report.project_id);
+                println!(
+                    "exported  {} by {}",
+                    report.generated_at.to_rfc3339(),
+                    report.generated_by
+                );
+                println!(
+                    "integrity {}",
+                    if report.ledger_intact {
+                        "verified".to_string()
+                    } else {
+                        format!("BROKEN at entry {}", report.broken_at.unwrap_or(0))
+                    }
+                );
+                if report.entries.is_empty() {
+                    println!("no recorded activity yet");
+                }
+                for entry in &report.entries {
+                    let mark = if entry.signature_ok {
+                        ""
+                    } else {
+                        "  [UNVERIFIED]"
+                    };
+                    println!(
+                        "  {}  {}  {}{}",
+                        entry.created_at.to_rfc3339(),
+                        entry.kind,
+                        entry.summary,
+                        mark
+                    );
+                    println!(
+                        "       by {}  ref: {}",
+                        entry.actor,
+                        entry.reference.as_deref().unwrap_or("-")
+                    );
                 }
             }
         }

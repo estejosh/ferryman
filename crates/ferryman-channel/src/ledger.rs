@@ -190,6 +190,94 @@ pub fn read_ledger(route: &ProjectRoute) -> Result<LedgerLog> {
     })
 }
 
+/// One entry of an exported audit report, with its verification status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReportedEntry {
+    pub kind: String,
+    pub actor: String,
+    pub summary: String,
+    pub reference: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// Whether this entry's signature verified against the roster.
+    pub signature_ok: bool,
+}
+
+/// A signed, standalone export of the attribution ledger, for a third party to
+/// verify without running Ferryman: it carries the whole history plus a
+/// signature over it, so "who did what and when" is provable off-channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditReport {
+    pub project_id: String,
+    pub generated_at: DateTime<Utc>,
+    /// Who exported it.
+    pub generated_by: String,
+    /// Whether the ledger's hash chain and signatures verified at export time.
+    pub ledger_intact: bool,
+    pub broken_at: Option<usize>,
+    pub entries: Vec<ReportedEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+fn audit_report_payload(report: &AuditReport) -> String {
+    let entries_digest = hex::encode(Sha256::digest(
+        serde_json::to_string(&report.entries)
+            .unwrap_or_default()
+            .as_bytes(),
+    ));
+    format!(
+        "ferryman-audit-report-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        report.project_id,
+        report.generated_at.to_rfc3339(),
+        report.generated_by,
+        report.ledger_intact,
+        report.broken_at.map(|i| i.to_string()).unwrap_or_default(),
+        entries_digest,
+    )
+}
+
+/// Build a signed audit report of the ledger, each entry carrying its own
+/// verification status and the whole report signed by `identity`.
+pub fn build_report(route: &ProjectRoute, identity: &AgentIdentity) -> Result<AuditReport> {
+    let log = read_ledger(route)?;
+    let mut entries = Vec::with_capacity(log.entries.len());
+    for entry in &log.entries {
+        let signature_ok = check_signature(
+            entry.signed_by.as_ref(),
+            entry.signature.as_ref(),
+            &ledger_payload(entry),
+            &route.agents,
+        ) == SignatureCheck::Valid;
+        entries.push(ReportedEntry {
+            kind: entry.kind.clone(),
+            actor: entry.actor.clone(),
+            summary: entry.summary.clone(),
+            reference: entry.reference.clone(),
+            created_at: entry.created_at,
+            signature_ok,
+        });
+    }
+
+    let mut report = AuditReport {
+        project_id: route.project_id.clone(),
+        generated_at: Utc::now(),
+        generated_by: identity.name().to_owned(),
+        ledger_intact: log.intact,
+        broken_at: log.broken_at,
+        entries,
+        signed_by: None,
+        signature: None,
+    };
+    let signature = identity
+        .signing
+        .sign(audit_report_payload(&report).as_bytes());
+    report.signed_by = Some(identity.name().to_owned());
+    report.signature = Some(hex::encode(signature.to_bytes()));
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +407,37 @@ mod tests {
         let log = read_ledger(&route).unwrap();
         assert!(!log.intact);
         assert_eq!(log.broken_at, Some(0));
+    }
+
+    #[test]
+    fn an_audit_report_is_signed_and_carries_per_entry_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, identity) = route_with_alice(dir.path());
+
+        append_ledger_entry(
+            &route,
+            &identity,
+            "order",
+            "alice",
+            "issued order t-1",
+            Some("t-1"),
+        )
+        .unwrap();
+        append_ledger_entry(
+            &route,
+            &identity,
+            "claim",
+            "alice",
+            "claimed order t-1",
+            Some("t-1"),
+        )
+        .unwrap();
+
+        let report = build_report(&route, &identity).unwrap();
+        assert!(report.ledger_intact);
+        assert_eq!(report.entries.len(), 2);
+        assert!(report.entries.iter().all(|e| e.signature_ok));
+        assert_eq!(report.signed_by.as_deref(), Some("alice"));
+        assert!(report.signature.is_some());
     }
 }
