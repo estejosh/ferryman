@@ -177,6 +177,35 @@ Decisions from the "what would make it compelling" review, in build order.
 
 ---
 
+## Competitor learnings → build plan (groundcrew/ClipboardHealth)
+
+Reviewed `ClipboardHealth/groundcrew` and `prolego-team/groundcrew`
+(`memory-bank/competitors.md`). Four borrows, planned:
+
+1. **Pluggable runner abstraction.** Generalize the current `sandbox=<image>`
+   into `local.runner` with `none` (bare) / `podman:<image>` / `docker:<image>`
+   and per-platform auto-resolution (Linux→podman, macOS/Windows→docker or a
+   native sandbox). Keep the "none" escape hatch + a network-egress allowlist.
+   First step: rename/extend `AgentConfig.sandbox` into a `runner` enum.
+2. **Task-source adapters.** Add pluggable task sources (Linear, Jira, custom
+   shell) that map external tickets into signed orders. Reuses the adapter
+   definition pattern from groundcrew; Ferryman's value-add is that the imported
+   ticket becomes a signed order with a ledger entry.
+3. **Worktree-per-task, made better.** Borrow groundcrew's `git worktree` per
+   task, but tie it to our trust model: the worktree branch derives from the
+   signed order id + agent (deterministic, idempotent re-dispatch), the worktree
+   is recorded in the attribution ledger, and the signed result carries the
+   worktree HEAD so a reviewer can verify the work matches the commit. Cleanup
+   (teardown of worktree + branch) is a ledger-recorded, idempotent operation.
+4. **Interrupt mode.** Today the Telegram gate approves/denies *parked* work;
+   groundcrew lets you take over a *running* agent. Add an interrupt path — a
+   signed "interrupt/pause/steer/kill" order that the worker honors between its
+   poll ticks, surfaced through Telegram and `ferry`. This is the missing
+   analogue of groundcrew's live terminals.
+
+---
+
+
 
 ## 5. Quick answers to the questions asked Friday
 
