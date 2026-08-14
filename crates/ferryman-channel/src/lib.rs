@@ -1538,6 +1538,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -1599,6 +1600,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -1634,6 +1636,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -1677,6 +1680,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -1726,6 +1730,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -1820,6 +1825,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -1870,6 +1876,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::create_dir_all(&route.attachment).unwrap();
@@ -1920,6 +1927,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::create_dir_all(&route.attachment).unwrap();
@@ -1968,6 +1976,7 @@ mod portable_auth_route_tests {
                 projects: vec!["ferryman".into()],
                 roles: vec!["orchestrator".into(), "worker".into()],
                 capabilities: vec!["issue".into()],
+                revoked: false,
             }],
         };
         std::fs::write(
@@ -5663,6 +5672,176 @@ mod tests {
                 .join(format!("acknowledgements/alpha/{}.json", first.id))
                 .is_file()
         );
+    }
+
+    #[test]
+    fn v2_signed_flow_survives_a_local_git_round_trip() {
+        use crate::portable_auth::SignerGrant;
+
+        let (temp, route) = fixture();
+        let remote = temp.path().join("communications.git");
+        fs::create_dir_all(&route.communications).unwrap();
+        test_git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        test_git(&route.communications, &["init", "-q"]);
+        test_git(
+            &route.communications,
+            &["config", "user.name", "Ferryman Test"],
+        );
+        test_git(
+            &route.communications,
+            &["config", "user.email", "ferryman-test@example.invalid"],
+        );
+        test_git(&route.communications, &["branch", "-M", "main"]);
+        test_git(
+            &route.communications,
+            &["commit", "--allow-empty", "-q", "-m", "seed"],
+        );
+        test_git(
+            &route.communications,
+            &["remote", "add", "origin", &route.git_remote],
+        );
+        let remote_text = remote.to_string_lossy().replace('\\', "/");
+        let remote_url = if remote_text.as_bytes().get(1) == Some(&b':') {
+            format!("file:///{remote_text}")
+        } else {
+            format!("file://{remote_text}")
+        };
+        test_git(
+            &route.communications,
+            &[
+                "config",
+                &format!("url.{remote_url}.insteadOf"),
+                &route.git_remote,
+            ],
+        );
+        test_git(
+            &route.communications,
+            &["push", "-q", "-u", "origin", "main"],
+        );
+        test_git(
+            temp.path(),
+            &[
+                "--git-dir",
+                remote.to_str().unwrap(),
+                "symbolic-ref",
+                "HEAD",
+                "refs/heads/main",
+            ],
+        );
+        let sender_route =
+            clone_test_route(temp.path(), &remote, &remote_url, &route, "sender-project");
+        let receiver_route = clone_test_route(
+            temp.path(),
+            &remote,
+            &remote_url,
+            &route,
+            "receiver-project",
+        );
+        test_git(
+            &sender_route.communications,
+            &["config", "user.name", "Ferryman Test"],
+        );
+        test_git(
+            &sender_route.communications,
+            &["config", "user.email", "ferryman-test@example.invalid"],
+        );
+
+        // Trust store: the orchestrator issues, the builder acknowledges.
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let orchestrator = ed25519_dalek::SigningKey::from_bytes(&seed);
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let builder = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![
+                SignerGrant {
+                    public_key: hex::encode(orchestrator.verifying_key().as_bytes()),
+                    projects: vec!["alpha".into()],
+                    roles: vec!["orchestrator".into()],
+                    capabilities: vec!["issue".into()],
+                    revoked: false,
+                },
+                SignerGrant {
+                    public_key: hex::encode(builder.verifying_key().as_bytes()),
+                    projects: vec!["alpha".into()],
+                    roles: vec!["builder".into()],
+                    capabilities: vec![],
+                    revoked: false,
+                },
+            ],
+        };
+        let store_toml = toml::to_string(&store).unwrap();
+        for checkpoint in [&sender_route, &receiver_route] {
+            fs::create_dir_all(&checkpoint.attachment).unwrap();
+            fs::write(
+                checkpoint.attachment.join("trusted-signers.toml"),
+                &store_toml,
+            )
+            .unwrap();
+        }
+
+        // The orchestrator signs a v2 message and a tampered twin.
+        let mut message = MessageV2::new(
+            "alpha",
+            "orchestrator",
+            "builder",
+            "r",
+            serde_json::json!({"work": "build"}),
+            true,
+        );
+        message.sign(&orchestrator).unwrap();
+        let mut tampered = MessageV2::new(
+            "alpha",
+            "orchestrator",
+            "builder",
+            "r",
+            serde_json::json!({"work": "sabotage"}),
+            true,
+        );
+        tampered.sign(&orchestrator).unwrap();
+        tampered.payload = serde_json::json!({"work": "forged after signing"});
+
+        let inbound = sender_route.communications.join("messages").join("alpha");
+        fs::create_dir_all(&inbound).unwrap();
+        fs::write(
+            inbound.join(format!("{}.json", message.id)),
+            serde_json::to_vec_pretty(&message).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            inbound.join(format!("{}.json", tampered.id)),
+            serde_json::to_vec_pretty(&tampered).unwrap(),
+        )
+        .unwrap();
+        test_git(&sender_route.communications, &["add", "-A"]);
+        test_git(
+            &sender_route.communications,
+            &["commit", "-q", "-m", "v2 messages"],
+        );
+        test_git(
+            &sender_route.communications,
+            &["push", "-q", "origin", "main"],
+        );
+        test_git(
+            &receiver_route.communications,
+            &["pull", "-q", "--ff-only", "origin", "main"],
+        );
+
+        // Only the genuine envelope survives the receiver's gate; the tampered twin
+        // fails signature verification and is dropped from the listing.
+        let listed = crate::list_messages_v2(&receiver_route).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, message.id);
+        let read = crate::read_message_v2(&receiver_route, &message.id).unwrap();
+        assert_eq!(read.id, message.id);
+        assert!(crate::read_message_v2(&receiver_route, &tampered.id).is_err());
+
+        // Claim is idempotent, and the builder's acknowledgement verifies.
+        assert!(crate::claim_message_v2(&receiver_route, &message).unwrap());
+        assert!(!crate::claim_message_v2(&receiver_route, &message).unwrap());
+        let mut acknowledgement = AcknowledgementV2::new(&message).unwrap();
+        acknowledgement.sign(&builder).unwrap();
+        assert!(crate::acknowledge_v2(&receiver_route, &acknowledgement).unwrap());
     }
 }
 

@@ -112,6 +112,10 @@ pub struct SignerGrant {
     pub roles: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Revoked signers are ignored by [`TrustedSigners::grant_for`] and
+    /// rejected by the v2 verifiers with a dedicated error.
+    #[serde(default)]
+    pub revoked: bool,
 }
 
 impl SignerGrant {
@@ -159,10 +163,29 @@ impl TrustedSigners {
     }
 
     /// The grant whose derived signer id matches `signer_id`, if trusted.
+    ///
+    /// Revoked signers are not trusted, so they are skipped even when their
+    /// signer id matches.
     pub fn grant_for(&self, signer_id: &str) -> Option<&SignerGrant> {
-        self.signers
-            .iter()
-            .find(|grant| grant.signer_id().is_ok_and(|id| id.as_str() == signer_id))
+        self.signers.iter().find(|grant| {
+            !grant.revoked && grant.signer_id().is_ok_and(|id| id.as_str() == signer_id)
+        })
+    }
+
+    fn revoked_for(&self, signer_id: &str) -> bool {
+        self.signers.iter().any(|grant| {
+            grant.revoked && grant.signer_id().is_ok_and(|id| id.as_str() == signer_id)
+        })
+    }
+
+    fn active_grant_for(&self, signer_id: &str) -> Result<&SignerGrant> {
+        if let Some(grant) = self.grant_for(signer_id) {
+            return Ok(grant);
+        }
+        if self.revoked_for(signer_id) {
+            bail!("signer is revoked");
+        }
+        bail!("signer is not trusted");
     }
 
     /// Load the trust store, returning an empty store when the file is absent.
@@ -267,6 +290,13 @@ fn verify_bytes(key: &VerifyingKey, kind: &str, canonical: &[u8], signature: &st
         .context("signature verification failed")
 }
 
+fn ensure_supported_key_version(key_version: u32) -> Result<()> {
+    if key_version != KEY_VERSION {
+        bail!("unsupported key version {key_version}");
+    }
+    Ok(())
+}
+
 impl MessageV2 {
     /// Build an unsigned v2 message.
     #[allow(clippy::too_many_arguments)]
@@ -321,9 +351,7 @@ impl MessageV2 {
 
     /// Verify the signature and that the signer is trusted; returns the signer id.
     pub fn verify(&self, trusted: &TrustedSigners) -> Result<SignerId> {
-        let grant = trusted
-            .grant_for(&self.authentication.signer_id)
-            .context("signer is not trusted")?;
+        let grant = trusted.active_grant_for(&self.authentication.signer_id)?;
         let key = grant.verifying_key()?;
         let mut copy = self.clone();
         copy.authentication.signature = String::new();
@@ -334,6 +362,7 @@ impl MessageV2 {
             &canonical,
             &self.authentication.signature,
         )?;
+        ensure_supported_key_version(self.authentication.key_version)?;
         grant.authorize(&self.project_id, &self.sender)?;
         SignerId::parse(&self.authentication.signer_id)
     }
@@ -378,9 +407,7 @@ impl AcknowledgementV2 {
 
     /// Verify the signature and that the signer is trusted.
     pub fn verify(&self, trusted: &TrustedSigners) -> Result<SignerId> {
-        let grant = trusted
-            .grant_for(&self.authentication.signer_id)
-            .context("signer is not trusted")?;
+        let grant = trusted.active_grant_for(&self.authentication.signer_id)?;
         let key = grant.verifying_key()?;
         let mut copy = self.clone();
         copy.authentication.signature = String::new();
@@ -391,6 +418,7 @@ impl AcknowledgementV2 {
             &canonical,
             &self.authentication.signature,
         )?;
+        ensure_supported_key_version(self.authentication.key_version)?;
         grant.authorize(&self.project_id, &self.recipient)?;
         SignerId::parse(&self.authentication.signer_id)
     }
@@ -413,6 +441,7 @@ mod tests {
                 projects: vec![],
                 roles: vec![],
                 capabilities: vec![],
+                revoked: false,
             }],
         }
     }
@@ -441,6 +470,71 @@ mod tests {
         message.sign(&signing).unwrap();
         let id = message.verify(&trusted).unwrap();
         assert_eq!(id, SignerId::from_verifying_key(&signing.verifying_key()));
+    }
+
+    #[test]
+    fn key_version_1_is_accepted() {
+        let signing = key();
+        let trusted = trust_for(&signing);
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({"hi": 1}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        assert_eq!(message.authentication.key_version, 1);
+        message.verify(&trusted).unwrap();
+    }
+
+    #[test]
+    fn key_version_2_is_rejected() {
+        let signing = key();
+        let trusted = trust_for(&signing);
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({"hi": 1}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+
+        // Re-sign the envelope with key_version 2 so the signature itself is
+        // valid; the verifier must still reject the unsupported version.
+        message.authentication.key_version = 2;
+        message.authentication.signature = String::new();
+        let canonical = canonical_bytes(&message).unwrap();
+        message.authentication.signature = sign_bytes(&signing, KIND_MESSAGE, &canonical);
+
+        let err = message.verify(&trusted).unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported key version 2"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn revoked_signer_is_rejected() {
+        let signing = key();
+        let mut trusted = trust_for(&signing);
+        trusted.signers[0].revoked = true;
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({"hi": 1}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+
+        let err = message.verify(&trusted).unwrap_err();
+        assert!(err.to_string().contains("signer is revoked"), "{err:?}");
     }
 
     #[test]
@@ -603,6 +697,7 @@ mod tests {
                 projects: vec!["some-other-project".into()],
                 roles: vec![],
                 capabilities: vec![],
+                revoked: false,
             }],
         };
         let mut message = MessageV2::new(
@@ -626,6 +721,7 @@ mod tests {
                 projects: vec![],
                 roles: vec!["someone-else".into()],
                 capabilities: vec![],
+                revoked: false,
             }],
         };
         let mut message = MessageV2::new(

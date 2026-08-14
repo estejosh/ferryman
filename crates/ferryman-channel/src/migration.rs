@@ -369,6 +369,7 @@ mod tests {
                 projects: Vec::new(),
                 roles: Vec::new(),
                 capabilities: Vec::new(),
+                revoked: false,
             }],
         }
     }

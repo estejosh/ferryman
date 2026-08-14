@@ -854,6 +854,47 @@ async fn send_communication(
     ))
 }
 
+fn list_v1_communications(
+    route: &communications::ProjectRoute,
+) -> Result<Vec<communications::Message>> {
+    let directory = route
+        .communications
+        .join("messages")
+        .join(&route.project_id);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = std::fs::read_dir(directory)?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut messages = Vec::with_capacity(paths.len());
+    for path in paths {
+        let raw = std::fs::read(&path)?;
+        let value: Value = serde_json::from_slice(&raw)?;
+        if value.get("format").and_then(Value::as_str)
+            == Some(communications::portable_auth::MESSAGE_FORMAT_V2)
+        {
+            continue;
+        }
+        let message: communications::Message = serde_json::from_value(value)?;
+        message.validate()?;
+        if message.project_id != route.project_id {
+            return Err(anyhow::anyhow!(
+                "message {} crossed project boundary",
+                message.id
+            ));
+        }
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
 async fn list_communications(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -862,13 +903,22 @@ async fn list_communications(
     checked(&state, &headers, &project_id)?;
     let route = project_route(&state, &project_id)?;
     communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
+    let v1_messages = list_v1_communications(&route).map_err(ApiError::internal)?;
     let v2_messages = communications::list_messages_v2(&route).map_err(ApiError::internal)?;
-    let items = if v2_messages.is_empty() {
-        serde_json::to_value(communications::list_messages(&route).map_err(ApiError::internal)?)
-            .map_err(|error| ApiError::internal(error.into()))?
-    } else {
-        serde_json::to_value(v2_messages).map_err(|error| ApiError::internal(error.into()))?
-    };
+    let mut items = Vec::with_capacity(v1_messages.len() + v2_messages.len());
+    for message in v1_messages {
+        items
+            .push(serde_json::to_value(message).map_err(|error| ApiError::internal(error.into()))?);
+    }
+    for message in v2_messages {
+        items
+            .push(serde_json::to_value(message).map_err(|error| ApiError::internal(error.into()))?);
+    }
+    items.sort_by(|left, right| {
+        let left_id = left.get("id").and_then(Value::as_str).unwrap_or_default();
+        let right_id = right.get("id").and_then(Value::as_str).unwrap_or_default();
+        left_id.cmp(right_id)
+    });
     Ok(Json(json!({"items":items})))
 }
 
