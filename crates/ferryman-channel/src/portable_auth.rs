@@ -167,6 +167,55 @@ impl TrustedSigners {
     }
 }
 
+/// The machine-local replay ledger: accepted `(signer_id, nonce)` pairs.
+///
+/// A previously consumed nonce must be rejected, so accepted pairs are retained
+/// for at least the maximum message lifetime plus the recovery window. The
+/// ledger is a plain set of pairs, so a clock moving backward cannot
+/// re-validate one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReplayLedger {
+    /// Accepted `(signer_id, nonce)` pairs, oldest first.
+    #[serde(default)]
+    pub accepted: Vec<(String, String)>,
+}
+
+impl ReplayLedger {
+    /// Load the ledger, returning an empty one when the file is absent.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read replay ledger {}", path.display()))?;
+        serde_json::from_str(&text)
+            .with_context(|| format!("parse replay ledger {}", path.display()))
+    }
+
+    /// Whether this `(signer_id, nonce)` pair has already been accepted.
+    pub fn contains(&self, signer_id: &str, nonce: &str) -> bool {
+        self.accepted
+            .iter()
+            .any(|(signer, seen)| signer == signer_id && seen == nonce)
+    }
+
+    /// Record a newly accepted pair, ignoring duplicates.
+    pub fn record(&mut self, signer_id: &str, nonce: &str) {
+        if !self.contains(signer_id, nonce) {
+            self.accepted.push((signer_id.to_owned(), nonce.to_owned()));
+        }
+    }
+
+    /// Persist the ledger to `path`.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, serde_json::to_vec(self)?)?;
+        Ok(())
+    }
+}
+
 /// RFC 8785 canonical JSON of `value`, as bytes.
 fn canonical_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let value = serde_json::to_value(value)?;
@@ -479,5 +528,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = TrustedSigners::load_or_empty(&dir.path().join("absent.toml")).unwrap();
         assert!(store.signers.is_empty());
+    }
+
+    #[test]
+    fn replay_ledger_roundtrips_and_detects_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = ReplayLedger::default();
+        assert!(!ledger.contains("sha256:a", "nonce1"));
+        ledger.record("sha256:a", "nonce1");
+        assert!(ledger.contains("sha256:a", "nonce1"));
+        ledger.record("sha256:a", "nonce1"); // duplicate is ignored
+        assert_eq!(ledger.accepted.len(), 1);
+        ledger.save(&path).unwrap();
+        let loaded = ReplayLedger::load(&path).unwrap();
+        assert!(loaded.contains("sha256:a", "nonce1"));
+        assert!(!loaded.contains("sha256:a", "nonce2"));
+    }
+
+    #[test]
+    fn missing_replay_ledger_loads_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger = ReplayLedger::load(&dir.path().join("absent.json")).unwrap();
+        assert!(ledger.accepted.is_empty());
     }
 }

@@ -15,7 +15,7 @@ use std::{
 pub mod licensing;
 pub mod portable_auth;
 
-use portable_auth::{AcknowledgementV2, MessageV2, SignerId, TrustedSigners};
+use portable_auth::{AcknowledgementV2, MessageV2, ReplayLedger, SignerId, TrustedSigners};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -1374,6 +1374,11 @@ pub fn trust_store(route: &ProjectRoute) -> Result<TrustedSigners> {
     TrustedSigners::load_or_empty(&route.attachment.join("trusted-signers.toml"))
 }
 
+/// Load this project's machine-local replay ledger.
+pub fn replay_ledger(route: &ProjectRoute) -> Result<ReplayLedger> {
+    ReplayLedger::load(&route.attachment.join("runtime/replay-ledger.json"))
+}
+
 /// Verify a v2 message against this project's trust store.
 pub fn verify_v2_message(route: &ProjectRoute, message: &MessageV2) -> Result<SignerId> {
     message.verify(&trust_store(route)?)
@@ -1405,6 +1410,16 @@ fn inspect_inbound_message_file(route: &ProjectRoute, path: &Path) -> Result<()>
         message
             .verify(&trusted)
             .context("v2 message failed verification")?;
+        let ledger = replay_ledger(route)?;
+        if ledger.contains(
+            &message.authentication.signer_id,
+            &message.authentication.nonce,
+        ) {
+            bail!(
+                "replayed nonce for signer {}",
+                message.authentication.signer_id
+            );
+        }
     } else if !trusted.signers.is_empty() {
         bail!("unsigned v1 message while enforcement is enabled");
     }
@@ -1466,7 +1481,7 @@ pub fn quarantine_invalid_inbound(route: &ProjectRoute) -> Result<usize> {
 #[cfg(test)]
 mod portable_auth_route_tests {
     use super::*;
-    use crate::portable_auth::{MessageV2, SignerGrant, TrustedSigners};
+    use crate::portable_auth::{MessageV2, ReplayLedger, SignerGrant, TrustedSigners};
 
     fn test_route(dir: &std::path::Path) -> ProjectRoute {
         ProjectRoute {
@@ -1616,6 +1631,55 @@ mod portable_auth_route_tests {
             serde_json::to_string(&v2).unwrap(),
         )
         .unwrap();
+
+        assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 1);
+    }
+
+    #[test]
+    fn inbound_scanner_quarantines_a_replayed_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut v2 = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        v2.sign(&signing).unwrap();
+        std::fs::write(
+            messages.join(format!("{}.json", v2.id)),
+            serde_json::to_string(&v2).unwrap(),
+        )
+        .unwrap();
+
+        // Pre-record the nonce: the message now looks like a replay.
+        let mut ledger = ReplayLedger::default();
+        ledger.record(&v2.authentication.signer_id, &v2.authentication.nonce);
+        ledger
+            .save(&route.attachment.join("runtime/replay-ledger.json"))
+            .unwrap();
 
         assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 1);
     }
