@@ -24,3 +24,9 @@ EVAL_FINDINGS.md
 /.verify.sh
 /.port*.patch
 /_build.log
+
+# graphify knowledge-graph output (generated locally, never commit)
+graphify-out/
+
+# Agent memory bank (shared across machines by Syncthing, never committed)
+memory-bank
