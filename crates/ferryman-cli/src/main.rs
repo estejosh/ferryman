@@ -396,6 +396,17 @@ enum Channel {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Manage the trusted signers that may sign v2 portable messages.
+    ///
+    /// Works directly against the synced channel. `list` shows signers;
+    /// `revoke` marks one revoked; `add` grants a new key. Rotation is `add`
+    /// the new key, then `revoke` the old.
+    Trust {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[command(subcommand)]
+        action: TrustAction,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -468,6 +479,32 @@ enum Jobs {
         limit: Option<u32>,
         #[arg(long)]
         cursor: Option<String>,
+    },
+}
+
+/// Subcommands for [`Channel::Trust`].
+#[derive(Subcommand, Clone)]
+enum TrustAction {
+    /// List trusted signers and their grants.
+    List,
+    /// Revoke a signer by `sha256:<hex>` signer id.
+    Revoke {
+        #[arg(long)]
+        signer: String,
+    },
+    /// Grant a new signer key (hex Ed25519 public key).
+    Add {
+        #[arg(long)]
+        public_key: String,
+        /// Comma-separated project ids; empty means any project.
+        #[arg(long)]
+        projects: Option<String>,
+        /// Comma-separated roles; empty means any role.
+        #[arg(long)]
+        roles: Option<String>,
+        /// Comma-separated capabilities; empty means none required.
+        #[arg(long)]
+        capabilities: Option<String>,
     },
 }
 #[derive(Subcommand, Clone)]
@@ -2151,6 +2188,67 @@ fn channel(command: Channel) -> Result<()> {
                 }
                 for (at, line) in entries.iter().rev().take(limit).rev() {
                     println!("{}  {line}", at.format("%Y-%m-%d %H:%M:%SZ"));
+                }
+            }
+        }
+        Channel::Trust { workspace, action } => {
+            let route = here(workspace)?;
+            match action {
+                TrustAction::List => {
+                    let store = ferryman_channel::trust_store(&route)?;
+                    if store.signers.is_empty() {
+                        println!("no trusted signers");
+                    }
+                    for grant in &store.signers {
+                        let id = match grant.signer_id() {
+                            Ok(id) => id.as_str().to_owned(),
+                            Err(_) => "<invalid key>".to_owned(),
+                        };
+                        println!(
+                            "{id}  projects=[{}]  roles=[{}]  capabilities=[{}]  revoked={}",
+                            grant.projects.join(","),
+                            grant.roles.join(","),
+                            grant.capabilities.join(","),
+                            grant.revoked
+                        );
+                    }
+                }
+                TrustAction::Revoke { signer } => {
+                    let changed = ferryman_channel::revoke_trusted_signer(&route, &signer)?;
+                    println!(
+                        "{}",
+                        if changed {
+                            "revoked"
+                        } else {
+                            "no change (signer not found or already revoked)"
+                        }
+                    );
+                }
+                TrustAction::Add {
+                    public_key,
+                    projects,
+                    roles,
+                    capabilities,
+                } => {
+                    let split = |value: Option<&String>| -> Vec<String> {
+                        value
+                            .map(|v| {
+                                v.split(',')
+                                    .filter(|item| !item.trim().is_empty())
+                                    .map(|item| item.trim().to_owned())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let grant = ferryman_channel::portable_auth::SignerGrant {
+                        public_key,
+                        projects: split(projects.as_ref()),
+                        roles: split(roles.as_ref()),
+                        capabilities: split(capabilities.as_ref()),
+                        revoked: false,
+                    };
+                    let added = ferryman_channel::add_trusted_signer(&route, grant)?;
+                    println!("{}", if added { "added" } else { "no change" });
                 }
             }
         }

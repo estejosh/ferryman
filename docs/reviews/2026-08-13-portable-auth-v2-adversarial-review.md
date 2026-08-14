@@ -31,9 +31,9 @@ inconsistency (F-04) is settled.
 | ID | Severity | Finding | Status |
 |---|---|---|---|
 | F-01 | Critical | Replay ledger applied at boundary/read/list as well as claim, so a claimed message was quarantined and the claim→ack sequence failed | Fixed (`2be0ad4`) |
-| F-02 | Medium | Replay check-vs-record in `claim_message_v2` is not atomic (TOCTOU) | Open |
-| F-03 | Low | `ReplayLedger::save` writes non-atomically; a crash can corrupt the ledger and fail all reads closed | Open |
-| F-04 | Low | v2 acknowledgement `recipient` records the message target, not the acknowledging actor (inconsistent with v1) | Open |
+| F-02 | Medium | Replay check-vs-record in `claim_message_v2` is not atomic (TOCTOU) | Fixed (per-project replay lock) |
+| F-03 | Low | `ReplayLedger::save` writes non-atomically; a crash can corrupt the ledger and fail all reads closed | Fixed (tmp + rename) |
+| F-04 | Low | v2 acknowledgement `recipient` records the message target, not the acknowledging actor (inconsistent with v1) | Fixed (`acknowledged_by` field) |
 | F-05 | Info | `message_digest` covers the signed envelope including its signature (matches the spec wording) | Accepted |
 | F-06 | Info | Replay ledger is unbounded | Accepted (tracked) |
 

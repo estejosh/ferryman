@@ -16,7 +16,9 @@ pub mod licensing;
 pub mod migration;
 pub mod portable_auth;
 
-use portable_auth::{AcknowledgementV2, MessageV2, ReplayLedger, SignerId, TrustedSigners};
+use portable_auth::{
+    AcknowledgementV2, MessageV2, ReplayLedger, SignerGrant, SignerId, TrustedSigners,
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -1403,6 +1405,46 @@ pub fn verify_v2_acknowledgement(
     acknowledgement.verify(&trust_store(route)?)
 }
 
+/// Add a trusted signer grant, refusing to replace an existing signer id.
+///
+/// Returns `true` when the grant was added. Rotation is expressed as `add` the
+/// new key, then `revoke_trusted_signer` the old one.
+pub fn add_trusted_signer(route: &ProjectRoute, grant: SignerGrant) -> Result<bool> {
+    let path = route.attachment.join("trusted-signers.toml");
+    let signer_id = grant.signer_id()?;
+    let mut store = TrustedSigners::load_or_empty(&path)?;
+    if store
+        .signers
+        .iter()
+        .any(|existing| existing.signer_id().is_ok_and(|id| id == signer_id))
+    {
+        bail!("signer {} is already trusted", signer_id.as_str());
+    }
+    store.signers.push(grant);
+    store.save(&path)?;
+    Ok(true)
+}
+
+/// Mark a trusted signer as revoked, writing the store back atomically.
+///
+/// A revoked signer is rejected by the v2 verifiers even though its signature
+/// is otherwise valid. Returns `true` when a matching grant was changed.
+pub fn revoke_trusted_signer(route: &ProjectRoute, signer_id: &str) -> Result<bool> {
+    let path = route.attachment.join("trusted-signers.toml");
+    let mut store = TrustedSigners::load_or_empty(&path)?;
+    let mut changed = false;
+    for grant in &mut store.signers {
+        if grant.signer_id().is_ok_and(|id| id.as_str() == signer_id) && !grant.revoked {
+            grant.revoked = true;
+            changed = true;
+        }
+    }
+    if changed {
+        store.save(&path)?;
+    }
+    Ok(changed)
+}
+
 /// Inspect one inbound message file against the portable-authentication gate.
 ///
 /// `Ok(())` means the file may be processed; `Err(reason)` means it must be
@@ -2015,6 +2057,7 @@ mod portable_auth_route_tests {
         // it must not be quarantined as a "replayed nonce".
         assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 0);
         let mut acknowledgement = AcknowledgementV2::new(&message).unwrap();
+        acknowledgement.acknowledged_by = "worker".into();
         acknowledgement.sign(&worker).unwrap();
         assert!(acknowledge_v2(&route, &acknowledgement).unwrap());
     }
@@ -2060,6 +2103,7 @@ mod portable_auth_route_tests {
         .unwrap();
 
         let mut acknowledgement = AcknowledgementV2::new(&message).unwrap();
+        acknowledgement.acknowledged_by = "worker".into();
         acknowledgement.sign(&signing).unwrap();
         assert!(acknowledge_v2(&route, &acknowledgement).unwrap());
 
@@ -2077,6 +2121,45 @@ mod portable_auth_route_tests {
         ));
 
         assert!(!acknowledge_v2(&route, &acknowledgement).unwrap());
+    }
+
+    #[test]
+    fn add_and_revoke_trusted_signer_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        std::fs::create_dir_all(&route.attachment).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let grant = SignerGrant {
+            public_key: hex::encode(signing.verifying_key().as_bytes()),
+            projects: vec!["ferryman".into()],
+            roles: vec!["orchestrator".into()],
+            capabilities: vec!["issue".into()],
+            revoked: false,
+        };
+        let signer_id = grant.signer_id().unwrap().as_str().to_owned();
+
+        assert!(add_trusted_signer(&route, grant.clone()).unwrap());
+        assert!(add_trusted_signer(&route, grant).is_err());
+
+        // A message signed by the added key verifies against the stored store.
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        verify_v2_message(&route, &message).unwrap();
+
+        // Revocation makes the same signature fail closed, and is idempotent.
+        assert!(revoke_trusted_signer(&route, &signer_id).unwrap());
+        assert!(!revoke_trusted_signer(&route, &signer_id).unwrap());
+        assert!(verify_v2_message(&route, &message).is_err());
     }
 }
 
@@ -4354,6 +4437,24 @@ pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<Message
     Ok(message)
 }
 
+/// Serialize replay-ledger check-and-record for this project. Claim and
+/// acknowledgement both read then write the ledger; without this lock two
+/// concurrent claims of different messages reusing one nonce could both pass
+/// the read before either records.
+fn acquire_replay_lock(route: &ProjectRoute) -> Result<File> {
+    let path = route.attachment.join("runtime/locks/replay.lock");
+    fs::create_dir_all(path.parent().context("replay lock path has no parent")?)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock_exclusive()
+        .with_context(|| format!("project replay lock is held: {}", path.display()))?;
+    Ok(file)
+}
+
 /// Atomically claim a v2 message, recording its nonce in the replay ledger
 /// before the claim so a replayed nonce can never be claimed twice.
 pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<bool> {
@@ -4374,6 +4475,13 @@ pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<boo
         )));
     // An already-claimed message (same idempotency key) is idempotent, not a
     // replay: the original claim recorded the nonce, so check the claim first.
+    if claim.is_dir() {
+        return Ok(false);
+    }
+    // Serialize check-then-record so a nonce cannot be claimed twice by two
+    // racing requests. Re-check the claim after taking the lock: the message may
+    // have been claimed (idempotently) while we waited, which is not a replay.
+    let _replay_lock = acquire_replay_lock(route)?;
     if claim.is_dir() {
         return Ok(false);
     }
@@ -4417,6 +4525,9 @@ pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2)
     if acknowledgement.project_id != route.project_id {
         bail!("acknowledgement project does not match route")
     }
+    if !is_safe_component(&acknowledgement.acknowledged_by) {
+        bail!("acknowledgement actor is missing or not a path-safe identifier")
+    }
     verify_v2_acknowledgement(route, acknowledgement)?;
 
     let stored_message_path = route
@@ -4445,6 +4556,8 @@ pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2)
         bail!("acknowledgement does not match the stored message")
     }
 
+    // Serialize idempotency + replay check-and-record for the acknowledgement.
+    let _replay_lock = acquire_replay_lock(route)?;
     let path = acknowledgement_path(route, &acknowledgement.message_id);
     if path.exists() {
         let existing: AcknowledgementV2 = serde_json::from_slice(&fs::read(&path)?)?;
@@ -5887,6 +6000,7 @@ mod tests {
         assert!(crate::claim_message_v2(&receiver_route, &message).unwrap());
         assert!(!crate::claim_message_v2(&receiver_route, &message).unwrap());
         let mut acknowledgement = AcknowledgementV2::new(&message).unwrap();
+        acknowledgement.acknowledged_by = "alpha-builder".into();
         acknowledgement.sign(&builder).unwrap();
         assert!(crate::acknowledge_v2(&receiver_route, &acknowledgement).unwrap());
     }

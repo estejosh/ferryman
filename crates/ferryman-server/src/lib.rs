@@ -1023,6 +1023,7 @@ async fn acknowledge_communication(
         }
         let mut acknowledgement = communications::portable_auth::AcknowledgementV2::new(&message)
             .map_err(ApiError::internal)?;
+        acknowledgement.acknowledged_by = input.recipient.clone();
         let identity =
             communications::AgentIdentity::load_or_create(&input.recipient, &route.attachment)
                 .map_err(ApiError::internal)?;

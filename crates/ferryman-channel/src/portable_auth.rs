@@ -18,6 +18,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 /// v2 message envelope format marker.
 pub const MESSAGE_FORMAT_V2: &str = "ferryman-message/v2";
@@ -96,6 +97,10 @@ pub struct AcknowledgementV2 {
     pub message_digest: String,
     pub project_id: String,
     pub recipient: String,
+    /// The human-readable actor that acknowledged, bound by the signature. Kept
+    /// distinct from `recipient` (the role being acknowledged) so a role-based
+    /// acknowledger still records who actually acted.
+    pub acknowledged_by: String,
     pub processed_at: DateTime<Utc>,
     pub idempotency_key: String,
     pub authentication: Authentication,
@@ -200,6 +205,18 @@ impl TrustedSigners {
             Ok(Self::default())
         }
     }
+
+    /// Persist the store to `path`, atomically (temp file + rename). Used by the
+    /// operator-facing add/revoke tooling so a crash cannot leave a half-written
+    /// trust store that fails closed.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().context("trust store path has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+        std::fs::write(&temporary, toml::to_string(self)?)?;
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    }
 }
 
 /// The machine-local replay ledger: accepted `(signer_id, nonce)` pairs.
@@ -241,12 +258,14 @@ impl ReplayLedger {
         }
     }
 
-    /// Persist the ledger to `path`.
+    /// Persist the ledger to `path`, atomically (temp file + rename) so a crash
+    /// mid-write cannot leave a truncated ledger that fails every later load.
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, serde_json::to_vec(self)?)?;
+        let parent = path.parent().context("replay ledger path has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".{}.tmp", Uuid::new_v4()));
+        std::fs::write(&temporary, serde_json::to_vec(self)?)?;
+        std::fs::rename(&temporary, path)?;
         Ok(())
     }
 }
@@ -377,6 +396,7 @@ impl AcknowledgementV2 {
             message_digest: hex::encode(Sha256::digest(canonical_bytes(message)?)),
             project_id: message.project_id.clone(),
             recipient: message.recipient.clone(),
+            acknowledged_by: String::new(),
             processed_at: Utc::now(),
             idempotency_key: message.idempotency_key.clone(),
             authentication: Authentication {
