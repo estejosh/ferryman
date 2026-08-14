@@ -168,6 +168,7 @@ mod tests {
                 &["-p".to_string(), "{prompt}".to_string()],
                 crate::agent::ReviewMode::Confirm,
                 None,
+                false,
             ),
         )
         .unwrap();

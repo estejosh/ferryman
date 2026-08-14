@@ -46,6 +46,8 @@ pub struct Request {
     pub master: bool,
     /// Container image to sandbox the agent CLI in; empty means run it bare.
     pub sandbox: Option<String>,
+    /// Run each task in its own git worktree when the workspace is a git repo.
+    pub worktree: bool,
 }
 
 /// A file this run created, or found already correct.
@@ -182,6 +184,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
                 &["-p".to_string(), "{prompt}".to_string()],
                 review,
                 request.sandbox.as_deref(),
+                request.worktree,
             ),
         )
         .with_context(|| format!("write {}", config_path.display()))?;
@@ -338,6 +341,7 @@ mod tests {
             as_json: false,
             master: false,
             sandbox: None,
+            worktree: false,
         })?;
         Ok(())
     }
@@ -400,6 +404,7 @@ mod tests {
             as_json: false,
             master: false,
             sandbox: None,
+            worktree: false,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome

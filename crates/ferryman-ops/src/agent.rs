@@ -67,6 +67,60 @@ impl ReviewMode {
     }
 }
 
+/// Where the agent CLI runs. The sandbox idea, generalised into a pluggable
+/// runner: today that is bare or one of two container runtimes, but a native
+/// per-platform sandbox (like groundcrew's Safehouse) can be added here later
+/// without touching the agent core.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Runner {
+    /// Run directly on the host, with this user's full privileges.
+    Bare,
+    /// Run inside a podman container built from the given image.
+    Podman(String),
+    /// Run inside a docker container built from the given image.
+    Docker(String),
+}
+
+impl Runner {
+    /// Parse the `sandbox = "..."` config value.
+    ///
+    /// `""` and `"none"` mean bare; `podman:IMAGE` and `docker:IMAGE` pick a
+    /// runtime; a bare `IMAGE` means podman, the behaviour this field always had
+    /// before the prefix existed, so old configs keep working.
+    pub fn parse(value: &str) -> Result<Self> {
+        let value = value.trim();
+        if value.is_empty() || value.eq_ignore_ascii_case("none") {
+            return Ok(Self::Bare);
+        }
+        if let Some(image) = value.strip_prefix("podman:") {
+            return Ok(Self::Podman(image.trim().to_string()));
+        }
+        if let Some(image) = value.strip_prefix("docker:") {
+            return Ok(Self::Docker(image.trim().to_string()));
+        }
+        if !value.is_empty() {
+            return Ok(Self::Podman(value.to_string()));
+        }
+        Ok(Self::Bare)
+    }
+
+    /// Whether the agent CLI runs inside a sandbox at all.
+    #[must_use]
+    pub fn is_sandboxed(&self) -> bool {
+        !matches!(self, Self::Bare)
+    }
+
+    /// The container runtime binary, if any. Empty when bare.
+    #[must_use]
+    pub fn runtime(&self) -> &'static str {
+        match self {
+            Self::Bare => "",
+            Self::Podman(_) => "podman",
+            Self::Docker(_) => "docker",
+        }
+    }
+}
+
 /// What this machine runs, and how far it is trusted.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -84,7 +138,10 @@ pub struct AgentConfig {
     pub args: Vec<String>,
     /// A container image to run the agent CLI inside, if any. Empty means the
     /// agent runs directly on the host with this user's full privileges.
-    pub sandbox: Option<String>,
+    pub runner: Runner,
+    /// Run each task in its own git worktree (branch derived from the signed
+    /// order + agent) when the workspace is a git repo. Off by default.
+    pub worktree: bool,
     pub timeout: Duration,
     pub review: ReviewMode,
     /// Megabytes of memory to leave available. Below this the agent does not claim, so
@@ -209,7 +266,12 @@ impl AgentConfig {
                 .unwrap_or_else(|| "worker".to_string()),
             command: take("command")?,
             args,
-            sandbox: fields.get("sandbox").cloned().filter(|s| !s.is_empty()),
+            runner: Runner::parse(&fields.get("sandbox").cloned().unwrap_or_default())?,
+            worktree: match fields.get("worktree").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(other) => bail!("worktree must be true or false, not '{other}'"),
+            },
             timeout: Duration::from_secs(number("timeout_secs", 900)?),
             review: ReviewMode::parse(
                 &fields
@@ -247,6 +309,7 @@ impl AgentConfig {
         args: &[String],
         review: ReviewMode,
         sandbox: Option<&str>,
+        worktree: bool,
     ) -> String {
         let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".into());
         format!(
@@ -264,9 +327,12 @@ role = "{role}"
 command = "{command}"
 args = {args}
 
-# Container image to run the agent CLI inside. Empty (the default) runs it
-# directly on the host, with your full privileges. Set it to an image that
-# contains the command above to sandbox the agent instead, e.g. a podman image.
+# Where the agent CLI runs. Empty (the default) or "none" runs it directly on
+# the host, with your full privileges. Otherwise it runs inside a container
+# built from an image that contains the command above:
+#   podman:IMAGE   sandbox with podman
+#   docker:IMAGE   sandbox with docker
+#   IMAGE          shorthand for podman:IMAGE (the historical behaviour)
 #
 # Overhead, so you can decide knowingly: on Linux the container costs roughly
 # 10-50 MB of RAM and a 1-2 second start per task. On macOS (podman machine) or
@@ -274,6 +340,14 @@ args = {args}
 # 1-2 GB, shared across all containers.
 sandbox = "{sandbox}"
 timeout_secs = "900"
+
+# Run each task in its own git worktree when this workspace is a git repo, so
+# parallel agents never collide in the same checkout. The branch name derives
+# from the signed order and this agent, and its head commit is signed into the
+# result, so the work is attributable and a re-dispatched task lands in the same
+# worktree rather than a fresh one. Off by default; harmless on a non-git
+# workspace.
+worktree = "{worktree}"
 
 # How much authority the reviewing agent has. This is YOUR call, not Ferryman's:
 #   auto    - the agent's verdict stands, and the loop runs unattended
@@ -334,7 +408,8 @@ idle_after_secs = "300"
 # preamble_file = "preamble.md"
 "#,
             review = review.as_str(),
-            sandbox = sandbox.unwrap_or("")
+            sandbox = sandbox.unwrap_or(""),
+            worktree = if worktree { "true" } else { "false" }
         )
     }
 }
@@ -348,44 +423,42 @@ struct AgentRun {
 
 /// Run the configured agent CLI over a prompt.
 ///
-/// stdout is the result. stderr is kept because a failed run's only explanation is
-/// usually there, and discarding it turns a diagnosable problem into a silent retry.
-async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Result<AgentRun> {
+/// Compute the runtime binary and full argument list for a prompt, without
+/// spawning anything. Pure so it can be tested without a container runtime.
+fn run_command(config: &AgentConfig, workspace: &Path, prompt: &str) -> (String, Vec<String>) {
     let args: Vec<String> = config
         .args
         .iter()
         .map(|arg| arg.replace("{prompt}", prompt))
         .collect();
-    // When a sandbox image is set, the agent CLI runs inside it with only the
-    // workspace mounted, instead of directly on the host. Empty sandbox is the
-    // bare behaviour.
-    let binary_name = match &config.sandbox {
-        Some(_) => "podman".to_string(),
-        None => config.command.clone(),
-    };
-    let mut command = match &config.sandbox {
-        Some(image) => {
-            let mount = format!("{}:/workspace:Z", workspace.display());
-            let mut command = Command::new("podman");
-            command.args([
-                "run",
-                "--rm",
-                "-v",
-                mount.as_str(),
-                "-w",
-                "/workspace",
-                image.as_str(),
-                config.command.as_str(),
-            ]);
-            command.args(&args);
-            command
+    match &config.runner {
+        Runner::Bare => (config.command.clone(), args),
+        Runner::Podman(image) | Runner::Docker(image) => {
+            let mut full = vec![
+                "run".to_string(),
+                "--rm".to_string(),
+                "-v".to_string(),
+                format!("{}:/workspace:Z", workspace.display()),
+                "-w".to_string(),
+                "/workspace".to_string(),
+                image.clone(),
+                config.command.clone(),
+            ];
+            full.extend(args);
+            (config.runner.runtime().to_string(), full)
         }
-        None => {
-            let mut command = Command::new(&config.command);
-            command.args(&args);
-            command
-        }
-    };
+    }
+}
+
+/// stdout is the result. stderr is kept because a failed run's only explanation is
+/// usually there, and discarding it turns a diagnosable problem into a silent retry.
+async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Result<AgentRun> {
+    let (binary, args) = run_command(config, workspace, prompt);
+    let mut command = Command::new(&binary);
+    command.args(&args);
+    // Run in the workspace (or its per-task worktree) so the agent's files land
+    // in the right checkout, not wherever the loop happened to be started.
+    command.current_dir(workspace);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -402,7 +475,7 @@ async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Resu
     command.creation_flags(crate::priority::BELOW_NORMAL_PRIORITY_CLASS);
     let mut child = command
         .spawn()
-        .with_context(|| format!("start '{binary_name}'; is it installed and on PATH?"))?;
+        .with_context(|| format!("start '{binary}'; is it installed and on PATH?"))?;
     // Elsewhere it is done just after spawn, which needs no unsafe and leaves the spawn
     // itself - and so its error message - exactly as it was.
     if let Some(pid) = child.id() {
@@ -720,13 +793,91 @@ async fn do_work(
     task: &Task,
     report: &dyn Progress,
 ) -> Result<()> {
+    use ferryman_channel::interrupt::InterruptAction;
+
     let id = &task.order.id;
     let revision = task.latest_revision().unwrap_or(0) + 1;
     report.info(&format!(
         "  {id}: running {} (revision {revision})",
         config.command
     ));
-    let run = run_agent(config, &route.workspace, &work_prompt(config, task)).await?;
+
+    // An operator may interrupt a running task mid-flight. This is Ferryman's
+    // answer to groundcrew's live-terminal takeover: a signed order the worker
+    // honours between ticks, and recorded in the ledger.
+    let mut steer: Option<String> = None;
+    for interrupt in ferryman_channel::interrupt::pending_interrupts(route, id, &config.agent)? {
+        ferryman_channel::interrupt::acknowledge(route, id, &interrupt.issued_by, &config.agent)?;
+        report.warn(&format!(
+            "  {id}: {} interrupt from {}: {}",
+            interrupt.action.as_str(),
+            interrupt.issued_by,
+            interrupt.note
+        ));
+        match interrupt.action {
+            InterruptAction::Kill => {
+                ferryman_channel::interrupt::abandon_claim(route, id, &config.agent)?;
+                ferryman_channel::ledger::append_ledger_entry(
+                    route,
+                    identity,
+                    "interrupt",
+                    &config.agent,
+                    &format!("killed {id} on interrupt from {}", interrupt.issued_by),
+                    Some(id),
+                )?;
+                return Ok(());
+            }
+            InterruptAction::Pause => {
+                ferryman_channel::interrupt::abandon_claim(route, id, &config.agent)?;
+                ferryman_channel::ledger::append_ledger_entry(
+                    route,
+                    identity,
+                    "interrupt",
+                    &config.agent,
+                    &format!("paused {id} on interrupt from {}", interrupt.issued_by),
+                    Some(id),
+                )?;
+                return Ok(());
+            }
+            InterruptAction::Steer => steer = Some(interrupt.note),
+        }
+    }
+
+    // One git worktree per task when enabled and the workspace is a git repo, so
+    // parallel agents never collide in the same checkout. The branch derives from
+    // the signed order + agent and is signed into the result below.
+    let branch = ferryman_channel::worktree::branch_name(id, &config.agent);
+    let mut workdir = route.workspace.clone();
+    let mut used_worktree = false;
+    if config.worktree && ferryman_channel::worktree::is_git_repo(&route.workspace) {
+        match ferryman_channel::worktree::create_worktree(&route.workspace, id, &config.agent) {
+            Ok((dir, _)) => {
+                workdir = dir;
+                used_worktree = true;
+            }
+            Err(e) => report.warn(&format!("  {id}: worktree unavailable, running in place: {e}")),
+        }
+    }
+
+    let mut prompt = work_prompt(config, task);
+    if let Some(note) = steer {
+        prompt = format!(
+            "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"
+        );
+    }
+    let run = run_agent(config, &workdir, &prompt).await?;
+
+    let mut payload = json!({
+        "output": run.stdout.trim(),
+        "produced_by": config.command,
+        "worktree_branch": branch,
+    });
+    if used_worktree {
+        if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, &branch) {
+            payload["worktree_head"] = json!(head);
+        }
+        let _ = ferryman_channel::worktree::remove_worktree(&route.workspace, &branch);
+    }
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
         // does not have, and inventing one here would be a worse lie than silence.
@@ -741,10 +892,7 @@ async fn do_work(
         agent: config.agent.clone(),
         revision,
         submitted_at: chrono::Utc::now(),
-        payload: json!({
-            "output": run.stdout.trim(),
-            "produced_by": config.command,
-        }),
+        payload,
         signed_by: None,
         signature: None,
     };
@@ -889,6 +1037,55 @@ pub fn pending(route: &ProjectRoute) -> Result<Vec<(String, Recommendation)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_runner_parses_the_new_syntax_and_keeps_the_old() {
+        use Runner::*;
+        assert_eq!(Runner::parse("").unwrap(), Bare);
+        assert_eq!(Runner::parse("none").unwrap(), Bare);
+        assert_eq!(Runner::parse("  NONE  ").unwrap(), Bare);
+        assert_eq!(Runner::parse("podman:ubuntu").unwrap(), Podman("ubuntu".into()));
+        assert_eq!(Runner::parse("docker:alpine:3").unwrap(), Docker("alpine:3".into()));
+        // A bare image name still means podman, so an existing config keeps working.
+        assert_eq!(Runner::parse("ghcr.io/x/y").unwrap(), Podman("ghcr.io/x/y".into()));
+        assert!(Bare.is_sandboxed() == false);
+        assert!(Podman("x".into()).is_sandboxed());
+        assert_eq!(Podman("x".into()).runtime(), "podman");
+        assert_eq!(Docker("x".into()).runtime(), "docker");
+    }
+
+    #[test]
+    fn a_bare_runner_spawns_the_command_directly() {
+        let config = AgentConfig::parse("agent = \"w\"\ncommand = \"claude\"\n").unwrap();
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello");
+        assert_eq!(binary, "claude");
+        assert_eq!(args, vec!["-p", "hello"]);
+    }
+
+    #[test]
+    fn a_docker_runner_wraps_the_command_in_the_container() {
+        let config =
+            AgentConfig::parse("agent = \"w\"\ncommand = \"codex\"\nsandbox = \"docker:node:22\"\n")
+                .unwrap();
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello");
+        assert_eq!(binary, "docker");
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "--rm",
+                "-v",
+                "/ws:/workspace:Z",
+                "-w",
+                "/workspace",
+                "node:22",
+                "codex",
+                "-p",
+                "hello"
+            ]
+        );
+    }
+
     use ferryman_channel::{Claim, Order, Review};
 
     /// A config with no preamble, which is what every prompt test but the preamble ones
@@ -1152,6 +1349,7 @@ mod tests {
             &["-p".into(), "{prompt}".into()],
             ReviewMode::Confirm,
             None,
+            false,
         );
         let config = AgentConfig::parse(&rendered).unwrap();
         assert_eq!(config.agent, "beastly");
@@ -1159,6 +1357,7 @@ mod tests {
         assert_eq!(config.args, vec!["-p", "{prompt}"]);
         assert_eq!(config.review, ReviewMode::Confirm);
         assert_eq!(config.timeout, Duration::from_secs(900));
+        assert!(!config.worktree);
     }
 
     #[test]

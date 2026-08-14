@@ -12,11 +12,14 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod interrupt;
 pub mod ledger;
 pub mod licensing;
 pub mod master;
 pub mod migration;
 pub mod portable_auth;
+pub mod source;
+pub mod worktree;
 
 use portable_auth::{
     AcknowledgementV2, MessageV2, ReplayLedger, SignerGrant, SignerId, TrustedSigners,
@@ -810,7 +813,7 @@ fn tasks_root(route: &ProjectRoute) -> PathBuf {
     route.communications.join("tasks")
 }
 
-fn task_dir(route: &ProjectRoute, order_id: &str) -> PathBuf {
+pub(crate) fn task_dir(route: &ProjectRoute, order_id: &str) -> PathBuf {
     tasks_root(route).join(order_id)
 }
 
@@ -818,7 +821,7 @@ fn task_dir(route: &ProjectRoute, order_id: &str) -> PathBuf {
 ///
 /// Temp-then-rename because Syncthing may copy the directory at any instant, and a
 /// half-written order read by a peer is worse than no order at all.
-fn write_task_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(crate) fn write_task_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1190,6 +1193,15 @@ impl AgentIdentity {
             .sign(recommendation_payload(recommendation).as_bytes());
         recommendation.signed_by = Some(self.name.clone());
         recommendation.signature = Some(hex::encode(signature.to_bytes()));
+    }
+
+    /// Sign an interrupt, so a kill/steer/pause cannot be forged onto an agent.
+    pub fn sign_interrupt(&self, interrupt: &mut crate::interrupt::Interrupt) {
+        let signature = self
+            .signing
+            .sign(crate::interrupt::payload(interrupt).as_bytes());
+        interrupt.signed_by = Some(self.name.clone());
+        interrupt.signature = Some(hex::encode(signature.to_bytes()));
     }
 }
 

@@ -70,6 +70,9 @@ enum Command {
         /// Overhead: ~10-50 MB + 1-2s per task on Linux; ~1-2 GB VM on macOS/Windows.
         #[arg(long)]
         sandbox: Option<String>,
+        /// Run each task in its own git worktree when the workspace is a git repo.
+        #[arg(long)]
+        worktree: bool,
         /// Emit one JSON object describing the result, for a caller that is a program.
         #[arg(long)]
         json: bool,
@@ -346,6 +349,45 @@ enum Channel {
         #[arg(long)]
         requires_review: bool,
     },
+    /// Import external work - an issue tracker export, a script's output - into
+    /// signed orders. Each ticket becomes a signed order with a ledger entry.
+    Source {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is importing. Defaults to this machine's name.
+        #[arg(long)]
+        agent: Option<String>,
+        /// A name for the source, e.g. "linear". Becomes part of each order id.
+        #[arg(long)]
+        name: String,
+        /// A shell command that prints one JSON ticket per line to stdout:
+        /// {"id": "...", "task": "...", "assigned_to": "..."} (the last is optional).
+        #[arg(long)]
+        command: String,
+    },
+    /// Manage the per-task git worktrees.
+    Worktree {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+    /// Pause, steer or kill a running task from outside the loop.
+    Interrupt {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is interrupting. Defaults to this machine's name.
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        order: String,
+        /// kill, pause or steer.
+        #[arg(long)]
+        action: String,
+        /// Why; folded into the next prompt for a steer.
+        #[arg(long, default_value = "")]
+        note: String,
+    },
     /// Work this agent can pick up.
     Work {
         #[arg(long)]
@@ -538,6 +580,32 @@ enum TrustAction {
         /// Comma-separated capabilities; empty means none required.
         #[arg(long)]
         capabilities: Option<String>,
+    },
+}
+
+/// Subcommands for [`Channel::Worktree`].
+#[derive(Subcommand, Clone)]
+enum WorktreeAction {
+    /// Show the branch name an (order, agent) pair would use.
+    Branch {
+        #[arg(long)]
+        order: String,
+        #[arg(long)]
+        agent: String,
+    },
+    /// Create the worktree for an (order, agent) pair.
+    Create {
+        #[arg(long)]
+        order: String,
+        #[arg(long)]
+        agent: String,
+    },
+    /// Remove the worktree (and its branch) for an (order, agent) pair.
+    Cleanup {
+        #[arg(long)]
+        order: String,
+        #[arg(long)]
+        agent: String,
     },
 }
 
@@ -790,6 +858,7 @@ async fn main() -> Result<()> {
             no_syncthing,
             master,
             sandbox,
+            worktree,
             json: as_json,
         } => {
             let outcome = enable::perform(enable::Request {
@@ -804,6 +873,7 @@ async fn main() -> Result<()> {
                 as_json,
                 master,
                 sandbox,
+                worktree,
             })?;
             if as_json {
                 report_enable_json(&outcome)?;
@@ -1986,6 +2056,78 @@ fn channel(command: Channel) -> Result<()> {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),
                 None => println!("  open: whichever agent claims first wins"),
             }
+        }
+
+        Channel::Source {
+            workspace,
+            agent,
+            name,
+            command,
+        } => {
+            let route = here(workspace)?;
+            let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity =
+                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)?;
+            let source = ferryman_channel::source::TaskSource::Shell { name, command };
+            let imported = ferryman_channel::source::import(&route, &source, &issuer, &identity)?;
+            println!("imported {imported} order(s) from {}", source.name());
+        }
+
+        Channel::Worktree { workspace, action } => {
+            let route = here(workspace)?;
+            match action {
+                WorktreeAction::Branch { order, agent } => {
+                    let branch = ferryman_channel::worktree::branch_name(&order, &agent);
+                    println!("{branch}");
+                }
+                WorktreeAction::Create { order, agent } => {
+                    let (dir, branch) =
+                        ferryman_channel::worktree::create_worktree(&route.workspace, &order, &agent)?;
+                    println!("worktree {branch} at {}", dir.display());
+                }
+                WorktreeAction::Cleanup { order, agent } => {
+                    let branch = ferryman_channel::worktree::branch_name(&order, &agent);
+                    ferryman_channel::worktree::remove_worktree(&route.workspace, &branch)?;
+                    println!("removed worktree {branch}");
+                }
+            }
+        }
+
+        Channel::Interrupt {
+            workspace,
+            agent,
+            order,
+            action,
+            note,
+        } => {
+            let route = here(workspace)?;
+            let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity =
+                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)?;
+            let mut interrupt = ferryman_channel::interrupt::Interrupt {
+                order_id: order.clone(),
+                action: ferryman_channel::interrupt::InterruptAction::parse(&action)?,
+                note,
+                issued_by: issuer.clone(),
+                created_at: chrono::Utc::now(),
+                signed_by: None,
+                signature: None,
+            };
+            identity.sign_interrupt(&mut interrupt);
+            let path = ferryman_channel::interrupt::write_interrupt(&route, &interrupt)?;
+            ferryman_channel::ledger::append_ledger_entry(
+                &route,
+                &identity,
+                "interrupt",
+                &issuer,
+                &format!("{} interrupt on {order}", interrupt.action.as_str()),
+                Some(&order),
+            )?;
+            println!(
+                "interrupt {} on {order} -> {}",
+                interrupt.action.as_str(),
+                path.display()
+            );
         }
 
         Channel::Work { workspace, agent } => {

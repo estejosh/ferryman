@@ -203,6 +203,35 @@ Reviewed `ClipboardHealth/groundcrew` and `prolego-team/groundcrew`
    poll ticks, surfaced through Telegram and `ferry`. This is the missing
    analogue of groundcrew's live terminals.
 
+### Status (2026-08-14): all four built on `feat/groundcrew-borrows`
+
+1. Runner abstraction — `agent::Runner` (`Bare`/`Podman`/`Docker`), `sandbox`
+   config now accepts `none`/`podman:IMG`/`docker:IMG`/`IMG` (legacy podman).
+2. Task sources — `channel::source` (`TaskSource::Shell` → signed orders),
+   `ferry channel source`.
+3. Worktree-per-task — `channel::worktree` + `AgentConfig.worktree`; branch
+   derives from signed order + agent; head signed into the result.
+4. Interrupt mode — `channel::interrupt` (kill/pause/steer, signed, acked),
+   honored in `do_work`, `ferry channel interrupt`.
+
+## Broader competitive research → next upgrades
+
+A parallel agent reviewed 11 adjacent projects (`memory-bank/competitive-research.md`).
+Ranked for next cycles:
+
+1. **Event/scheduled trigger adapter** (webhook/cron → signed order) — the gap
+   between Ferryman and an always-on fleet.
+2. **MCP tool/context providers** — leverage the MCP ecosystem; ACP later for
+   backend swapping.
+3. **Schema-validated deliverables** — machine-checkable handoffs; auto-reject
+   malformed work at the review gate.
+4. **Approval-mode ladder** — finer than the single Telegram approve/deny gate.
+5. **Worker eval harness** — measure which CLI solves tasks well (SWE-bench
+   batch model).
+6. **OTLP trace/metrics export** — observe *how* a run unfolded, not just
+   attribution.
+7. **Repo-map pre-context** — lower priority; many CLIs do it themselves.
+
 ---
 
 
