@@ -13,8 +13,12 @@ use std::{
 };
 
 pub mod contract;
+pub mod cost;
 pub mod credentials;
+pub mod encrypt;
+pub mod events;
 pub mod interrupt;
+pub mod keys;
 pub mod learning;
 pub mod ledger;
 pub mod licensing;

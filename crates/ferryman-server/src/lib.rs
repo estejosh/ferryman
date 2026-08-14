@@ -3,6 +3,7 @@
 /// Re-exported under the original path so the HTTP surface is unchanged.
 pub use ferryman_channel as communications;
 pub mod continuity;
+pub mod dashboard;
 pub mod recovery_targets;
 pub mod telegram;
 pub mod workspace;
