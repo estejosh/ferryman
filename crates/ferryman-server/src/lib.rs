@@ -861,6 +861,7 @@ async fn list_communications(
 ) -> ApiResult<Json<Value>> {
     checked(&state, &headers, &project_id)?;
     let route = project_route(&state, &project_id)?;
+    communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
     let messages = communications::list_messages(&route).map_err(ApiError::internal)?;
     Ok(Json(json!({"items":messages})))
 }
@@ -890,6 +891,7 @@ async fn claim_communication(
 ) -> ApiResult<Json<Value>> {
     checked_communication_actor(&state, &headers, &project_id, &input.recipient)?;
     let route = project_route(&state, &project_id)?;
+    communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
     let message = communications::read_message(&route, &message_id).map_err(ApiError::internal)?;
     if !communication_actor_may_process(&route, &message, &input.recipient) {
         return Err(ApiError::bad(
@@ -913,6 +915,7 @@ async fn acknowledge_communication(
 ) -> ApiResult<Json<Value>> {
     checked_communication_actor(&state, &headers, &project_id, &input.recipient)?;
     let route = project_route(&state, &project_id)?;
+    communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
     let message = communications::read_message(&route, &message_id).map_err(ApiError::internal)?;
     if !communication_actor_may_process(&route, &message, &input.recipient) {
         return Err(ApiError::bad(
@@ -985,6 +988,7 @@ async fn list_communication_actor_messages(
     } else {
         communications::TransportKind::LocalFilesystem
     };
+    communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
     let messages = communications::list_messages(&route)
         .map_err(ApiError::internal)?
         .into_iter()
