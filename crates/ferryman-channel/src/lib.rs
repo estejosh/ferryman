@@ -13,6 +13,7 @@ use std::{
 };
 
 pub mod licensing;
+pub mod migration;
 pub mod portable_auth;
 
 use portable_auth::{AcknowledgementV2, MessageV2, ReplayLedger, SignerId, TrustedSigners};
@@ -1119,6 +1120,16 @@ impl AgentIdentity {
         message.signature = Some(hex::encode(signature.to_bytes()));
     }
 
+    /// Sign a v2 portable message envelope.
+    pub fn sign_message_v2(&self, message: &mut MessageV2) -> Result<()> {
+        message.sign(&self.signing)
+    }
+
+    /// Sign a v2 portable acknowledgement envelope.
+    pub fn sign_acknowledgement_v2(&self, acknowledgement: &mut AcknowledgementV2) -> Result<()> {
+        acknowledgement.sign(&self.signing)
+    }
+
     /// Sign an order. Whoever issues work is on the record for it.
     pub fn sign_order(&self, order: &mut Order) {
         let signature = self.signing.sign(order_payload(order).as_bytes());
@@ -1484,15 +1495,30 @@ mod portable_auth_route_tests {
     use crate::portable_auth::{MessageV2, ReplayLedger, SignerGrant, TrustedSigners};
 
     fn test_route(dir: &std::path::Path) -> ProjectRoute {
+        let workspace = dir.join("workspace");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
         ProjectRoute {
             project_id: "ferryman".into(),
-            workspace: dir.join("workspace"),
-            attachment: dir.join("attachment"),
-            communications: dir.join("attachment").join("ferryman"),
+            workspace,
+            attachment,
+            communications,
             shared_remote: "ferryman-ferryman".into(),
             git_remote: String::new(),
             git_visibility: String::new(),
             agents: Vec::new(),
+        }
+    }
+
+    fn test_route_with_agents(dir: &std::path::Path) -> ProjectRoute {
+        ProjectRoute {
+            agents: vec![AgentRoute {
+                name: "worker".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+            }],
+            ..test_route(dir)
         }
     }
 
@@ -1682,6 +1708,261 @@ mod portable_auth_route_tests {
             .unwrap();
 
         assert_eq!(quarantine_invalid_inbound(&route).unwrap(), 1);
+    }
+
+    #[test]
+    fn list_messages_v2_skips_non_v2_and_invalid_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut first = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        first.sign(&signing).unwrap();
+        let mut second = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        second.sign(&signing).unwrap();
+
+        // A v1 file is ignored by the v2 listing.
+        let v1 = Message::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+            None,
+        );
+        std::fs::write(
+            messages.join(format!("{}.json", v1.id)),
+            serde_json::to_string(&v1).unwrap(),
+        )
+        .unwrap();
+
+        // A tampered v2 file is skipped rather than failing the listing.
+        let mut tampered = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        tampered.sign(&signing).unwrap();
+        tampered.payload = serde_json::json!({"tampered": true});
+        std::fs::write(
+            messages.join(format!("{}.json", tampered.id)),
+            serde_json::to_string(&tampered).unwrap(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            messages.join(format!("{}.json", first.id)),
+            serde_json::to_string(&first).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            messages.join(format!("{}.json", second.id)),
+            serde_json::to_string(&second).unwrap(),
+        )
+        .unwrap();
+
+        let listed = list_messages_v2(&route).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert!(listed.iter().any(|message| message.id == first.id));
+        assert!(listed.iter().any(|message| message.id == second.id));
+    }
+
+    #[test]
+    fn read_message_v2_verifies_and_rejects_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        std::fs::write(
+            messages.join(format!("{}.json", message.id)),
+            serde_json::to_string(&message).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(read_message_v2(&route, &message.id).unwrap().id, message.id);
+
+        let mut ledger = ReplayLedger::default();
+        ledger.record(
+            &message.authentication.signer_id,
+            &message.authentication.nonce,
+        );
+        ledger
+            .save(&route.attachment.join("runtime/replay-ledger.json"))
+            .unwrap();
+        assert!(read_message_v2(&route, &message.id).is_err());
+    }
+
+    #[test]
+    fn claim_message_v2_records_nonce_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route_with_agents(dir.path());
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::create_dir_all(&route.attachment).unwrap();
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+
+        assert!(claim_message_v2(&route, &message).unwrap());
+        let claim = route
+            .attachment
+            .join("runtime/processed")
+            .join(hex::encode(Sha256::digest(
+                message.idempotency_key.as_bytes(),
+            )));
+        assert!(claim.join("message.json").is_file());
+        let ledger =
+            ReplayLedger::load(&route.attachment.join("runtime/replay-ledger.json")).unwrap();
+        assert!(ledger.contains(
+            &message.authentication.signer_id,
+            &message.authentication.nonce
+        ));
+        assert!(!claim_message_v2(&route, &message).unwrap());
+    }
+
+    #[test]
+    fn acknowledge_v2_persists_verified_ack_and_handles_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route_with_agents(dir.path());
+        let messages = route.communications.join("messages").join("ferryman");
+        std::fs::create_dir_all(&messages).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        std::fs::write(
+            messages.join(format!("{}.json", message.id)),
+            serde_json::to_string(&message).unwrap(),
+        )
+        .unwrap();
+
+        let mut acknowledgement = AcknowledgementV2::new(&message).unwrap();
+        acknowledgement.sign(&signing).unwrap();
+        assert!(acknowledge_v2(&route, &acknowledgement).unwrap());
+
+        let path = acknowledgement_path(&route, &message.id);
+        assert!(path.is_file());
+        let stored: AcknowledgementV2 =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stored.message_id, message.id);
+
+        let ledger =
+            ReplayLedger::load(&route.attachment.join("runtime/replay-ledger.json")).unwrap();
+        assert!(ledger.contains(
+            &acknowledgement.authentication.signer_id,
+            &acknowledgement.authentication.nonce
+        ));
+
+        assert!(!acknowledge_v2(&route, &acknowledgement).unwrap());
     }
 }
 
@@ -3821,6 +4102,267 @@ pub fn record_acknowledgement(
     if queued.is_file() {
         fs::remove_file(queued)?;
     }
+    Ok(true)
+}
+
+/// Read the envelope `format` field from a stored message file without parsing the
+/// version-specific body. Missing `format` is treated as the unsigned v1 envelope.
+pub fn inbound_message_format(route: &ProjectRoute, message_id: &str) -> Result<String> {
+    route.validate()?;
+    if Uuid::parse_str(message_id).is_err() {
+        bail!("message ID is invalid")
+    }
+    let path = route
+        .communications
+        .join("messages")
+        .join(&route.project_id)
+        .join(format!("{message_id}.json"));
+    let value: Value = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read message {message_id}"))?,
+    )?;
+    Ok(value
+        .get("format")
+        .and_then(Value::as_str)
+        .unwrap_or(MESSAGE_FORMAT)
+        .to_owned())
+}
+
+fn validate_v2_message(message: &MessageV2) -> Result<()> {
+    if message.format != portable_auth::MESSAGE_FORMAT_V2 || Uuid::parse_str(&message.id).is_err() {
+        bail!("invalid Ferryman v2 message format or ID")
+    }
+    if message.project_id.trim().is_empty()
+        || message.sender.trim().is_empty()
+        || message.recipient.trim().is_empty()
+        || message.idempotency_key.trim().is_empty()
+    {
+        bail!("message routing and idempotency fields are required")
+    }
+    if message.acknowledgement_deadline < message.created_at {
+        bail!("acknowledgement deadline cannot precede creation")
+    }
+    if message.sender.len() > 128
+        || message.recipient.len() > 128
+        || message.idempotency_key.len() > 256
+        || message.payload_reference.len() > 2_048
+    {
+        bail!("message routing or reference field exceeds its size limit")
+    }
+    if serde_json::to_vec(&message.payload)?.len() > MAX_INLINE_PAYLOAD_BYTES {
+        bail!("inline message payload exceeds 256 KiB")
+    }
+    if contains_sensitive_key(&message.payload) {
+        bail!("portable message payload contains a prohibited secret-like field")
+    }
+    Ok(())
+}
+
+/// List the v2 messages in this project's inbound directory.
+///
+/// Invalid or non-v2 files are skipped rather than failing the whole listing; the
+/// server boundary calls [`quarantine_invalid_inbound`] before this so invalid
+/// envelopes have already been moved aside. Returned messages are sorted by ID.
+pub fn list_messages_v2(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
+    route.validate()?;
+    let directory = route
+        .communications
+        .join("messages")
+        .join(&route.project_id);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut paths = fs::read_dir(directory)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let ledger = replay_ledger(route)?;
+    let mut messages = Vec::new();
+    for path in paths {
+        let raw = match fs::read(&path) {
+            Ok(raw) => raw,
+            Err(_) => continue,
+        };
+        let value: Value = match serde_json::from_slice(&raw) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if value.get("format").and_then(Value::as_str) != Some(portable_auth::MESSAGE_FORMAT_V2) {
+            continue;
+        }
+        let message: MessageV2 = match serde_json::from_slice(&raw) {
+            Ok(message) => message,
+            Err(_) => continue,
+        };
+        if validate_v2_message(&message).is_err()
+            || message.project_id != route.project_id
+            || verify_v2_message(route, &message).is_err()
+        {
+            continue;
+        }
+        if ledger.contains(
+            &message.authentication.signer_id,
+            &message.authentication.nonce,
+        ) {
+            continue;
+        }
+        messages.push(message);
+    }
+    messages.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(messages)
+}
+
+/// Read one v2 message by ID, verifying its signature and rejecting a replayed nonce.
+pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<MessageV2> {
+    route.validate()?;
+    if Uuid::parse_str(message_id).is_err() {
+        bail!("message ID is invalid")
+    }
+    let path = route
+        .communications
+        .join("messages")
+        .join(&route.project_id)
+        .join(format!("{message_id}.json"));
+    let message: MessageV2 = serde_json::from_slice(
+        &fs::read(&path).with_context(|| format!("read v2 message {message_id}"))?,
+    )
+    .with_context(|| format!("parse v2 message {message_id}"))?;
+    validate_v2_message(&message)?;
+    if message.project_id != route.project_id {
+        bail!("stored message belongs to another project")
+    }
+    if message.id != message_id {
+        bail!("stored message ID does not match its filename")
+    }
+    verify_v2_message(route, &message)?;
+    let ledger = replay_ledger(route)?;
+    if ledger.contains(
+        &message.authentication.signer_id,
+        &message.authentication.nonce,
+    ) {
+        bail!(
+            "replayed nonce for signer {}",
+            message.authentication.signer_id
+        )
+    }
+    Ok(message)
+}
+
+/// Atomically claim a v2 message, then durably record its nonce in the replay ledger.
+pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<bool> {
+    route.validate()?;
+    validate_v2_message(message)?;
+    if message.project_id != route.project_id || !route.permits(&message.recipient, None) {
+        bail!("message is not permitted by this project route")
+    }
+    verify_v2_message(route, message)?;
+    if acknowledgement_path(route, &message.id).is_file() {
+        return Ok(false);
+    }
+    let claim = route
+        .attachment
+        .join("runtime/processed")
+        .join(hex::encode(Sha256::digest(
+            message.idempotency_key.as_bytes(),
+        )));
+    fs::create_dir_all(claim.parent().context("claim path has no parent")?)?;
+    match fs::create_dir(&claim) {
+        Ok(()) => {
+            atomic_json(&claim.join("message.json"), message)?;
+            let mut ledger = replay_ledger(route)?;
+            ledger.record(
+                &message.authentication.signer_id,
+                &message.authentication.nonce,
+            );
+            ledger.save(&route.attachment.join("runtime/replay-ledger.json"))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Verify and persist a v2 acknowledgement, mirroring the v1 acknowledgement path.
+pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2) -> Result<bool> {
+    route.validate()?;
+    if acknowledgement.format != portable_auth::ACKNOWLEDGEMENT_FORMAT_V2 {
+        bail!("invalid Ferryman v2 acknowledgement format")
+    }
+    if Uuid::parse_str(&acknowledgement.message_id).is_err() {
+        bail!("acknowledgement message ID is invalid")
+    }
+    if acknowledgement.project_id != route.project_id {
+        bail!("acknowledgement project does not match route")
+    }
+    verify_v2_acknowledgement(route, acknowledgement)?;
+
+    let stored_message_path = route
+        .communications
+        .join("messages")
+        .join(&route.project_id)
+        .join(format!("{}.json", acknowledgement.message_id));
+    let stored_message: MessageV2 = serde_json::from_slice(
+        &fs::read(&stored_message_path)
+            .with_context(|| format!("read message {}", acknowledgement.message_id))?,
+    )
+    .with_context(|| format!("parse v2 message {}", acknowledgement.message_id))?;
+    validate_v2_message(&stored_message)?;
+    if stored_message.project_id != route.project_id {
+        bail!("stored message belongs to another project")
+    }
+    // The message must be from a trusted signer, but its nonce may already have been
+    // consumed by a successful claim, so only the acknowledgement nonce is replay-checked.
+    verify_v2_message(route, &stored_message)?;
+    let expected = AcknowledgementV2::new(&stored_message)?;
+    if acknowledgement.message_id != stored_message.id
+        || acknowledgement.idempotency_key != stored_message.idempotency_key
+        || acknowledgement.recipient != stored_message.recipient
+        || acknowledgement.message_digest != expected.message_digest
+    {
+        bail!("acknowledgement does not match the stored message")
+    }
+
+    let path = acknowledgement_path(route, &acknowledgement.message_id);
+    if path.exists() {
+        let existing: AcknowledgementV2 = serde_json::from_slice(&fs::read(&path)?)?;
+        if existing.message_id == acknowledgement.message_id
+            && existing.project_id == acknowledgement.project_id
+            && existing.recipient == acknowledgement.recipient
+            && existing.idempotency_key == acknowledgement.idempotency_key
+        {
+            let queued = outbox_path(route, &acknowledgement.message_id);
+            if queued.is_file() {
+                fs::remove_file(queued)?;
+            }
+            return Ok(false);
+        }
+        bail!("conflicting acknowledgement already exists")
+    }
+
+    let mut ledger = replay_ledger(route)?;
+    if ledger.contains(
+        &acknowledgement.authentication.signer_id,
+        &acknowledgement.authentication.nonce,
+    ) {
+        bail!(
+            "replayed acknowledgement nonce for signer {}",
+            acknowledgement.authentication.signer_id
+        )
+    }
+    atomic_json(&path, acknowledgement)?;
+    let queued = outbox_path(route, &acknowledgement.message_id);
+    if queued.is_file() {
+        fs::remove_file(queued)?;
+    }
+    ledger.record(
+        &acknowledgement.authentication.signer_id,
+        &acknowledgement.authentication.nonce,
+    );
+    ledger.save(&route.attachment.join("runtime/replay-ledger.json"))?;
     Ok(true)
 }
 

@@ -862,8 +862,14 @@ async fn list_communications(
     checked(&state, &headers, &project_id)?;
     let route = project_route(&state, &project_id)?;
     communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
-    let messages = communications::list_messages(&route).map_err(ApiError::internal)?;
-    Ok(Json(json!({"items":messages})))
+    let v2_messages = communications::list_messages_v2(&route).map_err(ApiError::internal)?;
+    let items = if v2_messages.is_empty() {
+        serde_json::to_value(communications::list_messages(&route).map_err(ApiError::internal)?)
+            .map_err(|error| ApiError::internal(error.into()))?
+    } else {
+        serde_json::to_value(v2_messages).map_err(|error| ApiError::internal(error.into()))?
+    };
+    Ok(Json(json!({"items":items})))
 }
 
 #[derive(Deserialize)]
@@ -883,6 +889,28 @@ fn communication_actor_may_process(
         })
 }
 
+fn communication_actor_may_process_v2(
+    route: &communications::ProjectRoute,
+    message: &communications::portable_auth::MessageV2,
+    actor: &str,
+) -> bool {
+    actor == message.recipient
+        || route.agents.iter().any(|participant| {
+            participant.name == actor
+                && (participant.name == message.recipient || participant.role == message.recipient)
+        })
+}
+
+fn inbound_message_is_v2(
+    route: &communications::ProjectRoute,
+    message_id: &str,
+) -> ApiResult<bool> {
+    Ok(
+        communications::inbound_message_format(route, message_id).map_err(ApiError::internal)?
+            == communications::portable_auth::MESSAGE_FORMAT_V2,
+    )
+}
+
 async fn claim_communication(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -892,6 +920,18 @@ async fn claim_communication(
     checked_communication_actor(&state, &headers, &project_id, &input.recipient)?;
     let route = project_route(&state, &project_id)?;
     communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
+    if inbound_message_is_v2(&route, &message_id)? {
+        let message =
+            communications::read_message_v2(&route, &message_id).map_err(ApiError::internal)?;
+        if !communication_actor_may_process_v2(&route, &message, &input.recipient) {
+            return Err(ApiError::bad(
+                "claimant is not the message's intended recipient or role",
+            ));
+        }
+        let claimed =
+            communications::claim_message_v2(&route, &message).map_err(ApiError::internal)?;
+        return Ok(Json(json!({"message_id":message_id,"claimed":claimed})));
+    }
     let message = communications::read_message(&route, &message_id).map_err(ApiError::internal)?;
     if !communication_actor_may_process(&route, &message, &input.recipient) {
         return Err(ApiError::bad(
@@ -916,6 +956,35 @@ async fn acknowledge_communication(
     checked_communication_actor(&state, &headers, &project_id, &input.recipient)?;
     let route = project_route(&state, &project_id)?;
     communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
+    if inbound_message_is_v2(&route, &message_id)? {
+        let message_path = route
+            .communications
+            .join("messages")
+            .join(&project_id)
+            .join(format!("{message_id}.json"));
+        let message: communications::portable_auth::MessageV2 = serde_json::from_slice(
+            &std::fs::read(&message_path).map_err(|error| ApiError::internal(error.into()))?,
+        )
+        .map_err(|error| ApiError::internal(error.into()))?;
+        if !communication_actor_may_process_v2(&route, &message, &input.recipient) {
+            return Err(ApiError::bad(
+                "acknowledger is not the message's intended recipient or role",
+            ));
+        }
+        let mut acknowledgement = communications::portable_auth::AcknowledgementV2::new(&message)
+            .map_err(ApiError::internal)?;
+        let identity =
+            communications::AgentIdentity::load_or_create(&input.recipient, &route.attachment)
+                .map_err(ApiError::internal)?;
+        identity
+            .sign_acknowledgement_v2(&mut acknowledgement)
+            .map_err(ApiError::internal)?;
+        let recorded =
+            communications::acknowledge_v2(&route, &acknowledgement).map_err(ApiError::internal)?;
+        return Ok(Json(
+            json!({"acknowledgement":acknowledgement,"recorded":recorded,"delivery":null}),
+        ));
+    }
     let message = communications::read_message(&route, &message_id).map_err(ApiError::internal)?;
     if !communication_actor_may_process(&route, &message, &input.recipient) {
         return Err(ApiError::bad(
@@ -989,16 +1058,33 @@ async fn list_communication_actor_messages(
         communications::TransportKind::LocalFilesystem
     };
     communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
-    let messages = communications::list_messages(&route)
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .filter(|message| {
-            (message.recipient == actor || message.recipient == participant.role)
-                && !communications::is_acknowledged(&route, &message.id)
-        })
-        .collect::<Vec<_>>();
+    let v2_messages = communications::list_messages_v2(&route).map_err(ApiError::internal)?;
+    let items = if v2_messages.is_empty() {
+        serde_json::to_value(
+            communications::list_messages(&route)
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .filter(|message| {
+                    (message.recipient == actor || message.recipient == participant.role)
+                        && !communications::is_acknowledged(&route, &message.id)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| ApiError::internal(error.into()))?
+    } else {
+        serde_json::to_value(
+            v2_messages
+                .into_iter()
+                .filter(|message| {
+                    (message.recipient == actor || message.recipient == participant.role)
+                        && !communications::is_acknowledged(&route, &message.id)
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|error| ApiError::internal(error.into()))?
+    };
     Ok(Json(
-        json!({"items":messages,"synchronized_via":synchronized_via}),
+        json!({"items":items,"synchronized_via":synchronized_via}),
     ))
 }
 

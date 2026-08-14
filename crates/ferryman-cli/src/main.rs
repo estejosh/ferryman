@@ -244,6 +244,20 @@ enum Communications {
         #[arg(long)]
         actor: String,
     },
+    /// Inventory and convert local v1 messages into signed v2 envelopes.
+    ///
+    /// This works directly against the synced channel, not the server. It
+    /// defaults to `--dry-run true`; pass `--dry-run false` after reviewing the
+    /// classification to rewrite convertible v1 messages in place.
+    Migrate {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The signing agent name. Defaults to this machine's name.
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        dry_run: bool,
+    },
     /// Unregister the hub mapping and actor tokens; portable/local files are preserved.
     Unregister {
         #[arg(long)]
@@ -858,6 +872,71 @@ async fn main() -> Result<()> {
                     None,
                 )
                 .await?
+            }
+            Communications::Migrate {
+                workspace,
+                agent,
+                dry_run,
+            } => {
+                let start = match workspace {
+                    Some(path) => path,
+                    None => std::env::current_dir().context("resolve current directory")?,
+                };
+                let route = ferryman_channel::route_for(&start)?;
+
+                let entries = ferryman_channel::migration::inventory_v1(&route)?;
+                let mut convertible = 0usize;
+                for entry in &entries {
+                    let message = entry.message();
+                    match entry {
+                        ferryman_channel::migration::MigrationEntry::Convertible { .. } => {
+                            convertible += 1;
+                            println!(
+                                "convertible    {}  recipient={}",
+                                message.id, message.recipient
+                            )
+                        }
+                        ferryman_channel::migration::MigrationEntry::OperatorReview {
+                            reason,
+                            ..
+                        } => println!(
+                            "operator-review  {}  recipient={}  reason={reason}",
+                            message.id, message.recipient
+                        ),
+                    }
+                }
+                println!(
+                    "{} v1 message(s), {} convertible",
+                    entries.len(),
+                    convertible
+                );
+
+                if dry_run {
+                    println!("dry-run: no files were written");
+                    return Ok(());
+                }
+                if convertible == 0 {
+                    println!("nothing to convert");
+                    return Ok(());
+                }
+
+                let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                let identity =
+                    ferryman_channel::AgentIdentity::load_or_create(&agent, &route.attachment)?;
+
+                for entry in entries {
+                    if let ferryman_channel::migration::MigrationEntry::Convertible { message } =
+                        entry
+                    {
+                        let outcome = ferryman_channel::migration::convert_v1_to_v2_with_identity(
+                            &route, &message, &identity, false,
+                        )?;
+                        println!(
+                            "converted {}  old={}  new={}",
+                            outcome.message_id, outcome.old_digest, outcome.new_digest
+                        );
+                    }
+                }
             }
             Communications::Unregister { project } => {
                 call(
