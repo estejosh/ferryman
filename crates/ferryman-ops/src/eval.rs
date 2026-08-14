@@ -14,6 +14,32 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Runner, run_engine_prompt};
 
+/// Run a scorer command over the engine's output; exit 0 means pass. The
+/// output is written to the command's stdin, so a scorer like `grep -q 42`
+/// or a test runner reads it directly.
+fn scorer_passes(scorer: &str, output: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let Ok(mut child) = Command::new("sh")
+        .arg("-c")
+        .arg(scorer)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        return false;
+    };
+    if stdin.write_all(output.as_bytes()).is_err() {
+        return false;
+    }
+    drop(stdin);
+    child.wait().map(|status| status.success()).unwrap_or(false)
+}
+
 /// An engine to benchmark: any agent CLI, with its own args and runner.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchEngine {
@@ -27,7 +53,8 @@ pub struct BenchEngine {
     pub runner: String,
 }
 
-/// One benchmark task. Its result must carry the `require` keys to pass.
+/// One benchmark task. Its result must carry the `require` keys to pass, and
+/// must pass the optional `scorer` command if one is set.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BenchTask {
     pub id: String,
@@ -35,6 +62,10 @@ pub struct BenchTask {
     /// Required top-level keys in the result; scoring uses a result contract.
     #[serde(default)]
     pub require: Vec<String>,
+    /// Optional shell command that scores the result; exit 0 = pass. The
+    /// engine's stdout is written to the command's stdin.
+    #[serde(default)]
+    pub scorer: Option<String>,
 }
 
 /// The `bench.json` file.
@@ -95,11 +126,19 @@ pub async fn run_bench(
                 required: task.require.clone(),
             };
             let missing = contract.violations(&payload);
-            let accepted = missing.is_empty();
+            let contract_ok = missing.is_empty();
+            let scorer_ok = task
+                .scorer
+                .as_ref()
+                .map(|scorer| scorer_passes(scorer, stdout.trim()))
+                .unwrap_or(true);
+            let accepted = contract_ok && scorer_ok;
             let note = if accepted {
                 "ok".to_string()
-            } else {
+            } else if !contract_ok {
                 format!("missing: {}", missing.join(", "))
+            } else {
+                "scorer failed".to_string()
             };
             ferryman_channel::learning::record_learning(
                 route,

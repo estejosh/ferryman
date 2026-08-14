@@ -22,6 +22,7 @@ pub mod migration;
 pub mod portable_auth;
 pub mod skills;
 pub mod source;
+pub mod trajectory;
 pub mod worktree;
 
 use portable_auth::{
@@ -663,6 +664,10 @@ pub struct Order {
     /// order so it cannot be flipped off after issue.
     #[serde(default)]
     pub requires_approval: bool,
+    /// Orders this order depends on; it is not offered for work until each is
+    /// accepted or done. This is the dependency DAG between orders.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1092,21 +1097,49 @@ pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
 
 /// Work this agent should pick up: addressed to it, or open and unclaimed by anyone
 /// ahead of it.
-pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
-    Ok(list_tasks(route)?
-        .into_iter()
-        .filter(|task| match task.state() {
-            TaskState::Open => task
-                .order
-                .assigned_to
-                .as_deref()
-                .is_none_or(|assignee| assignee == agent),
-            TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
-                task.holder() == Some(agent)
+/// Whether every order this order depends on is in a terminal (accepted or
+/// done) state, so it is safe to start. A missing dependency is unsatisfied.
+pub fn dependencies_satisfied(route: &ProjectRoute, order: &Order) -> Result<bool> {
+    for dependency in &order.depends_on {
+        match crate::read_task(route, dependency) {
+            Ok(task) => {
+                if !matches!(task.state(), TaskState::Accepted | TaskState::Done) {
+                    return Ok(false);
+                }
             }
-            _ => false,
-        })
-        .collect())
+            Err(_) => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
+    let mut out = Vec::new();
+    for task in list_tasks(route)? {
+        // An order whose dependencies are not yet done must not be offered.
+        if !dependencies_satisfied(route, &task.order)? {
+            continue;
+        }
+        match task.state() {
+            TaskState::Open => {
+                if task
+                    .order
+                    .assigned_to
+                    .as_deref()
+                    .is_none_or(|assignee| assignee == agent)
+                {
+                    out.push(task);
+                }
+            }
+            TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
+                if task.holder() == Some(agent) {
+                    out.push(task);
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(out)
 }
 
 /// An agent's signing key.
@@ -1323,6 +1356,12 @@ fn order_payload(order: &Order) -> String {
     }
     if order.requires_approval {
         payload.push_str("\napproval:true");
+    }
+    if !order.depends_on.is_empty() {
+        payload.push_str(&format!(
+            "\ndepends:{}",
+            serde_json::to_string(&order.depends_on).unwrap_or_else(|_| "[]".to_string())
+        ));
     }
     payload
 }
@@ -6774,6 +6813,7 @@ mod work_over_files_tests {
             payload: json!({"task": "write the report"}),
             requires_review,
             requires_approval: false,
+            depends_on: Vec::new(),
             signed_by: None,
             signature: None,
             result_contract: None,
@@ -6845,6 +6885,21 @@ mod work_over_files_tests {
         claim_order(&route, "t-1", "nebra").unwrap();
         let task = read_task(&route, "t-1").unwrap();
         assert_eq!(task.holder(), Some("grouchly"), "the assignee holds it");
+    }
+
+    #[test]
+    fn an_order_waits_for_its_dependencies() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        let mut dependent = order("t-2", None, false);
+        dependent.depends_on = vec!["t-1".into()];
+        issue_order(&route, &dependent).unwrap();
+        // t-1 is still open, so t-2 must not be offered for work.
+        assert!(
+            work_for(&route, "grouchly").unwrap().iter().all(|t| t.order.id != "t-2"),
+            "a dependent order must wait for its dependencies"
+        );
+        assert!(dependencies_satisfied(&route, &dependent).unwrap() == false);
     }
 
     #[test]

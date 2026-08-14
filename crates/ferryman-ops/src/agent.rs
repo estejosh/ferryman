@@ -993,6 +993,22 @@ async fn do_work(
         );
     }
     let run = run_agent(config, &workdir, &prompt).await?;
+    // Record the full trajectory (prompt digest + output) for replayable review
+    // and as a corpus for the benchmark. Best-effort: a trajectory write must
+    // never fail the run itself.
+    let _ = ferryman_channel::trajectory::record_trajectory(
+        route,
+        &ferryman_channel::trajectory::Trajectory {
+            order_id: id.clone(),
+            agent: config.agent.clone(),
+            engine: config.command.clone(),
+            revision,
+            at: chrono::Utc::now(),
+            ok: run.ok,
+            prompt_digest: ferryman_channel::trajectory::digest(&prompt),
+            output: ferryman_channel::trajectory::truncate(&run.stdout),
+        },
+    );
 
     let mut payload = json!({
         "output": run.stdout.trim(),
@@ -1293,6 +1309,7 @@ mod tests {
             payload: json!({ "task": "write the report" }),
             requires_review: true,
             requires_approval: false,
+            depends_on: Vec::new(),
             signed_by: None,
             signature: None,
             result_contract: None,

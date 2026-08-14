@@ -364,6 +364,10 @@ enum Channel {
         /// Destructive/sensitive work: only the master may accept the result.
         #[arg(long)]
         requires_approval: bool,
+        /// Order ids this order depends on; repeatable. It is not offered for
+        /// work until each dependency is accepted or done.
+        #[arg(long)]
+        depends_on: Vec<String>,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -2112,6 +2116,7 @@ fn channel(command: Channel) -> Result<()> {
             requires_review,
             require,
             requires_approval,
+            depends_on,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
@@ -2129,6 +2134,7 @@ fn channel(command: Channel) -> Result<()> {
                 payload,
                 requires_review,
                 requires_approval,
+                depends_on,
                 signed_by: None,
                 signature: None,
                 result_contract: if require.is_empty() {

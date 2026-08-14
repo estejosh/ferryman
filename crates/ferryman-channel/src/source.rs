@@ -101,6 +101,7 @@ pub fn to_order(
         }),
         requires_review: true,
         requires_approval: false,
+        depends_on: Vec::new(),
         signed_by: None,
         signature: None,
         result_contract: None,
