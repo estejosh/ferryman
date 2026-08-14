@@ -407,6 +407,17 @@ enum Channel {
         #[command(subcommand)]
         action: TrustAction,
     },
+    /// Choose or inspect this project's master.
+    ///
+    /// The master is the root of trust for a team: their signed declaration
+    /// lives in a separate folder (`<project>-master-ferryman`) synced only to
+    /// their own devices.
+    Master {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[command(subcommand)]
+        action: MasterAction,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -506,6 +517,19 @@ enum TrustAction {
         #[arg(long)]
         capabilities: Option<String>,
     },
+}
+
+/// Subcommands for [`Channel::Master`].
+#[derive(Subcommand, Clone)]
+enum MasterAction {
+    /// Become this project's master: write the signed master declaration.
+    Init {
+        /// The master's name. Defaults to this machine's name.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show this project's master declaration, verifying its signature.
+    Status,
 }
 #[derive(Subcommand, Clone)]
 /// The agentic loop. Every one of these runs unattended and needs no terminal.
@@ -2262,6 +2286,50 @@ fn channel(command: Channel) -> Result<()> {
                     let added = ferryman_channel::add_trusted_signer(&route, grant)?;
                     println!("{}", if added { "added" } else { "no change" });
                 }
+            }
+        }
+        Channel::Master { workspace, action } => {
+            let route = here(workspace)?;
+            match action {
+                MasterAction::Init { name } => {
+                    let master = ferryman_ops::identity::resolve(name, &route.attachment)?;
+                    let identity = ferryman_channel::AgentIdentity::load_or_create(
+                        &master,
+                        &route.attachment,
+                    )?;
+                    let declaration =
+                        ferryman_channel::master::initialize_master(&route, &identity, &master)?;
+                    println!(
+                        "{} is now the master of project {}",
+                        declaration.master, route.project_id
+                    );
+                    println!("three folders a team agent needs:");
+                    println!("  work repository: {}", route.workspace.display());
+                    println!(
+                        "  shared channel:  {}  (Syncthing folder '{}')",
+                        route.communications.display(),
+                        route.shared_remote
+                    );
+                    println!(
+                        "  master folder:   {}  (Syncthing folder '{}')",
+                        route.master_dir().display(),
+                        ferryman_channel::master::master_folder_name(&route.project_id)
+                    );
+                }
+                MasterAction::Status => match ferryman_channel::master::read_master(&route)? {
+                    Some(declaration) => {
+                        println!(
+                            "master {}  signed by {}",
+                            declaration.master,
+                            declaration.signed_by.as_deref().unwrap_or("?")
+                        );
+                        println!("  folder: {}", declaration.folder);
+                        println!("  since:  {}", declaration.created_at.to_rfc3339());
+                    }
+                    None => {
+                        println!("no master yet; run 'ferry channel master init' to choose one")
+                    }
+                },
             }
         }
     }

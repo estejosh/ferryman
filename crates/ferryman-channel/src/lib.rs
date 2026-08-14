@@ -14,6 +14,7 @@ use std::{
 
 pub mod ledger;
 pub mod licensing;
+pub mod master;
 pub mod migration;
 pub mod portable_auth;
 
@@ -267,6 +268,14 @@ impl ProjectRoute {
                 && capability
                     .is_none_or(|required| agent.capabilities.iter().any(|item| item == required))
         })
+    }
+
+    /// The master's root-of-trust folder, local to this machine. A separate
+    /// Syncthing folder (`<project>-master-ferryman`) synced only to the
+    /// master's own devices.
+    #[must_use]
+    pub fn master_dir(&self) -> PathBuf {
+        self.attachment.join("master")
     }
 }
 
