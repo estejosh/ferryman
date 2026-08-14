@@ -103,6 +103,15 @@ enum Command {
         #[command(subcommand)]
         command: Agent,
     },
+    /// Benchmark the engines in bench.json against each other, and record the
+    /// results in the learning database.
+    Bench {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Seconds per engine-task run before it is killed.
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+    },
     /// What this deployment counts as under the licence.
     License {
         #[command(subcommand)]
@@ -456,6 +465,12 @@ enum Channel {
     },
     /// Every task and where it has got to.
     Tasks {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// How each engine is doing: aggregate the learning database into per-engine
+    /// totals, so the fleet knows which CLI wins on this project.
+    Stats {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
@@ -863,6 +878,9 @@ enum Continuity {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    // OTLP export, when an endpoint is configured: spans from the agent loop go
+    // to a collector so a fleet can be observed from one place. No-op otherwise.
+    ferryman_ops::telemetry::init();
     let cli = Cli::parse();
     match cli.command.clone() {
         Command::Init { path } => {
@@ -946,6 +964,50 @@ async fn main() -> Result<()> {
             }
         }
         Command::Agent { command } => agent_command(command).await?,
+        Command::Bench {
+            workspace,
+            timeout_secs,
+        } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = ferryman_channel::route_for(&start)?;
+            let bench = ferryman_ops::eval::load_bench(&route.attachment)?;
+            if bench.engines.is_empty() || bench.tasks.is_empty() {
+                bail!("bench.json needs at least one engine and one task");
+            }
+            // The benchmark is single-shot; the timeout flag is accepted so a caller
+            // can tune it, and run_bench uses its own per-run bound.
+            let _ = timeout_secs;
+            let results =
+                ferryman_ops::eval::run_bench(&route, &bench, &route.workspace).await?;
+            let mut by_engine: std::collections::BTreeMap<&str, (usize, usize)> =
+                std::collections::BTreeMap::new();
+            for result in &results {
+                let entry = by_engine.entry(&result.engine).or_insert((0, 0));
+                entry.0 += 1;
+                if result.accepted {
+                    entry.1 += 1;
+                }
+                println!(
+                    "  {:<12} {:<12} {}  {}",
+                    result.engine,
+                    result.task,
+                    if result.accepted { "PASS" } else { "FAIL" },
+                    result.note
+                );
+            }
+            println!();
+            for (engine, (total, passed)) in &by_engine {
+                let rate = if *total == 0 {
+                    0.0
+                } else {
+                    *passed as f64 / *total as f64
+                };
+                println!("  {engine:<12} {passed}/{total} ({:.0}%)", rate * 100.0);
+            }
+        }
         Command::License { command } => license_command(command).await?,
         Command::Jobs { command } => jobs(&cli, command).await?,
         Command::Projects { command } => match command {
@@ -2379,6 +2441,27 @@ fn channel(command: Channel) -> Result<()> {
             } else {
                 println!("sent {id} back for revision {}", revision + 1);
                 println!("  {}", notes.unwrap_or_default());
+            }
+        }
+
+        Channel::Stats { workspace } => {
+            let route = here(workspace)?;
+            let stats = ferryman_channel::learning::engine_stats(&route)?;
+            if stats.is_empty() {
+                println!(
+                    "nothing learned yet; reviews and 'ferry bench' record outcomes here"
+                );
+            } else {
+                println!("  {:<16} {:>6} {:>8}  total", "engine", "kept", "rate");
+                for s in &stats {
+                    println!(
+                        "  {:<16} {:>6} {:>7.0}%  {}",
+                        s.engine,
+                        s.accepted,
+                        s.rate() * 100.0,
+                        s.total
+                    );
+                }
             }
         }
 

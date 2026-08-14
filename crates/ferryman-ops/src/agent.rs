@@ -510,6 +510,39 @@ async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Resu
     })
 }
 
+/// Run any engine (agent CLI) over a prompt and return what it printed.
+///
+/// This is `run_agent` generalised past this machine's `agent.toml`, so a
+/// benchmark can drive several engines - deepseek, codex, claude, a local model
+/// - and compare them. Reuses the same runner/sandbox and timeout handling.
+#[tracing::instrument(name = "run_engine", skip_all, fields(command = %command, engine = %command))]
+pub async fn run_engine_prompt(
+    runner: &Runner,
+    command: &str,
+    args: &[String],
+    workspace: &Path,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let config = AgentConfig::parse(&format!(
+        "agent = \"bench\"\ncommand = \"{}\"\nargs = {}\ntimeout_secs = \"{}\"\n",
+        command,
+        serde_json::to_string(args)?,
+        timeout.as_secs(),
+    ))?;
+    let mut config = config;
+    config.runner = runner.clone();
+    let run = run_agent(&config, workspace, prompt).await?;
+    if !run.ok {
+        bail!(
+            "'{}' failed: {}",
+            command,
+            run.stderr.trim().lines().next().unwrap_or("no output")
+        );
+    }
+    Ok(run.stdout)
+}
+
 /// The prompt for a first attempt, or for a revision.
 ///
 /// A revision deliberately repeats the original task, the rejected attempt and the
@@ -720,6 +753,7 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
     })
 }
 
+#[tracing::instrument(name = "work_once", skip(route, config, report), fields(agent = %config.agent, project = %route.project_id))]
 pub async fn work_once(
     route: &ProjectRoute,
     config: &AgentConfig,
@@ -796,6 +830,7 @@ pub async fn work_once(
     Ok(acted)
 }
 
+#[tracing::instrument(name = "do_work", skip(route, config, identity, task, report), fields(order = %task.order.id, agent = %config.agent))]
 async fn do_work(
     route: &ProjectRoute,
     config: &AgentConfig,

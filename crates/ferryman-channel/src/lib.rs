@@ -14,6 +14,7 @@ use std::{
 
 pub mod contract;
 pub mod interrupt;
+pub mod learning;
 pub mod ledger;
 pub mod licensing;
 pub mod master;
@@ -910,6 +911,15 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
     let path =
         task_dir(route, &review.order_id).join(format!("review.{:03}.json", review.revision));
     write_task_file(&path, review)?;
+    // The fleet learns from every verdict: record which engine produced the
+    // result and whether it was kept, so later work can be steered to what wins.
+    let _ = crate::learning::record_outcome(
+        route,
+        &review.order_id,
+        review.revision,
+        review.accepted,
+        review.notes.as_deref().unwrap_or(""),
+    );
     Ok(path)
 }
 

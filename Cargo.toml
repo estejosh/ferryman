@@ -40,6 +40,10 @@ http-body-util = "0.1"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client"] }
+tracing-opentelemetry = "0.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_jcs = "0.2"
 serde_json = "1.0"
