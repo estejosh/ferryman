@@ -2,9 +2,9 @@
 
 ## Design constraints
 
-The core orchestrates durable units of work; it does not execute models, decide a project's business logic, or claim to sandbox arbitrary native code. Local single-node correctness comes before distributed scale.
+The core orchestrates durable units of work; it does not execute models, decide a project's business logic, or claim to sandbox arbitrary native code. Per-machine correctness comes before fleet-wide scale, but the design is multi-machine from the start: the channel is a Syncthing-carried shared folder with a private-Git backstop, not a single-node store.
 
-Ferryman is one machine-wide application. Each attached project has an
+Ferryman is one application that runs on every machine in a fleet. Each attached project has an
 outer machine-local `.ferryman` attachment and an inner portable
 `.ferryman/ferryman` communications repository. Live message delivery uses
 local filesystem, then a Syncthing-carried shared folder, then private Git as a

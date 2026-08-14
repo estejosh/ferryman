@@ -64,7 +64,7 @@ Publish this repository as a transparent, self-hostable **reference implementati
 3. Add GitHub labels, issue forms for bugs/security-sensitive reports/feature proposals, Discussions guidance, and maintainers/ownership information.
 4. Configure branch protection: required formatting, Clippy, tests, audit, OpenAPI validation, and code review.
 5. Produce signed release binaries/checksums and a container image only after the security/test gates pass.
-6. Add a repository banner: “Reference implementation; local single-node preview” until the production milestones are complete.
+6. Add a repository banner: “Self-hosted, local-first team coordination — reference implementation” until the production milestones are complete.
 
 **Done when:** a visitor can understand scope in under a minute, reproduce the demo, report a vulnerability safely, and verify a release artifact.
 

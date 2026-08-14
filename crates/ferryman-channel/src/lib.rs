@@ -64,6 +64,30 @@ const SENSITIVE_CHILD_ENVIRONMENT: &[&str] = &[
     "HUGGINGFACE_TOKEN",
     "OMNIROUTE_API_KEY",
     "ARENA_COOKIE",
+    "NVIDIA_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENROUTER_API_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
+    "GITLAB_TOKEN",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_ACCESS_KEY_ID",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_API_KEY",
+    "CODEX_API_KEY",
+];
+
+/// Name fragments that mark an environment variable as secret, so a new
+/// provider's key is scrubbed even before it is added to the explicit list.
+const SECRET_NAME_HINTS: &[&str] = &[
+    "API_KEY",
+    "AUTH_TOKEN",
+    "ACCESS_TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSPHRASE",
+    "CREDENTIAL",
+    "PRIVATE_KEY",
 ];
 #[cfg(windows)]
 const NULL_GIT_HOOKS_PATH: &str = "NUL";
@@ -634,6 +658,11 @@ pub struct Order {
     /// Whether the result must be reviewed before the task is done.
     #[serde(default)]
     pub requires_review: bool,
+    /// Destructive or sensitive work: the accept must come from the master — a
+    /// separate principal — never the agent that did the work. Signed into the
+    /// order so it cannot be flipped off after issue.
+    #[serde(default)]
+    pub requires_approval: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -908,6 +937,27 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
             .is_none_or(|notes| notes.trim().is_empty())
     {
         bail!("sending work back requires notes saying what to change")
+    }
+    // Independent approval: an order marked `requires_approval` may only be
+    // accepted by the master (a separate principal), never by the agent that
+    // produced the work. Enforced here so no code path can self-approve.
+    if review.accepted {
+        let task = crate::read_task(route, &review.order_id)?;
+        if task.order.requires_approval {
+            let worker = task
+                .results
+                .iter()
+                .find(|r| r.revision == review.revision)
+                .map(|r| r.agent.as_str());
+            if worker == Some(review.reviewer.as_str()) {
+                bail!("an agent cannot approve its own work")
+            }
+            match crate::master::read_master(route)? {
+                Some(master) if master.master == review.reviewer => {}
+                Some(_) => bail!("order requires master approval"),
+                None => bail!("order requires approval but no master is declared"),
+            }
+        }
     }
     let path =
         task_dir(route, &review.order_id).join(format!("review.{:03}.json", review.revision));
@@ -1232,7 +1282,7 @@ impl AgentIdentity {
 }
 
 fn order_payload(order: &Order) -> String {
-    let base = format!(
+    let mut payload = format!(
         "ferryman-order-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         order.id,
         order.project_id,
@@ -1242,15 +1292,18 @@ fn order_payload(order: &Order) -> String {
         order.requires_review,
         payload_digest(&order.payload),
     );
-    // The contract is bound to the signature only when present, so an order with
-    // no contract keeps the exact bytes it always had and still verifies.
-    match &order.result_contract {
-        None => base,
-        Some(contract) => format!(
-            "{base}\ncontract:{}",
+    // Optional fields are bound to the signature only when present, so an order
+    // with neither keeps the exact bytes it always had and still verifies.
+    if let Some(contract) = &order.result_contract {
+        payload.push_str(&format!(
+            "\ncontract:{}",
             serde_json::to_string(&contract.required).unwrap_or_else(|_| "[]".to_string())
-        ),
+        ));
     }
+    if order.requires_approval {
+        payload.push_str("\napproval:true");
+    }
+    payload
 }
 
 fn result_payload(result: &TaskResult) -> String {
@@ -2519,6 +2572,17 @@ fn run_with_timeout(command: &mut Command, timeout: Duration, label: &str) -> Re
 fn scrub_sensitive_child_environment(command: &mut Command) {
     for name in SENSITIVE_CHILD_ENVIRONMENT {
         command.env_remove(name);
+    }
+    // Pattern sweep: anything that looks secret by name is removed too, so a
+    // provider key we have not listed is still never inherited by a child.
+    for (name, _) in std::env::vars() {
+        let upper = name.to_ascii_uppercase();
+        if SECRET_NAME_HINTS
+            .iter()
+            .any(|hint| upper.contains(hint) && !name.starts_with("GIT_"))
+        {
+            command.env_remove(&name);
+        }
     }
 }
 
@@ -6615,6 +6679,7 @@ mod work_over_files_tests {
             created_at: Utc::now(),
             payload: json!({"task": "write the report"}),
             requires_review,
+            requires_approval: false,
             signed_by: None,
             signature: None,
             result_contract: None,
@@ -6639,6 +6704,40 @@ mod work_over_files_tests {
         assert!(
             issue_order(&route, &order("t-1", None, false)).is_err(),
             "two writers on one path is the one thing a synced folder cannot survive"
+        );
+    }
+
+    #[test]
+    fn an_approval_required_order_cannot_be_self_approved() {
+        let (_t, route) = channel();
+        let mut order = order("t-1", None, true);
+        order.requires_approval = true;
+        issue_order(&route, &order).unwrap();
+        let result = TaskResult {
+            order_id: "t-1".into(),
+            agent: "worker".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({"output": "x"}),
+            signed_by: None,
+            signature: None,
+        };
+        submit_result(&route, &result).unwrap();
+        // The worker that produced the result tries to accept its own work.
+        let review = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "worker".into(),
+            reviewed_at: Utc::now(),
+            accepted: true,
+            notes: None,
+            signed_by: None,
+            signature: None,
+        };
+        let error = submit_review(&route, &review).unwrap_err().to_string();
+        assert!(
+            error.contains("cannot approve its own work"),
+            "self-approval must be rejected: {error}"
         );
     }
 

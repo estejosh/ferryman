@@ -100,6 +100,7 @@ pub fn to_order(
             "source_id": ticket.id,
         }),
         requires_review: true,
+        requires_approval: false,
         signed_by: None,
         signature: None,
         result_contract: None,

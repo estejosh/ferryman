@@ -361,6 +361,9 @@ enum Channel {
         /// Repeatable; results missing any of these are flagged as malformed.
         #[arg(long)]
         require: Vec<String>,
+        /// Destructive/sensitive work: only the master may accept the result.
+        #[arg(long)]
+        requires_approval: bool,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -2108,6 +2111,7 @@ fn channel(command: Channel) -> Result<()> {
             task,
             requires_review,
             require,
+            requires_approval,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
@@ -2124,6 +2128,7 @@ fn channel(command: Channel) -> Result<()> {
                 created_at: chrono::Utc::now(),
                 payload,
                 requires_review,
+                requires_approval,
                 signed_by: None,
                 signature: None,
                 result_contract: if require.is_empty() {

@@ -1251,6 +1251,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             payload: json!({ "task": "write the report" }),
             requires_review: true,
+            requires_approval: false,
             signed_by: None,
             signature: None,
             result_contract: None,
