@@ -1,7 +1,8 @@
 # Production readiness plan
 
 **Written:** 2026-08-13 (Friday) — for orchestrator review Monday.
-**Branch:** `feat/portable-auth-v2` (all work below is committed there).
+**Last updated:** 2026-08-14 (end of session).
+**Branches (dependency order):** `feat/portable-auth-v2` → `feat/groundcrew-borrows` → `feat/always-on-fleet` → `feat/learn-and-observe` → `feat/skills` → `feat/ready-hardening`.
 
 This is the single source of truth for what it takes to reach production/live
 status. When an item changes, update this file — not the chat.
@@ -41,6 +42,47 @@ repository banner, and the README.
 - **Team-awareness + enforcement** — `integration_mode` read; `grants =
   "required"` gates the agent loop on master grants; `grants = "open"` (default)
   is full permissions.
+
+---
+
+## 1.5 Session-2 status (2026-08-14)
+
+One session added five feature branches and three production blockers:
+
+- **Built:** pluggable runner (`none`/`podman`/`docker` + `net=` egress policy),
+  task sources, worktree-per-task, interrupt mode, always-on triggers, result
+  contracts, learning DB + `ferry bench`/`ferry channel stats`, OTLP export,
+  `SKILL.md` skills, repo roadmap.
+- **Ready blockers done this session:** B1's sandbox half (runner) and
+  independent approval (`requires_approval`, no self-approval), B5 (git
+  subprocess secret sweep), B7 (label fix).
+- **Still open:** B3 (worker credential separation), B4 (distributed message
+  claims), B6 (release checklist).
+
+### B4 — distributed message claims: deferred with a design note
+
+`claim_message_v2` writes its processed-marker to the machine-local
+`attachment/runtime/processed`. Fixing the double-claim needs the marker moved
+into the synced channel, keyed per recipient. This is subtle because a message
+to `all` must be processed once *per machine*, whereas a message to a named
+agent must be processed once *total* — the claim model differs by recipient
+class. This needs an orchestrator decision on broadcast semantics before the
+change; documented rather than rushed, because the adjacent code is
+replay-protection-critical.
+
+### Next build sequence ("better", agreed 2026-08-14)
+
+1. Plan/spec artifact + dependency DAG.
+2. Session trajectory capture/replay (kept in channel memory).
+3. Credential injection (runner).
+4. Native event adapters (GitHub/Linear/webhook).
+5. Eval scorer command.
+6. Web dashboard.
+7. Cost/token accounting + reduction suggestions.
+8. BYO-key manager (easy key insertion, no `.env` hand-editing).
+9. At-rest/payload encryption.
+10. Cross-project master console + memory.
+11. hone integration (marketplace/orchestration) — see `docs/HONE_INTEGRATION.md`.
 
 ---
 
