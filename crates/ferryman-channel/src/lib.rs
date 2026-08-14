@@ -1920,7 +1920,7 @@ mod portable_auth_route_tests {
             signers: vec![SignerGrant {
                 public_key: hex::encode(signing.verifying_key().as_bytes()),
                 projects: vec!["ferryman".into()],
-                roles: vec!["orchestrator".into()],
+                roles: vec!["orchestrator".into(), "worker".into()],
                 capabilities: vec!["issue".into()],
             }],
         };

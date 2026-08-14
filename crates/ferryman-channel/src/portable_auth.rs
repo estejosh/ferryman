@@ -129,6 +129,18 @@ impl SignerGrant {
             .map_err(|_| anyhow::anyhow!("trusted signer public key must be 32 bytes"))?;
         VerifyingKey::from_bytes(&bytes).context("trusted signer public key is invalid")
     }
+
+    /// Check that this grant authorizes the signer to act on `project_id` as
+    /// `sender`. Empty `projects`/`roles` mean no restriction.
+    pub fn authorize(&self, project_id: &str, sender: &str) -> Result<()> {
+        if !self.projects.is_empty() && !self.projects.iter().any(|p| p == project_id) {
+            bail!("signer is not authorized for project '{project_id}'");
+        }
+        if !self.roles.is_empty() && !self.roles.iter().any(|role| role == sender) {
+            bail!("signer is not authorized to send as '{sender}'");
+        }
+        Ok(())
+    }
 }
 
 /// The outer, unsynchronized trust store (`trusted-signers.toml`).
@@ -322,6 +334,7 @@ impl MessageV2 {
             &canonical,
             &self.authentication.signature,
         )?;
+        grant.authorize(&self.project_id, &self.sender)?;
         SignerId::parse(&self.authentication.signer_id)
     }
 }
@@ -378,6 +391,7 @@ impl AcknowledgementV2 {
             &canonical,
             &self.authentication.signature,
         )?;
+        grant.authorize(&self.project_id, &self.recipient)?;
         SignerId::parse(&self.authentication.signer_id)
     }
 }
@@ -396,9 +410,9 @@ mod tests {
         TrustedSigners {
             signers: vec![SignerGrant {
                 public_key: hex::encode(key.verifying_key().as_bytes()),
-                projects: vec!["ferryman".into()],
-                roles: vec!["orchestrator".into()],
-                capabilities: vec!["issue".into(), "acknowledge".into()],
+                projects: vec![],
+                roles: vec![],
+                capabilities: vec![],
             }],
         }
     }
@@ -551,5 +565,78 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ledger = ReplayLedger::load(&dir.path().join("absent.json")).unwrap();
         assert!(ledger.accepted.is_empty());
+    }
+
+    #[test]
+    fn tampering_routing_fields_fails_verification() {
+        let signing = key();
+        let trusted = trust_for(&signing);
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({"a": 1}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+
+        let mut tampered = message.clone();
+        tampered.sender = "impostor".into();
+        assert!(tampered.verify(&trusted).is_err());
+
+        let mut tampered = message.clone();
+        tampered.recipient = "impostor".into();
+        assert!(tampered.verify(&trusted).is_err());
+
+        let mut tampered = message.clone();
+        tampered.project_id = "other-project".into();
+        assert!(tampered.verify(&trusted).is_err());
+    }
+
+    #[test]
+    fn a_signer_not_authorized_for_the_project_is_rejected() {
+        let signing = key();
+        let trusted = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["some-other-project".into()],
+                roles: vec![],
+                capabilities: vec![],
+            }],
+        };
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        assert!(message.verify(&trusted).is_err());
+    }
+
+    #[test]
+    fn a_signer_not_authorized_for_the_sender_role_is_rejected() {
+        let signing = key();
+        let trusted = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec![],
+                roles: vec!["someone-else".into()],
+                capabilities: vec![],
+            }],
+        };
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+        assert!(message.verify(&trusted).is_err());
     }
 }
