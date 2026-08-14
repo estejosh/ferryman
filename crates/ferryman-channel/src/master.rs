@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentIdentity, ProjectRoute, SignatureCheck, check_signature};
+use crate::{AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck, check_signature};
 
 /// The canonical Syncthing folder ID for a project's master folder.
 ///
@@ -163,6 +163,150 @@ pub fn transfer_master(
     Ok(declaration)
 }
 
+/// A master-signed grant of roles/capabilities to one member.
+///
+/// This is the authority model: the master signs what a member may do, and every
+/// member can verify that signature against the master's published key. It is
+/// separate from the declaration (who *is* master) and from the trust store
+/// (which keys are recognised): a grant says what *this* member may do.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MasterGrant {
+    /// The member's name (an agent or operator name).
+    pub grantee: String,
+    /// The member's Ed25519 public key, hex encoded.
+    pub public_key: String,
+    #[serde(default)]
+    pub projects: Vec<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    pub granted_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+fn grants_dir(route: &ProjectRoute) -> PathBuf {
+    route.communications.join("grants")
+}
+
+fn grant_path(route: &ProjectRoute, grantee: &str) -> PathBuf {
+    grants_dir(route).join(format!("{grantee}.json"))
+}
+
+/// Exactly what a grant signature covers.
+fn grant_payload(grant: &MasterGrant) -> String {
+    format!(
+        "ferryman-master-grant-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        grant.grantee,
+        grant.public_key,
+        grant.projects.join(","),
+        grant.roles.join(","),
+        grant.capabilities.join(","),
+        grant.granted_at.to_rfc3339(),
+    )
+}
+
+/// The master's roster entry, if the master is declared and in the roster.
+fn master_agent(route: &ProjectRoute) -> Result<Option<AgentRoute>> {
+    let Some(declaration) = read_master(route)? else {
+        return Ok(None);
+    };
+    Ok(route
+        .agents
+        .iter()
+        .find(|agent| agent.name == declaration.master)
+        .cloned())
+}
+
+/// Grant roles/capabilities to a member, signed by the master.
+pub fn grant_member(
+    route: &ProjectRoute,
+    master: &AgentIdentity,
+    grantee: &str,
+    public_key: &str,
+    projects: Vec<String>,
+    roles: Vec<String>,
+    capabilities: Vec<String>,
+) -> Result<MasterGrant> {
+    if !crate::is_safe_component(grantee) {
+        bail!("grantee name must be a path-safe identifier");
+    }
+    let Some(declaration) = read_master(route)? else {
+        bail!("this project has no master yet");
+    };
+    if declaration.master != master.name() {
+        bail!("only the master ({}) may grant roles", declaration.master);
+    }
+
+    let mut grant = MasterGrant {
+        grantee: grantee.to_owned(),
+        public_key: public_key.to_owned(),
+        projects,
+        roles,
+        capabilities,
+        granted_at: Utc::now(),
+        signed_by: None,
+        signature: None,
+    };
+    let signature = master.signing.sign(grant_payload(&grant).as_bytes());
+    grant.signed_by = Some(master.name().to_owned());
+    grant.signature = Some(hex::encode(signature.to_bytes()));
+
+    let directory = grants_dir(route);
+    fs::create_dir_all(&directory)?;
+    crate::atomic_json(&grant_path(route, grantee), &grant)?;
+    Ok(grant)
+}
+
+/// Every grant in the channel, each with its verification status against the
+/// master's published key.
+pub fn member_grants(route: &ProjectRoute) -> Result<Vec<(MasterGrant, SignatureCheck)>> {
+    let directory = grants_dir(route);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let master = master_agent(route)?;
+    let mut grants = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Ok(grant) = serde_json::from_str::<MasterGrant>(&fs::read_to_string(&path)?) else {
+            continue;
+        };
+        let check = match &master {
+            Some(master) => check_signature(
+                grant.signed_by.as_ref(),
+                grant.signature.as_ref(),
+                &grant_payload(&grant),
+                std::slice::from_ref(master),
+            ),
+            None => SignatureCheck::UnknownSigner,
+        };
+        grants.push((grant, check));
+    }
+    grants.sort_by(|a, b| a.0.grantee.cmp(&b.0.grantee));
+    Ok(grants)
+}
+
+/// Whether `grantee` holds a valid master-signed grant for `role` on this
+/// project. In team mode this is the gate that decides who may act.
+pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
+    for (grant, check) in member_grants(route)? {
+        if grant.grantee == grantee
+            && check == SignatureCheck::Valid
+            && (grant.roles.is_empty() || grant.roles.iter().any(|r| r == role))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +410,59 @@ mod tests {
         // A non-master cannot transfer.
         let mallory = AgentIdentity::load_or_create_in("mallory", &route.attachment, None).unwrap();
         assert!(transfer_master(&route, &mallory, "carol").is_err());
+    }
+
+    #[test]
+    fn master_grants_roles_to_a_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        fs::create_dir_all(&route.attachment).unwrap();
+        let johnny = AgentIdentity::load_or_create_in("johnny", &route.attachment, None).unwrap();
+        let bob = AgentIdentity::load_or_create_in("bob", &route.attachment, None).unwrap();
+        route.agents = vec![
+            AgentRoute {
+                name: "johnny".into(),
+                role: "worker".into(),
+                capabilities: vec![],
+                public_key: Some(johnny.public_key_hex()),
+            },
+            AgentRoute {
+                name: "bob".into(),
+                role: "worker".into(),
+                capabilities: vec![],
+                public_key: Some(bob.public_key_hex()),
+            },
+        ];
+
+        initialize_master(&route, &johnny, "johnny").unwrap();
+        grant_member(
+            &route,
+            &johnny,
+            "bob",
+            &bob.public_key_hex(),
+            vec!["hone".into()],
+            vec!["worker".into()],
+            vec!["code".into()],
+        )
+        .unwrap();
+
+        assert!(is_granted(&route, "bob", "worker").unwrap());
+        assert!(!is_granted(&route, "bob", "orchestrator").unwrap());
+        assert!(!is_granted(&route, "carol", "worker").unwrap());
+
+        // A non-master cannot grant.
+        let mallory = AgentIdentity::load_or_create_in("mallory", &route.attachment, None).unwrap();
+        assert!(
+            grant_member(
+                &route,
+                &mallory,
+                "carol",
+                &mallory.public_key_hex(),
+                vec![],
+                vec![],
+                vec![],
+            )
+            .is_err()
+        );
     }
 }

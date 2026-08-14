@@ -538,6 +538,22 @@ enum MasterAction {
         /// The name of the new master.
         name: String,
     },
+    /// Grant roles/capabilities to a member. Signed by the master.
+    Grant {
+        /// The member's name.
+        name: String,
+        /// The member's hex Ed25519 public key.
+        #[arg(long)]
+        public_key: String,
+        /// Comma-separated roles; empty means any role.
+        #[arg(long)]
+        roles: Option<String>,
+        /// Comma-separated capabilities; empty means none required.
+        #[arg(long)]
+        capabilities: Option<String>,
+    },
+    /// List the master's grants and whether each verifies.
+    Grants,
 }
 #[derive(Subcommand, Clone)]
 /// The agentic loop. Every one of these runs unattended and needs no terminal.
@@ -1737,6 +1753,14 @@ fn channel(command: Channel) -> Result<()> {
             println!("project        {}", route.project_id);
             println!("channel        {}", route.communications.display());
             println!(
+                "mode           {}",
+                if route.is_team() {
+                    "team (master-gated)"
+                } else {
+                    "single-agent / unmanaged"
+                }
+            );
+            println!(
                 "syncthing      {}",
                 if route.shared_remote.is_empty() {
                     "(no folder id configured)".to_string()
@@ -2355,6 +2379,62 @@ fn channel(command: Channel) -> Result<()> {
                         "master role transferred to {} (disclaimed by {})",
                         declaration.master, current
                     );
+                }
+                MasterAction::Grant {
+                    name,
+                    public_key,
+                    roles,
+                    capabilities,
+                } => {
+                    let current = match ferryman_channel::master::read_master(&route)? {
+                        Some(declaration) => declaration.master,
+                        None => bail!("this project has no master yet"),
+                    };
+                    let identity = ferryman_channel::AgentIdentity::load_or_create(
+                        &current,
+                        &route.attachment,
+                    )?;
+                    let split = |value: Option<&String>| -> Vec<String> {
+                        value
+                            .map(|v| {
+                                v.split(',')
+                                    .filter(|item| !item.trim().is_empty())
+                                    .map(|item| item.trim().to_owned())
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    let grant = ferryman_channel::master::grant_member(
+                        &route,
+                        &identity,
+                        &name,
+                        &public_key,
+                        vec![route.project_id.clone()],
+                        split(roles.as_ref()),
+                        split(capabilities.as_ref()),
+                    )?;
+                    println!(
+                        "granted {} roles=[{}] capabilities=[{}] (signed by {})",
+                        grant.grantee,
+                        grant.roles.join(","),
+                        grant.capabilities.join(","),
+                        current
+                    );
+                }
+                MasterAction::Grants => {
+                    let grants = ferryman_channel::master::member_grants(&route)?;
+                    if grants.is_empty() {
+                        println!("no grants yet");
+                    }
+                    for (grant, check) in grants {
+                        println!(
+                            "{}  roles=[{}]  capabilities=[{}]  {:?}",
+                            grant.grantee,
+                            grant.roles.join(","),
+                            grant.capabilities.join(","),
+                            check
+                        );
+                    }
                 }
             }
         }

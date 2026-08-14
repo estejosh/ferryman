@@ -277,6 +277,14 @@ impl ProjectRoute {
     pub fn master_dir(&self) -> PathBuf {
         self.attachment.join("master")
     }
+
+    /// Whether this project runs as a multi-agent team (vs `single-agent` or
+    /// `unmanaged`). Teams are the mode where the master's grants gate who may
+    /// act.
+    #[must_use]
+    pub fn is_team(&self) -> bool {
+        bridge_field(&self.attachment, "integration_mode") == "multi-agent"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2285,6 +2293,28 @@ pub fn load_route(attachment: &Path) -> Result<ProjectRoute> {
     };
     route.validate()?;
     Ok(route)
+}
+
+/// Read one key from the attachment's `bridge.toml`, or an empty string when the
+/// file or key is absent. Used for fields that inform behaviour but are not part
+/// of the route's structural identity.
+fn bridge_field(attachment: &Path, key: &str) -> String {
+    let path = attachment.join("bridge.toml");
+    let Ok(text) = fs::read_to_string(&path) else {
+        return String::new();
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((field, value)) = line.split_once('=')
+            && field.trim() == key
+        {
+            return value.trim().trim_matches('"').to_owned();
+        }
+    }
+    String::new()
 }
 
 /// The agents taking part, read from the channel itself.
