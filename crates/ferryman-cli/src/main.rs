@@ -474,6 +474,14 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// List the team's shared skills, and which would load for a task.
+    Skills {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Show which skills would match this task text.
+        #[arg(long)]
+        task: Option<String>,
+    },
     /// Everything that has happened in this channel, oldest last.
     ///
     /// Orders, claims, results, reviews and messages, merged into one timeline with
@@ -2441,6 +2449,30 @@ fn channel(command: Channel) -> Result<()> {
             } else {
                 println!("sent {id} back for revision {}", revision + 1);
                 println!("  {}", notes.unwrap_or_default());
+            }
+        }
+
+        Channel::Skills { workspace, task } => {
+            let route = here(workspace)?;
+            let skills = ferryman_channel::skills::load_skills(&route)?;
+            if skills.is_empty() {
+                println!(
+                    "no skills yet; add SKILL.md files under {}/skills",
+                    route.communications.display()
+                );
+            } else {
+                let matched: Vec<&ferryman_channel::skills::Skill> = match &task {
+                    Some(task) => ferryman_channel::skills::route(&skills, task),
+                    None => Vec::new(),
+                };
+                for skill in &skills {
+                    let tag = if matched.iter().any(|m| m.name == skill.name) {
+                        "  -> matches"
+                    } else {
+                        ""
+                    };
+                    println!("  {:<24} {}{}", skill.name, skill.description, tag);
+                }
             }
         }
 

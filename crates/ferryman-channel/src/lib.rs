@@ -20,6 +20,7 @@ pub mod licensing;
 pub mod master;
 pub mod migration;
 pub mod portable_auth;
+pub mod skills;
 pub mod source;
 pub mod worktree;
 

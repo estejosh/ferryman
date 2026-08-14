@@ -586,9 +586,20 @@ fn with_preamble(config: &AgentConfig, rest: String) -> String {
     }
 }
 
+/// The prompt for a first attempt or revision, without task-matched skills.
+/// Kept as the test-facing entry point; the worker uses
+/// [`work_prompt_with_skills`].
+#[cfg(test)]
 fn work_prompt(config: &AgentConfig, task: &Task) -> String {
+    work_prompt_with_skills(config, task, "")
+}
+
+/// `work_prompt`, with task-matched skills injected after the preamble and
+/// before the publishing notice, so the standing context still leads and the
+/// task-specific expertise sits just ahead of the work.
+fn work_prompt_with_skills(config: &AgentConfig, task: &Task, skills_text: &str) -> String {
     let request = format!(
-        "{PUBLISHING_NOTICE}{}",
+        "{skills_text}{PUBLISHING_NOTICE}{}",
         task.order
             .payload
             .get("task")
@@ -904,7 +915,12 @@ async fn do_work(
         }
     }
 
-    let mut prompt = work_prompt(config, task);
+    // Task-matched skills: load the team's shared SKILL.md expertise and inject
+    // only the skills whose description overlaps this task.
+    let skills = ferryman_channel::skills::load_skills(route).unwrap_or_default();
+    let matched = ferryman_channel::skills::route(&skills, &task.order.payload.to_string());
+    let skills_text = ferryman_channel::skills::render(&matched);
+    let mut prompt = work_prompt_with_skills(config, task, &skills_text);
     if let Some(note) = steer {
         prompt = format!(
             "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"
