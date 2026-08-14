@@ -66,6 +66,9 @@ enum Command {
         /// Become this project's master. Ask the user first; this is an explicit choice.
         #[arg(long)]
         master: bool,
+        /// Container image to sandbox the agent CLI in; empty means run it bare.
+        #[arg(long)]
+        sandbox: Option<String>,
         /// Emit one JSON object describing the result, for a caller that is a program.
         #[arg(long)]
         json: bool,
@@ -770,6 +773,7 @@ async fn main() -> Result<()> {
             review,
             no_syncthing,
             master,
+            sandbox,
             json: as_json,
         } => {
             let outcome = enable::perform(enable::Request {
@@ -783,6 +787,7 @@ async fn main() -> Result<()> {
                 no_syncthing,
                 as_json,
                 master,
+                sandbox,
             })?;
             if as_json {
                 report_enable_json(&outcome)?;

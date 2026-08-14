@@ -167,6 +167,7 @@ mod tests {
                 "claude",
                 &["-p".to_string(), "{prompt}".to_string()],
                 crate::agent::ReviewMode::Confirm,
+                None,
             ),
         )
         .unwrap();

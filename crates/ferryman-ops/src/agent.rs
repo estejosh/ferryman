@@ -82,6 +82,9 @@ pub struct AgentConfig {
     /// prompt; everything else is untouched, so a different CLI's flags need a config
     /// edit rather than a new build.
     pub args: Vec<String>,
+    /// A container image to run the agent CLI inside, if any. Empty means the
+    /// agent runs directly on the host with this user's full privileges.
+    pub sandbox: Option<String>,
     pub timeout: Duration,
     pub review: ReviewMode,
     /// Megabytes of memory to leave available. Below this the agent does not claim, so
@@ -206,6 +209,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| "worker".to_string()),
             command: take("command")?,
             args,
+            sandbox: fields.get("sandbox").cloned().filter(|s| !s.is_empty()),
             timeout: Duration::from_secs(number("timeout_secs", 900)?),
             review: ReviewMode::parse(
                 &fields
@@ -242,6 +246,7 @@ impl AgentConfig {
         command: &str,
         args: &[String],
         review: ReviewMode,
+        sandbox: Option<&str>,
     ) -> String {
         let args = serde_json::to_string(args).unwrap_or_else(|_| "[]".into());
         format!(
@@ -258,6 +263,11 @@ role = "{role}"
 # argument is passed through untouched.
 command = "{command}"
 args = {args}
+
+# Container image to run the agent CLI inside. Empty (the default) runs it
+# directly on the host, with your full privileges. Set it to an image that
+# contains the command above to sandbox the agent instead, e.g. a podman image.
+sandbox = "{sandbox}"
 timeout_secs = "900"
 
 # How much authority the reviewing agent has. This is YOUR call, not Ferryman's:
@@ -318,7 +328,8 @@ idle_after_secs = "300"
 # the agent refuses to start rather than quietly working without it.
 # preamble_file = "preamble.md"
 "#,
-            review = review.as_str()
+            review = review.as_str(),
+            sandbox = sandbox.unwrap_or("")
         )
     }
 }
@@ -334,15 +345,43 @@ struct AgentRun {
 ///
 /// stdout is the result. stderr is kept because a failed run's only explanation is
 /// usually there, and discarding it turns a diagnosable problem into a silent retry.
-async fn run_agent(config: &AgentConfig, prompt: &str) -> Result<AgentRun> {
+async fn run_agent(config: &AgentConfig, workspace: &Path, prompt: &str) -> Result<AgentRun> {
     let args: Vec<String> = config
         .args
         .iter()
         .map(|arg| arg.replace("{prompt}", prompt))
         .collect();
-    let mut command = Command::new(&config.command);
+    // When a sandbox image is set, the agent CLI runs inside it with only the
+    // workspace mounted, instead of directly on the host. Empty sandbox is the
+    // bare behaviour.
+    let binary_name = match &config.sandbox {
+        Some(_) => "podman".to_string(),
+        None => config.command.clone(),
+    };
+    let mut command = match &config.sandbox {
+        Some(image) => {
+            let mount = format!("{}:/workspace:Z", workspace.display());
+            let mut command = Command::new("podman");
+            command.args([
+                "run",
+                "--rm",
+                "-v",
+                mount.as_str(),
+                "-w",
+                "/workspace",
+                image.as_str(),
+                config.command.as_str(),
+            ]);
+            command.args(&args);
+            command
+        }
+        None => {
+            let mut command = Command::new(&config.command);
+            command.args(&args);
+            command
+        }
+    };
     command
-        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -358,7 +397,7 @@ async fn run_agent(config: &AgentConfig, prompt: &str) -> Result<AgentRun> {
     command.creation_flags(crate::priority::BELOW_NORMAL_PRIORITY_CLASS);
     let mut child = command
         .spawn()
-        .with_context(|| format!("start '{}'; is it installed and on PATH?", config.command))?;
+        .with_context(|| format!("start '{binary_name}'; is it installed and on PATH?"))?;
     // Elsewhere it is done just after spawn, which needs no unsafe and leaves the spawn
     // itself - and so its error message - exactly as it was.
     if let Some(pid) = child.id() {
@@ -682,7 +721,7 @@ async fn do_work(
         "  {id}: running {} (revision {revision})",
         config.command
     ));
-    let run = run_agent(config, &work_prompt(config, task)).await?;
+    let run = run_agent(config, &route.workspace, &work_prompt(config, task)).await?;
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
         // does not have, and inventing one here would be a worse lie than silence.
@@ -752,7 +791,12 @@ pub async fn review_once(
         }
         let id = task.order.id.clone();
         report.info(&format!("  {id}: judging revision {revision}"));
-        let run = run_agent(config, &review_prompt(config, &task, revision)).await?;
+        let run = run_agent(
+            config,
+            &route.workspace,
+            &review_prompt(config, &task, revision),
+        )
+        .await?;
         if !run.ok {
             bail!(
                 "'{}' failed reviewing {id}: {}",
@@ -1102,6 +1146,7 @@ mod tests {
             "claude",
             &["-p".into(), "{prompt}".into()],
             ReviewMode::Confirm,
+            None,
         );
         let config = AgentConfig::parse(&rendered).unwrap();
         assert_eq!(config.agent, "beastly");

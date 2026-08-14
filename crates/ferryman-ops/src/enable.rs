@@ -44,6 +44,8 @@ pub struct Request {
     /// Become this project's master: write the signed master declaration. Explicit,
     /// never silent — the caller should ask the user first.
     pub master: bool,
+    /// Container image to sandbox the agent CLI in; empty means run it bare.
+    pub sandbox: Option<String>,
 }
 
 /// A file this run created, or found already correct.
@@ -179,6 +181,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
                 &request.command,
                 &["-p".to_string(), "{prompt}".to_string()],
                 review,
+                request.sandbox.as_deref(),
             ),
         )
         .with_context(|| format!("write {}", config_path.display()))?;
@@ -334,6 +337,7 @@ mod tests {
             review: "confirm".into(),
             as_json: false,
             master: false,
+            sandbox: None,
         })?;
         Ok(())
     }
@@ -395,6 +399,7 @@ mod tests {
             review: "confirm".into(),
             as_json: false,
             master: false,
+            sandbox: None,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome
