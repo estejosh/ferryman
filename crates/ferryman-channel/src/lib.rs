@@ -1907,6 +1907,52 @@ mod portable_auth_route_tests {
     }
 
     #[test]
+    fn claim_message_v2_rejects_a_replayed_nonce() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route_with_agents(dir.path());
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+        let store = TrustedSigners {
+            signers: vec![SignerGrant {
+                public_key: hex::encode(signing.verifying_key().as_bytes()),
+                projects: vec!["ferryman".into()],
+                roles: vec!["orchestrator".into()],
+                capabilities: vec!["issue".into()],
+            }],
+        };
+        std::fs::create_dir_all(&route.attachment).unwrap();
+        std::fs::write(
+            route.attachment.join("trusted-signers.toml"),
+            toml::to_string(&store).unwrap(),
+        )
+        .unwrap();
+
+        let mut message = MessageV2::new(
+            "ferryman",
+            "orchestrator",
+            "worker",
+            "r",
+            serde_json::json!({}),
+            true,
+        );
+        message.sign(&signing).unwrap();
+
+        // Simulate a previously consumed nonce.
+        let mut ledger = ReplayLedger::default();
+        ledger.record(
+            &message.authentication.signer_id,
+            &message.authentication.nonce,
+        );
+        ledger
+            .save(&route.attachment.join("runtime/replay-ledger.json"))
+            .unwrap();
+
+        assert!(claim_message_v2(&route, &message).is_err());
+    }
+
+    #[test]
     fn acknowledge_v2_persists_verified_ack_and_handles_duplicate() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route_with_agents(dir.path());
@@ -4252,7 +4298,8 @@ pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<Message
     Ok(message)
 }
 
-/// Atomically claim a v2 message, then durably record its nonce in the replay ledger.
+/// Atomically claim a v2 message, recording its nonce in the replay ledger
+/// before the claim so a replayed nonce can never be claimed twice.
 pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<bool> {
     route.validate()?;
     validate_v2_message(message)?;
@@ -4269,16 +4316,32 @@ pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<boo
         .join(hex::encode(Sha256::digest(
             message.idempotency_key.as_bytes(),
         )));
+    // An already-claimed message (same idempotency key) is idempotent, not a
+    // replay: the original claim recorded the nonce, so check the claim first.
+    if claim.is_dir() {
+        return Ok(false);
+    }
+    // Reject a replayed nonce, then durably record acceptance before claiming.
+    let mut ledger = replay_ledger(route)?;
+    if ledger.contains(
+        &message.authentication.signer_id,
+        &message.authentication.nonce,
+    ) {
+        bail!(
+            "replayed nonce for signer {}",
+            message.authentication.signer_id
+        );
+    }
+    ledger.record(
+        &message.authentication.signer_id,
+        &message.authentication.nonce,
+    );
+    ledger.save(&route.attachment.join("runtime/replay-ledger.json"))?;
+
     fs::create_dir_all(claim.parent().context("claim path has no parent")?)?;
     match fs::create_dir(&claim) {
         Ok(()) => {
             atomic_json(&claim.join("message.json"), message)?;
-            let mut ledger = replay_ledger(route)?;
-            ledger.record(
-                &message.authentication.signer_id,
-                &message.authentication.nonce,
-            );
-            ledger.save(&route.attachment.join("runtime/replay-ledger.json"))?;
             Ok(true)
         }
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Ok(false),
