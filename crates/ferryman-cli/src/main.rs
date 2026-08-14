@@ -63,6 +63,9 @@ enum Command {
         /// step is otherwise a trip through a web UI that an agent cannot make.
         #[arg(long)]
         no_syncthing: bool,
+        /// Become this project's master. Ask the user first; this is an explicit choice.
+        #[arg(long)]
+        master: bool,
         /// Emit one JSON object describing the result, for a caller that is a program.
         #[arg(long)]
         json: bool,
@@ -750,6 +753,7 @@ async fn main() -> Result<()> {
             command,
             review,
             no_syncthing,
+            master,
             json: as_json,
         } => {
             let outcome = enable::perform(enable::Request {
@@ -762,6 +766,7 @@ async fn main() -> Result<()> {
                 review,
                 no_syncthing,
                 as_json,
+                master,
             })?;
             if as_json {
                 report_enable_json(&outcome)?;

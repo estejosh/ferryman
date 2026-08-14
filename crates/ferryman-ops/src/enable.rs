@@ -41,6 +41,9 @@ pub struct Request {
     /// something else, or where touching a running service is not wanted.
     pub no_syncthing: bool,
     pub as_json: bool,
+    /// Become this project's master: write the signed master declaration. Explicit,
+    /// never silent — the caller should ask the user first.
+    pub master: bool,
 }
 
 /// A file this run created, or found already correct.
@@ -219,15 +222,13 @@ pub fn perform(request: Request) -> Result<Outcome> {
         created: !roster_existed,
     });
 
-    // The operator who first set the project up is its master by default, unless
-    // they later disclaim the role to someone else. Written automatically and
-    // signed by this agent's key, so a team never has to remember a separate
-    // "choose the master" step. Best-effort: a machine that cannot write it
-    // still gets a working channel.
-    if bridge_created
-        && let Ok(declaration) =
-            ferryman_channel::master::initialize_master(&route, &identity, &agent_name)
-    {
+    // Becoming the master is an explicit choice, not a silent default: the caller
+    // asks "do you want to be master of this project?" and sets `master` from the
+    // answer. The declaration is signed by this agent's key, so the choice is
+    // verifiable.
+    if request.master {
+        let declaration =
+            ferryman_channel::master::initialize_master(&route, &identity, &agent_name)?;
         steps.push(Step {
             what: "master declaration",
             path: route.communications.join("master.json"),
@@ -331,6 +332,7 @@ mod tests {
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
+            master: false,
         })?;
         Ok(())
     }
@@ -391,6 +393,7 @@ mod tests {
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
+            master: false,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome
