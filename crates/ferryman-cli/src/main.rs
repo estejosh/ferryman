@@ -591,11 +591,16 @@ enum SyncthingAction {
         workspace: Option<PathBuf>,
     },
     /// Share this project's folder with the given device ids (adds to existing).
+    /// A device id that Syncthing does not already trust is added first, so one
+    /// project can be shared with a brand-new PC without sharing the rest.
     Share {
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
         with: Vec<String>,
+        /// Name for a device being added for the first time.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Stop sharing this project's folder with the given device ids.
     Unshare {
@@ -3163,11 +3168,28 @@ fn channel(command: Channel) -> Result<()> {
                     println!("shared  {id}  {name}  ({})", owner_label(&notes, &id));
                 }
             }
-            SyncthingAction::Share { workspace, with } => {
+            SyncthingAction::Share {
+                workspace,
+                with,
+                name,
+            } => {
                 if with.is_empty() {
                     bail!("--with is required: the device id to share this folder with");
                 }
                 let route = here(workspace)?;
+                let trusted = ferryman_channel::syncthing_peers()?;
+                for id in &with {
+                    if !trusted.iter().any(|peer| &peer.device_id == id) {
+                        ferryman_channel::syncthing_add_device(
+                            id,
+                            name.as_deref().unwrap_or_default(),
+                        )?;
+                        println!(
+                            "added {id} to Syncthing (was not trusted before; name: \"{}\")",
+                            name.as_deref().unwrap_or_default()
+                        );
+                    }
+                }
                 print_syncthing_setup(&ferryman_channel::syncthing_share_folder(&route, &with)?);
                 note_unclassified_shares(&route, &with, &ferryman_channel::syncthing_peers()?);
             }

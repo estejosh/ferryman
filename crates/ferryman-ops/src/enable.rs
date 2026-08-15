@@ -294,6 +294,13 @@ pub fn perform(request: Request) -> Result<Outcome> {
         // caller that wants one project to reach one person instead passes
         // `share_with`, which narrows the share list to exactly those devices.
         let peers = ferryman_channel::syncthing_peers().unwrap_or_default();
+        // A project can be shared with a machine Syncthing does not trust yet:
+        // add any `--share-with` device it has not seen, so the folder reaches it.
+        for id in &request.share_with {
+            if !peers.iter().any(|peer| &peer.device_id == id) {
+                ferryman_channel::syncthing_add_device(id, "")?;
+            }
+        }
         // The fleet channel first: it is what makes identity and the device count mean
         // the same thing on every machine. Best-effort, because a machine that cannot
         // host one must still be able to join a project.

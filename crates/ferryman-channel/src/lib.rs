@@ -3268,6 +3268,23 @@ pub fn peers_for_ids(device_ids: &[String]) -> Result<Vec<SyncthingPeer>> {
         .collect())
 }
 
+/// Add a device to Syncthing's config so a folder can be shared with it. This is
+/// the step that turns a "non-trusted PC" into a peer: without it Syncthing will
+/// not deliver a shared folder to a device it does not know. The device is named
+/// with `name` (its id is shown when the name is empty).
+pub fn syncthing_add_device(device_id: &str, name: &str) -> Result<()> {
+    let Some(key) = syncthing_api_key() else {
+        bail!("Syncthing config not found; cannot add a device");
+    };
+    let base = syncthing_api_base();
+    let body = serde_json::to_string(&json!({ "deviceID": device_id, "name": name }))?;
+    match syncthing_post(&base, "/rest/config/devices", &key, &body)? {
+        Some(code) if (200..300).contains(&code) => Ok(()),
+        Some(code) => bail!("Syncthing refused the device (HTTP {code})"),
+        None => bail!("could not reach Syncthing's API"),
+    }
+}
+
 /// Share this project's channel folder with the given device ids, keeping every
 /// peer it is already shared with. This is the granular control `enable`'s
 /// share-everything default does not give: one project can go to one person.
