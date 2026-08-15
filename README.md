@@ -1,6 +1,6 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/brand/svg/ferryman-logo-dark.svg">
-  <img src="assets/brand/svg/ferryman-logo.svg" alt="Ferryman - private coordination for AI agents" width="480">
+  <img src="assets/brand/svg/ferryman-logo.svg" alt="Ferryman - self-hosted, local-first team coordination for AI agents" width="480">
 </picture>
 
 [![CI](https://github.com/estejosh/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/ci.yml)
@@ -9,79 +9,47 @@
 [![license](https://img.shields.io/badge/license-source--available-blue)](LICENSE)
 [![free tier](https://img.shields.io/badge/free-2%20seats%20%C2%B7%202%20PCs%20%C2%B7%20unlimited%20agents-brightgreen)](COMMERCIAL.md)
 
-**Private coordination for a fleet of AI agents, across machines you own.**
+**Self-hosted, local-first team coordination for a fleet of AI agents.**
 
-Your agents leave each other files. Syncthing carries them. There's no server in the
-middle, no ports to forward, no cloud account — and the coordination lives in its own
-private repository, kept separate from the work itself.
+Your agents coordinate by writing signed files into a folder that
+[Syncthing](https://syncthing.net) carries between machines you own. There is no
+server in the middle, no port to forward, no cloud account — and the
+coordination lives in its own private repository, kept separate from the work
+itself.
 
 ```sh
 # macOS and Linux
 curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
 
-cd your-project && ferry enable --email you@example.com    # that's setup, all of it
+cd your-project && ferry enable --email you@example.com    # setup, all of it
 ferry agent run                                            # this machine now does work
 ```
 
-On Windows, in PowerShell — there is no `sh` there, so the line above cannot run:
+Windows, in PowerShell:
 
 ```powershell
 irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex
 ```
 
-No Rust toolchain, no compile. Both scripts verify the release checksum before
-installing, and install for the current user without asking for administrator rights.
-
-Ferryman also needs [Syncthing](https://syncthing.net/downloads/) installed and running
-to reach your other machines. It does not install Syncthing, and it says so plainly if it
-cannot find it.
+No Rust toolchain, no compile. Both scripts verify the release checksum and
+install for the current user. Ferryman needs [Syncthing](https://syncthing.net/downloads/)
+running to reach your other machines; it says so plainly if it can't find it.
 
 **Or don't run it yourself.** [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) is a
-block you paste into any coding agent — it installs Ferryman, enables the project, wires
-the Syncthing folder and starts working, without asking you anything. `ferry enable` never prompts, is safe to run twice, and reports in JSON —
-it is built to be run by an agent with nobody watching, because that is who usually
-installs this.
+block you paste into any coding agent — it installs Ferryman, enables the
+project, wires the Syncthing folder and starts working without asking anything.
+`ferry enable` never prompts, is safe to run twice, and reports in JSON.
 
-```sh
-mkdir -p ~/ferryman-channels/myproject
+## Why this shape
 
-podman run -d --name ferryman \
-  -v ~/ferryman-channels:/channels:U \
-  -v ferryman-state:/state \
-  -p 22000:22000/tcp -p 22000:22000/udp \
-  ghcr.io/estejosh/ferryman:latest
-```
+Most tools for coordinating AI agents put a server in the middle. Everything
+flows through it, it has to be reachable, and it has to be trusted with all of
+it.
 
-That's one machine in your fleet. It prints a device ID — share it with your other
-machines, accept theirs, and agents on different computers, in different houses, on
-different networks start talking. Syncthing handles NAT on its own, so in most setups
-you forward nothing.
-
-Runs on Intel/AMD and on ARM, so Apple Silicon Macs and Raspberry Pis are first-class,
-not emulated.
-
-Docker works too: `docker build -f Containerfile .`
-
-## What it looks like
-
-![Two agents on one channel: an order is issued, claimed, submitted, sent back with notes, revised, and accepted — every signature verifying.](docs/assets/demo.gif)
-
-A real recording, not a mockup — the cast is in
-[`docs/assets/demo.cast`](docs/assets/demo.cast) if you'd rather replay it. Both agents
-here read and write one folder, which is exactly what Syncthing gives each machine.
-Nothing is running: no server, no daemon, no token.
-
----
-
-## The idea
-
-Most tools for coordinating AI agents put a server in the middle. Everything flows
-through it, it has to be reachable, and it has to be trusted with all of it.
-
-Ferryman doesn't. **Machines write files; a synced folder carries them.** A message, a
-work order, a result, a review — all of them are just files appearing in a directory
-your machines already share. Nothing is "sent". There is no connection to establish and
-nothing to be down.
+Ferryman doesn't. **Machines write files; a synced folder carries them.** A work
+order, a result, a review — all of them are just files appearing in a directory
+your machines already share. Nothing is "sent". There is no connection to
+establish and nothing to be down.
 
 ```mermaid
 flowchart LR
@@ -99,16 +67,35 @@ flowchart LR
     DF <-. syncthing .-> FF
 ```
 
-*Three machines, one synced folder, nothing in the middle. Nothing here has to be up,
-reachable, or trusted.*
+*Three machines, one synced folder, nothing in the middle. Nothing here has to
+be up, reachable, or trusted.*
 
-That has two consequences worth caring about.
+Two consequences worth caring about:
 
-**It works anywhere.** A laptop on cellular, a box at a friend's house, a machine behind
-a router you don't control — if it can sync a folder, it's in the fleet.
+- **It works anywhere.** A laptop on cellular, a box at a friend's house, a
+  machine behind a router you don't control — if it can sync a folder, it's in
+  the fleet.
+- **It stays private.** The channel is your own repository on your own machines.
+  No third party holds your agents' conversation.
 
-**It stays private.** The channel is your own repository on your own machines. No third
-party holds your agents' conversation.
+## What you get
+
+- **Signed everything.** Each agent has its own key, so every message, order,
+  result and review carries a fingerprint. On a team you can tell *which* agent
+  did what, not merely which machine.
+- **Review and revision.** Accept the work, or send it back with notes. Revisions
+  are judgement, not failure — a job sent back five times has failed zero times.
+- **Shared memory** the fleet agrees on — proposed by agents, approved before it
+  counts, so one confused agent can't poison what everyone believes.
+- **An audit trail** of every decision, hash-chained and backed by private Git.
+- **Approval gates** for anything that shouldn't happen unsupervised — including
+  from your phone over Telegram, bound to a hash of exactly what was approved.
+- **A master, grants, and short-lived lease tokens.** Authority is explicit,
+  signed, and expiring — a leaked worker credential stops working on its own.
+- **A web dashboard** to watch tasks, ledger, cost and learnings, and to
+  approve or send work back from a browser.
+- **Recovery you can rehearse.** Encrypted continuity packs, and a drill command
+  that proves you can come back from a wiped machine.
 
 ## Two repositories, on purpose
 
@@ -117,91 +104,29 @@ your-project/            <- the work. Ferryman never touches this.
 your-project-ferryman/   <- the channel. Coordination and shared memory only.
 ```
 
-Your agents already share the work repository — that's where code goes, and where
-results are submitted. So the channel doesn't need to carry any of it. It carries the
-conversation *about* the work: what to do, what got done, what needs changing, and what
-the fleet has learned.
-
-Keeping those apart is the point, not an implementation detail. It is what makes the
-coordination safe to synchronize, and it means Ferryman can never corrupt, expose, or
-have an opinion about your actual code.
+Your agents already share the work repository. The channel carries the
+conversation *about* the work — what to do, what got done, what needs changing,
+what the fleet learned — never the work itself. That separation is the point:
+Ferryman can't corrupt, expose, or even have an opinion about your code.
 
 ## Agents that check each other
 
-Ferryman's protocol requires that an agent receiving a checkable claim — a bug, a root
-cause, a proposed fix — **verify it against the real code before acting on it**, rather
-than trusting the report.
+Ferryman's protocol requires that an agent receiving a checkable claim — a bug,
+a root cause, a proposed fix — **verify it against the real code before acting
+on it**, rather than trusting the report. That rule came from running this
+thing, not from a design document: it repeatedly caught agents confidently
+reporting things that were not true, before the error spread downstream. If you
+are going to let a fleet of models work unsupervised, this is the part that
+matters.
 
-That rule came out of running this thing, not out of a design document. It repeatedly
-caught agents confidently reporting things that were not true, before the error spread
-to everyone downstream. If you are going to let a fleet of models work unsupervised,
-this is the part that matters.
+## What it looks like
 
-Work that needs a human gets parked until someone approves it — including from your
-phone, over Telegram, with the approval bound to a hash of exactly what was approved.
+![Two agents on one channel: an order is issued, claimed, submitted, sent back with notes, revised, and accepted — every signature verifying.](docs/assets/demo.gif)
 
-## Work goes back until it's right
-
-An orchestrator hands out work; a worker does it. The interesting part is what happens
-next: the orchestrator reads the result and either keeps it, or sends it back saying what
-to change.
-
-```mermaid
-sequenceDiagram
-    participant O as orchestrator
-    participant W as worker
-    O->>W: order · "write the report"
-    W->>O: result
-    O->>W: review · changes requested<br>"the summary contradicts the table"
-    W->>O: result · revision 2
-    O->>W: review · accepted
-```
-
-Mark work `requires_review` and finishing it is not the end — the result waits until
-someone judges it. Sending it back returns it to the queue at the next revision with the
-reviewer's notes attached, so any worker can pick it up, not just the one that did it
-first.
-
-**And it all travels as files.** An order is a file, a claim is a file, a result is a
-file, a review is a file. Everything about one task lives in its own directory:
-
-```
-tasks/t-4f2a/
-  order.json                 written once, by whoever issued it
-  claim.grouchly.json        grouchly's claim; only grouchly writes it
-  result.grouchly.001.json   a result, at a revision
-  review.001.json            changes requested, with notes
-  result.grouchly.002.json   the revision
-  review.002.json            accepted
-```
-
-No path ever has two writers, which is the one rule a synced folder needs. So a worker at
-a friend's house or on a phone tether can be given work without anyone opening a port.
-
-Orders addressed to a machine have nothing to race over. Open ones — "whoever picks this
-up" — are settled by oldest claim, computed identically on every machine from the same
-files, so nobody has to be the authority. The loser finds out it lost and stops, having
-spent seconds rather than corrupted anything.
-
-Revisions are not failures. A job sent back five times has failed zero times and never
-exhausts its retries — retries are for crashes, revisions are for judgement. Every
-verdict is recorded against a hash of the exact result it judged, so an approval cannot
-be replayed against different work.
-
-## What you get
-
-- **A private channel per project**, carried by Syncthing, with durable outboxes,
-  idempotent delivery, duplicate-safe claims and acknowledgement deadlines.
-- **Review and revision** — accept the work, or send it back with notes.
-- **Signed contributions.** Each agent has its own key, so every message and result
-  carries a fingerprint. On a team that means you can tell whose agent did what, not
-  merely which machine it came from.
-- **Shared memory** the fleet agrees on — proposed by agents, approved before it counts,
-  so one confused agent cannot poison what everyone believes.
-- **An audit trail** of every decision, and encrypted continuity packs for recovery.
-- **Approval gates** for anything that should not happen unsupervised.
-- **One instance, many projects.** A single container serves every project a machine
-  works on.
+A real recording, not a mockup — replay it from
+[`docs/assets/demo.cast`](docs/assets/demo.cast). Both agents here read and
+write one folder, which is exactly what Syncthing gives each machine. Nothing is
+running: no server, no daemon, no token.
 
 ## Documentation
 
@@ -211,91 +136,70 @@ be replayed against different work.
 | [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
 | [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
-| [Adoption standard](docs/PROJECT_ADOPTION_STANDARD.md) | attaching a project |
 | [Writing a worker](docs/WRITING_A_WORKER.md) | the worker protocol |
 | [Getting started](docs/GETTING_STARTED.md) | the guided walkthrough |
 
 ## Building from source
 
-You need a stable Rust toolchain. On Linux the OS credential store needs D-Bus headers:
-
 ```sh
-sudo apt-get install -y libdbus-1-dev pkg-config   # Debian/Ubuntu
-sudo dnf install dbus-devel pkgconf                # Fedora/RHEL
-
+sudo apt-get install -y libdbus-1-dev pkg-config   # Debian/Ubuntu (Linux only)
 cargo build --release --workspace
 cargo test --workspace
 ```
 
 macOS and Windows use their native keychains and need nothing extra.
 
-## Current status
+## Current status — honest about where this is
 
-Honest about where this is:
+**Solid.** The channel, the Syncthing transport, project attachment, approval
+gates, shared memory, the audit trail, the dashboard, master/grants, lease
+tokens, continuity packs and the container. Messages, orders, results and
+reviews all travel as files and cross networks without anything reachable. All
+covered by the test suite.
 
-**Solid.** The channel, the Syncthing transport, project attachment, approval gates,
-shared memory, the audit trail, continuity packs, and the container. Messages, orders,
-results and reviews all travel as files and cross networks without anything reachable.
-All covered by the test suite.
+**Working, but young.** The agentic loops — `ferry agent run` and
+`ferry agent review`, where one agent picks work up and another judges what
+comes back — work end to end and are new. They have been exercised against a
+real agent CLI across a shared channel, not only in tests, but not yet run for
+weeks by strangers, which is the only thing that finds the last problems.
 
-**Working, but young.** The agentic loops — `ferry agent run` and `ferry agent review`,
-where an agent picks work up, does it, and another judges what comes back — work end to
-end and are new. They have been exercised against a real agent CLI across a shared
-channel, not only in tests, but they have not yet been run for weeks by strangers, which
-is the only thing that finds the last set of problems.
+**Not built yet.** PostgreSQL, RBAC, and workflow graphs are design targets, not
+implementations.
 
-Review authority is yours to set: `auto` lets the reviewing agent decide, `confirm` has
-it explain and leaves the decision with you, `off` keeps models out of it. `confirm` is
-the default because it is the cautious end, not because it is the recommendation.
-
-The older HTTP job/worker protocol still exists alongside the file model for callers who
-want a server, and that half does still need machines to reach each other — see
-[communications readiness](docs/COMMUNICATIONS_READINESS.md).
-
-**Not built yet.** PostgreSQL, RBAC, workflow graphs and a dashboard are design targets,
-not implementations. A phone cannot register itself for licence counting, because by
-definition it does not run Ferryman; it has to be recorded from another machine for now.
-
-**Not a sandbox.** Ferryman coordinates agents; it does not contain them. An agent
-worker runs with the privileges of the account that started it. Give each worker its own
-least-privilege account and its own disposable directory.
+**Not a sandbox.** Ferryman coordinates agents; it does not contain them. A
+worker runs with the privileges of the account that started it. Give each worker
+its own least-privilege account and its own disposable directory, or run it in
+the provided container.
 
 ## License
 
-Ferryman is **source-available** under the [Ferryman Source-Available License](LICENSE):
-free for any non-production use, and free in production for up to **2 people, on 2
-computers and 2 phones/tablets**.
+Ferryman is **source-available** under the [Ferryman Source-Available
+License](LICENSE): free for any non-production use, and free in production for
+up to **2 people, on 2 computers and 2 phones/tablets**.
 
-**Agents are unlimited and never counted.** One person running twenty agents across two
-computers is one Seat. The limits are separate, not a pool of four — three computers is
-over even with no phone. Beyond that it is $60 per additional seat per year, dropping
-with volume. See [COMMERCIAL.md](COMMERCIAL.md).
+**Agents are unlimited and never counted.** One person running twenty agents
+across two computers is one Seat. Beyond that it is $60 per additional seat per
+year, dropping with volume — priced per human, not per machine or agent. See
+[COMMERCIAL.md](COMMERCIAL.md).
 
-Priced per human rather than per machine or per agent, so growing your fleet costs you
-nothing. It is a source-available license, not an OSI-approved open-source license, and
-it does not convert to one on a timer.
-
-**Free production use asks for a contact email**, and Ferryman reports how many people
-and machines are in your deployment — three integers and that address, once a day.
-Never your code, your channel, your prompts, or anything your agents produce.
-[PRIVACY.md](PRIVACY.md) lists the entire payload field by field, and
-`ferry license checkin --dry-run` prints exactly what would be sent before anything is.
-Going over the limit prints a notice; nothing stops working, ever.
-
-Projects that deploy or redistribute Ferryman include a root-level `FERRYMAN.md` saying
-so (License section 6). The setup scripts write it for you.
+Free production use asks for a contact email, and Ferryman reports three
+integers and that address, once a day — never your code, your channel, your
+prompts, or anything your agents produce. [PRIVACY.md](PRIVACY.md) lists the
+entire payload field by field, and `ferry license checkin --dry-run` prints
+exactly what would be sent.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Agents and
-operators working *on* Ferryman itself should read
-[the operator brief](docs/OPERATOR_BRIEF.md) first.
+operators working *on* Ferryman itself should read [the operator
+brief](docs/OPERATOR_BRIEF.md) first.
 
 ## Acknowledgments
 
-Ferryman is provider-neutral and runs no models itself. The reference agent worker
-performs inference through an external agent CLI. This project was first piloted on
-**[honemesh.net](https://honemesh.net)**, credited for the inference work that shaped it.
+Ferryman is provider-neutral and runs no models itself. The reference agent
+worker performs inference through an external agent CLI. This project was first
+piloted on **[honemesh.net](https://honemesh.net)**, credited for the inference
+work that shaped it.
 
 Ferryman bundles [Syncthing](https://syncthing.net) (MPL-2.0), unmodified — see
 [THIRD_PARTY.md](THIRD_PARTY.md).
