@@ -579,6 +579,13 @@ enum Channel {
         #[command(subcommand)]
         action: SyncthingAction,
     },
+    /// Move any pre-Ferryman git-backed bridge files in this workspace into a
+    /// `deprecated/` folder, out of the way of the channel. Preserves the old
+    /// method rather than deleting it.
+    Deprecate {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -3236,6 +3243,23 @@ fn channel(command: Channel) -> Result<()> {
                 println!("marked {with} as {}", owner_label(&notes, &with));
             }
         },
+
+        Channel::Deprecate { workspace } => {
+            let route = here(workspace)?;
+            let moved = ferryman_channel::deprecate_legacy_bridge(&route.workspace)?;
+            if moved.is_empty() {
+                println!("no legacy bridge artifacts found; nothing to move");
+            } else {
+                println!(
+                    "moved {} legacy bridge item(s) into {}/deprecated/",
+                    moved.len(),
+                    route.workspace.display()
+                );
+                for path in &moved {
+                    println!("  {}", path.display());
+                }
+            }
+        }
     }
     Ok(())
 }

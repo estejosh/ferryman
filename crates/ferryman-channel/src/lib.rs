@@ -3285,6 +3285,74 @@ pub fn syncthing_add_device(device_id: &str, name: &str) -> Result<()> {
     }
 }
 
+/// Files and directories the pre-Ferryman git-backed hone bridge used. Their
+/// presence identifies an "old method" that can be moved out of the way into a
+/// `deprecated/` folder. Deliberately excludes `.git`, `.gitignore`,
+/// `.gitattributes`, and `README.md`, which belong to the repository itself.
+const LEGACY_BRIDGE_ARTIFACTS: &[&str] = &[
+    "send.sh",
+    "watch-beastly.sh",
+    "watch-grouchly.sh",
+    "_kc.sh",
+    "beastly",
+    "grouchly",
+    "claw",
+    "fang",
+    "outbox",
+    "inbox",
+    "proposals",
+    "harness",
+    "runbooks",
+    "worker-adapter",
+    "fleet",
+    "tools",
+    "agents",
+    "FMN_LOG.md",
+    "ORCHESTRATION.md",
+    "PROTOCOL.md",
+    "GO_LIVE_CYCLE.md",
+    "GITHUB_AUTH.md",
+    "JOIN-PROMPT.md",
+    "ROAD_TO_LIVE.md",
+    "SCOREBOARD.md",
+    "SYNCTHING.md",
+    "nodes.md",
+];
+
+/// The legacy bridge artifacts present in a workspace, if any.
+pub fn legacy_bridge_artifacts(workspace: &Path) -> Vec<PathBuf> {
+    LEGACY_BRIDGE_ARTIFACTS
+        .iter()
+        .map(|name| workspace.join(name))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+/// Move any legacy bridge artifacts into `<workspace>/deprecated/`, so the old
+/// method is preserved but out of the way of the ferryman channel. Returns the
+/// destination paths that were moved (empty when there is nothing to move).
+pub fn deprecate_legacy_bridge(workspace: &Path) -> Result<Vec<PathBuf>> {
+    let artifacts = legacy_bridge_artifacts(workspace);
+    if artifacts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let deprecated = workspace.join("deprecated");
+    fs::create_dir_all(&deprecated)?;
+    let mut moved = Vec::new();
+    for artifact in artifacts {
+        let Some(name) = artifact.file_name() else {
+            continue;
+        };
+        let destination = deprecated.join(name);
+        if destination.exists() {
+            continue;
+        }
+        fs::rename(&artifact, &destination)?;
+        moved.push(destination);
+    }
+    Ok(moved)
+}
+
 /// Share this project's channel folder with the given device ids, keeping every
 /// peer it is already shared with. This is the granular control `enable`'s
 /// share-everything default does not give: one project can go to one person.
