@@ -20,6 +20,7 @@ pub mod events;
 pub mod interrupt;
 pub mod keys;
 pub mod learning;
+pub mod lease;
 pub mod ledger;
 pub mod licensing;
 pub mod master;

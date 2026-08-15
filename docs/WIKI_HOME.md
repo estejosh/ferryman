@@ -4,8 +4,9 @@ A self-hostable, provider-neutral control plane for durable AI-assisted work. In
 workers lease and complete jobs through a small HTTP protocol; the bridge persists state,
 artifacts, audit events, and approval decisions without owning model execution.
 
-> v0.1 is a local, single-node reference implementation. Treat it as a preview/blueprint,
-> not production infrastructure. See [Public Release Plan](../docs/PUBLIC_RELEASE_PLAN.md).
+> v0.1 is a self-hosted, local-first team coordination system — a reference
+> implementation across machines you own, not a hosted service or a
+> production-security guarantee. See [Public Release Plan](../docs/PUBLIC_RELEASE_PLAN.md).
 
 ## Start here
 - [Getting Started](Getting-Started) — run the demo in a few minutes.

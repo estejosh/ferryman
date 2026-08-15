@@ -586,6 +586,13 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Mint or check short-lived, master-signed lease tokens for workers.
+    Lease {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[command(subcommand)]
+        action: LeaseAction,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -798,6 +805,27 @@ enum MasterAction {
     },
     /// List the master's grants and whether each verifies.
     Grants,
+}
+/// Subcommands for [`Channel::Lease`].
+#[derive(Subcommand, Clone)]
+enum LeaseAction {
+    /// Mint a short-lived, scoped lease for a worker. Signed by the master.
+    Mint {
+        /// The worker (agent) the lease is issued to.
+        to: String,
+        /// Comma-separated capabilities the lease confers. Empty means the
+        /// worker's membership roles decide.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Lease lifetime in minutes.
+        #[arg(long, default_value_t = 60)]
+        minutes: i64,
+    },
+    /// Verify a worker's lease and report its remaining lifetime.
+    Verify {
+        /// The worker whose lease to check.
+        to: String,
+    },
 }
 #[derive(Subcommand, Clone)]
 /// The agentic loop. Every one of these runs unattended and needs no terminal.
@@ -3091,6 +3119,69 @@ fn channel(command: Channel) -> Result<()> {
                             grant.capabilities.join(","),
                             check
                         );
+                    }
+                }
+            }
+        }
+        Channel::Lease { workspace, action } => {
+            let route = here(workspace)?;
+            match action {
+                LeaseAction::Mint {
+                    to,
+                    scope,
+                    minutes,
+                } => {
+                    let master_name = match ferryman_channel::master::read_master(&route)? {
+                        Some(declaration) => declaration.master,
+                        None => {
+                            bail!("this project has no master yet; run 'ferry channel master init'")
+                        }
+                    };
+                    let identity = ferryman_channel::AgentIdentity::load_or_create(
+                        &master_name,
+                        &route.attachment,
+                    )?;
+                    let scope = scope
+                        .map(|s| {
+                            s.split(',')
+                                .map(str::trim)
+                                .filter(|part| !part.is_empty())
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let lease = ferryman_channel::lease::mint_lease(
+                        &route,
+                        &identity,
+                        &to,
+                        scope,
+                        chrono::Duration::minutes(minutes),
+                    )?;
+                    println!(
+                        "leased to {} until {}  scope=[{}]",
+                        lease.issued_to,
+                        lease.expires_at.to_rfc3339(),
+                        lease.scope.join(",")
+                    );
+                }
+                LeaseAction::Verify { to } => {
+                    let path = route
+                        .communications
+                        .join("leases")
+                        .join(format!("{to}.json"));
+                    let token: ferryman_channel::lease::LeaseToken =
+                        serde_json::from_slice(&std::fs::read(&path)?)
+                            .with_context(|| format!("read lease for '{to}'"))?;
+                    if ferryman_channel::lease::verify_lease(&route, &token)? {
+                        let left = token.expires_at - chrono::Utc::now();
+                        println!(
+                            "valid: {} may [{}] for another {} minutes",
+                            token.issued_to,
+                            token.scope.join(","),
+                            left.num_minutes()
+                        );
+                    } else {
+                        println!("invalid or expired");
                     }
                 }
             }
