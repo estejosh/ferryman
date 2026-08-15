@@ -8,7 +8,9 @@ use ferryman_ops::enable;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
@@ -63,6 +65,11 @@ enum Command {
         /// step is otherwise a trip through a web UI that an agent cannot make.
         #[arg(long)]
         no_syncthing: bool,
+        /// Share the channel folder with only these Syncthing device ids, instead of
+        /// every device Syncthing already trusts. Repeatable. Use this when one project
+        /// should reach one person and not the whole fleet.
+        #[arg(long)]
+        share_with: Vec<String>,
         /// Become this project's master. Ask the user first; this is an explicit choice.
         #[arg(long)]
         master: bool,
@@ -565,6 +572,61 @@ enum Channel {
         #[arg(long)]
         json: bool,
     },
+    /// Manage this project's Syncthing folder: choose which devices it syncs
+    /// with, per project. Each project has its own folder, so one project can be
+    /// shared with one person without sharing the rest.
+    Syncthing {
+        #[command(subcommand)]
+        action: SyncthingAction,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum SyncthingAction {
+    /// Every device this Syncthing already trusts (the device ids to share with).
+    Devices,
+    /// This project's folder, and which devices it is currently shared with.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Share this project's folder with the given device ids (adds to existing).
+    Share {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        with: Vec<String>,
+    },
+    /// Stop sharing this project's folder with the given device ids.
+    Unshare {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        with: Vec<String>,
+    },
+    /// Register this project's folder with Syncthing (start syncing), shared
+    /// with no one yet — share explicitly afterwards.
+    On {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Remove this project's folder from Syncthing (stop syncing). The channel
+    /// files stay in place and still work locally.
+    Off {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Record whether a device is one of your own machines or a different
+    /// person, so the share list stays auditable.
+    Mark {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        with: String,
+        /// self = one of your own machines; other = a different person.
+        #[arg(long, value_parser = ["self", "other"])]
+        owner: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -942,6 +1004,7 @@ async fn main() -> Result<()> {
             command,
             review,
             no_syncthing,
+            share_with,
             master,
             sandbox,
             worktree,
@@ -958,6 +1021,7 @@ async fn main() -> Result<()> {
                 command,
                 review,
                 no_syncthing,
+                share_with,
                 as_json,
                 master,
                 sandbox,
@@ -3070,6 +3134,167 @@ fn channel(command: Channel) -> Result<()> {
                 }
             }
         }
+
+        Channel::Syncthing { action } => match action {
+            SyncthingAction::Devices => {
+                let peers = ferryman_channel::syncthing_peers()?;
+                if peers.is_empty() {
+                    println!("no other devices are paired with this Syncthing yet");
+                }
+                for peer in peers {
+                    println!("{}  {}", peer.device_id, peer.name);
+                }
+            }
+            SyncthingAction::Status { workspace } => {
+                let route = here(workspace)?;
+                let known = ferryman_channel::syncthing_peers()?;
+                let notes = load_device_notes(&route);
+                println!("folder  {}", ferryman_channel::channel_folder_id(&route));
+                let ids = ferryman_channel::syncthing_folder_device_ids(&route)?;
+                if ids.is_empty() {
+                    println!("shared  (no other devices)");
+                }
+                for id in ids {
+                    let name = known
+                        .iter()
+                        .find(|peer| peer.device_id == id)
+                        .map(|peer| peer.name.clone())
+                        .unwrap_or_default();
+                    println!("shared  {id}  {name}  ({})", owner_label(&notes, &id));
+                }
+            }
+            SyncthingAction::Share { workspace, with } => {
+                if with.is_empty() {
+                    bail!("--with is required: the device id to share this folder with");
+                }
+                let route = here(workspace)?;
+                print_syncthing_setup(&ferryman_channel::syncthing_share_folder(&route, &with)?);
+                note_unclassified_shares(&route, &with, &ferryman_channel::syncthing_peers()?);
+            }
+            SyncthingAction::Unshare { workspace, with } => {
+                if with.is_empty() {
+                    bail!("--with is required: the device id to stop sharing with");
+                }
+                let route = here(workspace)?;
+                print_syncthing_setup(&ferryman_channel::syncthing_unshare_folder(
+                    &route, &with,
+                )?);
+            }
+            SyncthingAction::On { workspace } => {
+                let route = here(workspace)?;
+                print_syncthing_setup(&ferryman_channel::syncthing_register_folder(
+                    &route, &[],
+                )?);
+            }
+            SyncthingAction::Off { workspace } => {
+                let route = here(workspace)?;
+                print_syncthing_setup(&ferryman_channel::syncthing_unregister_folder(&route)?);
+            }
+            SyncthingAction::Mark {
+                workspace,
+                with,
+                owner,
+            } => {
+                let route = here(workspace)?;
+                let peers = ferryman_channel::syncthing_peers()?;
+                let name = peers
+                    .iter()
+                    .find(|peer| peer.device_id == with)
+                    .map(|peer| peer.name.clone())
+                    .unwrap_or_default();
+                let mut notes = load_device_notes(&route);
+                notes.devices.insert(
+                    with.clone(),
+                    DeviceNote {
+                        name,
+                        owner: owner.clone(),
+                    },
+                );
+                save_device_notes(&route, &notes)?;
+                println!("marked {with} as {}", owner_label(&notes, &with));
+            }
+        },
     }
     Ok(())
 }
+
+fn print_syncthing_setup(setup: &ferryman_channel::SyncthingSetup) {
+    println!("folder  {}", setup.folder_id);
+    println!("path    {}", setup.folder_path);
+    if setup.available && !setup.shared_with.is_empty() {
+        for peer in &setup.shared_with {
+            println!("shared  {}  {}", peer.device_id, peer.name);
+        }
+    } else if setup.available {
+        println!("shared  (no other devices)");
+    }
+    println!("note    {}", setup.note);
+}
+
+/// Who a shared device belongs to, recorded by the operator so the share list
+/// stays auditable. Lives per project under `.ferryman/syncthing-devices.json`.
+#[derive(Serialize, Deserialize, Default)]
+struct DeviceNotes {
+    #[serde(default)]
+    devices: BTreeMap<String, DeviceNote>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DeviceNote {
+    name: String,
+    owner: String,
+}
+
+fn device_notes_path(route: &ferryman_channel::ProjectRoute) -> PathBuf {
+    route.attachment.join("syncthing-devices.json")
+}
+
+fn load_device_notes(route: &ferryman_channel::ProjectRoute) -> DeviceNotes {
+    std::fs::read_to_string(device_notes_path(route))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_device_notes(route: &ferryman_channel::ProjectRoute, notes: &DeviceNotes) -> Result<()> {
+    std::fs::create_dir_all(&route.attachment)?;
+    std::fs::write(device_notes_path(route), serde_json::to_string_pretty(notes)?)?;
+    Ok(())
+}
+
+fn owner_label(notes: &DeviceNotes, id: &str) -> &'static str {
+    match notes.devices.get(id).map(|note| note.owner.as_str()) {
+        Some("self") => "own machine",
+        Some("other") => "other person",
+        _ => "unclassified",
+    }
+}
+
+/// After a share, flag any device this project has never been asked to classify,
+/// so a new share is a conscious decision rather than a silent widening.
+fn note_unclassified_shares(
+    route: &ferryman_channel::ProjectRoute,
+    device_ids: &[String],
+    peers: &[ferryman_channel::SyncthingPeer],
+) {
+    let notes = load_device_notes(route);
+    let fresh: Vec<&String> = device_ids
+        .iter()
+        .filter(|id| !notes.devices.contains_key(*id))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    println!();
+    for id in fresh {
+        let name = peers
+            .iter()
+            .find(|peer| &peer.device_id == id)
+            .map(|peer| peer.name.clone())
+            .unwrap_or_default();
+        println!("⚠ new share: {id}  {name}");
+        println!("  is this a device you own, or a different person?");
+        println!("  record it with:  ferry channel syncthing mark --with {id} --owner self|other");
+    }
+}
+

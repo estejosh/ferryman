@@ -3036,6 +3036,49 @@ pub fn syncthing_peers() -> Result<Vec<SyncthingPeer>> {
     Ok(peers)
 }
 
+pub fn channel_folder_id(route: &ProjectRoute) -> String {
+    if route.shared_remote.trim().is_empty() {
+        format!("{}-ferryman", route.project_id)
+    } else {
+        route.shared_remote.clone()
+    }
+}
+
+/// DELETE to Syncthing's local API, for removing a folder.
+fn syncthing_delete(api_base: &str, path: &str, api_key: &str) -> Result<Option<u16>> {
+    let authority = api_base
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("http://")
+        .context("SYNCTHING_API_BASE must be a plain http:// loopback address")?;
+    let authority = if authority.contains(':') {
+        authority.to_string()
+    } else {
+        format!("{authority}:8384")
+    };
+    let Some(address) = authority.to_socket_addrs()?.next() else {
+        return Ok(None);
+    };
+    let Ok(mut stream) = TcpStream::connect_timeout(&address, SYNCTHING_API_TIMEOUT) else {
+        return Ok(None);
+    };
+    stream.set_read_timeout(Some(SYNCTHING_API_TIMEOUT))?;
+    stream.set_write_timeout(Some(SYNCTHING_API_TIMEOUT))?;
+    let request = format!("DELETE {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return Ok(None);
+    }
+    let mut raw = Vec::new();
+    if stream.read_to_end(&mut raw).is_err() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&raw);
+    let Some(status_line) = text.lines().next() else {
+        return Ok(None);
+    };
+    Ok(status_line.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()))
+}
+
 /// Register this project's channel folder with the local Syncthing and share it.
 ///
 /// This is the step that used to be left to the operator, and leaving it there was the
@@ -3168,6 +3211,117 @@ fn register_folder(
         }),
         Some(code) => Ok(unavailable(&format!(
             "Syncthing refused the folder (HTTP {code}); register it by hand"
+        ))),
+        None => Ok(unavailable("could not reach Syncthing's API")),
+    }
+}
+
+/// The device ids this project's channel folder is currently shared with
+/// (this machine excluded). Empty when the folder is not registered.
+pub fn syncthing_folder_device_ids(route: &ProjectRoute) -> Result<Vec<String>> {
+    let folder_id = channel_folder_id(route);
+    let Some(key) = syncthing_api_key() else {
+        return Ok(Vec::new());
+    };
+    let base = syncthing_api_base();
+    let Some(status) = syncthing_get(&base, "/rest/system/status", &key)? else {
+        return Ok(Vec::new());
+    };
+    let me = status.get("myID").and_then(Value::as_str).map(str::to_string);
+    let Some(config) = syncthing_get(&base, "/rest/config", &key)? else {
+        return Ok(Vec::new());
+    };
+    let mut ids = Vec::new();
+    if let Some(folders) = config.get("folders").and_then(Value::as_array) {
+        for folder in folders {
+            if folder.get("id").and_then(Value::as_str) != Some(folder_id.as_str()) {
+                continue;
+            }
+            if let Some(devices) = folder.get("devices").and_then(Value::as_array) {
+                for device in devices {
+                    if let Some(id) = device.get("deviceID").and_then(Value::as_str)
+                        && Some(id.to_string()) != me
+                    {
+                        ids.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(ids)
+}
+
+/// Resolve device ids to peers, keeping the names Syncthing already knows and
+/// leaving the name blank for an id this Syncthing has not paired yet.
+pub fn peers_for_ids(device_ids: &[String]) -> Result<Vec<SyncthingPeer>> {
+    let known = syncthing_peers()?;
+    Ok(device_ids
+        .iter()
+        .map(|id| SyncthingPeer {
+            device_id: id.clone(),
+            name: known
+                .iter()
+                .find(|peer| &peer.device_id == id)
+                .map(|peer| peer.name.clone())
+                .unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Share this project's channel folder with the given device ids, keeping every
+/// peer it is already shared with. This is the granular control `enable`'s
+/// share-everything default does not give: one project can go to one person.
+pub fn syncthing_share_folder(route: &ProjectRoute, device_ids: &[String]) -> Result<SyncthingSetup> {
+    let mut current = syncthing_folder_device_ids(route)?;
+    for id in device_ids {
+        if !current.contains(id) {
+            current.push(id.clone());
+        }
+    }
+    syncthing_register_folder(route, &peers_for_ids(&current)?)
+}
+
+/// Stop sharing this project's channel folder with the given device ids, leaving
+/// every other share untouched.
+pub fn syncthing_unshare_folder(
+    route: &ProjectRoute,
+    device_ids: &[String],
+) -> Result<SyncthingSetup> {
+    let remaining: Vec<String> = syncthing_folder_device_ids(route)?
+        .into_iter()
+        .filter(|id| !device_ids.contains(id))
+        .collect();
+    syncthing_register_folder(route, &peers_for_ids(&remaining)?)
+}
+
+/// Remove this project's channel folder from Syncthing entirely: the channel
+/// files stay put and still work locally, but this project no longer syncs.
+pub fn syncthing_unregister_folder(route: &ProjectRoute) -> Result<SyncthingSetup> {
+    let folder_id = channel_folder_id(route);
+    let folder_path = route.communications.display().to_string();
+    let unavailable = |note: &str| SyncthingSetup {
+        available: false,
+        folder_id: folder_id.clone(),
+        folder_path: folder_path.clone(),
+        device_id: None,
+        shared_with: Vec::new(),
+        note: note.to_string(),
+    };
+    let Some(key) = syncthing_api_key() else {
+        return Ok(unavailable("Syncthing config not found; nothing registered to remove"));
+    };
+    let base = syncthing_api_base();
+    match syncthing_delete(&base, &format!("/rest/config/folders/{folder_id}"), &key)? {
+        Some(code) if (200..300).contains(&code) => Ok(SyncthingSetup {
+            available: true,
+            folder_id,
+            folder_path,
+            device_id: None,
+            shared_with: Vec::new(),
+            note: "folder removed from Syncthing; the channel still works locally".to_string(),
+        }),
+        Some(code) => Ok(unavailable(&format!(
+            "Syncthing refused to remove the folder (HTTP {code})"
         ))),
         None => Ok(unavailable("could not reach Syncthing's API")),
     }

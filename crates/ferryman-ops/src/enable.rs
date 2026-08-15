@@ -40,6 +40,9 @@ pub struct Request {
     /// Leave the local Syncthing alone. For a machine where the folder is managed by
     /// something else, or where touching a running service is not wanted.
     pub no_syncthing: bool,
+    /// Share the channel folder with only these device ids, instead of every device
+    /// Syncthing already trusts. Lets one project go to one person.
+    pub share_with: Vec<String>,
     pub as_json: bool,
     /// Become this project's master: write the signed master declaration. Explicit,
     /// never silent — the caller should ask the user first.
@@ -287,12 +290,20 @@ pub fn perform(request: Request) -> Result<Outcome> {
     let syncthing = if request.no_syncthing {
         None
     } else {
+        // Shares with every device this Syncthing already trusts by default; a
+        // caller that wants one project to reach one person instead passes
+        // `share_with`, which narrows the share list to exactly those devices.
         let peers = ferryman_channel::syncthing_peers().unwrap_or_default();
         // The fleet channel first: it is what makes identity and the device count mean
         // the same thing on every machine. Best-effort, because a machine that cannot
         // host one must still be able to join a project.
         let _ = ferryman_channel::syncthing_register_fleet(&peers);
-        Some(ferryman_channel::syncthing_register_folder(&route, &peers)?)
+        let share = if request.share_with.is_empty() {
+            peers
+        } else {
+            ferryman_channel::peers_for_ids(&request.share_with)?
+        };
+        Some(ferryman_channel::syncthing_register_folder(&route, &share)?)
     };
 
     Ok(Outcome {
@@ -336,6 +347,7 @@ mod tests {
             role: "worker".into(),
             email: "tester@example.com".into(),
             no_syncthing: true,
+            share_with: vec![],
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
@@ -399,6 +411,7 @@ mod tests {
             role: "worker".into(),
             email: "tester@example.com".into(),
             no_syncthing: true,
+            share_with: vec![],
             command: "true".into(),
             review: "confirm".into(),
             as_json: false,
