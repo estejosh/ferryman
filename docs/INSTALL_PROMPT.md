@@ -39,6 +39,11 @@ Install Ferryman on this project and join it to my fleet.
    it is safe to run twice — if you are unsure whether you already ran it, run it again
    and read "already_configured" in the JSON.
 
+   (If the human wants the web dashboard so they can approve work from a browser, I do
+   NOT create their operator or know their password — it must stay out of my sight. I run
+   `ferry dashboard` and hand them the URL; they click "create operator" and choose a
+   name and password there, privately.)
+
 3. Read the JSON it printed and tell me:
      - syncthing.available — if false, tell me the "note" field verbatim; Syncthing is
        probably not installed or not running, and I need to fix that, not you.

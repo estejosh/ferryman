@@ -4,6 +4,7 @@
 pub use ferryman_channel as communications;
 pub mod continuity;
 pub mod dashboard;
+pub mod operators;
 pub mod recovery_targets;
 pub mod telegram;
 pub mod workspace;

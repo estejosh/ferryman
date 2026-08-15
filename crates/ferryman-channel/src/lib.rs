@@ -1163,6 +1163,17 @@ pub struct AgentIdentity {
     signing: SigningKey,
 }
 
+/// Never shows the signing seed: an identity may be debug-printed in logs and
+/// test failures, and the private half must not leak that way.
+impl std::fmt::Debug for AgentIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentIdentity")
+            .field("name", &self.name)
+            .field("public_key", &self.public_key_hex())
+            .finish()
+    }
+}
+
 impl AgentIdentity {
     /// Load this agent's key, creating one the first time it runs.
     ///
@@ -1279,6 +1290,30 @@ impl AgentIdentity {
     #[must_use]
     pub fn public_key_hex(&self) -> String {
         hex::encode(self.signing.verifying_key().to_bytes())
+    }
+
+    /// Reconstruct an identity from a raw 32-byte signing seed.
+    ///
+    /// This is the import half of a password-sealed operator identity: the
+    /// dashboard seals the seed with the operator's password, and on login
+    /// rebuilds the identity here so its signatures are indistinguishable from
+    /// one kept on disk.
+    #[must_use]
+    pub fn from_seed(name: &str, seed: [u8; 32]) -> Self {
+        Self {
+            name: name.to_string(),
+            signing: SigningKey::from_bytes(&seed),
+        }
+    }
+
+    /// The raw 32-byte signing seed.
+    ///
+    /// Private key material: only needed to seal the identity under a password.
+    /// Never write it to the synced channel (it is not part of the roster and
+    /// must not travel).
+    #[must_use]
+    pub fn seed_bytes(&self) -> [u8; 32] {
+        self.signing.to_bytes()
     }
 
     /// Sign a message, binding the signature to the fields that matter.
@@ -6904,7 +6939,7 @@ mod work_over_files_tests {
             work_for(&route, "grouchly").unwrap().iter().all(|t| t.order.id != "t-2"),
             "a dependent order must wait for its dependencies"
         );
-        assert!(dependencies_satisfied(&route, &dependent).unwrap() == false);
+        assert!(!dependencies_satisfied(&route, &dependent).unwrap());
     }
 
     #[test]

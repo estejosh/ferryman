@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ferryman — __PROJECT__</title>
+<script>window.__dash={readonly:__READONLY__,anyOperators:__ANY_OPERATORS__};</script>
+<style>
+:root{--bg:#0f1115;--panel:#181b22;--line:#2a2f3a;--fg:#e6e8ee;--dim:#9aa3b2;--accent:#5b9cf5;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);font-size:14px}
+header{display:flex;align-items:center;gap:1rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
+header h1{font-size:16px;margin:0;font-weight:600}
+header .project{color:var(--dim)}
+header .controls{margin-left:auto;display:flex;align-items:center;gap:.8rem}
+button{background:#232834;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:.35rem .7rem;cursor:pointer}
+button:hover{background:#2b3140}
+button.active{background:var(--accent);border-color:var(--accent);color:#fff}
+nav{display:flex;gap:.3rem;padding:.5rem 1rem;border-bottom:1px solid var(--line)}
+main{padding:1rem}
+.tab{display:none}
+.tab.active{display:block}
+.filters{display:flex;gap:.6rem;margin-bottom:.8rem}
+input,select{background:#14171d;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:.4rem .6rem}
+input[type=text]{flex:1}
+table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--line)}
+th{color:var(--dim);font-weight:600;background:#14171d}
+tr:last-child td{border-bottom:none}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:#1e232d}
+.badge{display:inline-block;padding:.1rem .45rem;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--dim)}
+.badge.ok{color:var(--ok);border-color:var(--ok)}
+.badge.bad{color:var(--bad);border-color:var(--bad)}
+.badge.warn{color:var(--warn);border-color:var(--warn)}
+.badge.accent{color:var(--accent);border-color:var(--accent)}
+.mono{font-family:ui-monospace,Menlo,monospace}
+.detail{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:1rem;margin-top:1rem}
+.detail h3{margin:0 0 .5rem;font-size:15px}
+.detail pre{white-space:pre-wrap;word-break:break-word;background:#14171d;border:1px solid var(--line);border-radius:6px;padding:.6rem;max-height:20rem;overflow:auto;font-family:ui-monospace,Menlo,monospace}
+.detail textarea{width:100%;min-height:4rem;background:#14171d;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:.5rem;margin:.4rem 0;font-family:inherit}
+.detail .review-actions{display:flex;gap:.5rem;align-items:center;margin-top:.4rem}
+.muted{color:var(--dim)}
+.lead{color:var(--warn);font-weight:600}
+section{min-height:10rem}
+.kpi{display:flex;gap:1rem;margin-bottom:1rem}
+.kpi div{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.7rem 1rem;flex:1}
+.kpi .num{font-size:22px;font-weight:600}
+.kpi .lab{color:var(--dim);font-size:12px}
+#login-overlay{position:fixed;inset:0;background:rgba(10,12,16,.85);display:flex;align-items:center;justify-content:center;z-index:10}
+.login-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1.5rem;width:22rem}
+.login-card h2{margin:0 0 .3rem;font-size:16px}
+.login-card input{width:100%;margin:.4rem 0}
+.login-card .row{display:flex;gap:.5rem;align-items:center;margin-top:.6rem}
+.login-card .row button:first-child{flex:1}
+</style>
+</head>
+<body>
+<header>
+  <h1>Ferryman</h1>
+  <span class="project mono">__PROJECT__</span>
+  <div class="controls">
+    <span id="who" class="muted"></span>
+    <button id="signout" style="display:none">sign out</button>
+    <label class="muted"><input type="checkbox" id="autorefresh" checked> auto</label>
+    <button id="refresh">refresh</button>
+    <span class="muted" id="updated"></span>
+  </div>
+</header>
+<nav id="tabs">
+  <button data-tab="tasks" class="active">Tasks</button>
+  <button data-tab="engines">Engines</button>
+  <button data-tab="ledger">Ledger</button>
+  <button data-tab="learnings">Learnings</button>
+</nav>
+<main>
+  <section id="tab-tasks" class="tab active">
+    <div class="filters">
+      <input id="search" type="text" placeholder="filter by id or task text…">
+      <select id="statefilter">
+        <option value="">all states</option>
+        <option value="open">open</option>
+        <option value="claimed">claimed</option>
+        <option value="awaiting_review">awaiting review</option>
+        <option value="changes_requested">changes requested</option>
+        <option value="accepted">accepted</option>
+        <option value="done">done</option>
+      </select>
+    </div>
+    <div id="tasklist"></div>
+    <div id="taskdetail"></div>
+  </section>
+  <section id="tab-engines" class="tab">
+    <div class="kpi" id="kpis"></div>
+    <table><thead><tr><th>engine</th><th>kept</th><th>rate</th><th>runs</th><th>est. cost</th></tr></thead><tbody id="engines-body"></tbody></table>
+  </section>
+  <section id="tab-ledger" class="tab">
+    <table><thead><tr><th>time</th><th>kind</th><th>actor</th><th>summary</th><th>ref</th></tr></thead><tbody id="ledger-body"></tbody></table>
+  </section>
+  <section id="tab-learnings" class="tab">
+    <table><thead><tr><th>time</th><th>engine</th><th>task</th><th>source</th><th>accepted</th><th>note</th></tr></thead><tbody id="learnings-body"></tbody></table>
+  </section>
+</main>
+<div id="login-overlay" style="display:none">
+  <div class="login-card">
+    <h2 id="auth-title">Sign in</h2>
+    <p class="muted">Operators approve and send back work under a password-protected identity.</p>
+    <input id="auth-name" placeholder="operator name" autocomplete="username">
+    <input id="auth-password" type="password" placeholder="password" autocomplete="current-password">
+    <div class="row">
+      <button id="auth-submit">sign in</button>
+      <button id="auth-toggle">create operator</button>
+    </div>
+    <span class="muted" id="auth-status"></span>
+  </div>
+</div>
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const st = s => s && s.status ? s.status.replace(/_/g,' ') : String(s||'');
+const sigBadge = s => s === 'valid' ? '<span class="badge ok">signed</span>' :
+  s === 'unsigned' ? '<span class="badge warn">unsigned</span>' : '<span class="badge bad">'+esc(s)+'</span>';
+
+async function j(url){const r = await fetch(url); if(!r.ok) throw new Error(r.status+' '+url); return r.json();}
+
+let tasks=[], selected=null;
+let session = sessionStorage.getItem('ferry-dash-token') || null;
+let operator = null;
+let authMode = 'login'; // 'login' | 'create'
+
+async function auth(mode, name, password){
+  const r = await fetch('/api/auth/'+mode, {
+    method:'POST',
+    headers:{'content-type':'application/json'},
+    body: JSON.stringify({name, password})
+  });
+  const text = await r.text();
+  if(!r.ok) throw new Error(text);
+  return JSON.parse(text);
+}
+
+function showLogin(mode){
+  authMode = mode;
+  document.getElementById('login-overlay').style.display = 'flex';
+  document.getElementById('auth-title').textContent = mode === 'login' ? 'Sign in' : 'Create operator';
+  document.getElementById('auth-submit').textContent = mode === 'login' ? 'sign in' : 'create';
+  document.getElementById('auth-toggle').textContent = mode === 'login' ? 'create operator' : 'sign in';
+  document.getElementById('auth-password').setAttribute('autocomplete', mode === 'login' ? 'current-password' : 'new-password');
+  document.getElementById('auth-status').textContent = '';
+}
+
+function hideLogin(){
+  document.getElementById('login-overlay').style.display = 'none';
+}
+
+function setSession(token, name){
+  session = token;
+  operator = name;
+  sessionStorage.setItem('ferry-dash-token', token);
+  document.getElementById('who').textContent = name ? 'signed in as '+name : '';
+  document.getElementById('signout').style.display = name ? '' : 'none';
+  hideLogin();
+}
+
+async function doAuth(){
+  const name = document.getElementById('auth-name').value.trim();
+  const password = document.getElementById('auth-password').value;
+  const status = document.getElementById('auth-status');
+  try{
+    if(authMode === 'login'){
+      const d = await auth('login', name, password);
+      setSession(d.token, d.name);
+      await refresh();
+    } else {
+      await auth('create', name, password);
+      status.textContent = 'created — sign in';
+      showLogin('login');
+      document.getElementById('auth-name').value = name;
+    }
+  }catch(e){
+    status.textContent = 'failed: ' + e.message;
+  }
+}
+
+async function doSignout(){
+  if(session){
+    try{ await fetch('/api/auth/logout', {method:'POST', headers:{'x-ferryman-dashboard-token':session}}); }catch(e){}
+  }
+  session = null; operator = null;
+  sessionStorage.removeItem('ferry-dash-token');
+  document.getElementById('who').textContent = '';
+  document.getElementById('signout').style.display = 'none';
+  showLogin('login');
+}
+
+async function checkSession(){
+  if(!session) return false;
+  try{
+    const r = await fetch('/api/auth/whoami', {headers:{'x-ferryman-dashboard-token':session}});
+    if(!r.ok){ session = null; return false; }
+    const d = await r.json();
+    operator = d.name;
+    return true;
+  }catch(e){ return false; }
+}
+
+function renderTasks(){
+  const q = (document.getElementById('search').value||'').toLowerCase();
+  const f = document.getElementById('statefilter').value;
+  const rows = tasks.filter(t =>
+    (!f || st(t.state)===f) &&
+    (!q || t.id.toLowerCase().includes(q) || (t.task||'').toLowerCase().includes(q))
+  );
+  const el = document.getElementById('tasklist');
+  if(!rows.length){ el.innerHTML='<div class="muted" style="padding:.6rem">no tasks match</div>'; return; }
+  el.innerHTML = '<table><thead><tr><th>id</th><th>state</th><th>holder</th><th>sig</th><th>task</th></tr></thead><tbody>' +
+    rows.map(t => `<tr data-id="${esc(t.id)}">
+      <td class="mono">${esc(t.id)}</td>
+      <td><span class="badge ${t.requires_approval?'accent':''}">${esc(st(t.state))}</span></td>
+      <td>${esc(t.holder||'—')}</td>
+      <td>${sigBadge(t.sig)}</td>
+      <td class="muted">${esc((t.task||'').slice(0,80))}</td>
+    </tr>`).join('') + '</tbody></table>';
+  el.querySelectorAll('tbody tr').forEach(tr => tr.onclick = () => showDetail(tr.dataset.id));
+}
+
+async function showDetail(id){
+  selected = id;
+  const d = await j('/api/tasks/'+encodeURIComponent(id));
+  const el = document.getElementById('taskdetail');
+  el.innerHTML = '<div class="detail"><h3 class="mono">'+esc(d.id)+' '+sigBadge(d.order.sig)+'</h3>'+
+    '<p class="muted">issued by <b>'+esc(d.order.issued_by)+'</b>'+(d.order.assigned_to?' → <b>'+esc(d.order.assigned_to)+'</b>':' (open)')+
+    (d.order.requires_approval?' <span class="badge accent">requires approval</span>':'')+
+    (d.order.requires_review?' <span class="badge">requires review</span>':'')+
+    (d.order.depends_on.length?' <span class="badge">depends: '+esc(d.order.depends_on.join(', '))+'</span>':'')+
+    (d.contract_missing.length?' <span class="badge bad">contract MISSING: '+esc(d.contract_missing.join(', '))+'</span>':'')+
+    '</p>'+
+    '<h3>Order</h3><pre>'+esc(JSON.stringify(d.order.payload,null,2))+'</pre>'+
+    '<h3>Claims</h3>'+(d.claims.length?d.claims.map(c=>'<div class="muted">'+esc(c.agent)+' at '+esc(c.at)+'</div>').join(''):'<div class="muted">none</div>')+
+    '<h3>Results</h3>'+(d.results.length?d.results.map(r=>'<pre>['+r.revision+'] '+esc(r.agent)+' '+sigBadge(r.sig)+'\n'+(esc(r.output||'(no output)')).slice(0,4000)+'</pre>').join(''):'<div class="muted">none</div>')+
+    '<h3>Reviews</h3>'+(d.reviews.length?d.reviews.map(r=>'<div>r'+r.revision+' by '+esc(r.reviewer)+' '+(r.accepted?'<span class="badge ok">accepted</span>':'<span class="badge warn">sent back</span>')+' '+sigBadge(r.sig)+(r.notes?' <span class="muted">— '+esc(r.notes)+'</span>':'')+'</div>').join(''):'<div class="muted">none</div>')+
+    (window.__dash.readonly || !d.results.length ? '' :
+      '<h3>Review</h3><textarea id="review-notes" placeholder="notes — required to send work back"></textarea>'+
+      '<div class="review-actions"><button id="btn-accept">accept</button><button id="btn-sendback">send back</button><span class="muted" id="review-status"></span></div>')+
+    '</div>';
+  const accept = document.getElementById('btn-accept');
+  if(accept) accept.onclick = () => doReview(id, true);
+  const sendback = document.getElementById('btn-sendback');
+  if(sendback) sendback.onclick = () => doReview(id, false);
+}
+
+async function doReview(id, accept){
+  const notes = (document.getElementById('review-notes')||{value:''}).value || '';
+  const status = document.getElementById('review-status');
+  try{
+    const r = await fetch('/api/tasks/'+encodeURIComponent(id)+'/review', {
+      method:'POST',
+      headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},
+      body: JSON.stringify({accept, notes: notes||null})
+    });
+    const text = await r.text();
+    if(r.status === 401){ doSignout(); return; }
+    if(r.ok){ if(status) status.textContent = 'done'; await showDetail(id); refresh(); }
+    else if(status){ status.textContent = 'failed: '+text; }
+    else { alert('review failed: '+text); }
+  }catch(e){ if(status) status.textContent = 'failed: '+e; }
+}
+
+function renderEngines(s){
+  document.getElementById('kpis').innerHTML = '<div><div class="num">'+s.length+'</div><div class="lab">engines</div></div>'+
+    '<div><div class="num">'+s.reduce((a,x)=>a+x.accepted,0)+'</div><div class="lab">kept</div></div>'+
+    '<div><div class="num">$'+s.reduce((a,x)=>a+(x.estimated_cost_usd||0),0).toFixed(2)+'</div><div class="lab">est. spend</div></div>';
+  document.getElementById('engines-body').innerHTML = s.map(x=>'<tr><td class="mono">'+esc(x.engine)+'</td><td>'+x.accepted+'/'+x.total+'</td><td>'+(x.rate*100).toFixed(0)+'%</td><td>'+x.runs+'</td><td>$'+(x.estimated_cost_usd||0).toFixed(3)+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">no learning data</td></tr>';
+}
+
+function renderLedger(d){
+  document.getElementById('ledger-body').innerHTML = (d.entries||[]).map(e=>'<tr><td class="muted">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">empty ledger</td></tr>';
+}
+
+function renderLearnings(l){
+  document.getElementById('learnings-body').innerHTML = l.map(x=>'<tr><td class="muted">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('') || '<tr><td colspan="6" class="muted">nothing learned yet</td></tr>';
+}
+
+async function refresh(){
+  try{
+    if(!window.__dash.readonly && session){
+      if(!(await checkSession())){ doSignout(); return; }
+      document.getElementById('who').textContent = 'signed in as '+operator;
+      document.getElementById('signout').style.display = '';
+    }
+    [tasks] = await Promise.all([j('/api/tasks')]);
+    renderTasks();
+    renderEngines(await j('/api/stats'));
+    renderLedger(await j('/api/ledger'));
+    renderLearnings(await j('/api/learnings'));
+    document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
+  }catch(e){ console.error(e); }
+}
+
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active');
+  document.getElementById('tab-'+b.dataset.tab).classList.add('active');
+});
+document.getElementById('refresh').onclick = refresh;
+document.getElementById('signout').onclick = doSignout;
+document.getElementById('auth-submit').onclick = doAuth;
+document.getElementById('auth-toggle').onclick = () => showLogin(authMode === 'login' ? 'create' : 'login');
+const authEnter = e => { if(e.key === 'Enter') doAuth(); };
+document.getElementById('auth-name').addEventListener('keydown', authEnter);
+document.getElementById('auth-password').addEventListener('keydown', authEnter);
+document.getElementById('search').oninput = renderTasks;
+document.getElementById('statefilter').onchange = renderTasks;
+setInterval(()=>{ if(document.getElementById('autorefresh').checked) refresh(); }, 3000);
+(async function init(){
+  if(window.__dash.readonly){
+    document.getElementById('signout').style.display = 'none';
+  } else if(await checkSession()){
+    document.getElementById('who').textContent = 'signed in as '+operator;
+    document.getElementById('signout').style.display = '';
+  } else {
+    // A first-time visitor with no operators yet should create one, not stare
+    // at a sign-in form with nothing to sign into.
+    showLogin(window.__dash.anyOperators ? 'login' : 'create');
+  }
+  refresh();
+})();
+</script>
+</body>
+</html>
+

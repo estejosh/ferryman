@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(Runner::parse("docker:alpine:3").unwrap(), Docker("alpine:3".into()));
         // A bare image name still means podman, so an existing config keeps working.
         assert_eq!(Runner::parse("ghcr.io/x/y").unwrap(), Podman("ghcr.io/x/y".into()));
-        assert!(Bare.is_sandboxed() == false);
+        assert!(!Bare.is_sandboxed());
         assert!(Podman("x".into()).is_sandboxed());
         assert_eq!(Podman("x".into()).runtime(), "podman");
         assert_eq!(Docker("x".into()).runtime(), "docker");

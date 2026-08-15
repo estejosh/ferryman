@@ -1,27 +1,199 @@
-//! Read-only web dashboard over the channel: tasks, ledger, and engine stats
-//! in one pane.
+//! Web dashboard over the channel: tasks, ledger, engine stats, and learnings
+//! in one interactive pane, plus (when not run read-only) the review action an
+//! operator needs to accept or send back work. Operators sign in with a
+//! password-protected identity and hold a short-lived, idle-expiring session.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
-use anyhow::Error;
+use anyhow::{Error, bail};
 use axum::{
     Json, Router,
-    extract::State,
-    http::StatusCode,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
     response::Html,
-    routing::get,
+    routing::{get, post},
 };
-use ferryman_channel::{ProjectRoute, TaskState};
+use ferryman_channel::{AgentIdentity, ProjectRoute, SignatureCheck, TaskState};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::net::TcpListener;
 
-/// A `Router` that serves the dashboard. The caller supplies the route to
-/// observe; this module never binds a listener or mutates the channel.
-pub fn router(route: Arc<ProjectRoute>) -> Router {
+use crate::operators::OperatorStore;
+
+const DASHBOARD_HTML: &str = include_str!("dashboard.html");
+
+/// Everything the dashboard handlers need. In read-only mode no operator can
+/// sign in and the write endpoint is disabled; otherwise each operator
+/// authenticates with a password, gets a session, and reviews are signed by
+/// that operator's identity, with the channel's own master-gating still
+/// binding what the web surface can approve.
+#[derive(Clone)]
+pub struct DashboardState {
+    pub route: Arc<ProjectRoute>,
+    pub operators: OperatorStore,
+    pub sessions: Sessions,
+    pub read_only: bool,
+}
+
+impl DashboardState {
+    pub fn new(
+        route: Arc<ProjectRoute>,
+        operators: OperatorStore,
+        read_only: bool,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            route,
+            operators,
+            sessions: Sessions::new(timeout),
+            read_only,
+        }
+    }
+}
+
+/// In-memory operator sessions, keyed by a random bearer token. Idle sessions
+/// expire after `timeout` and are pruned on access; a session holds the
+/// operator's unlocked signing identity for exactly as long as it is live.
+#[derive(Clone)]
+pub struct Sessions {
+    inner: Arc<Mutex<HashMap<String, Session>>>,
+    timeout: Duration,
+}
+
+struct Session {
+    identity: Arc<AgentIdentity>,
+    last_seen: Instant,
+}
+
+impl Sessions {
+    fn new(timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            timeout,
+        }
+    }
+
+    /// Start a session for an unlocked identity and return its bearer token.
+    fn insert(&self, identity: AgentIdentity) -> String {
+        let mut bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        let token = hex::encode(bytes);
+        self.inner.lock().unwrap().insert(
+            token.clone(),
+            Session {
+                identity: Arc::new(identity),
+                last_seen: Instant::now(),
+            },
+        );
+        token
+    }
+
+    /// Resolve a bearer token to an identity, refreshing its idle deadline.
+    /// Returns `None` for an unknown or expired token.
+    fn resolve(&self, token: &str) -> Option<Arc<AgentIdentity>> {
+        let mut map = self.inner.lock().unwrap();
+        map.retain(|_, s| s.last_seen.elapsed() < self.timeout);
+        let session = map.get_mut(token)?;
+        if session.last_seen.elapsed() >= self.timeout {
+            map.remove(token);
+            return None;
+        }
+        session.last_seen = Instant::now();
+        Some(session.identity.clone())
+    }
+
+    fn revoke(&self, token: &str) {
+        self.inner.lock().unwrap().remove(token);
+    }
+}
+
+/// A `Router` that serves the dashboard. The caller supplies the state to
+/// observe and (when not read-only) sign with; this module never binds a
+/// listener.
+pub fn router(state: DashboardState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/api/auth/create", post(create_operator))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/logout", post(logout))
+        .route("/api/auth/whoami", get(whoami))
         .route("/api/tasks", get(tasks))
+        .route("/api/tasks/{id}", get(task_detail))
+        .route("/api/tasks/{id}/review", post(review_task))
         .route("/api/stats", get(stats))
-        .with_state(route)
+        .route("/api/ledger", get(ledger))
+        .route("/api/learnings", get(learnings))
+        .layer(axum::middleware::from_fn(loopback_host_guard))
+        .with_state(state)
+}
+
+/// Reject requests whose `Host` header is not a loopback name/IP.
+///
+/// A raw loopback bind is not a defense against DNS rebinding: a browser can
+/// resolve `attacker.example` to 127.0.0.1 and reach the dashboard as
+/// "same-origin", reading the fleet and driving the write endpoints. Requiring
+/// a loopback `Host` blocks that. Requests with no `Host` at all (non-browser
+/// clients such as `curl`) are allowed. Mirrors the bridge server's guard.
+async fn loopback_host_guard(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host_ok = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| {
+            let host = match raw.rsplit_once(':') {
+                Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+                _ => raw,
+            };
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            host == "localhost"
+                || host == "127.0.0.1"
+                || host == "::1"
+                || host.starts_with("127.")
+        })
+        .unwrap_or(true);
+    if host_ok {
+        next.run(request).await
+    } else {
+        use axum::response::IntoResponse;
+        (StatusCode::FORBIDDEN, "host not allowed on loopback dashboard").into_response()
+    }
+}
+
+/// Bind a loopback listener and serve the dashboard until interrupted.
+///
+/// The dashboard reveals the whole fleet, so it refuses a non-loopback bind.
+/// To view it from another machine, forward a loopback port (e.g.
+/// `ssh -L 8788:127.0.0.1:8788 fleet-host`).
+pub async fn serve(state: DashboardState, addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    if !addr.ip().is_loopback() {
+        bail!(
+            "refusing to bind {addr}: the dashboard exposes the whole fleet; \
+             bind a loopback address and forward it (e.g. `ssh -L {port}:127.0.0.1:{port} fleet-host`)",
+            port = addr.port(),
+        );
+    }
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!(
+        "dashboard listening on http://{addr} (read_only={})",
+        state.read_only
+    );
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!("failed to install the ctrl-c handler: {error}");
+    }
 }
 
 type DashboardError = (StatusCode, String);
@@ -30,14 +202,91 @@ fn internal(error: Error) -> DashboardError {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
-/// GET /api/tasks
-///
-/// One object per task: its id, derived state, current holder, and how many
-/// results have been submitted.
+fn sig(signature: &SignatureCheck) -> &'static str {
+    match signature {
+        SignatureCheck::Valid => "valid",
+        SignatureCheck::Unsigned => "unsigned",
+        SignatureCheck::Invalid => "invalid",
+        SignatureCheck::UnknownSigner => "unknown",
+        SignatureCheck::KeyChanged { .. } => "key_changed",
+    }
+}
+
+fn session_token(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-ferryman-dashboard-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+#[derive(Deserialize)]
+struct Credentials {
+    name: String,
+    password: String,
+}
+
+/// POST /api/auth/create — mint a password-sealed operator identity and publish
+/// its public key to the roster, so the fleet can verify what this human signs.
+async fn create_operator(
+    State(state): State<DashboardState>,
+    Json(credentials): Json<Credentials>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = crate::operators::create_operator_identity(
+        &state.route,
+        &credentials.name,
+        &credentials.password,
+    )
+    .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({
+        "name": identity.name(),
+        "public_key": identity.public_key_hex(),
+    })))
+}
+
+/// POST /api/auth/login — unlock an operator identity and start a session.
+async fn login(
+    State(state): State<DashboardState>,
+    Json(credentials): Json<Credentials>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state
+        .operators
+        .login(&credentials.name, &credentials.password)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, e.to_string()))?;
+    let name = identity.name().to_string();
+    let public_key = identity.public_key_hex();
+    let token = state.sessions.insert(identity);
+    Ok(Json(json!({ "token": token, "name": name, "public_key": public_key })))
+}
+
+/// POST /api/auth/logout — end this session now, regardless of its deadline.
+async fn logout(State(state): State<DashboardState>, headers: HeaderMap) -> StatusCode {
+    state.sessions.revoke(session_token(&headers));
+    StatusCode::NO_CONTENT
+}
+
+/// GET /api/auth/whoami — report the session's operator, or 401 when there is
+/// no live session. Also touches the idle deadline, so an open tab stays in.
+async fn whoami(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    match state.sessions.resolve(session_token(&headers)) {
+        Some(identity) => Ok(Json(json!({ "name": identity.name() }))),
+        None => Err((StatusCode::UNAUTHORIZED, "no active session".to_string())),
+    }
+}
+
+/// GET /api/tasks — a summary of every task, with signature status.
 async fn tasks(
-    State(route): State<Arc<ProjectRoute>>,
+    State(state): State<DashboardState>,
 ) -> Result<Json<Vec<Value>>, DashboardError> {
-    let tasks = ferryman_channel::list_tasks(&route).map_err(internal)?;
+    let tasks = ferryman_channel::list_tasks(&state.route).map_err(internal)?;
     let items = tasks
         .iter()
         .map(|task| {
@@ -46,85 +295,218 @@ async fn tasks(
                 "state": state_value(&task.state()),
                 "holder": task.holder(),
                 "result_count": task.results.len(),
+                "sig": sig(&ferryman_channel::verify_order(&task.order, &state.route.agents)),
+                "requires_review": task.order.requires_review,
+                "requires_approval": task.order.requires_approval,
+                "task": task.order.payload.get("task").and_then(Value::as_str).unwrap_or(""),
+                "depends_on": task.order.depends_on,
+                "contract_missing": task.contract_violations().unwrap_or_default(),
             })
         })
         .collect();
     Ok(Json(items))
 }
 
-/// GET /api/stats
+/// GET /api/tasks/{id} — full detail for one task.
+async fn task_detail(
+    State(state): State<DashboardState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, DashboardError> {
+    let task = ferryman_channel::read_task(&state.route, &id).map_err(internal)?;
+    let results = task
+        .results
+        .iter()
+        .map(|r| {
+            json!({
+                "revision": r.revision,
+                "agent": r.agent,
+                "sig": sig(&ferryman_channel::verify_result(r, &state.route.agents)),
+                "output": r.payload.get("output").and_then(Value::as_str)
+                    .map(|s| s.chars().take(4000).collect::<String>()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let reviews = task
+        .reviews
+        .iter()
+        .map(|r| {
+            json!({
+                "revision": r.revision,
+                "reviewer": r.reviewer,
+                "accepted": r.accepted,
+                "notes": r.notes,
+                "sig": sig(&ferryman_channel::verify_review(r, &state.route.agents)),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "id": task.order.id,
+        "order": {
+            "issued_by": task.order.issued_by,
+            "assigned_to": task.order.assigned_to,
+            "created_at": task.order.created_at.to_rfc3339(),
+            "requires_review": task.order.requires_review,
+            "requires_approval": task.order.requires_approval,
+            "depends_on": task.order.depends_on,
+            "payload": task.order.payload,
+            "sig": sig(&ferryman_channel::verify_order(&task.order, &state.route.agents)),
+        },
+        "claims": task.claims.iter().map(|c| json!({ "agent": c.agent, "at": c.claimed_at.to_rfc3339() })).collect::<Vec<_>>(),
+        "results": results,
+        "reviews": reviews,
+        "contract_missing": task.contract_violations().unwrap_or_default(),
+    })))
+}
+
+/// GET /api/stats — engine acceptance plus cost, merged into one table.
 async fn stats(
-    State(route): State<Arc<ProjectRoute>>,
+    State(state): State<DashboardState>,
 ) -> Result<Json<Vec<Value>>, DashboardError> {
-    let stats = ferryman_channel::learning::engine_stats(&route).map_err(internal)?;
-    let items = stats
+    let acceptance = ferryman_channel::learning::engine_stats(&state.route).map_err(internal)?;
+    let costs = ferryman_channel::cost::engine_costs(&state.route).map_err(internal)?;
+    let items = acceptance
         .iter()
         .map(|stat| {
+            let cost = costs.iter().find(|c| c.engine == stat.engine);
             json!({
                 "engine": stat.engine,
                 "total": stat.total,
                 "accepted": stat.accepted,
                 "rate": stat.rate(),
+                "runs": cost.map(|c| c.runs).unwrap_or(0),
+                "prompt_tokens": cost.map(|c| c.prompt_tokens).unwrap_or(0),
+                "completion_tokens": cost.map(|c| c.completion_tokens).unwrap_or(0),
+                "estimated_cost_usd": cost.map(|c| c.estimated_cost_usd).unwrap_or(0.0),
             })
         })
         .collect();
     Ok(Json(items))
 }
 
-/// GET /
+/// GET /api/ledger — the most recent ledger entries, newest first.
+async fn ledger(
+    State(state): State<DashboardState>,
+) -> Result<Json<Value>, DashboardError> {
+    let log = ferryman_channel::ledger::read_ledger(&state.route).map_err(internal)?;
+    let entries = log
+        .entries
+        .iter()
+        .rev()
+        .take(100)
+        .map(|e| {
+            json!({
+                "kind": e.kind,
+                "actor": e.actor,
+                "summary": e.summary,
+                "reference": e.reference,
+                "at": e.created_at.to_rfc3339(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({ "intact": log.intact, "entries": entries })))
+}
+
+/// GET /api/learnings — the most recent learning records, newest first.
+async fn learnings(
+    State(state): State<DashboardState>,
+) -> Result<Json<Vec<Value>>, DashboardError> {
+    let learnings = ferryman_channel::learning::read_learnings(&state.route).map_err(internal)?;
+    let items = learnings
+        .iter()
+        .rev()
+        .take(100)
+        .map(|l| {
+            json!({
+                "engine": l.engine,
+                "task_id": l.task_id,
+                "source": l.source,
+                "accepted": l.accepted,
+                "note": l.note,
+                "at": l.at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(Json(items))
+}
+
+#[derive(Deserialize)]
+struct ReviewBody {
+    accept: bool,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// POST /api/tasks/{id}/review — accept a result, or send it back with notes.
 ///
-/// A minimal HTML page with the same task and stat data as the JSON endpoints.
-async fn index(State(route): State<Arc<ProjectRoute>>) -> Result<Html<String>, DashboardError> {
-    let tasks = ferryman_channel::list_tasks(&route).map_err(internal)?;
-    let stats = ferryman_channel::learning::engine_stats(&route).map_err(internal)?;
+/// This is the write action the CLI exposes as `ferry channel review`, and it
+/// uses the exact same path: load the latest result, enforce the contract, sign
+/// the verdict with the *session's* operator identity, and hand it to
+/// `submit_review`, whose own rules (an agent cannot approve its own work;
+/// approval-gated orders need the master) still bind the web surface. Guarded
+/// by the session token so a cross-origin page cannot drive it and so the
+/// verdict is attributable to the human who signed in.
+async fn review_task(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReviewBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state
+        .sessions
+        .resolve(session_token(&headers))
+        .ok_or((StatusCode::UNAUTHORIZED, "no active session; sign in again".to_string()))?;
 
-    let mut task_rows = String::new();
-    for task in &tasks {
-        task_rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-            escape_html(&task.order.id),
-            escape_html(&state_text(&task.state())),
-            escape_html(task.holder().unwrap_or("\u{2014}")),
-            task.results.len(),
+    let task = ferryman_channel::read_task(&state.route, &id).map_err(internal)?;
+    let revision = task
+        .latest_revision()
+        .ok_or((StatusCode::CONFLICT, "there is no result to review yet".to_string()))?;
+    if body.accept
+        && let Some(missing) = task.contract_violations()
+        && !missing.is_empty()
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "result does not satisfy the order's contract; missing keys: {}",
+                missing.join(", ")
+            ),
         ));
     }
-    if tasks.is_empty() {
-        task_rows.push_str("<tr><td colspan=\"4\">No tasks yet</td></tr>");
-    }
 
-    let mut stat_rows = String::new();
-    for stat in &stats {
-        stat_rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:.1}%</td></tr>",
-            escape_html(&stat.engine),
-            stat.total,
-            stat.accepted,
-            stat.rate() * 100.0,
-        ));
-    }
-    if stats.is_empty() {
-        stat_rows.push_str("<tr><td colspan=\"4\">No learning data yet</td></tr>");
-    }
+    let mut verdict = ferryman_channel::Review {
+        order_id: id.clone(),
+        revision,
+        reviewer: identity.name().to_string(),
+        reviewed_at: chrono::Utc::now(),
+        accepted: body.accept,
+        notes: body.notes.clone(),
+        signed_by: None,
+        signature: None,
+    };
+    identity.sign_review(&mut verdict);
+    let path = ferryman_channel::submit_review(&state.route, &verdict)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({
+        "order_id": id,
+        "revision": revision,
+        "accepted": body.accept,
+        "reviewer": verdict.reviewer,
+        "path": path.display().to_string(),
+    })))
+}
 
-    let html = format!(
-        "<!doctype html>\
-         <html lang=\"en\">\
-         <head><meta charset=\"utf-8\"><title>Ferryman dashboard</title>\
-         <style>\
-         body{{font-family:system-ui,sans-serif;margin:2rem;color:#111}}\
-         table{{border-collapse:collapse;margin-bottom:2rem;min-width:40rem}}\
-         th,td{{border:1px solid #ddd;padding:.4rem .6rem;text-align:left}}\
-         th{{background:#f5f5f5}}\
-         </style></head>\
-         <body>\
-         <h1>Ferryman dashboard</h1>\
-         <h2>Tasks</h2><table><thead><tr><th>ID</th><th>State</th><th>Holder</th><th>Results</th></tr></thead>\
-         <tbody>{task_rows}</tbody></table>\
-         <h2>Engine stats</h2><table><thead><tr><th>Engine</th><th>Total</th><th>Accepted</th><th>Rate</th></tr></thead>\
-         <tbody>{stat_rows}</tbody></table>\
-         </body></html>"
-    );
-    Ok(Html(html))
+/// GET / — the single-page app, with the project id and mode injected so the
+/// browser knows how to behave. The session token is never embedded: it only
+/// exists after the operator signs in, and it stays in the tab's memory.
+async fn index(State(state): State<DashboardState>) -> Html<String> {
+    let html = DASHBOARD_HTML
+        .replacen("__PROJECT__", &state.route.project_id, 1)
+        .replacen("__READONLY__", if state.read_only { "true" } else { "false" }, 1)
+        .replacen("__ANY_OPERATORS__", if state.operators.any() { "true" } else { "false" }, 1);
+    Html(html)
 }
 
 /// JSON representation of a task state. The shape is intentionally flat and
@@ -132,7 +514,7 @@ async fn index(State(route): State<Arc<ProjectRoute>>) -> Result<Html<String>, D
 /// channel's internal types evolve.
 fn state_value(state: &TaskState) -> Value {
     match state {
-        TaskState::Open => json!("open"),
+        TaskState::Open => json!({ "status": "open" }),
         TaskState::Claimed { by } => json!({ "status": "claimed", "by": by }),
         TaskState::AwaitingReview { by, revision } => {
             json!({ "status": "awaiting_review", "by": by, "revision": revision })
@@ -140,30 +522,9 @@ fn state_value(state: &TaskState) -> Value {
         TaskState::ChangesRequested { revision } => {
             json!({ "status": "changes_requested", "revision": revision })
         }
-        TaskState::Accepted => json!("accepted"),
-        TaskState::Done => json!("done"),
+        TaskState::Accepted => json!({ "status": "accepted" }),
+        TaskState::Done => json!({ "status": "done" }),
     }
-}
-
-fn state_text(state: &TaskState) -> String {
-    match state {
-        TaskState::Open => "open".to_string(),
-        TaskState::Claimed { by } => format!("claimed by {by}"),
-        TaskState::AwaitingReview { by, revision } => {
-            format!("awaiting review by {by} (revision {revision})")
-        }
-        TaskState::ChangesRequested { revision } => format!("changes requested (revision {revision})"),
-        TaskState::Accepted => "accepted".to_string(),
-        TaskState::Done => "done".to_string(),
-    }
-}
-
-fn escape_html(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
 }
 
 #[cfg(test)]
@@ -174,7 +535,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use chrono::Utc;
-    use ferryman_channel::Order;
+    use ferryman_channel::{AgentRoute, Order, TaskResult};
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -210,14 +571,42 @@ mod tests {
         }
     }
 
+    fn state(route: &Arc<ProjectRoute>, read_only: bool) -> DashboardState {
+        DashboardState::new(
+            route.clone(),
+            OperatorStore::new(&route.attachment),
+            read_only,
+            Duration::from_secs(900),
+        )
+    }
+
+    async fn post(
+        app: &Router,
+        uri: &str,
+        body: &str,
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("x-ferryman-dashboard-token", token);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn api_tasks_lists_channel_tasks() {
         let dir = tempfile::tempdir().unwrap();
-        let route = test_route(dir.path());
+        let route = Arc::new(test_route(dir.path()));
         ferryman_channel::issue_order(&route, &order("task-1")).unwrap();
         ferryman_channel::claim_order(&route, "task-1", "alice").unwrap();
 
-        let response = router(Arc::new(route))
+        let response = router(state(&route, false))
             .oneshot(
                 Request::builder()
                     .uri("/api/tasks")
@@ -236,6 +625,170 @@ mod tests {
         assert_eq!(tasks[0]["result_count"], 0);
         assert_eq!(tasks[0]["state"]["status"], "claimed");
         assert_eq!(tasks[0]["state"]["by"], "alice");
+    }
+
+    #[tokio::test]
+    async fn rejects_a_non_loopback_host_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let app = router(state(&route, false));
+
+        // A DNS-rebinding attacker resolves their domain to 127.0.0.1; the Host
+        // header betrays that and the request is refused.
+        let bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header("host", "attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::FORBIDDEN);
+
+        // A genuine loopback request (and one with no Host at all) still works.
+        let good = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header("host", "127.0.0.1:8788")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(good.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_create_publishes_the_identity_to_the_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep the machine-wide fleet roster inside the tempdir, so this test
+        // does not publish a random key into the real operator's fleet dir.
+        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        let route = Arc::new(test_route(dir.path()));
+        let app = router(state(&route, false));
+
+        let created = post(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+
+        // The public half is published to the project channel exactly like a
+        // joining agent, so the operator's reviews will verify.
+        let roster_file = route.communications.join("agents").join("operator1.json");
+        assert!(roster_file.exists(), "roster entry should exist");
+        let entry: AgentRoute =
+            serde_json::from_str(&std::fs::read_to_string(&roster_file).unwrap()).unwrap();
+        assert_eq!(entry.name, "operator1");
+        assert!(entry.public_key.is_some());
+
+        // The same name cannot be created again.
+        let dup = post(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(dup.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn review_requires_a_session_and_signs_the_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        // The channel verifies signatures at read time, so the result and the
+        // verdict must both be signed by identities whose public keys the roster
+        // knows. The worker is minted from a fixed seed; the operator comes from
+        // the password-sealed operator store.
+        let alice = AgentIdentity::from_seed("alice", [1u8; 32]);
+
+        let mut route = test_route(dir.path());
+        let reviewer = OperatorStore::new(&route.attachment)
+            .create("reviewer", "hunter2-secret")
+            .unwrap();
+        route.agents.push(AgentRoute {
+            name: "alice".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(alice.public_key_hex()),
+        });
+        route.agents.push(AgentRoute {
+            name: "reviewer".into(),
+            role: "master".into(),
+            capabilities: Vec::new(),
+            public_key: Some(reviewer.public_key_hex()),
+        });
+        let route = Arc::new(route);
+
+        ferryman_channel::issue_order(&route, &order("task-1")).unwrap();
+        ferryman_channel::claim_order(&route, "task-1", "alice").unwrap();
+        let mut result = TaskResult {
+            order_id: "task-1".into(),
+            agent: "alice".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "done" }),
+            signed_by: None,
+            signature: None,
+        };
+        alice.sign_result(&mut result);
+        ferryman_channel::submit_result(&route, &result).unwrap();
+
+        let app = router(state(&route, false));
+
+        // Signing in yields a session token.
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"reviewer","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let login: Value = serde_json::from_slice(&body).unwrap();
+        let token = login["token"].as_str().unwrap();
+
+        // Without a token, and with a bogus one, the review is refused.
+        let denied = post(&app, "/api/tasks/task-1/review", r#"{"accept":true}"#, None).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let denied = post(&app, "/api/tasks/task-1/review", r#"{"accept":true}"#, Some("bogus")).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        // With the token, the review lands signed by the operator.
+        let accepted = post(&app, "/api/tasks/task-1/review", r#"{"accept":true}"#, Some(token)).await;
+        assert_eq!(
+            accepted.status(),
+            StatusCode::OK,
+            "body: {:?}",
+            {
+                let body = accepted.into_body().collect().await.unwrap().to_bytes();
+                String::from_utf8_lossy(&body).to_string()
+            }
+        );
+
+        let task = ferryman_channel::read_task(&route, "task-1").unwrap();
+        assert_eq!(task.reviews.len(), 1);
+        assert!(task.reviews[0].accepted);
+        assert_eq!(task.reviews[0].reviewer, "reviewer");
+        assert!(task.reviews[0].signature.is_some(), "the verdict must be signed");
+    }
+
+    #[test]
+    fn sessions_expire_when_idle() {
+        let sessions = Sessions::new(Duration::from_millis(20));
+        let identity = AgentIdentity::from_seed("op", [9u8; 32]);
+        let token = sessions.insert(identity);
+        assert!(sessions.resolve(&token).is_some());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(sessions.resolve(&token).is_none(), "idle session must expire");
     }
 }
 

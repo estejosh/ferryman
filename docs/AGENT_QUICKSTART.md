@@ -106,9 +106,18 @@ Useful flags, all optional:
 | `--command` | `claude` | You run a different agent CLI |
 | `--email` | *(required)* | No default is possible; ask your human |
 | `--review` | `confirm` | See the risk section below |
+| `--dashboard` | off | Mark that the human wants the web dashboard (`ferry dashboard`) to approve work from a browser |
+| `--dashboard-operator` | email local part | The operator's username, for the interactive prompt only |
 
 Exit code is 0 on success, non-zero with a message on stderr otherwise. It never
 prompts, never opens an editor, and never waits on a terminal.
+
+The dashboard operator's password is **never handled by an agent**. `enable` does
+not accept one, and you must not type one into a flag, an environment variable, or a
+config file. When the human wants a dashboard, run `enable --dashboard`, then start
+`ferry dashboard` and hand the human the URL: they create their operator (name +
+password) in the browser, out of your sight. A human running `enable` themselves at a
+terminal is instead prompted for the password, typed without echo.
 
 ## Step 3 — join the other machines
 

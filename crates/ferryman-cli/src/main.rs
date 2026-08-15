@@ -76,6 +76,16 @@ enum Command {
         /// Emit one JSON object describing the result, for a caller that is a program.
         #[arg(long)]
         json: bool,
+        /// Also set up the web dashboard. Interactively, `enable` asks for the
+        /// operator name and password here (typed privately, never echoed). An
+        /// agent (`--json`) never sees or handles the password: it reports that
+        /// a human should run `ferry dashboard` and create the operator in the
+        /// browser instead.
+        #[arg(long)]
+        dashboard: bool,
+        /// The dashboard operator's username. Used by the interactive prompt.
+        #[arg(long)]
+        dashboard_operator: Option<String>,
     },
     /// Stop this machine taking on new work, until you resume it.
     ///
@@ -179,6 +189,24 @@ enum Command {
     Communications {
         #[command(subcommand)]
         command: Communications,
+    },
+    /// Serve a web dashboard over this project's channel: tasks, engine stats,
+    /// the ledger, and learnings, live. Operators sign in with a
+    /// password-protected identity and approve or send back work from the
+    /// browser. Binds loopback only.
+    Dashboard {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Loopback port to bind. Defaults to 8788.
+        #[arg(long, default_value_t = 8788)]
+        port: u16,
+        /// Minutes of inactivity before an operator is signed out.
+        #[arg(long, default_value_t = 15)]
+        timeout: u64,
+        /// Serve views only; disable sign-in and the approve/send-back action.
+        #[arg(long)]
+        read_only: bool,
     },
 }
 #[derive(Subcommand, Clone)]
@@ -918,13 +946,15 @@ async fn main() -> Result<()> {
             sandbox,
             worktree,
             json: as_json,
+            dashboard,
+            dashboard_operator,
         } => {
             let outcome = enable::perform(enable::Request {
                 workspace,
                 project,
                 agent: agent_name,
                 role,
-                email,
+                email: email.clone(),
                 command,
                 review,
                 no_syncthing,
@@ -933,10 +963,30 @@ async fn main() -> Result<()> {
                 sandbox,
                 worktree,
             })?;
+            // A human at a terminal types the operator password here, privately.
+            // An agent never sees or supplies it: it is told to hand the human a
+            // browser, where the operator identity is created out of the agent's
+            // sight.
+            let setup = resolve_dashboard_setup(dashboard, dashboard_operator, &email, as_json)?;
+            let dashboard = match setup {
+                Some(DashboardSetup::Create { name, password }) => {
+                    let identity = ferryman_server::operators::create_operator_identity(
+                        &outcome.route,
+                        &name,
+                        &password,
+                    )?;
+                    Some(DashboardOutcome::Created {
+                        operator: identity.name().to_string(),
+                        public_key: identity.public_key_hex(),
+                    })
+                }
+                Some(DashboardSetup::DeferToBrowser) => Some(DashboardOutcome::Deferred),
+                None => None,
+            };
             if as_json {
-                report_enable_json(&outcome)?;
+                report_enable_json(&outcome, dashboard.as_ref())?;
             } else {
-                report_enable_human(&outcome);
+                report_enable_human(&outcome, dashboard.as_ref());
             }
         }
         Command::Pause { reason } => {
@@ -1041,6 +1091,38 @@ async fn main() -> Result<()> {
             }
         },
         Command::Channel { command } => channel(command)?,
+        Command::Dashboard {
+            workspace,
+            port,
+            timeout,
+            read_only,
+        } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = std::sync::Arc::new(ferryman_channel::route_for(&start)?);
+            // Operators sign in over the web with a password-sealed identity; the
+            // signing key is only unlocked in memory for the lifetime of a session.
+            let operators = ferryman_server::operators::OperatorStore::new(&route.attachment);
+            let state = ferryman_server::dashboard::DashboardState::new(
+                route,
+                operators,
+                read_only,
+                std::time::Duration::from_secs(timeout.saturating_mul(60)),
+            );
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            println!(
+                "dashboard → http://{addr}  (project {})",
+                state.route.project_id
+            );
+            if read_only {
+                println!("read-only; ctrl-c to stop");
+            } else {
+                println!("sign in (or create an operator identity) in the browser; ctrl-c to stop");
+            }
+            ferryman_server::dashboard::serve(state, addr).await?;
+        }
         Command::Communications { command } => match command {
             Communications::Send {
                 project,
@@ -1439,7 +1521,92 @@ async fn main() -> Result<()> {
 /// This lives in the binary rather than in `ferryman-ops` because it is a *presentation*
 /// of the outcome, and the library has other callers - a tray application wants the
 /// `Outcome` struct, not a string it has to parse back.
-fn report_enable_json(outcome: &enable::Outcome) -> Result<()> {
+/// Resolve whether to create a dashboard operator during `ferry enable`.
+///
+/// What an interactive `enable` should do about the dashboard operator, or the
+/// instruction an agent-driven `enable` should pass on to the human.
+enum DashboardSetup {
+    /// The human is at the terminal and has just typed their password privately.
+    Create { name: String, password: String },
+    /// An agent is driving: the human must create the operator in the browser,
+    /// out of the agent's sight.
+    DeferToBrowser,
+}
+
+/// The result of the dashboard setup, for reporting.
+enum DashboardOutcome {
+    Created { operator: String, public_key: String },
+    Deferred,
+}
+
+/// Resolve whether to create a dashboard operator during `ferry enable`.
+///
+/// A human at a terminal is asked and types the password privately (never
+/// echoed). An agent (`--json`, or piped stdin) never sees or supplies the
+/// password: it is told to hand the human a browser instead.
+fn resolve_dashboard_setup(
+    dashboard: bool,
+    operator: Option<String>,
+    email: &str,
+    as_json: bool,
+) -> Result<Option<DashboardSetup>> {
+    use std::io::{IsTerminal, Write};
+    let interactive = !as_json && std::io::stdin().is_terminal();
+
+    if !dashboard {
+        if !interactive {
+            return Ok(None);
+        }
+        print!("Set up the web dashboard (approve work from a browser)? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            return Ok(None);
+        }
+    }
+
+    // An agent cannot type the operator's password here, and must not see it:
+    // the human creates the operator in the browser.
+    if !interactive {
+        return Ok(Some(DashboardSetup::DeferToBrowser));
+    }
+
+    let name = match operator {
+        Some(name) => name,
+        None => {
+            let default =
+                ferryman_ops::identity::slug(email.split('@').next().unwrap_or("operator"));
+            let default = if default.is_empty() {
+                "operator".to_string()
+            } else {
+                default
+            };
+            print!("dashboard operator name [{default}]: ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let input = answer.trim().to_string();
+            if input.is_empty() { default } else { input }
+        }
+    };
+
+    let first = rpassword::prompt_password("dashboard password: ")?;
+    let second = rpassword::prompt_password("repeat dashboard password: ")?;
+    if first != second {
+        bail!("dashboard passwords did not match");
+    }
+
+    Ok(Some(DashboardSetup::Create {
+        name,
+        password: first,
+    }))
+}
+
+fn report_enable_json(
+    outcome: &enable::Outcome,
+    dashboard: Option<&DashboardOutcome>,
+) -> Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&json!({
@@ -1453,6 +1620,18 @@ fn report_enable_json(outcome: &enable::Outcome) -> Result<()> {
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
             "already_configured": outcome.steps.iter().all(|s| !s.created),
+            "dashboard": dashboard.map(|d| match d {
+                DashboardOutcome::Created { operator, public_key } => json!({
+                    "operator": operator,
+                    "public_key": public_key,
+                    "then_run": ["ferry dashboard"],
+                }),
+                DashboardOutcome::Deferred => json!({
+                    "create_in_browser": true,
+                    "note": "hand the human a browser; they create their operator there, out of this agent's sight",
+                    "then_run": ["ferry dashboard"],
+                }),
+            }),
             "license": {
                 "seats": outcome.counted.seats,
                 "computers": outcome.counted.computers,
@@ -1477,7 +1656,7 @@ fn report_enable_json(outcome: &enable::Outcome) -> Result<()> {
 }
 
 /// The same facts, for a person.
-fn report_enable_human(outcome: &enable::Outcome) {
+fn report_enable_human(outcome: &enable::Outcome, dashboard: Option<&DashboardOutcome>) {
     println!("ferryman enabled for '{}'", outcome.project);
     for step in &outcome.steps {
         println!(
@@ -1492,6 +1671,16 @@ fn report_enable_human(outcome: &enable::Outcome) {
     println!("  runs       {}", outcome.config.command);
     println!("  review     {}", outcome.config.review.as_str());
     println!("  public key {}", outcome.public_key);
+    match dashboard {
+        Some(DashboardOutcome::Created { operator, .. }) => {
+            println!("  dashboard  operator '{operator}' created");
+            println!("             run `ferry dashboard` and sign in as {operator}");
+        }
+        Some(DashboardOutcome::Deferred) => {
+            println!("  dashboard  run `ferry dashboard` and create the operator in the browser");
+        }
+        None => {}
+    }
     println!();
     match &outcome.syncthing {
         Some(setup) if setup.available => {
