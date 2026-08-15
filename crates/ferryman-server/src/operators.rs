@@ -41,14 +41,23 @@ pub fn create_operator_identity(
     name: &str,
     password: &str,
 ) -> Result<AgentIdentity> {
-    let identity = OperatorStore::new(&route.attachment).create(name, password)?;
+    let store = OperatorStore::new(&route.attachment);
+    let identity = store.create(name, password)?;
     let published = AgentRoute {
         name: identity.name().to_string(),
         role: "operator".to_string(),
         capabilities: Vec::new(),
         public_key: Some(identity.public_key_hex()),
     };
-    register_agent_key(route, &published, &identity)?;
+    // Publish the public key to the roster so the fleet can verify this
+    // operator's signatures. If publication fails, remove the just-written
+    // operator file: leaving it would record an identity the roster has never
+    // heard of, and the name would then be "taken" while nothing can verify
+    // anything it signs - a lockout the human cannot see or fix.
+    if let Err(error) = register_agent_key(route, &published, &identity) {
+        let _ = store.remove(name);
+        return Err(error);
+    }
     Ok(identity)
 }
 
@@ -182,6 +191,18 @@ impl OperatorStore {
             .unwrap_or(false)
     }
 
+    /// Remove an operator identity file. Used to unwind a half-finished
+    /// creation (file written, roster registration failed) so the name is not
+    /// left occupied by an identity nobody can verify.
+    pub fn remove(&self, name: &str) -> Result<()> {
+        let path = self.path(name);
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("removing operator file for '{name}'"))?;
+        }
+        Ok(())
+    }
+
     fn path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.json"))
     }
@@ -238,6 +259,19 @@ mod tests {
         }
         // The honest path still works.
         assert!(store.login("alice", "hunter2-secret").is_ok());
+    }
+
+    #[test]
+    fn remove_unwinds_a_failed_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OperatorStore::new(dir.path());
+        store.create("alice", "hunter2-secret").unwrap();
+        store.remove("alice").unwrap();
+        // The name is free again: a retry can recreate it.
+        let identity = store.create("alice", "hunter2-secret").unwrap();
+        assert_eq!(identity.name(), "alice");
+        // Removing a name that was never created is not an error.
+        store.remove("nobody").unwrap();
     }
 }
 

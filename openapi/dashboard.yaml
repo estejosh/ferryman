@@ -1,0 +1,131 @@
+openapi: 3.1.0
+info:
+  title: Ferryman Dashboard API
+  description: >
+    The loopback-only web dashboard for observing a channel and (when not
+    read-only) reviewing work. Served by `ferry dashboard` on a loopback
+    address (default http://127.0.0.1:8788). It is a distinct surface from the
+    bridge server API (`openapi.yaml`, port 8787): it authenticates a *human
+    operator* by password and returns a short-lived session token, rather than
+    the server's project/actor bearer tokens.
+  version: 0.3.1
+servers:
+  - url: http://127.0.0.1:8788
+security:
+  - DashboardSession: []
+components:
+  securitySchemes:
+    DashboardSession:
+      type: apiKey
+      in: header
+      name: x-ferryman-dashboard-token
+      description: >
+        Random bearer token returned by `POST /api/auth/login`; idle-expiring
+        and revoked on sign-out.
+  schemas:
+    Credentials:
+      type: object
+      required: [name, password]
+      properties:
+        name: {type: string}
+        password: {type: string, writeOnly: true, minLength: 8}
+    CreatedOperator:
+      type: object
+      properties:
+        name: {type: string}
+        public_key: {type: string}
+    LoginResponse:
+      type: object
+      properties:
+        token: {type: string, description: Bearer token for the x-ferryman-dashboard-token header}
+        name: {type: string}
+        public_key: {type: string}
+    Review:
+      type: object
+      required: [accept]
+      properties:
+        accept: {type: boolean}
+        notes: {type: [string, 'null']}
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message: {type: string}
+paths:
+  /api/auth/create:
+    post:
+      summary: Mint a password-sealed operator identity and publish its public key to the roster
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/Credentials'}}
+      responses:
+        '200': {description: identity created, public key published, content: {application/json: {schema: {$ref: '#/components/schemas/CreatedOperator'}}}}
+        '403': {description: dashboard is read-only}
+        '409': {description: name already exists or password too short}
+        '429': {description: too many creations in the current window}
+  /api/auth/login:
+    post:
+      summary: Unlock an operator identity and start an idle-expiring session
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/Credentials'}}
+      responses:
+        '200': {description: session started, content: {application/json: {schema: {$ref: '#/components/schemas/LoginResponse'}}}}
+        '401': {description: name or password incorrect}
+        '403': {description: dashboard is read-only}
+        '429': {description: too many sign-in attempts for this name; wait a minute}
+  /api/auth/logout:
+    post:
+      summary: End the current session immediately
+      responses:
+        '204': {description: session revoked}
+  /api/auth/whoami:
+    get:
+      summary: Report the session's operator, or 401 when there is no live session
+      responses:
+        '200': {description: operator name, content: {application/json: {schema: {type: object, properties: {name: {type: string}}}}}}
+        '401': {description: no active session}
+  /api/tasks:
+    get:
+      summary: Summaries of every task, with signature status
+      responses:
+        '200': {description: task summaries}
+  /api/tasks/{id}:
+    get:
+      summary: Full detail for one task (order, claims, results, reviews)
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: task detail}
+        '404': {description: unknown task}
+  /api/tasks/{id}/review:
+    post:
+      summary: Accept a result or send it back with notes, signed by the session's operator
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {$ref: '#/components/schemas/Review'}}
+      responses:
+        '200': {description: verdict submitted}
+        '401': {description: no active session}
+        '403': {description: dashboard is read-only}
+        '409': {description: no result to review, or result fails the order's contract}
+  /api/stats:
+    get:
+      summary: Per-engine acceptance rate and estimated cost, merged into one table
+      responses:
+        '200': {description: engine stats}
+  /api/ledger:
+    get:
+      summary: Most recent ledger entries, newest first, with integrity flag
+      responses:
+        '200': {description: ledger entries}
+  /api/learnings:
+    get:
+      summary: Most recent learning records, newest first
+      responses:
+        '200': {description: learning records}

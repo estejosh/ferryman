@@ -37,6 +37,8 @@ pub struct DashboardState {
     pub operators: OperatorStore,
     pub sessions: Sessions,
     pub read_only: bool,
+    login_rate: RateLimiter,
+    create_rate: RateLimiter,
 }
 
 impl DashboardState {
@@ -51,6 +53,8 @@ impl DashboardState {
             operators,
             sessions: Sessions::new(timeout),
             read_only,
+            login_rate: RateLimiter::new(5, Duration::from_secs(60)),
+            create_rate: RateLimiter::new(10, Duration::from_secs(3600)),
         }
     }
 }
@@ -108,6 +112,45 @@ impl Sessions {
 
     fn revoke(&self, token: &str) {
         self.inner.lock().unwrap().remove(token);
+    }
+}
+
+/// Fixed-window rate limiter for the credential endpoints.
+///
+/// The dashboard binds to loopback only, so this is defense-in-depth: a local
+/// process (or a rebinding bypass of the Host guard) that hammers sign-in to
+/// brute-force a password is throttled to a handful of attempts per window.
+/// Keyed by operator name for sign-in, so one name's failures never lock a
+/// different operator out; account creation is limited per name as well.
+#[derive(Clone)]
+struct RateLimiter {
+    inner: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
+    limit: usize,
+    window: Duration,
+}
+
+impl RateLimiter {
+    fn new(limit: usize, window: Duration) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+            limit,
+            window,
+        }
+    }
+
+    /// Record an attempt for `key`; returns `true` when it is within the
+    /// window's budget. Entries older than the window are pruned on access, so
+    /// the map stays small.
+    fn allow(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut buckets = self.inner.lock().unwrap();
+        let bucket = buckets.entry(key.to_string()).or_default();
+        bucket.retain(|at| now.duration_since(*at) < self.window);
+        if bucket.len() >= self.limit {
+            return false;
+        }
+        bucket.push(now);
+        true
     }
 }
 
@@ -234,6 +277,12 @@ async fn create_operator(
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
+    if !state.create_rate.allow(&credentials.name) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many operator creations; slow down".to_string(),
+        ));
+    }
     let identity = crate::operators::create_operator_identity(
         &state.route,
         &credentials.name,
@@ -253,6 +302,12 @@ async fn login(
 ) -> Result<Json<Value>, DashboardError> {
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    if !state.login_rate.allow(&credentials.name) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many sign-in attempts; wait a minute".to_string(),
+        ));
     }
     let identity = state
         .operators
@@ -698,6 +753,44 @@ mod tests {
         )
         .await;
         assert_eq!(dup.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn login_is_rate_limited_per_operator_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let app = router(state(&route, false));
+
+        // Five attempts are allowed; the sixth is refused. The operator does
+        // not exist, so the first five 401 and the sixth is a 429.
+        for _ in 0..5 {
+            let response = post(
+                &app,
+                "/api/auth/login",
+                r#"{"name":"alice","password":"wrong"}"#,
+                None,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"alice","password":"wrong"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // A different operator name is not locked out by alice's failures.
+        let other = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"bob","password":"wrong"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

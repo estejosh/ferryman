@@ -17,8 +17,8 @@ use crate::ProjectRoute;
 ///
 /// `runs` counts recorded trajectories, `accepted` counts accepted learnings,
 /// and the token totals are summed from any `usage` payload found on those
-/// trajectories. The cost is a deliberately simple placeholder pricing model,
-/// not a vendor price table.
+/// trajectories. Cost is estimated from a per-engine list-price table (see
+/// `price_for`); unknown engines fall back to a conservative default.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineCost {
     pub engine: String,
@@ -29,18 +29,47 @@ pub struct EngineCost {
     pub estimated_cost_usd: f64,
 }
 
-/// Placeholder prices, per million tokens.
-const PROMPT_COST_PER_MILLION: f64 = 3.0;
-const COMPLETION_COST_PER_MILLION: f64 = 15.0;
+/// Per-million-token list prices, looked up per engine by name. Published list
+/// prices rounded to two decimals, kept as a maintainable table rather than
+/// fetched from a vendor at runtime (the dashboard works offline). Unknown
+/// engines fall back to the defaults below.
+struct EnginePrice {
+    prompt_per_million: f64,
+    completion_per_million: f64,
+}
+
+/// Default list prices, per million tokens, for engines without a table entry.
+const DEFAULT_PROMPT_PER_MILLION: f64 = 3.0;
+const DEFAULT_COMPLETION_PER_MILLION: f64 = 15.0;
+
+/// Look up an engine's list price. Matching is by name substring so
+/// `claude-sonnet-4-5` and `deepseek-v4-pro` land in the right bucket, and a
+/// new model variant inherits its family's price without a table edit.
+fn price_for(engine: &str) -> EnginePrice {
+    let key = engine.to_ascii_lowercase();
+    let (prompt_per_million, completion_per_million) = match key.as_str() {
+        e if e.contains("claude") => (3.0, 15.0),
+        e if e.contains("deepseek") => (0.27, 1.10),
+        e if e.contains("gpt-4o-mini") => (0.15, 0.60),
+        e if e.contains("gpt-4o") || e.contains("gpt-4") => (2.50, 10.0),
+        e if e.contains("o1") || e.contains("o3") || e.contains("o4") => (15.0, 60.0),
+        _ => (DEFAULT_PROMPT_PER_MILLION, DEFAULT_COMPLETION_PER_MILLION),
+    };
+    EnginePrice {
+        prompt_per_million,
+        completion_per_million,
+    }
+}
 
 fn trajectories_root(route: &ProjectRoute) -> PathBuf {
     route.communications.join("trajectories")
 }
 
-/// Placeholder estimate: `$3`/M prompt tokens and `$15`/M completion tokens.
-fn estimate_cost(prompt_tokens: u64, completion_tokens: u64) -> f64 {
-    (prompt_tokens as f64 * PROMPT_COST_PER_MILLION
-        + completion_tokens as f64 * COMPLETION_COST_PER_MILLION)
+/// Estimate spend for one engine from its token counts and list price.
+fn estimate_cost(engine: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+    let price = price_for(engine);
+    (prompt_tokens as f64 * price.prompt_per_million
+        + completion_tokens as f64 * price.completion_per_million)
         / 1_000_000.0
 }
 
@@ -151,7 +180,8 @@ pub fn engine_costs(route: &ProjectRoute) -> Result<Vec<EngineCost>> {
     }
 
     for entry in costs.values_mut() {
-        entry.estimated_cost_usd = estimate_cost(entry.prompt_tokens, entry.completion_tokens);
+        entry.estimated_cost_usd =
+            estimate_cost(&entry.engine, entry.prompt_tokens, entry.completion_tokens);
     }
 
     let mut costs: Vec<EngineCost> = costs.into_values().collect();
@@ -246,7 +276,9 @@ mod tests {
         assert_eq!(costs[0].accepted, 1);
         assert_eq!(costs[0].prompt_tokens, 1000);
         assert_eq!(costs[0].completion_tokens, 200);
-        assert!((costs[0].estimated_cost_usd - 0.006).abs() < f64::EPSILON);
+        // deepseek list price: $0.27/M prompt + $1.10/M completion, so
+        // 1000 prompt + 200 completion tokens = (270 + 220) / 1e6 dollars.
+        assert!((costs[0].estimated_cost_usd - 0.00049).abs() < 1e-9);
 
         assert_eq!(costs[1].engine, "claude");
         assert_eq!(costs[1].runs, 1);
