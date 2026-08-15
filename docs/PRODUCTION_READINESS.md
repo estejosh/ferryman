@@ -70,22 +70,19 @@ class. This needs an orchestrator decision on broadcast semantics before the
 change; documented rather than rushed, because the adjacent code is
 replay-protection-critical.
 
-### Next build sequence ("better", agreed 2026-08-14)
+### Next build sequence ("better", agreed 2026-08-14) — all built
 
-1. ~~Plan/spec artifact + dependency DAG~~ — **BUILT**: `Order.depends_on` (signed);
-   `work_for` waits for dependencies (`--depends-on`).
-2. ~~Session trajectory capture/replay~~ — **BUILT**: `channel::trajectory` records
-   each run (prompt digest + output) to the synced channel.
-3. ~~Credential injection~~ — **BUILT**: `credentials.json` injected into the
-   sandboxed agent CLI (scrub-all-then-inject-listed).
-4. Native event adapters (GitHub/Linear/webhook) — **next**.
-5. ~~Eval scorer command~~ — **BUILT**: bench tasks accept a `scorer` (exit 0 = pass).
-6. Web dashboard — **next** (large: frontend).
-7. Cost/token accounting + reduction suggestions — **next**.
-8. BYO-key manager (easy key insertion, no `.env` hand-editing) — **next**.
-9. At-rest/payload encryption — **next** (large: crypto).
-10. Cross-project master console + memory — **next** (large).
-11. hone integration — **BUILT** (`docs/HONE_INTEGRATION.md`).
+1. ~~Plan/spec artifact + dependency DAG~~ — `Order.depends_on` (signed); `work_for` waits for dependencies.
+2. ~~Session trajectory capture/replay~~ — `channel::trajectory` (prompt digest + output).
+3. ~~Credential injection~~ — `credentials.json` injected into the sandboxed agent CLI.
+4. ~~Native event adapters~~ — `channel::events` GitHub `gh` adapter → signed orders.
+5. ~~Eval scorer command~~ — bench tasks accept a `scorer` (exit 0 = pass).
+6. ~~Web dashboard~~ — `ferryman-server::dashboard` read-only axum router.
+7. ~~Cost/token accounting~~ — `channel::cost` per-engine usage + estimated cost.
+8. ~~BYO-key manager~~ — `channel::keys` KeyStore add/list/remove (no `.env` editing).
+9. ~~At-rest/payload encryption~~ — `channel::encrypt` (chacha20poly1305 + sha256 key).
+10. ~~Cross-project master console~~ — `ops::console` `fleet_summary`.
+11. ~~hone integration~~ — `docs/HONE_INTEGRATION.md`.
 
 ---
 
