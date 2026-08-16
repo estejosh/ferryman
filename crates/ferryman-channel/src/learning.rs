@@ -30,6 +30,10 @@ pub struct Learning {
     pub at: DateTime<Utc>,
     /// The engine that produced the work (the agent CLI command).
     pub engine: String,
+    /// The agent identity (name) that signed the work, when known. Benchmarks
+    /// compare engines without an identity, so this is empty for `source = "eval"`.
+    #[serde(default)]
+    pub agent: Option<String>,
     /// The order/task it was for.
     pub task_id: String,
     /// `eval` for benchmark runs, `live` for real accepted/rejected work.
@@ -142,6 +146,31 @@ pub fn engine_stats(route: &ProjectRoute) -> Result<Vec<EngineStats>> {
     Ok(stats)
 }
 
+/// Per-agent totals from live outcomes only, keyed by the agent identity rather
+/// than the engine command. Benchmarks (`source = "eval"`) carry no identity and
+/// are excluded, so the roster can show each agent's measured confidence. The
+/// `EngineStats::engine` field carries the agent name here.
+pub fn agent_stats(route: &ProjectRoute) -> Result<Vec<EngineStats>> {
+    let mut totals: BTreeMap<String, EngineStats> = BTreeMap::new();
+    for learning in read_learnings(route)? {
+        let Some(agent) = &learning.agent else {
+            continue;
+        };
+        let stats = totals.entry(agent.clone()).or_insert_with(|| EngineStats {
+            engine: agent.clone(),
+            total: 0,
+            accepted: 0,
+        });
+        stats.total += 1;
+        if learning.accepted {
+            stats.accepted += 1;
+        }
+    }
+    let mut stats: Vec<EngineStats> = totals.into_values().collect();
+    stats.sort_by(|a, b| b.total.cmp(&a.total).then_with(|| a.engine.cmp(&b.engine)));
+    Ok(stats)
+}
+
 /// Record the outcome of a real review, so the fleet learns from live work.
 ///
 /// Finds the result the review judged and the engine that produced it, then
@@ -171,6 +200,7 @@ pub fn record_outcome(
         &Learning {
             at: Utc::now(),
             engine,
+            agent: Some(result.agent.clone()),
             task_id: order_id.to_string(),
             source: "live".to_string(),
             accepted,
@@ -203,6 +233,7 @@ mod tests {
         Learning {
             at: Utc::now(),
             engine: engine.into(),
+            agent: None,
             task_id: "t-1".into(),
             source: "eval".into(),
             accepted,
@@ -266,6 +297,29 @@ mod tests {
         };
         assert!((many.confidence() - 15.0 / 17.0).abs() < f64::EPSILON);
         assert!(many.confidence() > 0.85);
+    }
+
+    #[test]
+    fn agent_stats_aggregate_by_identity_and_ignore_benchmarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        // Live outcomes keyed by agent identity.
+        let mut live = learning("claude", true);
+        live.source = "live".into();
+        live.agent = Some("claw".into());
+        record_learning(&route, &live).unwrap();
+        let mut live2 = learning("claude", false);
+        live2.source = "live".into();
+        live2.agent = Some("claw".into());
+        record_learning(&route, &live2).unwrap();
+        // A benchmark has no identity and must not appear in agent stats.
+        record_learning(&route, &learning("claude", true)).unwrap();
+
+        let stats = agent_stats(&route).unwrap();
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].engine, "claw");
+        assert_eq!(stats[0].total, 2);
+        assert_eq!(stats[0].accepted, 1);
     }
 
     #[test]

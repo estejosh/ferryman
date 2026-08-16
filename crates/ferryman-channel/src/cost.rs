@@ -218,6 +218,7 @@ mod tests {
         crate::learning::Learning {
             at: chrono::Utc::now(),
             engine: engine.into(),
+            agent: None,
             task_id: "t-1".into(),
             source: "eval".into(),
             accepted,

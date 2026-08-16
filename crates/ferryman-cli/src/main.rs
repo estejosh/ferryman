@@ -391,6 +391,21 @@ enum Channel {
         #[arg(long, default_value = "messages.receive")]
         capabilities: String,
     },
+    /// Reserve a name for an agent that has not come online yet, so messages can
+    /// be addressed to it (and queued) before its device syncs. When the real
+    /// agent registers, its key binds to the reserved name.
+    Expect {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The agent name to reserve, e.g. the machine that will join later.
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// Comma-separated capabilities, e.g. "messages.receive".
+        #[arg(long, default_value = "messages.receive")]
+        capabilities: String,
+    },
     /// Who is taking part in this channel.
     Agents {
         #[arg(long)]
@@ -2439,17 +2454,16 @@ fn find_durable_log(
     candidates.into_iter().find(|path| path.is_file())
 }
 
-/// Measured confidence per agent name, keyed by the slugified engine name from
-/// the learnings. Best-effort: the learnings record the engine *command* for most
-/// results, so only an agent whose recorded engine matches its own name gets a
-/// score; everyone else is shown no score rather than a guess.
+/// Measured confidence per agent identity, keyed by the slugified agent name so it
+/// matches the roster's profile file names. Built from live review outcomes only;
+/// benchmarks carry no identity and are excluded.
 fn confidence_by_agent(
     route: Option<&ferryman_channel::ProjectRoute>,
 ) -> std::collections::BTreeMap<String, String> {
     let Some(route) = route else {
         return Default::default();
     };
-    let Ok(stats) = ferryman_channel::learning::engine_stats(route) else {
+    let Ok(stats) = ferryman_channel::learning::agent_stats(route) else {
         return Default::default();
     };
     stats
@@ -2692,6 +2706,26 @@ fn channel(command: Channel) -> Result<()> {
                 route.attachment.join("keys").display()
             );
             println!("it will appear on the other machines once Syncthing carries the folder");
+        }
+
+        Channel::Expect {
+            workspace,
+            name,
+            role,
+            capabilities,
+        } => {
+            let route = here(workspace)?;
+            let capabilities: Vec<String> = capabilities
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect();
+            let path =
+                ferryman_channel::register_expected_agent(&route, &name, &role, &capabilities)?;
+            println!("reserved '{name}' as {role}; it can now receive messages");
+            println!("  written to {}", path.display());
+            println!("  when the real '{name}' registers, its key binds to this name");
         }
 
         Channel::Agents { workspace } => {

@@ -145,6 +145,7 @@ pub async fn run_bench(
                 &ferryman_channel::learning::Learning {
                     at: chrono::Utc::now(),
                     engine: engine.name.clone(),
+                    agent: None,
                     task_id: task.id.clone(),
                     source: "eval".to_string(),
                     accepted,

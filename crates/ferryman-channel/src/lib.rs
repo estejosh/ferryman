@@ -2639,6 +2639,28 @@ pub fn register_agent(route: &ProjectRoute, agent: &AgentRoute) -> Result<PathBu
     Ok(path)
 }
 
+/// Reserve a name for an agent that has not come online yet, so it can be
+/// addressed — and messages queued for it — before its device syncs. No key is
+/// published. When the real agent registers, its key binds to the reserved name
+/// under the usual first-key-wins rule, so this is a name reservation rather
+/// than an impersonation risk.
+pub fn register_expected_agent(
+    route: &ProjectRoute,
+    name: &str,
+    role: &str,
+    capabilities: &[String],
+) -> Result<PathBuf> {
+    register_agent(
+        route,
+        &AgentRoute {
+            name: name.to_string(),
+            role: role.to_string(),
+            capabilities: capabilities.to_vec(),
+            public_key: None,
+        },
+    )
+}
+
 /// Locate the route for the project containing `start`, with a clear explanation when
 /// there is nothing to find - "no channel here" is a normal situation for a new user,
 /// not an error worth a backtrace.
@@ -6698,6 +6720,30 @@ mod serverless_tests {
             route.git_remote.is_empty(),
             "a Syncthing-only channel has no Git remote and must still load"
         );
+    }
+
+    #[test]
+    fn an_expected_agent_is_reserved_and_addressable_without_a_key() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        register_expected_agent(
+            &route,
+            "beastly",
+            "orchestrator",
+            &["messages.receive".to_string()],
+        )
+        .unwrap();
+
+        // A freshly loaded route sees the reservation and permits messages to it.
+        let reloaded = route_for(&workspace).unwrap();
+        assert!(reloaded.permits("beastly", None));
+        // The reservation is a name, not an identity: no key was published.
+        let entry = reloaded
+            .agents
+            .iter()
+            .find(|agent| agent.name == "beastly")
+            .unwrap();
+        assert!(entry.public_key.is_none());
     }
 
     #[test]
