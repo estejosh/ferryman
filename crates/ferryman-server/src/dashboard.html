@@ -92,6 +92,10 @@ tbody tr:hover{background:var(--surface2)}
 .login-card .row button:first-child{flex:1}
 #auth-status{color:var(--bad);font-size:12px}
 @media(max-width:900px){.kpis{grid-template-columns:repeat(3,1fr)}.taskgrid{grid-template-columns:1fr}}
+.section-title{font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.4px;margin:1.2rem 0 .5rem}
+.graph-grid{display:grid;gap:.6rem;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));margin-top:.5rem}
+.graph-node{background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:.6rem .7rem}
+.graph-node .mono{font-size:13px}
 </style>
 </head>
 <body>
@@ -109,12 +113,22 @@ tbody tr:hover{background:var(--surface2)}
   <div class="kpis" id="kpis"></div>
   <div id="attention"></div>
   <nav class="tabs" id="tabs">
+    <button data-tab="fleet">Fleet</button>
     <button data-tab="tasks" class="active">Tasks</button>
     <button data-tab="machines">Machines</button>
     <button data-tab="engines">Engines</button>
     <button data-tab="ledger">Ledger</button>
     <button data-tab="learnings">Learnings</button>
+    <button data-tab="memory">Memory</button>
   </nav>
+  <section id="tab-fleet" class="tab">
+    <div class="section-title">Machines on the network</div>
+    <table><thead><tr><th>machine</th><th>kind</th><th>operator</th><th>registered</th></tr></thead><tbody id="machines-body"></tbody></table>
+    <div class="section-title">Syncing devices</div>
+    <table><thead><tr><th>device</th><th>id</th></tr></thead><tbody id="devices-body"></tbody></table>
+    <div class="section-title">Projects ready to run</div>
+    <table><thead><tr><th>project</th><th>path</th><th>tasks</th><th>open</th><th>done</th></tr></thead><tbody id="projects-body"></tbody></table>
+  </section>
   <section id="tab-tasks" class="tab active">
     <div class="filters">
       <input id="search" type="text" placeholder="filter tasks…">
@@ -137,6 +151,15 @@ tbody tr:hover{background:var(--surface2)}
   </section>
   <section id="tab-learnings" class="tab">
     <table><thead><tr><th>time</th><th>engine</th><th>task</th><th>source</th><th>accepted</th><th>note</th></tr></thead><tbody id="learnings-body"></tbody></table>
+  </section>
+  <section id="tab-memory" class="tab">
+    <div class="taskgrid">
+      <div class="tasklist" id="memory-files"></div>
+      <div class="detail" id="memory-content"><div class="muted">Select a memory file to read it.</div></div>
+    </div>
+    <div class="section-title">Knowledge graph</div>
+    <div id="graph-summary" class="muted"></div>
+    <div class="graph-grid" id="graph-nodes"></div>
   </section>
 </main>
 <div id="login-overlay" style="display:none">
@@ -199,9 +222,27 @@ function renderEngines(s){
 function renderMachines(m){
   document.getElementById('machines-body').innerHTML=m.map(x=>'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="badge">'+esc(x.role)+'</span></td><td>'+(x.capabilities&&x.capabilities.length?esc(x.capabilities.join(', ')):'<span class="muted">—</span>')+'</td><td class="mono">'+(x.engine?esc(x.engine):'<span class="muted">—</span>')+'</td><td>'+x.runs+'</td><td class="muted">'+((x.last_active||'').replace('T',' ').slice(0,16)||'—')+'</td><td class="mono muted" title="'+esc(x.key)+'">'+esc(x.key)+'</td></tr>').join('')||'<tr><td colspan="7"><div class="empty">No machines in the roster yet.</div></td></tr>';
 }
+function renderFleet(f){
+  document.getElementById('machines-body').innerHTML=(f.machines||[]).map(m=>'<tr><td class="mono muted" title="'+esc(m.id)+'">'+esc(String(m.id).slice(0,12))+'…</td><td>'+esc(m.kind)+'</td><td>'+esc(m.operator_email)+'</td><td class="muted">'+((m.registered_at||'').replace('T',' ').slice(0,10))+'</td></tr>').join('')||'<tr><td colspan="4"><div class="empty">No machines registered yet — they appear when an agent runs <code>ferry enable</code> on each machine.</div></td></tr>';
+  document.getElementById('devices-body').innerHTML=(f.devices||[]).map(d=>'<tr><td>'+esc(d.name)+'</td><td class="mono muted">'+esc(d.device_id.slice(0,13))+'…</td></tr>').join('')||'<tr><td colspan="2"><div class="empty">No syncing devices — pair another machine in Syncthing.</div></td></tr>';
+  document.getElementById('projects-body').innerHTML=(f.projects||[]).map(p=>'<tr><td class="mono">'+esc(p.project_id)+'</td><td class="muted mono">'+esc(p.path)+'</td><td>'+p.tasks+'</td><td>'+p.open+'</td><td>'+p.done+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No projects found beside this workspace.</div></td></tr>';
+}
+function renderMemory(m){
+  const files=m.files||[];
+  document.getElementById('memory-files').innerHTML=files.map((f,i)=>'<div class="task-row" data-mi="'+i+'"><span class="dot" style="background:var(--accent)"></span><div class="task-main"><div class="task-id mono">'+esc(f.name)+'</div></div></div>').join('')||'<div class="empty">No memory bank in this channel.</div>';
+  document.getElementById('memory-files').querySelectorAll('.task-row').forEach(r=>r.onclick=()=>{const f=files[+r.dataset.mi];document.getElementById('memory-content').innerHTML='<h3 class="mono">'+esc(f.name)+'</h3><pre>'+esc(f.content)+'</pre>';});
+  const g=m.graph;
+  if(g&&g.nodes&&g.nodes.length){
+    document.getElementById('graph-summary').innerHTML='<b>'+g.nodes.length+'</b> nodes · <b>'+g.links+'</b> links';
+    document.getElementById('graph-nodes').innerHTML=g.nodes.slice(0,200).map(n=>'<div class="graph-node"><div class="mono">'+esc(n.label)+'</div><div class="muted">'+esc(n.type||'')+'</div><div class="muted">'+esc(n.summary||'')+'</div></div>').join('');
+  }else{
+    document.getElementById('graph-summary').innerHTML='<span class="muted">No knowledge graph exported — set FERRYMAN_GRAPH_JSON or run graphify.</span>';
+    document.getElementById('graph-nodes').innerHTML='';
+  }
+}
 function renderLedger(d){document.getElementById('ledger-body').innerHTML=(d.entries||[]).map(e=>'<tr><td class="muted mono">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No ledger entries yet — they appear as work is issued and reviewed.</div></td></tr>';}
 function renderLearnings(l){document.getElementById('learnings-body').innerHTML=l.map(x=>'<tr><td class="muted mono">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">Nothing learned yet — learnings appear when agents record what worked.</div></td></tr>';}
-async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j('/api/tasks');renderKpis();renderTasks();renderMachines(await j('/api/roster'));renderEngines(await j('/api/stats'));renderLedger(await j('/api/ledger'));renderLearnings(await j('/api/learnings'));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
+async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j('/api/tasks');renderKpis();renderTasks();renderMachines(await j('/api/roster'));renderFleet(await j('/api/fleet'));renderMemory(await j('/api/memory'));renderEngines(await j('/api/stats'));renderLedger(await j('/api/ledger'));renderLearnings(await j('/api/learnings'));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
 async function auth(mode,name,password){const r=await fetch('/api/auth/'+mode,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,password})});const t=await r.text();if(!r.ok)throw new Error(t);return JSON.parse(t);}
 function showLogin(mode){authMode=mode;document.getElementById('login-overlay').style.display='flex';document.getElementById('auth-title').textContent=mode==='login'?'Sign in':'Create operator';document.getElementById('auth-submit').textContent=mode==='login'?'sign in':'create';document.getElementById('auth-toggle').textContent=mode==='login'?'create operator':'sign in';document.getElementById('auth-status').textContent='';document.getElementById('auth-password').value='';document.getElementById('auth-name').focus();}
 async function doAuth(){const n=document.getElementById('auth-name').value.trim(),p=document.getElementById('auth-password').value;try{const r=await auth(authMode,n,p);if(authMode==='create'){showLogin('login');document.getElementById('auth-status').textContent='operator created — sign in';document.getElementById('auth-name').value=n;return;}session=r.token;sessionStorage.setItem('ferry-dash-token',session);operator=r.name;document.getElementById('login-overlay').style.display='none';refresh();}catch(e){document.getElementById('auth-status').textContent=String(e);}}

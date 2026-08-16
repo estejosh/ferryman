@@ -171,6 +171,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/ledger", get(ledger))
         .route("/api/learnings", get(learnings))
         .route("/api/roster", get(roster))
+        .route("/api/fleet", get(fleet))
+        .route("/api/memory", get(memory))
         .layer(axum::middleware::from_fn(loopback_host_guard))
         .with_state(state)
 }
@@ -549,6 +551,152 @@ fn result_text(payload: &Value) -> Option<String> {
         return Some(text.chars().take(4000).collect());
     }
     Some(serde_json::to_string_pretty(payload).unwrap_or_default())
+}
+
+/// GET /api/fleet — every machine on the network, every syncing device, and
+/// every project this machine has a channel for. The whole fleet in one view,
+/// not just the current project.
+async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
+    let machines = ferryman_channel::licensing::read_devices(&state.route)
+        .map_err(internal)?
+        .iter()
+        .map(|device| {
+            json!({
+                "id": device.id,
+                "kind": device.kind.as_str(),
+                "operator_email": device.operator_email,
+                "registered_at": device.registered_at.to_rfc3339(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let devices = ferryman_channel::syncthing_peers()
+        .unwrap_or_default()
+        .iter()
+        .map(|peer| json!({ "device_id": peer.device_id, "name": peer.name }))
+        .collect::<Vec<_>>();
+    let projects = discover_projects(&state.route).map_err(internal)?;
+    Ok(Json(json!({ "machines": machines, "devices": devices, "projects": projects })))
+}
+
+/// Every project whose channel directory sits beside this workspace. A sibling
+/// directory is a project exactly when it has a `.ferryman/bridge.toml`; there
+/// is no registry to keep in sync, so a project appears the moment its channel
+/// is on disk.
+fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
+    let Some(parent) = route.workspace.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut projects: Vec<(String, String, usize, usize, usize)> = Vec::new();
+    if parent.is_dir() {
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            let Ok(child) = ferryman_channel::route_for(&path) else {
+                continue;
+            };
+            let tasks = ferryman_channel::list_tasks(&child).unwrap_or_default();
+            let open = tasks
+                .iter()
+                .filter(|task| !matches!(task.state(), TaskState::Accepted | TaskState::Done))
+                .count();
+            projects.push((
+                child.project_id,
+                child.workspace.display().to_string(),
+                tasks.len(),
+                open,
+                tasks.len() - open,
+            ));
+        }
+    }
+    projects.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(projects
+        .into_iter()
+        .map(|(project_id, path, tasks, open, done)| {
+            json!({
+                "project_id": project_id,
+                "path": path,
+                "tasks": tasks,
+                "open": open,
+                "done": done,
+            })
+        })
+        .collect())
+}
+
+/// GET /api/memory — the project's shared memory bank, plus the knowledge graph
+/// if graphify has exported one. Best-effort: an unreadable file is skipped, and
+/// a missing graph simply returns `graph: null`.
+async fn memory(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
+    let mut files = Vec::new();
+    let memory_dir = state.route.communications.join("memory-bank");
+    if memory_dir.is_dir() {
+        for entry in std::fs::read_dir(&memory_dir).map_err(|e| internal(e.into()))? {
+            let entry = entry.map_err(|e| internal(e.into()))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string();
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            files.push(json!({ "name": name, "content": content }));
+        }
+    }
+    files.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Json(json!({ "files": files, "graph": load_graph() })))
+}
+
+/// The graphify knowledge graph, if one can be found: `FERRYMAN_GRAPH_JSON`
+/// first, then the conventional graphify output location. Returns the nodes
+/// (label, type, community, summary) and a link count rather than the raw
+/// geometry, which is a local build artifact.
+fn load_graph() -> Option<Value> {
+    let path = std::env::var("FERRYMAN_GRAPH_JSON")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            ["/mnt/nvme-storage/cline/projects/ferryman/graphify-out/graph.json"]
+                .iter()
+                .map(std::path::PathBuf::from)
+                .find(|path| path.is_file())
+        })?;
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    let nodes = value
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .map(|node| {
+                    json!({
+                        "label": node.get("label").and_then(Value::as_str).unwrap_or(""),
+                        "type": node.get("type").and_then(Value::as_str).unwrap_or(""),
+                        "community": node.get("community"),
+                        "summary": node.get("summary").and_then(Value::as_str).unwrap_or(""),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let links = value
+        .get("links")
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    Some(json!({ "nodes": nodes, "links": links }))
 }
 
 #[derive(Deserialize)]
