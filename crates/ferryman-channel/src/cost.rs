@@ -249,9 +249,7 @@ mod tests {
         )
         .unwrap();
 
-        let deepseek_path = route
-            .communications
-            .join("trajectories/t-2/agent.001.json");
+        let deepseek_path = route.communications.join("trajectories/t-2/agent.001.json");
         std::fs::create_dir_all(deepseek_path.parent().unwrap()).unwrap();
         std::fs::write(
             &deepseek_path,
@@ -295,4 +293,3 @@ mod tests {
         assert!(engine_costs(&route).unwrap().is_empty());
     }
 }
-

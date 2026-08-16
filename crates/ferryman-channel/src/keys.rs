@@ -120,4 +120,3 @@ mod tests {
         assert_eq!(store.list().unwrap(), vec!["FIRST_KEY", "SECOND_KEY"]);
     }
 }
-

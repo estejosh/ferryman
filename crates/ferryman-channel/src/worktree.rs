@@ -41,7 +41,9 @@ pub fn is_git_repo(path: &Path) -> bool {
 pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(PathBuf, String)> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
     let branch = branch_name(order_id, agent);
-    let parent = repo.parent().context("repo has no parent to hold a worktree")?;
+    let parent = repo
+        .parent()
+        .context("repo has no parent to hold a worktree")?;
     let dir = parent.join(&branch);
     if dir.exists() {
         return Ok((dir, branch));
@@ -67,7 +69,12 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
 /// The commit at the tip of a worktree's branch, to sign into the result.
 pub fn worktree_head(repo: &Path, branch: &str) -> Result<String> {
     let output = Command::new("git")
-        .args(["-C", repo.to_str().context("repo path is not valid UTF-8")?, "rev-parse", branch])
+        .args([
+            "-C",
+            repo.to_str().context("repo path is not valid UTF-8")?,
+            "rev-parse",
+            branch,
+        ])
         .output()
         .with_context(|| format!("git rev-parse {branch}"))?;
     if !output.status.success() {
@@ -98,7 +105,9 @@ pub fn remove_worktree(repo: &Path, branch: &str) -> Result<()> {
             bail!("git worktree remove {branch} failed");
         }
     }
-    let _ = Command::new("git").args(["-C", repo_dir, "branch", "-D", branch]).status();
+    let _ = Command::new("git")
+        .args(["-C", repo_dir, "branch", "-D", branch])
+        .status();
     Ok(())
 }
 
@@ -123,13 +132,27 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let _ = Command::new("git")
-            .args(["-C", base.to_str().unwrap(), "config", "user.email", "t@example.com"])
+            .args([
+                "-C",
+                base.to_str().unwrap(),
+                "config",
+                "user.email",
+                "t@example.com",
+            ])
             .status();
         let _ = Command::new("git")
-            .args(["-C", base.to_str().unwrap(), "config", "user.name", "tester"])
+            .args([
+                "-C",
+                base.to_str().unwrap(),
+                "config",
+                "user.name",
+                "tester",
+            ])
             .status();
         fs::write(base.join("f.txt"), "hello").unwrap();
-        let _ = Command::new("git").args(["-C", base.to_str().unwrap(), "add", "f.txt"]).status();
+        let _ = Command::new("git")
+            .args(["-C", base.to_str().unwrap(), "add", "f.txt"])
+            .status();
         let _ = Command::new("git")
             .args(["-C", base.to_str().unwrap(), "commit", "-q", "-m", "init"])
             .status();
@@ -162,4 +185,3 @@ mod tests {
         let _ = fs::remove_dir_all(&repo);
     }
 }
-

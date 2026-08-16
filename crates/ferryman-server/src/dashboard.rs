@@ -242,17 +242,18 @@ async fn loopback_host_guard(
                 _ => raw,
             };
             let host = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost"
-                || host == "127.0.0.1"
-                || host == "::1"
-                || host.starts_with("127.")
+            host == "localhost" || host == "127.0.0.1" || host == "::1" || host.starts_with("127.")
         })
         .unwrap_or(true);
     if host_ok {
         next.run(request).await
     } else {
         use axum::response::IntoResponse;
-        (StatusCode::FORBIDDEN, "host not allowed on loopback dashboard").into_response()
+        (
+            StatusCode::FORBIDDEN,
+            "host not allowed on loopback dashboard",
+        )
+            .into_response()
     }
 }
 
@@ -363,7 +364,9 @@ async fn login(
     let name = identity.name().to_string();
     let public_key = identity.public_key_hex();
     let token = state.sessions.insert(identity);
-    Ok(Json(json!({ "token": token, "name": name, "public_key": public_key })))
+    Ok(Json(
+        json!({ "token": token, "name": name, "public_key": public_key }),
+    ))
 }
 
 /// POST /api/auth/logout — end this session now, regardless of its deadline.
@@ -673,7 +676,9 @@ async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, Dashb
         .map(|peer| json!({ "device_id": peer.device_id, "name": peer.name }))
         .collect::<Vec<_>>();
     let projects = discover_projects(&state.route).map_err(internal)?;
-    Ok(Json(json!({ "machines": machines, "devices": devices, "projects": projects })))
+    Ok(Json(
+        json!({ "machines": machines, "devices": devices, "projects": projects }),
+    ))
 }
 
 /// Every project whose channel directory sits beside this workspace. A sibling
@@ -835,15 +840,16 @@ async fn review_task(
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
-    let identity = state
-        .sessions
-        .resolve(session_token(&headers))
-        .ok_or((StatusCode::UNAUTHORIZED, "no active session; sign in again".to_string()))?;
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
 
     let task = ferryman_channel::read_task(&state.route, &id).map_err(internal)?;
-    let revision = task
-        .latest_revision()
-        .ok_or((StatusCode::CONFLICT, "there is no result to review yet".to_string()))?;
+    let revision = task.latest_revision().ok_or((
+        StatusCode::CONFLICT,
+        "there is no result to review yet".to_string(),
+    ))?;
     if body.accept
         && let Some(missing) = task.contract_violations()
         && !missing.is_empty()
@@ -885,10 +891,17 @@ async fn review_task(
 async fn index(State(state): State<DashboardState>) -> Html<String> {
     let html = DASHBOARD_HTML
         .replace("__PROJECT__", &state.route.project_id)
-        .replace("__READONLY__", if state.read_only { "true" } else { "false" })
+        .replace(
+            "__READONLY__",
+            if state.read_only { "true" } else { "false" },
+        )
         .replace(
             "__ANY_OPERATORS__",
-            if state.operators.any() { "true" } else { "false" },
+            if state.operators.any() {
+                "true"
+            } else {
+                "false"
+            },
         );
     Html(html)
 }
@@ -1181,26 +1194,36 @@ mod tests {
         // Without a token, and with a bogus one, the review is refused.
         let denied = post(&app, "/api/tasks/task-1/review", r#"{"accept":true}"#, None).await;
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-        let denied = post(&app, "/api/tasks/task-1/review", r#"{"accept":true}"#, Some("bogus")).await;
+        let denied = post(
+            &app,
+            "/api/tasks/task-1/review",
+            r#"{"accept":true}"#,
+            Some("bogus"),
+        )
+        .await;
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
         // With the token, the review lands signed by the operator.
-        let accepted = post(&app, "/api/tasks/task-1/review", r#"{"accept":true}"#, Some(token)).await;
-        assert_eq!(
-            accepted.status(),
-            StatusCode::OK,
-            "body: {:?}",
-            {
-                let body = accepted.into_body().collect().await.unwrap().to_bytes();
-                String::from_utf8_lossy(&body).to_string()
-            }
-        );
+        let accepted = post(
+            &app,
+            "/api/tasks/task-1/review",
+            r#"{"accept":true}"#,
+            Some(token),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK, "body: {:?}", {
+            let body = accepted.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8_lossy(&body).to_string()
+        });
 
         let task = ferryman_channel::read_task(&route, "task-1").unwrap();
         assert_eq!(task.reviews.len(), 1);
         assert!(task.reviews[0].accepted);
         assert_eq!(task.reviews[0].reviewer, "reviewer");
-        assert!(task.reviews[0].signature.is_some(), "the verdict must be signed");
+        assert!(
+            task.reviews[0].signature.is_some(),
+            "the verdict must be signed"
+        );
     }
 
     #[test]
@@ -1210,7 +1233,9 @@ mod tests {
         let token = sessions.insert(identity);
         assert!(sessions.resolve(&token).is_some());
         std::thread::sleep(Duration::from_millis(40));
-        assert!(sessions.resolve(&token).is_none(), "idle session must expire");
+        assert!(
+            sessions.resolve(&token).is_none(),
+            "idle session must expire"
+        );
     }
 }
-

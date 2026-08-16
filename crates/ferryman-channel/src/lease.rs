@@ -218,8 +218,6 @@ mod tests {
 
         // With no master at all, minting also fails.
         let no_master = test_route(dir.path());
-        assert!(
-            mint_lease(&no_master, &master, "worker", vec![], Duration::minutes(30)).is_err()
-        );
+        assert!(mint_lease(&no_master, &master, "worker", vec![], Duration::minutes(30)).is_err());
     }
 }

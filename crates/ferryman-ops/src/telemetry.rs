@@ -43,5 +43,8 @@ pub fn init() {
     let layer = tracing_opentelemetry::layer().with_tracer(tracer);
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::registry().with(filter).with(layer).try_init();
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(layer)
+        .try_init();
 }

@@ -210,7 +210,11 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].note, "use the totals from page 2");
         acknowledge(&route, "t-1", "orchestrator", "worker").unwrap();
-        assert!(pending_interrupts(&route, "t-1", "worker").unwrap().is_empty());
+        assert!(
+            pending_interrupts(&route, "t-1", "worker")
+                .unwrap()
+                .is_empty()
+        );
         // An ack is per-agent; another machine still sees the interrupt.
         assert_eq!(pending_interrupts(&route, "t-1", "nebra").unwrap().len(), 1);
     }
@@ -230,15 +234,23 @@ mod tests {
         };
         write_interrupt(&route, &interrupt).unwrap();
         assert!(
-            pending_interrupts(&route, "t-1", "worker").unwrap().is_empty(),
+            pending_interrupts(&route, "t-1", "worker")
+                .unwrap()
+                .is_empty(),
             "an unsigned interrupt must never reach the worker"
         );
     }
 
     #[test]
     fn actions_parse_and_reject_garbage() {
-        assert_eq!(InterruptAction::parse("steer").unwrap(), InterruptAction::Steer);
-        assert_eq!(InterruptAction::parse("KILL").unwrap(), InterruptAction::Kill);
+        assert_eq!(
+            InterruptAction::parse("steer").unwrap(),
+            InterruptAction::Steer
+        );
+        assert_eq!(
+            InterruptAction::parse("KILL").unwrap(),
+            InterruptAction::Kill
+        );
         assert!(InterruptAction::parse("nuke").is_err());
     }
 
@@ -259,4 +271,3 @@ mod tests {
         );
     }
 }
-

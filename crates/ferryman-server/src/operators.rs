@@ -142,11 +142,11 @@ impl OperatorStore {
         if !is_safe_component(name) {
             return Err(anyhow::anyhow!("operator name or password is incorrect"));
         }
-        let record: OperatorRecord =
-            serde_json::from_reader(std::fs::File::open(self.path(name)).map_err(|_| {
-                anyhow::anyhow!("operator name or password is incorrect")
-            })?)
-            .map_err(|_| anyhow::anyhow!("operator identity file is unreadable"))?;
+        let record: OperatorRecord = serde_json::from_reader(
+            std::fs::File::open(self.path(name))
+                .map_err(|_| anyhow::anyhow!("operator name or password is incorrect"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("operator identity file is unreadable"))?;
         if record.format != FORMAT {
             bail!("unsupported operator identity format");
         }
@@ -155,11 +155,8 @@ impl OperatorStore {
         if salt.len() != 16 || nonce.len() != 24 {
             bail!("operator identity file is malformed");
         }
-        let cipher = XChaCha20Poly1305::new_from_slice(&derive_key(
-            password,
-            &salt,
-            record.iterations,
-        ))?;
+        let cipher =
+            XChaCha20Poly1305::new_from_slice(&derive_key(password, &salt, record.iterations))?;
         let seed = cipher
             .decrypt(
                 XNonce::from_slice(&nonce),
@@ -223,7 +220,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = OperatorStore::new(dir.path());
 
-        assert!(store.create("op/alice", "secret123").is_err(), "path-unsafe name");
+        assert!(
+            store.create("op/alice", "secret123").is_err(),
+            "path-unsafe name"
+        );
         assert!(store.create("alice", "short").is_err(), "short password");
 
         let identity = store.create("alice", "hunter2-secret").unwrap();
@@ -274,4 +274,3 @@ mod tests {
         store.remove("nobody").unwrap();
     }
 }
-

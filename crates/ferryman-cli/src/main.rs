@@ -1173,8 +1173,7 @@ async fn main() -> Result<()> {
             // The benchmark is single-shot; the timeout flag is accepted so a caller
             // can tune it, and run_bench uses its own per-run bound.
             let _ = timeout_secs;
-            let results =
-                ferryman_ops::eval::run_bench(&route, &bench, &route.workspace).await?;
+            let results = ferryman_ops::eval::run_bench(&route, &bench, &route.workspace).await?;
             let mut by_engine: std::collections::BTreeMap<&str, (usize, usize)> =
                 std::collections::BTreeMap::new();
             for result in &results {
@@ -1670,7 +1669,10 @@ enum DashboardSetup {
 
 /// The result of the dashboard setup, for reporting.
 enum DashboardOutcome {
-    Created { operator: String, public_key: String },
+    Created {
+        operator: String,
+        public_key: String,
+    },
     Deferred,
 }
 
@@ -2863,10 +2865,7 @@ fn channel(command: Channel) -> Result<()> {
                     match ferryman_channel::source::poll_if_due(&route, trigger, &issuer, &identity)
                     {
                         Ok(0) => {}
-                        Ok(n) => println!(
-                            "imported {n} order(s) from {}",
-                            trigger.name
-                        ),
+                        Ok(n) => println!("imported {n} order(s) from {}", trigger.name),
                         Err(e) => eprintln!("source '{}' failed: {e:#}", trigger.name),
                     }
                 }
@@ -2885,8 +2884,11 @@ fn channel(command: Channel) -> Result<()> {
                     println!("{branch}");
                 }
                 WorktreeAction::Create { order, agent } => {
-                    let (dir, branch) =
-                        ferryman_channel::worktree::create_worktree(&route.workspace, &order, &agent)?;
+                    let (dir, branch) = ferryman_channel::worktree::create_worktree(
+                        &route.workspace,
+                        &order,
+                        &agent,
+                    )?;
                     println!("worktree {branch} at {}", dir.display());
                 }
                 WorktreeAction::Cleanup { order, agent } => {
@@ -3129,9 +3131,7 @@ fn channel(command: Channel) -> Result<()> {
             let route = here(workspace)?;
             let stats = ferryman_channel::learning::engine_stats(&route)?;
             if stats.is_empty() {
-                println!(
-                    "nothing learned yet; reviews and 'ferry bench' record outcomes here"
-                );
+                println!("nothing learned yet; reviews and 'ferry bench' record outcomes here");
             } else {
                 println!("  {:<16} {:>6} {:>8}  total", "engine", "kept", "rate");
                 for s in &stats {
@@ -3471,11 +3471,7 @@ fn channel(command: Channel) -> Result<()> {
         Channel::Lease { workspace, action } => {
             let route = here(workspace)?;
             match action {
-                LeaseAction::Mint {
-                    to,
-                    scope,
-                    minutes,
-                } => {
+                LeaseAction::Mint { to, scope, minutes } => {
                     let master_name = match ferryman_channel::master::read_master(&route)? {
                         Some(declaration) => declaration.master,
                         None => {
@@ -3641,15 +3637,11 @@ fn channel(command: Channel) -> Result<()> {
                     bail!("--with is required: the device id to stop sharing with");
                 }
                 let route = here(workspace)?;
-                print_syncthing_setup(&ferryman_channel::syncthing_unshare_folder(
-                    &route, &with,
-                )?);
+                print_syncthing_setup(&ferryman_channel::syncthing_unshare_folder(&route, &with)?);
             }
             SyncthingAction::On { workspace } => {
                 let route = here(workspace)?;
-                print_syncthing_setup(&ferryman_channel::syncthing_register_folder(
-                    &route, &[],
-                )?);
+                print_syncthing_setup(&ferryman_channel::syncthing_register_folder(&route, &[])?);
             }
             SyncthingAction::Off { workspace } => {
                 let route = here(workspace)?;
@@ -3740,7 +3732,10 @@ fn load_device_notes(route: &ferryman_channel::ProjectRoute) -> DeviceNotes {
 
 fn save_device_notes(route: &ferryman_channel::ProjectRoute, notes: &DeviceNotes) -> Result<()> {
     std::fs::create_dir_all(&route.attachment)?;
-    std::fs::write(device_notes_path(route), serde_json::to_string_pretty(notes)?)?;
+    std::fs::write(
+        device_notes_path(route),
+        serde_json::to_string_pretty(notes)?,
+    )?;
     Ok(())
 }
 

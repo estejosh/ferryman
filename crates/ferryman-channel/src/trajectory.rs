@@ -64,7 +64,10 @@ pub fn record_trajectory(route: &ProjectRoute, trajectory: &Trajectory) -> Resul
         .communications
         .join("trajectories")
         .join(&trajectory.order_id)
-        .join(format!("{}.{:03}.json", trajectory.agent, trajectory.revision));
+        .join(format!(
+            "{}.{:03}.json",
+            trajectory.agent, trajectory.revision
+        ));
     crate::write_task_file(&path, trajectory)?;
     Ok(path)
 }

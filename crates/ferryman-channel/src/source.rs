@@ -129,7 +129,10 @@ pub fn import(
     let mut imported = 0;
     for ticket in &tickets {
         let mut order = to_order(source.name(), ticket, &route.project_id, issued_by);
-        if crate::task_dir(route, &order.id).join("order.json").exists() {
+        if crate::task_dir(route, &order.id)
+            .join("order.json")
+            .exists()
+        {
             continue; // already imported; importing again would be a duplicate
         }
         identity.sign_order(&mut order);
@@ -138,7 +141,10 @@ pub fn import(
             Err(e) => {
                 // Another importer may have won the race to issue this order. If it
                 // now exists, that is a duplicate rather than a failure.
-                if crate::task_dir(route, &order.id).join("order.json").exists() {
+                if crate::task_dir(route, &order.id)
+                    .join("order.json")
+                    .exists()
+                {
                     continue;
                 }
                 return Err(e);
@@ -251,7 +257,6 @@ pub fn poll_if_due(
     }
     Ok(imported)
 }
-
 
 /// Lowercase, map runs of non-alphanumerics to a dash, and collapse dashes, so
 /// an order id derived from arbitrary source/ticket ids is always path-safe.
@@ -369,7 +374,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let route = route(dir.path());
         std::fs::create_dir_all(&route.attachment).unwrap();
-        let identity = crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
+        let identity =
+            crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
         let trigger = SourceTrigger {
             name: "tickets".into(),
             command: "printf '%s\\n' '{\"id\":\"E-1\",\"task\":\"do it\"}'".into(),
@@ -385,5 +391,3 @@ mod tests {
         assert_eq!(order.order.issued_by, "orchestrator");
     }
 }
-
-

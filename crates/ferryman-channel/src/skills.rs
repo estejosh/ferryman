@@ -89,7 +89,11 @@ pub fn render(skills: &[&Skill]) -> String {
         "The following project skills apply to this task. Follow their instructions.\n\n",
     );
     for skill in skills {
-        out.push_str(&format!("## Skill: {}\n{}\n\n", skill.name, skill.body.trim()));
+        out.push_str(&format!(
+            "## Skill: {}\n{}\n\n",
+            skill.name,
+            skill.body.trim()
+        ));
     }
     out
 }
@@ -209,7 +213,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(skill.name, "alloydb-basics");
-        assert_eq!(skill.description, "Manages clusters for AlloyDB. Do NOT use for Cloud SQL.");
+        assert_eq!(
+            skill.description,
+            "Manages clusters for AlloyDB. Do NOT use for Cloud SQL."
+        );
         assert!(skill.body.contains("# AlloyDB Basics"));
     }
 
@@ -250,4 +257,3 @@ mod tests {
         assert_eq!(loaded[0].name, "good");
     }
 }
-

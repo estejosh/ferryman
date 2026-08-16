@@ -1223,7 +1223,9 @@ async fn do_work(
                 workdir = dir;
                 used_worktree = true;
             }
-            Err(e) => report.warn(&format!("  {id}: worktree unavailable, running in place: {e}")),
+            Err(e) => report.warn(&format!(
+                "  {id}: worktree unavailable, running in place: {e}"
+            )),
         }
     }
 
@@ -1239,8 +1241,11 @@ async fn do_work(
     // And the roster of the other agents, so it knows who else is available, what
     // they are practiced at, and can say so when one of them is a better fit.
     let roster_text = peer_roster_block(route, &config.agent);
-    let mut prompt =
-        work_prompt_with_skills(config, task, &format!("{profile_text}{roster_text}{skills_text}"));
+    let mut prompt = work_prompt_with_skills(
+        config,
+        task,
+        &format!("{profile_text}{roster_text}{skills_text}"),
+    );
     if let Some(note) = steer {
         prompt = format!(
             "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"
@@ -1344,15 +1349,11 @@ pub async fn review_once(
             ));
             continue;
         }
-        if !task
-            .results
-            .iter()
-            .any(|r| {
-                r.revision == revision
-                    && ferryman_channel::verify_result(r, &route.agents)
-                        == ferryman_channel::SignatureCheck::Valid
-            })
-        {
+        if !task.results.iter().any(|r| {
+            r.revision == revision
+                && ferryman_channel::verify_result(r, &route.agents)
+                    == ferryman_channel::SignatureCheck::Valid
+        }) {
             report.warn(&format!(
                 "  {}: result signature invalid, skipping",
                 task.order.id
@@ -1479,10 +1480,19 @@ mod tests {
         assert_eq!(Runner::parse("").unwrap(), Bare);
         assert_eq!(Runner::parse("none").unwrap(), Bare);
         assert_eq!(Runner::parse("  NONE  ").unwrap(), Bare);
-        assert_eq!(Runner::parse("podman:ubuntu").unwrap(), Podman("ubuntu".into()));
-        assert_eq!(Runner::parse("docker:alpine:3").unwrap(), Docker("alpine:3".into()));
+        assert_eq!(
+            Runner::parse("podman:ubuntu").unwrap(),
+            Podman("ubuntu".into())
+        );
+        assert_eq!(
+            Runner::parse("docker:alpine:3").unwrap(),
+            Docker("alpine:3".into())
+        );
         // A bare image name still means podman, so an existing config keeps working.
-        assert_eq!(Runner::parse("ghcr.io/x/y").unwrap(), Podman("ghcr.io/x/y".into()));
+        assert_eq!(
+            Runner::parse("ghcr.io/x/y").unwrap(),
+            Podman("ghcr.io/x/y".into())
+        );
         assert!(!Bare.is_sandboxed());
         assert!(Podman("x".into()).is_sandboxed());
         assert_eq!(Podman("x".into()).runtime(), "podman");
@@ -1499,9 +1509,10 @@ mod tests {
 
     #[test]
     fn a_docker_runner_wraps_the_command_in_the_container() {
-        let config =
-            AgentConfig::parse("agent = \"w\"\ncommand = \"codex\"\nsandbox = \"docker:node:22\"\n")
-                .unwrap();
+        let config = AgentConfig::parse(
+            "agent = \"w\"\ncommand = \"codex\"\nsandbox = \"docker:node:22\"\n",
+        )
+        .unwrap();
         let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(binary, "docker");
         let mount = workspace_mount(Path::new("/ws"));
@@ -1573,7 +1584,6 @@ mod tests {
         assert_eq!(Open.network_arg(), Option::None);
         assert_eq!(NetworkPolicy::None.network_arg(), Option::Some("none"));
     }
-
 
     use ferryman_channel::{Claim, Order, Review};
 

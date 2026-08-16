@@ -1521,7 +1521,10 @@ pub fn verify_review(review: &Review, roster: &[AgentRoute]) -> SignatureCheck {
 /// Who issued this interrupt, checkably. An unsigned interrupt is a forged one:
 /// a peer could otherwise kill, pause, or steer another machine's work.
 #[must_use]
-pub fn verify_interrupt(interrupt: &crate::interrupt::Interrupt, roster: &[AgentRoute]) -> SignatureCheck {
+pub fn verify_interrupt(
+    interrupt: &crate::interrupt::Interrupt,
+    roster: &[AgentRoute],
+) -> SignatureCheck {
     check_signature(
         interrupt.signed_by.as_ref(),
         interrupt.signature.as_ref(),
@@ -3066,7 +3069,8 @@ fn syncthing_delete(api_base: &str, path: &str, api_key: &str) -> Result<Option<
     };
     stream.set_read_timeout(Some(SYNCTHING_API_TIMEOUT))?;
     stream.set_write_timeout(Some(SYNCTHING_API_TIMEOUT))?;
-    let request = format!("DELETE {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\n\r\n");
+    let request =
+        format!("DELETE {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\n\r\n");
     if stream.write_all(request.as_bytes()).is_err() {
         return Ok(None);
     }
@@ -3078,7 +3082,10 @@ fn syncthing_delete(api_base: &str, path: &str, api_key: &str) -> Result<Option<
     let Some(status_line) = text.lines().next() else {
         return Ok(None);
     };
-    Ok(status_line.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()))
+    Ok(status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok()))
 }
 
 /// Register this project's channel folder with the local Syncthing and share it.
@@ -3229,7 +3236,10 @@ pub fn syncthing_folder_device_ids(route: &ProjectRoute) -> Result<Vec<String>> 
     let Some(status) = syncthing_get(&base, "/rest/system/status", &key)? else {
         return Ok(Vec::new());
     };
-    let me = status.get("myID").and_then(Value::as_str).map(str::to_string);
+    let me = status
+        .get("myID")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let Some(config) = syncthing_get(&base, "/rest/config", &key)? else {
         return Ok(Vec::new());
     };
@@ -3358,7 +3368,10 @@ pub fn deprecate_legacy_bridge(workspace: &Path) -> Result<Vec<PathBuf>> {
 /// Share this project's channel folder with the given device ids, keeping every
 /// peer it is already shared with. This is the granular control `enable`'s
 /// share-everything default does not give: one project can go to one person.
-pub fn syncthing_share_folder(route: &ProjectRoute, device_ids: &[String]) -> Result<SyncthingSetup> {
+pub fn syncthing_share_folder(
+    route: &ProjectRoute,
+    device_ids: &[String],
+) -> Result<SyncthingSetup> {
     let mut current = syncthing_folder_device_ids(route)?;
     for id in device_ids {
         if !current.contains(id) {
@@ -3395,7 +3408,9 @@ pub fn syncthing_unregister_folder(route: &ProjectRoute) -> Result<SyncthingSetu
         note: note.to_string(),
     };
     let Some(key) = syncthing_api_key() else {
-        return Ok(unavailable("Syncthing config not found; nothing registered to remove"));
+        return Ok(unavailable(
+            "Syncthing config not found; nothing registered to remove",
+        ));
     };
     let base = syncthing_api_base();
     match syncthing_delete(&base, &format!("/rest/config/folders/{folder_id}"), &key)? {
@@ -7066,7 +7081,11 @@ mod work_over_files_tests {
 
     /// A route whose roster carries real signing keys for the agents the tests
     /// use, plus the identities, so results/reviews/interrupts can be signed.
-    fn signed_channel() -> (tempfile::TempDir, ProjectRoute, HashMap<String, AgentIdentity>) {
+    fn signed_channel() -> (
+        tempfile::TempDir,
+        ProjectRoute,
+        HashMap<String, AgentIdentity>,
+    ) {
         let (temp, mut route) = channel();
         let mut identities = HashMap::new();
         let mut roster = Vec::new();
@@ -7177,7 +7196,10 @@ mod work_over_files_tests {
         issue_order(&route, &dependent).unwrap();
         // t-1 is still open, so t-2 must not be offered for work.
         assert!(
-            work_for(&route, "grouchly").unwrap().iter().all(|t| t.order.id != "t-2"),
+            work_for(&route, "grouchly")
+                .unwrap()
+                .iter()
+                .all(|t| t.order.id != "t-2"),
             "a dependent order must wait for its dependencies"
         );
         assert!(!dependencies_satisfied(&route, &dependent).unwrap());

@@ -69,10 +69,7 @@ pub fn record_learning(route: &ProjectRoute, learning: &Learning) -> Result<()> 
         fs::create_dir_all(parent)?;
     }
     let line = serde_json::to_string(learning)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     writeln!(file, "{line}")?;
     drop(file);
     let _ = crate::snapshot_channel_to_git(route);
@@ -214,4 +211,3 @@ mod tests {
         assert_eq!(read_learnings(&route).unwrap().len(), 1);
     }
 }
-
