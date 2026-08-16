@@ -558,9 +558,12 @@ async fn review_task(
 /// exists after the operator signs in, and it stays in the tab's memory.
 async fn index(State(state): State<DashboardState>) -> Html<String> {
     let html = DASHBOARD_HTML
-        .replacen("__PROJECT__", &state.route.project_id, 1)
-        .replacen("__READONLY__", if state.read_only { "true" } else { "false" }, 1)
-        .replacen("__ANY_OPERATORS__", if state.operators.any() { "true" } else { "false" }, 1);
+        .replace("__PROJECT__", &state.route.project_id)
+        .replace("__READONLY__", if state.read_only { "true" } else { "false" })
+        .replace(
+            "__ANY_OPERATORS__",
+            if state.operators.any() { "true" } else { "false" },
+        );
     Html(html)
 }
 

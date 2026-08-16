@@ -3,96 +3,129 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ferryman — __PROJECT__</title>
+<title>Ferryman · __PROJECT__</title>
 <script>window.__dash={readonly:__READONLY__,anyOperators:__ANY_OPERATORS__};</script>
 <style>
-:root{--bg:#0f1115;--panel:#181b22;--line:#2a2f3a;--fg:#e6e8ee;--dim:#9aa3b2;--accent:#5b9cf5;--ok:#3fb950;--warn:#d29922;--bad:#f85149}
+:root{--bg:#0b0e13;--surface:#12161e;--surface2:#1a2029;--line:#242c39;--fg:#e8ecf3;--dim:#8b95a7;--accent:#4f9cf9;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--review:#a371f7}
 *{box-sizing:border-box}
-body{margin:0;font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--fg);font-size:14px}
-header{display:flex;align-items:center;gap:1rem;padding:.7rem 1.1rem;border-bottom:1px solid var(--line);background:var(--panel)}
-header h1{font-size:16px;margin:0;font-weight:600}
-header .project{color:var(--dim)}
-header .controls{margin-left:auto;display:flex;align-items:center;gap:.8rem}
-button{background:#232834;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:.35rem .7rem;cursor:pointer}
-button:hover{background:#2b3140}
-button.active{background:var(--accent);border-color:var(--accent);color:#fff}
-nav{display:flex;gap:.3rem;padding:.5rem 1rem;border-bottom:1px solid var(--line)}
-main{padding:1rem}
+html,body{margin:0;height:100%}
+body{font:14px/1.5 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+a{color:var(--accent)}
+code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--surface2);border:1px solid var(--line);border-radius:4px;padding:0 .3em}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace}
+.muted{color:var(--dim)}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:.9rem;padding:.7rem 1.25rem;border-bottom:1px solid var(--line);background:rgba(11,14,19,.9);backdrop-filter:blur(6px);flex-wrap:wrap}
+.brand{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:15px}
+.mark{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,var(--accent),#7c5cff);display:grid;place-items:center;font-size:12px;color:#fff;font-weight:800}
+.brand .sub{color:var(--dim);font-weight:400}
+.controls{margin-left:auto;display:flex;align-items:center;gap:.7rem;font-size:13px}
+button{background:var(--surface2);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:.4rem .8rem;cursor:pointer;font:inherit;font-size:13px}
+button:hover{background:#212838}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.primary:hover{background:#3d87e0}
+button.ghost{background:transparent;border-color:transparent;color:var(--dim)}
+button.ghost:hover{color:var(--fg)}
+label.switch{display:flex;align-items:center;gap:.35rem;cursor:pointer;color:var(--dim)}
+input[type=checkbox]{accent-color:var(--accent)}
+main{max-width:1200px;margin:0 auto;padding:1.1rem 1.25rem 3rem}
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:.7rem;margin-bottom:1rem}
+.kpi{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:.7rem .9rem}
+.kpi .num{font-size:24px;font-weight:700;line-height:1.1}
+.kpi .lab{color:var(--dim);font-size:12px;text-transform:uppercase;letter-spacing:.4px;margin-top:2px}
+.attention{display:inline-block;margin:0 0 1rem;padding:.45rem .8rem;border:1px solid var(--warn);color:var(--warn);border-radius:8px;background:rgba(210,153,34,.08)}
+nav.tabs{display:flex;gap:.25rem;border-bottom:1px solid var(--line);margin-bottom:1rem}
+nav.tabs button{background:transparent;border:none;border-bottom:2px solid transparent;border-radius:0;padding:.55rem .9rem;color:var(--dim);font-weight:500}
+nav.tabs button.active{color:var(--fg);border-bottom-color:var(--accent)}
 .tab{display:none}
 .tab.active{display:block}
 .filters{display:flex;gap:.6rem;margin-bottom:.8rem}
-input,select{background:#14171d;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:.4rem .6rem}
+input[type=text],select{background:var(--surface2);border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:.45rem .6rem;font:inherit}
 input[type=text]{flex:1}
-table{width:100%;border-collapse:collapse;background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
-th,td{text-align:left;padding:.45rem .6rem;border-bottom:1px solid var(--line)}
-th{color:var(--dim);font-weight:600;background:#14171d}
-tr:last-child td{border-bottom:none}
-tbody tr{cursor:pointer}
-tbody tr:hover{background:#1e232d}
-.badge{display:inline-block;padding:.1rem .45rem;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--dim)}
+.taskgrid{display:grid;grid-template-columns:minmax(300px,5fr) 7fr;gap:1rem;align-items:start}
+.tasklist{display:flex;flex-direction:column;gap:.4rem}
+.task-row{display:flex;gap:.7rem;align-items:center;background:var(--surface);border:1px solid var(--line);border-radius:9px;padding:.55rem .7rem;cursor:pointer}
+.task-row:hover{border-color:var(--accent)}
+.task-row.selected{border-color:var(--accent);background:var(--surface2)}
+.dot{width:9px;height:9px;border-radius:50%;flex:none}
+.task-main{min-width:0}
+.task-id{font-size:12px;color:var(--accent)}
+.task-text{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.task-meta{margin-left:auto;text-align:right;flex:none}
+.task-meta .muted{font-size:12px}
+.badge{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:11px;border:1px solid var(--line);color:var(--dim)}
 .badge.ok{color:var(--ok);border-color:var(--ok)}
 .badge.bad{color:var(--bad);border-color:var(--bad)}
 .badge.warn{color:var(--warn);border-color:var(--warn)}
 .badge.accent{color:var(--accent);border-color:var(--accent)}
-.mono{font-family:ui-monospace,Menlo,monospace}
-.detail{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:1rem;margin-top:1rem}
-.detail h3{margin:0 0 .5rem;font-size:15px}
-.detail pre{white-space:pre-wrap;word-break:break-word;background:#14171d;border:1px solid var(--line);border-radius:6px;padding:.6rem;max-height:20rem;overflow:auto;font-family:ui-monospace,Menlo,monospace}
-.detail textarea{width:100%;min-height:4rem;background:#14171d;border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:.5rem;margin:.4rem 0;font-family:inherit}
-.detail .review-actions{display:flex;gap:.5rem;align-items:center;margin-top:.4rem}
-.muted{color:var(--dim)}
-.lead{color:var(--warn);font-weight:600}
-section{min-height:10rem}
-.kpi{display:flex;gap:1rem;margin-bottom:1rem}
-.kpi div{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:.7rem 1rem;flex:1}
-.kpi .num{font-size:22px;font-weight:600}
-.kpi .lab{color:var(--dim);font-size:12px}
-#login-overlay{position:fixed;inset:0;background:rgba(10,12,16,.85);display:flex;align-items:center;justify-content:center;z-index:10}
-.login-card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:1.5rem;width:22rem}
-.login-card h2{margin:0 0 .3rem;font-size:16px}
-.login-card input{width:100%;margin:.4rem 0}
-.login-card .row{display:flex;gap:.5rem;align-items:center;margin-top:.6rem}
+.detail{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1.1rem}
+.d-head{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap}
+.d-title{font-weight:700;font-size:15px}
+.d-task{font-size:14px;margin:.5rem 0;color:var(--fg)}
+.d-meta{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:.9rem}
+.tl{position:relative;padding-left:1.2rem;display:flex;flex-direction:column;gap:1rem;margin:1rem 0}
+.tl::before{content:'';position:absolute;left:4px;top:4px;bottom:4px;width:2px;background:var(--line)}
+.tl-item{position:relative}
+.tl-dot{position:absolute;left:-1.2rem;top:3px;width:10px;height:10px;border-radius:50%;border:2px solid var(--bg)}
+.tl-label{font-weight:600;font-size:13px}
+.tl .muted{font-size:12px}
+.tl pre{white-space:pre-wrap;word-break:break-word;background:var(--surface2);border:1px solid var(--line);border-radius:7px;padding:.6rem;margin:.3rem 0 0;font-size:12px;font-family:ui-monospace,Menlo,monospace}
+details.payload{margin-top:.4rem}
+details.payload summary{cursor:pointer;color:var(--dim);font-size:12px}
+details.payload pre{white-space:pre-wrap;word-break:break-word;background:var(--surface2);border:1px solid var(--line);border-radius:7px;padding:.6rem;max-height:16rem;overflow:auto}
+.review-box{margin-top:1rem;border-top:1px solid var(--line);padding-top:.9rem}
+.review-box textarea{width:100%;min-height:3.5rem;background:var(--surface2);border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:.5rem;font:inherit;resize:vertical}
+.review-actions{display:flex;gap:.5rem;align-items:center;margin-top:.5rem}
+table{width:100%;border-collapse:collapse;background:var(--surface);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--line);font-size:13px}
+th{color:var(--dim);font-weight:600;background:var(--surface2);text-transform:uppercase;font-size:11px;letter-spacing:.4px}
+tr:last-child td{border-bottom:none}
+tbody tr:hover{background:var(--surface2)}
+.empty{padding:2.5rem 1rem;text-align:center;color:var(--dim);background:var(--surface);border:1px dashed var(--line);border-radius:10px}
+.empty code{display:inline-block;margin-top:.5rem}
+#login-overlay{position:fixed;inset:0;background:rgba(5,7,10,.8);display:flex;align-items:center;justify-content:center;z-index:20}
+.login-card{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:1.6rem;width:23rem}
+.login-card h2{margin:0 0 .3rem;font-size:17px}
+.login-card p{color:var(--dim);margin:.2rem 0 1rem;font-size:13px}
+.login-card input{width:100%;margin:.4rem 0;background:var(--surface2);border:1px solid var(--line);color:var(--fg);border-radius:7px;padding:.55rem .6rem;font:inherit}
+.login-card .row{display:flex;gap:.5rem;align-items:center;margin-top:.8rem}
 .login-card .row button:first-child{flex:1}
+#auth-status{color:var(--bad);font-size:12px}
+@media(max-width:900px){.kpis{grid-template-columns:repeat(3,1fr)}.taskgrid{grid-template-columns:1fr}}
 </style>
 </head>
 <body>
 <header>
-  <h1>Ferryman</h1>
-  <span class="project mono">__PROJECT__</span>
+  <div class="brand"><span class="mark">⛵</span> Ferryman <span class="sub">· __PROJECT__</span></div>
   <div class="controls">
     <span id="who" class="muted"></span>
-    <button id="signout" style="display:none">sign out</button>
-    <label class="muted"><input type="checkbox" id="autorefresh" checked> auto</label>
-    <button id="refresh">refresh</button>
+    <button id="signout" class="ghost" style="display:none">sign out</button>
+    <label class="switch"><input type="checkbox" id="autorefresh" checked> auto</label>
+    <button id="refresh" class="ghost">refresh</button>
     <span class="muted" id="updated"></span>
   </div>
 </header>
-<nav id="tabs">
-  <button data-tab="tasks" class="active">Tasks</button>
-  <button data-tab="engines">Engines</button>
-  <button data-tab="ledger">Ledger</button>
-  <button data-tab="learnings">Learnings</button>
-</nav>
 <main>
+  <div class="kpis" id="kpis"></div>
+  <div id="attention"></div>
+  <nav class="tabs" id="tabs">
+    <button data-tab="tasks" class="active">Tasks</button>
+    <button data-tab="engines">Engines</button>
+    <button data-tab="ledger">Ledger</button>
+    <button data-tab="learnings">Learnings</button>
+  </nav>
   <section id="tab-tasks" class="tab active">
     <div class="filters">
-      <input id="search" type="text" placeholder="filter by id or task text…">
-      <select id="statefilter">
-        <option value="">all states</option>
-        <option value="open">open</option>
-        <option value="claimed">claimed</option>
-        <option value="awaiting_review">awaiting review</option>
-        <option value="changes_requested">changes requested</option>
-        <option value="accepted">accepted</option>
-        <option value="done">done</option>
-      </select>
+      <input id="search" type="text" placeholder="filter tasks…">
+      <select id="statefilter"><option value="">all states</option><option>open</option><option>claimed</option><option>awaiting_review</option><option>changes_requested</option><option>accepted</option><option>done</option></select>
     </div>
-    <div id="tasklist"></div>
-    <div id="taskdetail"></div>
+    <div class="taskgrid">
+      <div class="tasklist" id="tasklist"></div>
+      <div id="taskdetail"></div>
+    </div>
   </section>
   <section id="tab-engines" class="tab">
-    <div class="kpi" id="kpis"></div>
-    <table><thead><tr><th>engine</th><th>kept</th><th>rate</th><th>runs</th><th>est. cost</th></tr></thead><tbody id="engines-body"></tbody></table>
+    <div class="kpis" id="ekpis" style="grid-template-columns:repeat(3,1fr)"></div>
+    <table><thead><tr><th>engine</th><th>kept</th><th>accept rate</th><th>runs</th><th>est. cost</th></tr></thead><tbody id="engines-body"></tbody></table>
   </section>
   <section id="tab-ledger" class="tab">
     <table><thead><tr><th>time</th><th>kind</th><th>actor</th><th>summary</th><th>ref</th></tr></thead><tbody id="ledger-body"></tbody></table>
@@ -104,228 +137,74 @@ section{min-height:10rem}
 <div id="login-overlay" style="display:none">
   <div class="login-card">
     <h2 id="auth-title">Sign in</h2>
-    <p class="muted">Operators approve and send back work under a password-protected identity.</p>
+    <p>Operators approve and send back work under a password-protected identity.</p>
     <input id="auth-name" placeholder="operator name" autocomplete="username">
     <input id="auth-password" type="password" placeholder="password" autocomplete="current-password">
-    <div class="row">
-      <button id="auth-submit">sign in</button>
-      <button id="auth-toggle">create operator</button>
-    </div>
-    <span class="muted" id="auth-status"></span>
+    <div class="row"><button id="auth-submit" class="primary">sign in</button><button id="auth-toggle" class="ghost">create operator</button></div>
+    <span id="auth-status"></span>
   </div>
 </div>
 <script>
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const st = s => s && s.status ? s.status.replace(/_/g,' ') : String(s||'');
-const sigBadge = s => s === 'valid' ? '<span class="badge ok">signed</span>' :
-  s === 'unsigned' ? '<span class="badge warn">unsigned</span>' : '<span class="badge bad">'+esc(s)+'</span>';
-
-async function j(url){const r = await fetch(url); if(!r.ok) throw new Error(r.status+' '+url); return r.json();}
-
-let tasks=[], selected=null;
-let session = sessionStorage.getItem('ferry-dash-token') || null;
-let operator = null;
-let authMode = 'login'; // 'login' | 'create'
-
-async function auth(mode, name, password){
-  const r = await fetch('/api/auth/'+mode, {
-    method:'POST',
-    headers:{'content-type':'application/json'},
-    body: JSON.stringify({name, password})
-  });
-  const text = await r.text();
-  if(!r.ok) throw new Error(text);
-  return JSON.parse(text);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATES={open:{l:'open',c:'var(--dim)'},claimed:{l:'claimed',c:'var(--accent)'},awaiting_review:{l:'awaiting review',c:'var(--review)'},changes_requested:{l:'changes requested',c:'var(--warn)'},accepted:{l:'accepted',c:'var(--ok)'},done:{l:'done',c:'var(--dim)'}};
+const stOf=t=>STATES[(t.state&&t.state.status)||'open']||{l:(t.state&&t.state.status)||'open',c:'var(--dim)'};
+const sigBadge=s=>s==='valid'?'<span class="badge ok">signed</span>':s==='unsigned'?'<span class="badge warn">unsigned</span>':'<span class="badge bad">'+esc(s)+'</span>';
+async function j(url){const r=await fetch(url);if(!r.ok)throw new Error(r.status+' '+url);return r.json();}
+let tasks=[],session=sessionStorage.getItem('ferry-dash-token')||null,operator=null,authMode='login';
+function renderKpis(){
+  const c={};tasks.forEach(t=>{const s=(t.state&&t.state.status)||'open';c[s]=(c[s]||0)+1;});
+  document.getElementById('kpis').innerHTML=['open','claimed','awaiting_review','changes_requested','accepted','done'].map(k=>'<div class="kpi"><div class="num" style="color:'+STATES[k].c+'">'+(c[k]||0)+'</div><div class="lab">'+STATES[k].l+'</div></div>').join('');
+  const needs=(c.awaiting_review||0)+(c.changes_requested||0)+tasks.filter(t=>t.requires_approval&&(!t.state||t.state.status==='open')).length;
+  document.getElementById('attention').innerHTML=needs?'<span class="attention">'+needs+' task'+(needs===1?'':'s')+' need'+(needs===1?'s':'')+' your attention</span>':'';
 }
-
-function showLogin(mode){
-  authMode = mode;
-  document.getElementById('login-overlay').style.display = 'flex';
-  document.getElementById('auth-title').textContent = mode === 'login' ? 'Sign in' : 'Create operator';
-  document.getElementById('auth-submit').textContent = mode === 'login' ? 'sign in' : 'create';
-  document.getElementById('auth-toggle').textContent = mode === 'login' ? 'create operator' : 'sign in';
-  document.getElementById('auth-password').setAttribute('autocomplete', mode === 'login' ? 'current-password' : 'new-password');
-  document.getElementById('auth-status').textContent = '';
-}
-
-function hideLogin(){
-  document.getElementById('login-overlay').style.display = 'none';
-}
-
-function setSession(token, name){
-  session = token;
-  operator = name;
-  sessionStorage.setItem('ferry-dash-token', token);
-  document.getElementById('who').textContent = name ? 'signed in as '+name : '';
-  document.getElementById('signout').style.display = name ? '' : 'none';
-  hideLogin();
-}
-
-async function doAuth(){
-  const name = document.getElementById('auth-name').value.trim();
-  const password = document.getElementById('auth-password').value;
-  const status = document.getElementById('auth-status');
-  try{
-    if(authMode === 'login'){
-      const d = await auth('login', name, password);
-      setSession(d.token, d.name);
-      await refresh();
-    } else {
-      await auth('create', name, password);
-      status.textContent = 'created — sign in';
-      showLogin('login');
-      document.getElementById('auth-name').value = name;
-    }
-  }catch(e){
-    status.textContent = 'failed: ' + e.message;
-  }
-}
-
-async function doSignout(){
-  if(session){
-    try{ await fetch('/api/auth/logout', {method:'POST', headers:{'x-ferryman-dashboard-token':session}}); }catch(e){}
-  }
-  session = null; operator = null;
-  sessionStorage.removeItem('ferry-dash-token');
-  document.getElementById('who').textContent = '';
-  document.getElementById('signout').style.display = 'none';
-  showLogin('login');
-}
-
-async function checkSession(){
-  if(!session) return false;
-  try{
-    const r = await fetch('/api/auth/whoami', {headers:{'x-ferryman-dashboard-token':session}});
-    if(!r.ok){ session = null; return false; }
-    const d = await r.json();
-    operator = d.name;
-    return true;
-  }catch(e){ return false; }
-}
-
 function renderTasks(){
-  const q = (document.getElementById('search').value||'').toLowerCase();
-  const f = document.getElementById('statefilter').value;
-  const rows = tasks.filter(t =>
-    (!f || st(t.state)===f) &&
-    (!q || t.id.toLowerCase().includes(q) || (t.task||'').toLowerCase().includes(q))
-  );
-  const el = document.getElementById('tasklist');
-  if(!rows.length){ el.innerHTML='<div class="muted" style="padding:.6rem">no tasks match</div>'; return; }
-  el.innerHTML = '<table><thead><tr><th>id</th><th>state</th><th>holder</th><th>sig</th><th>task</th></tr></thead><tbody>' +
-    rows.map(t => `<tr data-id="${esc(t.id)}">
-      <td class="mono">${esc(t.id)}</td>
-      <td><span class="badge ${t.requires_approval?'accent':''}">${esc(st(t.state))}</span></td>
-      <td>${esc(t.holder||'—')}</td>
-      <td>${sigBadge(t.sig)}</td>
-      <td class="muted">${esc((t.task||'').slice(0,80))}</td>
-    </tr>`).join('') + '</tbody></table>';
-  el.querySelectorAll('tbody tr').forEach(tr => tr.onclick = () => showDetail(tr.dataset.id));
+  const q=(document.getElementById('search').value||'').toLowerCase(),f=document.getElementById('statefilter').value;
+  const rows=tasks.filter(t=>{const s=(t.state&&t.state.status)||'open';return (!f||s===f)&&(!q||(t.id+' '+(t.task||'')).toLowerCase().includes(q));});
+  const el=document.getElementById('tasklist');
+  if(!tasks.length){el.innerHTML='<div class="empty">No tasks in this channel yet.<br><code>ferry channel order --task "your first task"</code></div>';return;}
+  if(!rows.length){el.innerHTML='<div class="empty">No tasks match this filter.</div>';return;}
+  el.innerHTML=rows.map(t=>{const s=stOf(t);return '<div class="task-row" data-id="'+esc(t.id)+'"><span class="dot" style="background:'+s.c+'"></span><div class="task-main"><div class="task-id mono">'+esc(t.id)+'</div><div class="task-text">'+esc((t.task||'').slice(0,90)||'(untitled)')+'</div></div><div class="task-meta"><span class="badge" style="color:'+s.c+';border-color:'+s.c+'">'+s.l+'</span><div class="muted">'+esc(t.holder||'—')+'</div></div></div>';}).join('');
+  el.querySelectorAll('.task-row').forEach(r=>r.onclick=()=>selectTask(r.dataset.id));
 }
-
-async function showDetail(id){
-  selected = id;
-  const d = await j('/api/tasks/'+encodeURIComponent(id));
-  const el = document.getElementById('taskdetail');
-  el.innerHTML = '<div class="detail"><h3 class="mono">'+esc(d.id)+' '+sigBadge(d.order.sig)+'</h3>'+
-    '<p class="muted">issued by <b>'+esc(d.order.issued_by)+'</b>'+(d.order.assigned_to?' → <b>'+esc(d.order.assigned_to)+'</b>':' (open)')+
-    (d.order.requires_approval?' <span class="badge accent">requires approval</span>':'')+
-    (d.order.requires_review?' <span class="badge">requires review</span>':'')+
-    (d.order.depends_on.length?' <span class="badge">depends: '+esc(d.order.depends_on.join(', '))+'</span>':'')+
-    (d.contract_missing.length?' <span class="badge bad">contract MISSING: '+esc(d.contract_missing.join(', '))+'</span>':'')+
-    '</p>'+
-    '<h3>Order</h3><pre>'+esc(JSON.stringify(d.order.payload,null,2))+'</pre>'+
-    '<h3>Claims</h3>'+(d.claims.length?d.claims.map(c=>'<div class="muted">'+esc(c.agent)+' at '+esc(c.at)+'</div>').join(''):'<div class="muted">none</div>')+
-    '<h3>Results</h3>'+(d.results.length?d.results.map(r=>'<pre>['+r.revision+'] '+esc(r.agent)+' '+sigBadge(r.sig)+'\n'+(esc(r.output||'(no output)')).slice(0,4000)+'</pre>').join(''):'<div class="muted">none</div>')+
-    '<h3>Reviews</h3>'+(d.reviews.length?d.reviews.map(r=>'<div>r'+r.revision+' by '+esc(r.reviewer)+' '+(r.accepted?'<span class="badge ok">accepted</span>':'<span class="badge warn">sent back</span>')+' '+sigBadge(r.sig)+(r.notes?' <span class="muted">— '+esc(r.notes)+'</span>':'')+'</div>').join(''):'<div class="muted">none</div>')+
-    (window.__dash.readonly || !d.results.length ? '' :
-      '<h3>Review</h3><textarea id="review-notes" placeholder="notes — required to send work back"></textarea>'+
-      '<div class="review-actions"><button id="btn-accept">accept</button><button id="btn-sendback">send back</button><span class="muted" id="review-status"></span></div>')+
-    '</div>';
-  const accept = document.getElementById('btn-accept');
-  if(accept) accept.onclick = () => doReview(id, true);
-  const sendback = document.getElementById('btn-sendback');
-  if(sendback) sendback.onclick = () => doReview(id, false);
+async function selectTask(id){
+  document.querySelectorAll('.task-row').forEach(r=>r.classList.toggle('selected',r.dataset.id===id));
+  const d=await j('/api/tasks/'+encodeURIComponent(id)),s=stOf(d);
+  const el=document.getElementById('taskdetail');
+  let h='<div class="detail"><div class="d-head"><div class="d-title mono">'+esc(d.id)+'</div><span class="badge" style="color:'+s.c+';border-color:'+s.c+'">'+s.l+'</span>'+sigBadge(d.order.sig)+'</div>';
+  h+='<p class="d-task">'+esc(d.order.payload&&d.order.payload.task||'(no task text)')+'</p>';
+  h+='<div class="d-meta"><span class="muted">issued by <b>'+esc(d.order.issued_by)+'</b>'+(d.order.assigned_to?' → <b>'+esc(d.order.assigned_to)+'</b>':' (open)')+'</span>'+(d.order.requires_approval?'<span class="badge accent">requires approval</span>':'')+(d.order.requires_review?'<span class="badge">requires review</span>':'')+(d.order.depends_on.length?'<span class="badge">depends: '+esc(d.order.depends_on.join(', '))+'</span>':'')+(d.contract_missing.length?'<span class="badge bad">contract missing: '+esc(d.contract_missing.join(', '))+'</span>':'')+'</div>';
+  h+='<div class="tl"><div class="tl-item"><span class="tl-dot" style="background:var(--accent)"></span><div class="tl-label">order</div><div class="muted">'+esc((d.order.created_at||'').replace('T',' ').slice(0,19))+'</div></div>';
+  d.claims.forEach(c=>{h+='<div class="tl-item"><span class="tl-dot" style="background:var(--accent)"></span><div class="tl-label">claimed · '+esc(c.agent)+'</div><div class="muted">'+esc((c.at||'').replace('T',' ').slice(0,19))+'</div></div>';});
+  d.results.forEach(r=>{h+='<div class="tl-item"><span class="tl-dot" style="background:var(--accent)"></span><div class="tl-label">result r'+r.revision+' · '+esc(r.agent)+'</div>'+sigBadge(r.sig)+(r.output?'<pre>'+esc(String(r.output).slice(0,3000))+'</pre>':'<div class="muted">(no output)</div>')+'</div>';});
+  d.reviews.forEach(r=>{h+='<div class="tl-item"><span class="tl-dot" style="background:'+(r.accepted?'var(--ok)':'var(--warn)')+'"></span><div class="tl-label">'+(r.accepted?'accepted':'sent back')+' · '+esc(r.reviewer)+'</div>'+sigBadge(r.sig)+(r.notes?'<div class="muted">“'+esc(r.notes)+'”</div>':'')+'</div>';});
+  h+='</div><details class="payload"><summary>order payload</summary><pre>'+esc(JSON.stringify(d.order.payload,null,2))+'</pre></details>';
+  if(!window.__dash.readonly&&d.results.length)h+='<div class="review-box"><textarea id="review-notes" placeholder="notes — required to send work back"></textarea><div class="review-actions"><button id="btn-accept" class="primary">accept</button><button id="btn-sendback">send back</button><span class="muted" id="review-status"></span></div></div>';
+  el.innerHTML=h+'</div>';
+  const a=document.getElementById('btn-accept');if(a)a.onclick=()=>doReview(id,true);
+  const b=document.getElementById('btn-sendback');if(b)b.onclick=()=>doReview(id,false);
 }
-
-async function doReview(id, accept){
-  const notes = (document.getElementById('review-notes')||{value:''}).value || '';
-  const status = document.getElementById('review-status');
-  try{
-    const r = await fetch('/api/tasks/'+encodeURIComponent(id)+'/review', {
-      method:'POST',
-      headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},
-      body: JSON.stringify({accept, notes: notes||null})
-    });
-    const text = await r.text();
-    if(r.status === 401){ doSignout(); return; }
-    if(r.ok){ if(status) status.textContent = 'done'; await showDetail(id); refresh(); }
-    else if(status){ status.textContent = 'failed: '+text; }
-    else { alert('review failed: '+text); }
-  }catch(e){ if(status) status.textContent = 'failed: '+e; }
+async function doReview(id,accept){
+  const notes=(document.getElementById('review-notes')||{value:''}).value||'',st=document.getElementById('review-status');
+  try{const r=await fetch('/api/tasks/'+encodeURIComponent(id)+'/review',{method:'POST',headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},body:JSON.stringify({accept,notes:notes||null})});const t=await r.text();if(r.status===401){doSignout();return;}if(r.ok){if(st)st.textContent='done';await selectTask(id);refresh();}else if(st)st.textContent='failed: '+t;else alert('review failed: '+t);}catch(e){if(st)st.textContent='failed: '+e;}
 }
-
 function renderEngines(s){
-  document.getElementById('kpis').innerHTML = '<div><div class="num">'+s.length+'</div><div class="lab">engines</div></div>'+
-    '<div><div class="num">'+s.reduce((a,x)=>a+x.accepted,0)+'</div><div class="lab">kept</div></div>'+
-    '<div><div class="num">$'+s.reduce((a,x)=>a+(x.estimated_cost_usd||0),0).toFixed(2)+'</div><div class="lab">est. spend</div></div>';
-  document.getElementById('engines-body').innerHTML = s.map(x=>'<tr><td class="mono">'+esc(x.engine)+'</td><td>'+x.accepted+'/'+x.total+'</td><td>'+(x.rate*100).toFixed(0)+'%</td><td>'+x.runs+'</td><td>$'+(x.estimated_cost_usd||0).toFixed(3)+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">no learning data</td></tr>';
+  document.getElementById('ekpis').innerHTML='<div class="kpi"><div class="num">'+s.length+'</div><div class="lab">engines</div></div><div class="kpi"><div class="num">'+s.reduce((a,x)=>a+x.accepted,0)+'</div><div class="lab">kept</div></div><div class="kpi"><div class="num">$'+s.reduce((a,x)=>a+(x.estimated_cost_usd||0),0).toFixed(2)+'</div><div class="lab">est. spend</div></div>';
+  document.getElementById('engines-body').innerHTML=s.map(x=>'<tr><td class="mono">'+esc(x.engine)+'</td><td>'+x.accepted+'/'+x.total+'</td><td>'+(x.rate*100).toFixed(0)+'%</td><td>'+x.runs+'</td><td>$'+(x.estimated_cost_usd||0).toFixed(3)+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No engine usage yet — it appears when agents run and record trajectories.</div></td></tr>';
 }
-
-function renderLedger(d){
-  document.getElementById('ledger-body').innerHTML = (d.entries||[]).map(e=>'<tr><td class="muted">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">empty ledger</td></tr>';
-}
-
-function renderLearnings(l){
-  document.getElementById('learnings-body').innerHTML = l.map(x=>'<tr><td class="muted">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('') || '<tr><td colspan="6" class="muted">nothing learned yet</td></tr>';
-}
-
-async function refresh(){
-  try{
-    if(!window.__dash.readonly && session){
-      if(!(await checkSession())){ doSignout(); return; }
-      document.getElementById('who').textContent = 'signed in as '+operator;
-      document.getElementById('signout').style.display = '';
-    }
-    [tasks] = await Promise.all([j('/api/tasks')]);
-    renderTasks();
-    renderEngines(await j('/api/stats'));
-    renderLedger(await j('/api/ledger'));
-    renderLearnings(await j('/api/learnings'));
-    document.getElementById('updated').textContent = 'updated '+new Date().toLocaleTimeString();
-  }catch(e){ console.error(e); }
-}
-
-document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
-  document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active');
-  document.getElementById('tab-'+b.dataset.tab).classList.add('active');
-});
-document.getElementById('refresh').onclick = refresh;
-document.getElementById('signout').onclick = doSignout;
-document.getElementById('auth-submit').onclick = doAuth;
-document.getElementById('auth-toggle').onclick = () => showLogin(authMode === 'login' ? 'create' : 'login');
-const authEnter = e => { if(e.key === 'Enter') doAuth(); };
-document.getElementById('auth-name').addEventListener('keydown', authEnter);
-document.getElementById('auth-password').addEventListener('keydown', authEnter);
-document.getElementById('search').oninput = renderTasks;
-document.getElementById('statefilter').onchange = renderTasks;
-setInterval(()=>{ if(document.getElementById('autorefresh').checked) refresh(); }, 3000);
-(async function init(){
-  if(window.__dash.readonly){
-    document.getElementById('signout').style.display = 'none';
-  } else if(await checkSession()){
-    document.getElementById('who').textContent = 'signed in as '+operator;
-    document.getElementById('signout').style.display = '';
-  } else {
-    // A first-time visitor with no operators yet should create one, not stare
-    // at a sign-in form with nothing to sign into.
-    showLogin(window.__dash.anyOperators ? 'login' : 'create');
-  }
-  refresh();
-})();
+function renderLedger(d){document.getElementById('ledger-body').innerHTML=(d.entries||[]).map(e=>'<tr><td class="muted mono">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No ledger entries yet — they appear as work is issued and reviewed.</div></td></tr>';}
+function renderLearnings(l){document.getElementById('learnings-body').innerHTML=l.map(x=>'<tr><td class="muted mono">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">Nothing learned yet — learnings appear when agents record what worked.</div></td></tr>';}
+async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j('/api/tasks');renderKpis();renderTasks();renderEngines(await j('/api/stats'));renderLedger(await j('/api/ledger'));renderLearnings(await j('/api/learnings'));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
+async function auth(mode,name,password){const r=await fetch('/api/auth/'+mode,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,password})});const t=await r.text();if(!r.ok)throw new Error(t);return JSON.parse(t);}
+function showLogin(mode){authMode=mode;document.getElementById('login-overlay').style.display='flex';document.getElementById('auth-title').textContent=mode==='login'?'Sign in':'Create operator';document.getElementById('auth-submit').textContent=mode==='login'?'sign in':'create';document.getElementById('auth-toggle').textContent=mode==='login'?'create operator':'sign in';document.getElementById('auth-status').textContent='';document.getElementById('auth-password').value='';document.getElementById('auth-name').focus();}
+async function doAuth(){const n=document.getElementById('auth-name').value.trim(),p=document.getElementById('auth-password').value;try{const r=await auth(authMode,n,p);if(authMode==='create'){showLogin('login');document.getElementById('auth-status').textContent='operator created — sign in';document.getElementById('auth-name').value=n;return;}session=r.token;sessionStorage.setItem('ferry-dash-token',session);operator=r.name;document.getElementById('login-overlay').style.display='none';refresh();}catch(e){document.getElementById('auth-status').textContent=String(e);}}
+async function checkSession(){if(!session)return false;try{const r=await fetch('/api/auth/whoami',{headers:{'x-ferryman-dashboard-token':session}});if(!r.ok)return false;const d=await r.json();operator=d.name;return true;}catch(e){return false;}}
+function doSignout(){session=null;operator=null;sessionStorage.removeItem('ferry-dash-token');document.getElementById('signout').style.display='none';document.getElementById('who').textContent='';if(!window.__dash.readonly)showLogin(window.__dash.anyOperators?'login':'create');}
+document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('tab-'+b.dataset.tab).classList.add('active');});
+document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
+const onEnter=e=>{if(e.key==='Enter')doAuth();};document.getElementById('auth-name').addEventListener('keydown',onEnter);document.getElementById('auth-password').addEventListener('keydown',onEnter);
+document.getElementById('search').oninput=renderTasks;document.getElementById('statefilter').onchange=renderTasks;
+setInterval(()=>{if(document.getElementById('autorefresh').checked)refresh();},3000);
+(async function init(){if(window.__dash.readonly){document.getElementById('signout').style.display='none';}else if(await checkSession()){document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}else{showLogin(window.__dash.anyOperators?'login':'create');}refresh();})();
 </script>
 </body>
 </html>
-
