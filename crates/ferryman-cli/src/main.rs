@@ -215,6 +215,18 @@ enum Command {
         #[arg(long)]
         read_only: bool,
     },
+    /// Print this project's persistent memory — the synced memory bank and the
+    /// durable append-only log — so an agent that has lost its context (or a
+    /// human) can reload the whole picture in one command. Works from the
+    /// checkout or the channel folder; no channel is required.
+    Loadmem {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Project slug, when the directory name is not the slug.
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 #[derive(Subcommand, Clone)]
 enum Projects {
@@ -1227,6 +1239,7 @@ async fn main() -> Result<()> {
             }
             ferryman_server::dashboard::serve(state, addr).await?;
         }
+        Command::Loadmem { workspace, project } => loadmem(workspace, project)?,
         Command::Communications { command } => match command {
             Communications::Send {
                 project,
@@ -2218,6 +2231,165 @@ async fn agent_command(command: Agent) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// The core memory-bank files, in the order the memory bank's own README
+/// prescribes. Reference files follow, alphabetically.
+const MEMORY_BANK_ORDER: &[&str] = &[
+    "projectbrief.md",
+    "productContext.md",
+    "systemPatterns.md",
+    "techContext.md",
+    "activeContext.md",
+    "progress.md",
+];
+
+/// `ferry loadmem`: print the project's persistent memory so an agent that lost
+/// its context (or a human) can reload it in one command.
+///
+/// Deliberately forgiving: it works from the checkout, the channel folder, or
+/// anywhere the memory bank is reachable. No channel is required — the memory
+/// bank is the recovery record, and a machine that just failed is exactly the
+/// machine that must be able to read it.
+fn loadmem(workspace: Option<PathBuf>, project: Option<String>) -> Result<()> {
+    let start = match workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    // The route is nice to have (channel path, canonical project id) but not
+    // required: memory must be readable even when the attachment is gone.
+    let route = ferryman_channel::route_for(&start).ok();
+    let slug = project
+        .or_else(|| route.as_ref().map(|route| route.project_id.clone()))
+        .unwrap_or_else(|| slug_of(&start));
+
+    let bank = find_memory_bank(&start, route.as_ref());
+    let log = find_durable_log(&start, &slug, route.as_ref());
+
+    println!("project   {slug}");
+    if let Some(path) = &bank {
+        println!("memory    {}", path.display());
+    }
+    if let Some(path) = &log {
+        println!("log       {}", path.display());
+    }
+    println!();
+
+    let mut printed = false;
+
+    if let Some(dir) = bank {
+        let readme = dir.join("README.md");
+        if readme.is_file() {
+            print_memory_file("## Memory review order (read this first)", &readme)?;
+            printed = true;
+        }
+        for name in MEMORY_BANK_ORDER {
+            let path = dir.join(name);
+            if path.is_file() {
+                print_memory_file(&format!("## {name}"), &path)?;
+                printed = true;
+            }
+        }
+        let mut others = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy().to_string();
+                if name.ends_with(".md")
+                    && name != "README.md"
+                    && !MEMORY_BANK_ORDER.contains(&name.as_str())
+                {
+                    others.push(name);
+                }
+            }
+        }
+        others.sort();
+        for name in others {
+            print_memory_file(&format!("## {name}"), &dir.join(&name))?;
+            printed = true;
+        }
+    }
+
+    if let Some(path) = log {
+        print_memory_file("## Durable memory (append-only log)", &path)?;
+        printed = true;
+    }
+
+    if !printed {
+        bail!(
+            "no memory found for '{slug}'. Expected a memory-bank/ directory, or a \
+             MEMORY.md under ./memory/, ./ or FERRYMAN_MEMORY_FILE. Run \
+             'ferryman-memory-init' (or 'ferryman-memory-record \"<note>\"') to create it"
+        );
+    }
+    Ok(())
+}
+
+/// The project slug, derived the way the fleet protocol derives it: the
+/// directory name, lowercased, non-alphanumerics collapsed to a dash.
+fn slug_of(dir: &std::path::Path) -> String {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Locate the memory bank: the channel's synced copy first, then the local
+/// checkout's, then an explicit override.
+fn find_memory_bank(
+    start: &std::path::Path,
+    route: Option<&ferryman_channel::ProjectRoute>,
+) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(route) = route {
+        candidates.push(route.communications.join("memory-bank"));
+        candidates.push(route.attachment.join("memory-bank"));
+    }
+    candidates.push(start.join("memory-bank"));
+    if let Ok(path) = std::env::var("FERREY_MEM_BANK") {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    candidates.into_iter().find(|path| path.is_dir())
+}
+
+/// Locate the durable append-only log, from the most explicit location down.
+fn find_durable_log(
+    start: &std::path::Path,
+    slug: &str,
+    route: Option<&ferryman_channel::ProjectRoute>,
+) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("FERRYMAN_MEMORY_FILE") {
+        candidates.push(std::path::PathBuf::from(path));
+    }
+    candidates.push(start.join("memory").join("MEMORY.md"));
+    candidates.push(start.join("MEMORY.md"));
+    if let Some(route) = route {
+        candidates.push(route.workspace.join("memory").join("MEMORY.md"));
+        candidates.push(route.workspace.join(slug).join("MEMORY.md"));
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    println!("{heading}");
+    println!();
+    println!("{text}");
+    println!();
     Ok(())
 }
 
@@ -3435,3 +3607,23 @@ fn note_unclassified_shares(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::slug_of;
+    use std::path::Path;
+
+    #[test]
+    fn slug_derives_from_the_directory_name() {
+        assert_eq!(
+            slug_of(Path::new("/mnt/nvme-storage/repos/ferryman")),
+            "ferryman"
+        );
+        assert_eq!(slug_of(Path::new("/home/you/My Project")), "my-project");
+        assert_eq!(
+            slug_of(Path::new("/tmp/groundcrew_borrows")),
+            "groundcrew-borrows"
+        );
+        assert_eq!(slug_of(Path::new("/tmp/foo--bar--")), "foo-bar");
+        assert_eq!(slug_of(Path::new("/")), "");
+    }
+}
