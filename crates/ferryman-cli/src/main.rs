@@ -2292,6 +2292,7 @@ fn loadmem(
 
     let bank = find_memory_bank(&start, route.as_ref());
     let log = find_durable_log(&start, &slug, route.as_ref());
+    let confidence = confidence_by_agent(route.as_ref());
 
     // Refresh the derived roster so anyone reading roster.md sees the current
     // profiles. Best-effort: it is a view, not the source of truth.
@@ -2318,7 +2319,7 @@ fn loadmem(
 
     // List mode: just the chooser, no shared memory.
     if list_agents {
-        if !print_agent_list(bank.as_deref()) {
+        if !print_agent_list(bank.as_deref(), &confidence) {
             println!("no agent profiles yet. Create one with:");
             println!("  ferry loadmem --agent <name> --record \"<what this agent is good at>\"");
         }
@@ -2378,7 +2379,7 @@ fn loadmem(
     // which one to load.
     match &agent {
         Some(name) => printed |= print_one_agent(bank.as_deref(), name),
-        None => printed |= choose_agent(bank.as_deref()),
+        None => printed |= choose_agent(bank.as_deref(), &confidence),
     }
 
     if !printed {
@@ -2438,6 +2439,25 @@ fn find_durable_log(
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// Measured confidence per agent name, keyed by the slugified engine name from
+/// the learnings. Best-effort: the learnings record the engine *command* for most
+/// results, so only an agent whose recorded engine matches its own name gets a
+/// score; everyone else is shown no score rather than a guess.
+fn confidence_by_agent(
+    route: Option<&ferryman_channel::ProjectRoute>,
+) -> std::collections::BTreeMap<String, String> {
+    let Some(route) = route else {
+        return Default::default();
+    };
+    let Ok(stats) = ferryman_channel::learning::engine_stats(route) else {
+        return Default::default();
+    };
+    stats
+        .into_iter()
+        .map(|s| (ferryman_channel::memory::slugify(&s.engine), s.describe()))
+        .collect()
+}
+
 fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     println!("{heading}");
@@ -2492,9 +2512,12 @@ fn print_one_agent(bank: Option<&std::path::Path>, agent: &str) -> bool {
     }
 }
 
-/// Print the chooser: every agent that has a profile, with a one-line summary.
-/// Returns true when at least one profile exists.
-fn print_agent_list(bank: Option<&std::path::Path>) -> bool {
+/// Print the chooser: every agent that has a profile, with a one-line summary and
+/// (when measured) its confidence. Returns true when at least one profile exists.
+fn print_agent_list(
+    bank: Option<&std::path::Path>,
+    confidence: &std::collections::BTreeMap<String, String>,
+) -> bool {
     let Some(bank) = bank else {
         return false;
     };
@@ -2505,10 +2528,14 @@ fn print_agent_list(bank: Option<&std::path::Path>) -> bool {
     println!("## Agents with memory (load one with --agent <name>)");
     println!();
     for (agent, summary) in &profiles {
+        let conf = confidence
+            .get(agent)
+            .map(|c| format!("  [{c}]"))
+            .unwrap_or_default();
         if summary.is_empty() {
-            println!("  {agent}");
+            println!("  {agent}{conf}");
         } else {
-            println!("  {agent:<16} {summary}");
+            println!("  {agent:<16} {summary}{conf}");
         }
     }
     println!();
@@ -2518,7 +2545,10 @@ fn print_agent_list(bank: Option<&std::path::Path>) -> bool {
 /// The interactive chooser: list every agent that has memory, then — on a
 /// terminal — ask which one to load. A piped or headless caller just gets the
 /// list and no prompt. Returns true when at least one profile was listed.
-fn choose_agent(bank: Option<&std::path::Path>) -> bool {
+fn choose_agent(
+    bank: Option<&std::path::Path>,
+    confidence: &std::collections::BTreeMap<String, String>,
+) -> bool {
     let Some(bank) = bank else {
         return false;
     };
@@ -2529,10 +2559,14 @@ fn choose_agent(bank: Option<&std::path::Path>) -> bool {
     println!("## Agents with memory");
     println!();
     for (index, (agent, summary)) in profiles.iter().enumerate() {
+        let conf = confidence
+            .get(agent)
+            .map(|c| format!("  [{c}]"))
+            .unwrap_or_default();
         if summary.is_empty() {
-            println!("  {}  {agent}", index + 1);
+            println!("  {}  {agent}{conf}", index + 1);
         } else {
-            println!("  {}  {agent:<16} {summary}", index + 1);
+            println!("  {}  {agent:<16} {summary}{conf}", index + 1);
         }
     }
     println!();
