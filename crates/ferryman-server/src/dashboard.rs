@@ -736,6 +736,7 @@ fn load_graph() -> Option<Value> {
                 .iter()
                 .map(|node| {
                     json!({
+                        "id": node.get("id").and_then(Value::as_str).unwrap_or(""),
                         "label": node.get("label").and_then(Value::as_str).unwrap_or(""),
                         "type": node.get("type").and_then(Value::as_str).unwrap_or(""),
                         "community": node.get("community"),
@@ -750,8 +751,18 @@ fn load_graph() -> Option<Value> {
     let links = value
         .get("links")
         .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+        .map(|links| {
+            links
+                .iter()
+                .map(|link| {
+                    json!({
+                        "source": link.get("source").and_then(Value::as_str).unwrap_or(""),
+                        "target": link.get("target").and_then(Value::as_str).unwrap_or(""),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     Some(json!({ "nodes": nodes, "links": links }))
 }
 
