@@ -64,6 +64,18 @@ pub fn list_agent_profiles(bank: &Path) -> Vec<(String, String)> {
     out
 }
 
+/// Like [`list_agent_profiles`], minus one agent: the roster the agent is shown,
+/// so it knows who else is available and what they are practiced at, without
+/// re-reading its own profile as if it were a stranger's.
+#[must_use]
+pub fn list_peer_profiles(bank: &Path, self_agent: &str) -> Vec<(String, String)> {
+    let me = slugify(self_agent);
+    list_agent_profiles(bank)
+        .into_iter()
+        .filter(|(agent, _)| *agent != me)
+        .collect()
+}
+
 /// Lowercase and collapse non-alphanumerics to a single dash — the same slug
 /// rule the fleet protocol derives project slugs from directory names.
 #[must_use]
@@ -125,5 +137,21 @@ mod tests {
     fn a_missing_profile_is_none_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_agent_profile(dir.path(), "nobody").is_none());
+    }
+
+    #[test]
+    fn peer_profiles_exclude_the_agent_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = dir.path();
+        std::fs::create_dir_all(bank.join("agents")).unwrap();
+        std::fs::write(bank.join("agents/claw.md"), "Rust\n").unwrap();
+        std::fs::write(bank.join("agents/fang.md"), "SQL\n").unwrap();
+
+        let peers = list_peer_profiles(bank, "claw");
+        assert_eq!(peers, vec![("fang".to_string(), "SQL".to_string())]);
+        // The name is slugified before the comparison, so "My Agent" matches
+        // the on-disk `my-agent.md`.
+        let none = list_peer_profiles(bank, "fang");
+        assert_eq!(none, vec![("claw".to_string(), "Rust".to_string())]);
     }
 }

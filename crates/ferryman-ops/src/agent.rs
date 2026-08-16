@@ -863,6 +863,32 @@ fn profile_block(route: &ProjectRoute, agent: &str) -> String {
     }
 }
 
+/// The roster of the OTHER agents on this project, each with what they are
+/// practiced at, plus the instruction to say so when one of them is a better fit.
+/// This is what lets an agent hand work to a specialist instead of doing a worse
+/// job itself, and what lets the operator see the routing suggestion in a result.
+fn peer_roster_block(route: &ProjectRoute, agent: &str) -> String {
+    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    let peers = ferryman_channel::memory::list_peer_profiles(&bank, agent);
+    if peers.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Other agents on this project, and what they are practiced at:\n\n");
+    for (peer, summary) in &peers {
+        if summary.is_empty() {
+            out.push_str(&format!("- {peer}\n"));
+        } else {
+            out.push_str(&format!("- {peer} — {summary}\n"));
+        }
+    }
+    out.push_str(
+        "\nIf a task is squarely in one of these agents' listed specialty and outside \
+         yours, say so plainly in your result (for example: \"agent 'claw' is better \
+         suited to this than I am\") so the operator can route it there.\n\n",
+    );
+    out
+}
+
 /// The prompt for a first attempt or revision, without task-matched skills.
 /// Kept as the test-facing entry point; the worker uses
 /// [`work_prompt_with_skills`].
@@ -1210,7 +1236,11 @@ async fn do_work(
     // skills: what it has become good at, so an agent that sharpened itself on Rust
     // keeps its Rust memory instead of loading someone else's unrelated one.
     let profile_text = profile_block(route, &config.agent);
-    let mut prompt = work_prompt_with_skills(config, task, &format!("{profile_text}{skills_text}"));
+    // And the roster of the other agents, so it knows who else is available, what
+    // they are practiced at, and can say so when one of them is a better fit.
+    let roster_text = peer_roster_block(route, &config.agent);
+    let mut prompt =
+        work_prompt_with_skills(config, task, &format!("{profile_text}{roster_text}{skills_text}"));
     if let Some(note) = steer {
         prompt = format!(
             "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"

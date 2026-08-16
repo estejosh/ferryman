@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
@@ -2365,11 +2366,11 @@ fn loadmem(
         printed = true;
     }
 
-    // The agent layer: load one agent's specialization, or list them all so the
-    // operator can choose whose memory to load.
+    // The agent layer: load one agent's specialization, or list them all and ask
+    // which one to load.
     match &agent {
         Some(name) => printed |= print_one_agent(bank.as_deref(), name),
-        None => printed |= print_agent_list(bank.as_deref()),
+        None => printed |= choose_agent(bank.as_deref()),
     }
 
     if !printed {
@@ -2501,6 +2502,67 @@ fn print_agent_list(bank: Option<&std::path::Path>) -> bool {
         }
     }
     println!();
+    true
+}
+
+/// The interactive chooser: list every agent that has memory, then — on a
+/// terminal — ask which one to load. A piped or headless caller just gets the
+/// list and no prompt. Returns true when at least one profile was listed.
+fn choose_agent(bank: Option<&std::path::Path>) -> bool {
+    let Some(bank) = bank else {
+        return false;
+    };
+    let profiles = ferryman_channel::memory::list_agent_profiles(bank);
+    if profiles.is_empty() {
+        return false;
+    }
+    println!("## Agents with memory");
+    println!();
+    for (index, (agent, summary)) in profiles.iter().enumerate() {
+        if summary.is_empty() {
+            println!("  {}  {agent}", index + 1);
+        } else {
+            println!("  {}  {agent:<16} {summary}", index + 1);
+        }
+    }
+    println!();
+
+    // Only a terminal can answer; an agent reading this through a pipe just gets
+    // the list above and picks its own profile with --agent <name>.
+    if !std::io::stdin().is_terminal() {
+        return true;
+    }
+
+    use std::io::Write;
+    print!(
+        "load which agent? [1-{}, 'all', or enter to skip]: ",
+        profiles.len()
+    );
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return true;
+    }
+    let line = line.trim();
+    if line.is_empty() {
+        return true;
+    }
+    if line.eq_ignore_ascii_case("all") {
+        println!();
+        for (agent, _) in &profiles {
+            print_one_agent(Some(bank), agent);
+        }
+        return true;
+    }
+    let Ok(index) = line.parse::<usize>() else {
+        return true;
+    };
+    if index == 0 || index > profiles.len() {
+        return true;
+    }
+    let (agent, _) = &profiles[index - 1];
+    println!();
+    print_one_agent(Some(bank), agent);
     true
 }
 
