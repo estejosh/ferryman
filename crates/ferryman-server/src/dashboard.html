@@ -269,7 +269,7 @@ function renderGraphView(nodes,links){
   const edges=links.map(l=>[l.source,l.target]).filter(e=>byId[e[0]]&&byId[e[1]]);
   const comms={};nodes.forEach(n=>{(comms[n.community]=comms[n.community]||[]).push(n);});
   const cs=Object.keys(comms);
-  nodes.forEach(n=>{const ci=cs.indexOf(String(n.community));const mem=comms[n.community];const j=mem.indexOf(n);const ang=ci/cs.length*Math.PI*2+j/Math.max(mem.length,1)*1.2;const r=Math.min(W,H)*0.46;n.x=W/2+Math.cos(ang)*r;n.y=H/2+Math.sin(ang)*r;});
+  nodes.forEach(n=>{const ci=cs.indexOf(String(n.community));const mem=comms[n.community];const j=mem.indexOf(n);const ang=ci/cs.length*Math.PI*2+j/Math.max(mem.length,1)*1.2;const rx=W*0.46,ry=H*0.46;n.x=W/2+Math.cos(ang)*rx;n.y=H/2+Math.sin(ang)*ry;});
   const k=Math.sqrt(W*H/nodes.length)*2.4;let temp=W/8;
   for(let it=0;it<420;it++){
     const disp={};nodes.forEach(n=>disp[n.id]={x:0,y:0});
