@@ -12,6 +12,13 @@ description = "Ferryman in the system tray: what it is doing, and a switch to st
 # member would mean `cargo build --workspace` failing on the machines that matter most,
 # to build a tray nobody there can see.
 
+# Known advisory, accepted risk: the Linux menu backend (tray-icon -> muda ->
+# libappindicator -> gtk 0.18 -> glib 0.18.5) carries GHSA-wrw7-89jp-8q8g, an
+# unsoundness in glib::VariantStrIter. There is no patched release: gtk-rs 0.18
+# (gtk3) is frozen at glib 0.18, and the fix (glib 0.20) requires the gtk4 stack,
+# which libappindicator does not support. The tray never exercises VariantStrIter.
+# The real fix is rewriting the Linux menu on gtk4 — tracked, not scheduled.
+
 [dependencies]
 anyhow = "1.0"
 ferryman-channel = { path = "../ferryman-channel" }
