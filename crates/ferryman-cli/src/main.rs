@@ -3141,15 +3141,9 @@ fn channel(command: Channel) -> Result<()> {
             if stats.is_empty() {
                 println!("nothing learned yet; reviews and 'ferry bench' record outcomes here");
             } else {
-                println!("  {:<16} {:>6} {:>8}  total", "engine", "kept", "rate");
+                println!("  {:<16} {:>6}  confidence", "engine", "total");
                 for s in &stats {
-                    println!(
-                        "  {:<16} {:>6} {:>7.0}%  {}",
-                        s.engine,
-                        s.accepted,
-                        s.rate() * 100.0,
-                        s.total
-                    );
+                    println!("  {:<16} {:>6}  {}", s.engine, s.total, s.describe());
                 }
             }
         }

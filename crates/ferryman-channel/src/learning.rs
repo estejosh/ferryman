@@ -56,6 +56,32 @@ impl EngineStats {
             self.accepted as f64 / self.total as f64
         }
     }
+
+    /// Confidence in [0, 1] that this engine does good work: the observed
+    /// acceptance rate pulled toward 0.5 by a two-sample prior, so a single
+    /// accepted result is not mistaken for certainty and one rejected result is
+    /// not mistaken for doom. The more samples, the more the rate is believed.
+    #[must_use]
+    pub fn confidence(&self) -> f64 {
+        (self.accepted as f64 + 1.0) / (self.total as f64 + 2.0)
+    }
+
+    /// A short natural-language verdict, e.g. "high confidence (14/15 accepted)".
+    /// The count is included because confidence is only as meaningful as the
+    /// number of samples behind it.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        if self.total == 0 {
+            return "no data yet".to_string();
+        }
+        let band = match self.confidence() {
+            c if c >= 0.85 => "high confidence",
+            c if c >= 0.70 => "moderate confidence",
+            c if c >= 0.55 => "low confidence",
+            _ => "mostly rejected",
+        };
+        format!("{band} ({}/{} accepted)", self.accepted, self.total)
+    }
 }
 
 fn learnings_path(route: &ProjectRoute) -> PathBuf {
@@ -209,5 +235,58 @@ mod tests {
         std::fs::write(route.communications.join("learnings.jsonl"), "{not json}\n").unwrap();
         record_learning(&route, &learning("claude", true)).unwrap();
         assert_eq!(read_learnings(&route).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn confidence_is_rate_pulled_toward_a_prior() {
+        // No data: the honest answer is 50/50, not "perfect" or "useless".
+        assert!(
+            (EngineStats {
+                engine: "x".into(),
+                total: 0,
+                accepted: 0,
+            }
+            .confidence()
+                - 0.5)
+                .abs()
+                < f64::EPSILON
+        );
+        // One accepted sample is promising but not certain.
+        let one = EngineStats {
+            engine: "x".into(),
+            total: 1,
+            accepted: 1,
+        };
+        assert!((one.confidence() - 2.0 / 3.0).abs() < f64::EPSILON);
+        // Lots of accepted work converges toward certainty.
+        let many = EngineStats {
+            engine: "x".into(),
+            total: 15,
+            accepted: 14,
+        };
+        assert!((many.confidence() - 15.0 / 17.0).abs() < f64::EPSILON);
+        assert!(many.confidence() > 0.85);
+    }
+
+    #[test]
+    fn describe_is_natural_language_with_the_counts() {
+        let none = EngineStats {
+            engine: "x".into(),
+            total: 0,
+            accepted: 0,
+        };
+        assert_eq!(none.describe(), "no data yet");
+        let good = EngineStats {
+            engine: "x".into(),
+            total: 15,
+            accepted: 14,
+        };
+        assert_eq!(good.describe(), "high confidence (14/15 accepted)");
+        let bad = EngineStats {
+            engine: "x".into(),
+            total: 6,
+            accepted: 1,
+        };
+        assert_eq!(bad.describe(), "mostly rejected (1/6 accepted)");
     }
 }
