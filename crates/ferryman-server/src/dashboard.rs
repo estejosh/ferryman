@@ -216,6 +216,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/roster", get(roster))
         .route("/api/fleet", get(fleet))
         .route("/api/memory", get(memory))
+        .route("/api/memory/suggest", post(suggest))
         .layer(axum::middleware::from_fn(loopback_host_guard))
         .with_state(state)
 }
@@ -580,6 +581,49 @@ async fn roster(
         })
         .collect();
     Ok(Json(items))
+}
+
+/// POST /api/memory/suggest — record a human suggestion for improving the
+/// project's memory. Appended to the synced memory bank so the whole fleet can
+/// read it and fold it into the knowledge graph.
+#[derive(Deserialize)]
+struct Suggestion {
+    text: String,
+}
+
+async fn suggest(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<Suggestion>,
+) -> Result<StatusCode, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "suggestion is empty".to_string()));
+    }
+    let author = state
+        .sessions
+        .resolve(session_token(&headers))
+        .map(|identity| identity.name().to_string())
+        .unwrap_or_else(|| "operator".to_string());
+    let entry = format!(
+        "\n## {}\n_by {}_\n\n{}\n",
+        chrono::Utc::now().to_rfc3339(),
+        author,
+        text
+    );
+    let dir = state.route.communications.join("memory-bank");
+    std::fs::create_dir_all(&dir).map_err(|e| internal(e.into()))?;
+    let path = dir.join("suggestions.md");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| internal(e.into()))?;
+    std::io::Write::write_all(&mut file, entry.as_bytes()).map_err(|e| internal(e.into()))?;
+    Ok(StatusCode::CREATED)
 }
 
 /// A short, still-identifiable prefix of a public key for display.
