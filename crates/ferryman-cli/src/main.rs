@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 mod license;
+mod mcp;
 
 use ferryman_ops::Progress;
 use ferryman_ops::agent;
@@ -244,6 +245,15 @@ enum Command {
         /// an agent that gets better at a task keeps that sharpened memory.
         #[arg(long)]
         record: Option<String>,
+    },
+    /// Serve this project over MCP (Model Context Protocol) on stdio, exposing
+    /// the channel's query surface — tasks, memory, roster, ledger, learnings,
+    /// skills — as tools an MCP client (Claude Desktop, Codex, Claude Code) can
+    /// call. Read-only: an MCP connection is a stranger, not the operator.
+    Mcp {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
 }
 #[derive(Subcommand, Clone)]
@@ -1319,6 +1329,7 @@ async fn main() -> Result<()> {
             list_agents,
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
+        Command::Mcp { workspace } => mcp::serve(workspace)?,
         Command::Communications { command } => match command {
             Communications::Send {
                 project,
