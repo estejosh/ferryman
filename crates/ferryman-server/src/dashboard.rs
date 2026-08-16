@@ -218,7 +218,6 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/memory", get(memory))
         .route("/api/memory/suggest", post(suggest))
         .route("/api/cost/rates", get(cost_rates))
-        .route("/api/cost/estimate", post(cost_estimate))
         .route("/api/cost/plan", post(cost_plan))
         .layer(axum::middleware::from_fn(loopback_host_guard))
         .with_state(state)
@@ -520,44 +519,6 @@ async fn cost_rates() -> Result<Json<Value>, DashboardError> {
                 })
             })
             .collect::<Vec<_>>(),
-    })))
-}
-
-/// POST /api/cost/estimate — price one prompt against one engine. A rough
-/// estimate (about four characters per input token), not a vendor's exact count.
-#[derive(Deserialize)]
-struct EstimateBody {
-    engine: String,
-    prompt: String,
-    #[serde(default = "default_output_tokens")]
-    output_tokens: u64,
-}
-
-fn default_output_tokens() -> u64 {
-    500
-}
-
-async fn cost_estimate(
-    State(state): State<DashboardState>,
-    Json(body): Json<EstimateBody>,
-) -> Result<Json<Value>, DashboardError> {
-    let engine = body.engine.trim();
-    if engine.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "engine is empty".to_string()));
-    }
-    let rates = ferryman_channel::cost::Rates::load(state.route.as_ref());
-    let input_tokens = ferryman_channel::cost::estimate_tokens(&body.prompt);
-    let estimated_cost_usd = ferryman_channel::cost::estimate_prompt_cost(
-        &rates,
-        engine,
-        &body.prompt,
-        body.output_tokens,
-    );
-    Ok(Json(json!({
-        "engine": engine,
-        "input_tokens": input_tokens,
-        "output_tokens": body.output_tokens,
-        "estimated_cost_usd": estimated_cost_usd,
     })))
 }
 

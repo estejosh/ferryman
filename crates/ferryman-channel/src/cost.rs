@@ -145,25 +145,6 @@ fn estimate_cost(rates: &Rates, engine: &str, prompt_tokens: u64, completion_tok
         / 1_000_000.0
 }
 
-/// Rough token count: about four characters per token for English prose. Good
-/// enough to size a project before the first call; not a substitute for a
-/// vendor's exact count.
-#[must_use]
-pub fn estimate_tokens(text: &str) -> u64 {
-    text.chars().count().div_ceil(4) as u64
-}
-
-/// Estimate the cost of sending one prompt to one engine: input tokens at the
-/// engine's prompt price, plus `output_tokens` at its completion price.
-#[must_use]
-pub fn estimate_prompt_cost(rates: &Rates, engine: &str, prompt: &str, output_tokens: u64) -> f64 {
-    let input_tokens = estimate_tokens(prompt);
-    let price = rates.price_for(engine);
-    (input_tokens as f64 * price.prompt_per_million
-        + output_tokens as f64 * price.completion_per_million)
-        / 1_000_000.0
-}
-
 /// Feature keywords that each suggest one more work item, for a rough project
 /// scope estimate from a natural-language description.
 const FEATURE_SIGNALS: &[&str] = &[
@@ -574,28 +555,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let route = route(dir.path());
         assert!(engine_costs(&route).unwrap().is_empty());
-    }
-
-    #[test]
-    fn token_estimate_is_about_four_chars_per_token() {
-        assert_eq!(estimate_tokens(""), 0);
-        assert_eq!(estimate_tokens("abcd"), 1);
-        assert_eq!(estimate_tokens("hello world"), 3);
-        assert_eq!(estimate_tokens(&"a".repeat(100)), 25);
-    }
-
-    #[test]
-    fn prompt_cost_uses_prompt_and_completion_prices() {
-        // deepseek: $0.27/M prompt, $1.10/M completion. 400 chars = 100 input
-        // tokens, plus 1000 output tokens -> (27 + 1100) / 1e6 dollars.
-        let cost = estimate_prompt_cost(&Rates::defaults(), "deepseek", &"a".repeat(400), 1000);
-        assert!((cost - 0.001127).abs() < 1e-12);
-        // Unknown engines fall back to the default ($3 / $15).
-        let unknown = estimate_prompt_cost(&Rates::defaults(), "mystery-engine", "hello", 0);
-        assert!(
-            (unknown - estimate_prompt_cost(&Rates::defaults(), "claude", "hello", 0)).abs()
-                < 1e-12
-        );
     }
 
     #[test]

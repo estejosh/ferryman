@@ -966,24 +966,6 @@ enum Agents {
 enum Cost {
     /// The published per-engine price table, dollars per million tokens.
     Rates,
-    /// Estimate the cost of sending one prompt to one engine.
-    Estimate {
-        /// The engine/CLI name, e.g. claude, deepseek, gpt-4o.
-        #[arg(long)]
-        engine: String,
-        /// The prompt text. Read from --prompt-file or stdin when omitted.
-        #[arg(long)]
-        prompt: Option<String>,
-        /// Read the prompt from a file instead of --prompt.
-        #[arg(long)]
-        prompt_file: Option<PathBuf>,
-        /// Expected completion (output) tokens. Defaults to 500.
-        #[arg(long, default_value_t = 500)]
-        output_tokens: u64,
-        /// Load per-engine rates from this project's rates.toml (built-in defaults otherwise).
-        #[arg(long)]
-        workspace: Option<PathBuf>,
-    },
     /// Estimate a whole project's cost: describe the project in your own words,
     /// and the estimator models the work items and prices them against every
     /// engine. An estimate, not a bid.
@@ -2689,39 +2671,7 @@ fn cost_command(command: Cost) -> Result<()> {
             }
             println!();
             println!("  list prices, dollars per million tokens; unknown engines fall back");
-            println!("  to the default row. `ferry cost estimate` prices a single prompt.");
-        }
-        Cost::Estimate {
-            engine,
-            prompt,
-            prompt_file,
-            output_tokens,
-            workspace,
-        } => {
-            let prompt = resolve_prompt(prompt, prompt_file)?;
-            let rates = match workspace {
-                Some(path) => {
-                    let route = ferryman_channel::route_for(&path)?;
-                    ferryman_channel::cost::Rates::load(&route)
-                }
-                None => ferryman_channel::cost::Rates::defaults(),
-            };
-            let input_tokens = ferryman_channel::cost::estimate_tokens(&prompt);
-            let cost = ferryman_channel::cost::estimate_prompt_cost(
-                &rates,
-                &engine,
-                &prompt,
-                output_tokens,
-            );
-            println!("engine      {engine}");
-            println!(
-                "input       ~{input_tokens} tokens ({} chars)",
-                prompt.chars().count()
-            );
-            println!("output      ~{output_tokens} tokens (assumed; --output-tokens to change)");
-            println!("estimated   ${cost:.4} for this one run");
-            println!();
-            println!("  multiply by the number of tasks/iterations to size a whole project.");
+            println!("  to the default row. `ferry cost plan` prices a whole project.");
         }
         Cost::Plan {
             prompt,
