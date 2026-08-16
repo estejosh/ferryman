@@ -642,6 +642,7 @@ async fn roster(
                 "name": agent.name,
                 "role": agent.role,
                 "capabilities": agent.capabilities,
+                "mcp": ferryman_channel::discovery::is_mcp(agent),
                 "key": agent.public_key.as_deref().map(fingerprint).unwrap_or_default(),
                 "engine": engine,
                 "last_active": last_active,

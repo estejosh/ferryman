@@ -72,6 +72,13 @@ pub fn list_peer_profiles(bank: &Path, self_agent: &str) -> Vec<(String, String)
         .collect()
 }
 
+/// One agent's specialization summary — its profile's first line, capped to a
+/// single short line — for discovery views that need the whole fleet at a glance.
+#[must_use]
+pub fn agent_summary(bank: &Path, agent: &str) -> Option<String> {
+    load_agent_profile(bank, agent).map(|profile| summarize(&summary_of(&profile)))
+}
+
 /// Significant words, for keyword overlap — the same shape the skills router
 /// uses, so "creating" matches "create".
 fn words(text: &str) -> Vec<String> {

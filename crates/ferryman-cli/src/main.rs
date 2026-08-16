@@ -396,6 +396,10 @@ enum Channel {
         /// Comma-separated, e.g. "messages.receive,code".
         #[arg(long, default_value = "messages.receive")]
         capabilities: String,
+        /// Mark this agent as the fleet's MCP gateway. Only one agent should
+        /// carry this; a second one is reported as a conflict.
+        #[arg(long)]
+        mcp: bool,
     },
     /// Reserve a name for an agent that has not come online yet, so messages can
     /// be addressed to it (and queued) before its device syncs. When the real
@@ -411,11 +415,19 @@ enum Channel {
         /// Comma-separated capabilities, e.g. "messages.receive".
         #[arg(long, default_value = "messages.receive")]
         capabilities: String,
+        /// Mark this agent as the fleet's MCP gateway. Only one agent should
+        /// carry this; a second one is reported as a conflict.
+        #[arg(long)]
+        mcp: bool,
     },
     /// Who is taking part in this channel.
     Agents {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Emit the machine-readable discovery manifest (JSON) instead of the
+        /// human list: agents, their specializations, skills, and the MCP agent.
+        #[arg(long)]
+        json: bool,
     },
     /// Issue work into the channel. Addressed to a machine, or open to anyone.
     Order {
@@ -2842,17 +2854,28 @@ fn channel(command: Channel) -> Result<()> {
             name,
             role,
             capabilities,
+            mcp,
         } => {
             let route = here(workspace)?;
             let agent = ferryman_channel::AgentRoute {
                 name: ferryman_ops::identity::resolve(name, &route.attachment)?,
                 role,
-                capabilities: capabilities
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(ToString::to_string)
-                    .collect(),
+                capabilities: {
+                    let mut caps: Vec<String> = capabilities
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .collect();
+                    if mcp
+                        && !caps
+                            .iter()
+                            .any(|c| c == ferryman_channel::discovery::MCP_CAPABILITY)
+                    {
+                        caps.push(ferryman_channel::discovery::MCP_CAPABILITY.to_string());
+                    }
+                    caps
+                },
                 public_key: None,
             };
             // The private key is created here and stays in the attachment, which is
@@ -2875,14 +2898,22 @@ fn channel(command: Channel) -> Result<()> {
             name,
             role,
             capabilities,
+            mcp,
         } => {
             let route = here(workspace)?;
-            let capabilities: Vec<String> = capabilities
+            let mut capabilities: Vec<String> = capabilities
                 .split(',')
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
                 .collect();
+            if mcp
+                && !capabilities
+                    .iter()
+                    .any(|c| c == ferryman_channel::discovery::MCP_CAPABILITY)
+            {
+                capabilities.push(ferryman_channel::discovery::MCP_CAPABILITY.to_string());
+            }
             let path =
                 ferryman_channel::register_expected_agent(&route, &name, &role, &capabilities)?;
             println!("reserved '{name}' as {role}; it can now receive messages");
@@ -2890,18 +2921,43 @@ fn channel(command: Channel) -> Result<()> {
             println!("  when the real '{name}' registers, its key binds to this name");
         }
 
-        Channel::Agents { workspace } => {
+        Channel::Agents { workspace, json } => {
             let route = here(workspace)?;
-            if route.agents.is_empty() {
-                println!("no agents registered yet - run `ferry channel join`");
-            }
-            for agent in &route.agents {
-                println!(
-                    "  {:<20} role={:<12} {}",
-                    agent.name,
-                    agent.role,
-                    agent.capabilities.join(",")
-                );
+            if json {
+                let manifest = ferryman_channel::discovery::manifest(&route)?;
+                println!("{}", serde_json::to_string_pretty(&manifest)?);
+            } else {
+                if route.agents.is_empty() {
+                    println!("no agents registered yet - run `ferry channel join`");
+                }
+                let claimants = ferryman_channel::discovery::mcp_agents(&route);
+                if claimants.len() > 1 {
+                    eprintln!(
+                        "warning: {} agents claim the mcp capability ({}); '{}' is the effective MCP agent",
+                        claimants.len(),
+                        claimants
+                            .iter()
+                            .map(|a| a.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        ferryman_channel::discovery::mcp_agent(&route)
+                            .map(|a| a.name.as_str())
+                            .unwrap_or("")
+                    );
+                }
+                for agent in &route.agents {
+                    println!(
+                        "  {:<20} role={:<12} {}{}",
+                        agent.name,
+                        agent.role,
+                        if ferryman_channel::discovery::is_mcp(agent) {
+                            "mcp "
+                        } else {
+                            ""
+                        },
+                        agent.capabilities.join(",")
+                    );
+                }
             }
         }
 

@@ -15,6 +15,7 @@ use std::{
 pub mod contract;
 pub mod cost;
 pub mod credentials;
+pub mod discovery;
 pub mod encrypt;
 pub mod events;
 pub mod interrupt;
