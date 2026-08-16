@@ -251,7 +251,7 @@ function renderMemory(m){
   }
 }
 function commColor(c){const P=['#4f9cf9','#a371f7','#3fb950','#d29922','#f85149','#7c5cff','#39c5cf','#e8833a'];return P[(+c||0)%P.length];}
-let graphLayout=null,graphZoom=1;
+let graphLayout=null,graphZoom=1,graphPanX=0,graphPanY=0;
 function renderGraphView(nodes,links){
   const W=900,H=480;
   const byId={};nodes.forEach(n=>byId[n.id]=n);
@@ -270,12 +270,12 @@ function renderGraphView(nodes,links){
   let minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;nodes.forEach(n=>{minx=Math.min(minx,n.x);miny=Math.min(miny,n.y);maxx=Math.max(maxx,n.x);maxy=Math.max(maxy,n.y);});
   const bw=maxx-minx||1,bh=maxy-miny||1;const sc=Math.min((W-40)/bw,(H-40)/bh);
   nodes.forEach(n=>{n.x=(n.x-minx)*sc+20;n.y=(n.y-miny)*sc+20;});
-  graphLayout={nodes:nodes.slice(),edges:edges.slice(),W,H};graphZoom=1;drawGraph();
+  graphLayout={nodes:nodes.slice(),edges:edges.slice(),W,H};graphZoom=1;graphPanX=0;graphPanY=0;drawGraph();
 }
 function drawGraph(){
   const svg=document.getElementById('graph-canvas');if(!graphLayout)return;
   const byId={};graphLayout.nodes.forEach(n=>byId[n.id]=n);
-  let s='<g transform="translate('+(graphLayout.W/2)+' '+(graphLayout.H/2)+') scale('+graphZoom+') translate('+(-graphLayout.W/2)+' '+(-graphLayout.H/2)+')">';
+  let s='<g transform="translate('+graphPanX+' '+graphPanY+') translate('+(graphLayout.W/2)+' '+(graphLayout.H/2)+') scale('+graphZoom+') translate('+(-graphLayout.W/2)+' '+(-graphLayout.H/2)+')">';
   graphLayout.edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];s+='<line x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'" stroke="#54637c" stroke-width="1"/>';});
   graphLayout.nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/><text x="'+(n.x+6)+'" y="'+(n.y+3)+'" font-size="10" fill="#aeb9ca">'+esc(n.label)+'</text>';});
   s+='</g>';svg.innerHTML=s;
@@ -283,6 +283,17 @@ function drawGraph(){
   document.getElementById('zoomlabel').textContent=Math.round(graphZoom*100)+'%';
 }
 function graphZoomBy(f){graphZoom=Math.max(0.4,Math.min(3,graphZoom*f));drawGraph();}
+function svgPoint(svg,e){const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;const ctm=svg.getScreenCTM();if(!ctm)return{x:e.clientX,y:e.clientY};const p=pt.matrixTransform(ctm.inverse());return{x:p.x,y:p.y};}
+function attachGraphPan(){
+  const svg=document.getElementById('graph-canvas');
+  let dragging=false,sx=0,sy=0,px=0,py=0;
+  svg.style.cursor='grab';
+  svg.addEventListener('pointerdown',e=>{if(e.target.tagName==='circle')return;dragging=true;svg.setPointerCapture(e.pointerId);const p=svgPoint(svg,e);sx=p.x;sy=p.y;px=graphPanX;py=graphPanY;svg.style.cursor='grabbing';});
+  svg.addEventListener('pointermove',e=>{if(!dragging)return;const p=svgPoint(svg,e);graphPanX=px+(p.x-sx);graphPanY=py+(p.y-sy);drawGraph();});
+  const end=()=>{dragging=false;svg.style.cursor='grab';};
+  svg.addEventListener('pointerup',end);
+  svg.addEventListener('pointercancel',end);
+}
 function showGraphNodeById(id){const i=graphNodes.findIndex(n=>n.id===id);if(i>=0)showGraphNode(i);}
 function showGraphNode(i){
   const n=graphNodes[i];if(!n)return;
@@ -297,7 +308,7 @@ async function doAuth(){const n=document.getElementById('auth-name').value.trim(
 async function checkSession(){if(!session)return false;try{const r=await fetch('/api/auth/whoami',{headers:{'x-ferryman-dashboard-token':session}});if(!r.ok)return false;const d=await r.json();operator=d.name;return true;}catch(e){return false;}}
 function doSignout(){session=null;operator=null;sessionStorage.removeItem('ferry-dash-token');document.getElementById('signout').style.display='none';document.getElementById('who').textContent='';if(!window.__dash.readonly)showLogin(window.__dash.anyOperators?'login':'create');}
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('tab-'+b.dataset.tab).classList.add('active');});
-document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('back').onclick=()=>setProject(null);document.getElementById('zoomin').onclick=()=>graphZoomBy(1.3);document.getElementById('zoomout').onclick=()=>graphZoomBy(0.77);document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
+document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('back').onclick=()=>setProject(null);document.getElementById('zoomin').onclick=()=>graphZoomBy(1.3);document.getElementById('zoomout').onclick=()=>graphZoomBy(0.77);attachGraphPan();document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
 const onEnter=e=>{if(e.key==='Enter')doAuth();};document.getElementById('auth-name').addEventListener('keydown',onEnter);document.getElementById('auth-password').addEventListener('keydown',onEnter);
 document.getElementById('search').oninput=renderTasks;document.getElementById('statefilter').onchange=renderTasks;
 setInterval(()=>{if(document.getElementById('autorefresh').checked)refresh();},3000);
