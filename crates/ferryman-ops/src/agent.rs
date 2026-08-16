@@ -865,9 +865,10 @@ fn profile_block(route: &ProjectRoute, agent: &str) -> String {
 
 /// The roster of the OTHER agents on this project, each with what they are
 /// practiced at, plus the instruction to say so when one of them is a better fit.
-/// This is what lets an agent hand work to a specialist instead of doing a worse
-/// job itself, and what lets the operator see the routing suggestion in a result.
-fn peer_roster_block(route: &ProjectRoute, agent: &str) -> String {
+/// A deterministic routing hint is appended when the task matches a peer's
+/// specialty more than this agent's own, because a model's own judgement is the
+/// unreliable half — it would rather just do the work.
+fn peer_roster_block(route: &ProjectRoute, agent: &str, task: &str) -> String {
     let bank = ferryman_channel::memory::memory_bank_dir(route);
     let peers = ferryman_channel::memory::list_peer_profiles(&bank, agent);
     if peers.is_empty() {
@@ -883,11 +884,14 @@ fn peer_roster_block(route: &ProjectRoute, agent: &str) -> String {
         }
     }
     out.push_str(
-        "\nIf this task is squarely in one of these agents' listed specialty and outside \
-         yours, say so plainly — in your result, or in your review reasoning — so the \
-         operator can route it there (for example: \"agent 'claw' is better suited to \
-         this than I am\").\n\n",
+        "\nROUTING RULE: if this task is in one of these agents' listed specialty and not \
+         yours, say so at the start of your result — for example \"better suited to 'claw' \
+         (Rust)\" — then do your best anyway.\n",
     );
+    if let Some(hint) = ferryman_channel::memory::routing_hint(&bank, agent, task) {
+        out.push_str(&format!("\n{hint}\n"));
+    }
+    out.push('\n');
     out
 }
 
@@ -1258,9 +1262,16 @@ async fn do_work(
     // skills: what it has become good at, so an agent that sharpened itself on Rust
     // keeps its Rust memory instead of loading someone else's unrelated one.
     let profile_text = profile_block(route, &config.agent);
+    let task_text = task
+        .order
+        .payload
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| task.order.payload.to_string());
     // And the roster of the other agents, so it knows who else is available, what
     // they are practiced at, and can say so when one of them is a better fit.
-    let roster_text = peer_roster_block(route, &config.agent);
+    let roster_text = peer_roster_block(route, &config.agent, &task_text);
     let mut prompt = work_prompt_with_skills(
         config,
         task,
@@ -1414,7 +1425,14 @@ pub async fn review_once(
                 .collect();
         // The reviewer sees the same peer roster, so it too can flag when another
         // agent was better suited to the work it is judging.
-        let roster = peer_roster_block(route, &config.agent);
+        let task_text = task
+            .order
+            .payload
+            .get("task")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| task.order.payload.to_string());
+        let roster = peer_roster_block(route, &config.agent, &task_text);
         let run = run_agent(
             config,
             &route.workspace,

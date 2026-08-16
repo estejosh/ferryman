@@ -72,6 +72,59 @@ pub fn list_peer_profiles(bank: &Path, self_agent: &str) -> Vec<(String, String)
         .collect()
 }
 
+/// Significant words, for keyword overlap — the same shape the skills router
+/// uses, so "creating" matches "create".
+fn words(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|w| w.len() >= 4)
+        .collect()
+}
+
+/// A deterministic routing hint: when the task text overlaps a peer's
+/// specialization summary more than the agent's own, name that peer. This is the
+/// reliable half of routing — a model's own judgement is the unreliable half
+/// (it would rather just do the work), so we compute the match ourselves and
+/// tell the agent plainly.
+#[must_use]
+pub fn routing_hint(bank: &Path, self_agent: &str, task: &str) -> Option<String> {
+    let task_words = words(task);
+    if task_words.is_empty() {
+        return None;
+    }
+    let self_summary = load_agent_profile(bank, self_agent)
+        .map(|profile| summary_of(&profile))
+        .unwrap_or_default();
+    let hits = |summary: &str| {
+        let summary_words = words(summary);
+        task_words
+            .iter()
+            .filter(|w| {
+                summary_words.iter().any(|p| {
+                    p == *w
+                        || (p.len() >= 4
+                            && w.len() >= 4
+                            && (p.starts_with(w.as_str()) || w.starts_with(p.as_str())))
+                })
+            })
+            .count()
+    };
+    let self_hits = hits(&self_summary);
+    let mut best: Option<(String, usize)> = None;
+    for (peer, summary) in list_peer_profiles(bank, self_agent) {
+        let count = hits(&summary);
+        if count > self_hits && count > best.as_ref().map_or(0, |(_, b)| *b) {
+            best = Some((peer, count));
+        }
+    }
+    best.map(|(peer, _)| {
+        format!(
+            "This task appears to match '{peer}'s listed specialty more than your own. \
+             If it is outside yours, say so plainly so the operator can route it to '{peer}'."
+        )
+    })
+}
+
 /// Where the generated roster lives: one line per agent, beside the `agents/`
 /// profiles it summarises.
 #[must_use]
@@ -269,6 +322,36 @@ mod tests {
         let long = summarize(&"x".repeat(500));
         assert_eq!(long.chars().count(), 118); // 117 chars + ellipsis
         assert!(long.ends_with('…'));
+    }
+
+    #[test]
+    fn routing_hint_names_a_peer_when_the_task_matches_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let bank = dir.path();
+        std::fs::create_dir_all(bank.join("agents")).unwrap();
+        std::fs::write(
+            bank.join("agents/claw.md"),
+            "Rust: ownership, borrow checker, async\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bank.join("agents/fang.md"),
+            "SQL migrations and dashboard frontend\n",
+        )
+        .unwrap();
+
+        // A Rust task matches claw, not fang, so fang is pointed at claw.
+        let hint = routing_hint(
+            bank,
+            "fang",
+            "fix the rust borrow checker error in this function",
+        )
+        .unwrap();
+        assert!(hint.contains("claw"), "got: {hint}");
+        // A SQL task matches fang itself, so there is nothing to route away.
+        assert!(routing_hint(bank, "fang", "write a database migration for postgres").is_none());
+        // No significant task words -> no hint.
+        assert!(routing_hint(bank, "fang", "ok").is_none());
     }
 
     #[test]
