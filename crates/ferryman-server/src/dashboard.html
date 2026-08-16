@@ -269,13 +269,13 @@ function renderGraphView(nodes,links){
   const edges=links.map(l=>[l.source,l.target]).filter(e=>byId[e[0]]&&byId[e[1]]);
   const comms={};nodes.forEach(n=>{(comms[n.community]=comms[n.community]||[]).push(n);});
   const cs=Object.keys(comms);
-  nodes.forEach(n=>{const ci=cs.indexOf(String(n.community));const mem=comms[n.community];const j=mem.indexOf(n);const ang=ci/cs.length*Math.PI*2+j/Math.max(mem.length,1)*0.8;const r=Math.min(W,H)*0.38;n.x=W/2+Math.cos(ang)*r;n.y=H/2+Math.sin(ang)*r;});
-  const k=Math.sqrt(W*H/nodes.length);let temp=W/8;
-  for(let it=0;it<280;it++){
+  nodes.forEach(n=>{const ci=cs.indexOf(String(n.community));const mem=comms[n.community];const j=mem.indexOf(n);const ang=ci/cs.length*Math.PI*2+j/Math.max(mem.length,1)*1.2;const r=Math.min(W,H)*0.46;n.x=W/2+Math.cos(ang)*r;n.y=H/2+Math.sin(ang)*r;});
+  const k=Math.sqrt(W*H/nodes.length)*2.4;let temp=W/8;
+  for(let it=0;it<420;it++){
     const disp={};nodes.forEach(n=>disp[n.id]={x:0,y:0});
     for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){const a=nodes[i],b=nodes[j];let dx=a.x-b.x,dy=a.y-b.y;const d=Math.sqrt(dx*dx+dy*dy)||0.01;const f=k*k/d;dx/=d;dy/=d;disp[a.id].x+=dx*f;disp[a.id].y+=dy*f;disp[b.id].x-=dx*f;disp[b.id].y-=dy*f;}
     edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];let dx=b.x-a.x,dy=b.y-a.y;const d=Math.sqrt(dx*dx+dy*dy)||0.01;const f=d*d/k;dx/=d;dy/=d;disp[a.id].x+=dx*f;disp[a.id].y+=dy*f;disp[b.id].x-=dx*f;disp[b.id].y-=dy*f;});
-    nodes.forEach(n=>{const dd=disp[n.id];const dl=Math.sqrt(dd.x*dd.x+dd.y*dd.y)||1;const cap=Math.min(dl,temp);n.x+=dd.x/dl*cap;n.y+=dd.y/dl*cap;n.x+=(W/2-n.x)*0.01;n.y+=(H/2-n.y)*0.01;});
+    nodes.forEach(n=>{const dd=disp[n.id];const dl=Math.sqrt(dd.x*dd.x+dd.y*dd.y)||1;const cap=Math.min(dl,temp);n.x+=dd.x/dl*cap;n.y+=dd.y/dl*cap;n.x+=(W/2-n.x)*0.004;n.y+=(H/2-n.y)*0.004;});
     temp*=0.97;
   }
   let minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;nodes.forEach(n=>{minx=Math.min(minx,n.x);miny=Math.min(miny,n.y);maxx=Math.max(maxx,n.x);maxy=Math.max(maxy,n.y);});
