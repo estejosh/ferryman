@@ -984,6 +984,23 @@ enum Cost {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Estimate a whole project's cost: describe the project in your own words,
+    /// and the estimator models the work items and prices them against every
+    /// engine. An estimate, not a bid.
+    Plan {
+        /// The project description/goals.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read the description from a file instead of --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Override the estimated number of work items.
+        #[arg(long)]
+        tasks: Option<u64>,
+        /// Load per-engine rates from this project's rates.toml.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
     /// This project's recorded per-engine usage and cost, from trajectories and
     /// review outcomes.
     Project {
@@ -2705,6 +2722,45 @@ fn cost_command(command: Cost) -> Result<()> {
             println!("estimated   ${cost:.4} for this one run");
             println!();
             println!("  multiply by the number of tasks/iterations to size a whole project.");
+        }
+        Cost::Plan {
+            prompt,
+            prompt_file,
+            tasks,
+            workspace,
+        } => {
+            let prompt = resolve_prompt(prompt, prompt_file)?;
+            let (tasks, prompt_tokens, completion_tokens) =
+                ferryman_channel::cost::estimate_project_tokens(&prompt, tasks);
+            let rates = match &workspace {
+                Some(path) => {
+                    let route = ferryman_channel::route_for(path)?;
+                    ferryman_channel::cost::Rates::load(&route)
+                }
+                None => ferryman_channel::cost::Rates::defaults(),
+            };
+            println!("project scope  ~{tasks} tasks");
+            println!(
+                "               ~{prompt_tokens} prompt + ~{completion_tokens} completion tokens total \
+                 ({} + {} per task, ×{} revisions)",
+                ferryman_channel::cost::PROMPT_TOKENS_PER_TASK,
+                ferryman_channel::cost::COMPLETION_TOKENS_PER_TASK,
+                ferryman_channel::cost::REVISION_FACTOR
+            );
+            println!();
+            println!("  {:<22} {:>12}", "engine", "est. cost");
+            for (family, _, _) in ferryman_channel::cost::published_rates() {
+                let key = family.split_whitespace().next().unwrap_or(family);
+                let cost = ferryman_channel::cost::project_cost(
+                    &rates,
+                    key,
+                    prompt_tokens,
+                    completion_tokens,
+                );
+                println!("  {family:<22} ${cost:>11.2}");
+            }
+            println!();
+            println!("  an estimate, not a bid — recorded spend is in `ferry cost project`.");
         }
         Cost::Project { workspace } => {
             let start = match workspace {

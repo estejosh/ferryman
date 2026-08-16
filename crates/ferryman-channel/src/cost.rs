@@ -148,6 +148,86 @@ pub fn estimate_prompt_cost(rates: &Rates, engine: &str, prompt: &str, output_to
         / 1_000_000.0
 }
 
+/// Feature keywords that each suggest one more work item, for a rough project
+/// scope estimate from a natural-language description.
+const FEATURE_SIGNALS: &[&str] = &[
+    "auth",
+    "login",
+    "signup",
+    "database",
+    "api",
+    "endpoint",
+    "frontend",
+    "ui",
+    "dashboard",
+    "test",
+    "deploy",
+    "search",
+    "payment",
+    "email",
+    "notification",
+    "admin",
+    "report",
+    "integration",
+    "migration",
+    "queue",
+    "worker",
+    "mobile",
+    "desktop",
+    "cli",
+    "sync",
+    "import",
+    "export",
+    "cache",
+    "monitor",
+    "backup",
+];
+
+/// Tokens a single work item costs, before the revision factor. Rough defaults
+/// for a coding task: standing context plus the task in, code plus explanation out.
+pub const PROMPT_TOKENS_PER_TASK: u64 = 3000;
+pub const COMPLETION_TOKENS_PER_TASK: u64 = 2500;
+/// Some work gets sent back for revision; this multiplies the token totals.
+pub const REVISION_FACTOR: f64 = 1.5;
+
+/// A rough project-scope estimate: one base task, plus one per significant
+/// feature mentioned, scaled a little by description length. Deliberately a
+/// heuristic — the goal is "an idea of the cost", not a bid.
+#[must_use]
+pub fn estimate_task_count(description: &str) -> u64 {
+    let lower = description.to_ascii_lowercase();
+    let signals = FEATURE_SIGNALS
+        .iter()
+        .filter(|s| lower.contains(**s))
+        .count() as u64;
+    let length = (description.split_whitespace().count() as u64) / 40;
+    (1 + signals + length).clamp(1, 200)
+}
+
+/// Model a whole project as `tasks` work items: total prompt and completion
+/// tokens, with the revision factor applied. Returns `(tasks, prompt, completion)`.
+#[must_use]
+pub fn estimate_project_tokens(description: &str, tasks_hint: Option<u64>) -> (u64, u64, u64) {
+    let tasks = tasks_hint.unwrap_or_else(|| estimate_task_count(description));
+    let prompt = (tasks as f64 * PROMPT_TOKENS_PER_TASK as f64 * REVISION_FACTOR) as u64;
+    let completion = (tasks as f64 * COMPLETION_TOKENS_PER_TASK as f64 * REVISION_FACTOR) as u64;
+    (tasks, prompt, completion)
+}
+
+/// Total project cost for one engine, from the project's token totals.
+#[must_use]
+pub fn project_cost(
+    rates: &Rates,
+    engine: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> f64 {
+    let price = rates.price_for(engine);
+    (prompt_tokens as f64 * price.prompt_per_million
+        + completion_tokens as f64 * price.completion_per_million)
+        / 1_000_000.0
+}
+
 /// The published price families, for a `ferry cost rates` listing. Prices are per
 /// million tokens. Unknown engines fall back to the default family.
 #[must_use]
@@ -408,6 +488,40 @@ mod tests {
             (unknown - estimate_prompt_cost(&Rates::defaults(), "claude", "hello", 0)).abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn project_scope_grows_with_features_and_length() {
+        assert_eq!(estimate_task_count(""), 1);
+        assert_eq!(estimate_task_count("a tiny script"), 1);
+        // Feature keywords each add a task.
+        let features = estimate_task_count(
+            "a service with auth, login, an api, a database, tests, and a dashboard",
+        );
+        assert!(features >= 7, "got {features}");
+        // A long description adds tasks by length too.
+        let long = estimate_task_count(&"word ".repeat(200));
+        assert!(long >= 6, "got {long}");
+        // The estimate is clamped to a sane range.
+        let huge = estimate_task_count(&"auth api database ".repeat(500));
+        assert!(huge <= 200);
+    }
+
+    #[test]
+    fn project_tokens_scale_with_tasks_and_revisions() {
+        let (tasks, prompt, completion) = estimate_project_tokens("a simple tool", Some(10));
+        assert_eq!(tasks, 10);
+        assert_eq!(prompt, (10.0 * 3000.0 * 1.5) as u64);
+        assert_eq!(completion, (10.0 * 2500.0 * 1.5) as u64);
+    }
+
+    #[test]
+    fn project_cost_uses_both_prices() {
+        let rates = Rates::defaults();
+        // deepseek: $0.27/M prompt, $1.10/M completion.
+        let cost = project_cost(&rates, "deepseek", 45000, 37500);
+        // (45000*0.27 + 37500*1.10) / 1e6 = (12150 + 41250) / 1e6.
+        assert!((cost - 0.0534).abs() < 1e-9);
     }
 
     #[test]

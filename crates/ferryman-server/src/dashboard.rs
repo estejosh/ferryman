@@ -219,6 +219,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/memory/suggest", post(suggest))
         .route("/api/cost/rates", get(cost_rates))
         .route("/api/cost/estimate", post(cost_estimate))
+        .route("/api/cost/plan", post(cost_plan))
         .layer(axum::middleware::from_fn(loopback_host_guard))
         .with_state(state)
 }
@@ -557,6 +558,43 @@ async fn cost_estimate(
         "input_tokens": input_tokens,
         "output_tokens": body.output_tokens,
         "estimated_cost_usd": estimated_cost_usd,
+    })))
+}
+
+/// POST /api/cost/plan — model a whole project from a description and price it
+/// against every engine. An estimate, not a bid.
+#[derive(Deserialize)]
+struct PlanBody {
+    prompt: String,
+    #[serde(default)]
+    tasks: Option<u64>,
+}
+
+async fn cost_plan(
+    State(state): State<DashboardState>,
+    Json(body): Json<PlanBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let (tasks, prompt_tokens, completion_tokens) =
+        ferryman_channel::cost::estimate_project_tokens(&body.prompt, body.tasks);
+    let rates = ferryman_channel::cost::Rates::load(state.route.as_ref());
+    let costs = ferryman_channel::cost::published_rates()
+        .iter()
+        .map(|(family, _, _)| {
+            let key = family.split_whitespace().next().unwrap_or(family);
+            json!({
+                "family": family,
+                "key": key,
+                "estimated_cost_usd": ferryman_channel::cost::project_cost(
+                    &rates, key, prompt_tokens, completion_tokens
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "tasks": tasks,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "costs": costs,
     })))
 }
 
