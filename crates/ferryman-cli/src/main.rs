@@ -980,6 +980,9 @@ enum Cost {
         /// Expected completion (output) tokens. Defaults to 500.
         #[arg(long, default_value_t = 500)]
         output_tokens: u64,
+        /// Load per-engine rates from this project's rates.toml (built-in defaults otherwise).
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
     /// This project's recorded per-engine usage and cost, from trajectories and
     /// review outcomes.
@@ -2676,11 +2679,23 @@ fn cost_command(command: Cost) -> Result<()> {
             prompt,
             prompt_file,
             output_tokens,
+            workspace,
         } => {
             let prompt = resolve_prompt(prompt, prompt_file)?;
+            let rates = match workspace {
+                Some(path) => {
+                    let route = ferryman_channel::route_for(&path)?;
+                    ferryman_channel::cost::Rates::load(&route)
+                }
+                None => ferryman_channel::cost::Rates::defaults(),
+            };
             let input_tokens = ferryman_channel::cost::estimate_tokens(&prompt);
-            let cost =
-                ferryman_channel::cost::estimate_prompt_cost(&engine, &prompt, output_tokens);
+            let cost = ferryman_channel::cost::estimate_prompt_cost(
+                &rates,
+                &engine,
+                &prompt,
+                output_tokens,
+            );
             println!("engine      {engine}");
             println!(
                 "input       ~{input_tokens} tokens ({} chars)",

@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::Result;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::ProjectRoute;
@@ -29,35 +30,90 @@ pub struct EngineCost {
     pub estimated_cost_usd: f64,
 }
 
-/// Per-million-token list prices, looked up per engine by name. Published list
-/// prices rounded to two decimals, kept as a maintainable table rather than
-/// fetched from a vendor at runtime (the dashboard works offline). Unknown
-/// engines fall back to the defaults below.
-struct EnginePrice {
+/// Per-million-token list prices, looked up per engine by name. Unknown engines
+/// fall back to the defaults below.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EnginePrice {
+    pub prompt_per_million: f64,
+    pub completion_per_million: f64,
+}
+
+/// One engine-family override from a `rates.toml`. The name matches by
+/// substring, so `claude-sonnet-4-5` inherits the `claude` row.
+#[derive(Debug, Clone, Deserialize)]
+struct EngineRate {
+    name: String,
     prompt_per_million: f64,
     completion_per_million: f64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct RatesFile {
+    #[serde(default)]
+    engine: Vec<EngineRate>,
+}
+
+/// Editable per-engine rates: the built-in table, optionally overridden by a
+/// `rates.toml` beside the channel, so prices move without a rebuild. Matching
+/// is by name substring, first match wins — list specific names before families.
+#[derive(Debug, Clone, Default)]
+pub struct Rates {
+    overrides: Vec<EngineRate>,
 }
 
 /// Default list prices, per million tokens, for engines without a table entry.
 const DEFAULT_PROMPT_PER_MILLION: f64 = 3.0;
 const DEFAULT_COMPLETION_PER_MILLION: f64 = 15.0;
 
-/// Look up an engine's list price. Matching is by name substring so
-/// `claude-sonnet-4-5` and `deepseek-v4-pro` land in the right bucket, and a
-/// new model variant inherits its family's price without a table edit.
-fn price_for(engine: &str) -> EnginePrice {
-    let key = engine.to_ascii_lowercase();
-    let (prompt_per_million, completion_per_million) = match key.as_str() {
-        e if e.contains("claude") => (3.0, 15.0),
-        e if e.contains("deepseek") => (0.27, 1.10),
-        e if e.contains("gpt-4o-mini") => (0.15, 0.60),
-        e if e.contains("gpt-4o") || e.contains("gpt-4") => (2.50, 10.0),
-        e if e.contains("o1") || e.contains("o3") || e.contains("o4") => (15.0, 60.0),
-        _ => (DEFAULT_PROMPT_PER_MILLION, DEFAULT_COMPLETION_PER_MILLION),
-    };
-    EnginePrice {
-        prompt_per_million,
-        completion_per_million,
+impl Rates {
+    /// The built-in table with no file overrides.
+    #[must_use]
+    pub fn defaults() -> Self {
+        Self::default()
+    }
+
+    /// Load `rates.toml` from the channel, then the attachment. A missing or
+    /// malformed file falls back to the built-in table.
+    #[must_use]
+    pub fn load(route: &ProjectRoute) -> Self {
+        for dir in [&route.communications, &route.attachment] {
+            let path = dir.join("rates.toml");
+            if let Ok(text) = fs::read_to_string(&path)
+                && let Ok(file) = toml::from_str::<RatesFile>(&text)
+            {
+                return Self {
+                    overrides: file.engine,
+                };
+            }
+        }
+        Self::default()
+    }
+
+    /// The price for an engine, matching by name substring — file overrides
+    /// first (first match wins), then the built-in defaults.
+    #[must_use]
+    pub fn price_for(&self, engine: &str) -> EnginePrice {
+        let key = engine.to_ascii_lowercase();
+        for entry in &self.overrides {
+            if key.contains(&entry.name.to_ascii_lowercase()) {
+                return EnginePrice {
+                    prompt_per_million: entry.prompt_per_million,
+                    completion_per_million: entry.completion_per_million,
+                };
+            }
+        }
+        let (prompt_per_million, completion_per_million) = match key.as_str() {
+            e if e.contains("claude") => (3.0, 15.0),
+            e if e.contains("deepseek") => (0.27, 1.10),
+            e if e.contains("gpt-4o-mini") => (0.15, 0.60),
+            e if e.contains("gpt-4o") || e.contains("gpt-4") => (2.50, 10.0),
+            e if e.contains("o1") || e.contains("o3") || e.contains("o4") => (15.0, 60.0),
+            _ => (DEFAULT_PROMPT_PER_MILLION, DEFAULT_COMPLETION_PER_MILLION),
+        };
+        EnginePrice {
+            prompt_per_million,
+            completion_per_million,
+        }
     }
 }
 
@@ -66,8 +122,8 @@ fn trajectories_root(route: &ProjectRoute) -> PathBuf {
 }
 
 /// Estimate spend for one engine from its token counts and list price.
-fn estimate_cost(engine: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
-    let price = price_for(engine);
+fn estimate_cost(rates: &Rates, engine: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+    let price = rates.price_for(engine);
     (prompt_tokens as f64 * price.prompt_per_million
         + completion_tokens as f64 * price.completion_per_million)
         / 1_000_000.0
@@ -84,9 +140,9 @@ pub fn estimate_tokens(text: &str) -> u64 {
 /// Estimate the cost of sending one prompt to one engine: input tokens at the
 /// engine's prompt price, plus `output_tokens` at its completion price.
 #[must_use]
-pub fn estimate_prompt_cost(engine: &str, prompt: &str, output_tokens: u64) -> f64 {
+pub fn estimate_prompt_cost(rates: &Rates, engine: &str, prompt: &str, output_tokens: u64) -> f64 {
     let input_tokens = estimate_tokens(prompt);
-    let price = price_for(engine);
+    let price = rates.price_for(engine);
     (input_tokens as f64 * price.prompt_per_million
         + output_tokens as f64 * price.completion_per_million)
         / 1_000_000.0
@@ -212,9 +268,14 @@ pub fn engine_costs(route: &ProjectRoute) -> Result<Vec<EngineCost>> {
         entry.completion_tokens += usage_tokens(&value, "completion_tokens");
     }
 
+    let rates = Rates::load(route);
     for entry in costs.values_mut() {
-        entry.estimated_cost_usd =
-            estimate_cost(&entry.engine, entry.prompt_tokens, entry.completion_tokens);
+        entry.estimated_cost_usd = estimate_cost(
+            &rates,
+            &entry.engine,
+            entry.prompt_tokens,
+            entry.completion_tokens,
+        );
     }
 
     let mut costs: Vec<EngineCost> = costs.into_values().collect();
@@ -339,10 +400,33 @@ mod tests {
     fn prompt_cost_uses_prompt_and_completion_prices() {
         // deepseek: $0.27/M prompt, $1.10/M completion. 400 chars = 100 input
         // tokens, plus 1000 output tokens -> (27 + 1100) / 1e6 dollars.
-        let cost = estimate_prompt_cost("deepseek", &"a".repeat(400), 1000);
+        let cost = estimate_prompt_cost(&Rates::defaults(), "deepseek", &"a".repeat(400), 1000);
         assert!((cost - 0.001127).abs() < 1e-12);
         // Unknown engines fall back to the default ($3 / $15).
-        let unknown = estimate_prompt_cost("mystery-engine", "hello", 0);
-        assert!((unknown - estimate_prompt_cost("claude", "hello", 0)).abs() < 1e-12);
+        let unknown = estimate_prompt_cost(&Rates::defaults(), "mystery-engine", "hello", 0);
+        assert!(
+            (unknown - estimate_prompt_cost(&Rates::defaults(), "claude", "hello", 0)).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn rates_toml_overrides_the_built_in_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        std::fs::create_dir_all(&route.communications).unwrap();
+        std::fs::write(
+            route.communications.join("rates.toml"),
+            "[[engine]]\nname = \"mystery\"\nprompt_per_million = 7.5\ncompletion_per_million = 22.0\n",
+        )
+        .unwrap();
+        let rates = Rates::load(&route);
+        let price = rates.price_for("mystery-engine");
+        assert_eq!(price.prompt_per_million, 7.5);
+        assert_eq!(price.completion_per_million, 22.0);
+        // Unmatched names still hit the built-in defaults.
+        let default = rates.price_for("some-other");
+        assert_eq!(default.prompt_per_million, 3.0);
+        assert_eq!(default.completion_per_million, 15.0);
     }
 }

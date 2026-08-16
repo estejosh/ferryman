@@ -99,6 +99,11 @@ Two consequences worth caring about:
 - **Opt-in sandboxing.** Run each worker inside a fresh podman or docker
   container, with a network-egress policy (`net = none | open | <name>`) — one
   config line per project, at your direction.
+- **A project cost estimator.** `ferry cost` prices a prompt against published
+  per-engine list rates (editable in a `rates.toml` beside the channel, no
+  rebuild needed) and totals your *recorded* usage, so you can size a project's
+  spend before committing to it. It is an **estimate**, not a meter reading — a
+  token heuristic for sizing, real recorded tokens where the agent reports them.
 
 ## Two repositories, on purpose
 
