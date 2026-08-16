@@ -112,6 +112,31 @@ tr[data-pid]:hover td{color:var(--accent)}
 .graph-tip{position:absolute;z-index:6;max-width:340px;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:.7rem;box-shadow:0 10px 30px rgba(0,0,0,.55)}
 .graph-tip .tip-close{float:right;cursor:pointer;color:var(--dim);font-size:15px;line-height:1}
 .graph-tip pre{white-space:pre-wrap;word-break:break-word;font-size:12px;margin:.3rem 0 0;max-height:16rem;overflow:auto}
+/* ---- design polish ---- */
+html{scroll-behavior:smooth}
+body{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+button,.task-row,.graph-node,.kpi,.detail,tr[data-pid],tbody tr{transition:border-color .15s ease,background .15s ease,box-shadow .15s ease,transform .15s ease}
+button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.kpi:hover,.graph-node:hover{box-shadow:0 6px 20px rgba(0,0,0,.35)}
+.task-row:hover{transform:translateY(-1px);box-shadow:0 4px 14px rgba(0,0,0,.32)}
+.tab.active{animation:fadein .18s ease}
+@keyframes fadein{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.badge{background:rgba(139,149,167,.08)}
+.badge.ok{background:rgba(63,185,80,.1)}
+.badge.bad{background:rgba(248,81,73,.1)}
+.badge.warn{background:rgba(210,153,34,.1)}
+.badge.accent{background:rgba(79,156,249,.1)}
+.empty{font-size:13px}
+.empty::before{content:'—';display:block;font-size:20px;color:var(--dim);opacity:.45;margin-bottom:.4rem;font-weight:300}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:#2a3342;border-radius:6px;border:2px solid var(--bg)}
+::-webkit-scrollbar-thumb:hover{background:#38445c}
+::selection{background:rgba(79,156,249,.3)}
+.login-card{box-shadow:0 24px 70px rgba(0,0,0,.6)}
+.kpi .num{letter-spacing:-.5px}
+th{letter-spacing:.6px}
+button.primary{box-shadow:0 2px 8px rgba(79,156,249,.25)}
+button.primary:hover{box-shadow:0 3px 12px rgba(79,156,249,.35)}
 </style>
 </head>
 <body>
@@ -355,6 +380,7 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.que
 document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('suggest-submit').onclick=async()=>{const text=document.getElementById('suggest-text').value.trim(),status=document.getElementById('suggest-status');if(!text){status.textContent='type something first';return;}try{const r=await fetch('/api/memory/suggest',{method:'POST',headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},body:JSON.stringify({text})});if(r.ok){document.getElementById('suggest-text').value='';status.textContent='suggestion recorded';refresh();}else{status.textContent='failed: '+await r.text();}}catch(e){status.textContent='failed: '+e;}};document.getElementById('back').onclick=()=>setProject(null);document.getElementById('zoomin').onclick=()=>graphZoomBy(1.3);document.getElementById('zoomout').onclick=()=>graphZoomBy(0.77);document.getElementById('reset').onclick=resetGraph;document.getElementById('fontminus').onclick=()=>graphFontBy(-1);document.getElementById('fontplus').onclick=()=>graphFontBy(1);document.getElementById('fullscreen').onclick=()=>{const p=document.getElementById('graph-panel');document.fullscreenElement?document.exitFullscreen():p.requestFullscreen&&p.requestFullscreen();};document.getElementById('maximize').onclick=()=>{const p=document.getElementById('graph-panel');p.classList.toggle('maximized');document.getElementById('maximize').textContent=p.classList.contains('maximized')?'⤡':'⤢';};attachGraphPan();document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
 const onEnter=e=>{if(e.key==='Enter')doAuth();};document.getElementById('auth-name').addEventListener('keydown',onEnter);document.getElementById('auth-password').addEventListener('keydown',onEnter);
 document.getElementById('search').oninput=renderTasks;document.getElementById('statefilter').onchange=renderTasks;
+document.addEventListener('keydown',e=>{if(e.key==='/'&&!/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)){e.preventDefault();document.getElementById('search').focus();}});
 document.getElementById('cost-submit').onclick=async()=>{const prompt=document.getElementById('cost-prompt').value,st=document.getElementById('cost-status'),res=document.getElementById('cost-result');if(!prompt.trim()){st.textContent='describe the project first';res.innerHTML='';return;}try{const r=await fetch('/api/cost/plan',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({prompt})});const d=await r.json();if(r.ok){st.textContent='~'+d.tasks+' tasks · ~'+d.prompt_tokens+' prompt + ~'+d.completion_tokens+' completion tokens';res.innerHTML='<table><thead><tr><th>engine</th><th>est. project cost</th><th>quality</th></tr></thead><tbody>'+(d.costs||[]).map(c=>{const q=c.measured?(esc(c.quality_label)+' ('+(c.quality*100).toFixed(0)+' · '+c.accepted+'/'+c.total+' accepted)'):(esc(c.quality_label)+' ('+(c.quality*100).toFixed(0)+')');return '<tr><td>'+esc(c.family)+'</td><td>$'+c.estimated_cost_usd.toFixed(2)+'</td><td>'+q+'</td></tr>';}).join('')+'</tbody></table>';}else{st.textContent='failed: '+(d.error||r.status);}}catch(e){st.textContent='failed: '+e;}};
 setInterval(()=>{if(document.getElementById('autorefresh').checked)refresh();},3000);
 (async function init(){if(window.__dash.readonly){document.getElementById('signout').style.display='none';}else if(await checkSession()){document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}else{showLogin(window.__dash.anyOperators?'login':'create');}refresh();})();
