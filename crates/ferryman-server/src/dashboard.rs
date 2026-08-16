@@ -12,7 +12,7 @@ use std::{
 use anyhow::{Error, bail};
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Html,
     routing::{get, post},
@@ -57,6 +57,49 @@ impl DashboardState {
             create_rate: RateLimiter::new(10, Duration::from_secs(3600)),
         }
     }
+}
+
+impl DashboardState {
+    /// The project a request is about: the current project, or a discovered
+    /// sibling named by `project`. Lets one dashboard read every project.
+    fn route_for(&self, project: Option<&str>) -> Arc<ProjectRoute> {
+        match project.filter(|id| !id.is_empty() && *id != self.route.project_id) {
+            Some(id) => find_project_route(&self.route, id)
+                .map(Arc::new)
+                .unwrap_or_else(|| self.route.clone()),
+            None => self.route.clone(),
+        }
+    }
+}
+
+/// The query parameter that scopes a read to a particular project.
+#[derive(Deserialize)]
+struct ProjectParam {
+    project: Option<String>,
+}
+
+/// Find a sibling project's route by id, scanning the workspace's parent. The
+/// same discovery the Fleet tab uses, so a clickable project resolves to the
+/// same channel `route_for` would find.
+fn find_project_route(current: &ProjectRoute, id: &str) -> Option<ProjectRoute> {
+    let parent = current.workspace.parent()?;
+    if !parent.is_dir() {
+        return None;
+    }
+    for entry in std::fs::read_dir(parent).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if !entry.file_type().ok()?.is_dir() {
+            continue;
+        }
+        let Ok(route) = ferryman_channel::route_for(&path) else {
+            continue;
+        };
+        if route.project_id == id {
+            return Some(route);
+        }
+    }
+    None
 }
 
 /// In-memory operator sessions, keyed by a random bearer token. Idle sessions
@@ -343,8 +386,10 @@ async fn whoami(
 /// GET /api/tasks — a summary of every task, with signature status.
 async fn tasks(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Vec<Value>>, DashboardError> {
-    let tasks = ferryman_channel::list_tasks(&state.route).map_err(internal)?;
+    let route = state.route_for(params.project.as_deref());
+    let tasks = ferryman_channel::list_tasks(&route).map_err(internal)?;
     let items = tasks
         .iter()
         .map(|task| {
@@ -353,7 +398,7 @@ async fn tasks(
                 "state": state_value(&task.state()),
                 "holder": task.holder(),
                 "result_count": task.results.len(),
-                "sig": sig(&ferryman_channel::verify_order(&task.order, &state.route.agents)),
+                "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
                 "requires_review": task.order.requires_review,
                 "requires_approval": task.order.requires_approval,
                 "task": task.order.payload.get("task").and_then(Value::as_str).unwrap_or(""),
@@ -369,14 +414,16 @@ async fn tasks(
 async fn task_detail(
     State(state): State<DashboardState>,
     Path(id): Path<String>,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Value>, DashboardError> {
-    let task = ferryman_channel::read_task(&state.route, &id).map_err(internal)?;
+    let route = state.route_for(params.project.as_deref());
+    let task = ferryman_channel::read_task(&route, &id).map_err(internal)?;
     let results = task
         .results
         .iter()
         .map(|r| {
             let trajectory = ferryman_channel::trajectory::read_trajectory(
-                &state.route,
+                &route,
                 &task.order.id,
                 &r.agent,
                 r.revision,
@@ -386,7 +433,7 @@ async fn task_detail(
                 "agent": r.agent,
                 "engine": trajectory.as_ref().map(|t| t.engine.clone()),
                 "ok": trajectory.as_ref().map(|t| t.ok),
-                "sig": sig(&ferryman_channel::verify_result(r, &state.route.agents)),
+                "sig": sig(&ferryman_channel::verify_result(r, &route.agents)),
                 "output": result_text(&r.payload),
             })
         })
@@ -400,7 +447,7 @@ async fn task_detail(
                 "reviewer": r.reviewer,
                 "accepted": r.accepted,
                 "notes": r.notes,
-                "sig": sig(&ferryman_channel::verify_review(r, &state.route.agents)),
+                "sig": sig(&ferryman_channel::verify_review(r, &route.agents)),
             })
         })
         .collect::<Vec<_>>();
@@ -414,7 +461,7 @@ async fn task_detail(
             "requires_approval": task.order.requires_approval,
             "depends_on": task.order.depends_on,
             "payload": task.order.payload,
-            "sig": sig(&ferryman_channel::verify_order(&task.order, &state.route.agents)),
+            "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
         },
         "claims": task.claims.iter().map(|c| json!({ "agent": c.agent, "at": c.claimed_at.to_rfc3339() })).collect::<Vec<_>>(),
         "results": results,
@@ -426,9 +473,11 @@ async fn task_detail(
 /// GET /api/stats — engine acceptance plus cost, merged into one table.
 async fn stats(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Vec<Value>>, DashboardError> {
-    let acceptance = ferryman_channel::learning::engine_stats(&state.route).map_err(internal)?;
-    let costs = ferryman_channel::cost::engine_costs(&state.route).map_err(internal)?;
+    let route = state.route_for(params.project.as_deref());
+    let acceptance = ferryman_channel::learning::engine_stats(&route).map_err(internal)?;
+    let costs = ferryman_channel::cost::engine_costs(&route).map_err(internal)?;
     let items = acceptance
         .iter()
         .map(|stat| {
@@ -451,8 +500,10 @@ async fn stats(
 /// GET /api/ledger — the most recent ledger entries, newest first.
 async fn ledger(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Value>, DashboardError> {
-    let log = ferryman_channel::ledger::read_ledger(&state.route).map_err(internal)?;
+    let route = state.route_for(params.project.as_deref());
+    let log = ferryman_channel::ledger::read_ledger(&route).map_err(internal)?;
     let entries = log
         .entries
         .iter()
@@ -474,8 +525,10 @@ async fn ledger(
 /// GET /api/learnings — the most recent learning records, newest first.
 async fn learnings(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Vec<Value>>, DashboardError> {
-    let learnings = ferryman_channel::learning::read_learnings(&state.route).map_err(internal)?;
+    let route = state.route_for(params.project.as_deref());
+    let learnings = ferryman_channel::learning::read_learnings(&route).map_err(internal)?;
     let items = learnings
         .iter()
         .rev()
@@ -499,10 +552,11 @@ async fn learnings(
 /// columns is the point: a machine runs an engine, they are not the same thing.
 async fn roster(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Vec<Value>>, DashboardError> {
-    let agents =
-        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
-    let runs = ferryman_channel::trajectory::agent_runs(&state.route).map_err(internal)?;
+    let route = state.route_for(params.project.as_deref());
+    let agents = ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
+    let runs = ferryman_channel::trajectory::agent_runs(&route).map_err(internal)?;
     let items = agents
         .iter()
         .map(|agent| {
@@ -686,6 +740,8 @@ fn load_graph() -> Option<Value> {
                         "type": node.get("type").and_then(Value::as_str).unwrap_or(""),
                         "community": node.get("community"),
                         "summary": node.get("summary").and_then(Value::as_str).unwrap_or(""),
+                        "file": node.get("file").and_then(Value::as_str).unwrap_or(""),
+                        "file_type": node.get("file_type").and_then(Value::as_str).unwrap_or(""),
                     })
                 })
                 .collect::<Vec<_>>()
