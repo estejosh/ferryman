@@ -98,6 +98,9 @@ tbody tr:hover{background:var(--surface2)}
 .graph-node .mono{font-size:13px}
 tr[data-pid]{cursor:pointer}
 tr[data-pid]:hover td{color:var(--accent)}
+.graph-bar{display:flex;align-items:center;gap:.7rem}
+.graph-controls{margin-left:auto;display:flex;align-items:center;gap:.3rem}
+.graph-controls button{padding:.1rem .55rem;font-size:15px;line-height:1.4}
 </style>
 </head>
 <body>
@@ -161,8 +164,8 @@ tr[data-pid]:hover td{color:var(--accent)}
       <div class="detail" id="memory-content"><div class="muted">Select a memory file to read it.</div></div>
     </div>
     <div class="section-title">Knowledge graph</div>
-    <div id="graph-summary" class="muted"></div>
-    <svg id="graph-canvas" width="100%" height="480" style="background:var(--surface);border:1px solid var(--line);border-radius:10px;display:block"></svg>
+    <div class="graph-bar"><div id="graph-summary" class="muted"></div><div class="graph-controls"><button id="zoomin" title="zoom in">+</button><button id="zoomout" title="zoom out">−</button><span id="zoomlabel" class="muted"></span></div></div>
+    <svg id="graph-canvas" viewBox="0 0 900 480" preserveAspectRatio="xMidYMid meet" style="width:100%;height:480px;background:var(--surface);border:1px solid var(--line);border-radius:10px;display:block"></svg>
   </section>
 </main>
 <div id="login-overlay" style="display:none">
@@ -241,30 +244,45 @@ function renderMemory(m){
   if(g&&g.nodes&&g.nodes.length){
     graphNodes=g.nodes;
     document.getElementById('graph-summary').innerHTML='<b>'+g.nodes.length+'</b> nodes · <b>'+(g.links||[]).length+'</b> links — click a node for detail';
-    renderGraphView(g.nodes,g.links||[]);
+    if(!graphLayout||graphLayout.nodes.length!==g.nodes.length){renderGraphView(g.nodes,g.links||[]);}
   }else{
     document.getElementById('graph-summary').innerHTML='<span class="muted">No knowledge graph exported — set FERRYMAN_GRAPH_JSON or run graphify.</span>';
     document.getElementById('graph-canvas').innerHTML='';
   }
 }
 function commColor(c){const P=['#4f9cf9','#a371f7','#3fb950','#d29922','#f85149','#7c5cff','#39c5cf','#e8833a'];return P[(+c||0)%P.length];}
+let graphLayout=null,graphZoom=1;
 function renderGraphView(nodes,links){
-  const svg=document.getElementById('graph-canvas');const W=svg.clientWidth||900,H=480;svg.innerHTML='';
+  const W=900,H=480;
   const byId={};nodes.forEach(n=>byId[n.id]=n);
   const edges=links.map(l=>[l.source,l.target]).filter(e=>byId[e[0]]&&byId[e[1]]);
   const comms={};nodes.forEach(n=>{(comms[n.community]=comms[n.community]||[]).push(n);});
   const cs=Object.keys(comms);
-  nodes.forEach(n=>{const ci=cs.indexOf(String(n.community));const mem=comms[n.community];const j=mem.indexOf(n);const ang=ci/cs.length*Math.PI*2+j/Math.max(mem.length,1)*0.7;const r=120+(j%5)*16;n.x=W/2+Math.cos(ang)*r;n.y=H/2+Math.sin(ang)*r;});
-  for(let it=0;it<200;it++){
-    for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){const a=nodes[i],b=nodes[j];let dx=a.x-b.x,dy=a.y-b.y;const d2=dx*dx+dy*dy||0.01;if(d2<6400){const d=Math.sqrt(d2),f=(80-d)/d*0.05;dx/=d;dy/=d;a.x+=dx*f;a.y+=dy*f;b.x-=dx*f;b.y-=dy*f;}}
-    edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];const dx=b.x-a.x,dy=b.y-a.y;a.x+=dx*0.012;a.y+=dy*0.012;b.x-=dx*0.012;b.y-=dy*0.012;});
-    nodes.forEach(n=>{n.x+=(W/2-n.x)*0.02;n.y+=(H/2-n.y)*0.02;});
+  nodes.forEach(n=>{const ci=cs.indexOf(String(n.community));const mem=comms[n.community];const j=mem.indexOf(n);const ang=ci/cs.length*Math.PI*2+j/Math.max(mem.length,1)*0.8;const r=Math.min(W,H)*0.38;n.x=W/2+Math.cos(ang)*r;n.y=H/2+Math.sin(ang)*r;});
+  const k=Math.sqrt(W*H/nodes.length);let temp=W/8;
+  for(let it=0;it<280;it++){
+    const disp={};nodes.forEach(n=>disp[n.id]={x:0,y:0});
+    for(let i=0;i<nodes.length;i++)for(let j=i+1;j<nodes.length;j++){const a=nodes[i],b=nodes[j];let dx=a.x-b.x,dy=a.y-b.y;const d=Math.sqrt(dx*dx+dy*dy)||0.01;const f=k*k/d;dx/=d;dy/=d;disp[a.id].x+=dx*f;disp[a.id].y+=dy*f;disp[b.id].x-=dx*f;disp[b.id].y-=dy*f;}
+    edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];let dx=b.x-a.x,dy=b.y-a.y;const d=Math.sqrt(dx*dx+dy*dy)||0.01;const f=d*d/k;dx/=d;dy/=d;disp[a.id].x+=dx*f;disp[a.id].y+=dy*f;disp[b.id].x-=dx*f;disp[b.id].y-=dy*f;});
+    nodes.forEach(n=>{const dd=disp[n.id];const dl=Math.sqrt(dd.x*dd.x+dd.y*dd.y)||1;const cap=Math.min(dl,temp);n.x+=dd.x/dl*cap;n.y+=dd.y/dl*cap;n.x+=(W/2-n.x)*0.01;n.y+=(H/2-n.y)*0.01;});
+    temp*=0.97;
   }
-  nodes.forEach(n=>{n.x=Math.max(16,Math.min(W-16,n.x));n.y=Math.max(16,Math.min(H-16,n.y));});
-  let s='';edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];s+='<line x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'" stroke="#263041" stroke-width="1"/>';});
-  nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/><text x="'+(n.x+6)+'" y="'+(n.y+3)+'" font-size="10" fill="#8b95a7">'+esc(n.label)+'</text>';});
-  svg.innerHTML=s;svg.querySelectorAll('circle').forEach(c=>c.onclick=()=>showGraphNodeById(c.dataset.id));
+  let minx=1e9,miny=1e9,maxx=-1e9,maxy=-1e9;nodes.forEach(n=>{minx=Math.min(minx,n.x);miny=Math.min(miny,n.y);maxx=Math.max(maxx,n.x);maxy=Math.max(maxy,n.y);});
+  const bw=maxx-minx||1,bh=maxy-miny||1;const sc=Math.min((W-40)/bw,(H-40)/bh);
+  nodes.forEach(n=>{n.x=(n.x-minx)*sc+20;n.y=(n.y-miny)*sc+20;});
+  graphLayout={nodes:nodes.slice(),edges:edges.slice(),W,H};graphZoom=1;drawGraph();
 }
+function drawGraph(){
+  const svg=document.getElementById('graph-canvas');if(!graphLayout)return;
+  const byId={};graphLayout.nodes.forEach(n=>byId[n.id]=n);
+  let s='<g transform="translate('+(graphLayout.W/2)+' '+(graphLayout.H/2)+') scale('+graphZoom+') translate('+(-graphLayout.W/2)+' '+(-graphLayout.H/2)+')">';
+  graphLayout.edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];s+='<line x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'" stroke="#54637c" stroke-width="1"/>';});
+  graphLayout.nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/><text x="'+(n.x+6)+'" y="'+(n.y+3)+'" font-size="10" fill="#aeb9ca">'+esc(n.label)+'</text>';});
+  s+='</g>';svg.innerHTML=s;
+  svg.querySelectorAll('circle').forEach(c=>c.onclick=()=>showGraphNodeById(c.dataset.id));
+  document.getElementById('zoomlabel').textContent=Math.round(graphZoom*100)+'%';
+}
+function graphZoomBy(f){graphZoom=Math.max(0.4,Math.min(3,graphZoom*f));drawGraph();}
 function showGraphNodeById(id){const i=graphNodes.findIndex(n=>n.id===id);if(i>=0)showGraphNode(i);}
 function showGraphNode(i){
   const n=graphNodes[i];if(!n)return;
@@ -279,7 +297,7 @@ async function doAuth(){const n=document.getElementById('auth-name').value.trim(
 async function checkSession(){if(!session)return false;try{const r=await fetch('/api/auth/whoami',{headers:{'x-ferryman-dashboard-token':session}});if(!r.ok)return false;const d=await r.json();operator=d.name;return true;}catch(e){return false;}}
 function doSignout(){session=null;operator=null;sessionStorage.removeItem('ferry-dash-token');document.getElementById('signout').style.display='none';document.getElementById('who').textContent='';if(!window.__dash.readonly)showLogin(window.__dash.anyOperators?'login':'create');}
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('tab-'+b.dataset.tab).classList.add('active');});
-document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('back').onclick=()=>setProject(null);document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
+document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('back').onclick=()=>setProject(null);document.getElementById('zoomin').onclick=()=>graphZoomBy(1.3);document.getElementById('zoomout').onclick=()=>graphZoomBy(0.77);document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
 const onEnter=e=>{if(e.key==='Enter')doAuth();};document.getElementById('auth-name').addEventListener('keydown',onEnter);document.getElementById('auth-password').addEventListener('keydown',onEnter);
 document.getElementById('search').oninput=renderTasks;document.getElementById('statefilter').onchange=renderTasks;
 setInterval(()=>{if(document.getElementById('autorefresh').checked)refresh();},3000);
