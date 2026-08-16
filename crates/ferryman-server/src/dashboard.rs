@@ -373,12 +373,19 @@ async fn task_detail(
         .results
         .iter()
         .map(|r| {
+            let trajectory = ferryman_channel::trajectory::read_trajectory(
+                &state.route,
+                &task.order.id,
+                &r.agent,
+                r.revision,
+            );
             json!({
                 "revision": r.revision,
                 "agent": r.agent,
+                "engine": trajectory.as_ref().map(|t| t.engine.clone()),
+                "ok": trajectory.as_ref().map(|t| t.ok),
                 "sig": sig(&ferryman_channel::verify_result(r, &state.route.agents)),
-                "output": r.payload.get("output").and_then(Value::as_str)
-                    .map(|s| s.chars().take(4000).collect::<String>()),
+                "output": result_text(&r.payload),
             })
         })
         .collect::<Vec<_>>();
@@ -527,6 +534,21 @@ fn fingerprint(key: &str) -> String {
     } else {
         short
     }
+}
+
+/// The human-readable content of a result payload: its `output` or `text` key,
+/// or the whole payload as JSON when neither is present. A result's payload is
+/// whatever the worker chose to put there, so this keeps the dashboard from
+/// showing "(no output)" for a result that simply used a different key.
+fn result_text(payload: &Value) -> Option<String> {
+    if let Some(text) = payload
+        .get("output")
+        .or_else(|| payload.get("text"))
+        .and_then(Value::as_str)
+    {
+        return Some(text.chars().take(4000).collect());
+    }
+    Some(serde_json::to_string_pretty(payload).unwrap_or_default())
 }
 
 #[derive(Deserialize)]

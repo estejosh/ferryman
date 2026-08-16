@@ -118,6 +118,24 @@ pub fn agent_runs(route: &ProjectRoute) -> Result<BTreeMap<String, AgentRuns>> {
     Ok(out)
 }
 
+/// Read the trajectory for one specific run, if it was recorded. The dashboard
+/// uses this to show which engine produced a given result, alongside the machine
+/// that ran it.
+pub fn read_trajectory(
+    route: &ProjectRoute,
+    order_id: &str,
+    agent: &str,
+    revision: u32,
+) -> Option<Trajectory> {
+    let path = route
+        .communications
+        .join("trajectories")
+        .join(order_id)
+        .join(format!("{agent}.{revision:03}.json"));
+    let text = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
