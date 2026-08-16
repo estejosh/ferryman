@@ -471,6 +471,70 @@ struct AgentRun {
     ok: bool,
 }
 
+/// The bind-mount argument for the container runner, computed per platform so
+/// the workspace mounts correctly everywhere.
+fn workspace_mount(workspace: &Path) -> String {
+    mount_arg(workspace, selinux_enforcing())
+}
+
+/// The pure form of [`workspace_mount`], so the flag logic is testable without
+/// reading the host's SELinux state.
+///
+/// Linux with SELinux enforcing adds `:z` (shared relabel) so both the host and
+/// the container keep access to the workspace. `:Z` (private) would relabel the
+/// workspace so only the container could read it — breaking the host's own git
+/// and result-collection access. Non-SELinux hosts (Ubuntu, macOS, WSL) need no
+/// flag at all.
+fn mount_arg(workspace: &Path, selinux_enforcing: bool) -> String {
+    let flag = if selinux_enforcing { ":z" } else { "" };
+    format!("{}:/workspace{flag}", workspace.display())
+}
+
+/// Whether this host enforces SELinux. Reads the kernel's enforce flag; the
+/// path is absent on hosts without SELinux, which is the common case.
+fn selinux_enforcing() -> bool {
+    std::fs::read_to_string("/sys/fs/selinux/enforce")
+        .map(|enforce| enforce.trim() == "1")
+        .unwrap_or(false)
+}
+
+/// Bind-mount warnings for a workspace path, returned for the caller to log.
+///
+/// - **macOS**: podman/docker run containers in a Linux VM that only mounts a
+///   few host directories (`/Users`, `/Volumes`, `/tmp`, `/private`). A
+///   workspace outside those mounts empty inside the container.
+/// - **WSL**: a workspace on a Windows drive (`/mnt/<letter>/…`) is re-exported
+///   through the VM with degraded permissions and performance. A normal Linux
+///   `/mnt` (e.g. `/mnt/nvme-storage`) has a multi-character first component
+///   and must not warn, so only a single ASCII drive letter counts.
+fn mount_warnings(workspace: &Path) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let path = workspace.to_string_lossy();
+
+    #[cfg(target_os = "macos")]
+    {
+        const SHARED_ROOTS: [&str; 5] = ["/Users", "/Volumes", "/tmp", "/private", "/var/folders"];
+        if !SHARED_ROOTS.iter().any(|root| path.starts_with(root)) {
+            warnings.push(format!(
+                "workspace {path} is outside the directories podman/docker share into the macOS VM \
+                 (/Users, /Volumes, /tmp, /private); the container may see an empty mount"
+            ));
+        }
+    }
+
+    if let Some(rest) = path.strip_prefix("/mnt/") {
+        let drive = rest.split('/').next().unwrap_or("");
+        if drive.len() == 1 && drive.chars().all(|c| c.is_ascii_alphabetic()) {
+            warnings.push(format!(
+                "workspace {path} is on a Windows drive (/mnt/<letter>); container mounts from \
+                 Windows drives are slower and report Unix permissions loosely"
+            ));
+        }
+    }
+
+    warnings
+}
+
 /// Run the configured agent CLI over a prompt.
 ///
 /// Compute the runtime binary and full argument list for a prompt, without
@@ -501,7 +565,7 @@ fn run_command(
                 full.push(format!("{key}={value}"));
             }
             full.push("-v".to_string());
-            full.push(format!("{}:/workspace:Z", workspace.display()));
+            full.push(workspace_mount(workspace));
             full.push("-w".to_string());
             full.push("/workspace".to_string());
             full.push(image.clone());
@@ -521,6 +585,9 @@ async fn run_agent(
     credentials: &[(String, String)],
 ) -> Result<AgentRun> {
     let (binary, args) = run_command(config, workspace, prompt, credentials);
+    for warning in mount_warnings(workspace) {
+        tracing::warn!("{warning}");
+    }
     let mut command = Command::new(&binary);
     command.args(&args);
     // Run in the workspace (or its per-task worktree) so the agent's files land
@@ -1273,13 +1340,14 @@ mod tests {
                 .unwrap();
         let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(binary, "docker");
+        let mount = workspace_mount(Path::new("/ws"));
         assert_eq!(
             args,
             vec![
                 "run",
                 "--rm",
                 "-v",
-                "/ws:/workspace:Z",
+                mount.as_str(),
                 "-w",
                 "/workspace",
                 "node:22",
@@ -1288,6 +1356,23 @@ mod tests {
                 "hello"
             ]
         );
+    }
+
+    #[test]
+    fn the_mount_arg_adds_the_selinux_flag_only_when_enforcing() {
+        assert_eq!(mount_arg(Path::new("/ws"), false), "/ws:/workspace");
+        assert_eq!(mount_arg(Path::new("/ws"), true), "/ws:/workspace:z");
+    }
+
+    #[test]
+    fn mount_warnings_flag_windows_drives_but_not_normal_mnt() {
+        assert!(
+            mount_warnings(Path::new("/mnt/c/project"))
+                .iter()
+                .any(|w| w.contains("Windows drive"))
+        );
+        assert!(mount_warnings(Path::new("/mnt/nvme-storage/repos")).is_empty());
+        assert!(mount_warnings(Path::new("/home/you/project")).is_empty());
     }
 
     #[test]
