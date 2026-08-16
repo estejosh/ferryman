@@ -16,7 +16,8 @@ code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--surface2
 .muted{color:var(--dim)}
 header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:.9rem;padding:.7rem 1.25rem;border-bottom:1px solid var(--line);background:rgba(11,14,19,.9);backdrop-filter:blur(6px);flex-wrap:wrap}
 .brand{display:flex;align-items:center;gap:.55rem;font-weight:700;font-size:15px}
-.mark{width:24px;height:24px;border-radius:7px;background:linear-gradient(135deg,var(--accent),#7c5cff);display:grid;place-items:center;font-size:12px;color:#fff;font-weight:800}
+.mark{color:#c9d8f0;display:flex;align-items:center}
+.mark svg{width:22px;height:22px;display:block}
 .brand .sub{color:var(--dim);font-weight:400}
 .controls{margin-left:auto;display:flex;align-items:center;gap:.7rem;font-size:13px}
 button{background:var(--surface2);color:var(--fg);border:1px solid var(--line);border-radius:7px;padding:.4rem .8rem;cursor:pointer;font:inherit;font-size:13px}
@@ -95,7 +96,7 @@ tbody tr:hover{background:var(--surface2)}
 </head>
 <body>
 <header>
-  <div class="brand"><span class="mark">⛵</span> Ferryman <span class="sub">· __PROJECT__</span></div>
+  <div class="brand"><span class="mark"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none"><g stroke="currentColor" fill="none" stroke-linecap="round"><line x1="32" y1="13" x2="32" y2="6.6" stroke-width="3"/><line x1="48.454" y1="22.5" x2="53.997" y2="19.3" stroke-width="3"/><line x1="48.454" y1="41.5" x2="53.997" y2="44.7" stroke-width="3"/><line x1="32" y1="51" x2="32" y2="57.4" stroke-width="3"/><line x1="15.546" y1="41.5" x2="10.003" y2="44.7" stroke-width="3"/><line x1="15.546" y1="22.5" x2="10.003" y2="19.3" stroke-width="3"/><circle cx="32" cy="32" r="19" stroke-width="5"/><circle cx="32" cy="6.6" r="4" stroke="none" fill="currentColor"/><circle cx="53.997" cy="19.3" r="4" stroke="none" fill="currentColor"/><circle cx="53.997" cy="44.7" r="4" stroke="none" fill="currentColor"/><circle cx="32" cy="57.4" r="4" stroke="none" fill="currentColor"/><circle cx="10.003" cy="44.7" r="4" stroke="none" fill="currentColor"/><circle cx="10.003" cy="19.3" r="4" stroke="none" fill="currentColor"/><path d="M26.6,23.2 H37.6 V27.3 H30.7 V30.24 H35 V34.34 H30.7 V40.8 H26.6 Z" stroke="none" fill="currentColor"/></g></svg></span> Ferryman <span class="sub">· __PROJECT__</span></div>
   <div class="controls">
     <span id="who" class="muted"></span>
     <button id="signout" class="ghost" style="display:none">sign out</button>
@@ -109,6 +110,7 @@ tbody tr:hover{background:var(--surface2)}
   <div id="attention"></div>
   <nav class="tabs" id="tabs">
     <button data-tab="tasks" class="active">Tasks</button>
+    <button data-tab="machines">Machines</button>
     <button data-tab="engines">Engines</button>
     <button data-tab="ledger">Ledger</button>
     <button data-tab="learnings">Learnings</button>
@@ -122,6 +124,9 @@ tbody tr:hover{background:var(--surface2)}
       <div class="tasklist" id="tasklist"></div>
       <div id="taskdetail"></div>
     </div>
+  </section>
+  <section id="tab-machines" class="tab">
+    <table><thead><tr><th>machine</th><th>role</th><th>capabilities</th><th>engine</th><th>runs</th><th>last active</th><th>key</th></tr></thead><tbody id="machines-body"></tbody></table>
   </section>
   <section id="tab-engines" class="tab">
     <div class="kpis" id="ekpis" style="grid-template-columns:repeat(3,1fr)"></div>
@@ -191,9 +196,12 @@ function renderEngines(s){
   document.getElementById('ekpis').innerHTML='<div class="kpi"><div class="num">'+s.length+'</div><div class="lab">engines</div></div><div class="kpi"><div class="num">'+s.reduce((a,x)=>a+x.accepted,0)+'</div><div class="lab">kept</div></div><div class="kpi"><div class="num">$'+s.reduce((a,x)=>a+(x.estimated_cost_usd||0),0).toFixed(2)+'</div><div class="lab">est. spend</div></div>';
   document.getElementById('engines-body').innerHTML=s.map(x=>'<tr><td class="mono">'+esc(x.engine)+'</td><td>'+x.accepted+'/'+x.total+'</td><td>'+(x.rate*100).toFixed(0)+'%</td><td>'+x.runs+'</td><td>$'+(x.estimated_cost_usd||0).toFixed(3)+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No engine usage yet — it appears when agents run and record trajectories.</div></td></tr>';
 }
+function renderMachines(m){
+  document.getElementById('machines-body').innerHTML=m.map(x=>'<tr><td class="mono">'+esc(x.name)+'</td><td><span class="badge">'+esc(x.role)+'</span></td><td>'+(x.capabilities&&x.capabilities.length?esc(x.capabilities.join(', ')):'<span class="muted">—</span>')+'</td><td class="mono">'+(x.engine?esc(x.engine):'<span class="muted">—</span>')+'</td><td>'+x.runs+'</td><td class="muted">'+((x.last_active||'').replace('T',' ').slice(0,16)||'—')+'</td><td class="mono muted" title="'+esc(x.key)+'">'+esc(x.key)+'</td></tr>').join('')||'<tr><td colspan="7"><div class="empty">No machines in the roster yet.</div></td></tr>';
+}
 function renderLedger(d){document.getElementById('ledger-body').innerHTML=(d.entries||[]).map(e=>'<tr><td class="muted mono">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No ledger entries yet — they appear as work is issued and reviewed.</div></td></tr>';}
 function renderLearnings(l){document.getElementById('learnings-body').innerHTML=l.map(x=>'<tr><td class="muted mono">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">Nothing learned yet — learnings appear when agents record what worked.</div></td></tr>';}
-async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j('/api/tasks');renderKpis();renderTasks();renderEngines(await j('/api/stats'));renderLedger(await j('/api/ledger'));renderLearnings(await j('/api/learnings'));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
+async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j('/api/tasks');renderKpis();renderTasks();renderMachines(await j('/api/roster'));renderEngines(await j('/api/stats'));renderLedger(await j('/api/ledger'));renderLearnings(await j('/api/learnings'));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
 async function auth(mode,name,password){const r=await fetch('/api/auth/'+mode,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name,password})});const t=await r.text();if(!r.ok)throw new Error(t);return JSON.parse(t);}
 function showLogin(mode){authMode=mode;document.getElementById('login-overlay').style.display='flex';document.getElementById('auth-title').textContent=mode==='login'?'Sign in':'Create operator';document.getElementById('auth-submit').textContent=mode==='login'?'sign in':'create';document.getElementById('auth-toggle').textContent=mode==='login'?'create operator':'sign in';document.getElementById('auth-status').textContent='';document.getElementById('auth-password').value='';document.getElementById('auth-name').focus();}
 async function doAuth(){const n=document.getElementById('auth-name').value.trim(),p=document.getElementById('auth-password').value;try{const r=await auth(authMode,n,p);if(authMode==='create'){showLogin('login');document.getElementById('auth-status').textContent='operator created — sign in';document.getElementById('auth-name').value=n;return;}session=r.token;sessionStorage.setItem('ferry-dash-token',session);operator=r.name;document.getElementById('login-overlay').style.display='none';refresh();}catch(e){document.getElementById('auth-status').textContent=String(e);}}

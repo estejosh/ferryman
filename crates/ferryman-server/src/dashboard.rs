@@ -170,6 +170,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/stats", get(stats))
         .route("/api/ledger", get(ledger))
         .route("/api/learnings", get(learnings))
+        .route("/api/roster", get(roster))
         .layer(axum::middleware::from_fn(loopback_host_guard))
         .with_state(state)
 }
@@ -482,6 +483,50 @@ async fn learnings(
         })
         .collect();
     Ok(Json(items))
+}
+
+/// GET /api/roster — the machines in this project's roster, and the engine each
+/// most recently ran. Keeping "which machine" and "which model" as separate
+/// columns is the point: a machine runs an engine, they are not the same thing.
+async fn roster(
+    State(state): State<DashboardState>,
+) -> Result<Json<Vec<Value>>, DashboardError> {
+    let agents =
+        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+    let runs = ferryman_channel::trajectory::agent_runs(&state.route).map_err(internal)?;
+    let items = agents
+        .iter()
+        .map(|agent| {
+            let (engine, last_active, runs) = match runs.get(&agent.name) {
+                Some(info) => (
+                    Some(info.engine.clone()),
+                    Some(info.last_active.to_rfc3339()),
+                    info.runs,
+                ),
+                None => (None, None, 0),
+            };
+            json!({
+                "name": agent.name,
+                "role": agent.role,
+                "capabilities": agent.capabilities,
+                "key": agent.public_key.as_deref().map(fingerprint).unwrap_or_default(),
+                "engine": engine,
+                "last_active": last_active,
+                "runs": runs,
+            })
+        })
+        .collect();
+    Ok(Json(items))
+}
+
+/// A short, still-identifiable prefix of a public key for display.
+fn fingerprint(key: &str) -> String {
+    let short: String = key.chars().take(16).collect();
+    if key.len() > 16 {
+        format!("{short}…")
+    } else {
+        short
+    }
 }
 
 #[derive(Deserialize)]

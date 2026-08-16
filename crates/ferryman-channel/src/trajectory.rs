@@ -4,6 +4,8 @@
 //! work happened rather than only read the verdict, and so the benchmark has a
 //! corpus of real runs.
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
@@ -65,6 +67,55 @@ pub fn record_trajectory(route: &ProjectRoute, trajectory: &Trajectory) -> Resul
         .join(format!("{}.{:03}.json", trajectory.agent, trajectory.revision));
     crate::write_task_file(&path, trajectory)?;
     Ok(path)
+}
+
+/// What one agent has been doing, summarised for a dashboard: its most recent
+/// engine, when that was, and how many runs are on record. Keeps "which machine"
+/// and "which model" distinct — an agent is the machine, the engine is the model
+/// it drove.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuns {
+    pub engine: String,
+    pub last_active: DateTime<Utc>,
+    pub runs: usize,
+}
+
+/// Per-agent run summary, from the synced trajectory files.
+pub fn agent_runs(route: &ProjectRoute) -> Result<BTreeMap<String, AgentRuns>> {
+    let mut out: BTreeMap<String, AgentRuns> = BTreeMap::new();
+    let root = route.communications.join("trajectories");
+    if !root.is_dir() {
+        return Ok(out);
+    }
+    for order in fs::read_dir(&root)? {
+        let order = order?.path();
+        if !order.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&order)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(trajectory) = serde_json::from_str::<Trajectory>(&text) else {
+                continue;
+            };
+            let entry = out.entry(trajectory.agent.clone()).or_insert(AgentRuns {
+                engine: trajectory.engine.clone(),
+                last_active: trajectory.at,
+                runs: 0,
+            });
+            entry.runs += 1;
+            if trajectory.at > entry.last_active {
+                entry.last_active = trajectory.at;
+                entry.engine = trajectory.engine.clone();
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
