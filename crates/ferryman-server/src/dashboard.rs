@@ -576,12 +576,14 @@ async fn cost_plan(
 ) -> Result<Json<Value>, DashboardError> {
     let (tasks, prompt_tokens, completion_tokens) =
         ferryman_channel::cost::estimate_project_tokens(&body.prompt, body.tasks);
-    let rates = ferryman_channel::cost::Rates::load(state.route.as_ref());
+    let route = state.route.as_ref();
+    let rates = ferryman_channel::cost::Rates::load(route);
     let costs = ferryman_channel::cost::published_rates()
         .iter()
         .map(|(family, _, _)| {
             let key = family.split_whitespace().next().unwrap_or(family);
-            let quality = ferryman_channel::cost::quality_for(key);
+            let (quality, measured, total, accepted) =
+                ferryman_channel::cost::effective_quality(route, &rates, key);
             json!({
                 "family": family,
                 "key": key,
@@ -590,6 +592,9 @@ async fn cost_plan(
                 ),
                 "quality": quality,
                 "quality_label": ferryman_channel::cost::quality_label(quality),
+                "measured": measured,
+                "total": total,
+                "accepted": accepted,
             })
         })
         .collect::<Vec<_>>();

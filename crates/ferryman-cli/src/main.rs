@@ -2732,11 +2732,12 @@ fn cost_command(command: Cost) -> Result<()> {
             let prompt = resolve_prompt(prompt, prompt_file)?;
             let (tasks, prompt_tokens, completion_tokens) =
                 ferryman_channel::cost::estimate_project_tokens(&prompt, tasks);
-            let rates = match &workspace {
-                Some(path) => {
-                    let route = ferryman_channel::route_for(path)?;
-                    ferryman_channel::cost::Rates::load(&route)
-                }
+            let route = match &workspace {
+                Some(path) => Some(ferryman_channel::route_for(path)?),
+                None => None,
+            };
+            let rates = match &route {
+                Some(r) => ferryman_channel::cost::Rates::load(r),
                 None => ferryman_channel::cost::Rates::defaults(),
             };
             println!("project scope  ~{tasks} tasks");
@@ -2748,7 +2749,7 @@ fn cost_command(command: Cost) -> Result<()> {
                 ferryman_channel::cost::REVISION_FACTOR
             );
             println!();
-            println!("  {:<22} {:>12} {:>18}", "engine", "est. cost", "quality");
+            println!("  {:<22} {:>12}  quality", "engine", "est. cost");
             for (family, _, _) in ferryman_channel::cost::published_rates() {
                 let key = family.split_whitespace().next().unwrap_or(family);
                 let cost = ferryman_channel::cost::project_cost(
@@ -2757,16 +2758,27 @@ fn cost_command(command: Cost) -> Result<()> {
                     prompt_tokens,
                     completion_tokens,
                 );
-                let quality = ferryman_channel::cost::quality_for(key);
-                println!(
-                    "  {family:<22} ${cost:>11.2} {:>12} ({quality:.2})",
-                    ferryman_channel::cost::quality_label(quality)
-                );
+                let (quality, measured, total, accepted) = match &route {
+                    Some(r) => ferryman_channel::cost::effective_quality(r, &rates, key),
+                    None => (rates.quality_for(key), false, 0, 0),
+                };
+                let qs = if measured {
+                    format!(
+                        "{} ({quality:.2} · {accepted}/{total} accepted)",
+                        ferryman_channel::cost::quality_label(quality)
+                    )
+                } else {
+                    format!(
+                        "{} ({quality:.2})",
+                        ferryman_channel::cost::quality_label(quality)
+                    )
+                };
+                println!("  {family:<22} ${cost:>11.2}  {qs}");
             }
             println!();
             println!("  an estimate, not a bid — recorded spend is in `ferry cost project`.");
-            println!("  quality is a static model-capability hint; your own accepted/sent-back");
-            println!("  rate becomes the measured signal once the project has run work.");
+            println!("  quality is measured confidence where this project has run that engine,");
+            println!("  and a static model-capability hint otherwise.");
         }
         Cost::Project { workspace } => {
             let start = match workspace {

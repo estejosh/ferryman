@@ -45,6 +45,9 @@ struct EngineRate {
     name: String,
     prompt_per_million: f64,
     completion_per_million: f64,
+    /// Optional capability override; falls back to the built-in table when absent.
+    #[serde(default)]
+    quality: Option<f64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -114,6 +117,19 @@ impl Rates {
             prompt_per_million,
             completion_per_million,
         }
+    }
+
+    /// The quality for an engine: file override first (first match wins), then
+    /// the built-in capability table.
+    #[must_use]
+    pub fn quality_for(&self, engine: &str) -> f64 {
+        let key = engine.to_ascii_lowercase();
+        for entry in &self.overrides {
+            if key.contains(&entry.name.to_ascii_lowercase()) {
+                return entry.quality.unwrap_or_else(|| quality_for(engine));
+            }
+        }
+        quality_for(engine)
     }
 }
 
@@ -263,6 +279,29 @@ pub fn quality_label(score: f64) -> &'static str {
     } else {
         "weak"
     }
+}
+
+/// The effective quality for an engine on a project: measured confidence from
+/// recorded outcomes when there are any, else the capability score. Returns
+/// `(score, measured, total, accepted)` — `measured` distinguishes a real signal
+/// from the static capability hint, and the counts let a caller show the evidence.
+#[must_use]
+pub fn effective_quality(
+    route: &ProjectRoute,
+    rates: &Rates,
+    engine: &str,
+) -> (f64, bool, usize, usize) {
+    if let Ok(stats) = crate::learning::engine_stats(route)
+        && let Some(stat) = stats.iter().find(|s| {
+            let e = s.engine.to_ascii_lowercase();
+            let k = engine.to_ascii_lowercase();
+            !e.is_empty() && (e.contains(&k) || k.contains(&e))
+        })
+        && stat.total > 0
+    {
+        return (stat.confidence(), true, stat.total, stat.accepted);
+    }
+    (rates.quality_for(engine), false, 0, 0)
 }
 
 /// The published price families, for a `ferry cost rates` listing. Prices are per
@@ -570,6 +609,44 @@ mod tests {
         assert_eq!(quality_label(0.85), "strong");
         assert_eq!(quality_label(0.78), "capable");
         assert_eq!(quality_label(0.65), "basic");
+    }
+
+    #[test]
+    fn quality_can_be_overridden_in_rates_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        std::fs::create_dir_all(&route.communications).unwrap();
+        std::fs::write(
+            route.communications.join("rates.toml"),
+            "[[engine]]\nname = \"mystery\"\nprompt_per_million = 7.5\ncompletion_per_million = 22.0\nquality = 0.99\n",
+        )
+        .unwrap();
+        let rates = Rates::load(&route);
+        assert_eq!(rates.quality_for("mystery-engine"), 0.99);
+        // Not overridden -> built-in table.
+        assert_eq!(rates.quality_for("claude"), 0.90);
+    }
+
+    #[test]
+    fn effective_quality_prefers_measured_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        let rates = Rates::defaults();
+        // No learnings -> capability only, flagged as not measured.
+        let (score, measured, _, _) = effective_quality(&route, &rates, "claude");
+        assert!(!measured);
+        assert_eq!(score, 0.90);
+        // Record three accepted deepseek outcomes -> measured confidence wins.
+        for _ in 0..3 {
+            let mut l = learning("deepseek", true);
+            l.source = "live".into();
+            crate::learning::record_learning(&route, &l).unwrap();
+        }
+        let (score, measured, total, accepted) = effective_quality(&route, &rates, "deepseek");
+        assert!(measured);
+        assert_eq!(total, 3);
+        assert_eq!(accepted, 3);
+        assert!((score - 4.0 / 5.0).abs() < 1e-9); // (3+1)/(3+2)
     }
 
     #[test]
