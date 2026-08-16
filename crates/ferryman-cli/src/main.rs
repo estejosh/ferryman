@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod license;
 mod mcp;
+mod mcp_client;
 
 use ferryman_ops::Progress;
 use ferryman_ops::agent;
@@ -246,16 +247,47 @@ enum Command {
         #[arg(long)]
         record: Option<String>,
     },
+    /// Talk MCP. `serve` exposes this project's read-only query surface as tools
+    /// for an MCP client; `list` and `call` connect to an external MCP server
+    /// and use its tools instead.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+#[derive(Subcommand, Clone)]
+enum McpCommand {
     /// Serve this project over MCP (Model Context Protocol) on stdio, exposing
     /// the channel's query surface — tasks, memory, roster, ledger, learnings,
     /// skills — as tools an MCP client (Claude Desktop, Codex, Claude Code) can
     /// call. Read-only: an MCP connection is a stranger, not the operator.
-    Mcp {
+    Serve {
         /// The project directory. Defaults to where you are.
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Connect to an external MCP server and print the tools it advertises.
+    List {
+        /// The server command and its arguments, e.g.
+        /// "npx -y @modelcontextprotocol/server-github". Split on whitespace;
+        /// quoting is not supported.
+        #[arg(long)]
+        server: String,
+    },
+    /// Call one tool on an external MCP server and print its text result.
+    Call {
+        /// The server command and its arguments, as for `list`.
+        #[arg(long)]
+        server: String,
+        /// The tool name to call.
+        #[arg(long)]
+        tool: String,
+        /// Tool arguments as a JSON object, e.g. '{"query":"ferryman"}'.
+        #[arg(long)]
+        arguments: Option<String>,
+    },
 }
+
 #[derive(Subcommand, Clone)]
 enum Projects {
     /// Create a project. FERRYMAN_TOKEN must be the admin token when the server runs with --production.
@@ -1329,7 +1361,15 @@ async fn main() -> Result<()> {
             list_agents,
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
-        Command::Mcp { workspace } => mcp::serve(workspace)?,
+        Command::Mcp { command } => match command {
+            McpCommand::Serve { workspace } => mcp::serve(workspace)?,
+            McpCommand::List { server } => mcp_client::list(&server)?,
+            McpCommand::Call {
+                server,
+                tool,
+                arguments,
+            } => mcp_client::call(&server, &tool, arguments)?,
+        },
         Command::Communications { command } => match command {
             Communications::Send {
                 project,
