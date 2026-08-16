@@ -286,6 +286,32 @@ enum McpCommand {
         #[arg(long)]
         arguments: Option<String>,
     },
+    /// Configure an external MCP server for this project, so `ferry mcp serve`
+    /// proxies its tools to agents under a `name_` prefix.
+    Add {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The server name, e.g. "github".
+        name: String,
+        /// The server command and its arguments, as for `list`.
+        #[arg(long)]
+        server: String,
+    },
+    /// Remove a configured external MCP server.
+    Remove {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The server name to remove.
+        name: String,
+    },
+    /// List the external MCP servers configured for this project.
+    Servers {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -1369,6 +1395,33 @@ async fn main() -> Result<()> {
                 tool,
                 arguments,
             } => mcp_client::call(&server, &tool, arguments)?,
+            McpCommand::Add {
+                workspace,
+                name,
+                server,
+            } => {
+                let route = mcp::route_for(workspace)?;
+                mcp::add_server(&route, &name, &server)?;
+                println!("configured MCP server '{name}'; agents see its tools as {name}_<tool>");
+            }
+            McpCommand::Remove { workspace, name } => {
+                let route = mcp::route_for(workspace)?;
+                mcp::remove_server(&route, &name)?;
+                println!("removed MCP server '{name}'");
+            }
+            McpCommand::Servers { workspace } => {
+                let route = mcp::route_for(workspace)?;
+                let servers = mcp::load_servers(&route)?;
+                if servers.is_empty() {
+                    println!(
+                        "no external MCP servers configured — run `ferry mcp add <name> --server '<command>'`"
+                    );
+                } else {
+                    for (name, spec) in servers {
+                        println!("  {name:<20} {spec}");
+                    }
+                }
+            }
         },
         Command::Communications { command } => match command {
             Communications::Send {

@@ -179,6 +179,10 @@ pub struct AgentConfig {
     /// so the fleet's cost estimator can credit measured quality to the right
     /// engine, independently of the agent's stable machine-based nickname.
     pub model: Option<String>,
+    /// When true, write a `.mcp.json` into the agent's working directory before
+    /// each run, pointing it at `ferry mcp serve` for this project so the agent
+    /// can call Ferryman's tools plus any external MCP servers in `.ferryman/mcp.toml`.
+    pub mcp: bool,
     /// A container image to run the agent CLI inside, if any. Empty means the
     /// agent runs directly on the host with this user's full privileges.
     pub runner: Runner,
@@ -320,6 +324,11 @@ impl AgentConfig {
             command: take("command")?,
             args,
             model: fields.get("model").cloned().filter(|m| !m.is_empty()),
+            mcp: match fields.get("mcp").map(String::as_str) {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(other) => bail!("mcp must be true or false, not '{other}'"),
+            },
             runner: Runner::parse(&fields.get("sandbox").cloned().unwrap_or_default())?,
             worktree: match fields.get("worktree").map(String::as_str) {
                 None | Some("false") => false,
@@ -604,6 +613,22 @@ fn run_command(
             (config.runner.runtime().to_string(), full)
         }
     }
+}
+
+/// The Claude Code `.mcp.json` that points the agent at `ferry mcp serve` for
+/// this workspace. One stdio server, spawned by the agent CLI itself, so the
+/// agent gets Ferryman's tools plus any external servers in `.ferryman/mcp.toml`.
+#[must_use]
+pub fn gateway_config(workspace: &Path) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            "ferryman": {
+                "command": "ferry",
+                "args": ["mcp", "serve", "--workspace", workspace.display().to_string()],
+            },
+        },
+    })
+    .to_string()
 }
 
 /// stdout is the result. stderr is kept because a failed run's only explanation is
@@ -1299,6 +1324,10 @@ async fn do_work(
             .unwrap_or_default()
             .into_iter()
             .collect();
+    if config.mcp {
+        std::fs::write(workdir.join(".mcp.json"), gateway_config(&route.workspace))
+            .context("write .mcp.json for the agent's MCP access")?;
+    }
     let run = run_agent(config, &workdir, &prompt, &credentials).await?;
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
@@ -1979,5 +2008,18 @@ mod tests {
         let error =
             AgentConfig::parse("agent=\"a\"\ncommand=\"c\"\nreview=\"yolo\"\n").unwrap_err();
         assert!(format!("{error:#}").contains("auto"));
+    }
+
+    #[test]
+    fn mcp_defaults_off_and_gateway_config_points_at_serve() {
+        let config = AgentConfig::parse("agent = \"a\"\ncommand = \"claude\"\n").unwrap();
+        assert!(!config.mcp);
+        let on = AgentConfig::parse("agent=\"a\"\ncommand=\"c\"\nmcp=\"true\"\n").unwrap();
+        assert!(on.mcp);
+        let json: serde_json::Value =
+            serde_json::from_str(&gateway_config(Path::new("/srv/project"))).unwrap();
+        assert_eq!(json["mcpServers"]["ferryman"]["command"], "ferry");
+        assert_eq!(json["mcpServers"]["ferryman"]["args"][1], "serve");
+        assert_eq!(json["mcpServers"]["ferryman"]["args"][3], "/srv/project");
     }
 }

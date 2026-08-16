@@ -90,15 +90,21 @@ impl McpClient {
         Ok(response.get("result").cloned().unwrap_or(Value::Null))
     }
 
-    /// Every tool the server advertises, as `(name, description)`.
-    pub fn list_tools(&mut self) -> Result<Vec<(String, String)>> {
+    /// Every tool the server advertises, as raw JSON objects (name, description,
+    /// inputSchema). `list_tools` is the flattened form for display.
+    pub fn list_tools_raw(&mut self) -> Result<Vec<Value>> {
         let result = self.request("tools/list", json!({}))?;
-        let tools = result
+        Ok(result
             .get("tools")
             .and_then(Value::as_array)
             .cloned()
-            .unwrap_or_default();
-        Ok(tools
+            .unwrap_or_default())
+    }
+
+    /// Every tool the server advertises, as `(name, description)`.
+    pub fn list_tools(&mut self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .list_tools_raw()?
             .into_iter()
             .map(|t| {
                 (
