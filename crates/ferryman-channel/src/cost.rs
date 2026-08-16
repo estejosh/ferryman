@@ -291,17 +291,43 @@ pub fn effective_quality(
     rates: &Rates,
     engine: &str,
 ) -> (f64, bool, usize, usize) {
-    if let Ok(stats) = crate::learning::engine_stats(route)
-        && let Some(stat) = stats.iter().find(|s| {
-            let e = s.engine.to_ascii_lowercase();
-            let k = engine.to_ascii_lowercase();
-            !e.is_empty() && (e.contains(&k) || k.contains(&e))
-        })
-        && stat.total > 0
-    {
-        return (stat.confidence(), true, stat.total, stat.accepted);
+    if let Some((confidence, total, accepted)) = measured_quality(route, engine) {
+        return (confidence, true, total, accepted);
     }
     (rates.quality_for(engine), false, 0, 0)
+}
+
+/// Measured quality for an engine family from recorded outcomes: matches both
+/// the recorded engine (command) and the agent name, so an agent named
+/// `grouchly-deepseek` counts toward the "deepseek" family. Returns
+/// `(confidence, total, accepted)` when there are any matching outcomes.
+fn measured_quality(route: &ProjectRoute, engine_key: &str) -> Option<(f64, usize, usize)> {
+    let key = engine_key.to_ascii_lowercase();
+    let learnings = crate::learning::read_learnings(route).ok()?;
+    let mut total = 0;
+    let mut accepted = 0;
+    for learning in &learnings {
+        let engine_matches = learning.engine.to_ascii_lowercase().contains(&key);
+        let agent_matches = learning
+            .agent
+            .as_deref()
+            .map(|a| a.to_ascii_lowercase().contains(&key))
+            .unwrap_or(false);
+        if engine_matches || agent_matches {
+            total += 1;
+            if learning.accepted {
+                accepted += 1;
+            }
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    Some((
+        (accepted as f64 + 1.0) / (total as f64 + 2.0),
+        total,
+        accepted,
+    ))
 }
 
 /// The published price families, for a `ferry cost rates` listing. Prices are per
@@ -647,6 +673,24 @@ mod tests {
         assert_eq!(total, 3);
         assert_eq!(accepted, 3);
         assert!((score - 4.0 / 5.0).abs() < 1e-9); // (3+1)/(3+2)
+    }
+
+    #[test]
+    fn measured_quality_matches_agent_names_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        let rates = Rates::defaults();
+        // An agent named for the engine counts toward that engine's family even
+        // when the recorded command is something else (e.g. the CLI shim).
+        let mut l = learning("cline", true);
+        l.source = "live".into();
+        l.agent = Some("grouchly-deepseek".into());
+        crate::learning::record_learning(&route, &l).unwrap();
+        let (score, measured, total, accepted) = effective_quality(&route, &rates, "deepseek");
+        assert!(measured);
+        assert_eq!(total, 1);
+        assert_eq!(accepted, 1);
+        assert!((score - 2.0 / 3.0).abs() < 1e-9); // (1+1)/(1+2)
     }
 
     #[test]
