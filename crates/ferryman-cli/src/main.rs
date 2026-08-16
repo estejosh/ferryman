@@ -254,6 +254,19 @@ enum Command {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Ask this project a question and get an auditable answer (MAARAG) — every
+    /// claim carries its signed source, so the answer can be verified rather
+    /// than trusted. Read-only.
+    Ask {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The question to answer.
+        question: String,
+        /// Emit the claims as JSON instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
 #[derive(Subcommand, Clone)]
 enum McpCommand {
@@ -1423,6 +1436,27 @@ async fn main() -> Result<()> {
                 }
             }
         },
+        Command::Ask {
+            workspace,
+            question,
+            json,
+        } => {
+            let start =
+                workspace.unwrap_or(std::env::current_dir().context("read the current directory")?);
+            let route = ferryman_channel::route_for(&start)?;
+            let claims = ferryman_channel::ask::ask(&route, &question)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "question": question,
+                        "claims": claims,
+                    }))?
+                );
+            } else {
+                println!("{}", ferryman_channel::ask::render(&question, &claims));
+            }
+        }
         Command::Communications { command } => match command {
             Communications::Send {
                 project,

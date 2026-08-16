@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod ask;
 pub mod contract;
 pub mod cost;
 pub mod credentials;
