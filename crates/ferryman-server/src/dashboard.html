@@ -286,10 +286,14 @@ function renderGraphView(nodes,links){
 function drawGraph(){
   const svg=document.getElementById('graph-canvas');if(!graphLayout)return;
   const byId={};graphLayout.nodes.forEach(n=>byId[n.id]=n);
-  let s='<g transform="translate('+graphPanX+' '+graphPanY+') translate('+(graphLayout.W/2)+' '+(graphLayout.H/2)+') scale('+graphZoom+') translate('+(-graphLayout.W/2)+' '+(-graphLayout.H/2)+')">';
+  const cx=graphLayout.W/2,cy=graphLayout.H/2;
+  const tx=n=>graphPanX+cx+graphZoom*(n.x-cx),ty=n=>graphPanY+cy+graphZoom*(n.y-cy);
+  let s='<g transform="translate('+graphPanX+' '+graphPanY+') translate('+cx+' '+cy+') scale('+graphZoom+') translate('+(-cx)+' '+(-cy)+')">';
   graphLayout.edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];s+='<line x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'" stroke="#7b96bb" stroke-width="1.5" stroke-opacity="0.9"/>';});
-  graphLayout.nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/><text x="'+(n.x+6)+'" y="'+(n.y+3)+'" font-size="10" fill="#aeb9ca">'+esc(n.label)+'</text>';});
-  s+='</g>';svg.innerHTML=s;
+  graphLayout.nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/>';});
+  s+='</g>';
+  graphLayout.nodes.forEach(n=>{s+='<text x="'+(tx(n)+6)+'" y="'+(ty(n)+3)+'" font-size="10" fill="#aeb9ca">'+esc(n.label)+'</text>';});
+  svg.innerHTML=s;
   svg.querySelectorAll('circle').forEach(c=>c.onclick=()=>showGraphTip(c.dataset.id));
   document.getElementById('zoomlabel').textContent=Math.round(graphZoom*100)+'%';
 }
