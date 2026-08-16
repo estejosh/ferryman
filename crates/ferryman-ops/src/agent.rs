@@ -844,6 +844,25 @@ fn with_preamble(config: &AgentConfig, rest: String) -> String {
     }
 }
 
+/// The notice that frames an agent's own specialization profile in its prompt.
+const PROFILE_NOTICE: &str = "\
+The following is your own specialization profile for this project - what you have \
+become good at and the conventions you have established. It is yours, accumulated \
+across your own sessions. Lean on it, and add to it after the task.\n";
+
+/// This agent's specialization profile, framed for injection, or empty when it has
+/// not written one. Keeping the empty case byte-identical means specialization is
+/// opt-in by writing a profile, never a tax on every agent's prompt.
+fn profile_block(route: &ProjectRoute, agent: &str) -> String {
+    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    match ferryman_channel::memory::load_agent_profile(&bank, agent) {
+        Some(profile) if !profile.trim().is_empty() => {
+            format!("{PROFILE_NOTICE}\n\n{}\n\n", profile.trim_end())
+        }
+        _ => String::new(),
+    }
+}
+
 /// The prompt for a first attempt or revision, without task-matched skills.
 /// Kept as the test-facing entry point; the worker uses
 /// [`work_prompt_with_skills`].
@@ -1187,7 +1206,11 @@ async fn do_work(
     let skills = ferryman_channel::skills::load_skills(route).unwrap_or_default();
     let matched = ferryman_channel::skills::route(&skills, &task.order.payload.to_string());
     let skills_text = ferryman_channel::skills::render(&matched);
-    let mut prompt = work_prompt_with_skills(config, task, &skills_text);
+    // This agent's own specialization profile rides in front of the task-matched
+    // skills: what it has become good at, so an agent that sharpened itself on Rust
+    // keeps its Rust memory instead of loading someone else's unrelated one.
+    let profile_text = profile_block(route, &config.agent);
+    let mut prompt = work_prompt_with_skills(config, task, &format!("{profile_text}{skills_text}"));
     if let Some(note) = steer {
         prompt = format!(
             "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"

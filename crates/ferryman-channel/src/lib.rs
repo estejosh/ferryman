@@ -24,6 +24,7 @@ pub mod lease;
 pub mod ledger;
 pub mod licensing;
 pub mod master;
+pub mod memory;
 pub mod migration;
 pub mod portable_auth;
 pub mod skills;

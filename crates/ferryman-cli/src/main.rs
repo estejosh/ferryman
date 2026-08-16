@@ -226,6 +226,17 @@ enum Command {
         /// Project slug, when the directory name is not the slug.
         #[arg(long)]
         project: Option<String>,
+        /// Load one agent's specialization profile on top of the shared memory.
+        #[arg(long)]
+        agent: Option<String>,
+        /// List the agents that have memory, with a one-line summary each — the
+        /// chooser for deciding whose memory to load.
+        #[arg(long)]
+        list_agents: bool,
+        /// Append a note to an agent's specialization profile (requires --agent), so
+        /// an agent that gets better at a task keeps that sharpened memory.
+        #[arg(long)]
+        record: Option<String>,
     },
 }
 #[derive(Subcommand, Clone)]
@@ -1239,7 +1250,13 @@ async fn main() -> Result<()> {
             }
             ferryman_server::dashboard::serve(state, addr).await?;
         }
-        Command::Loadmem { workspace, project } => loadmem(workspace, project)?,
+        Command::Loadmem {
+            workspace,
+            project,
+            agent,
+            list_agents,
+            record,
+        } => loadmem(workspace, project, agent, list_agents, record)?,
         Command::Communications { command } => match command {
             Communications::Send {
                 project,
@@ -2252,7 +2269,13 @@ const MEMORY_BANK_ORDER: &[&str] = &[
 /// anywhere the memory bank is reachable. No channel is required — the memory
 /// bank is the recovery record, and a machine that just failed is exactly the
 /// machine that must be able to read it.
-fn loadmem(workspace: Option<PathBuf>, project: Option<String>) -> Result<()> {
+fn loadmem(
+    workspace: Option<PathBuf>,
+    project: Option<String>,
+    agent: Option<String>,
+    list_agents: bool,
+    record: Option<String>,
+) -> Result<()> {
     let start = match workspace {
         Some(path) => path,
         None => std::env::current_dir().context("read the current directory")?,
@@ -2267,6 +2290,32 @@ fn loadmem(workspace: Option<PathBuf>, project: Option<String>) -> Result<()> {
     let bank = find_memory_bank(&start, route.as_ref());
     let log = find_durable_log(&start, &slug, route.as_ref());
 
+    // Record mode: append a note to one agent's specialization profile, then fall
+    // through so the operator sees the updated profile.
+    if let Some(note) = record {
+        let name = agent
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--record needs --agent <name>"))?;
+        let Some(bank_dir) = bank.as_deref() else {
+            bail!("no memory bank found to record into for '{slug}'");
+        };
+        record_agent_profile(bank_dir, name, &note)?;
+        println!(
+            "recorded into {}",
+            ferryman_channel::memory::agent_profile_path(bank_dir, name).display()
+        );
+        println!();
+    }
+
+    // List mode: just the chooser, no shared memory.
+    if list_agents {
+        if !print_agent_list(bank.as_deref()) {
+            println!("no agent profiles yet. Create one with:");
+            println!("  ferry loadmem --agent <name> --record \"<what this agent is good at>\"");
+        }
+        return Ok(());
+    }
+
     println!("project   {slug}");
     if let Some(path) = &bank {
         println!("memory    {}", path.display());
@@ -2278,7 +2327,7 @@ fn loadmem(workspace: Option<PathBuf>, project: Option<String>) -> Result<()> {
 
     let mut printed = false;
 
-    if let Some(dir) = bank {
+    if let Some(dir) = bank.as_deref() {
         let readme = dir.join("README.md");
         if readme.is_file() {
             print_memory_file("## Memory review order (read this first)", &readme)?;
@@ -2292,7 +2341,7 @@ fn loadmem(workspace: Option<PathBuf>, project: Option<String>) -> Result<()> {
             }
         }
         let mut others = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy().to_string();
@@ -2316,6 +2365,13 @@ fn loadmem(workspace: Option<PathBuf>, project: Option<String>) -> Result<()> {
         printed = true;
     }
 
+    // The agent layer: load one agent's specialization, or list them all so the
+    // operator can choose whose memory to load.
+    match &agent {
+        Some(name) => printed |= print_one_agent(bank.as_deref(), name),
+        None => printed |= print_agent_list(bank.as_deref()),
+    }
+
     if !printed {
         bail!(
             "no memory found for '{slug}'. Expected a memory-bank/ directory, or a \
@@ -2333,18 +2389,7 @@ fn slug_of(dir: &std::path::Path) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    let mut out = String::new();
-    for ch in name.chars() {
-        if ch.is_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    while out.ends_with('-') {
-        out.pop();
-    }
-    out
+    ferryman_channel::memory::slugify(&name)
 }
 
 /// Locate the memory bank: the channel's synced copy first, then the local
@@ -2391,6 +2436,72 @@ fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
     println!("{text}");
     println!();
     Ok(())
+}
+
+/// Append a dated note to one agent's specialization profile, creating the file
+/// and its `agents/` directory on first use.
+fn record_agent_profile(bank: &std::path::Path, agent: &str, note: &str) -> Result<()> {
+    let path = ferryman_channel::memory::agent_profile_path(bank, agent);
+    let Some(dir) = path.parent() else {
+        bail!("profile path {} has no parent", path.display());
+    };
+    std::fs::create_dir_all(dir)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open {} for append", path.display()))?;
+    use std::io::Write;
+    writeln!(file, "- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))?;
+    Ok(())
+}
+
+/// Print one agent's specialization profile. Returns true when a profile was
+/// actually printed (as opposed to the "no profile yet" hint).
+fn print_one_agent(bank: Option<&std::path::Path>, agent: &str) -> bool {
+    let Some(bank) = bank else {
+        return false;
+    };
+    match ferryman_channel::memory::load_agent_profile(bank, agent) {
+        Some(profile) if !profile.trim().is_empty() => {
+            println!("## Agent profile — {agent}");
+            println!();
+            println!("{}", profile.trim_end());
+            println!();
+            true
+        }
+        _ => {
+            println!("## Agent profile — {agent}");
+            println!();
+            println!("no profile yet. Create one with:");
+            println!("  ferry loadmem --agent {agent} --record \"<what this agent is good at>\"");
+            println!();
+            false
+        }
+    }
+}
+
+/// Print the chooser: every agent that has a profile, with a one-line summary.
+/// Returns true when at least one profile exists.
+fn print_agent_list(bank: Option<&std::path::Path>) -> bool {
+    let Some(bank) = bank else {
+        return false;
+    };
+    let profiles = ferryman_channel::memory::list_agent_profiles(bank);
+    if profiles.is_empty() {
+        return false;
+    }
+    println!("## Agents with memory (load one with --agent <name>)");
+    println!();
+    for (agent, summary) in &profiles {
+        if summary.is_empty() {
+            println!("  {agent}");
+        } else {
+            println!("  {agent:<16} {summary}");
+        }
+    }
+    println!();
+    true
 }
 
 fn channel(command: Channel) -> Result<()> {
