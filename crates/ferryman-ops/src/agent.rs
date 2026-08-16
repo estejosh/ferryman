@@ -31,8 +31,10 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 /// How much authority the operator has given the reviewing agent.
@@ -183,9 +185,16 @@ pub struct AgentConfig {
     /// docker runners; the bare runner is unaffected.
     pub network: NetworkPolicy,
     pub timeout: Duration,
+    /// How long the agent CLI may run without printing anything to stdout or stderr
+    /// before it is considered frozen and killed. A healthy CLI streams progress; a
+    /// frozen one is silent, and left alone it holds the claim while the machine stays
+    /// busy for nothing. 0 turns the watchdog off (timeout_secs still bounds the run).
+    pub stall: Duration,
     pub review: ReviewMode,
-    /// Megabytes of memory to leave available. Below this the agent does not claim, so
-    /// the task stays open for a machine with room. 0 turns the check off.
+    /// Megabytes of memory to leave available on this machine. Below this the agent
+    /// does not claim a new task - it stays open for a machine with room - and a task
+    /// already running is killed before the OS has to kill something itself. 0 turns
+    /// both checks off.
     pub min_free_ram_mb: u64,
     /// Stop taking work while someone is using this machine.
     pub pause_while_active: bool,
@@ -314,6 +323,7 @@ impl AgentConfig {
             },
             network: NetworkPolicy::parse(&fields.get("net").cloned().unwrap_or_default())?,
             timeout: Duration::from_secs(number("timeout_secs", 900)?),
+            stall: Duration::from_secs(number("stall_secs", 600)?),
             review: ReviewMode::parse(
                 &fields
                     .get("review")
@@ -382,6 +392,12 @@ args = {args}
 sandbox = "{sandbox}"
 timeout_secs = "900"
 
+# The agent CLI is killed if it prints nothing for this many seconds - frozen,
+# not slow: the machine is busy, the claim is held, and nothing is happening. A
+# healthy agent streams progress; a frozen one goes silent. Set 0 to turn the
+# watchdog off. timeout_secs still bounds the whole run either way.
+stall_secs = "600"
+
 # Run each task in its own git worktree when this workspace is a git repo, so
 # parallel agents never collide in the same checkout. The branch name derives
 # from the signed order and this agent, and its head commit is signed into the
@@ -410,9 +426,11 @@ poll_secs = "10"
 
 # Megabytes of memory to leave available on this machine. If less than this is
 # free, this agent does not claim - the task simply stays open, so another
-# machine can take it and nothing is failed or lost. Lowering the agent's
-# priority stops it fighting you for CPU; only declining to start stops it
-# taking the last of your memory. Set to 0 to turn the check off.
+# machine can take it and nothing is failed or lost. And if memory runs out
+# while a task is already running, that task is killed before the OS has to
+# kill something itself - a machine you had to hard-reset is the worst failure
+# of all. Lowering the agent's priority stops it fighting you for CPU; this
+# stops it taking the last of your memory. Set to 0 to turn the check off.
 min_free_ram_mb = "1024"
 
 # Stop taking new work while you are using this machine, and start again once it
@@ -465,6 +483,7 @@ idle_after_secs = "300"
 }
 
 /// What the agent CLI printed, and whether it got to finish.
+#[derive(Debug)]
 struct AgentRun {
     stdout: String,
     stderr: String,
@@ -628,32 +647,121 @@ async fn run_agent(
     if let Some(pid) = child.id() {
         crate::priority::lower(pid);
     }
-    let mut stdout_pipe = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-    let mut stderr_pipe = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let collect = async {
-        stdout_pipe.read_to_string(&mut stdout).await?;
-        stderr_pipe.read_to_string(&mut stderr).await?;
-        child.wait().await
-    };
-    // An agent that hangs must not hold the claim forever - the task would look held by
-    // a live worker while nothing is happening.
-    let status = match tokio::time::timeout(config.timeout, collect).await {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = child.start_kill();
+    let stdout_pipe = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let stderr_pipe = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+
+    // Two readers pull both streams concurrently and stamp a shared clock on every
+    // byte. A frozen agent - alive, but silent - is then distinguishable from one that
+    // is merely slow, because "slow" keeps the clock moving.
+    let clock_start = Instant::now();
+    let last_output = Arc::new(AtomicU64::new(0));
+    let stdout_task = drain_pipe(stdout_pipe, Arc::clone(&last_output), clock_start);
+    let stderr_task = drain_pipe(stderr_pipe, Arc::clone(&last_output), clock_start);
+
+    // The watchdog poll. A few times a second is invisible while a task runs - and this
+    // function only runs while a task runs - but bounds how long a freeze can last.
+    let mut poll = tokio::time::interval(Duration::from_millis(500));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline = Instant::now() + config.timeout;
+    // Memory is the one check that is not free (sysinfo re-reads the system), so it is
+    // sampled at most every five seconds.
+    let mut memory_checked_at = Instant::now() - Duration::from_secs(5);
+
+    loop {
+        if let Some(status) = child.try_wait()? {
+            let stdout = stdout_task.await??;
+            let stderr = stderr_task.await??;
+            return Ok(AgentRun {
+                stdout,
+                stderr,
+                ok: status.success(),
+            });
+        }
+        poll.tick().await;
+
+        // A frozen agent holds the claim forever while the machine stays busy for
+        // nothing. Kill it; the task fails and can be retried by someone else.
+        if !config.stall.is_zero() {
+            let silent_ms =
+                clock_start.elapsed().as_millis() as u64 - last_output.load(Ordering::Relaxed);
+            if silent_ms >= config.stall.as_millis() as u64 {
+                kill_child(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                bail!(
+                    "'{}' printed nothing for {}s and was killed as frozen",
+                    config.command,
+                    config.stall.as_secs()
+                );
+            }
+        }
+
+        // An agent that keeps printing but never finishes must not hold the claim
+        // forever either. This is the overall bound, distinct from the stall guard.
+        if Instant::now() >= deadline {
+            kill_child(&mut child).await;
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
             bail!(
                 "'{}' ran past {}s and was killed",
                 config.command,
                 config.timeout.as_secs()
-            )
+            );
         }
-    };
-    Ok(AgentRun {
-        stdout,
-        stderr,
-        ok: status.success(),
+
+        // The operator asked to keep this much memory free. Declining to claim only
+        // protects the *next* task; a running one can still eat the machine alive, and a
+        // machine the operator had to hard-reset is the worst failure of all. Kill the
+        // child before the OS has to kill something itself.
+        if config.min_free_ram_mb > 0 && memory_checked_at.elapsed() >= Duration::from_secs(5) {
+            memory_checked_at = Instant::now();
+            if let Some(free) = crate::governor::available_memory_mb()
+                && free < config.min_free_ram_mb
+            {
+                kill_child(&mut child).await;
+                let _ = stdout_task.await;
+                let _ = stderr_task.await;
+                bail!(
+                    "'{}' was killed: {free} MB free, below min_free_ram_mb {}",
+                    config.command,
+                    config.min_free_ram_mb
+                );
+            }
+        }
+    }
+}
+
+/// Kill a child and wait for it to be reaped, so no zombie is left behind.
+async fn kill_child(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+/// Read a pipe to EOF into a string, stamping `last_output` (milliseconds since
+/// `clock_start`, monotonic) on every chunk so the watchdog can tell a silent child
+/// from a slow one.
+fn drain_pipe<R>(
+    mut pipe: R,
+    last_output: Arc<AtomicU64>,
+    clock_start: Instant,
+) -> tokio::task::JoinHandle<std::io::Result<String>>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = vec![0u8; 8192];
+        let mut out = String::new();
+        loop {
+            match pipe.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    last_output.store(clock_start.elapsed().as_millis() as u64, Ordering::Relaxed);
+                    out.push_str(&String::from_utf8_lossy(&buffer[..n]));
+                }
+                Err(_) => break,
+            }
+        }
+        Ok(out)
     })
 }
 
@@ -671,8 +779,11 @@ pub async fn run_engine_prompt(
     prompt: &str,
     timeout: Duration,
 ) -> Result<String> {
+    // A benchmark compares raw engines, so only the overall timeout applies: the
+    // stall and memory guards are worker protections, and a benchmark must be able
+    // to watch a long, quiet inference without being killed for it.
     let config = AgentConfig::parse(&format!(
-        "agent = \"bench\"\ncommand = \"{}\"\nargs = {}\ntimeout_secs = \"{}\"\n",
+        "agent = \"bench\"\ncommand = \"{}\"\nargs = {}\ntimeout_secs = \"{}\"\nstall_secs = \"0\"\nmin_free_ram_mb = \"0\"\n",
         command,
         serde_json::to_string(args)?,
         timeout.as_secs(),
@@ -1685,7 +1796,43 @@ mod tests {
         assert_eq!(config.args, vec!["-p", "{prompt}"]);
         assert_eq!(config.review, ReviewMode::Confirm);
         assert_eq!(config.timeout, Duration::from_secs(900));
+        assert_eq!(config.stall, Duration::from_secs(600));
         assert!(!config.worktree);
+    }
+
+    #[test]
+    fn the_stall_watchdog_defaults_on_and_can_be_turned_off() {
+        let config = AgentConfig::parse("agent = \"a\"\ncommand = \"c\"\n").unwrap();
+        assert_eq!(config.stall, Duration::from_secs(600));
+        let config =
+            AgentConfig::parse("agent = \"a\"\ncommand = \"c\"\nstall_secs = \"0\"\n").unwrap();
+        assert!(config.stall.is_zero());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_agent_is_killed_as_frozen() {
+        // `sleep` prints nothing, so a one-second stall window must kill it long before
+        // the thirty seconds it would otherwise run. Skips where there is no `sleep`.
+        if std::process::Command::new("sleep")
+            .arg("0")
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ferryman-stall-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let config = AgentConfig::parse(
+            "agent = \"w\"\ncommand = \"sleep\"\nargs = [\"30\"]\nstall_secs = \"1\"\ntimeout_secs = \"60\"\n",
+        )
+        .unwrap();
+        let error = run_agent(&config, &dir, "hello", &[]).await.unwrap_err();
+        assert!(
+            format!("{error}").contains("frozen"),
+            "expected the stall watchdog, got: {error:#}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
