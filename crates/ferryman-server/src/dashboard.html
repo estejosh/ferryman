@@ -162,6 +162,17 @@ tr[data-pid]:hover td{color:var(--accent)}
   <section id="tab-engines" class="tab">
     <div class="kpis" id="ekpis" style="grid-template-columns:repeat(3,1fr)"></div>
     <table><thead><tr><th>engine</th><th>kept</th><th>accept rate</th><th>runs</th><th>est. cost</th></tr></thead><tbody id="engines-body"></tbody></table>
+    <div class="suggest-box">
+      <div class="section-title">Cost estimator</div>
+      <div class="muted">Price a prompt against an engine — a rough estimate, not a meter reading.</div>
+      <div style="display:flex;gap:.5rem;margin-top:.5rem;flex-wrap:wrap;align-items:center">
+        <select id="cost-engine"></select>
+        <label class="muted">output tokens <input id="cost-output" type="number" value="500" min="1" style="width:6rem"></label>
+        <button id="cost-submit" class="primary">estimate</button>
+      </div>
+      <textarea id="cost-prompt" placeholder="paste a prompt to estimate…" style="width:100%;min-height:4rem;margin-top:.5rem"></textarea>
+      <div class="muted" id="cost-status" style="margin-top:.4rem"></div>
+    </div>
   </section>
   <section id="tab-ledger" class="tab">
     <table><thead><tr><th>time</th><th>kind</th><th>actor</th><th>summary</th><th>ref</th></tr></thead><tbody id="ledger-body"></tbody></table>
@@ -348,8 +359,10 @@ document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.que
 document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('suggest-submit').onclick=async()=>{const text=document.getElementById('suggest-text').value.trim(),status=document.getElementById('suggest-status');if(!text){status.textContent='type something first';return;}try{const r=await fetch('/api/memory/suggest',{method:'POST',headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},body:JSON.stringify({text})});if(r.ok){document.getElementById('suggest-text').value='';status.textContent='suggestion recorded';refresh();}else{status.textContent='failed: '+await r.text();}}catch(e){status.textContent='failed: '+e;}};document.getElementById('back').onclick=()=>setProject(null);document.getElementById('zoomin').onclick=()=>graphZoomBy(1.3);document.getElementById('zoomout').onclick=()=>graphZoomBy(0.77);document.getElementById('reset').onclick=resetGraph;document.getElementById('fontminus').onclick=()=>graphFontBy(-1);document.getElementById('fontplus').onclick=()=>graphFontBy(1);document.getElementById('fullscreen').onclick=()=>{const p=document.getElementById('graph-panel');document.fullscreenElement?document.exitFullscreen():p.requestFullscreen&&p.requestFullscreen();};document.getElementById('maximize').onclick=()=>{const p=document.getElementById('graph-panel');p.classList.toggle('maximized');document.getElementById('maximize').textContent=p.classList.contains('maximized')?'⤡':'⤢';};attachGraphPan();document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
 const onEnter=e=>{if(e.key==='Enter')doAuth();};document.getElementById('auth-name').addEventListener('keydown',onEnter);document.getElementById('auth-password').addEventListener('keydown',onEnter);
 document.getElementById('search').oninput=renderTasks;document.getElementById('statefilter').onchange=renderTasks;
+async function loadCostRates(){try{const d=await j('/api/cost/rates');const sel=document.getElementById('cost-engine');sel.innerHTML=(d.rates||[]).map(x=>'<option value="'+esc(x.key)+'">'+esc(x.family)+'</option>').join('');}catch(e){}}
+document.getElementById('cost-submit').onclick=async()=>{const engine=document.getElementById('cost-engine').value||'claude',prompt=document.getElementById('cost-prompt').value,out=parseInt(document.getElementById('cost-output').value||'500',10),st=document.getElementById('cost-status');if(!prompt.trim()){st.textContent='type a prompt first';return;}try{const r=await fetch('/api/cost/estimate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({engine,prompt,output_tokens:out})});const d=await r.json();if(r.ok){st.textContent='~'+d.input_tokens+' input + '+d.output_tokens+' output tokens ≈ $'+d.estimated_cost_usd.toFixed(4)+' per run';}else{st.textContent='failed: '+(d.error||r.status);}}catch(e){st.textContent='failed: '+e;}};
 setInterval(()=>{if(document.getElementById('autorefresh').checked)refresh();},3000);
-(async function init(){if(window.__dash.readonly){document.getElementById('signout').style.display='none';}else if(await checkSession()){document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}else{showLogin(window.__dash.anyOperators?'login':'create');}refresh();})();
+(async function init(){if(window.__dash.readonly){document.getElementById('signout').style.display='none';}else if(await checkSession()){document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}else{showLogin(window.__dash.anyOperators?'login':'create');}refresh();loadCostRates();})();
 </script>
 </body>
 </html>
