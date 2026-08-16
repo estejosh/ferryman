@@ -293,7 +293,7 @@ function drawGraph(){
   graphLayout.nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/>';});
   s+='</g>';
   graphLayout.nodes.forEach(n=>{s+='<circle cx="'+tx(n)+'" cy="'+ty(n)+'" r="5" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/>';});
-  graphLayout.nodes.forEach(n=>{s+='<text x="'+(tx(n)+7)+'" y="'+(ty(n)+4)+'" font-size="'+graphFont+'" fill="#aeb9ca">'+esc(n.label)+'</text>';});
+  graphLayout.nodes.forEach(n=>{s+='<text x="'+(tx(n)+7)+'" y="'+(ty(n)+4)+'" font-size="'+graphFont+'" fill="#ffffff" stroke="#0b0e13" stroke-width="3" paint-order="stroke">'+esc(n.label)+'</text>';});
   svg.innerHTML=s;
   svg.querySelectorAll('circle').forEach(c=>c.onclick=()=>showGraphTip(c.dataset.id));
   document.getElementById('zoomlabel').textContent=Math.round(graphZoom*100)+'%';
