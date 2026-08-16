@@ -130,6 +130,12 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         timeout_secs: u64,
     },
+    /// Estimate spend: published per-engine rates, a single prompt's cost, or
+    /// this project's recorded usage. Prices are list prices, computed offline.
+    Cost {
+        #[command(subcommand)]
+        command: Cost,
+    },
     /// What this deployment counts as under the licence.
     License {
         #[command(subcommand)]
@@ -957,6 +963,32 @@ enum Agents {
     },
 }
 #[derive(Subcommand, Clone)]
+enum Cost {
+    /// The published per-engine price table, dollars per million tokens.
+    Rates,
+    /// Estimate the cost of sending one prompt to one engine.
+    Estimate {
+        /// The engine/CLI name, e.g. claude, deepseek, gpt-4o.
+        #[arg(long)]
+        engine: String,
+        /// The prompt text. Read from --prompt-file or stdin when omitted.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Read the prompt from a file instead of --prompt.
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Expected completion (output) tokens. Defaults to 500.
+        #[arg(long, default_value_t = 500)]
+        output_tokens: u64,
+    },
+    /// This project's recorded per-engine usage and cost, from trajectories and
+    /// review outcomes.
+    Project {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+#[derive(Subcommand, Clone)]
 enum Memory {
     Add {
         #[arg(long)]
@@ -1215,6 +1247,7 @@ async fn main() -> Result<()> {
                 println!("  {engine:<12} {passed}/{total} ({:.0}%)", rate * 100.0);
             }
         }
+        Command::Cost { command } => cost_command(command)?,
         Command::License { command } => license_command(command).await?,
         Command::Jobs { command } => jobs(&cli, command).await?,
         Command::Projects { command } => match command {
@@ -2622,6 +2655,96 @@ fn choose_agent(
     println!();
     print_one_agent(Some(bank), agent);
     true
+}
+
+fn cost_command(command: Cost) -> Result<()> {
+    match command {
+        Cost::Rates => {
+            println!(
+                "  {:<22} {:>10} {:>14}",
+                "engine family", "prompt $/M", "completion $/M"
+            );
+            for (family, prompt, completion) in ferryman_channel::cost::published_rates() {
+                println!("  {family:<22} {prompt:>10.2} {completion:>14.2}");
+            }
+            println!();
+            println!("  list prices, dollars per million tokens; unknown engines fall back");
+            println!("  to the default row. `ferry cost estimate` prices a single prompt.");
+        }
+        Cost::Estimate {
+            engine,
+            prompt,
+            prompt_file,
+            output_tokens,
+        } => {
+            let prompt = resolve_prompt(prompt, prompt_file)?;
+            let input_tokens = ferryman_channel::cost::estimate_tokens(&prompt);
+            let cost =
+                ferryman_channel::cost::estimate_prompt_cost(&engine, &prompt, output_tokens);
+            println!("engine      {engine}");
+            println!(
+                "input       ~{input_tokens} tokens ({} chars)",
+                prompt.chars().count()
+            );
+            println!("output      ~{output_tokens} tokens (assumed; --output-tokens to change)");
+            println!("estimated   ${cost:.4} for this one run");
+            println!();
+            println!("  multiply by the number of tasks/iterations to size a whole project.");
+        }
+        Cost::Project { workspace } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = ferryman_channel::route_for(&start)?;
+            let costs = ferryman_channel::cost::engine_costs(&route)?;
+            if costs.is_empty() {
+                println!("no recorded usage yet; runs and reviews populate this over time");
+                return Ok(());
+            }
+            let mut total = 0.0;
+            println!(
+                "  {:<16} {:>5} {:>8} {:>12} {:>12} {:>10}",
+                "engine", "runs", "accepted", "prompt tok", "completion", "cost"
+            );
+            for c in &costs {
+                total += c.estimated_cost_usd;
+                println!(
+                    "  {:<16} {:>5} {:>8} {:>12} {:>12} ${:>9.4}",
+                    c.engine,
+                    c.runs,
+                    c.accepted,
+                    c.prompt_tokens,
+                    c.completion_tokens,
+                    c.estimated_cost_usd
+                );
+            }
+            println!(
+                "  {:<16} {:>5} {:>8} {:>12} {:>12} ${:>9.4}",
+                "total", "", "", "", "", total
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a prompt from --prompt, --prompt-file, or piped stdin, in that order.
+fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<String> {
+    if let Some(prompt) = prompt {
+        return Ok(prompt);
+    }
+    if let Some(path) = prompt_file {
+        return std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()));
+    }
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text)?;
+        if !text.trim().is_empty() {
+            return Ok(text);
+        }
+    }
+    bail!("no prompt given; use --prompt, --prompt-file, or pipe one in on stdin")
 }
 
 fn channel(command: Channel) -> Result<()> {
