@@ -96,6 +96,9 @@ Two consequences worth caring about:
   approve or send work back from a browser.
 - **Recovery you can rehearse.** Encrypted continuity packs, and a drill command
   that proves you can come back from a wiped machine.
+- **Opt-in sandboxing.** Run each worker inside a fresh podman or docker
+  container, with a network-egress policy (`net = none | open | <name>`) — one
+  config line per project, at your direction.
 
 ## Two repositories, on purpose
 
@@ -166,10 +169,13 @@ weeks by strangers, which is the only thing that finds the last problems.
 **Not built yet.** PostgreSQL, RBAC, and workflow graphs are design targets, not
 implementations.
 
-**Not a sandbox.** Ferryman coordinates agents; it does not contain them. A
-worker runs with the privileges of the account that started it. Give each worker
-its own least-privilege account and its own disposable directory, or run it in
-the provided container.
+**Sandboxing is yours to turn on.** By default a worker runs with the privileges
+of the account that started it. Point `sandbox` at an image in `agent.toml` (or
+`ferry enable --sandbox IMAGE`) and Ferryman runs each worker inside a fresh
+podman or docker container instead, with a network-egress policy so a hermetic
+task can be cut off from the network entirely. The container path is built; the
+per-platform bind-mount wrinkles (SELinux, macOS, WSL) are still being smoothed
+out. If you don't direct it to sandbox, it doesn't.
 
 ## License
 
