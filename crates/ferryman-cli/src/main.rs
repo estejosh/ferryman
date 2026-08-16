@@ -2293,6 +2293,12 @@ fn loadmem(
     let bank = find_memory_bank(&start, route.as_ref());
     let log = find_durable_log(&start, &slug, route.as_ref());
 
+    // Refresh the derived roster so anyone reading roster.md sees the current
+    // profiles. Best-effort: it is a view, not the source of truth.
+    if let Some(bank_dir) = bank.as_deref() {
+        let _ = ferryman_channel::memory::regenerate_roster(bank_dir);
+    }
+
     // Record mode: append a note to one agent's specialization profile, then fall
     // through so the operator sees the updated profile.
     if let Some(note) = record {
@@ -2442,20 +2448,22 @@ fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
 }
 
 /// Append a dated note to one agent's specialization profile, creating the file
-/// and its `agents/` directory on first use.
+/// and its `agents/` directory on first use, then refresh the derived roster.
 fn record_agent_profile(bank: &std::path::Path, agent: &str, note: &str) -> Result<()> {
     let path = ferryman_channel::memory::agent_profile_path(bank, agent);
-    let Some(dir) = path.parent() else {
-        bail!("profile path {} has no parent", path.display());
+    // The very first record becomes the one-line summary; later records append a
+    // dated history line, so the summary stays readable in the roster.
+    let fresh = std::fs::read_to_string(&path)
+        .map(|text| text.trim().is_empty())
+        .unwrap_or(true);
+    let line = if fresh {
+        note.to_string()
+    } else {
+        format!("- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))
     };
-    std::fs::create_dir_all(dir)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .with_context(|| format!("open {} for append", path.display()))?;
-    use std::io::Write;
-    writeln!(file, "- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))?;
+    ferryman_channel::memory::append_agent_profile(bank, agent, &line)
+        .with_context(|| format!("append to {}", path.display()))?;
+    let _ = ferryman_channel::memory::regenerate_roster(bank);
     Ok(())
 }
 

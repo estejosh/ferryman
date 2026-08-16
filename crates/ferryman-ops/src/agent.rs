@@ -875,6 +875,7 @@ fn peer_roster_block(route: &ProjectRoute, agent: &str) -> String {
     }
     let mut out = String::from("Other agents on this project, and what they are practiced at:\n\n");
     for (peer, summary) in &peers {
+        let summary = ferryman_channel::memory::summarize(summary);
         if summary.is_empty() {
             out.push_str(&format!("- {peer}\n"));
         } else {
@@ -882,11 +883,30 @@ fn peer_roster_block(route: &ProjectRoute, agent: &str) -> String {
         }
     }
     out.push_str(
-        "\nIf a task is squarely in one of these agents' listed specialty and outside \
-         yours, say so plainly in your result (for example: \"agent 'claw' is better \
-         suited to this than I am\") so the operator can route it there.\n\n",
+        "\nIf this task is squarely in one of these agents' listed specialty and outside \
+         yours, say so plainly — in your result, or in your review reasoning — so the \
+         operator can route it there (for example: \"agent 'claw' is better suited to \
+         this than I am\").\n\n",
     );
     out
+}
+
+/// Append a dated line to this agent's own profile recording the task it just
+/// finished, so the profile accumulates a real "what I have practiced at" history
+/// without the agent having to remember. Best-effort: a memory write must never
+/// fail the run it records.
+fn record_agent_activity(route: &ProjectRoute, agent: &str, order_id: &str, summary: &str) {
+    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    let summary = ferryman_channel::memory::summarize(summary);
+    let line = if summary.is_empty() {
+        format!("- {} {order_id}", chrono::Utc::now().format("%Y-%m-%d"))
+    } else {
+        format!(
+            "- {} {order_id}: {summary}",
+            chrono::Utc::now().format("%Y-%m-%d")
+        )
+    };
+    let _ = ferryman_channel::memory::append_agent_profile(&bank, agent, &line);
 }
 
 /// The prompt for a first attempt or revision, without task-matched skills.
@@ -943,7 +963,7 @@ fn work_prompt_with_skills(config: &AgentConfig, task: &Task, skills_text: &str)
 }
 
 /// Ask for a verdict in a shape that can be parsed without guessing.
-fn review_prompt(config: &AgentConfig, task: &Task, revision: u32) -> String {
+fn review_prompt(config: &AgentConfig, task: &Task, revision: u32, roster: &str) -> String {
     let request = task
         .order
         .payload
@@ -960,7 +980,7 @@ fn review_prompt(config: &AgentConfig, task: &Task, revision: u32) -> String {
     with_preamble(
         config,
         format!(
-            "You are reviewing another agent's work.\n\n\
+            "{roster}You are reviewing another agent's work.\n\n\
              The task was:\n{request}\n\n\
              What was submitted:\n{submitted}\n\n\
              Decide whether this should be accepted or sent back for another revision. \
@@ -1318,6 +1338,19 @@ async fn do_work(
         "  {id}: submitted revision {revision}, signed by {}",
         config.agent
     ));
+    // Record the practice into this agent's own profile, so its specialization
+    // grows from what it actually did rather than what it remembers to note.
+    record_agent_activity(
+        route,
+        &config.agent,
+        id,
+        task.order
+            .payload
+            .get("task")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim(),
+    );
     Ok(())
 }
 
@@ -1379,10 +1412,13 @@ pub async fn review_once(
                 .unwrap_or_default()
                 .into_iter()
                 .collect();
+        // The reviewer sees the same peer roster, so it too can flag when another
+        // agent was better suited to the work it is judging.
+        let roster = peer_roster_block(route, &config.agent);
         let run = run_agent(
             config,
             &route.workspace,
-            &review_prompt(config, &task, revision),
+            &review_prompt(config, &task, revision, &roster),
             &credentials,
         )
         .await?;
@@ -1719,7 +1755,7 @@ mod tests {
         // preamble is present but that it is in front and the same every time.
         let config = config_with_preamble("REPO MAP\nsrc/ is the code.");
         let work = work_prompt(&config, &task_with(Vec::new(), Vec::new()));
-        let review = review_prompt(&config, &task_with(vec![result(1, "a")], Vec::new()), 1);
+        let review = review_prompt(&config, &task_with(vec![result(1, "a")], Vec::new()), 1, "");
 
         let expected = "REPO MAP\nsrc/ is the code.\n\n";
         assert!(work.starts_with(expected), "work prompt: {work}");
