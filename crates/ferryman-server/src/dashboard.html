@@ -104,8 +104,12 @@ tr[data-pid]:hover td{color:var(--accent)}
 #graph-panel:fullscreen{display:flex;flex-direction:column;height:100vh;background:var(--bg);padding:1rem}
 #graph-panel:fullscreen #graph-canvas{flex:1;height:auto;min-height:0}
 #graph-canvas{height:480px}
+#graph-panel{position:relative}
 #graph-panel.maximized{position:fixed;inset:0;z-index:30;background:var(--bg);padding:1rem;display:flex;flex-direction:column}
 #graph-panel.maximized #graph-canvas{height:auto;flex:1;min-height:0}
+.graph-tip{position:absolute;z-index:6;max-width:340px;background:var(--surface2);border:1px solid var(--accent);border-radius:8px;padding:.7rem;box-shadow:0 10px 30px rgba(0,0,0,.55)}
+.graph-tip .tip-close{float:right;cursor:pointer;color:var(--dim);font-size:15px;line-height:1}
+.graph-tip pre{white-space:pre-wrap;word-break:break-word;font-size:12px;margin:.3rem 0 0;max-height:16rem;overflow:auto}
 </style>
 </head>
 <body>
@@ -172,6 +176,7 @@ tr[data-pid]:hover td{color:var(--accent)}
     <div id="graph-panel">
       <div class="graph-bar"><div id="graph-summary" class="muted"></div><div class="graph-controls"><button id="zoomin" title="zoom in">+</button><button id="zoomout" title="zoom out">−</button><button id="maximize" title="maximize to window">⤢</button><button id="fullscreen" title="full screen">⛶</button><span id="zoomlabel" class="muted"></span></div></div>
       <svg id="graph-canvas" viewBox="0 0 900 480" preserveAspectRatio="xMidYMid meet" style="width:100%;background:var(--surface);border:1px solid var(--line);border-radius:10px;display:block"></svg>
+      <div id="graph-tip" class="graph-tip" style="display:none"></div>
     </div>
   </section>
 </main>
@@ -191,7 +196,7 @@ const STATES={open:{l:'open',c:'var(--dim)'},claimed:{l:'claimed',c:'var(--accen
 const stOf=t=>STATES[(t.state&&t.state.status)||'open']||{l:(t.state&&t.state.status)||'open',c:'var(--dim)'};
 const sigBadge=s=>s==='valid'?'<span class="badge ok">signed</span>':s==='unsigned'?'<span class="badge warn">unsigned</span>':'<span class="badge bad">'+esc(s)+'</span>';
 async function j(url){const r=await fetch(url);if(!r.ok)throw new Error(r.status+' '+url);return r.json();}
-let tasks=[],session=sessionStorage.getItem('ferry-dash-token')||null,operator=null,authMode='login',activeProject=null,graphNodes=[];
+let tasks=[],session=sessionStorage.getItem('ferry-dash-token')||null,operator=null,authMode='login',activeProject=null;
 function qs(base){return activeProject?base+'?project='+encodeURIComponent(activeProject):base;}
 function setProject(id){activeProject=(id&&id!=='__current__')?id:null;document.getElementById('viewing').style.display=activeProject?'':'none';document.getElementById('viewing-name').textContent=activeProject||'';refresh();document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));document.querySelector('#tabs button[data-tab="tasks"]').classList.add('active');document.getElementById('tab-tasks').classList.add('active');}
 function renderKpis(){
@@ -249,7 +254,6 @@ function renderMemory(m){
   document.getElementById('memory-files').querySelectorAll('.task-row').forEach(r=>r.onclick=()=>{const f=files[+r.dataset.mi];document.getElementById('memory-content').innerHTML='<h3 class="mono">'+esc(f.name)+'</h3><pre>'+esc(f.content)+'</pre>';});
   const g=m.graph;
   if(g&&g.nodes&&g.nodes.length){
-    graphNodes=g.nodes;
     document.getElementById('graph-summary').innerHTML='<b>'+g.nodes.length+'</b> nodes · <b>'+(g.links||[]).length+'</b> links — click a node for detail';
     if(!graphLayout||graphLayout.nodes.length!==g.nodes.length){renderGraphView(g.nodes,g.links||[]);}
   }else{
@@ -283,13 +287,13 @@ function drawGraph(){
   const svg=document.getElementById('graph-canvas');if(!graphLayout)return;
   const byId={};graphLayout.nodes.forEach(n=>byId[n.id]=n);
   let s='<g transform="translate('+graphPanX+' '+graphPanY+') translate('+(graphLayout.W/2)+' '+(graphLayout.H/2)+') scale('+graphZoom+') translate('+(-graphLayout.W/2)+' '+(-graphLayout.H/2)+')">';
-  graphLayout.edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];s+='<line x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'" stroke="#54637c" stroke-width="1"/>';});
+  graphLayout.edges.forEach(e=>{const a=byId[e[0]],b=byId[e[1]];s+='<line x1="'+a.x+'" y1="'+a.y+'" x2="'+b.x+'" y2="'+b.y+'" stroke="#7b96bb" stroke-width="1.5" stroke-opacity="0.9"/>';});
   graphLayout.nodes.forEach(n=>{s+='<circle cx="'+n.x+'" cy="'+n.y+'" r="4" fill="'+commColor(n.community)+'" data-id="'+esc(n.id)+'" style="cursor:pointer"/><text x="'+(n.x+6)+'" y="'+(n.y+3)+'" font-size="10" fill="#aeb9ca">'+esc(n.label)+'</text>';});
   s+='</g>';svg.innerHTML=s;
-  svg.querySelectorAll('circle').forEach(c=>c.onclick=()=>showGraphNodeById(c.dataset.id));
+  svg.querySelectorAll('circle').forEach(c=>c.onclick=()=>showGraphTip(c.dataset.id));
   document.getElementById('zoomlabel').textContent=Math.round(graphZoom*100)+'%';
 }
-function graphZoomBy(f){graphZoom=Math.max(0.4,Math.min(3,graphZoom*f));drawGraph();}
+function graphZoomBy(f){graphZoom=Math.max(0.2,Math.min(10,graphZoom*f));drawGraph();}
 function svgPoint(svg,e){const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;const ctm=svg.getScreenCTM();if(!ctm)return{x:e.clientX,y:e.clientY};const p=pt.matrixTransform(ctm.inverse());return{x:p.x,y:p.y};}
 function attachGraphPan(){
   const svg=document.getElementById('graph-canvas');
@@ -300,13 +304,25 @@ function attachGraphPan(){
   const end=()=>{dragging=false;svg.style.cursor='grab';};
   svg.addEventListener('pointerup',end);
   svg.addEventListener('pointercancel',end);
-  svg.addEventListener('wheel',e=>{e.preventDefault();if(!graphLayout)return;const p=svgPoint(svg,e);const f=e.deltaY<0?1.15:0.87;const z2=Math.max(0.4,Math.min(3,graphZoom*f));const cx=graphLayout.W/2,cy=graphLayout.H/2;const cxp=(p.x-graphPanX-cx)/graphZoom+cx,cyp=(p.y-graphPanY-cy)/graphZoom+cy;graphPanX=p.x-cx-z2*(cxp-cx);graphPanY=p.y-cy-z2*(cyp-cy);graphZoom=z2;drawGraph();},{passive:false});
+  svg.addEventListener('wheel',e=>{e.preventDefault();if(!graphLayout)return;const p=svgPoint(svg,e);const f=e.deltaY<0?1.15:0.87;const z2=Math.max(0.2,Math.min(10,graphZoom*f));const cx=graphLayout.W/2,cy=graphLayout.H/2;const cxp=(p.x-graphPanX-cx)/graphZoom+cx,cyp=(p.y-graphPanY-cy)/graphZoom+cy;graphPanX=p.x-cx-z2*(cxp-cx);graphPanY=p.y-cy-z2*(cyp-cy);graphZoom=z2;drawGraph();},{passive:false});
 }
-function showGraphNodeById(id){const i=graphNodes.findIndex(n=>n.id===id);if(i>=0)showGraphNode(i);}
-function showGraphNode(i){
-  const n=graphNodes[i];if(!n)return;
-  document.getElementById('memory-content').innerHTML='<h3 class="mono">'+esc(n.label)+'</h3><div class="muted">'+esc(n.type||'')+' · community '+(n.community??'—')+'</div>'+(n.file?'<div class="muted">file: <span class="mono">'+esc(n.file)+'</span></div>':'')+(n.file_type?'<div class="muted">kind: '+esc(n.file_type)+'</div>':'')+'<pre>'+esc(n.summary||'')+'</pre>';
+function nodeScreenPoint(n){
+  const svg=document.getElementById('graph-canvas');const pt=svg.createSVGPoint();
+  const cx=graphLayout.W/2,cy=graphLayout.H/2;
+  const sx=graphPanX+cx+graphZoom*(n.x-cx),sy=graphPanY+cy+graphZoom*(n.y-cy);
+  pt.x=sx;pt.y=sy;const ctm=svg.getScreenCTM();if(!ctm)return{x:sx,y:sy};
+  const p=pt.matrixTransform(ctm);return{x:p.x,y:p.y};
 }
+function showGraphTip(id){
+  const n=graphLayout.nodes.find(x=>x.id===id);if(!n)return;
+  const tip=document.getElementById('graph-tip');
+  const p=nodeScreenPoint(n);const pr=document.getElementById('graph-panel').getBoundingClientRect();
+  tip.innerHTML='<span class="tip-close" onclick="hideGraphTip()">×</span><div class="mono" style="font-weight:600">'+esc(n.label)+'</div><div class="muted">'+esc(n.type||'')+' · community '+(n.community??'—')+'</div>'+(n.file?'<div class="muted">file: <span class="mono">'+esc(n.file)+'</span></div>':'')+(n.file_type?'<div class="muted">kind: '+esc(n.file_type)+'</div>':'')+'<pre>'+esc(n.summary||'')+'</pre>';
+  tip.style.display='block';
+  tip.style.left=Math.max(8,Math.min(pr.width-350,p.x-pr.left+14))+'px';
+  tip.style.top=Math.max(8,p.y-pr.top+14)+'px';
+}
+function hideGraphTip(){document.getElementById('graph-tip').style.display='none';}
 function renderLedger(d){document.getElementById('ledger-body').innerHTML=(d.entries||[]).map(e=>'<tr><td class="muted mono">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No ledger entries yet — they appear as work is issued and reviewed.</div></td></tr>';}
 function renderLearnings(l){document.getElementById('learnings-body').innerHTML=l.map(x=>'<tr><td class="muted mono">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">Nothing learned yet — learnings appear when agents record what worked.</div></td></tr>';}
 async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j(qs('/api/tasks'));renderKpis();renderTasks();renderMachines(await j(qs('/api/roster')));renderFleet(await j('/api/fleet'));renderMemory(await j('/api/memory'));renderEngines(await j(qs('/api/stats')));renderLedger(await j(qs('/api/ledger')));renderLearnings(await j(qs('/api/learnings')));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
