@@ -34,6 +34,10 @@ pub struct Learning {
     /// compare engines without an identity, so this is empty for `source = "eval"`.
     #[serde(default)]
     pub agent: Option<String>,
+    /// The model that produced the work, e.g. `deepseek-v4-pro`, when the agent
+    /// declared one. More specific than `engine` (which is the CLI command).
+    #[serde(default)]
+    pub model: Option<String>,
     /// The order/task it was for.
     pub task_id: String,
     /// `eval` for benchmark runs, `live` for real accepted/rejected work.
@@ -201,6 +205,12 @@ pub fn record_outcome(
             at: Utc::now(),
             engine,
             agent: Some(result.agent.clone()),
+            model: result
+                .payload
+                .get("model")
+                .and_then(|v| v.as_str())
+                .filter(|m| !m.is_empty())
+                .map(str::to_string),
             task_id: order_id.to_string(),
             source: "live".to_string(),
             accepted,
@@ -234,6 +244,7 @@ mod tests {
             at: Utc::now(),
             engine: engine.into(),
             agent: None,
+            model: None,
             task_id: "t-1".into(),
             source: "eval".into(),
             accepted,

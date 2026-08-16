@@ -146,6 +146,7 @@ pub async fn run_bench(
                     at: chrono::Utc::now(),
                     engine: engine.name.clone(),
                     agent: None,
+                    model: None,
                     task_id: task.id.clone(),
                     source: "eval".to_string(),
                     accepted,

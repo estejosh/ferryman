@@ -175,6 +175,10 @@ pub struct AgentConfig {
     /// prompt; everything else is untouched, so a different CLI's flags need a config
     /// edit rather than a new build.
     pub args: Vec<String>,
+    /// The model this agent runs, e.g. `deepseek-v4-pro`. Recorded on every result
+    /// so the fleet's cost estimator can credit measured quality to the right
+    /// engine, independently of the agent's stable machine-based nickname.
+    pub model: Option<String>,
     /// A container image to run the agent CLI inside, if any. Empty means the
     /// agent runs directly on the host with this user's full privileges.
     pub runner: Runner,
@@ -315,6 +319,7 @@ impl AgentConfig {
                 .unwrap_or_else(|| "worker".to_string()),
             command: take("command")?,
             args,
+            model: fields.get("model").cloned().filter(|m| !m.is_empty()),
             runner: Runner::parse(&fields.get("sandbox").cloned().unwrap_or_default())?,
             worktree: match fields.get("worktree").map(String::as_str) {
                 None | Some("false") => false,
@@ -377,6 +382,12 @@ role = "{role}"
 # argument is passed through untouched.
 command = "{command}"
 args = {args}
+
+# The model this agent runs, e.g. "deepseek-v4-pro". Recorded on every result so
+# the fleet's cost estimator can credit measured quality to the right engine,
+# independent of this agent's stable machine-based nickname. Leave unset if the
+# command above already names the model.
+# model = "deepseek-v4-pro"
 
 # Where the agent CLI runs. Empty (the default) or "none" runs it directly on
 # the host, with your full privileges. Otherwise it runs inside a container
@@ -1311,6 +1322,9 @@ async fn do_work(
         "produced_by": config.command,
         "worktree_branch": branch,
     });
+    if let Some(model) = &config.model {
+        payload["model"] = json!(model);
+    }
     if used_worktree {
         if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, &branch) {
             payload["worktree_head"] = json!(head);

@@ -313,7 +313,12 @@ fn measured_quality(route: &ProjectRoute, engine_key: &str) -> Option<(f64, usiz
             .as_deref()
             .map(|a| a.to_ascii_lowercase().contains(&key))
             .unwrap_or(false);
-        if engine_matches || agent_matches {
+        let model_matches = learning
+            .model
+            .as_deref()
+            .map(|m| m.to_ascii_lowercase().contains(&key))
+            .unwrap_or(false);
+        if engine_matches || agent_matches || model_matches {
             total += 1;
             if learning.accepted {
                 accepted += 1;
@@ -495,6 +500,7 @@ mod tests {
             at: chrono::Utc::now(),
             engine: engine.into(),
             agent: None,
+            model: None,
             task_id: "t-1".into(),
             source: "eval".into(),
             accepted,
@@ -691,6 +697,24 @@ mod tests {
         assert_eq!(total, 1);
         assert_eq!(accepted, 1);
         assert!((score - 2.0 / 3.0).abs() < 1e-9); // (1+1)/(1+2)
+    }
+
+    #[test]
+    fn measured_quality_matches_the_declared_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        let rates = Rates::defaults();
+        // A stable agent nickname with a declared model: the model field is what
+        // credits the engine family, not the nickname.
+        let mut l = learning("cline", true);
+        l.source = "live".into();
+        l.agent = Some("grouchly".into());
+        l.model = Some("deepseek-v4-pro".into());
+        crate::learning::record_learning(&route, &l).unwrap();
+        let (_, measured, total, accepted) = effective_quality(&route, &rates, "deepseek");
+        assert!(measured);
+        assert_eq!(total, 1);
+        assert_eq!(accepted, 1);
     }
 
     #[test]
