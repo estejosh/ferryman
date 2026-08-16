@@ -228,6 +228,43 @@ pub fn project_cost(
         / 1_000_000.0
 }
 
+/// A rough model-capability score in [0, 1], for the project-quality estimate.
+/// Static and approximate — a quality *hint*, not a benchmark result, and it
+/// drifts as vendors ship new models. Matching is by name substring, like prices.
+#[must_use]
+pub fn quality_for(engine: &str) -> f64 {
+    let key = engine.to_ascii_lowercase();
+    if key.contains("o1") || key.contains("o3") || key.contains("o4") {
+        0.95
+    } else if key.contains("claude") {
+        0.90
+    } else if key.contains("gpt-4o") && !key.contains("mini") {
+        0.85
+    } else if key.contains("deepseek") {
+        0.78
+    } else if key.contains("gpt-4o-mini") {
+        0.65
+    } else {
+        0.70
+    }
+}
+
+/// A qualitative label for a capability score.
+#[must_use]
+pub fn quality_label(score: f64) -> &'static str {
+    if score >= 0.90 {
+        "frontier"
+    } else if score >= 0.80 {
+        "strong"
+    } else if score >= 0.70 {
+        "capable"
+    } else if score >= 0.60 {
+        "basic"
+    } else {
+        "weak"
+    }
+}
+
 /// The published price families, for a `ferry cost rates` listing. Prices are per
 /// million tokens. Unknown engines fall back to the default family.
 #[must_use]
@@ -522,6 +559,17 @@ mod tests {
         let cost = project_cost(&rates, "deepseek", 45000, 37500);
         // (45000*0.27 + 37500*1.10) / 1e6 = (12150 + 41250) / 1e6.
         assert!((cost - 0.0534).abs() < 1e-9);
+    }
+
+    #[test]
+    fn quality_is_a_static_capability_hint() {
+        assert!(quality_for("o3-mini") > quality_for("claude-sonnet-4-5"));
+        assert!(quality_for("claude") > quality_for("deepseek"));
+        assert!(quality_for("gpt-4o") > quality_for("gpt-4o-mini"));
+        assert_eq!(quality_label(0.95), "frontier");
+        assert_eq!(quality_label(0.85), "strong");
+        assert_eq!(quality_label(0.78), "capable");
+        assert_eq!(quality_label(0.65), "basic");
     }
 
     #[test]

@@ -581,12 +581,15 @@ async fn cost_plan(
         .iter()
         .map(|(family, _, _)| {
             let key = family.split_whitespace().next().unwrap_or(family);
+            let quality = ferryman_channel::cost::quality_for(key);
             json!({
                 "family": family,
                 "key": key,
                 "estimated_cost_usd": ferryman_channel::cost::project_cost(
                     &rates, key, prompt_tokens, completion_tokens
                 ),
+                "quality": quality,
+                "quality_label": ferryman_channel::cost::quality_label(quality),
             })
         })
         .collect::<Vec<_>>();

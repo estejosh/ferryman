@@ -2748,7 +2748,7 @@ fn cost_command(command: Cost) -> Result<()> {
                 ferryman_channel::cost::REVISION_FACTOR
             );
             println!();
-            println!("  {:<22} {:>12}", "engine", "est. cost");
+            println!("  {:<22} {:>12} {:>18}", "engine", "est. cost", "quality");
             for (family, _, _) in ferryman_channel::cost::published_rates() {
                 let key = family.split_whitespace().next().unwrap_or(family);
                 let cost = ferryman_channel::cost::project_cost(
@@ -2757,10 +2757,16 @@ fn cost_command(command: Cost) -> Result<()> {
                     prompt_tokens,
                     completion_tokens,
                 );
-                println!("  {family:<22} ${cost:>11.2}");
+                let quality = ferryman_channel::cost::quality_for(key);
+                println!(
+                    "  {family:<22} ${cost:>11.2} {:>12} ({quality:.2})",
+                    ferryman_channel::cost::quality_label(quality)
+                );
             }
             println!();
             println!("  an estimate, not a bid — recorded spend is in `ferry cost project`.");
+            println!("  quality is a static model-capability hint; your own accepted/sent-back");
+            println!("  rate becomes the measured signal once the project has run work.");
         }
         Cost::Project { workspace } => {
             let start = match workspace {
