@@ -250,7 +250,11 @@ fn master_agent(route: &ProjectRoute) -> Result<Option<AgentRoute>> {
     Ok(route
         .agents
         .iter()
-        .find(|agent| agent.name == declaration.master)
+        // Case-insensitive against the DECLARATION, which is stored data: a
+        // master declared before names were folded names itself however it was
+        // typed, and losing the master over capitalisation would take the
+        // channel's root of trust with it.
+        .find(|agent| agent.name.eq_ignore_ascii_case(&declaration.master))
         .cloned())
 }
 

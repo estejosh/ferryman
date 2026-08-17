@@ -277,8 +277,14 @@ impl ProjectRoute {
             if agent.name.len() > 128 || agent.role.len() > 128 {
                 bail!("registered participant name or role exceeds 128 bytes")
             }
-            if !names.insert(&agent.name) {
-                bail!("registered participant names must be unique")
+            // Grouchly's catch, kept as the backstop for the fold. `route.agents` is
+            // built by `read_agent_roster`, which folds case variants away, so two
+            // spellings should be impossible by the time validation runs - and that is
+            // exactly what makes this worth asserting. If it ever fires, the fold has a
+            // hole in it and the channel says so instead of quietly routing to one of
+            // two agents that are supposed to be one.
+            if !names.insert(canonical_agent_name(&agent.name)) {
+                bail!("registered participant names must be unique, ignoring case")
             }
             if agent.capabilities.len() > 128
                 || agent
@@ -2640,6 +2646,62 @@ mod portable_auth_route_tests {
         );
     }
 
+    /// Grouchly's test, kept verbatim in intent: a route that somehow carries both
+    /// spellings must refuse to route rather than pick one. With the fold in
+    /// `read_agent_roster` this should be unreachable through any real path, which is
+    /// the point of asserting it - it is how we find out if the fold ever regresses.
+    #[test]
+    fn participant_names_are_case_insensitively_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        route.agents = vec![
+            AgentRoute {
+                name: "grouchly".into(),
+                role: "orchestrator".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+            },
+            AgentRoute {
+                name: "Grouchly".into(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+            },
+        ];
+        let error = route.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("ignoring case"));
+    }
+
+    /// Grouchly's other test, and the bug that actually broke the live channel: a
+    /// Syncthing conflict copy names the same agent, so it was read as a second one.
+    #[test]
+    fn roster_ignores_syncthing_conflict_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(
+            agents.join("beastly.json"),
+            r#"{"name":"beastly","role":"orchestrator","capabilities":[],"public_key":"aa"}"#,
+        )
+        .unwrap();
+        // The conflict copy is the older, KEYLESS one - so reading it was not merely
+        // double-counting, it could displace the real agent's published key.
+        std::fs::write(
+            agents.join("beastly.sync-conflict-20260817-144138-O4SHF2J.json"),
+            r#"{"name":"beastly","role":"orchestrator","capabilities":[]}"#,
+        )
+        .unwrap();
+
+        let roster = read_roster_in(&agents).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].name, "beastly");
+        assert_eq!(
+            roster[0].public_key.as_deref(),
+            Some("aa"),
+            "the real entry survived, not the keyless conflict copy"
+        );
+    }
+
     /// Addressing and sending use the folded name whatever the operator typed.
     #[test]
     fn addressing_an_agent_is_case_insensitive() {
@@ -2921,6 +2983,24 @@ fn read_roster_in(directory: &Path) -> Result<Vec<AgentRoute>> {
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        // Grouchly's find, and the more valuable half of the two fixes: a Syncthing
+        // conflict copy of an agent file was being read as a SECOND participant. It
+        // carries the same `name`, so the roster held two `beastly` entries - and the
+        // conflict copy is usually the older, keyless one, so it could displace the real
+        // key. That is what actually broke this channel with "registered participant
+        // names must be unique"; the capitalisation split was a separate fault that
+        // happened to look similar.
+        //
+        // `ledger.rs` already skipped these for the same reason. The primitive existed
+        // and this code reached past it, which by now is the most familiar shape of
+        // defect in this codebase.
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".sync-conflict-"))
+        {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else {
