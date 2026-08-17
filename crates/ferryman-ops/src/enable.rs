@@ -141,10 +141,16 @@ pub fn perform(request: Request) -> Result<Outcome> {
     if !ferryman_channel::is_safe_component(&project) {
         bail!("project id '{project}' is not a path-safe identifier")
     }
-    let agent_name = match request.agent {
+    // Both arms already fold case - `slug` lowercases, and `machine_name` slugs the
+    // hostname - so this wrapper changes nothing today. It is here because those are two
+    // functions in another crate that happen to agree, and the guarantee this line needs
+    // is that the name is canonical, not that two helpers stay in step forever. The
+    // channel folds again on write; this keeps the local `agent.toml` and key file
+    // agreeing with what gets published.
+    let agent_name = ferryman_channel::canonical_agent_name(&match request.agent {
         Some(name) => slug(&name),
         None => machine_name()?,
-    };
+    });
     if !ferryman_channel::is_safe_component(&agent_name) {
         bail!("agent name '{agent_name}' is not a path-safe identifier")
     }

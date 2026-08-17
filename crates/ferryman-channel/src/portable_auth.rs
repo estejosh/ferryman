@@ -334,8 +334,11 @@ impl MessageV2 {
             idempotency_key: id.clone(),
             id,
             project_id: project_id.into(),
-            sender: sender.into(),
-            recipient: recipient.into(),
+            // Same folding as v1: an agent name is one identity regardless of how it was
+            // typed, and `grant.authorize(project, sender)` below matches the sender
+            // against a grant's roles by string.
+            sender: crate::canonical_agent_name(&sender.into()),
+            recipient: crate::canonical_agent_name(&recipient.into()),
             created_at,
             acknowledgement_deadline: created_at + chrono::Duration::seconds(30),
             payload_reference: payload_reference.into(),

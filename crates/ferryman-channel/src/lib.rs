@@ -304,7 +304,7 @@ impl ProjectRoute {
 
     pub fn permits(&self, recipient: &str, capability: Option<&str>) -> bool {
         self.agents.iter().any(|agent| {
-            (agent.name == recipient || agent.role == recipient)
+            (agent.name.eq_ignore_ascii_case(recipient) || agent.role == recipient)
                 && capability
                     .is_none_or(|required| agent.capabilities.iter().any(|item| item == required))
         })
@@ -398,8 +398,12 @@ impl Message {
             idempotency_key: idempotency_key.unwrap_or_else(|| id.clone()),
             id,
             project_id: project_id.into(),
-            sender: sender.into(),
-            recipient: recipient.into(),
+            // Folded here rather than at the twenty-odd places that compare them. Both
+            // fields hold either an agent name or a role, and roles are lowercase
+            // already, so this is a no-op for everything except the case that was
+            // broken. Doing it before signing keeps the signature over what is stored.
+            sender: canonical_agent_name(&sender.into()),
+            recipient: canonical_agent_name(&recipient.into()),
             created_at,
             acknowledgement_deadline: created_at + acknowledgement_timeout,
             payload_reference: payload_reference.into(),
@@ -1135,13 +1139,16 @@ pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
                     .order
                     .assigned_to
                     .as_deref()
-                    .is_none_or(|assignee| assignee == agent)
+                    .is_none_or(|assignee| assignee.eq_ignore_ascii_case(agent))
                 {
                     out.push(task);
                 }
             }
             TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
-                if task.holder() == Some(agent) {
+                if task
+                    .holder()
+                    .is_some_and(|held| held.eq_ignore_ascii_case(agent))
+                {
                     out.push(task);
                 }
             }
@@ -1219,6 +1226,11 @@ impl AgentIdentity {
         if !is_safe_component(name) {
             bail!("agent name must be a path-safe identifier")
         }
+        // One spelling, everywhere. See `canonical_agent_name`: the name is a filename in
+        // three stores, and on a case-sensitive filesystem `Grouchly` and `grouchly` were
+        // two identities with two keys. Folded here, at the point a key is minted, so no
+        // new split can be created; `from_state_file` adopts the ones already on disk.
+        let name = &canonical_agent_name(name);
         // An identity that has already signed things must never change. A project with
         // its own key keeps it, even though a machine-wide key exists: swapping it would
         // make this agent sign as a key the roster has not seen, and the roster - rightly
@@ -1267,23 +1279,66 @@ impl AgentIdentity {
     }
 
     fn key_path(name: &str, state_dir: &Path) -> PathBuf {
+        let name = canonical_agent_name(name);
         state_dir.join("keys").join(format!("{name}.key"))
     }
 
+    /// A key file on disk written under a different capitalisation of this same name.
+    ///
+    /// Only consulted when the canonical path is absent, which is exactly the upgrade
+    /// case: a machine that joined as `Grouchly` has `keys/Grouchly.key` and nothing
+    /// else. Without this it would find no key under the folded name and **mint a new
+    /// one** - a second key under a name the roster already knows, which is the single
+    /// worst thing this code can do, and precisely what `load_existing` exists to
+    /// prevent. Adopt, never rotate.
+    fn case_variant_key_path(name: &str, state_dir: &Path) -> Option<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(state_dir.join("keys"))
+            .ok()?
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                let stem = path.file_stem()?.to_str()?;
+                (path.extension().is_some_and(|ext| ext == "key")
+                    && canonical_agent_name(stem) == name)
+                    .then_some(path)
+            })
+            .collect();
+        // Sorted so a machine that somehow holds `Grouchly.key` and `GROUCHLY.key` picks
+        // the same one on every run rather than whichever the directory listing happened
+        // to yield. Deterministically wrong beats non-deterministically wrong: the
+        // operator sees one stable public key and can act on it.
+        found.sort();
+        found.into_iter().next()
+    }
+
     fn from_state_file(name: &str, state_dir: &Path) -> Result<Option<Self>> {
-        let path = Self::key_path(name, state_dir);
-        if !path.is_file() {
-            return Ok(None);
-        }
+        let name = &canonical_agent_name(name);
+        let canonical = Self::key_path(name, state_dir);
+        let (path, adopted) = if canonical.is_file() {
+            (canonical, false)
+        } else {
+            match Self::case_variant_key_path(name, state_dir) {
+                Some(variant) => (variant, true),
+                None => return Ok(None),
+            }
+        };
         let encoded = fs::read_to_string(&path)?;
         let bytes = hex::decode(encoded.trim())
             .with_context(|| format!("{} is not a valid key", path.display()))?;
         let bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("{} is not a 32-byte key", path.display()))?;
+        let signing = SigningKey::from_bytes(&bytes);
+        if adopted {
+            // Write the same key under the canonical name so the next run finds it
+            // directly and the scan above becomes dead weight rather than load-bearing.
+            // Best-effort: a read-only state directory must still yield the identity it
+            // already holds, and the old file is left in place so an older `ferry` on
+            // this machine keeps working.
+            let _ = Self::write_state_file(name, state_dir, &signing);
+        }
         Ok(Some(Self {
             name: name.to_string(),
-            signing: SigningKey::from_bytes(&bytes),
+            signing,
         }))
     }
 
@@ -1317,7 +1372,7 @@ impl AgentIdentity {
     #[must_use]
     pub fn from_seed(name: &str, seed: [u8; 32]) -> Self {
         Self {
-            name: name.to_string(),
+            name: canonical_agent_name(name),
             signing: SigningKey::from_bytes(&seed),
         }
     }
@@ -1482,7 +1537,14 @@ fn check_signature(
     let (Some(signed_by), Some(signature_hex)) = (signed_by, signature) else {
         return SignatureCheck::Unsigned;
     };
-    let Some(agent) = roster.iter().find(|a| &a.name == signed_by) else {
+    // Case-insensitive, because a message already in flight was signed under whatever
+    // spelling its sender used. The roster it is checked against is folded, so an exact
+    // match would report a perfectly good signature from `Grouchly` as `UnknownSigner` -
+    // turning an upgrade into a fleet-wide impersonation alarm.
+    let Some(agent) = roster
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(signed_by))
+    else {
         return SignatureCheck::UnknownSigner;
     };
     let Some(known_key) = agent.public_key.as_ref().filter(|k| !k.is_empty()) else {
@@ -2439,6 +2501,173 @@ mod portable_auth_route_tests {
         assert!(!revoke_trusted_signer(&route, &signer_id).unwrap());
         assert!(verify_v2_message(&route, &message).is_err());
     }
+
+    /// A machine that joined as `Grouchly` must keep the key it already signed with.
+    ///
+    /// This is the whole risk in folding names: the key store is `keys/<name>.key`, so a
+    /// folded lookup finds nothing where an unfolded one found a key, and
+    /// `load_or_create` would happily mint a fresh one. That new key would be published
+    /// under a name the fleet already has a key for, and every machine would - correctly
+    /// - read the result as an impostor. Adopt, never rotate.
+    #[test]
+    fn a_key_stored_under_the_old_capitalisation_is_adopted_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let keys = dir.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let established = SigningKey::from_bytes(&seed);
+        std::fs::write(
+            keys.join("Grouchly.key"),
+            hex::encode(established.to_bytes()),
+        )
+        .unwrap();
+
+        // Asked for under either spelling, it is the same key - the one already on disk.
+        for asked in ["grouchly", "Grouchly", "GROUCHLY"] {
+            let identity = AgentIdentity::load_or_create_in(
+                asked,
+                dir.path(),
+                Some(machine.path().to_path_buf()),
+            )
+            .unwrap();
+            assert_eq!(
+                identity.public_key_hex(),
+                hex::encode(established.verifying_key().to_bytes()),
+                "asking as '{asked}' minted a new key instead of adopting the existing one"
+            );
+            assert_eq!(identity.name(), "grouchly", "the name itself is folded");
+        }
+
+        // And it was written under the canonical name, so the variant scan stops being
+        // load-bearing after the first run.
+        assert!(keys.join("grouchly.key").is_file());
+    }
+
+    /// Both spellings in the roster are one agent, and the entry that survives is the
+    /// one current code wrote.
+    #[test]
+    fn a_roster_holding_both_spellings_reports_one_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let agents = route.communications.join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+
+        let write = |file: &str, name: &str, key: &str| {
+            std::fs::write(
+                agents.join(file),
+                serde_json::to_vec_pretty(&AgentRoute {
+                    name: name.into(),
+                    role: "worker".into(),
+                    capabilities: Vec::new(),
+                    public_key: Some(key.into()),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        // The stale entry from before folding, and the live one written since.
+        write("Grouchly.json", "Grouchly", &"aa".repeat(32));
+        write("grouchly.json", "grouchly", &"bb".repeat(32));
+
+        let roster = read_agent_roster(&route.communications).unwrap();
+        assert_eq!(roster.len(), 1, "two spellings are one agent");
+        assert_eq!(roster[0].name, "grouchly");
+        assert_eq!(
+            roster[0].public_key.as_deref(),
+            Some("bb".repeat(32).as_str()),
+            "the canonically-stored entry is the live one and must win"
+        );
+
+        // A message signed under the OLD spelling still verifies against the folded
+        // roster: it was signed before the upgrade and is legitimately in flight.
+        assert_ne!(
+            check_signature(
+                Some(&"Grouchly".to_string()),
+                Some(&String::new()),
+                "payload",
+                &roster,
+            ),
+            SignatureCheck::UnknownSigner,
+            "folding the roster must not turn an old sender into an unknown one"
+        );
+    }
+
+    /// A keyless reservation from `ferry channel expect` must not displace the real
+    /// agent, whichever order the directory listing happens to yield.
+    #[test]
+    fn a_reservation_never_outranks_the_agent_that_holds_the_key() {
+        let reservation = AgentRoute {
+            name: "grouchly".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: None,
+        };
+        let real = AgentRoute {
+            name: "Grouchly".into(),
+            public_key: Some("cc".repeat(32)),
+            ..reservation.clone()
+        };
+        for input in [
+            vec![reservation.clone(), real.clone()],
+            vec![real.clone(), reservation.clone()],
+        ] {
+            let folded = fold_case_variants(input);
+            assert_eq!(folded.len(), 1);
+            assert_eq!(folded[0].name, "grouchly");
+            assert_eq!(
+                folded[0].public_key.as_deref(),
+                Some("cc".repeat(32).as_str())
+            );
+        }
+    }
+
+    /// Registering under any spelling writes exactly one file, under the folded name.
+    #[test]
+    fn registering_a_mixed_case_name_writes_the_folded_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        let path = register_expected_agent(&route, "Grouchly", "worker", &[]).unwrap();
+        assert_eq!(path.file_name().unwrap(), "grouchly.json");
+
+        let roster = read_agent_roster(&route.communications).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            roster[0].name, "grouchly",
+            "the name inside the file is folded too, not just the filename"
+        );
+    }
+
+    /// Addressing and sending use the folded name whatever the operator typed.
+    #[test]
+    fn addressing_an_agent_is_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = ProjectRoute {
+            agents: vec![AgentRoute {
+                name: "grouchly".into(),
+                role: "worker".into(),
+                capabilities: vec!["build".into()],
+                public_key: None,
+            }],
+            ..test_route(dir.path())
+        };
+        assert!(route.permits("Grouchly", Some("build")));
+        assert!(route.permits("GROUCHLY", None));
+
+        let message = Message::new(
+            "ferryman",
+            "Beastly",
+            "Grouchly",
+            "r",
+            serde_json::json!({}),
+            false,
+            None,
+        );
+        assert_eq!(message.sender, "beastly");
+        assert_eq!(message.recipient, "grouchly");
+    }
 }
 
 /// Publish an agent, refusing to overwrite an established key with a different one.
@@ -2452,14 +2681,14 @@ pub fn register_agent_key(
     identity: &AgentIdentity,
 ) -> Result<PathBuf> {
     let published = AgentRoute {
-        name: agent.name.clone(),
+        name: canonical_agent_name(&agent.name),
         role: agent.role.clone(),
         capabilities: agent.capabilities.clone(),
         public_key: Some(identity.public_key_hex()),
     };
     if let Some(existing) = read_agent_roster(&route.communications)?
         .into_iter()
-        .find(|a| a.name == published.name)
+        .find(|a| canonical_agent_name(&a.name) == published.name)
         && let Some(known) = existing.public_key.filter(|k| !k.is_empty())
         && Some(&known) != published.public_key.as_ref()
     {
@@ -2482,7 +2711,7 @@ pub fn register_agent_key(
 
 /// One roster entry, written atomically.
 fn write_roster_entry(directory: &Path, agent: &AgentRoute) -> Result<PathBuf> {
-    let path = directory.join(format!("{}.json", agent.name));
+    let path = directory.join(format!("{}.json", canonical_agent_name(&agent.name)));
     fs::create_dir_all(directory)?;
     let temporary = path.with_extension("tmp");
     fs::write(&temporary, serde_json::to_vec_pretty(agent)?)?;
@@ -2587,14 +2816,64 @@ fn bridge_field(attachment: &Path, key: &str) -> String {
 /// A malformed entry is skipped rather than fatal: one agent writing nonsense must not
 /// stop the rest of the fleet from talking.
 fn pin_path(attachment: &Path, name: &str) -> PathBuf {
+    let name = canonical_agent_name(name);
     attachment.join("agents-pinned").join(format!("{name}.key"))
+}
+
+/// Collapse capitalisation variants of one agent into the single entry that agent is.
+///
+/// Ferryman channels that predate the folding rule contain both spellings as separate
+/// files - a live one written by current code and a stale one from before - and the
+/// stale entry carries a key that nothing signs with any more. Deleting it is not this
+/// function's business: the synced folder is one-writer-per-path, and the writer of
+/// `agents/Grouchly.json` is grouchly, not whoever happens to be reading. So it is
+/// folded away on read instead, everywhere, and the file may be removed at leisure.
+///
+/// Which survives, in order:
+///  1. an entry carrying a key, over a keyless one. A keyless entry is a reservation
+///     made by `register_expected_agent` for an agent that has not come online yet;
+///     a key is proof that a machine actually holds this identity, and no spelling
+///     convention outranks that. Getting this the other way round - preferring the
+///     canonical filename first - let a `ferry channel expect grouchly` reservation
+///     erase the real `Grouchly`'s published key, which is the fold doing exactly the
+///     damage it exists to prevent.
+///  2. among keyed entries, the one already stored under the canonical spelling: that
+///     is current code writing, so it is the identity in use now rather than the
+///     leftover from before.
+///
+/// Order within the input is otherwise preserved, so a roster's own ordering still
+/// decides ties rather than the directory listing.
+fn fold_case_variants(agents: Vec<AgentRoute>) -> Vec<AgentRoute> {
+    fn rank(agent: &AgentRoute) -> u8 {
+        let canonical = agent.name == canonical_agent_name(&agent.name);
+        let keyed = agent.public_key.as_ref().is_some_and(|key| !key.is_empty());
+        u8::from(keyed) * 2 + u8::from(canonical)
+    }
+    let mut folded: Vec<AgentRoute> = Vec::with_capacity(agents.len());
+    for agent in agents {
+        match folded
+            .iter_mut()
+            .find(|kept| canonical_agent_name(&kept.name) == canonical_agent_name(&agent.name))
+        {
+            Some(kept) if rank(&agent) > rank(kept) => *kept = agent,
+            Some(_) => {}
+            None => folded.push(agent),
+        }
+    }
+    for agent in &mut folded {
+        agent.name = canonical_agent_name(&agent.name);
+    }
+    folded
 }
 
 pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
     // The attachment (`.ferryman`) is the operator-local, non-synced side of the
     // channel; `communications` is its `ferryman` subdirectory.
     let attachment = communications.parent().unwrap_or(communications);
-    let mut agents = read_roster_in(&communications.join("agents"))?;
+    // Folded before the pinning loop below, not after: pins are keyed by agent name, and
+    // pinning `Grouchly` and `grouchly` separately would re-create the split in the one
+    // store whose whole job is to notice when an agent's key changes.
+    let mut agents = fold_case_variants(read_roster_in(&communications.join("agents"))?);
     // Pin keys: an agent's public key is pinned to this operator's local store
     // the first time it is seen, and a later change to agents/<name>.json in the
     // shared folder (a peer overwriting a victim's key to forge as it) is
@@ -2624,7 +2903,7 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
     // fleet channel is where identity belongs; the project copy stays authoritative for
     // anyone already in it, so an existing channel keeps verifying exactly as it did.
     if let Some(fleet) = licensing::fleet_dir() {
-        for entry in read_roster_in(&fleet.join("agents"))? {
+        for entry in fold_case_variants(read_roster_in(&fleet.join("agents"))?) {
             if !agents.iter().any(|known| known.name == entry.name) {
                 agents.push(entry);
             }
@@ -2663,6 +2942,13 @@ pub fn register_agent(route: &ProjectRoute, agent: &AgentRoute) -> Result<PathBu
     if !is_safe_component(&agent.name) || !is_safe_component(&agent.role) {
         bail!("agent name and role must be path-safe identifiers")
     }
+    // Both the filename and the name recorded inside it, so the entry says the same
+    // thing however it is read. Writing the canonical file while leaving `MixedCase`
+    // in the JSON would just move the split from the filesystem into the payload.
+    let agent = &AgentRoute {
+        name: canonical_agent_name(&agent.name),
+        ..agent.clone()
+    };
     let directory = route.communications.join("agents");
     fs::create_dir_all(&directory)?;
     let path = directory.join(format!("{}.json", agent.name));
@@ -4096,6 +4382,31 @@ fn normalize_path(path: &Path) -> String {
         .to_owned()
 }
 
+/// The one canonical form of an agent name: trimmed and lowercase.
+///
+/// # Why an agent name has to be case-folded
+///
+/// An agent name is not just a label - it is a **filename**, in three places at once:
+/// the roster entry (`agents/<name>.json`) in the synced folder, the pinned-key store
+/// (`agents-pinned/<name>.key`), and the private key store (`keys/<name>.key`). Whether
+/// two spellings are the same file therefore depends on the filesystem, and Ferryman
+/// deliberately runs across all of them: NTFS and APFS fold case, ext4 does not.
+///
+/// So `--agent Grouchly` on Linux minted a *second* key under a *second* roster entry,
+/// and the fleet ended up with `Grouchly` and `grouchly` as two agents with two different
+/// public keys. Messages addressed to one were invisible to the other, and a message
+/// signed as one read as `UnknownSigner` to a machine that only knew the other. On
+/// Windows the very same pair of commands silently shared one key, so the bug did not
+/// exist there - which is why it went unnoticed until a mixed fleet.
+///
+/// ASCII lowercase rather than [`str::to_lowercase`] on purpose: names are already
+/// restricted to ASCII by [`is_safe_component`], and Unicode lowering is locale-shaped
+/// (the dotless-i problem), which is not a property an identity should have.
+#[must_use]
+pub fn canonical_agent_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
 /// A single path component that is safe to use as a directory or folder-ID segment:
 /// non-empty, not a traversal token, and restricted to ASCII alphanumerics plus
 /// `.`, `-`, `_`.
@@ -4967,7 +5278,8 @@ pub fn record_acknowledgement(
     if acknowledgement.idempotency_key != message.idempotency_key
         || (acknowledgement.recipient != message.recipient
             && !route.agents.iter().any(|agent| {
-                agent.name == acknowledgement.recipient && agent.role == message.recipient
+                agent.name.eq_ignore_ascii_case(&acknowledgement.recipient)
+                    && agent.role == message.recipient
             }))
     {
         bail!("acknowledgement does not match the stored message")
