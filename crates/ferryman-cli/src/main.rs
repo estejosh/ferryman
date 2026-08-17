@@ -127,6 +127,30 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         lines: usize,
     },
+    /// A report you can paste into an issue while soak-testing.
+    ///
+    /// Counts, category labels and the build string. No file paths, task text, prompts,
+    /// results, agent output or credentials - the report is assembled out of values whose
+    /// type cannot carry them, rather than filtered afterwards.
+    ///
+    /// Nothing is sent unless you pass `--send`. It prints, and you decide.
+    Soak {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Print JSON instead of markdown, for scripting.
+        #[arg(long)]
+        json: bool,
+        /// Also write the report here, for attaching to an issue.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Send the report to the soak endpoint. Off by default, and per invocation:
+        /// there is no setting that makes this happen on its own.
+        #[arg(long)]
+        send: bool,
+        /// Print exactly what `--send` would transmit, and send nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run the agentic loop: pick work up, do it, and judge what comes back.
     Agent {
         #[command(subcommand)]
@@ -1305,6 +1329,87 @@ async fn main() -> Result<()> {
                 for entry in entries {
                     println!("{entry}");
                 }
+            }
+        }
+        Command::Soak {
+            workspace,
+            json,
+            out,
+            send,
+            dry_run,
+        } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = ferryman_channel::route_for(&start)?;
+            // The config is optional on purpose: a report must be obtainable from a machine
+            // whose `agent.toml` is missing or broken, which is exactly when someone most
+            // needs to file an issue.
+            let config = ferryman_ops::agent::AgentConfig::load(&route.attachment).ok();
+            let report = ferryman_ops::soak::report(&route, config.as_ref(), VERSION);
+            let text = if json {
+                serde_json::to_string_pretty(&report)?
+            } else {
+                ferryman_ops::soak::render(&report)
+            };
+            // Printed first, always. This is the consent step: the operator reads the whole
+            // report before deciding to send it, so they never have to trust a claim about
+            // what it contains.
+            println!("{text}");
+            if let Some(path) = out {
+                std::fs::write(&path, &text)
+                    .with_context(|| format!("write {}", path.display()))?;
+                println!("written to {}", path.display());
+            }
+            // Sending is a separate, explicit act. `--dry-run` prints the same `report`
+            // binding that `--send` transmits, so the two cannot drift - the property that
+            // makes `ferry license checkin --dry-run` worth believing, applied here.
+            if dry_run {
+                println!("-- dry run: nothing was sent --");
+                match soak_endpoint() {
+                    Some(url) => println!("would POST the JSON form of the above to {url}"),
+                    None => println!(
+                        "no soak URL is set (FERRYMAN_SOAK_URL), so --send would do nothing"
+                    ),
+                }
+            } else if send {
+                match soak_endpoint() {
+                    None => println!(
+                        "no soak URL is set (FERRYMAN_SOAK_URL); nothing sent. \
+                         Paste the report into an issue instead."
+                    ),
+                    Some(url) => {
+                        let client = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(10))
+                            .build()
+                            .context("build the HTTP client")?;
+                        // A failure is reported and ignored, never fatal: a soak report is a
+                        // favour to the maintainers and must not become a reason someone's
+                        // fleet stops.
+                        match client.post(&url).json(&report).send().await {
+                            Ok(response) if response.status().is_success() => {
+                                println!("sent to {url} — thank you");
+                            }
+                            Ok(response) => {
+                                eprintln!("refused by {url}: {}", response.status());
+                            }
+                            Err(error) => {
+                                eprintln!("could not be delivered (ignored): {error}");
+                            }
+                        }
+                    }
+                }
+            } else if !json {
+                println!(
+                    "Nothing was sent. To help with soak testing, open an issue at\n  \
+                     https://github.com/estejosh/ferryman/issues/new/choose\n\
+                     and paste the report above, or email it to lafamiliahale@gmail.com.\n\
+                     \n\
+                     If you would rather it went straight to the maintainers, set\n  \
+                     FERRYMAN_SOAK_URL=<url>\n\
+                     and run 'ferry soak --send'. There is no setting that sends on its own."
+                );
             }
         }
         Command::Agent { command } => agent_command(command).await?,
@@ -2618,6 +2723,23 @@ fn loadmem(
 
 /// The project slug, derived the way the fleet protocol derives it: the
 /// directory name, lowercased, non-alphanumerics collapsed to a dash.
+/// Where `ferry soak --send` posts, when the operator has set one.
+///
+/// Unset means this build cannot send a soak report at all, which is the default and the
+/// state every downloaded release is in. Deliberately an environment variable and not an
+/// `agent.toml` key: a config file is something a project carries, and carrying it would
+/// make a report get sent on a machine whose owner never chose to. This has to be set where
+/// the command runs, by whoever runs it.
+///
+/// `off` is accepted as a synonym for unset, matching `FERRYMAN_CHECKIN_URL`, so a wrapper
+/// script can disable it without unsetting the variable.
+fn soak_endpoint() -> Option<String> {
+    std::env::var("FERRYMAN_SOAK_URL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != "off")
+}
+
 /// The signing key for a name the OPERATOR named, refusing rather than inventing one.
 ///
 /// # Why this exists, and why it is a function rather than a rule

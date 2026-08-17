@@ -53,15 +53,60 @@ the struct above, and nothing constructs it from your project data.
 - Your hostnames or your agents' names
 - Any content of any kind
 
+The list above describes the licence check-in, which is the only thing Ferryman will
+ever send to the Licensor. Two other outbound paths exist, both off unless you turn
+them on, and neither goes to us by default:
+
+### Soak reports — `ferry soak`
+
+While Ferryman is in soak testing we would very much like to know how it behaves on
+your machines. `ferry soak` builds a report and **prints it**; it is sent only if you
+set `FERRYMAN_SOAK_URL` *and* pass `--send`, per invocation. There is no setting that
+makes it happen on its own.
+
+The report is counts, category labels and the build string:
+
+| Field | What it is |
+|---|---|
+| `format`, `version`, `platform` | The report format, the build (including its git commit), and `linux`/`macos`/`windows`. Not your hostname or OS release. |
+| `sandboxed`, `preamble_bytes` | Whether a container runner is configured, and the *size* of your preamble file. Never the image name or the preamble's contents. |
+| `agents` | How many agents are on the project roster. A number, not names. |
+| `tasks_by_state`, `max_revision` | Counts of tasks per state, and the highest revision reached. |
+| `signature_checks` | Counts per outcome: `valid`, `unsigned`, `invalid`, `unknown_signer`, `key_changed`. The most useful number in the report. |
+| `ledger_intact`, `ledger_entries` | Whether the ledger verifies, and how many entries it has. |
+| `run_log_categories`, `run_log_lines` | Your local run log matched against a fixed list of failure *labels* (`agent_stalled`, `governor_declined`, …) and counted. Lines that match nothing count as `other`. |
+
+No file paths, task text, prompts, results, agent output, credentials, agent names or
+project names. That is structural rather than filtered: the report type has no field
+that can hold them, and log lines are reduced to a label from a fixed vocabulary
+before they are counted. `ferry soak --dry-run` prints exactly what `--send` would
+transmit, from the same value, so the two cannot disagree.
+
+### Tracing — `FERRYMAN_OTLP_ENDPOINT`
+
+If you set `FERRYMAN_OTLP_ENDPOINT` (or `OTEL_EXPORTER_OTLP_ENDPOINT`), Ferryman
+exports OpenTelemetry spans to **your** collector. This is a debugging tool you point
+at your own infrastructure; it never goes to the Licensor and there is no default
+endpoint. Unlike the two above, these spans **do** carry agent names, project names
+and absolute workspace paths, because that is what makes a trace useful. Do not set it
+unless you are happy for that data to reach wherever you are pointing it.
+
 ## What you can do about it
 
-- **Turn it off.** Set `checkin = "off"` in `.ferryman/agent.toml`, or leave the
-  check-in URL unset. The software keeps working. Note that free *production* use is
-  conditioned on registration under Section 3 of the license — turning it off does not
-  change what you owe, it only changes whether the Licensor can see it. Non-production
-  use has no registration requirement at all.
-- **See it before it goes.** `ferry license checkin --dry-run` prints the exact payload
-  and sends nothing.
+- **Nothing is sent automatically.** There is no timer and no background sender. The
+  check-in happens only when you run `ferry license checkin` yourself, and only if a
+  check-in URL is configured in your install. If no URL is set — which is the state
+  every downloaded release is in — that command sends nothing and says so.
+  (An earlier version of this page suggested `checkin = "off"` in
+  `.ferryman/agent.toml`. No code ever read that key, so it did nothing; leaving the
+  URL unset is the control that works, and it is the default.)
+  Note that free *production* use is conditioned on registration under Section 3 of the
+  license — not reporting does not change what you owe, it only changes whether the
+  Licensor can see it. Non-production use has no registration requirement at all.
+- **See it before it goes.** `ferry license checkin --dry-run` and
+  `ferry soak --dry-run` each print the exact payload and send nothing. In both cases
+  the dry run and the real send format the *same value*, so a payload cannot drift away
+  from what the dry run shows.
 - **Read the code.** It is source-available. This is a claim you can check rather than
   trust, which is the only kind of privacy claim worth making.
 

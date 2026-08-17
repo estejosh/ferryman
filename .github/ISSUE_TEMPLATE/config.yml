@@ -1,1 +1,11 @@
 blank_issues_enabled: false
+contact_links:
+  - name: Soak report (or just "nothing broke")
+    url: https://github.com/estejosh/ferryman/issues/new?template=soak_report.md
+    about: Ferryman is in soak testing. Run `ferry soak` and tell us what happened - a clean run is a useful report too.
+  - name: Email instead
+    url: mailto:lafamiliahale@gmail.com
+    about: Prefer not to open an issue? Send the report by email.
+  - name: Report a vulnerability privately
+    url: https://github.com/estejosh/ferryman/security/advisories/new
+    about: Do not file security issues publicly. Use private vulnerability reporting.

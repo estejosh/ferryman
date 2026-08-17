@@ -99,11 +99,13 @@ Two consequences worth caring about:
 - **Opt-in sandboxing.** Run each worker inside a fresh podman or docker
   container, with a network-egress policy (`net = none | open | <name>`) — one
   config line per project, at your direction.
-- **A project cost estimator.** `ferry cost` prices a prompt against published
-  per-engine list rates (editable in a `rates.toml` beside the channel, no
-  rebuild needed) and totals your *recorded* usage, so you can size a project's
-  spend before committing to it. It is an **estimate**, not a meter reading — a
-  token heuristic for sizing, real recorded tokens where the agent reports them.
+- **A project cost estimator.** `ferry cost plan` sizes a project against
+  per-engine list rates (editable in a `rates.toml`, no rebuild needed) so you can
+  price work before committing to it. It is an **estimate from a token heuristic**,
+  not a meter reading, and the rates are hand-maintained constants — check them
+  against your provider's current pricing. `ferry cost project`, which is meant to
+  total *recorded* usage, currently reports zero because nothing yet records
+  per-run token counts; see [Known issues](#known-issues).
 
 ## Two repositories, on purpose
 
@@ -157,6 +159,39 @@ cargo test --workspace
 
 macOS and Windows use their native keychains and need nothing extra.
 
+## Soak testing — please break it
+
+**Ferryman is in soak testing, and that is a request, not a disclaimer.**
+
+It works. It is also new, and the last set of problems in software like this is
+only ever found by other people running it on machines we do not have, for longer
+than we have. So: run it, and tell us what happened.
+
+```sh
+ferry soak      # counts and category labels. Prints; sends nothing unless you ask.
+```
+
+Then [open an issue](https://github.com/estejosh/ferryman/issues/new?template=soak_report.md)
+or email `lafamiliahale@gmail.com`. **"I ran it for a week and nothing broke" is a
+real report and we want it** — it tells us which platforms and shapes of fleet are
+holding up, which is not knowable any other way.
+
+If you would rather not copy and paste, set `FERRYMAN_SOAK_URL` and run
+`ferry soak --send`. That is per invocation and opt-in twice over: there is no config
+key that sends on its own, no timer, and a downloaded release has no endpoint set.
+`ferry soak --dry-run` prints exactly what `--send` would transmit, from the same
+value, so the two cannot disagree.
+
+`ferry soak` carries no file paths, task text, prompts, results, agent output or
+credentials. It is built out of values whose *type* cannot hold them rather than
+filtered afterwards, and the whole thing is
+[one readable file](crates/ferryman-ops/src/soak.rs) if you would rather check that
+than trust it.
+
+Security issues go through
+[private vulnerability reporting](https://github.com/estejosh/ferryman/security/advisories/new),
+not public issues.
+
 ## Current status — honest about where this is
 
 **Solid.** The channel, the Syncthing transport, project attachment, approval
@@ -173,6 +208,58 @@ weeks by strangers, which is the only thing that finds the last problems.
 
 **Not built yet.** PostgreSQL, RBAC, and workflow graphs are design targets, not
 implementations.
+
+### Known issues
+
+Listed because you will hit some of these, and finding them written down beats
+discovering them. Every one is something we know about and intend to fix; none of
+them loses work or leaks anything.
+
+- **Costs read as `$0.00`.** `ferry cost project` and the dashboard's *est. spend*
+  tile compute from a per-run token count that nothing currently records, so they
+  are structurally zero. Treat `ferry cost plan` (an estimate, and labelled as one)
+  as the useful half and ignore the recorded totals until this is wired up.
+- **Engine prices and quality scores are hand-typed constants.** `ferry cost rates`
+  prints a table of list prices with no as-of date, an unrecognised engine is priced
+  at a mid-range commercial rate — including a local model, which costs nothing —
+  and the `quality` column is a static hint, not a measurement, wherever no
+  outcomes have been recorded yet. Measured confidence *is* real and always shows
+  its sample size (`0.67 · 1/1 accepted`); the priors beside it are opinion.
+- **`ferry ask` reports its sources as signed without verifying them.** The ledger
+  half is genuinely verified; agent-profile and task claims are read from the
+  channel and attributed by filename. On a fleet you control this is cosmetic. Do
+  not rely on it as provenance until it verifies, and prefer
+  `ferry channel log` / `ferry channel tasks`, which do.
+- **An addressed order reports as `claimed` before anyone picks it up.** `--to
+  grouchly` shows as claimed by grouchly immediately, whether or not grouchly has
+  started, because the holder is the assignee and no claim file is required. So
+  "waiting for that machine" and "that machine is working" currently look the same.
+- **`checkin = "off"` in `agent.toml` does nothing.** PRIVACY.md mentions it; no
+  code reads it. Nothing sends automatically anyway — the check-in only ever runs
+  when you run `ferry license checkin` — so leaving the URL unset is the control
+  that actually works.
+- **The SBOM omits the tray.** `sbom.cdx.json` covers the workspace, and
+  `ferryman-tray` is excluded from the workspace with its own lockfile, so its
+  dependencies are missing from it. The tray is optional and not installed by the
+  install scripts.
+- **`ferry bench --timeout-secs` is accepted and ignored.** The benchmark uses a
+  fixed 300s per task.
+- **The MCP client has no timeouts.** An external MCP server that hangs will block
+  the gateway, and one that never answers at startup will stop `ferry mcp serve`
+  from answering at all. Point it only at servers you trust to respond.
+- **External MCP tool output is not marked as third-party** when it reaches an
+  agent's prompt. Treat any MCP server you connect as something whose output can
+  influence your agents, and prefer read-only ones.
+- **Windows has less test coverage than Linux and macOS.** CI runs all three, but
+  several suites are Unix-only, and the two most recent platform bugs were both
+  Windows-only and both found by running on a real machine rather than in review.
+
+Fixed in `0.4.0` and worth knowing if you ran an earlier build: a worker could kill
+its own running task in an unrecoverable retry loop; a peer could forge another
+machine's signing key through several CLI paths; the container runner put
+credentials on the process argument list; the audit ledger reported itself tampered
+after ordinary two-machine use; and shell task sources never worked on Windows. See
+the changelog.
 
 **Sandboxing is yours to turn on.** By default a worker runs with the privileges
 of the account that started it. Point `sandbox` at an image in `agent.toml` (or
