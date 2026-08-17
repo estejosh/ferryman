@@ -2896,6 +2896,50 @@ fn agent_name(value: &str) -> Result<String, String> {
     Ok(folded)
 }
 
+/// Sign as `name`, or establish that signing unsigned is honest here.
+///
+/// # The distinction this exists to draw
+///
+/// Every signing site in the CLI was written as `if let Ok(identity) =
+/// signing_identity(..)`, which computes the refusal and throws it away. The reasoning
+/// was sound and is worth keeping: a fleet that has not adopted signing must keep
+/// working, so a missing key cannot be fatal.
+///
+/// But that reasoning covers one case and was applied to two.
+///
+///   * Nobody in this channel has a published key. Unsigned is the only thing available
+///     and everyone reads it as unsigned. Fine.
+///   * The roster knows this sender AND carries a key for them, and this machine does
+///     not hold it. Sending unsigned "from" them is claiming to be a person whose
+///     signature every reader can check, while supplying none.
+///
+/// The second is what let `ferry channel send --from op` publish a message from a human
+/// who was nowhere near it. Not a forgery - readers see `Unsigned` - but the fleet was
+/// told something about who spoke, with nothing behind it, and nothing said so.
+///
+/// So: refuse when the roster can verify this name and we cannot produce it. Otherwise
+/// carry on unsigned, exactly as before.
+fn sign_as(
+    route: &ferryman_channel::ProjectRoute,
+    name: &str,
+) -> Result<Option<ferryman_channel::AgentIdentity>> {
+    match signing_identity(route, name) {
+        Ok(identity) => Ok(Some(identity)),
+        Err(error) => {
+            let known_key = ferryman_channel::read_agent_roster(&route.communications)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|agent| agent.name.eq_ignore_ascii_case(name))
+                .and_then(|agent| agent.public_key)
+                .is_some_and(|key| !key.is_empty());
+            if known_key {
+                return Err(error);
+            }
+            Ok(None)
+        }
+    }
+}
+
 fn signing_identity(
     route: &ferryman_channel::ProjectRoute,
     name: &str,
@@ -3603,7 +3647,7 @@ fn channel(command: Channel) -> Result<()> {
             // not adopted signing keeps running - but anything that has joined gets
             // attribution for free, which is the point: on a team, every contribution
             // carries a fingerprint.
-            if let Ok(identity) = signing_identity(&route, &sender) {
+            if let Some(identity) = sign_as(&route, &sender)? {
                 identity.sign(&mut message);
             }
             let mut engine = ferryman_channel::system_delivery_engine();
@@ -3693,11 +3737,11 @@ fn channel(command: Channel) -> Result<()> {
             };
             // Actually sign it. Setting signed_by without a signature would claim
             // attribution nothing could check, which is worse than claiming none.
-            if let Ok(identity) = signing_identity(&route, &issuer) {
+            if let Some(identity) = sign_as(&route, &issuer)? {
                 identity.sign_order(&mut order);
             }
             let path = ferryman_channel::issue_order(&route, &order)?;
-            if let Ok(identity) = signing_identity(&route, &issuer) {
+            if let Some(identity) = sign_as(&route, &issuer)? {
                 let _ = ferryman_channel::ledger::append_ledger_entry(
                     &route,
                     &identity,
@@ -3939,7 +3983,7 @@ fn channel(command: Channel) -> Result<()> {
                 signature: None,
             };
             // The fingerprint on a contribution: this agent, this work, checkable later.
-            if let Ok(identity) = signing_identity(&route, &agent) {
+            if let Some(identity) = sign_as(&route, &agent)? {
                 identity.sign_result(&mut submission);
             }
             let signed = submission.signature.is_some();
@@ -3988,7 +4032,7 @@ fn channel(command: Channel) -> Result<()> {
                 signature: None,
             };
             // A verdict is signed too, so an acceptance cannot later be denied or forged.
-            if let Ok(identity) = signing_identity(&route, &reviewer) {
+            if let Some(identity) = sign_as(&route, &reviewer)? {
                 identity.sign_review(&mut verdict);
             }
             ferryman_channel::submit_review(&route, &verdict)?;
