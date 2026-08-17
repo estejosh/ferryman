@@ -17,15 +17,58 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build --workspace --release
+  # macOS runs on EVERY push, not only on tags.
+  #
+  # It used to be gated to `refs/tags/v*`, and the cost of that was paid in full at the
+  # first release: 101 commits of new work had never once been compiled or tested on
+  # macOS, and the tag build was where we found out. A platform tested only at release
+  # time is a platform whose bugs are all discovered at release time.
+  #
+  # The gate was presumably about macOS runner minutes, which bill at ten times Linux.
+  # That does not apply here - this repository is public, and Actions minutes are free
+  # for public repositories on all runner types. So it was buying nothing.
   test-macos:
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.90
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+
+      # Why this is not just `cargo test --workspace`
+      #
+      # When this fails, the only thing visible without a GitHub token is the
+      # annotation "Process completed with exit code 101" - which does not name the
+      # test, the assertion, or the file. On a platform none of the maintainers can
+      # run locally, that is the difference between a fix and a guess. It produced two
+      # wrong guesses before this step existed.
+      #
+      # The job summary is rendered on the run page and readable by anyone who can see
+      # the repository, so the failing test travels with the failure.
+      - name: Test
+        id: test
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee test-output.txt
+
+      - name: Report which tests failed
+        if: failure() && steps.test.outcome == 'failure'
+        run: |
+          {
+            echo '## macOS test failures'
+            echo
+            echo 'Names of the failing tests, then the assertions:'
+            echo
+            echo '```'
+            # The `failures:` blocks list the test names; the panics carry the reason.
+            awk '/^failures:$/,/^test result:/' test-output.txt | head -60
+            echo '```'
+            echo
+            echo '```'
+            grep -A6 'panicked at' test-output.txt | head -80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - run: cargo build --workspace --release
   audit:
     runs-on: ubuntu-latest

@@ -270,6 +270,11 @@ them loses work or leaks anything.
 - **Windows has less test coverage than Linux and macOS.** CI runs all three, but
   several suites are Unix-only, and the two most recent platform bugs were both
   Windows-only and both found by running on a real machine rather than in review.
+- **The macOS test suite is currently red.** The macOS binaries build and are published
+  on the release page, but `cargo test --workspace` fails there and the cause is not yet
+  identified — the job was previously gated to tags, so it had never run against the
+  work in this release. It now runs on every push. If you use Ferryman on a Mac, a soak
+  report is especially valuable: nobody maintaining this has one.
 
 Fixed in `0.4.0` and worth knowing if you ran an earlier build: a worker could kill
 its own running task in an unrecoverable retry loop; a peer could forge another
