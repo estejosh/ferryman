@@ -26,3 +26,19 @@ ferryman-ops = { path = "../ferryman-ops" }
 tray-icon = "0.19"
 winit = "0.30"
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# GTK must be initialised before a tray icon exists on Linux, so `main` calls
+# `gtk::init()` there - which needs `gtk` to be a DIRECT dependency, not merely present
+# in the lockfile.
+#
+# It was not, and the Linux tray therefore never compiled: `gtk` arrives transitively
+# through tray-icon -> muda -> libappindicator, which puts it in `Cargo.lock` and makes
+# it look present without making it linkable. The tray was developed on Windows, this
+# crate is excluded from the workspace so `cargo build --workspace` never touched it,
+# and the release job that builds it is newer than the crate. Nothing had ever compiled
+# this file for Linux until the first tag that included that job.
+#
+# Pinned to the 0.18 series to match what libappindicator already resolves, so this adds
+# a link, not a second copy of the GTK stack.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
