@@ -49,9 +49,7 @@ impl TaskSource {
     pub fn fetch(&self) -> Result<Vec<SourceTicket>> {
         match self {
             Self::Shell { command, .. } => {
-                let output = Command::new("sh")
-                    .arg("-c")
-                    .arg(command)
+                let output = shell_command(command)
                     .output()
                     .with_context(|| format!("run the source command: {command}"))?;
                 if !output.status.success() {
@@ -60,21 +58,66 @@ impl TaskSource {
                         String::from_utf8_lossy(&output.stderr).trim()
                     );
                 }
-                let mut tickets = Vec::new();
-                for (line_no, line) in String::from_utf8_lossy(&output.stdout).lines().enumerate() {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    let ticket: SourceTicket = serde_json::from_str(line).with_context(|| {
-                        format!("source printed a non-ticket line {line_no}: {line}")
-                    })?;
-                    tickets.push(ticket);
-                }
-                Ok(tickets)
+                parse_tickets(&String::from_utf8_lossy(&output.stdout))
             }
         }
     }
+}
+
+/// A command that runs `command` through this platform's shell.
+///
+/// # Two separate Windows bugs live here
+///
+/// **The shell.** This was `Command::new("sh")` unconditionally. Windows has no `sh` on
+/// `PATH`, so every shell task source failed there with "program not found" - not untested,
+/// broken. The machine that imports tickets in the fleet this was written for runs Windows.
+/// `cmd /C` rather than PowerShell because it is always present and needs no execution
+/// policy; an operator who wants PowerShell can say so in the command.
+///
+/// **The quoting**, which is the subtler one and the reason this is not two `.arg()` calls.
+/// Rust quotes arguments on Windows using the C runtime's rules - a `"` becomes `\"`. That is
+/// correct for ordinary programs and wrong for `cmd.exe`, which does not understand `\"` and
+/// passes the backslashes through literally. So `cmd /C echo {"id":"J-1"}` printed
+/// `{\"id\":\"J-1\"}`, and the ticket failed to parse.
+///
+/// It would have failed *quietly and selectively*: only commands containing quotes, which is
+/// nearly every real one (`gh issue list --json ...`, `curl -H "..."`). `raw_arg` appends the
+/// string to the command line verbatim, which is what a shell needs and what `arg` cannot do.
+/// It is a safe function, so `#![forbid(unsafe_code)]` still holds.
+fn shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut shell = Command::new("cmd");
+        shell.raw_arg("/C").raw_arg(command);
+        shell
+    }
+    #[cfg(not(windows))]
+    {
+        let mut shell = Command::new("sh");
+        shell.arg("-c").arg(command);
+        shell
+    }
+}
+
+/// One ticket per non-blank line of JSON.
+///
+/// Split out from [`TaskSource::fetch`] so the parsing can be tested without spawning
+/// anything - which is also what makes it testable on every platform. The tests that failed
+/// on Windows were testing this logic through a `printf` command, so they were really
+/// testing whether the CI runner had a Unix shell.
+pub fn parse_tickets(stdout: &str) -> Result<Vec<SourceTicket>> {
+    let mut tickets = Vec::new();
+    for (line_no, line) in stdout.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let ticket: SourceTicket = serde_json::from_str(line)
+            .with_context(|| format!("source printed a non-ticket line {line_no}: {line}"))?;
+        tickets.push(ticket);
+    }
+    Ok(tickets)
 }
 
 /// Map a ticket into an order. Pure, so it can be tested without a channel.
@@ -314,25 +357,55 @@ mod tests {
         assert!(order.requires_review);
     }
 
+    /// The parsing, tested on every platform because it is pure.
+    ///
+    /// This used to go through a `printf` command, so on Windows it was testing whether the
+    /// runner had a Unix shell - and failing. The logic it means to check has nothing to do
+    /// with shells.
     #[test]
-    fn fetch_parses_one_ticket_per_line_and_ignores_blank_lines() {
-        let source = TaskSource::Shell {
-            name: "jira".into(),
-            command: "printf '%s\\n' '{\"id\":\"J-1\",\"task\":\"do it\"}' '' '{\"id\":\"J-2\",\"task\":\"and this\"}'"
-                .into(),
-        };
-        let tickets = source.fetch().unwrap();
+    fn one_ticket_per_line_blank_lines_ignored() {
+        let tickets = parse_tickets(
+            "{\"id\":\"J-1\",\"task\":\"do it\"}\n\n{\"id\":\"J-2\",\"task\":\"and this\"}\n",
+        )
+        .unwrap();
         assert_eq!(tickets.len(), 2);
         assert_eq!(tickets[1].id, "J-2");
     }
 
     #[test]
-    fn fetch_rejects_a_line_that_is_not_a_ticket() {
-        let source = TaskSource::Shell {
-            name: "broken".into(),
-            command: "printf '%s\\n' 'not json'".into(),
+    fn a_line_that_is_not_a_ticket_is_an_error_naming_the_line() {
+        let error = parse_tickets("not json\n").unwrap_err().to_string();
+        assert!(
+            error.contains("not json"),
+            "the error must quote the offending line: {error}"
+        );
+    }
+
+    /// That a source command actually runs, on whatever shell this platform has.
+    ///
+    /// The one thing that genuinely needs a shell, so it is the only thing written per
+    /// platform - and it exists specifically because `sh` was hardcoded and Windows has no
+    /// `sh`, which made every shell source fail there rather than merely go untested.
+    #[test]
+    fn a_source_command_runs_on_this_platform() {
+        // Quotes on purpose. A command without them would pass on Windows even with the
+        // argument escaping wrong, and every command an operator actually writes has them.
+        let command = if cfg!(windows) {
+            // cmd's echo takes the rest of the line literally, quotes included.
+            r#"echo {"id":"J-1","task":"do it"}"#
+        } else {
+            r#"printf '%s\n' '{"id":"J-1","task":"do it"}'"#
         };
-        assert!(source.fetch().is_err());
+        let source = TaskSource::Shell {
+            name: "jira".into(),
+            command: command.into(),
+        };
+        let tickets = source
+            .fetch()
+            .expect("a source command must run on every platform Ferryman builds for");
+        assert_eq!(tickets.len(), 1);
+        assert_eq!(tickets[0].id, "J-1");
+        assert_eq!(tickets[0].task, "do it");
     }
 
     fn route(dir: &std::path::Path) -> ProjectRoute {
@@ -378,7 +451,12 @@ mod tests {
             crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
         let trigger = SourceTrigger {
             name: "tickets".into(),
-            command: "printf '%s\\n' '{\"id\":\"E-1\",\"task\":\"do it\"}'".into(),
+            // Per platform for the same reason as above: this one really does spawn a shell.
+            command: if cfg!(windows) {
+                r#"echo {"id":"E-1","task":"do it"}"#.to_string()
+            } else {
+                r#"printf '%s\n' '{"id":"E-1","task":"do it"}'"#.to_string()
+            },
             interval_secs: 3600,
         };
         let n = poll_if_due(&route, &trigger, "orchestrator", &identity).unwrap();
