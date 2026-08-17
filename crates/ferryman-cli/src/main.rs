@@ -1626,8 +1626,7 @@ async fn main() -> Result<()> {
                 }
 
                 let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
-                let identity =
-                    ferryman_channel::AgentIdentity::load_or_create(&agent, &route.attachment)?;
+                let identity = signing_identity(&route, &agent)?;
 
                 for entry in entries {
                     if let ferryman_channel::migration::MigrationEntry::Convertible { message } =
@@ -2619,6 +2618,46 @@ fn loadmem(
 
 /// The project slug, derived the way the fleet protocol derives it: the
 /// directory name, lowercased, non-alphanumerics collapsed to a dash.
+/// The signing key for a name the OPERATOR named, refusing rather than inventing one.
+///
+/// # Why this exists, and why it is a function rather than a rule
+///
+/// `AgentIdentity::load_or_create` mints a fresh key when none is on disk. That is correct in
+/// exactly one place - `ferry channel join`, where this machine is establishing its own
+/// identity for the first time - and wrong everywhere else, because everywhere else the name
+/// came from `--agent`, `--to`, `--reviewer`, or was read out of the channel.
+///
+/// It was called in fifteen other places, and the consequence was not theoretical. Reproduced
+/// during review: a peer holding nothing but the synced folder ran
+/// `ferry channel master transfer bob`, which read the *current* master's name out of the
+/// channel and called `load_or_create` on it - forging the master's key, overwriting
+/// `master.json`, and printing "master role transferred to bob (disclaimed by alice)". Every
+/// machine then failed `master status`, `lease` and `grants` with "signature does not verify",
+/// and there was no way back: `init` said the project already had a master, and `transfer`
+/// failed the signature check it had just broken.
+///
+/// The general rule: **a machine can only sign as an identity it holds the key for.** A
+/// forged key is worse than a refusal, because a refusal is a message and a forged key is a
+/// roster the whole fleet rejects.
+///
+/// This is a function so the rule has one place to live. Fifteen careful call sites is
+/// fifteen chances for the sixteenth to be wrong.
+fn signing_identity(
+    route: &ferryman_channel::ProjectRoute,
+    name: &str,
+) -> anyhow::Result<ferryman_channel::AgentIdentity> {
+    ferryman_channel::AgentIdentity::load_existing(name, &route.attachment)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "this machine holds no signing key for '{name}', so it cannot sign as '{name}'.\n\
+             \n\
+             If '{name}' is this machine, run 'ferry channel join --agent {name}' first.\n\
+             If '{name}' is another machine, run this command there - a key cannot be created \
+             on demand, because a second key under a name the roster already knows makes every \
+             signature it produces read as an impostor to every other machine."
+        )
+    })
+}
+
 fn slug_of(dir: &std::path::Path) -> String {
     let name = dir
         .file_name()
@@ -3049,6 +3088,13 @@ fn channel(command: Channel) -> Result<()> {
             // The private key is created here and stays in the attachment, which is
             // machine-local and outside the folder Syncthing carries. Only the public
             // half is published.
+            //
+            // This is the ONLY place in the CLI that may create a key, and the only one that
+            // still calls `load_or_create`. Joining is by definition the act of establishing
+            // this machine's own identity; every other command signs as an identity that must
+            // already exist, and uses `signing_identity` so a missing key is a refusal rather
+            // than a forgery. `register_agent_key` refuses to republish a name under a
+            // different key, so joining twice cannot silently take a name over either.
             let identity =
                 ferryman_channel::AgentIdentity::load_or_create(&agent.name, &route.attachment)?;
             let path = ferryman_channel::register_agent_key(&route, &agent, &identity)?;
@@ -3158,9 +3204,7 @@ fn channel(command: Channel) -> Result<()> {
             // not adopted signing keeps running - but anything that has joined gets
             // attribution for free, which is the point: on a team, every contribution
             // carries a fingerprint.
-            if let Ok(identity) =
-                ferryman_channel::AgentIdentity::load_or_create(&sender, &route.attachment)
-            {
+            if let Ok(identity) = signing_identity(&route, &sender) {
                 identity.sign(&mut message);
             }
             let mut engine = ferryman_channel::system_delivery_engine();
@@ -3247,15 +3291,11 @@ fn channel(command: Channel) -> Result<()> {
             };
             // Actually sign it. Setting signed_by without a signature would claim
             // attribution nothing could check, which is worse than claiming none.
-            if let Ok(identity) =
-                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)
-            {
+            if let Ok(identity) = signing_identity(&route, &issuer) {
                 identity.sign_order(&mut order);
             }
             let path = ferryman_channel::issue_order(&route, &order)?;
-            if let Ok(identity) =
-                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)
-            {
+            if let Ok(identity) = signing_identity(&route, &issuer) {
                 let _ = ferryman_channel::ledger::append_ledger_entry(
                     &route,
                     &identity,
@@ -3280,8 +3320,7 @@ fn channel(command: Channel) -> Result<()> {
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
-            let identity =
-                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)?;
+            let identity = signing_identity(&route, &issuer)?;
             let source = ferryman_channel::source::TaskSource::Shell { name, command };
             let imported = ferryman_channel::source::import(&route, &source, &issuer, &identity)?;
             println!("imported {imported} order(s) from {}", source.name());
@@ -3313,8 +3352,7 @@ fn channel(command: Channel) -> Result<()> {
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
-            let identity =
-                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)?;
+            let identity = signing_identity(&route, &issuer)?;
             let triggers = ferryman_channel::source::load_triggers(&route)?;
             if triggers.is_empty() {
                 bail!(
@@ -3370,8 +3408,7 @@ fn channel(command: Channel) -> Result<()> {
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
-            let identity =
-                ferryman_channel::AgentIdentity::load_or_create(&issuer, &route.attachment)?;
+            let identity = signing_identity(&route, &issuer)?;
             let mut interrupt = ferryman_channel::interrupt::Interrupt {
                 order_id: order.clone(),
                 action: ferryman_channel::interrupt::InterruptAction::parse(&action)?,
@@ -3500,9 +3537,7 @@ fn channel(command: Channel) -> Result<()> {
                 signature: None,
             };
             // The fingerprint on a contribution: this agent, this work, checkable later.
-            if let Ok(identity) =
-                ferryman_channel::AgentIdentity::load_or_create(&agent, &route.attachment)
-            {
+            if let Ok(identity) = signing_identity(&route, &agent) {
                 identity.sign_result(&mut submission);
             }
             let signed = submission.signature.is_some();
@@ -3551,9 +3586,7 @@ fn channel(command: Channel) -> Result<()> {
                 signature: None,
             };
             // A verdict is signed too, so an acceptance cannot later be denied or forged.
-            if let Ok(identity) =
-                ferryman_channel::AgentIdentity::load_or_create(&reviewer, &route.attachment)
-            {
+            if let Ok(identity) = signing_identity(&route, &reviewer) {
                 identity.sign_review(&mut verdict);
             }
             ferryman_channel::submit_review(&route, &verdict)?;
@@ -3813,10 +3846,7 @@ fn channel(command: Channel) -> Result<()> {
             match action {
                 MasterAction::Init { name } => {
                     let master = ferryman_ops::identity::resolve(name, &route.attachment)?;
-                    let identity = ferryman_channel::AgentIdentity::load_or_create(
-                        &master,
-                        &route.attachment,
-                    )?;
+                    let identity = signing_identity(&route, &master)?;
                     let declaration =
                         ferryman_channel::master::initialize_master(&route, &identity, &master)?;
                     println!(
@@ -3855,10 +3885,7 @@ fn channel(command: Channel) -> Result<()> {
                         Some(declaration) => declaration.master,
                         None => bail!("this project has no master yet"),
                     };
-                    let identity = ferryman_channel::AgentIdentity::load_or_create(
-                        &current,
-                        &route.attachment,
-                    )?;
+                    let identity = signing_identity(&route, &current)?;
                     let declaration =
                         ferryman_channel::master::transfer_master(&route, &identity, &name)?;
                     println!(
@@ -3876,10 +3903,7 @@ fn channel(command: Channel) -> Result<()> {
                         Some(declaration) => declaration.master,
                         None => bail!("this project has no master yet"),
                     };
-                    let identity = ferryman_channel::AgentIdentity::load_or_create(
-                        &current,
-                        &route.attachment,
-                    )?;
+                    let identity = signing_identity(&route, &current)?;
                     let split = |value: Option<&String>| -> Vec<String> {
                         value
                             .map(|v| {
@@ -3934,10 +3958,7 @@ fn channel(command: Channel) -> Result<()> {
                             bail!("this project has no master yet; run 'ferry channel master init'")
                         }
                     };
-                    let identity = ferryman_channel::AgentIdentity::load_or_create(
-                        &master_name,
-                        &route.attachment,
-                    )?;
+                    let identity = signing_identity(&route, &master_name)?;
                     let scope = scope
                         .map(|s| {
                             s.split(',')
@@ -3990,8 +4011,7 @@ fn channel(command: Channel) -> Result<()> {
         } => {
             let route = here(workspace)?;
             let exporter = ferryman_ops::identity::resolve(agent, &route.attachment)?;
-            let identity =
-                ferryman_channel::AgentIdentity::load_or_create(&exporter, &route.attachment)?;
+            let identity = signing_identity(&route, &exporter)?;
             let report = ferryman_channel::ledger::build_report(&route, &identity)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);

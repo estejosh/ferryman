@@ -145,6 +145,39 @@ pub fn transfer_master(
             existing.master
         );
     }
+    // The KEY must be the master's key, not merely a key wearing the master's name.
+    //
+    // Defence in depth for a hole that was reproduced: the CLI used to resolve the current
+    // master's identity with `load_or_create`, so a peer holding only the synced folder minted
+    // a key under the master's name and transferred the role to itself. The name check above
+    // passed, because the forged key was called the right thing. That call site now refuses,
+    // but a name comparison is the wrong check to leave standing behind it - it authorises on
+    // a string that the caller chose.
+    //
+    // Comparing against the key the declaration was actually signed with means a forged key
+    // fails here even if some future caller hands one over.
+    // `read_master` has already established that the declaration verifies against the roster,
+    // so re-checking it against ONLY this caller's key answers a different question: is this
+    // the same key? A roster of one.
+    let offered = AgentRoute {
+        name: current.name().to_owned(),
+        role: "master".to_owned(),
+        capabilities: Vec::new(),
+        public_key: Some(current.public_key_hex()),
+    };
+    if check_signature(
+        existing.signed_by.as_ref(),
+        existing.signature.as_ref(),
+        &master_payload(&existing),
+        std::slice::from_ref(&offered),
+    ) != SignatureCheck::Valid
+    {
+        bail!(
+            "the key offered for '{}' is not the key that signed the current master \
+             declaration, so this machine does not hold the role it is trying to transfer",
+            existing.master
+        );
+    }
 
     let mut declaration = MasterDeclaration {
         project_id: route.project_id.clone(),
@@ -309,6 +342,7 @@ pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<boo
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::AgentRoute;
 
@@ -326,6 +360,45 @@ mod tests {
             git_visibility: String::new(),
             agents: Vec::new(),
         }
+    }
+
+    /// A key that merely has the master's NAME cannot transfer the role.
+    ///
+    /// This was reproduced end to end during review: a peer holding only the synced folder
+    /// minted a key under the master's name (the CLI used `load_or_create`), transferred the
+    /// role to itself, and left every machine unable to verify anything master-signed with no
+    /// way back. The CLI now refuses to mint the key; this is the check behind that one, so a
+    /// forged key fails even if some future caller hands one over.
+    #[test]
+    fn a_forged_key_wearing_the_masters_name_cannot_transfer_the_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+
+        let alice = AgentIdentity::from_seed("alice", [1u8; 32]);
+        // Same NAME, different key - exactly what minting on demand produces.
+        let forged_alice = AgentIdentity::from_seed("alice", [2u8; 32]);
+        assert_ne!(alice.public_key_hex(), forged_alice.public_key_hex());
+
+        // The roster carries alice's real key, so the declaration verifies for everyone.
+        route.agents = vec![AgentRoute {
+            name: "alice".into(),
+            role: "master".into(),
+            capabilities: Vec::new(),
+            public_key: Some(alice.public_key_hex()),
+        }];
+        initialize_master(&route, &alice, "alice").unwrap();
+
+        let error = transfer_master(&route, &forged_alice, "bob")
+            .expect_err("a key that is not alice's must not transfer alice's role")
+            .to_string();
+        assert!(
+            error.contains("not the key that signed"),
+            "the refusal must say it is the wrong key, not the wrong name: {error}"
+        );
+
+        // The real master can still do it, so this is a check and not a wall.
+        let moved = transfer_master(&route, &alice, "bob").unwrap();
+        assert_eq!(moved.master, "bob");
     }
 
     #[test]
