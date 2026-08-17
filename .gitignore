@@ -30,3 +30,8 @@ graphify-out/
 
 # Agent memory bank (shared across machines by Syncthing, never committed)
 memory-bank
+
+# Ferryman's attachment: this machine's config, its synced channel, and its
+# PRIVATE SIGNING KEY. None of it belongs in the work repository - committing
+# .ferryman/keys would publish an identity every machine in your fleet trusts.
+/.ferryman/

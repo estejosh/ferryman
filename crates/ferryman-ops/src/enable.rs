@@ -24,7 +24,7 @@
 use anyhow::{Context, Result, bail};
 use ferryman_channel::{AgentRoute, ProjectRoute};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::agent::{AgentConfig, ReviewMode};
 use crate::identity::{machine_name, slug};
@@ -72,6 +72,49 @@ pub struct Outcome {
     pub public_key: String,
     pub config: AgentConfig,
     pub steps: Vec<Step>,
+}
+
+/// Make sure git will not carry `.ferryman/` — above all the signing key inside it.
+///
+/// Returns the path written, or `None` when the workspace is not a git repository or the
+/// entry was already there. Idempotent: running enable twice must not append twice.
+///
+/// Deliberately additive. The operator's `.gitignore` is theirs, so this appends one entry
+/// with a comment saying why, and never rewrites or reorders what is already there.
+fn ensure_git_ignores_attachment(workspace: &Path) -> Result<Option<PathBuf>> {
+    // Only in a git repository. Writing a .gitignore into a directory that has nothing to
+    // do with git would be litter.
+    if !workspace.join(".git").exists() {
+        return Ok(None);
+    }
+    let path = workspace.join(".gitignore");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    // Match how anyone would actually have written it, so we do not add a duplicate to a
+    // repository that already handled this.
+    let already = existing.lines().map(str::trim).any(|line| {
+        matches!(
+            line,
+            ".ferryman" | ".ferryman/" | "/.ferryman" | "/.ferryman/" | ".ferryman/**"
+        )
+    });
+    if already {
+        return Ok(None);
+    }
+    let mut updated = existing;
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.is_empty() {
+        updated.push('\n');
+    }
+    updated.push_str(
+        "# Ferryman's attachment: this machine's config, its synced channel, and its\n\
+         # PRIVATE SIGNING KEY. None of it belongs in the work repository - committing\n\
+         # .ferryman/keys would publish an identity every machine in your fleet trusts.\n\
+         /.ferryman/\n",
+    );
+    fs::write(&path, updated).with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(path))
 }
 
 pub fn perform(request: Request) -> Result<Outcome> {
@@ -141,6 +184,32 @@ pub fn perform(request: Request) -> Result<Outcome> {
         path: bridge.clone(),
         created: bridge_created,
     });
+
+    // Keep the private half out of GIT, which is a different exit than Syncthing and was
+    // not covered.
+    //
+    // `.stignore` below stops keys leaving through the synced channel, and the threat
+    // model talks about that at length. But `ferry enable` runs inside the operator's work
+    // repository, and it created `.ferryman/keys/<agent>.key` as an ordinary untracked
+    // file. One `git add -A` - which is what agents and humans both type - and a private
+    // signing key is committed. If that repository is public, the key is public, and every
+    // artifact that agent ever signs is forgeable by anyone who read it.
+    //
+    // Verified on this project's own repository: `.gitignore` had no `.ferryman` entry,
+    // and nothing in enable had ever written one.
+    //
+    // The whole directory, not just `keys/`: none of it belongs in the work repository.
+    // `.ferryman/ferryman` is the synced channel, which is the point of "two repositories,
+    // on purpose", and the rest is machine-local config that would only cause conflicts if
+    // shared.
+    let gitignore_updated = ensure_git_ignores_attachment(&workspace)?;
+    if let Some(path) = gitignore_updated {
+        steps.push(Step {
+            what: "git exclusion",
+            path,
+            created: true,
+        });
+    }
 
     // Keep the private half out of the synced folder. Written before any key exists, so
     // there is no window in which a key could be carried away.
@@ -403,6 +472,67 @@ mod tests {
         enable_in(&dir).unwrap();
         let ignore = fs::read_to_string(dir.join(".ferryman/ferryman/.stignore")).unwrap();
         assert!(ignore.lines().any(|line| line.trim() == "keys"));
+    }
+
+    /// Enabling inside a git repository must put `.ferryman/` beyond git's reach.
+    ///
+    /// The key lives at `.ferryman/keys/<agent>.key` as an ordinary untracked file, so one
+    /// `git add -A` - which agents and humans both type - would commit a private signing
+    /// key. On a public repository that publishes an identity the whole fleet trusts.
+    #[test]
+    fn enabling_in_a_git_repository_keeps_the_signing_key_out_of_git() {
+        let dir = tempdir();
+        // Enough for the check: it looks for a .git entry, not a valid repository.
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        enable_in(&dir).unwrap();
+
+        let key = dir.join(".ferryman/keys/tester.key");
+        assert!(
+            key.is_file(),
+            "the test is meaningless without a key present"
+        );
+
+        let ignored = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert!(
+            ignored.lines().any(|line| line.trim() == "/.ferryman/"),
+            "enable must exclude the attachment from git, got:\n{ignored}"
+        );
+
+        // Idempotent: enable is safe to run twice, so it must not append twice.
+        enable_in(&dir).unwrap();
+        let again = fs::read_to_string(dir.join(".gitignore")).unwrap();
+        assert_eq!(
+            again.matches("/.ferryman/").count(),
+            1,
+            "a second run duplicated the entry"
+        );
+    }
+
+    /// An operator who already excluded it, in any of the usual spellings, is left alone.
+    #[test]
+    fn an_existing_exclusion_is_respected_rather_than_duplicated() {
+        for spelling in [".ferryman", ".ferryman/", "/.ferryman"] {
+            let dir = tempdir();
+            fs::create_dir_all(dir.join(".git")).unwrap();
+            fs::write(dir.join(".gitignore"), format!("target/\n{spelling}\n")).unwrap();
+            enable_in(&dir).unwrap();
+            let ignored = fs::read_to_string(dir.join(".gitignore")).unwrap();
+            assert!(
+                !ignored.contains("Ferryman's attachment"),
+                "'{spelling}' already covers it; enable should not add another entry"
+            );
+        }
+    }
+
+    /// Outside a git repository there is nothing to protect and nothing to write.
+    #[test]
+    fn enabling_outside_git_writes_no_gitignore() {
+        let dir = tempdir();
+        enable_in(&dir).unwrap();
+        assert!(
+            !dir.join(".gitignore").exists(),
+            "a .gitignore in a non-git directory is litter"
+        );
     }
 
     #[test]
