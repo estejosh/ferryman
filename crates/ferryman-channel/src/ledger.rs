@@ -51,8 +51,73 @@ pub struct LedgerLog {
     pub broken_at: Option<usize>,
 }
 
-fn ledger_path(route: &ProjectRoute) -> PathBuf {
+/// One agent's ledger file. **One writer per path**, like every other channel artifact.
+///
+/// # Why this is per-agent and not one file
+///
+/// It was one `ledger.jsonl` in the synced directory, appended by every machine. The lock
+/// guarding it is at `attachment/runtime/locks/`, which is machine-local and invisible to the
+/// fleet - it serialises this machine's own writers and nothing else.
+///
+/// So two machines recording in one sync window is not an attack, it is ordinary use, and the
+/// result was: Syncthing renames one copy to `ledger.sync-conflict-…`, those attribution
+/// records leave the ledger entirely, and - because both machines computed `prev` from the
+/// same last line - the chain no longer lines up. `read_ledger` then reports
+/// `intact = false` **permanently**, with no repair possible because the file is append-only.
+///
+/// A tamper-evident audit log that reports tampering within hours of normal two-machine use is
+/// worse than no audit log, because it trains the operator to ignore the one signal it exists
+/// to give.
+///
+/// Every other artifact in this crate already carries its writer's name -
+/// `claim.{agent}.json`, `result.{agent}.{rev}.json`, `interrupt.{issued_by}.json`. The ledger
+/// was the exception.
+///
+/// # The chain is per-file, and that is the right granularity
+///
+/// Each agent chains only to its own previous line, so each file is independently verifiable
+/// and no machine's chain depends on another machine's sync timing. A global order across
+/// machines was never real anyway: it was an artifact of whoever's write landed first.
+/// Reading merges the files by timestamp, exactly as `read_agent_roster` merges rosters.
+fn ledger_path(route: &ProjectRoute, signer: &str) -> PathBuf {
+    route.communications.join(format!("ledger.{signer}.jsonl"))
+}
+
+/// The single-file ledger this project may still carry from before per-agent files.
+///
+/// Read, never written. Its history is real and stays visible; new entries go to the writer's
+/// own file. Nothing needs migrating, which is the point of reading it rather than moving it.
+fn legacy_ledger_path(route: &ProjectRoute) -> PathBuf {
     route.communications.join("ledger.jsonl")
+}
+
+/// Every ledger file in the channel, oldest-named first, plus the legacy file if present.
+fn ledger_files(route: &ProjectRoute) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let legacy = legacy_ledger_path(route);
+    if legacy.is_file() {
+        files.push(legacy);
+    }
+    if let Ok(entries) = fs::read_dir(&route.communications) {
+        let mut per_agent: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    return false;
+                };
+                // `ledger.<agent>.jsonl`, and not a Syncthing conflict copy of one - those
+                // are duplicates of records already counted, and reading them would report
+                // a broken chain for a file that is merely a copy.
+                name.starts_with("ledger.")
+                    && name.ends_with(".jsonl")
+                    && !name.contains(".sync-conflict-")
+            })
+            .collect();
+        per_agent.sort();
+        files.extend(per_agent);
+    }
+    files
 }
 
 /// Exactly what a ledger signature covers, and nothing else.
@@ -109,7 +174,17 @@ pub fn append_ledger_entry(
     if !crate::is_safe_component(actor) {
         bail!("ledger actor must be a path-safe identifier");
     }
-    let path = ledger_path(route);
+    // Keyed by the SIGNER, not the actor. The signer is the identity whose key writes the
+    // line, so keying by it is what makes this one-writer-per-path; `actor` is a separate
+    // field precisely because it can name someone else (an operator's decision recorded by a
+    // worker, for instance).
+    let signer = identity.name();
+    if !crate::is_safe_component(signer) {
+        bail!("ledger signer must be a path-safe identifier");
+    }
+    let path = ledger_path(route, signer);
+    // Now a correct lock rather than a decorative one: this file has exactly one writing
+    // machine, so a machine-local lock is the whole of the contention.
     let _lock = acquire_ledger_lock(route)?;
     let lines = read_lines(&path)?;
     let prev = lines
@@ -145,43 +220,61 @@ pub fn append_ledger_entry(
     Ok(entry)
 }
 
-/// Read the ledger and report whether its chain and signatures are intact.
+/// Read every agent's ledger and report whether the chains and signatures are intact.
+///
+/// Each file is verified as its own chain, then all entries are merged by time. One machine's
+/// broken chain does not make another machine's records unverifiable, which is the property the
+/// single shared file could not have: there, one sync conflict broke the chain for everybody,
+/// forever.
 pub fn read_ledger(route: &ProjectRoute) -> Result<LedgerLog> {
-    let lines = read_lines(&ledger_path(route))?;
-    let mut entries = Vec::new();
+    let mut entries: Vec<LedgerEntry> = Vec::new();
     let mut intact = true;
     let mut broken_at = None;
-    let mut previous_line: Option<&str> = None;
 
-    for (index, line) in lines.iter().enumerate() {
-        let entry: LedgerEntry = match serde_json::from_str(line) {
-            Ok(entry) => entry,
-            Err(_) => {
+    for path in ledger_files(route) {
+        let lines = read_lines(&path)?;
+        let mut previous_line: Option<&str> = None;
+        for line in &lines {
+            // The index reported is into the MERGED list, so it points at the entry an
+            // operator will actually see when they print the ledger.
+            let index = entries.len();
+            let entry: LedgerEntry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                Err(_) => {
+                    intact = false;
+                    broken_at.get_or_insert(index);
+                    // Stop reading THIS file - the rest of its chain is unanchored - but keep
+                    // reading the others. One machine writing a bad line must not erase every
+                    // other machine's history from the report.
+                    break;
+                }
+            };
+            let expected_prev = previous_line
+                .map(|previous| hex::encode(Sha256::digest(previous.as_bytes())))
+                .unwrap_or_default();
+            if entry.prev != expected_prev {
                 intact = false;
                 broken_at.get_or_insert(index);
-                break;
             }
-        };
-        let expected_prev = previous_line
-            .map(|previous| hex::encode(Sha256::digest(previous.as_bytes())))
-            .unwrap_or_default();
-        if entry.prev != expected_prev {
-            intact = false;
-            broken_at.get_or_insert(index);
+            if check_signature(
+                entry.signed_by.as_ref(),
+                entry.signature.as_ref(),
+                &ledger_payload(&entry),
+                &route.agents,
+            ) != SignatureCheck::Valid
+            {
+                intact = false;
+                broken_at.get_or_insert(index);
+            }
+            entries.push(entry);
+            previous_line = Some(line);
         }
-        if check_signature(
-            entry.signed_by.as_ref(),
-            entry.signature.as_ref(),
-            &ledger_payload(&entry),
-            &route.agents,
-        ) != SignatureCheck::Valid
-        {
-            intact = false;
-            broken_at.get_or_insert(index);
-        }
-        entries.push(entry);
-        previous_line = Some(line);
     }
+
+    // Merged by time, stably, so entries recorded in the same instant keep the order their
+    // own file had. Sorting is what replaces the old global chain: an ordering across machines
+    // was never truly established by it either - it recorded whichever write landed first.
+    entries.sort_by_key(|entry| entry.created_at);
 
     Ok(LedgerLog {
         entries,
@@ -348,6 +441,99 @@ mod tests {
         );
     }
 
+    /// Two machines recording in the same window must both keep their records.
+    ///
+    /// This is the case the single shared file could not survive, and it needs no attacker:
+    /// both machines computed `prev` from the same last line, Syncthing conflict-renamed one
+    /// copy, and the chain never lined up again - `intact = false` permanently, unrepairable
+    /// because the file is append-only. A tamper-evident log that cries tamper on Tuesday
+    /// teaches its operator to ignore it.
+    #[test]
+    fn two_machines_recording_at_once_keep_both_histories_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        let alice = AgentIdentity::from_seed("alice", [1u8; 32]);
+        let bob = AgentIdentity::from_seed("bob", [2u8; 32]);
+        route.agents = vec![
+            crate::AgentRoute {
+                name: "alice".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(alice.public_key_hex()),
+            },
+            crate::AgentRoute {
+                name: "bob".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(bob.public_key_hex()),
+            },
+        ];
+
+        // Interleaved, as two machines syncing a folder actually are.
+        append_ledger_entry(&route, &alice, "order", "alice", "issued t-1", Some("t-1")).unwrap();
+        append_ledger_entry(&route, &bob, "claim", "bob", "claimed t-1", Some("t-1")).unwrap();
+        append_ledger_entry(&route, &alice, "order", "alice", "issued t-2", Some("t-2")).unwrap();
+        append_ledger_entry(&route, &bob, "result", "bob", "submitted t-1", Some("t-1")).unwrap();
+
+        // Separate files, one writer each - which is what makes the above safe.
+        assert!(route.communications.join("ledger.alice.jsonl").is_file());
+        assert!(route.communications.join("ledger.bob.jsonl").is_file());
+
+        let log = read_ledger(&route).unwrap();
+        assert!(
+            log.intact,
+            "two machines recording concurrently is ordinary use, not tampering: {:?}",
+            log.broken_at
+        );
+        assert_eq!(log.entries.len(), 4, "nobody's records may go missing");
+        // Merged by time, so the operator reads one history rather than two.
+        let summaries: Vec<&str> = log.entries.iter().map(|e| e.summary.as_str()).collect();
+        assert_eq!(
+            summaries,
+            vec!["issued t-1", "claimed t-1", "issued t-2", "submitted t-1"]
+        );
+    }
+
+    /// One machine writing a bad line must not erase everyone else's history from the report.
+    #[test]
+    fn one_broken_file_does_not_invalidate_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        let alice = AgentIdentity::from_seed("alice", [1u8; 32]);
+        let bob = AgentIdentity::from_seed("bob", [2u8; 32]);
+        route.agents = vec![
+            crate::AgentRoute {
+                name: "alice".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(alice.public_key_hex()),
+            },
+            crate::AgentRoute {
+                name: "bob".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(bob.public_key_hex()),
+            },
+        ];
+        append_ledger_entry(&route, &alice, "order", "alice", "issued t-1", Some("t-1")).unwrap();
+        append_ledger_entry(&route, &bob, "claim", "bob", "claimed t-1", Some("t-1")).unwrap();
+
+        // Corrupt only bob's file.
+        fs::write(
+            route.communications.join("ledger.bob.jsonl"),
+            "this is not json\n",
+        )
+        .unwrap();
+
+        let log = read_ledger(&route).unwrap();
+        assert!(!log.intact, "the corruption must still be reported");
+        // Alice's record survives into the report, which the shared-file version could not do.
+        assert!(
+            log.entries.iter().any(|e| e.summary == "issued t-1"),
+            "another machine's history must not vanish because bob's file broke"
+        );
+    }
+
     #[test]
     fn a_tampered_entry_breaks_the_chain() {
         let dir = tempfile::tempdir().unwrap();
@@ -372,7 +558,8 @@ mod tests {
         )
         .unwrap();
 
-        let path = route.communications.join("ledger.jsonl");
+        // The agent's OWN file, which is where appends go now.
+        let path = route.communications.join("ledger.alice.jsonl");
         let mut lines: Vec<String> = fs::read_to_string(&path)
             .unwrap()
             .lines()
