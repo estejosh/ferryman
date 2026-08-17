@@ -149,6 +149,23 @@ running: no server, no daemon, no token.
 | [Writing a worker](docs/WRITING_A_WORKER.md) | the worker protocol |
 | [Getting started](docs/GETTING_STARTED.md) | the guided walkthrough |
 
+## Keeping a fleet on the same build
+
+```sh
+# in any repository you use Ferryman in
+curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/ferry-up.sh | sh
+```
+
+Installs or updates `ferry`, attaches the repository if it isn't attached, and then
+tells you where you stand: version **and commit** before and after, whether your
+signing key is unchanged, and a signature check on every artifact. Safe to run twice,
+and it never rotates a key — it prints the fingerprint before and after so you can see
+that rather than take it on faith. Windows: `ferry-up.ps1`, same thing.
+
+Run it on every machine, then compare the commit in `ferry --version`. If they differ,
+they aren't running the same Ferryman — which is the cause of a whole class of problems
+that otherwise look like bugs.
+
 ## Building from source
 
 ```sh
