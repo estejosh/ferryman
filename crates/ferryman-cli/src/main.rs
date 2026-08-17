@@ -53,7 +53,7 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
         /// This agent's name. Defaults to this machine's name.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// Contact email for this deployment. Required: free production use is
         /// conditioned on registering one (LICENSE section 3). Nothing about your
@@ -269,7 +269,7 @@ enum Command {
         #[arg(long)]
         project: Option<String>,
         /// Load one agent's specialization profile on top of the shared memory.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// List the agents that have memory, with a one-line summary each — the
         /// chooser for deciding whose memory to load.
@@ -451,7 +451,7 @@ enum Communications {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// The signing agent name. Defaults to this machine's name.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         dry_run: bool,
@@ -477,7 +477,7 @@ enum Channel {
         /// Who it is from. Defaults to this machine's name.
         #[arg(long)]
         from: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         to: String,
         /// The message body. Plain text, or JSON if it starts with '{'.
         #[arg(long)]
@@ -492,7 +492,7 @@ enum Channel {
     Inbox {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: String,
         /// Include messages that have already been acknowledged.
         #[arg(long)]
@@ -522,7 +522,7 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// The agent name to reserve, e.g. the machine that will join later.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         name: String,
         #[arg(long, default_value = "worker")]
         role: String,
@@ -550,13 +550,13 @@ enum Channel {
         /// Who is issuing it. Defaults to this machine's name. Give the name this
         /// agent joined under, or the order is signed by an identity the roster
         /// does not know and every reader reports it as UnknownSigner.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// Task id, e.g. t-4f2a.
         #[arg(long)]
         id: String,
         /// The machine to do it. Omit for "whoever picks it up first".
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         to: Option<String>,
         #[arg(long)]
         task: String,
@@ -581,7 +581,7 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Who is importing. Defaults to this machine's name.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// A name for the source, e.g. "linear". Becomes part of each order id.
         #[arg(long)]
@@ -603,7 +603,7 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Who is importing. Defaults to this machine's name.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// Seconds between polls when a source has no interval of its own.
         #[arg(long, default_value_t = 60)]
@@ -624,7 +624,7 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Who is interrupting. Defaults to this machine's name.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         #[arg(long)]
         order: String,
@@ -639,14 +639,14 @@ enum Channel {
     Work {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
     },
     /// Stake a claim on an open order.
     Claim {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         id: String,
     },
@@ -654,7 +654,7 @@ enum Channel {
     Submit {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         #[arg(long)]
         result: String,
@@ -667,7 +667,7 @@ enum Channel {
         /// Who is settling it. Defaults to this machine, not to a shared name: a
         /// verdict signed "orchestrator" on every machine cannot be told apart from
         /// any other machine's, which defeats the point of signing it.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         reviewer: Option<String>,
         /// Keep it. Without this, the work is sent back and --notes is required.
         #[arg(long)]
@@ -737,7 +737,7 @@ enum Channel {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// Who is exporting. Defaults to this machine's name.
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// Emit JSON instead of a human-readable report.
         #[arg(long)]
@@ -925,21 +925,21 @@ enum WorktreeAction {
     Branch {
         #[arg(long)]
         order: String,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: String,
     },
     /// Create the worktree for an (order, agent) pair.
     Create {
         #[arg(long)]
         order: String,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: String,
     },
     /// Remove the worktree (and its branch) for an (order, agent) pair.
     Cleanup {
         #[arg(long)]
         order: String,
-        #[arg(long)]
+        #[arg(long, value_parser = agent_name)]
         agent: String,
     },
 }
@@ -2825,6 +2825,33 @@ fn soak_endpoint() -> Option<String> {
 ///
 /// This is a function so the rule has one place to live. Fifteen careful call sites is
 /// fifteen chances for the sixteenth to be wrong.
+/// Fold an agent name as it arrives from the operator, before anything compares it.
+///
+/// # Why this is a `value_parser` and not a rule
+///
+/// Same lesson as `signing_identity` directly below, learned the same way. The channel
+/// folds names when it *writes* them, so the roster holds one `grouchly` however it was
+/// typed - but the CLI then compared the operator's raw `--agent GROUCHLY` against that
+/// folded roster with `==`, and told the operator that no such agent had joined while
+/// listing `grouchly` in the very same sentence. Rewriting the four or five comparisons
+/// that happen to exist today is how you get a sixth one wrong next month.
+///
+/// Attached to every argument that names an agent - `--agent`, `--to`, `--reviewer`,
+/// `--name` on `expect` - so by the time any handler sees a name, it is already the one
+/// spelling the channel uses. Nothing downstream has to remember.
+fn agent_name(value: &str) -> Result<String, String> {
+    let folded = ferryman_channel::canonical_agent_name(value);
+    if folded.is_empty() {
+        return Err("an agent name cannot be empty".to_string());
+    }
+    if !ferryman_channel::is_safe_component(&folded) {
+        return Err(format!(
+            "'{value}' is not a usable agent name: it must be letters, digits, '-', '_' or '.'"
+        ));
+    }
+    Ok(folded)
+}
+
 fn signing_identity(
     route: &ferryman_channel::ProjectRoute,
     name: &str,
@@ -3422,7 +3449,10 @@ fn channel(command: Channel) -> Result<()> {
             let messages = ferryman_channel::list_messages(&route)?;
             let mine: Vec<_> = messages
                 .into_iter()
-                .filter(|m| m.recipient == agent || m.recipient == "all")
+                // Case-insensitive against what is STORED: messages written before names
+                // were folded carry whatever spelling their sender used, and they are
+                // still addressed to this agent.
+                .filter(|m| m.recipient.eq_ignore_ascii_case(&agent) || m.recipient == "all")
                 .filter(|m| all || !ferryman_channel::is_acknowledged(&route, &m.id))
                 .map(|m| {
                     let verdict = ferryman_channel::verify_message(&m, &route.agents);
