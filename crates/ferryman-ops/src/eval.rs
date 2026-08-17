@@ -51,8 +51,22 @@ fn scorer_passes(scorer: &str, output: &str) -> Scored {
     let Some(mut stdin) = child.stdin.take() else {
         return Scored::NotRun;
     };
-    if stdin.write_all(output.as_bytes()).is_err() {
-        return Scored::NotRun;
+    if let Err(error) = stdin.write_all(output.as_bytes()) {
+        // A broken pipe is the scorer declining to read, not a failure to run it.
+        //
+        // Plenty of correct scorers never read stdin, or stop reading early: `exit 0`,
+        // `test -f build/report.json`, a `grep -q` that matches in the first line. The
+        // child exits, the pipe closes, and our write returns EPIPE. Whether that happens
+        // is a race between the child exiting and this thread writing - which is exactly
+        // why it showed up as a FLAKE rather than a failure, passing three runs in four.
+        //
+        // Treating it as `NotRun` meant a scorer's verdict was silently discarded some of
+        // the time, and since `NotRun` abstains from the fleet-wide learning record, the
+        // benchmark would quietly under-count results on a machine whose timing happened
+        // to lose. Any other write error is a genuine inability to talk to the child.
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            return Scored::NotRun;
+        }
     }
     drop(stdin);
     match child.wait() {
@@ -208,6 +222,34 @@ mod tests {
     /// The three outcomes must stay three. Collapsing "could not run" into "failed" is what
     /// wrote fabricated verdicts into the fleet's synced confidence data on every Windows
     /// machine, and it is the kind of simplification someone will reach for again.
+    /// A scorer that never reads its input still gets a verdict, every time.
+    ///
+    /// This is the regression test for a flake that took three runs in four to show: the
+    /// child exits without reading stdin, the pipe closes, and `write_all` returns EPIPE.
+    /// Reading that as "could not run" silently threw away a real verdict, and because
+    /// `NotRun` abstains from the fleet-wide learning record, a benchmark would quietly
+    /// under-count on whichever machine's timing lost the race.
+    ///
+    /// Repeated deliberately: once is not a test of a race, it is a coin flip. The output
+    /// is large enough that a single `write_all` cannot fit in the pipe buffer, which is
+    /// what makes losing the race the likely outcome rather than the rare one.
+    #[test]
+    fn a_scorer_that_ignores_its_input_still_reports_a_verdict() {
+        let big = "x".repeat(256 * 1024);
+        for attempt in 0..25 {
+            assert_eq!(
+                scorer_passes("exit 0", &big),
+                Scored::Passed,
+                "attempt {attempt}: a scorer may exit without reading stdin"
+            );
+            assert_eq!(
+                scorer_passes("exit 7", &big),
+                Scored::Failed,
+                "attempt {attempt}: and its non-zero exit is still a verdict"
+            );
+        }
+    }
+
     #[test]
     fn a_scorer_that_cannot_run_is_not_a_failing_engine() {
         // Exit 0 on every platform.
