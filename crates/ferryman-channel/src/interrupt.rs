@@ -118,13 +118,43 @@ pub fn pending_interrupts(
         if ack_path(route, order_id, issued_by, agent).exists() {
             continue;
         }
-        let raw = std::fs::read_to_string(entry.path())?;
-        let interrupt: Interrupt =
-            serde_json::from_str(&raw).with_context(|| format!("parse {name}"))?;
+        // Every failure from here on SKIPS this file. It must never propagate.
+        //
+        // Reading and parsing used to use `?`, above the signature check, so one non-JSON
+        // file in one task directory made every worker pass fail identically every ten
+        // seconds, forever, doing no work and quarantining nothing. That is a denial of
+        // service needing no valid signature at all - it failed before signatures were
+        // consulted - and any peer, or a Syncthing `.sync-conflict-….json` copy, could
+        // cause it. The signature check below always got this right; the parse did not.
+        let Ok(raw) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        let Ok(interrupt) = serde_json::from_str::<Interrupt>(&raw) else {
+            continue;
+        };
         // Trust boundary: only honour interrupts whose signature verifies. A
         // peer can write to the shared folder, so an unsigned interrupt is a
         // forged steer/kill/pause and must be ignored, not acted on.
         if crate::verify_interrupt(&interrupt, &route.agents) != crate::SignatureCheck::Valid {
+            continue;
+        }
+        // A valid signature over the WRONG order is still the wrong order.
+        //
+        // The signed payload contains `order_id`, and nothing compared it to the directory
+        // the file was found in. So a legitimately-signed `kill` could be copied into every
+        // task directory - no key required, just `cp` - and every worker would abandon the
+        // claim for whichever task the directory happened to be. Binding the signature to
+        // its location is what makes the signature mean "kill THIS task".
+        if interrupt.order_id != order_id {
+            continue;
+        }
+        // The name on the file must be the name in the signature.
+        //
+        // Without this, any roster member could sign an interrupt and file it under
+        // `interrupt.orchestrator.json`, and the worker would attribute the kill - and its
+        // acknowledgement - to the orchestrator. It also keeps the ack path derivable from
+        // the body alone, which is what fixes the replay below.
+        if interrupt.issued_by != issued_by {
             continue;
         }
         out.push(interrupt);
@@ -181,6 +211,152 @@ mod tests {
             git_visibility: String::new(),
             agents: Vec::new(),
         }
+    }
+
+    /// A signed interrupt must not travel between tasks.
+    ///
+    /// The attack needs no key: copy one legitimately-signed `kill` into every task
+    /// directory. Before the binding check, every worker abandoned the claim for whichever
+    /// task the directory happened to be.
+    #[test]
+    fn a_signed_interrupt_for_one_order_does_not_apply_to_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = route(dir.path());
+        let identity =
+            crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
+        route.agents = vec![crate::AgentRoute {
+            name: "orchestrator".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+        }];
+        let mut interrupt = Interrupt {
+            order_id: "t-1".into(),
+            action: InterruptAction::Kill,
+            note: "stop".into(),
+            issued_by: "orchestrator".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        identity.sign_interrupt(&mut interrupt);
+        write_interrupt(&route, &interrupt).unwrap();
+
+        // Where it belongs, it applies.
+        assert_eq!(
+            pending_interrupts(&route, "t-1", "claw").unwrap().len(),
+            1,
+            "the interrupt must work for the order it names"
+        );
+
+        // Copied verbatim into another task's directory - same bytes, same valid signature.
+        let elsewhere = crate::task_dir(&route, "t-2");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::copy(
+            interrupt_path(&route, "t-1", "orchestrator"),
+            elsewhere.join("interrupt.orchestrator.json"),
+        )
+        .unwrap();
+        assert!(
+            pending_interrupts(&route, "t-2", "claw")
+                .unwrap()
+                .is_empty(),
+            "a signature over t-1 must not kill t-2"
+        );
+    }
+
+    /// One unparseable file must not stop the worker, and must not need a signature to be
+    /// refused. This was an unauthenticated permanent denial of service: the parse used `?`
+    /// above the signature check, so `work_once` failed identically every poll, forever.
+    #[test]
+    fn a_malformed_or_forged_interrupt_is_skipped_rather_than_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = route(dir.path());
+        let identity =
+            crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
+        route.agents = vec![crate::AgentRoute {
+            name: "orchestrator".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+        }];
+        let task = crate::task_dir(&route, "t-1");
+        std::fs::create_dir_all(&task).unwrap();
+
+        // Not JSON at all.
+        std::fs::write(task.join("interrupt.someone.json"), "{ not json").unwrap();
+        // Valid JSON, wrong shape.
+        std::fs::write(task.join("interrupt.other.json"), r#"{"hello":"world"}"#).unwrap();
+        // A Syncthing conflict copy of a real interrupt, which passes the prefix/suffix
+        // filter and whose derived issuer will not match the body.
+        let mut real = Interrupt {
+            order_id: "t-1".into(),
+            action: InterruptAction::Kill,
+            note: "stop".into(),
+            issued_by: "orchestrator".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        identity.sign_interrupt(&mut real);
+        std::fs::write(
+            task.join("interrupt.orchestrator.sync-conflict-20260817-101112.json"),
+            serde_json::to_string(&real).unwrap(),
+        )
+        .unwrap();
+
+        let pending = pending_interrupts(&route, "t-1", "claw")
+            .expect("a malformed file must not fail the whole pass");
+        assert!(
+            pending.is_empty(),
+            "nothing here should be honoured: {pending:?}"
+        );
+
+        // And a well-formed signed one still gets through, so the skipping is not blanket.
+        write_interrupt(&route, &real).unwrap();
+        assert_eq!(pending_interrupts(&route, "t-1", "claw").unwrap().len(), 1);
+    }
+
+    /// The name on the file must be the name in the signature, or a roster member could
+    /// file their own signed interrupt under someone else's name and have the worker
+    /// attribute the kill - and its acknowledgement - to that person.
+    #[test]
+    fn an_interrupt_filed_under_another_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = route(dir.path());
+        let mallory = crate::AgentIdentity::load_or_create("mallory", &route.attachment).unwrap();
+        route.agents = vec![crate::AgentRoute {
+            name: "mallory".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(mallory.public_key_hex()),
+        }];
+        let mut interrupt = Interrupt {
+            order_id: "t-1".into(),
+            action: InterruptAction::Kill,
+            note: "stop".into(),
+            issued_by: "mallory".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        // Genuinely signed by mallory, with mallory's real key, and mallory is on the
+        // roster. The only lie is the filename.
+        mallory.sign_interrupt(&mut interrupt);
+        let task = crate::task_dir(&route, "t-1");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(
+            task.join("interrupt.orchestrator.json"),
+            serde_json::to_string(&interrupt).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            pending_interrupts(&route, "t-1", "claw")
+                .unwrap()
+                .is_empty(),
+            "a valid signature does not make the filename true"
+        );
     }
 
     #[test]

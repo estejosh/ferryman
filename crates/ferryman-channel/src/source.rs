@@ -66,6 +66,10 @@ impl TaskSource {
 
 /// A command that runs `command` through this platform's shell.
 ///
+/// Public because it is not only this module's concern: the benchmark scorer in
+/// `ferryman-ops` runs an operator-supplied shell command too, and had the identical `sh`
+/// bug. A second copy of this reasoning is a second place to get it wrong.
+///
 /// # Two separate Windows bugs live here
 ///
 /// **The shell.** This was `Command::new("sh")` unconditionally. Windows has no `sh` on
@@ -84,7 +88,7 @@ impl TaskSource {
 /// nearly every real one (`gh issue list --json ...`, `curl -H "..."`). `raw_arg` appends the
 /// string to the command line verbatim, which is what a shell needs and what `arg` cannot do.
 /// It is a safe function, so `#![forbid(unsafe_code)]` still holds.
-fn shell_command(command: &str) -> Command {
+pub fn shell_command(command: &str) -> Command {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

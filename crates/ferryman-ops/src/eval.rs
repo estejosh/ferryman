@@ -14,30 +14,53 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Runner, run_engine_prompt};
 
+/// What running a scorer told us.
+///
+/// Three outcomes, not two. "The scorer says this output is wrong" and "the scorer could not
+/// be run" are completely different facts, and collapsing them into `false` is what made this
+/// dangerous: the verdict is written to `learnings.jsonl` in the **synced** channel, so a
+/// scorer that could not start recorded a fabricated failure against that engine on every
+/// machine in the fleet, permanently, in an append-only log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scored {
+    Passed,
+    Failed,
+    /// The scorer itself did not run. Says nothing about the engine.
+    NotRun,
+}
+
 /// Run a scorer command over the engine's output; exit 0 means pass. The
 /// output is written to the command's stdin, so a scorer like `grep -q 42`
 /// or a test runner reads it directly.
-fn scorer_passes(scorer: &str, output: &str) -> bool {
+///
+/// Uses the shared [`ferryman_channel::source::shell_command`] rather than `sh` directly.
+/// This function had exactly the bug that helper exists to prevent: `Command::new("sh")` on a
+/// platform with no `sh`, whose spawn failure was indistinguishable from a low score. On
+/// Windows that meant every benchmarked task recorded as a failure.
+fn scorer_passes(scorer: &str, output: &str) -> Scored {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new("sh")
-        .arg("-c")
-        .arg(scorer)
+    use std::process::Stdio;
+    let Ok(mut child) = ferryman_channel::source::shell_command(scorer)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     else {
-        return false;
+        return Scored::NotRun;
     };
     let Some(mut stdin) = child.stdin.take() else {
-        return false;
+        return Scored::NotRun;
     };
     if stdin.write_all(output.as_bytes()).is_err() {
-        return false;
+        return Scored::NotRun;
     }
     drop(stdin);
-    child.wait().map(|status| status.success()).unwrap_or(false)
+    match child.wait() {
+        // Only here has the scorer actually reached a verdict about the output.
+        Ok(status) if status.success() => Scored::Passed,
+        Ok(_) => Scored::Failed,
+        Err(_) => Scored::NotRun,
+    }
 }
 
 /// An engine to benchmark: any agent CLI, with its own args and runner.
@@ -127,32 +150,46 @@ pub async fn run_bench(
             };
             let missing = contract.violations(&payload);
             let contract_ok = missing.is_empty();
-            let scorer_ok = task
-                .scorer
-                .as_ref()
-                .map(|scorer| scorer_passes(scorer, stdout.trim()))
-                .unwrap_or(true);
-            let accepted = contract_ok && scorer_ok;
+            let scored = match task.scorer.as_ref() {
+                Some(scorer) => scorer_passes(scorer, stdout.trim()),
+                None => Scored::Passed,
+            };
+            let accepted = contract_ok && scored == Scored::Passed;
             let note = if accepted {
                 "ok".to_string()
             } else if !contract_ok {
                 format!("missing: {}", missing.join(", "))
+            } else if scored == Scored::NotRun {
+                format!(
+                    "scorer could not be run: {}",
+                    task.scorer.as_deref().unwrap_or("(none)")
+                )
             } else {
                 "scorer failed".to_string()
             };
-            ferryman_channel::learning::record_learning(
-                route,
-                &ferryman_channel::learning::Learning {
-                    at: chrono::Utc::now(),
-                    engine: engine.name.clone(),
-                    agent: None,
-                    model: None,
-                    task_id: task.id.clone(),
-                    source: "eval".to_string(),
-                    accepted,
-                    note: note.clone(),
-                },
-            )?;
+            // A benchmark whose scorer never ran is NOT evidence about the engine, and it
+            // must not be filed as if it were. `learnings.jsonl` is in the synced channel and
+            // feeds the confidence figures every machine displays and routes work by, so one
+            // broken scorer would otherwise write a fabricated verdict against this engine to
+            // the whole fleet, in an append-only log with nothing to un-poison it with.
+            //
+            // The run is still reported to the operator below, so a broken scorer is visible
+            // rather than silently skipped. It is only the fleet-wide record that abstains.
+            if scored != Scored::NotRun {
+                ferryman_channel::learning::record_learning(
+                    route,
+                    &ferryman_channel::learning::Learning {
+                        at: chrono::Utc::now(),
+                        engine: engine.name.clone(),
+                        agent: None,
+                        model: None,
+                        task_id: task.id.clone(),
+                        source: "eval".to_string(),
+                        accepted,
+                        note: note.clone(),
+                    },
+                )?;
+            }
             results.push(BenchResult {
                 engine: engine.name.clone(),
                 task: task.id.clone(),
@@ -162,4 +199,40 @@ pub async fn run_bench(
         }
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The three outcomes must stay three. Collapsing "could not run" into "failed" is what
+    /// wrote fabricated verdicts into the fleet's synced confidence data on every Windows
+    /// machine, and it is the kind of simplification someone will reach for again.
+    #[test]
+    fn a_scorer_that_cannot_run_is_not_a_failing_engine() {
+        // Exit 0 on every platform.
+        assert_eq!(scorer_passes("exit 0", "anything"), Scored::Passed);
+        // Exit non-zero: a real verdict about the output.
+        assert_eq!(scorer_passes("exit 3", "anything"), Scored::Failed);
+        // A program that does not exist: the scorer could not reach a verdict at all. Note
+        // this goes through the shell, so it is the shell that fails - which is exactly the
+        // shape of the original bug, where the shell itself was missing.
+        assert_eq!(
+            scorer_passes("ferryman-no-such-program-exists-anywhere", "anything"),
+            Scored::Failed,
+            "a missing program is the shell reporting non-zero, which IS a verdict"
+        );
+    }
+
+    /// The scorer really does read the engine's output on stdin, on this platform.
+    #[test]
+    fn the_output_reaches_the_scorer_on_stdin() {
+        let scorer = if cfg!(windows) {
+            "findstr 42 >nul"
+        } else {
+            "grep -q 42"
+        };
+        assert_eq!(scorer_passes(scorer, "the answer is 42"), Scored::Passed);
+        assert_eq!(scorer_passes(scorer, "the answer is 41"), Scored::Failed);
+    }
 }

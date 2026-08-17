@@ -16,8 +16,17 @@ use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
+/// What `ferry --version` reports: the crate version plus the commit it was built from.
+///
+/// The version alone was not enough, and an outside upgrade report proved it: `0.3.1` before a
+/// day of changes and `0.3.1` after, so the one check the upgrade instructions asked for could
+/// not distinguish the builds. Machines here build from `main`, so two builds days apart share
+/// a version legitimately. The commit makes "did that machine get the new build?" answerable
+/// at any moment rather than only just after a tag. See `build.rs`.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), env!("FERRYMAN_BUILD"));
+
 #[derive(Parser, Clone)]
-#[command(version, about = "Private coordination for a fleet of AI agents")]
+#[command(version = VERSION, about = "Private coordination for a fleet of AI agents")]
 struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8787")]
     endpoint: String,

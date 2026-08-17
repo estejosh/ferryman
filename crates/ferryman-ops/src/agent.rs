@@ -597,11 +597,19 @@ fn run_command(
                 full.push("--network".to_string());
                 full.push(network.to_string());
             }
-            // Inject only the operator-listed credentials; the container gets
-            // nothing else of the host environment.
-            for (key, value) in credentials {
+            // Pass only the NAME. `--env KEY` with no `=value` tells podman and docker to
+            // forward that variable from their own environment, and the value is put there
+            // by the caller.
+            //
+            // This used to be `--env KEY=VALUE`, which put every API key the operator listed
+            // into the container runtime's argument list - and `/proc/<pid>/cmdline` is
+            // world-readable, so `ps auxww` showed them in plaintext to every account on the
+            // machine for the task's lifetime. The container runner is the one an operator
+            // reaches for *because* they wanted isolation, and it was the leaky one; the bare
+            // runner below always did it correctly with `command.env`.
+            for (key, _) in credentials {
                 full.push("--env".to_string());
-                full.push(format!("{key}={value}"));
+                full.push(key.clone());
             }
             full.push("-v".to_string());
             full.push(workspace_mount(workspace));
@@ -658,12 +666,15 @@ async fn run_agent(
     for name in ferryman_channel::scrub_child_environment_names() {
         command.env_remove(&name);
     }
-    // Put back only the credentials the operator listed; the container got them
-    // via --env, the bare runner needs them set directly.
-    if matches!(config.runner, Runner::Bare) {
-        for (key, value) in credentials {
-            command.env(key, value);
-        }
+    // Put back only the credentials the operator listed, for EVERY runner.
+    //
+    // This used to be `if matches!(config.runner, Runner::Bare)`, because the container
+    // runner passed values on its own argv - where `ps` could read them. Now the argv
+    // carries only names (`--env KEY`), and podman and docker forward the value from their
+    // own environment, which is this one. So the container path needs these set too, and the
+    // secret never appears in any process's arguments.
+    for (key, value) in credentials {
+        command.env(key, value);
     }
     // The agent CLI, not Ferryman, is what makes a machine unusable: the loop idles at
     // about 5 MB, the thing it starts is measured in hundreds. Below-normal is set at
@@ -699,9 +710,6 @@ async fn run_agent(
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline = Instant::now() + config.timeout;
-    // Memory is the one check that is not free (sysinfo re-reads the system), so it is
-    // sampled at most every five seconds.
-    let mut memory_checked_at = Instant::now() - Duration::from_secs(5);
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -745,27 +753,44 @@ async fn run_agent(
             );
         }
 
-        // The operator asked to keep this much memory free. Declining to claim only
-        // protects the *next* task; a running one can still eat the machine alive, and a
-        // machine the operator had to hard-reset is the worst failure of all. Kill the
-        // child before the OS has to kill something itself.
-        if config.min_free_ram_mb > 0 && memory_checked_at.elapsed() >= Duration::from_secs(5) {
-            memory_checked_at = Instant::now();
-            if let Some(free) = crate::governor::available_memory_mb()
-                && free < config.min_free_ram_mb
-            {
-                kill_child(&mut child).await;
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                bail!(
-                    "'{}' was killed: {free} MB free, below min_free_ram_mb {}",
-                    config.command,
-                    config.min_free_ram_mb
-                );
-            }
-        }
+        // There is deliberately NO memory check here. See the note below.
     }
 }
+
+// Why running work is never killed for memory
+// ===========================================
+//
+// This loop used to sample free memory every five seconds and kill the agent CLI when it
+// dropped below `min_free_ram_mb`. That was removed, and it must not come back.
+//
+// **It killed the work it was protecting.** `min_free_ram_mb` is the threshold the governor
+// used to ALLOW the claim, and the agent CLI is the thing that consumes the memory. So 1200
+// MB free passes a 1024 MB gate, the CLI allocates 400 MB doing exactly what it was told to
+// do, and the next tick killed it for it. The check could not distinguish "this machine is in
+// trouble" from "the task I just started is running".
+//
+// **And it could not stop.** `bail!` here becomes an `Err` from `do_work`, then from
+// `work_once`, and the loop logs "pass failed, will retry" and starts again. The claim is
+// never released, and `work_for` only offers a claimed task back to its own holder, so no
+// other machine could take over. A machine short of memory did not degrade - it burned in
+// place, forever, killing the same task.
+//
+// **It also watched the wrong number.** `available_memory_mb` is system-wide, so a browser or
+// a second worker on the same box killed your run.
+//
+// The rule this violated is stated in `governor`'s module docs - "The gate runs before
+// claiming. Never during... does not kill it to free resources" - printed to the operator as
+// "anything already running is unaffected", and asserted by two tests. The code contradicted
+// its own tested promise.
+//
+// What actually protects the machine, and did all along: the pre-claim gate declines the
+// NEXT task while memory is short (so pressure becomes placement across the fleet, or a
+// delay on one machine), and the agent runs at lowered priority so it cannot make the
+// desktop unresponsive. The stall guard and the overall timeout above still kill a run -
+// but on evidence about that run, not about the weather on the rest of the machine.
+//
+// If a hard memory ceiling is ever genuinely wanted, it belongs to the OS: a cgroup or a
+// container memory limit, applied to the child, where exceeding it is unambiguous.
 
 /// Kill a child and wait for it to be reaped, so no zombie is left behind.
 async fn kill_child(child: &mut tokio::process::Child) {
@@ -1657,6 +1682,40 @@ mod tests {
         assert!(Podman("x".into()).is_sandboxed());
         assert_eq!(Podman("x".into()).runtime(), "podman");
         assert_eq!(Docker("x".into()).runtime(), "docker");
+    }
+
+    /// A secret must never reach any process's argument list.
+    ///
+    /// The container runner used to push `--env KEY=VALUE` into podman's argv, and
+    /// `/proc/<pid>/cmdline` is world-readable - `ps auxww` showed the plaintext key to every
+    /// account on the machine. The existing container tests all passed `&[]` for credentials,
+    /// so nothing looked at this path at all.
+    #[test]
+    fn credentials_never_appear_in_the_container_argument_list() {
+        let mut config = AgentConfig::parse("agent = \"a\"\ncommand = \"claude\"\n").unwrap();
+        config.runner = Runner::Podman("ferryman/agent:latest".into());
+        let secret = "sk-live-do-not-log-me";
+        let credentials = vec![("ANTHROPIC_API_KEY".to_string(), secret.to_string())];
+
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &credentials);
+        assert_eq!(binary, "podman");
+
+        let line = args.join(" ");
+        assert!(
+            !line.contains(secret),
+            "the secret VALUE must not be an argument: {line}"
+        );
+        assert!(
+            !line.contains("ANTHROPIC_API_KEY="),
+            "not even as KEY=VALUE: {line}"
+        );
+        // The name alone is present, which is what makes podman forward it from its own
+        // environment - where `command.env` puts it.
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--env".to_string(), "ANTHROPIC_API_KEY".to_string()]),
+            "the variable must still be forwarded by name: {line}"
+        );
     }
 
     #[test]
