@@ -1556,7 +1556,12 @@ pub fn verify_recommendation(
 /// On Unix that is mode 0600. On Windows the state directory is already per-user and
 /// Rust exposes no equivalent without extra dependencies, so this is a no-op there and
 /// says so rather than pretending otherwise.
-fn restrict_to_owner(path: &Path) -> Result<()> {
+///
+/// Public because it is not only this module's concern: the dashboard seals operator
+/// identities into their own files, and a second implementation of "make this owner-only"
+/// is a second thing that can be wrong. One resolver for one question - the same reason
+/// there is one `identity::machine_name` rather than two that drifted.
+pub fn restrict_to_owner(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -39,6 +39,12 @@ pub struct DashboardState {
     pub read_only: bool,
     login_rate: RateLimiter,
     create_rate: RateLimiter,
+    /// The one-time secret that authorises creating the FIRST operator.
+    ///
+    /// Minted at startup only when no operator exists, printed to the terminal, and
+    /// consumed by the first successful creation. See [`create_operator`] for why this
+    /// exists rather than nothing, and why it is a token rather than a flag.
+    bootstrap: Arc<Mutex<Option<String>>>,
 }
 
 impl DashboardState {
@@ -48,6 +54,14 @@ impl DashboardState {
         read_only: bool,
         timeout: Duration,
     ) -> Self {
+        // Minted only when there is nobody to authenticate as. Once one operator exists,
+        // creation is an authenticated action and no bootstrap secret should be in memory
+        // at all - a standing one is a standing bypass of the thing it bootstrapped.
+        let bootstrap = (!read_only && !operators.any()).then(|| {
+            let mut bytes = [0u8; 32];
+            rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+            hex::encode(bytes)
+        });
         Self {
             route,
             operators,
@@ -55,7 +69,39 @@ impl DashboardState {
             read_only,
             login_rate: RateLimiter::new(5, Duration::from_secs(60)),
             create_rate: RateLimiter::new(10, Duration::from_secs(3600)),
+            bootstrap: Arc::new(Mutex::new(bootstrap)),
         }
+    }
+
+    /// The bootstrap token to print, when there is one. The caller shows this to the human
+    /// at the terminal; it is deliberately never available over HTTP.
+    #[must_use]
+    pub fn bootstrap_token(&self) -> Option<String> {
+        self.bootstrap.lock().unwrap().clone()
+    }
+
+    /// Accept and consume the bootstrap token, or refuse.
+    ///
+    /// Single-use: taken out of the state on success, so a token that leaks after the first
+    /// operator exists is worth nothing. Compared in constant time, because it is a secret
+    /// and an early-returning comparison over a hex string is a byte-at-a-time oracle.
+    fn consume_bootstrap(&self, offered: &str) -> bool {
+        let mut held = self.bootstrap.lock().unwrap();
+        let Some(expected) = held.as_deref() else {
+            return false;
+        };
+        if expected.len() != offered.len() {
+            return false;
+        }
+        let matched = expected
+            .bytes()
+            .zip(offered.bytes())
+            .fold(0u8, |differences, (a, b)| differences | (a ^ b))
+            == 0;
+        if matched {
+            *held = None;
+        }
+        matched
     }
 }
 
@@ -197,6 +243,65 @@ impl RateLimiter {
     }
 }
 
+/// The only paths reachable without a session, listed in one place on purpose.
+///
+/// Everything not named here requires authentication, because [`require_session`] is a
+/// layer over the whole router rather than a check inside each handler.
+///
+/// That inversion is the fix for a real bug, not a preference. Authentication used to be
+/// per-handler: `sessions.resolve()` appeared in three handlers out of seventeen, and the
+/// other fourteen served the fleet - order payloads, worker output, the memory bank, the
+/// ledger, and `/api/fleet` with every device's operator email - to anyone who could reach
+/// the port. Nothing failed, no test noticed, and `openapi/dashboard.yaml` documented a
+/// session as required on every path while one path enforced it.
+///
+/// A check you can forget to add is a check somebody will forget to add. Adding a route is
+/// now safe by default and *opening* one is the deliberate act, which is the right way
+/// round: the failure mode of this list is a locked door, and the failure mode of the old
+/// arrangement was a silent open one.
+const PUBLIC_PATHS: &[&str] = &[
+    // The page itself. It is a shell that fetches everything through the API, so serving
+    // it to an anonymous browser reveals nothing - and it must be reachable, since it is
+    // where the sign-in form lives.
+    "/",
+    // Bootstrap and sign-in. `create` is not unauthenticated - it carries its own gate
+    // (see `create_operator`), which is not a session and so cannot live in this layer.
+    "/api/auth/create",
+    "/api/auth/login",
+    // Ending a session must work even after it has expired, or a stale tab can never
+    // clear itself. Revoking an unknown token is already a no-op.
+    "/api/auth/logout",
+];
+
+/// Require a live session for every path except [`PUBLIC_PATHS`].
+async fn require_session(
+    State(state): State<DashboardState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    // Exact match, never a prefix. `starts_with` here would be the same class of mistake
+    // as the Host guard's `starts_with("127.")` two functions down: `/api/auth/login` as a
+    // prefix would also open `/api/auth/login/../tasks`-shaped paths and anything later
+    // nested beneath it.
+    if PUBLIC_PATHS.contains(&request.uri().path()) {
+        return next.run(request).await;
+    }
+    if state
+        .sessions
+        .resolve(session_token(request.headers()))
+        .is_some()
+    {
+        return next.run(request).await;
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        "sign in to the dashboard first (no active session)",
+    )
+        .into_response()
+}
+
 /// A `Router` that serves the dashboard. The caller supplies the state to
 /// observe and (when not read-only) sign with; this module never binds a
 /// listener.
@@ -219,8 +324,39 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/memory/suggest", post(suggest))
         .route("/api/cost/rates", get(cost_rates))
         .route("/api/cost/plan", post(cost_plan))
+        // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
+        // session check. A rebinding attempt is refused without its token being examined,
+        // and a missing session is never reported to an origin that should not be talking
+        // to us at all.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_session,
+        ))
         .layer(axum::middleware::from_fn(loopback_host_guard))
         .with_state(state)
+}
+
+/// Whether a `Host` value names this machine's loopback interface.
+///
+/// # Why this is a parse and not a string test
+///
+/// This was `host.starts_with("127.")`, meaning to accept 127.0.0.0/8. A prefix test on a
+/// hostname is not a test on an address: **`127.0.0.1.evil.com` starts with `127.`**, and
+/// that is a name an attacker can register. Pointing it at 127.0.0.1 makes the attacker's
+/// page same-origin with this dashboard - identical scheme, host and port strings - so
+/// there is no preflight, responses are readable, and the `Host` header the browser sends
+/// is the one that just passed the guard. Which is the whole attack this function exists
+/// to stop.
+///
+/// `IpAddr::is_loopback` answers the question that was actually being asked, for v4 and v6
+/// at once, and cannot be fooled by a suffix. `localhost` stays a special case because it
+/// is a name rather than an address; it is compared whole.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 /// Reject requests whose `Host` header is not a loopback name/IP.
@@ -244,7 +380,7 @@ async fn loopback_host_guard(
                 _ => raw,
             };
             let host = host.trim_start_matches('[').trim_end_matches(']');
-            host == "localhost" || host == "127.0.0.1" || host == "::1" || host.starts_with("127.")
+            is_loopback_host(host)
         })
         .unwrap_or(true);
     if host_ok {
@@ -277,6 +413,16 @@ pub async fn serve(state: DashboardState, addr: std::net::SocketAddr) -> anyhow:
         "dashboard listening on http://{addr} (read_only={})",
         state.read_only
     );
+    // Printed to stdout, not logged: this is an instruction to the human standing at the
+    // terminal, and it must survive `--quiet`, a log level, or logs going to a file. It
+    // appears only when there is no operator yet, and stops working the moment one exists.
+    if let Some(token) = state.bootstrap_token() {
+        println!("\nNo operator exists for this project yet.");
+        println!("To create the first one, the dashboard needs this single-use setup token:");
+        println!("\n    {token}\n");
+        println!("Paste it into the sign-up form. It is not stored, is never sent to you");
+        println!("over HTTP, and stops working as soon as one operator exists.\n");
+    }
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -312,6 +458,18 @@ fn session_token(headers: &HeaderMap) -> &str {
         .unwrap_or("")
 }
 
+/// The one-time setup token offered for creating the first operator.
+///
+/// A separate header from the session token so the two can never be confused for one
+/// another: a session token must never authorise bootstrap, and the bootstrap token must
+/// never be accepted as a session.
+fn bootstrap_token(headers: &HeaderMap) -> &str {
+    headers
+        .get("x-ferryman-dashboard-setup")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
 #[derive(Deserialize)]
 struct Credentials {
     name: String,
@@ -322,6 +480,7 @@ struct Credentials {
 /// its public key to the roster, so the fleet can verify what this human signs.
 async fn create_operator(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<Value>, DashboardError> {
     if state.read_only {
@@ -331,6 +490,38 @@ async fn create_operator(
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             "too many operator creations; slow down".to_string(),
+        ));
+    }
+    // Who may create an operator, and why this is not simply "nobody without a session".
+    //
+    // This endpoint had NO authentication at all. Anyone who could reach the port created
+    // an operator, signed in, and approved agent work under a roster identity the whole
+    // fleet verifies as valid. What looked like a gate was in the browser: the page used
+    // `__ANY_OPERATORS__` to choose which FORM to show, and the server never consulted it.
+    //
+    // It cannot simply require a session, because the first operator has nobody to
+    // authenticate as. So there are exactly two ways in:
+    //
+    //   * an existing operator's session - ordinary authenticated creation; or
+    //   * the one-time token printed on the terminal when the store is empty.
+    //
+    // The token is proof of access to the machine's console, which is the property that
+    // actually matters and the one a network attacker cannot have. Chosen over an `--init`
+    // flag because a flag can be left switched on: the failure mode of a forgotten flag is
+    // a permanently open door, and the failure mode of a consumed token is nothing.
+    if state.operators.any() {
+        if state.sessions.resolve(session_token(&headers)).is_none() {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "sign in as an existing operator to create another".to_string(),
+            ));
+        }
+    } else if !state.consume_bootstrap(bootstrap_token(&headers)) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "creating the first operator needs the setup token printed in the terminal \
+             running the dashboard; pass it as x-ferryman-dashboard-setup"
+                .to_string(),
         ));
     }
     let identity = crate::operators::create_operator_identity(
@@ -350,9 +541,14 @@ async fn login(
     State(state): State<DashboardState>,
     Json(credentials): Json<Credentials>,
 ) -> Result<Json<Value>, DashboardError> {
-    if state.read_only {
-        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
-    }
+    // Sign-in is deliberately allowed in read-only mode, which is a change: it used to be
+    // refused, on the reasoning that read-only means "nothing to sign with".
+    //
+    // That reasoning stopped holding the moment reads required a session. Refusing the
+    // only way to obtain a session, while every read demands one, does not make a
+    // read-only dashboard read-only - it makes it unopenable. What read-only must forbid
+    // is *writing*, and that is enforced where writes happen (`create_operator`,
+    // `review_task`, `suggest`), not by withholding identity.
     if !state.login_rate.allow(&credentials.name) {
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
@@ -673,11 +869,29 @@ async fn suggest(
     if text.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "suggestion is empty".to_string()));
     }
+    // A byline is a claim about who said something, so it is taken from the session or the
+    // request is refused. This used to fall back to the literal string "operator" when
+    // there was no session - inventing an author, for an unauthenticated write, into the
+    // SYNCED memory bank that every agent on every machine reads. Silent degradation is
+    // bad enough on a read; on a signed-looking write it manufactures provenance.
     let author = state
         .sessions
         .resolve(session_token(&headers))
-        .map(|identity| identity.name().to_string())
-        .unwrap_or_else(|| "operator".to_string());
+        .ok_or((
+            StatusCode::UNAUTHORIZED,
+            "sign in before suggesting; a suggestion carries your name".to_string(),
+        ))?
+        .name()
+        .to_string();
+    // Bounded because this file replicates to every machine in the fleet. Axum's 2 MB body
+    // limit caps one request; nothing capped how many times you could append.
+    const MAX_SUGGESTION: usize = 4096;
+    if text.len() > MAX_SUGGESTION {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a suggestion is at most {MAX_SUGGESTION} characters"),
+        ));
+    }
     let entry = format!(
         "\n## {}\n_by {}_\n\n{}\n",
         chrono::Utc::now().to_rfc3339(),
@@ -1063,6 +1277,172 @@ mod tests {
             .unwrap()
     }
 
+    /// POST carrying the one-time setup token, for bootstrap paths.
+    async fn post_with_setup(
+        app: &Router,
+        uri: &str,
+        body: &str,
+        setup: &str,
+    ) -> axum::response::Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .header("x-ferryman-dashboard-setup", setup)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Sign in and return the session token, for tests that are about something else.
+    async fn signed_in(app: &Router, state: &DashboardState) -> String {
+        state.operators.create("alice", "hunter2-secret").unwrap();
+        let response = post(
+            app,
+            "/api/auth/login",
+            r#"{"name":"alice","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "test sign-in must work");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        value["token"].as_str().unwrap().to_string()
+    }
+
+    /// Every endpoint that is not on `PUBLIC_PATHS` refuses an anonymous caller.
+    ///
+    /// This is the test that did not exist. Authentication was per-handler and three
+    /// handlers out of seventeen had it, so the fleet - order payloads, worker output, the
+    /// memory bank, the ledger, and every device's operator email - answered anyone who
+    /// could reach the port. Two tests actively asserted that anonymous reads returned
+    /// `200`, which is how a hole stays open through a green suite.
+    ///
+    /// Written as a loop over the real route list rather than one case, so adding a route
+    /// without opening it deliberately cannot regress this.
+    #[tokio::test]
+    async fn every_non_public_endpoint_refuses_an_anonymous_caller() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        ferryman_channel::issue_order(&route, &order("task-1")).unwrap();
+        let app = router(state(&route, false));
+
+        for path in [
+            "/api/auth/whoami",
+            "/api/tasks",
+            "/api/tasks/task-1",
+            "/api/stats",
+            "/api/ledger",
+            "/api/learnings",
+            "/api/roster",
+            "/api/fleet",
+            "/api/memory",
+            "/api/cost/rates",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must require a session"
+            );
+        }
+
+        // The write endpoints too, including the one that used to invent the author name
+        // `"operator"` for an unauthenticated caller and append it to the SYNCED memory
+        // bank - an anonymous write into the context every agent on every machine reads.
+        for (path, body) in [
+            ("/api/tasks/task-1/review", r#"{"accept":true}"#),
+            ("/api/memory/suggest", r#"{"text":"anonymous"}"#),
+            ("/api/cost/plan", r#"{"goal":"x"}"#),
+        ] {
+            let response = post(&app, path, body, None).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must require a session"
+            );
+        }
+
+        // And the page itself must stay reachable, or there is nowhere to sign in from.
+        let index = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(index.status(), StatusCode::OK, "the sign-in page is public");
+    }
+
+    /// A read-only dashboard must still be openable.
+    ///
+    /// Requiring a session on reads while `--read-only` refused sign-in would have made
+    /// the flag mean "unusable" rather than "cannot write". This is the assertion that
+    /// stops the two rules being reintroduced in isolation from each other.
+    #[tokio::test]
+    async fn a_read_only_dashboard_can_still_be_signed_into_and_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        ferryman_channel::issue_order(&route, &order("task-1")).unwrap();
+
+        // The operator is created out of band, as `ferry enable --dashboard` does: a
+        // read-only dashboard still refuses to create one over HTTP.
+        let state = state(&route, true);
+        state.operators.create("alice", "hunter2-secret").unwrap();
+        let app = router(state);
+
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"alice","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(
+            login.status(),
+            StatusCode::OK,
+            "read-only must not mean unopenable"
+        );
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tasks")
+                    .header("x-ferryman-dashboard-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK, "reads work when signed in");
+
+        // Writing still does not.
+        let write = post(
+            &app,
+            "/api/tasks/task-1/review",
+            r#"{"accept":true}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(
+            write.status(),
+            StatusCode::FORBIDDEN,
+            "read-only must still refuse a write"
+        );
+    }
+
     #[tokio::test]
     async fn api_tasks_lists_channel_tasks() {
         let dir = tempfile::tempdir().unwrap();
@@ -1070,10 +1450,15 @@ mod tests {
         ferryman_channel::issue_order(&route, &order("task-1")).unwrap();
         ferryman_channel::claim_order(&route, "task-1", "alice").unwrap();
 
-        let response = router(state(&route, false))
+        let state = state(&route, false);
+        let app = router(state.clone());
+        let token = signed_in(&app, &state).await;
+
+        let response = app
             .oneshot(
                 Request::builder()
                     .uri("/api/tasks")
+                    .header("x-ferryman-dashboard-token", &token)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1091,19 +1476,72 @@ mod tests {
         assert_eq!(tasks[0]["state"]["by"], "alice");
     }
 
+    /// The cases a prefix test gets wrong.
+    ///
+    /// The bug this replaces passed every test that existed, because the only hostile
+    /// input tried was `attacker.example` - a name that looks nothing like a loopback
+    /// address. The bypass looks exactly like one. That asymmetry is the lesson: a guard
+    /// is only tested by inputs shaped like the thing it is meant to let through.
+    #[test]
+    fn a_hostname_that_merely_starts_with_a_loopback_address_is_not_loopback() {
+        for hostile in [
+            // The bypass. A registrable domain, prefixed to look local.
+            "127.0.0.1.evil.com",
+            "127.0.0.1.nip.io",
+            // Same trick without the dot boundary.
+            "127.0.0.1evil.com",
+            // The other half of the old test: a plain name is not a loopback address.
+            "attacker.example",
+            "localhost.evil.com",
+            "notlocalhost",
+            // Neither is a public address that happens to be near the range.
+            "128.0.0.1",
+            "12.7.0.1",
+            // Or an empty header.
+            "",
+        ] {
+            assert!(
+                !is_loopback_host(hostile),
+                "{hostile} must not be treated as loopback"
+            );
+        }
+
+        for genuine in [
+            "127.0.0.1",
+            // The rest of 127.0.0.0/8, which the prefix test did get right and which a
+            // naive equality-only fix would break.
+            "127.0.0.2",
+            "127.1.2.3",
+            "localhost",
+            "LocalHost",
+            "::1",
+            // The v6 loopback written out, which no string test would ever have matched.
+            "0:0:0:0:0:0:0:1",
+        ] {
+            assert!(is_loopback_host(genuine), "{genuine} is loopback");
+        }
+    }
+
     #[tokio::test]
     async fn rejects_a_non_loopback_host_header() {
         let dir = tempfile::tempdir().unwrap();
         let route = Arc::new(test_route(dir.path()));
         let app = router(state(&route, false));
 
-        // A DNS-rebinding attacker resolves their domain to 127.0.0.1; the Host
-        // header betrays that and the request is refused.
+        // Aimed at a PUBLIC path on purpose. The point is to prove the Host guard alone
+        // decides these two outcomes: against an authenticated path, a 403 would be
+        // indistinguishable from the session layer's 401 and the test would pass whether
+        // or not the guard existed.
+        //
+        // It also pins the layer ORDER. The guard is the outer layer, so a rebinding
+        // attempt is refused before its credentials are examined at all - a 401 here would
+        // mean the session check ran first and told an origin we should not be talking to
+        // that it merely needed to sign in.
         let bad = app
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/api/tasks")
+                    .uri("/")
                     .header("host", "attacker.example")
                     .body(Body::empty())
                     .unwrap(),
@@ -1112,11 +1550,26 @@ mod tests {
             .unwrap();
         assert_eq!(bad.status(), StatusCode::FORBIDDEN);
 
+        // The bypass this guard was rewritten for: a registrable domain prefixed to look
+        // local. It must be refused exactly like any other foreign host.
+        let rebound = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header("host", "127.0.0.1.evil.com:8788")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rebound.status(), StatusCode::FORBIDDEN);
+
         // A genuine loopback request (and one with no Host at all) still works.
         let good = app
             .oneshot(
                 Request::builder()
-                    .uri("/api/tasks")
+                    .uri("/")
                     .header("host", "127.0.0.1:8788")
                     .body(Body::empty())
                     .unwrap(),
@@ -1133,13 +1586,42 @@ mod tests {
         // does not publish a random key into the real operator's fleet dir.
         ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
         let route = Arc::new(test_route(dir.path()));
-        let app = router(state(&route, false));
+        let state = state(&route, false);
+        let setup = state
+            .bootstrap_token()
+            .expect("a store with no operators mints a setup token");
+        let app = router(state);
 
-        let created = post(
+        // Without the token, no operator can be created - the hole this closes. Anyone who
+        // could reach the port used to get a roster identity the whole fleet trusts.
+        let refused = post(
             &app,
             "/api/auth/create",
             r#"{"name":"operator1","password":"hunter2-secret"}"#,
             None,
+        )
+        .await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNAUTHORIZED,
+            "creating the first operator must need the terminal's setup token"
+        );
+
+        // A wrong token is no better than none.
+        let wrong = post_with_setup(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            &"0".repeat(setup.len()),
+        )
+        .await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+
+        let created = post_with_setup(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            &setup,
         )
         .await;
         assert_eq!(created.status(), StatusCode::OK);
@@ -1153,12 +1635,52 @@ mod tests {
         assert_eq!(entry.name, "operator1");
         assert!(entry.public_key.is_some());
 
-        // The same name cannot be created again.
+        // Single-use: the same token cannot mint a second operator. Otherwise a token that
+        // leaked from a scrollback would stay a standing key to the fleet.
+        let replayed = post_with_setup(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator2","password":"hunter2-secret"}"#,
+            &setup,
+        )
+        .await;
+        assert_eq!(
+            replayed.status(),
+            StatusCode::UNAUTHORIZED,
+            "the setup token must be consumed by its first use"
+        );
+
+        // And with an operator now in place, creating another is an authenticated action.
+        let second = post(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator2","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+
+        // The same name cannot be created again - checked through the authenticated path,
+        // since the bootstrap route is now closed.
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
         let dup = post(
             &app,
             "/api/auth/create",
             r#"{"name":"operator1","password":"hunter2-secret"}"#,
-            None,
+            Some(&token),
         )
         .await;
         assert_eq!(dup.status(), StatusCode::CONFLICT);

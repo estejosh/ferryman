@@ -27,6 +27,25 @@ use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+/// Keep the operator directory readable only by its owner.
+///
+/// Separate from [`ferryman_channel::restrict_to_owner`] because a directory needs the
+/// execute bit to be traversable at all: 0600 on a directory makes it unusable, so this is
+/// 0700 rather than a copy of the file version with a different constant.
+fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restrict {} to its owner", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+    }
+    Ok(())
+}
+
 const FORMAT: &str = "ferryman-operator/v1";
 const ITERATIONS: u32 = 600_000;
 /// The smallest password we will accept for an identity that can approve work.
@@ -125,12 +144,27 @@ impl OperatorStore {
         };
 
         std::fs::create_dir_all(&self.dir)?;
+        // Owner-only on the directory before anything is written into it, so there is no
+        // instant at which a world-readable file exists.
+        restrict_dir_to_owner(&self.dir)?;
+        let path = self.path(name);
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(self.path(name))
+            .open(&path)
             .with_context(|| format!("could not create operator identity {name}"))?;
         serde_json::to_writer_pretty(file, &record)?;
+        // This file is a password-cracking kit: salt, nonce, iteration count and the
+        // sealed seed are everything an offline attack needs, and the only thing standing
+        // between it and a forged signature that the whole fleet accepts is one password.
+        // 600k PBKDF2 iterations is a strong ONLINE policy and a weak offline one, so the
+        // file must not be readable by other accounts on this machine in the first place.
+        //
+        // The signing key next door has always done this (`restrict_to_owner`, used since
+        // keys existed). This did not, which is the kind of gap that only shows up when
+        // someone compares two files that should have matched.
+        ferryman_channel::restrict_to_owner(&path)
+            .with_context(|| format!("restrict {} to its owner", path.display()))?;
         Ok(identity)
     }
 
@@ -214,6 +248,45 @@ fn derive_key(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The sealed file is a complete offline-cracking kit, so no other account on the
+    /// machine may read it. Asserted rather than assumed: the signing key beside it has
+    /// been owner-only since keys existed, this file was world-readable, and nothing
+    /// failed - a permission bug produces no error and no wrong output, only a
+    /// consequence somewhere else entirely.
+    #[cfg(unix)]
+    #[test]
+    fn the_sealed_operator_file_is_not_readable_by_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = OperatorStore::new(dir.path());
+        store.create("alice", "hunter2-secret").unwrap();
+
+        let file = std::fs::metadata(store.path("alice"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            file.mode() & 0o777,
+            0o600,
+            "the sealed seed must be owner-only, not {:o}",
+            file.mode() & 0o777
+        );
+
+        // The directory the store actually owns - `operators/` under the attachment, not
+        // the attachment itself, which belongs to the project and is not ours to lock
+        // down. 0700 rather than 0600: a directory without the execute bit cannot be
+        // traversed, so copying the file mode here would break login.
+        let parent = std::fs::metadata(dir.path().join("operators"))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            parent.mode() & 0o777,
+            0o700,
+            "the operator directory must be owner-only and traversable, not {:o}",
+            parent.mode() & 0o777
+        );
+    }
 
     #[test]
     fn password_round_trip_and_wrong_password() {
