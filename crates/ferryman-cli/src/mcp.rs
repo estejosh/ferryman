@@ -596,6 +596,10 @@ mod tests {
     }
 
     /// A minimal stdio MCP server driven by line number, mirroring the client test.
+    ///
+    /// Gated with its test: unconditional, it is an unused constant on Windows and
+    /// `clippy -D warnings` fails there only.
+    #[cfg(unix)]
     const FIXTURE: &str = r#"n=0
 while IFS= read -r line; do
   n=$((n+1))

@@ -173,7 +173,11 @@ pub fn call(spec: &str, tool: &str, arguments: Option<String>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+// The whole module is unix-only because its one test drives a `sh` fixture. Gated at the
+// module rather than per item: with only the test gated, the import and the fixture constant
+// it feeds become unused on Windows, and `clippy -D warnings` fails there while passing on
+// Linux - which is how this reached a release branch unnoticed.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
