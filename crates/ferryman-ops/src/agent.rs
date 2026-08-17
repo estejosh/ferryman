@@ -1758,15 +1758,45 @@ mod tests {
         assert_eq!(mount_arg(Path::new("/ws"), true), "/ws:/workspace:z");
     }
 
+    /// One rule per assertion, checked by what the warning SAYS.
+    ///
+    /// This asserted `is_empty()` for `/mnt/nvme-storage/repos` and `/home/you/project`,
+    /// which quietly made it a test of two rules at once - and the other rule is
+    /// macOS-only. On macOS every path outside `/Users`, `/Volumes`, `/tmp`, `/private`
+    /// and `/var/folders` warns about the container VM's shared roots, correctly, so both
+    /// of those paths warn and `is_empty()` fails. The macOS CI job runs only on tags, so
+    /// this passed everywhere it was ever run until the first release build.
+    ///
+    /// Matching on the message keeps each assertion about the rule it names, and stops a
+    /// new warning for an unrelated reason from breaking a test that has nothing to do
+    /// with it.
     #[test]
-    fn mount_warnings_flag_windows_drives_but_not_normal_mnt() {
-        assert!(
-            mount_warnings(Path::new("/mnt/c/project"))
+    fn only_a_windows_drive_letter_warns_about_windows_drives() {
+        let windows_drive = |path: &str| {
+            mount_warnings(Path::new(path))
                 .iter()
                 .any(|w| w.contains("Windows drive"))
+        };
+        assert!(windows_drive("/mnt/c/project"), "/mnt/c is a drive letter");
+        assert!(
+            !windows_drive("/mnt/nvme-storage/repos"),
+            "a multi-character /mnt component is an ordinary Linux mount"
         );
-        assert!(mount_warnings(Path::new("/mnt/nvme-storage/repos")).is_empty());
-        assert!(mount_warnings(Path::new("/home/you/project")).is_empty());
+        assert!(!windows_drive("/home/you/project"));
+    }
+
+    /// The macOS rule, tested only where it applies.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_warns_about_paths_the_container_vm_cannot_see() {
+        let shared = |path: &str| mount_warnings(Path::new(path)).is_empty();
+        assert!(shared("/Users/you/project"), "/Users is shared into the VM");
+        assert!(shared("/private/tmp/project"));
+        assert!(
+            !shared("/opt/project"),
+            "a path outside the shared roots must warn, or the container silently sees \
+             an empty mount"
+        );
     }
 
     #[test]
