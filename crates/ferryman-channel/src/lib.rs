@@ -277,8 +277,8 @@ impl ProjectRoute {
             if agent.name.len() > 128 || agent.role.len() > 128 {
                 bail!("registered participant name or role exceeds 128 bytes")
             }
-            if !names.insert(&agent.name) {
-                bail!("registered participant names must be unique")
+            if !names.insert(agent.name.to_ascii_lowercase()) {
+                bail!("registered participant names must be unique, ignoring case")
             }
             if agent.capabilities.len() > 128
                 || agent
@@ -1833,6 +1833,52 @@ mod portable_auth_route_tests {
     }
 
     #[test]
+    fn participant_names_are_case_insensitively_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        route.agents = vec![
+            AgentRoute {
+                name: "grouchly".into(),
+                role: "orchestrator".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+            },
+            AgentRoute {
+                name: "Grouchly".into(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+            },
+        ];
+        // "grouchly" and "Grouchly" differ only by case, which collides on the
+        // case-insensitive filesystems the fleet runs on (macOS, Windows).
+        let error = route.validate().unwrap_err();
+        assert!(format!("{error:#}").contains("ignoring case"));
+    }
+
+    #[test]
+    fn roster_ignores_syncthing_conflict_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("beastly.json"),
+            r#"{"name":"beastly","role":"orchestrator","capabilities":[],"public_key":"aa"}"#,
+        )
+        .unwrap();
+        // A Syncthing conflict copy of the same entry must not be read as a
+        // second, keyless participant.
+        std::fs::write(
+            agents_dir.join("beastly.sync-conflict-20260817-144138-O4SHF2J.json"),
+            r#"{"name":"beastly","role":"orchestrator","capabilities":[]}"#,
+        )
+        .unwrap();
+        let roster = read_roster_in(&agents_dir).unwrap();
+        assert_eq!(roster.len(), 1);
+        assert_eq!(roster[0].name, "beastly");
+    }
+
+    #[test]
     fn v2_message_verifies_against_the_route_trust_store() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route(dir.path());
@@ -2459,7 +2505,7 @@ pub fn register_agent_key(
     };
     if let Some(existing) = read_agent_roster(&route.communications)?
         .into_iter()
-        .find(|a| a.name == published.name)
+        .find(|a| a.name.eq_ignore_ascii_case(&published.name))
         && let Some(known) = existing.public_key.filter(|k| !k.is_empty())
         && Some(&known) != published.public_key.as_ref()
     {
@@ -2625,7 +2671,10 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
     // anyone already in it, so an existing channel keeps verifying exactly as it did.
     if let Some(fleet) = licensing::fleet_dir() {
         for entry in read_roster_in(&fleet.join("agents"))? {
-            if !agents.iter().any(|known| known.name == entry.name) {
+            if !agents
+                .iter()
+                .any(|known| known.name.eq_ignore_ascii_case(&entry.name))
+            {
                 agents.push(entry);
             }
         }
@@ -2642,6 +2691,15 @@ fn read_roster_in(directory: &Path) -> Result<Vec<AgentRoute>> {
     for entry in fs::read_dir(directory)? {
         let path = entry?.path();
         if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        // A Syncthing conflict copy of an agent file is a duplicate of a
+        // participant already counted, not a second participant.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.contains(".sync-conflict-"))
+        {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else {

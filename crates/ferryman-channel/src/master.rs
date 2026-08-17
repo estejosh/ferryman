@@ -250,7 +250,7 @@ fn master_agent(route: &ProjectRoute) -> Result<Option<AgentRoute>> {
     Ok(route
         .agents
         .iter()
-        .find(|agent| agent.name == declaration.master)
+        .find(|agent| agent.name.eq_ignore_ascii_case(&declaration.master))
         .cloned())
 }
 
