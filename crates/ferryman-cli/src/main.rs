@@ -39,6 +39,40 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+/// Carrying one human identity between the machines that person works from.
+#[derive(Subcommand, Clone)]
+enum Operator {
+    /// Write your sealed identity to a file, to carry to another machine.
+    ///
+    /// The file is encrypted with your password. Moving it is not moving a key: without
+    /// the password it is a password-cracking problem, not an identity. That is exactly
+    /// why an operator does not need a separate identity per machine the way an agent
+    /// does - and why a machine key, which is NOT sealed, has no equivalent command.
+    Export {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Your operator name.
+        #[arg(long, value_parser = agent_name)]
+        name: String,
+        /// Where to write it. Defaults to <name>.ferryman-operator here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Install a sealed identity exported from another machine.
+    Import {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The file written by `ferry operator export`.
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Which operator identities this machine can sign as.
+    List {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Clone)]
 enum Command {
     /// Point a project at Ferryman. Run it once, in the project directory.
@@ -150,6 +184,15 @@ enum Command {
         /// Print exactly what `--send` would transmit, and send nothing.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Your own identity, as a person rather than a machine.
+    ///
+    /// An agent's key belongs to the machine it runs on. Yours belongs to you, and you
+    /// work from more than one machine - so it is sealed under your password and can be
+    /// carried, which a machine key deliberately cannot be.
+    Operator {
+        #[command(subcommand)]
+        command: Operator,
     },
     /// Run the agentic loop: pick work up, do it, and judge what comes back.
     Agent {
@@ -1473,6 +1516,7 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
+        Command::Operator { command } => operator_command(command)?,
         Command::Agent { command } => agent_command(command).await?,
         Command::Bench {
             workspace,
@@ -2856,16 +2900,161 @@ fn signing_identity(
     route: &ferryman_channel::ProjectRoute,
     name: &str,
 ) -> anyhow::Result<ferryman_channel::AgentIdentity> {
-    ferryman_channel::AgentIdentity::load_existing(name, &route.attachment)?.ok_or_else(|| {
-        anyhow::anyhow!(
-            "this machine holds no signing key for '{name}', so it cannot sign as '{name}'.\n\
-             \n\
-             If '{name}' is this machine, run 'ferry channel join --agent {name}' first.\n\
-             If '{name}' is another machine, run this command there - a key cannot be created \
-             on demand, because a second key under a name the roster already knows makes every \
-             signature it produces read as an impostor to every other machine."
+    if let Some(identity) = ferryman_channel::AgentIdentity::load_existing(name, &route.attachment)?
+    {
+        return Ok(identity);
+    }
+    // A human operator is not a machine, and their key is not stored like one.
+    //
+    // Machine keys sit in plaintext in `keys/<name>.key`, which is right for an unattended
+    // agent: nobody is present to type a password at 3am. An operator is the opposite -
+    // they are a *person*, they move between machines, and there IS someone present. So
+    // their seed is sealed under their password in `operators/<name>.json`, and only their
+    // password opens it.
+    //
+    // Both halves already existed; nothing joined them. The dashboard could unseal an
+    // operator and the CLI could sign as a machine, so `ferry channel send --from op`
+    // found no `keys/op.key`, and rather than refusing it published the message UNSIGNED.
+    // That is the worst of the three possible answers: it is not a forgery, because a
+    // reader sees `Unsigned` - but it is a message claiming to be from a person, carrying
+    // no proof, and saying nothing about it. This project's own rule is that a refusal is
+    // a message. Silently downgrading is a fourth option nobody chose.
+    let operators = ferryman_server::operators::OperatorStore::new(&route.attachment);
+    if operators.exists(name) {
+        let password = operator_password(name)?;
+        return operators.login(name, &password);
+    }
+    anyhow::bail!(
+        "this machine holds no signing key for '{name}', so it cannot sign as '{name}'.\n\
+         \n\
+         If '{name}' is this machine, run 'ferry channel join --agent {name}' first.\n\
+         If '{name}' is you, and your operator identity lives on another machine, carry it \
+         here with 'ferry operator export --name {name}' there and 'ferry operator import' \
+         here - the file is sealed under your password, so it is safe to move.\n\
+         If '{name}' is another machine, run this command there - a key cannot be created \
+         on demand, because a second key under a name the roster already knows makes every \
+         signature it produces read as an impostor to every other machine."
+    )
+}
+
+fn operator_command(command: Operator) -> anyhow::Result<()> {
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    match command {
+        Operator::Export {
+            workspace,
+            name,
+            out,
+        } => {
+            let route = here(workspace)?;
+            let store = ferryman_server::operators::OperatorStore::new(&route.attachment);
+            let sealed = store.export(&name)?;
+            let path = out.unwrap_or_else(|| PathBuf::from(format!("{name}.ferryman-operator")));
+            std::fs::write(&path, &sealed)?;
+            // Owner-only even though it is sealed. The seal is one password away from a
+            // signing identity the whole fleet trusts, and 600k PBKDF2 iterations is a
+            // strong online policy and a weak offline one - so it should not be sitting
+            // world-readable in a download directory while it waits to be carried.
+            ferryman_channel::restrict_to_owner(&path)?;
+            println!("wrote {}", path.display());
+            println!("  sealed under your password; safe to carry, useless without it");
+            println!(
+                "  on the other machine:  ferry operator import --file {}",
+                path.display()
+            );
+            println!("  delete it once imported - it is not a backup, your password is");
+        }
+        Operator::Import { workspace, file } => {
+            let route = here(workspace)?;
+            let store = ferryman_server::operators::OperatorStore::new(&route.attachment);
+            let sealed =
+                std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
+            // Check the record against the roster BEFORE installing it.
+            //
+            // Grouchly asked for this explicitly and was right to. An operator record
+            // whose public key disagrees with the roster is not a usable identity: every
+            // signature it produces reads as `KeyChanged` on every other machine, and the
+            // person finds out at the moment their approval is rejected rather than at
+            // the moment they imported the wrong file. The roster is the fleet's opinion
+            // of who this person is, so it is the thing worth checking against.
+            let record = ferryman_server::operators::peek(&sealed)?;
+            let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+            let known = roster
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&record.name))
+                .and_then(|a| a.public_key.clone())
+                .filter(|key| !key.is_empty());
+            if let Some(known) = &known
+                && known != &record.public_key
+            {
+                anyhow::bail!(
+                    "this file is operator '{}' with key {}, but the roster here already \
+                     knows '{}' with key {}.\n\
+                     \n\
+                     Importing it would install an identity every other machine reads as \
+                     KeyChanged. Export from the machine whose key the roster already \
+                     carries, or settle which key is the real one first.",
+                    record.name,
+                    &record.public_key,
+                    record.name,
+                    known
+                )
+            }
+            let name = store.import(&sealed)?;
+            println!("imported operator '{name}'");
+            println!("  this machine can now sign as '{name}' when you give the password");
+            match known {
+                Some(key) => println!("  matches the key the roster already trusts: {key}"),
+                None => println!(
+                    "  note: '{name}' is not in this project's roster yet, so signatures \
+                     will read as UnknownSigner until it syncs"
+                ),
+            }
+        }
+        Operator::List { workspace } => {
+            let route = here(workspace)?;
+            let store = ferryman_server::operators::OperatorStore::new(&route.attachment);
+            let names = store.names()?;
+            if names.is_empty() {
+                println!("this machine holds no operator identity for this project");
+                println!("  carry yours here with 'ferry operator import --file <file>'");
+            } else {
+                for name in names {
+                    println!("  {name}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The operator's password, from the environment when unattended, from the terminal when
+/// a person is present.
+///
+/// The environment variable exists because Ferryman's whole point is loops that run with
+/// nobody watching, and a prompt in that setting is a hang rather than a question. It is
+/// read once, here, and never placed in a child process's environment - `send` signs in
+/// this process and passes on the signature, not the secret.
+fn operator_password(name: &str) -> anyhow::Result<String> {
+    if let Ok(password) = std::env::var("FERRYMAN_OPERATOR_PASSWORD")
+        && !password.is_empty()
+    {
+        return Ok(password);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!(
+            "signing as operator '{name}' needs their password, and there is no terminal to \
+             ask on. Set FERRYMAN_OPERATOR_PASSWORD for unattended use."
         )
-    })
+    }
+    Ok(rpassword::prompt_password(format!(
+        "password for operator '{name}': "
+    ))?)
 }
 
 fn slug_of(dir: &std::path::Path) -> String {

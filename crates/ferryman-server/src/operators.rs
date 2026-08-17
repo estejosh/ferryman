@@ -65,7 +65,11 @@ pub fn create_operator_identity(
     let published = AgentRoute {
         name: identity.name().to_string(),
         role: "operator".to_string(),
-        capabilities: Vec::new(),
+        // An operator must be able to RECEIVE. This was an empty list, and the
+        // consequence was quiet rather than loud: nothing refused, but every path that
+        // routes by capability skipped the human. The one principal in the fleet that
+        // exists to be told things could not be told anything.
+        capabilities: vec!["messages.receive".to_string()],
         public_key: Some(identity.public_key_hex()),
     };
     // Publish the public key to the roster so the fleet can verify this
@@ -78,6 +82,29 @@ pub fn create_operator_identity(
         return Err(error);
     }
     Ok(identity)
+}
+
+/// What a sealed record says about itself, without opening it.
+///
+/// Only the two public facts: who it claims to be, and the key it will sign with. Enough
+/// to check a record against the roster before installing it, and nothing that helps
+/// anyone open it.
+pub struct SealedSummary {
+    pub name: String,
+    pub public_key: String,
+}
+
+/// Read the public half of a sealed record. No password, so no seed.
+pub fn peek(sealed: &[u8]) -> Result<SealedSummary> {
+    let record: OperatorRecord =
+        serde_json::from_slice(sealed).context("this is not an operator identity file")?;
+    if record.format != FORMAT {
+        bail!("unsupported operator identity format");
+    }
+    Ok(SealedSummary {
+        name: ferryman_channel::canonical_agent_name(&record.name),
+        public_key: record.public_key_hex,
+    })
 }
 
 /// Where operator identities for one project are kept, keyed by name.
@@ -122,6 +149,7 @@ impl OperatorStore {
 
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        let name = &ferryman_channel::canonical_agent_name(name);
         let identity = AgentIdentity::from_seed(name, seed);
 
         let mut salt = [0u8; 16];
@@ -222,6 +250,78 @@ impl OperatorStore {
             .unwrap_or(false)
     }
 
+    /// Whether this machine holds a sealed identity for `name`.
+    ///
+    /// Deliberately narrower than `any()`: this answers "can I offer to unseal this one",
+    /// which the CLI needs before prompting for a password. It leaks that a *named*
+    /// operator exists, which `login` is careful not to - acceptable here because the
+    /// caller already holds the private attachment directory, and prompting for the
+    /// password of an operator that cannot exist is a worse answer than saying so.
+    #[must_use]
+    pub fn exists(&self, name: &str) -> bool {
+        self.path(name).is_file()
+    }
+
+    /// The sealed record itself, for carrying an operator between their own machines.
+    ///
+    /// Returns the file's bytes verbatim. It is safe to move over any channel *because*
+    /// it is sealed: salt, nonce, iteration count and the ciphertext, and nothing that
+    /// opens them. That is the property the format was designed for, and the reason an
+    /// operator does not need a second identity per machine the way an agent does.
+    ///
+    /// It is still a password-cracking kit, so this hands back bytes rather than writing
+    /// them somewhere convenient - the caller decides where, and the CLI restricts it.
+    pub fn export(&self, name: &str) -> Result<Vec<u8>> {
+        std::fs::read(self.path(name))
+            .with_context(|| format!("no operator identity for '{name}' on this machine"))
+    }
+
+    /// Install a sealed record exported from another machine.
+    ///
+    /// Refuses to overwrite: replacing an operator's sealed seed with another is how a
+    /// person loses the identity everything they have ever signed is verified against.
+    /// The record is opened and checked before it is stored, so a corrupt or foreign file
+    /// is rejected here rather than at the first attempt to sign with it.
+    pub fn import(&self, sealed: &[u8]) -> Result<String> {
+        let record: OperatorRecord =
+            serde_json::from_slice(sealed).context("this is not an operator identity file")?;
+        if record.format != FORMAT {
+            bail!("unsupported operator identity format");
+        }
+        let name = ferryman_channel::canonical_agent_name(&record.name);
+        if !is_safe_component(&name) {
+            bail!("operator identity file names an operator that cannot exist");
+        }
+        if self.path(&name).exists() {
+            bail!(
+                "an operator named '{name}' already exists on this machine; remove it \
+                 deliberately if you mean to replace it"
+            );
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        restrict_dir_to_owner(&self.dir)?;
+        let path = self.path(&name);
+        std::fs::write(&path, sealed)?;
+        ferryman_channel::restrict_to_owner(&path)
+            .with_context(|| format!("restrict {} to its owner", path.display()))?;
+        Ok(name)
+    }
+
+    /// The operators this machine can sign as, for `ferry operator list`.
+    pub fn names(&self) -> Result<Vec<String>> {
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Ok(Vec::new());
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     /// Remove an operator identity file. Used to unwind a half-finished
     /// creation (file written, roster registration failed) so the name is not
     /// left occupied by an identity nobody can verify.
@@ -234,7 +334,14 @@ impl OperatorStore {
         Ok(())
     }
 
+    /// An operator name is folded exactly like every other agent name, and for the same
+    /// reason: this is a filename. `OP.json` and `op.json` are one file on NTFS and two
+    /// on ext4, so without folding a human operator becomes two principals with two keys
+    /// the moment they work from a second machine - which is precisely the split that
+    /// `canonical_agent_name` exists to prevent, appearing again in the one identity that
+    /// is a *person* rather than a machine.
     fn path(&self, name: &str) -> PathBuf {
+        let name = ferryman_channel::canonical_agent_name(name);
         self.dir.join(format!("{name}.json"))
     }
 }
@@ -248,6 +355,101 @@ fn derive_key(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One person, one identity, however they capitalise their own name.
+    ///
+    /// This is the same fold as every agent name, and it matters more here, not less:
+    /// an operator is the identity that approves work, and it is the only one that
+    /// deliberately moves between machines - so it meets both a case-folding and a
+    /// case-sensitive filesystem in the course of ordinary use.
+    #[test]
+    fn an_operator_is_one_identity_however_it_is_capitalised() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OperatorStore::new(dir.path());
+        let created = store.create("OP", "correct horse battery").unwrap();
+        assert_eq!(
+            created.name(),
+            "op",
+            "the identity itself carries the folded name"
+        );
+
+        // The same person, typed four ways, is the same key every time.
+        for spelling in ["op", "OP", "Op", "oP"] {
+            assert!(store.exists(spelling), "{spelling} should be found");
+            let back = store.login(spelling, "correct horse battery").unwrap();
+            assert_eq!(back.public_key_hex(), created.public_key_hex());
+        }
+        // And a second registration under another spelling is refused, rather than
+        // quietly minting a second operator who signs as the same person.
+        assert!(store.create("op", "another password").is_err());
+    }
+
+    /// The sealed record survives the journey between two machines, and is useless
+    /// on the way.
+    #[test]
+    fn an_operator_can_be_carried_to_another_machine() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (here, there) = (
+            OperatorStore::new(first.path()),
+            OperatorStore::new(second.path()),
+        );
+
+        let original = here.create("op", "correct horse battery").unwrap();
+        let sealed = here.export("op").unwrap();
+
+        // What travels is ciphertext: the seed must not be recoverable from the file.
+        let seed_hex = hex::encode(original.seed_bytes());
+        assert!(
+            !String::from_utf8_lossy(&sealed).contains(&seed_hex),
+            "the exported file must not contain the signing seed"
+        );
+
+        assert_eq!(there.import(&sealed).unwrap(), "op");
+        let carried = there.login("op", "correct horse battery").unwrap();
+        assert_eq!(
+            carried.public_key_hex(),
+            original.public_key_hex(),
+            "the same person signs with the same key on both machines"
+        );
+        assert!(
+            there.login("op", "the wrong password").is_err(),
+            "carrying the file must not carry the password with it"
+        );
+        // Importing over an existing operator would destroy the identity everything
+        // that person has signed is verified against.
+        assert!(there.import(&sealed).is_err());
+    }
+
+    /// An operator that cannot be sent to is not an operator. This published an empty
+    /// capability list, so every path that routes by capability skipped the human.
+    #[test]
+    fn a_created_operator_can_receive_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = ferryman_channel::ProjectRoute {
+            project_id: "ferryman".into(),
+            workspace: dir.path().join("workspace"),
+            attachment: dir.path().join("workspace/.ferryman"),
+            communications: dir.path().join("workspace/.ferryman/ferryman"),
+            shared_remote: "ferryman-ferryman".into(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        std::fs::create_dir_all(&route.communications).unwrap();
+        create_operator_identity(&route, "op", "correct horse battery").unwrap();
+
+        let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
+        let op = roster
+            .iter()
+            .find(|a| a.name == "op")
+            .expect("op is in the roster");
+        assert!(
+            op.capabilities.iter().any(|c| c == "messages.receive"),
+            "an operator must be addressable, got {:?}",
+            op.capabilities
+        );
+    }
 
     /// The sealed file is a complete offline-cracking kit, so no other account on the
     /// machine may read it. Asserted rather than assumed: the signing key beside it has
