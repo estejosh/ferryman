@@ -1254,6 +1254,18 @@ impl AgentIdentity {
         })
     }
 
+    /// Load an existing identity, and do NOT create one.
+    ///
+    /// The distinction matters wherever a name comes from the operator rather than from this
+    /// machine's own config. `load_or_create` would happily mint a brand-new key called
+    /// `grouchly` on a machine that is not grouchly - a second identity under a name the
+    /// roster already knows, whose signatures every other machine would then reject as an
+    /// impostor. For "sign something as <name>", the only correct answer when the key is
+    /// absent is to refuse.
+    pub fn load_existing(name: &str, state_dir: &Path) -> Result<Option<Self>> {
+        Self::from_state_file(name, state_dir)
+    }
+
     fn key_path(name: &str, state_dir: &Path) -> PathBuf {
         state_dir.join("keys").join(format!("{name}.key"))
     }
@@ -1367,6 +1379,20 @@ impl AgentIdentity {
             .sign(recommendation_payload(recommendation).as_bytes());
         recommendation.signed_by = Some(self.name.clone());
         recommendation.signature = Some(hex::encode(signature.to_bytes()));
+    }
+
+    /// Sign an agent's specialization profile.
+    ///
+    /// A profile is prompt text placed at the front of every prompt, carried by the synced
+    /// channel. Unsigned, it was the one input the worker acted on without checking who
+    /// wrote it - see [`crate::memory::ProfileAttestation`] for the whole argument.
+    pub fn sign_profile_attestation(&self, attestation: &mut crate::memory::ProfileAttestation) {
+        let signature = self.signing.sign(
+            crate::memory::attestation_payload_for(&attestation.agent, &attestation.sha256)
+                .as_bytes(),
+        );
+        attestation.signed_by = Some(self.name.clone());
+        attestation.signature = Some(hex::encode(signature.to_bytes()));
     }
 
     /// Sign an interrupt, so a kill/steer/pause cannot be forged onto an agent.

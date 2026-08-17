@@ -130,7 +130,8 @@ mod tests {
         let mut route = route(dir.path());
         route.agents = vec![agent("alice", &["code"])];
         let bank = crate::memory::memory_bank_dir(&route);
-        crate::memory::append_agent_profile(&bank, "alice", "Rust services").unwrap();
+        let identity = crate::AgentIdentity::from_seed("alice", [7u8; 32]);
+        crate::memory::append_agent_profile(&bank, "alice", "Rust services", &identity).unwrap();
         std::fs::create_dir_all(route.attachment.join("skills/db")).unwrap();
         std::fs::write(
             route.attachment.join("skills/db/SKILL.md"),

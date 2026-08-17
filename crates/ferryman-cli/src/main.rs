@@ -2509,7 +2509,23 @@ fn loadmem(
         let Some(bank_dir) = bank.as_deref() else {
             bail!("no memory bank found to record into for '{slug}'");
         };
-        record_agent_profile(bank_dir, name, &note)?;
+        // Signed as that agent, which means only the machine holding that agent's key can
+        // record into its profile. Refusing here is the point: `load_or_create` would mint a
+        // second key under a name the roster already knows, and every signature it made
+        // would then read as an impostor to every other machine.
+        let Some(route) = route.as_ref() else {
+            bail!("recording into a profile needs a Ferryman channel; run this inside a project");
+        };
+        let identity = ferryman_channel::AgentIdentity::load_existing(name, &route.attachment)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no signing key for '{name}' on this machine, so its profile cannot be \
+                     signed here. A profile is prompt text carried to every machine, so it is \
+                     signed by the agent it belongs to - record this on {name}'s own machine, \
+                     or use --agent with a name this machine holds a key for."
+                )
+            })?;
+        record_agent_profile(bank_dir, name, &note, &identity)?;
         println!(
             "recorded into {}",
             ferryman_channel::memory::agent_profile_path(bank_dir, name).display()
@@ -2668,7 +2684,12 @@ fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
 
 /// Append a dated note to one agent's specialization profile, creating the file
 /// and its `agents/` directory on first use, then refresh the derived roster.
-fn record_agent_profile(bank: &std::path::Path, agent: &str, note: &str) -> Result<()> {
+fn record_agent_profile(
+    bank: &std::path::Path,
+    agent: &str,
+    note: &str,
+    identity: &ferryman_channel::AgentIdentity,
+) -> Result<()> {
     let path = ferryman_channel::memory::agent_profile_path(bank, agent);
     // The very first record becomes the one-line summary; later records append a
     // dated history line, so the summary stays readable in the roster.
@@ -2680,7 +2701,7 @@ fn record_agent_profile(bank: &std::path::Path, agent: &str, note: &str) -> Resu
     } else {
         format!("- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))
     };
-    ferryman_channel::memory::append_agent_profile(bank, agent, &line)
+    ferryman_channel::memory::append_agent_profile(bank, agent, &line, identity)
         .with_context(|| format!("append to {}", path.display()))?;
     let _ = ferryman_channel::memory::regenerate_roster(bank);
     Ok(())
