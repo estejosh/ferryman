@@ -1220,12 +1220,73 @@ enum Continuity {
         outbound: bool,
     },
 }
-#[tokio::main]
-async fn main() -> Result<()> {
-    // OTLP export, when an endpoint is configured: spans from the agent loop go
-    // to a collector so a fleet can be observed from one place. No-op otherwise.
-    ferryman_ops::telemetry::init();
-    let cli = Cli::parse();
+/// How much stack the command thread gets.
+///
+/// 16 MiB, chosen to be far larger than anything measured rather than tuned to fit: the point
+/// is to stop this being a number anyone has to think about again.
+const COMMAND_STACK: usize = 16 * 1024 * 1024;
+
+/// Run everything on a thread whose stack size we set, rather than the platform's default.
+///
+/// # Why this is not `#[tokio::main]`
+///
+/// It was, and a debug build died before running a line of its own code:
+///
+/// ```text
+/// > ferry --version
+/// thread 'main' has overflowed its stack
+/// ```
+///
+/// [`run`] is one `async fn` holding a match over every subcommand, so its state machine is
+/// the union of every arm's locals - hundreds of them, several holding whole config structs.
+/// A future's storage lives in its caller's frame, and Windows gives the main thread 1 MB
+/// where Linux gives 8. So it overflowed on Windows and was fine everywhere the work was
+/// being done. `--version` crashing is the tell that the command never mattered: the frame is
+/// allocated on entry, so every invocation died.
+///
+/// `Box::pin(run(cli))` was the obvious fix and it does not work, which is worth recording
+/// because it looks like it should: the future is *constructed on the stack* and then moved to
+/// the heap, so the stack still has to hold it once. Verified on a real Windows machine, which
+/// is the only reason this is not still in the tree.
+///
+/// Release builds survived either way, because optimisation shrinks the state machine. That is
+/// not a margin to ship on - the next subcommand spends it, and the failure mode is a binary
+/// that dies instantly on one platform with nothing but that one line to explain itself.
+///
+/// So the stack stops being the platform's decision. `main` spawns one thread with a size we
+/// chose, builds the runtime there, and joins it. The cost is one thread; what it buys is that
+/// the CLI's command surface can keep growing without a platform-specific cliff waiting for
+/// it.
+fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .name("ferry".to_string())
+        .stack_size(COMMAND_STACK)
+        .spawn(|| {
+            // OTLP export, when an endpoint is configured: spans from the agent loop go
+            // to a collector so a fleet can be observed from one place. No-op otherwise.
+            ferryman_ops::telemetry::init();
+            // Parsed in here too: `Cli` is a large enum and clap's generated parser is not
+            // small either, so keeping it inside the roomy stack costs nothing and removes
+            // another thing that has to stay under 1 MB. `--version` and `--help` exit from
+            // here, which is fine from any thread.
+            let cli = Cli::parse();
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("start the async runtime")?
+                .block_on(run(cli))
+        })
+        .context("start the command thread")?;
+    // A panic in there has already printed its own message; propagate the failure without
+    // wrapping it in a second, less informative one.
+    match worker.join() {
+        Ok(result) => result,
+        Err(_) => bail!("ferry exited abnormally"),
+    }
+}
+
+/// Everything the CLI does. Runs on the thread `main` sized for it.
+async fn run(cli: Cli) -> Result<()> {
     match cli.command.clone() {
         Command::Init { path } => {
             std::fs::write(
