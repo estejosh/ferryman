@@ -60,7 +60,27 @@ pub fn create_operator_identity(
     name: &str,
     password: &str,
 ) -> Result<AgentIdentity> {
-    let store = OperatorStore::new(&route.attachment);
+    create_operator_identity_in(
+        route,
+        &OperatorStore::new(&route.attachment),
+        name,
+        password,
+    )
+}
+
+/// The same, with the store given rather than discovered.
+///
+/// `AgentIdentity::load_or_create_in` exists for this reason and this is the same need: a
+/// test of the whole create-and-publish path must be able to say which machine it is on.
+/// Without it the only test covering this path wrote an operator into the developer's real
+/// state directory, and then failed on the *second* run because the name it had polluted
+/// was still there.
+pub fn create_operator_identity_in(
+    route: &ProjectRoute,
+    store: &OperatorStore,
+    name: &str,
+    password: &str,
+) -> Result<AgentIdentity> {
     let identity = store.create(name, password)?;
     let published = AgentRoute {
         name: identity.name().to_string(),
@@ -107,10 +127,44 @@ pub fn peek(sealed: &[u8]) -> Result<SealedSummary> {
     })
 }
 
-/// Where operator identities for one project are kept, keyed by name.
+/// Where this machine's operator identities live, keyed by name.
+///
+/// # Two directories, and why an operator gets what a machine key already got
+///
+/// A machine key used to live only under a project's `.ferryman/`, so one machine working
+/// on three projects had three keys under one name. The note on
+/// `AgentIdentity::load_or_create` puts it plainly: *an identity that changes per
+/// directory is not an identity*. It was fixed by storing the key once per machine.
+///
+/// An operator is a **person**, which is a stronger version of the same argument, and it
+/// did not get the same treatment - so being the operator of nineteen projects meant
+/// nineteen imports, and twenty after the next project.
+///
+/// So identities are read machine-wide, from beside the machine key. What makes that safe
+/// here, and would not be safe for a machine key, is that these records are **sealed**: a
+/// machine key is plaintext on disk, so one per machine is the only prudent number, while
+/// an operator record is ciphertext whose password its owner holds. Several people can
+/// therefore keep an identity on one machine without being able to sign as one another,
+/// which is exactly what a shared workstation needs.
+///
+/// # Why the project directory does not simply go away
+///
+/// Machine-wide must not mean machine-*only*. A project may deliberately have a different
+/// operator from the rest of the machine - a client's repository approved by that client's
+/// account, not by whoever owns the laptop. So a project-local record still exists and
+/// still WINS for that name. The order is specific-beats-general, the same rule paths and
+/// configuration already follow here.
+///
+/// Existing installs are unaffected: everything already written is project-local, and
+/// project-local is what is consulted first.
 #[derive(Clone)]
 pub struct OperatorStore {
-    dir: PathBuf,
+    /// This project's own operators. Checked first; a name here overrides the machine.
+    project: PathBuf,
+    /// Every operator this machine knows. `None` only when the machine has no state
+    /// directory at all, which is the same condition under which a machine key has
+    /// nowhere to live either.
+    machine: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,12 +179,57 @@ struct OperatorRecord {
 }
 
 impl OperatorStore {
-    /// Operator identities live beside the attachment, out of the synced folder.
+    /// Operator identities live out of the synced folder: beside the machine key for the
+    /// ones that belong to this person wherever they work, and beside the attachment for
+    /// any this project overrides.
     #[must_use]
     pub fn new(attachment: &Path) -> Self {
+        Self::with_machine_dir(attachment, ferryman_channel::licensing::machine_state_dir())
+    }
+
+    /// The same, with the machine directory given rather than discovered.
+    ///
+    /// Exactly the reason `AgentIdentity::load_or_create_in` exists, and needed here for
+    /// the same two: a test must be able to describe a *different machine* to check that
+    /// an identity crosses between them, and `use_machine_state_dir` is first-call-wins,
+    /// so a test cannot switch machines by setting it twice - it would silently keep the
+    /// first and quietly assert nothing.
+    ///
+    /// It also keeps the suite out of the developer's real home directory. Before the
+    /// store had a machine tier, `new` touched nothing outside the temporary attachment
+    /// it was given; now it would write operator records into this machine's actual state
+    /// directory as a side effect of running tests, which is the fault that note on
+    /// `use_machine_state_dir` was written about.
+    #[must_use]
+    pub fn with_machine_dir(attachment: &Path, machine_dir: Option<PathBuf>) -> Self {
         Self {
-            dir: attachment.join("operators"),
+            project: attachment.join("operators"),
+            machine: machine_dir.map(|dir| dir.join("operators")),
         }
+    }
+
+    /// Both directories, most specific first. The single place the precedence rule is
+    /// written down, so no method can disagree with another about it.
+    fn search_path(&self) -> Vec<&Path> {
+        let mut dirs: Vec<&Path> = vec![self.project.as_path()];
+        dirs.extend(self.machine.as_deref());
+        dirs
+    }
+
+    /// Where a record for `name` already is, if it is anywhere.
+    fn existing_path(&self, name: &str) -> Option<PathBuf> {
+        self.search_path()
+            .into_iter()
+            .map(|dir| Self::path_in(dir, name))
+            .find(|path| path.is_file())
+    }
+
+    /// Where a NEW record for `name` should be written: machine-wide, so the person is
+    /// themselves in every project on this machine rather than in the one they happened
+    /// to be standing in. Falls back to the project only when the machine has no state
+    /// directory to write to.
+    fn write_dir(&self) -> &Path {
+        self.machine.as_deref().unwrap_or(self.project.as_path())
     }
 
     /// Create a new operator identity, sealing its signing seed under the
@@ -143,8 +242,11 @@ impl OperatorStore {
         if password.chars().count() < MIN_PASSWORD_LEN {
             bail!("password must be at least {MIN_PASSWORD_LEN} characters");
         }
-        if self.path(name).exists() {
-            bail!("an operator named '{name}' already exists");
+        // Anywhere, not just here. Creating `op` in a second project when the machine
+        // already knows `op` would mint a second key for one person - the exact fault
+        // this store exists to prevent, arriving by the back door.
+        if self.existing_path(name).is_some() {
+            bail!("an operator named '{name}' already exists on this machine");
         }
 
         let mut seed = [0u8; 32];
@@ -171,11 +273,12 @@ impl OperatorStore {
             public_key_hex: identity.public_key_hex(),
         };
 
-        std::fs::create_dir_all(&self.dir)?;
+        let dir = self.write_dir();
+        std::fs::create_dir_all(dir)?;
         // Owner-only on the directory before anything is written into it, so there is no
         // instant at which a world-readable file exists.
-        restrict_dir_to_owner(&self.dir)?;
-        let path = self.path(name);
+        restrict_dir_to_owner(dir)?;
+        let path = Self::path_in(dir, name);
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -204,8 +307,11 @@ impl OperatorStore {
         if !is_safe_component(name) {
             return Err(anyhow::anyhow!("operator name or password is incorrect"));
         }
+        let path = self
+            .existing_path(name)
+            .ok_or_else(|| anyhow::anyhow!("operator name or password is incorrect"))?;
         let record: OperatorRecord = serde_json::from_reader(
-            std::fs::File::open(self.path(name))
+            std::fs::File::open(path)
                 .map_err(|_| anyhow::anyhow!("operator name or password is incorrect"))?,
         )
         .map_err(|_| anyhow::anyhow!("operator identity file is unreadable"))?;
@@ -241,13 +347,15 @@ impl OperatorStore {
     /// form with nothing to sign into. Reveals only the *count* being zero or
     /// not, never which operators exist.
     pub fn any(&self) -> bool {
-        std::fs::read_dir(&self.dir)
-            .map(|entries| {
-                entries
-                    .filter_map(std::result::Result::ok)
-                    .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
-            })
-            .unwrap_or(false)
+        self.search_path().into_iter().any(|dir| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(std::result::Result::ok)
+                        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                })
+                .unwrap_or(false)
+        })
     }
 
     /// Whether this machine holds a sealed identity for `name`.
@@ -259,7 +367,7 @@ impl OperatorStore {
     /// password of an operator that cannot exist is a worse answer than saying so.
     #[must_use]
     pub fn exists(&self, name: &str) -> bool {
-        self.path(name).is_file()
+        self.existing_path(name).is_some()
     }
 
     /// The sealed record itself, for carrying an operator between their own machines.
@@ -272,8 +380,10 @@ impl OperatorStore {
     /// It is still a password-cracking kit, so this hands back bytes rather than writing
     /// them somewhere convenient - the caller decides where, and the CLI restricts it.
     pub fn export(&self, name: &str) -> Result<Vec<u8>> {
-        std::fs::read(self.path(name))
-            .with_context(|| format!("no operator identity for '{name}' on this machine"))
+        let path = self
+            .existing_path(name)
+            .ok_or_else(|| anyhow::anyhow!("no operator identity for '{name}' on this machine"))?;
+        std::fs::read(&path).with_context(|| format!("read {}", path.display()))
     }
 
     /// Install a sealed record exported from another machine.
@@ -282,7 +392,7 @@ impl OperatorStore {
     /// person loses the identity everything they have ever signed is verified against.
     /// The record is opened and checked before it is stored, so a corrupt or foreign file
     /// is rejected here rather than at the first attempt to sign with it.
-    pub fn import(&self, sealed: &[u8]) -> Result<String> {
+    pub fn import(&self, sealed: &[u8], this_project_only: bool) -> Result<String> {
         let record: OperatorRecord =
             serde_json::from_slice(sealed).context("this is not an operator identity file")?;
         if record.format != FORMAT {
@@ -292,15 +402,47 @@ impl OperatorStore {
         if !is_safe_component(&name) {
             bail!("operator identity file names an operator that cannot exist");
         }
-        if self.path(&name).exists() {
+        // Machine-wide unless the caller is deliberately giving THIS project a different
+        // operator from the rest of the machine. One import, then this person is
+        // themselves in every project here - which is the whole point, and the reason a
+        // per-project store was the wrong shape for a human.
+        let dir = if this_project_only {
+            self.project.as_path()
+        } else {
+            self.write_dir()
+        };
+        let path = Self::path_in(dir, &name);
+        if path.exists() {
             bail!(
-                "an operator named '{name}' already exists on this machine; remove it \
-                 deliberately if you mean to replace it"
+                "an operator named '{name}' already exists here; remove it deliberately \
+                 if you mean to replace it"
             );
         }
-        std::fs::create_dir_all(&self.dir)?;
-        restrict_dir_to_owner(&self.dir)?;
-        let path = self.path(&name);
+        // Shadowing is legitimate; shadowing by accident is not. The two directions are
+        // not symmetric, so they are not treated as if they were:
+        //
+        //   --this-project-only over a machine-wide record  -> exactly what was asked
+        //      for. A client repository approved by that client's account rather than by
+        //      whoever owns the laptop is a real arrangement, and the flag is how you say
+        //      so. Allowed silently.
+        //
+        //   machine-wide under an existing PROJECT record   -> the import appears to
+        //      succeed and then does nothing here, because project-local wins. That is a
+        //      lie told by a success message, so it is refused instead.
+        if !this_project_only
+            && let Some(existing) = self.existing_path(&name)
+            && existing.starts_with(&self.project)
+        {
+            bail!(
+                "'{name}' is already an operator of THIS project ({}), and a project's own \
+                 record wins over the machine's. Importing machine-wide would report \
+                 success and change nothing here. Remove that record first if the machine \
+                 copy is meant to take over.",
+                existing.display()
+            );
+        }
+        std::fs::create_dir_all(dir)?;
+        restrict_dir_to_owner(dir)?;
         std::fs::write(&path, sealed)?;
         ferryman_channel::restrict_to_owner(&path)
             .with_context(|| format!("restrict {} to its owner", path.display()))?;
@@ -309,25 +451,44 @@ impl OperatorStore {
 
     /// The operators this machine can sign as, for `ferry operator list`.
     pub fn names(&self) -> Result<Vec<String>> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            return Ok(Vec::new());
-        };
-        let mut names: Vec<String> = entries
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
-            .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
-            .collect();
+        let mut names: Vec<String> = Vec::new();
+        for dir in self.search_path() {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            for path in entries
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            {
+                let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                // One name, one entry: a project record and a machine record for the same
+                // person are the same person, and only one of them is ever used. Listing
+                // both would suggest a choice the caller does not have.
+                if !names.iter().any(|known| known == name) {
+                    names.push(name.to_owned());
+                }
+            }
+        }
         names.sort();
         Ok(names)
+    }
+
+    /// Whether `name` is answered by this project specifically rather than by the
+    /// machine, so callers can show where an identity is coming from.
+    #[must_use]
+    pub fn is_project_local(&self, name: &str) -> bool {
+        self.existing_path(name)
+            .is_some_and(|path| path.starts_with(&self.project))
     }
 
     /// Remove an operator identity file. Used to unwind a half-finished
     /// creation (file written, roster registration failed) so the name is not
     /// left occupied by an identity nobody can verify.
     pub fn remove(&self, name: &str) -> Result<()> {
-        let path = self.path(name);
-        if path.exists() {
+        if let Some(path) = self.existing_path(name) {
             std::fs::remove_file(&path)
                 .with_context(|| format!("removing operator file for '{name}'"))?;
         }
@@ -340,10 +501,27 @@ impl OperatorStore {
     /// the moment they work from a second machine - which is precisely the split that
     /// `canonical_agent_name` exists to prevent, appearing again in the one identity that
     /// is a *person* rather than a machine.
-    fn path(&self, name: &str) -> PathBuf {
+    fn path_in(dir: &Path, name: &str) -> PathBuf {
         let name = ferryman_channel::canonical_agent_name(name);
-        self.dir.join(format!("{name}.json"))
+        dir.join(format!("{name}.json"))
     }
+}
+
+/// A store whose "machine" is this test's own temporary directory.
+///
+/// Every test in this crate that creates an operator must go through here, because the
+/// store became machine-wide and a machine is now a shared namespace: two tests both
+/// creating `alice` are, correctly, one person being created twice. They collided as soon
+/// as the tier was added - and before that they were writing into the developer's real
+/// state directory without anything saying so.
+///
+/// The machine directory is placed under the test's own attachment. That is not where a
+/// machine directory belongs in production, and it does not need to be: what a test needs
+/// is a machine of its own, and each test already has a temporary directory that is
+/// exactly that.
+#[cfg(test)]
+pub(crate) fn test_store(attachment: &Path) -> OperatorStore {
+    OperatorStore::with_machine_dir(attachment, Some(attachment.join("machine")))
 }
 
 fn derive_key(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
@@ -364,8 +542,9 @@ mod tests {
     /// case-sensitive filesystem in the course of ordinary use.
     #[test]
     fn an_operator_is_one_identity_however_it_is_capitalised() {
+        let machine = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = OperatorStore::new(dir.path());
+        let store = store_on(&machine, &dir);
         let created = store.create("OP", "correct horse battery").unwrap();
         assert_eq!(
             created.name(),
@@ -384,16 +563,153 @@ mod tests {
         assert!(store.create("op", "another password").is_err());
     }
 
+    /// A store on a named machine, with nothing discovered from the real one.
+    ///
+    /// Every test here builds its store through this, and none calls `OperatorStore::new`.
+    /// That is not style. `new` consults this machine's actual state directory, so a test
+    /// using it writes operator records into the developer's real home - and, because the
+    /// suite runs in parallel and tests share names like `alice`, they then collide with
+    /// each other and fail with "already exists on this machine". Both happened here on
+    /// the first run of the two-tier store; the second symptom is the only reason the
+    /// first was noticed.
+    fn store_on(machine: &tempfile::TempDir, project: &tempfile::TempDir) -> OperatorStore {
+        OperatorStore::with_machine_dir(project.path(), Some(machine.path().to_path_buf()))
+    }
+
+    /// One import, and the person is themselves in every project on the machine.
+    ///
+    /// This is the whole reason the store has two tiers. Nineteen channels used to mean
+    /// nineteen imports, and twenty after the next project - the same "an identity that
+    /// changes per directory is not an identity" fault the machine key was fixed for,
+    /// reappearing in the identity that is a *person*.
+    #[test]
+    fn one_import_covers_every_project_on_the_machine() {
+        let machine = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        store_on(&machine, &first)
+            .create("op", "correct horse battery")
+            .unwrap();
+
+        // A project that has never seen this file, on the same machine, can sign as op.
+        let untouched = tempfile::tempdir().unwrap();
+        let elsewhere = store_on(&machine, &untouched);
+        assert!(elsewhere.exists("op"), "op should be known machine-wide");
+        assert!(elsewhere.login("op", "correct horse battery").is_ok());
+        assert!(
+            !elsewhere.is_project_local("op"),
+            "it is the machine answering, not this project"
+        );
+
+        // And a DIFFERENT machine knows nothing about them, which is the other half of
+        // the claim: machine-wide is a scope, not a broadcast.
+        let other_machine = tempfile::tempdir().unwrap();
+        assert!(!store_on(&other_machine, &untouched).exists("op"));
+    }
+
+    /// Several people may keep an identity on one machine without being able to sign as
+    /// one another. This is what makes machine-wide storage safe HERE and not for a
+    /// machine key: a machine key is plaintext, these records are ciphertext.
+    #[test]
+    fn two_different_operators_can_share_a_machine() {
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = store_on(&machine, &project);
+
+        let op = store.create("op", "correct horse battery").unwrap();
+        let alice = store.create("alice", "a different password").unwrap();
+        assert_ne!(op.public_key_hex(), alice.public_key_hex());
+        assert_eq!(
+            store.names().unwrap(),
+            vec!["alice".to_string(), "op".to_string()]
+        );
+
+        // Sharing a machine is not sharing an identity.
+        assert!(store.login("alice", "correct horse battery").is_err());
+        assert!(store.login("op", "a different password").is_err());
+        assert_eq!(
+            store
+                .login("alice", "a different password")
+                .unwrap()
+                .public_key_hex(),
+            alice.public_key_hex()
+        );
+    }
+
+    /// A project may deliberately have a different operator from the rest of the machine,
+    /// and the specific one wins. Machine-wide must not mean machine-only.
+    #[test]
+    fn a_project_can_override_the_machine_wide_operator() {
+        let machine = tempfile::tempdir().unwrap();
+        let ordinary = tempfile::tempdir().unwrap();
+        let machine_wide = store_on(&machine, &ordinary)
+            .create("op", "correct horse battery")
+            .unwrap();
+
+        // The client builds their identity on their own machine and carries it here.
+        let their_machine = tempfile::tempdir().unwrap();
+        let their_project = tempfile::tempdir().unwrap();
+        let theirs = store_on(&their_machine, &their_project);
+        let client_identity = theirs.create("op", "the client's password").unwrap();
+        let sealed = theirs.export("op").unwrap();
+
+        // Installed for the client's repository only.
+        let client_repo = tempfile::tempdir().unwrap();
+        let client_store = store_on(&machine, &client_repo);
+        client_store.import(&sealed, true).unwrap();
+
+        assert!(
+            client_store.is_project_local("op"),
+            "the project's own record answers here"
+        );
+        assert_eq!(
+            client_store
+                .login("op", "the client's password")
+                .unwrap()
+                .public_key_hex(),
+            client_identity.public_key_hex(),
+        );
+        // Every other project on the same machine is untouched.
+        let another = tempfile::tempdir().unwrap();
+        assert_eq!(
+            store_on(&machine, &another)
+                .login("op", "correct horse battery")
+                .unwrap()
+                .public_key_hex(),
+            machine_wide.public_key_hex(),
+        );
+    }
+
+    /// Importing machine-wide underneath an existing project record would report success
+    /// and change nothing, because the project record keeps winning. A success message
+    /// that is not true is worse than a refusal.
+    #[test]
+    fn a_machine_wide_import_refuses_to_hide_under_a_project_record() {
+        let their_machine = tempfile::tempdir().unwrap();
+        let their_project = tempfile::tempdir().unwrap();
+        let theirs = store_on(&their_machine, &their_project);
+        theirs.create("op", "correct horse battery").unwrap();
+        let sealed = theirs.export("op").unwrap();
+
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = store_on(&machine, &project);
+        store.import(&sealed, true).unwrap();
+
+        let error = store.import(&sealed, false).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("wins over the machine"),
+            "got: {error:#}"
+        );
+    }
+
     /// The sealed record survives the journey between two machines, and is useless
     /// on the way.
     #[test]
     fn an_operator_can_be_carried_to_another_machine() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        let (here, there) = (
-            OperatorStore::new(first.path()),
-            OperatorStore::new(second.path()),
-        );
+        let (machine_a, machine_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (here, there) = (store_on(&machine_a, &first), store_on(&machine_b, &second));
 
         let original = here.create("op", "correct horse battery").unwrap();
         let sealed = here.export("op").unwrap();
@@ -405,7 +721,7 @@ mod tests {
             "the exported file must not contain the signing seed"
         );
 
-        assert_eq!(there.import(&sealed).unwrap(), "op");
+        assert_eq!(there.import(&sealed, false).unwrap(), "op");
         let carried = there.login("op", "correct horse battery").unwrap();
         assert_eq!(
             carried.public_key_hex(),
@@ -418,13 +734,25 @@ mod tests {
         );
         // Importing over an existing operator would destroy the identity everything
         // that person has signed is verified against.
-        assert!(there.import(&sealed).is_err());
+        assert!(there.import(&sealed, false).is_err());
     }
 
     /// An operator that cannot be sent to is not an operator. This published an empty
     /// capability list, so every path that routes by capability skipped the human.
     #[test]
     fn a_created_operator_can_receive_messages() {
+        // Redirect the whole machine, not just the operator store. `register_agent_key`
+        // also publishes to the FLEET roster, which lives under the same machine
+        // directory - so injecting the store alone left this test writing `op` into the
+        // developer's real fleet, and failing on the next run with "already published
+        // with a different key". Two separate leaks through one directory; fixing the
+        // first only made the second legible.
+        //
+        // First call wins process-wide, which is what makes this safe to call from a
+        // test: every test in this binary then agrees on the same fake machine.
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-optest-{}", std::process::id())),
+        );
         let dir = tempfile::tempdir().unwrap();
         let route = ferryman_channel::ProjectRoute {
             project_id: "ferryman".into(),
@@ -437,7 +765,14 @@ mod tests {
             agents: Vec::new(),
         };
         std::fs::create_dir_all(&route.communications).unwrap();
-        create_operator_identity(&route, "op", "correct horse battery").unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        create_operator_identity_in(
+            &route,
+            &OperatorStore::with_machine_dir(&route.attachment, Some(machine.path().to_path_buf())),
+            "op",
+            "correct horse battery",
+        )
+        .unwrap();
 
         let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
         let op = roster
@@ -461,11 +796,12 @@ mod tests {
     fn the_sealed_operator_file_is_not_readable_by_other_accounts() {
         use std::os::unix::fs::PermissionsExt;
 
+        let machine = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = OperatorStore::new(dir.path());
+        let store = store_on(&machine, &dir);
         store.create("alice", "hunter2-secret").unwrap();
 
-        let file = std::fs::metadata(store.path("alice"))
+        let file = std::fs::metadata(store.existing_path("alice").expect("just created"))
             .unwrap()
             .permissions();
         assert_eq!(
@@ -475,11 +811,15 @@ mod tests {
             file.mode() & 0o777
         );
 
-        // The directory the store actually owns - `operators/` under the attachment, not
-        // the attachment itself, which belongs to the project and is not ours to lock
+        // The directory the store actually owns - `operators/`, not the directory it sits
+        // under, which belongs to the project or to the machine and is not ours to lock
         // down. 0700 rather than 0600: a directory without the execute bit cannot be
         // traversed, so copying the file mode here would break login.
-        let parent = std::fs::metadata(dir.path().join("operators"))
+        //
+        // Read from the store rather than rebuilt from `dir`, because a new record is now
+        // written machine-wide: hardcoding the project path here would have checked the
+        // permissions of a directory the record is no longer in, and passed.
+        let parent = std::fs::metadata(machine.path().join("operators"))
             .unwrap()
             .permissions();
         assert_eq!(
@@ -492,8 +832,9 @@ mod tests {
 
     #[test]
     fn password_round_trip_and_wrong_password() {
+        let machine = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = OperatorStore::new(dir.path());
+        let store = store_on(&machine, &dir);
 
         assert!(
             store.create("op/alice", "secret123").is_err(),
@@ -520,8 +861,9 @@ mod tests {
 
     #[test]
     fn login_refuses_path_traversal_names() {
+        let machine = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = OperatorStore::new(dir.path());
+        let store = store_on(&machine, &dir);
         store.create("alice", "hunter2-secret").unwrap();
 
         // A traversal-looking name must be rejected like an unknown name, before
@@ -538,8 +880,9 @@ mod tests {
 
     #[test]
     fn remove_unwinds_a_failed_registration() {
+        let machine = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let store = OperatorStore::new(dir.path());
+        let store = store_on(&machine, &dir);
         store.create("alice", "hunter2-secret").unwrap();
         store.remove("alice").unwrap();
         // The name is free again: a retry can recreate it.

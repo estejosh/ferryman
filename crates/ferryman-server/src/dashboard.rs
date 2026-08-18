@@ -524,8 +524,16 @@ async fn create_operator(
                 .to_string(),
         ));
     }
-    let identity = crate::operators::create_operator_identity(
+    // Through `state.operators`, not a store this function builds for itself.
+    //
+    // It used to construct its own, which was invisible while every store resolved to the
+    // same directory - and became a split brain the moment stores could differ: this
+    // endpoint wrote an operator into one store while `login`, three functions down, read
+    // from `state.operators` and answered 401 for the account that had just been created
+    // successfully. One dashboard, one store.
+    let identity = crate::operators::create_operator_identity_in(
         &state.route,
+        &state.operators,
         &credentials.name,
         &credentials.password,
     )
@@ -1252,7 +1260,7 @@ mod tests {
     fn state(route: &Arc<ProjectRoute>, read_only: bool) -> DashboardState {
         DashboardState::new(
             route.clone(),
-            OperatorStore::new(&route.attachment),
+            crate::operators::test_store(&route.attachment),
             read_only,
             Duration::from_secs(900),
         )
@@ -1734,7 +1742,7 @@ mod tests {
         let alice = AgentIdentity::from_seed("alice", [1u8; 32]);
 
         let mut route = test_route(dir.path());
-        let reviewer = OperatorStore::new(&route.attachment)
+        let reviewer = crate::operators::test_store(&route.attachment)
             .create("reviewer", "hunter2-secret")
             .unwrap();
         route.agents.push(AgentRoute {

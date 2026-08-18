@@ -59,12 +59,20 @@ enum Operator {
         out: Option<PathBuf>,
     },
     /// Install a sealed identity exported from another machine.
+    ///
+    /// Installed for the whole machine, so one import makes you yourself in every
+    /// project here rather than only the one you happened to be standing in.
     Import {
         #[arg(long)]
         workspace: Option<PathBuf>,
         /// The file written by `ferry operator export`.
         #[arg(long)]
         file: PathBuf,
+        /// Give THIS project a different operator from the rest of the machine - a
+        /// client's repository approved by that client's account, say. Rare, and
+        /// deliberately not the default.
+        #[arg(long)]
+        this_project_only: bool,
     },
     /// Which operator identities this machine can sign as.
     List {
@@ -3013,7 +3021,11 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
             );
             println!("  delete it once imported - it is not a backup, your password is");
         }
-        Operator::Import { workspace, file } => {
+        Operator::Import {
+            workspace,
+            file,
+            this_project_only,
+        } => {
             let route = here(workspace)?;
             let store = ferryman_server::operators::OperatorStore::new(&route.attachment);
             let sealed =
@@ -3049,8 +3061,13 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
                     known
                 )
             }
-            let name = store.import(&sealed)?;
+            let name = store.import(&sealed, this_project_only)?;
             println!("imported operator '{name}'");
+            if this_project_only {
+                println!("  for THIS project only; the rest of the machine is unchanged");
+            } else {
+                println!("  for every project on this machine, present and future");
+            }
             println!("  this machine can now sign as '{name}' when you give the password");
             match known {
                 Some(key) => println!("  matches the key the roster already trusts: {key}"),
@@ -3069,7 +3086,15 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
                 println!("  carry yours here with 'ferry operator import --file <file>'");
             } else {
                 for name in names {
-                    println!("  {name}");
+                    // Where an identity comes from is the thing a person actually needs
+                    // to know here: whether editing this project changes it, and whether
+                    // it follows them to the next one.
+                    let scope = if store.is_project_local(&name) {
+                        "this project only"
+                    } else {
+                        "this machine"
+                    };
+                    println!("  {name:<20} {scope}");
                 }
             }
         }
