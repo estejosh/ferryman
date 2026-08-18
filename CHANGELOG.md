@@ -1,5 +1,92 @@
 # Changelog
 
+## 0.4.1
+
+A fleet is a mixed fleet. Everything here was found by running 0.4.0 across Windows,
+WSL and Linux at the same time, and none of it is visible on any single one of them.
+
+**If you run Ferryman on more than one machine, upgrade.** The identity faults below
+are silent on a case-folding filesystem and split an agent in two on a case-sensitive
+one, which is exactly the pair most people have.
+
+### Fixed - one name, one identity
+
+- **`Grouchly` and `grouchly` were two agents with two keys.** An agent name is a
+  filename in three stores at once: the roster entry in the synced folder, the pinned
+  key store, and the private key store. Whether two spellings are the same file
+  therefore depended on the filesystem - NTFS and APFS fold case, ext4 does not. So the
+  same two commands produced one agent on Windows and two on Linux, each with its own
+  key; messages addressed to one were invisible to the other, and a message signed by
+  one read as `UnknownSigner` to a machine that knew the other. Names are now folded
+  where they are minted, published, and put into messages.
+
+  Existing keys are **adopted, never rotated**. A machine holding `keys/Grouchly.key`
+  and nothing else would otherwise find no key under the folded name and mint a fresh
+  one - publishing a second key under a name the fleet already trusts, which every
+  other machine would correctly read as an impostor.
+
+  Rosters are folded on **read**, not rewritten: the synced folder is
+  one-writer-per-path, and someone else's roster entry is not yours to delete.
+  Signature checks match case-insensitively so a message already in flight, signed
+  under the old spelling, still verifies - otherwise upgrading would itself raise a
+  fleet-wide impersonation alarm.
+
+- **A Syncthing conflict copy of a roster entry was read as a second agent.** Found by
+  grouchly. `agents/beastly.sync-conflict-....json` carries the same `name`, so the
+  roster held two `beastly` entries - and the conflict copy is usually the older,
+  *keyless* one, so it could displace a real published key. This, not the
+  capitalisation, is what produced "registered participant names must be unique" on a
+  live channel.
+
+### Fixed - signing
+
+- **A message could be published unsigned in a person's name.** Every signing site was
+  written `if let Ok(identity) = signing_identity(..)`, which computes the refusal and
+  discards it. The reasoning was sound - a fleet that has not adopted signing must keep
+  working - but it covers one case and was applied to two. Where nobody has a published
+  key, unsigned is all there is and readers see it as unsigned. Where the roster
+  *knows* this sender and carries a key for them, "unsigned from op" is a claim about
+  who spoke, made to readers who could have checked it, with nothing behind it. That
+  case now refuses. Five sites: send, order (twice), claim, review.
+
+### Added - operators are people
+
+- **`ferry operator create|export|import|list`.** A human operator's key is sealed
+  under their password rather than kept in plaintext like a machine key, which is what
+  makes it safe to carry: the sealed record can cross machines and is useless without
+  the password. So one person is one identity everywhere they work, instead of a
+  separate key per machine under the same name - which the roster's first-key-wins
+  correctly rejects. `import` verifies the record against the roster **before**
+  installing it, so a mismatch is caught at import rather than at the first rejected
+  approval.
+
+- **Operator identities are machine-wide, and a machine can hold several.** Being the
+  operator of nineteen projects used to mean nineteen imports. Machine-wide because a
+  person is not per-directory - the same reasoning that moved machine keys once per
+  machine. Several per machine because these records are *sealed*: two people can keep
+  an identity on one workstation without being able to sign as one another. A
+  project-local record still wins for that name, so one project can have a different
+  operator from the rest of the machine - use `--this-project-only`.
+
+- **Operators can receive messages.** A created operator published an empty capability
+  list. Nothing refused; every path that routes by capability simply skipped the human.
+
+### Fixed - platforms and CI
+
+- **A scorer that ignores its input was sometimes recorded as never having run.** A
+  scorer that exits without reading stdin (`exit 0`, `test -f build/report.json`, a
+  `grep -q` matching the first line) makes `write_all` return EPIPE. That was read as
+  "could not run", which abstains from the fleet's synced learning record - so a real
+  verdict was silently discarded whenever the race went the wrong way. It passed three
+  runs in four.
+
+- **`ferry enable` left the signing key one `git add -A` from being committed.**
+
+- **macOS is built and tested on every push, not only on tags.** It was gated to tags,
+  and the cost was paid in full at the first release: 101 commits had never been
+  compiled on macOS, and the tag build was where we found out. Its failures now name
+  the failing test in the job summary, readable without a token.
+
 ## 0.4.0
 
 The release this project was reviewed for rather than written into. Most of what
