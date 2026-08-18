@@ -192,6 +192,27 @@ pub struct AgentConfig {
     /// How much network the sandboxed agent gets. Only applies to the podman /
     /// docker runners; the bare runner is unaffected.
     pub network: NetworkPolicy,
+    /// Extra paths to bind-mount into the sandbox, as `host:container` pairs.
+    ///
+    /// # Why this is needed at all
+    ///
+    /// The container gets the workspace and nothing else, which is right as a default and
+    /// wrong for the most common engine. Claude Code authenticates from a credential file
+    /// in the operator's home directory; inside a container that file does not exist, so a
+    /// sandboxed agent cannot log in. The workaround people reach for is an API key, which
+    /// silently moves the work off a subscription and onto metered billing - a pricing
+    /// decision arrived at by accident, because a mount was missing.
+    ///
+    /// One line fixes it:
+    ///
+    /// ```toml
+    /// mounts = ["/home/you/.claude:/root/.claude"]
+    /// ```
+    ///
+    /// Only applies to the container runners. Anything mounted here is reachable by a
+    /// model-driven process, so mount the least that works - a credential directory, not a
+    /// home directory.
+    pub mounts: Vec<String>,
     pub timeout: Duration,
     /// How long the agent CLI may run without printing anything to stdout or stderr
     /// before it is considered frozen and killed. A healthy CLI streams progress; a
@@ -336,6 +357,7 @@ impl AgentConfig {
                 Some(other) => bail!("worktree must be true or false, not '{other}'"),
             },
             network: NetworkPolicy::parse(&fields.get("net").cloned().unwrap_or_default())?,
+            mounts: parse_mounts(fields.get("mounts").map(String::as_str).unwrap_or(""))?,
             timeout: Duration::from_secs(number("timeout_secs", 900)?),
             stall: Duration::from_secs(number("stall_secs", 600)?),
             review: ReviewMode::parse(
@@ -430,6 +452,23 @@ args = {args}
 # Windows (WSL2 / Docker Desktop) a Linux VM runs underneath and reserves about
 # 1-2 GB, shared across all containers.
 sandbox = "{sandbox}"
+
+# Extra paths to bind-mount into the sandbox, as host:container pairs, comma-separated.
+# Container runners only; ignored when `sandbox` is empty.
+#
+# You will need this the first time you sandbox Claude Code. It authenticates from a
+# credential file in your home directory, and a container does not have your home
+# directory - so a sandboxed agent cannot log in, and the obvious-looking fix is an API
+# key, which quietly moves your agent work off your subscription and onto metered
+# billing. That is a pricing decision nobody made on purpose. Mount the credential
+# instead:
+#
+#   mounts = "/home/you/.claude:/root/.claude"
+#
+# Whatever you list here is reachable by a model-driven process with whatever privileges
+# the container has. Mount the least that works - a credential directory, never a home
+# directory, and never the host root.
+# mounts = ""
 timeout_secs = "900"
 
 # The agent CLI is killed if it prints nothing for this many seconds - frozen,
@@ -658,6 +697,33 @@ fn mount_warnings(workspace: &Path) -> Vec<String> {
     warnings
 }
 
+/// Read the `mounts` setting: a comma-separated list of `host:container` pairs.
+///
+/// Rejected rather than passed through when malformed. A mount that is silently dropped
+/// produces an agent that cannot authenticate and no explanation anywhere - which is the
+/// failure this setting exists to prevent, arriving by a different route.
+fn parse_mounts(raw: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+        // `host:container`, and optionally `:ro` or another runtime flag after it.
+        let parts: Vec<&str> = entry.split(':').collect();
+        if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+            bail!(
+                "mounts entry '{entry}' must be host:container, e.g. \
+                 \"/home/you/.claude:/root/.claude\""
+            )
+        }
+        if !parts[0].starts_with('/') {
+            bail!(
+                "mounts entry '{entry}' needs an absolute host path, not '{}'",
+                parts[0]
+            )
+        }
+        out.push(entry.to_string());
+    }
+    Ok(out)
+}
+
 /// Run the configured agent CLI over a prompt.
 ///
 /// Compute the runtime binary and full argument list for a prompt, without
@@ -697,6 +763,12 @@ fn run_command(
             }
             full.push("-v".to_string());
             full.push(workspace_mount(workspace));
+            // Operator-listed mounts after the workspace, so a mistake in one cannot
+            // displace the workspace the task is supposed to happen in.
+            for mount in &config.mounts {
+                full.push("-v".to_string());
+                full.push(mount.clone());
+            }
             full.push("-w".to_string());
             full.push("/workspace".to_string());
             full.push(image.clone());
@@ -1915,6 +1987,77 @@ pub fn pending(route: &ProjectRoute) -> Result<Vec<(String, Recommendation)>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sandboxed agent must be able to reach the credential it authenticates with.
+    ///
+    /// Without this the container gets the workspace and nothing else, Claude Code cannot
+    /// log in, and the workaround everyone reaches for is an API key - which moves the
+    /// work off a subscription and onto metered billing without anyone deciding to.
+    #[test]
+    fn a_sandboxed_agent_can_be_given_its_credential_directory() {
+        let config = AgentConfig::parse(
+            "agent = \"a\"\nrole = \"worker\"\ncommand = \"claude\"\nargs = [\"-p\"]\n\
+             sandbox = \"podman:img\"\nmounts = \"/home/me/.claude:/root/.claude\"\n",
+        )
+        .unwrap();
+        let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
+        assert_eq!(binary, "podman");
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "-v" && w[1] == "/home/me/.claude:/root/.claude"),
+            "the credential mount must reach the runtime: {args:?}"
+        );
+        // And the workspace mount is still there, first.
+        let first_v = args.iter().position(|a| a == "-v").unwrap();
+        assert!(
+            args[first_v + 1].contains("/workspace"),
+            "workspace mount comes first"
+        );
+    }
+
+    /// Several mounts, and the bare runner ignores them - it has no container to mount into.
+    #[test]
+    fn mounts_are_a_container_concern_only() {
+        let toml = |sandbox: &str| {
+            format!(
+                "agent = \"a\"\nrole = \"worker\"\ncommand = \"claude\"\nargs = [\"-p\"]\n\
+                 sandbox = \"{sandbox}\"\nmounts = \"/a:/a, /b:/b:ro\"\n"
+            )
+        };
+        let sandboxed = AgentConfig::parse(&toml("podman:img")).unwrap();
+        let (_, args) = run_command(&sandboxed, Path::new("/ws"), "p", &[]);
+        assert!(args.contains(&"/a:/a".to_string()));
+        assert!(
+            args.contains(&"/b:/b:ro".to_string()),
+            "runtime flags pass through"
+        );
+
+        let bare = AgentConfig::parse(&toml("")).unwrap();
+        let (binary, args) = run_command(&bare, Path::new("/ws"), "p", &[]);
+        assert_eq!(binary, "claude", "bare runner runs the command itself");
+        assert!(
+            !args.iter().any(|a| a == "-v"),
+            "no mounts without a container: {args:?}"
+        );
+    }
+
+    /// A malformed mount is refused, not dropped. A silently-ignored mount produces an
+    /// agent that cannot authenticate and no explanation anywhere.
+    #[test]
+    fn a_malformed_mount_is_refused_rather_than_ignored() {
+        for bad in ["notapath", "relative/path:/x", ":/x", "/x:"] {
+            let toml = format!(
+                "agent = \"a\"\nrole = \"worker\"\ncommand = \"c\"\nargs = []\n\
+                 sandbox = \"podman:i\"\nmounts = \"{bad}\"\n"
+            );
+            assert!(
+                AgentConfig::parse(&toml).is_err(),
+                "'{bad}' should be refused"
+            );
+        }
+        // Empty is fine - it means no extra mounts.
+        assert!(parse_mounts("").unwrap().is_empty());
+    }
 
     /// A failing engine must say WHY, not merely that it failed.
     ///
