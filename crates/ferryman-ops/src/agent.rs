@@ -389,6 +389,26 @@ role = "{role}"
 # What actually does the work. Ferryman runs no models itself - point this at
 # whichever agent CLI you use. {{prompt}} is replaced with the task; every other
 # argument is passed through untouched.
+#
+# READ THIS BEFORE YOUR FIRST TASK: most agent CLIs will not touch a file without
+# permission, and a worker has no terminal for them to ask on. The symptom is not a
+# clear refusal - the engine sits there until something kills it, and reports
+# something unhelpful like "Execution error". A task that needs no tools succeeds,
+# which makes it look like the engine works and Ferryman does not.
+#
+# So whichever engine you use, find its non-interactive flag and put it here:
+#
+#   claude   args = ["-p","--dangerously-skip-permissions","{{prompt}}"]
+#   codex    args = ["exec","--full-auto","{{prompt}}"]
+#
+# That is a real grant, not a formality. The engine then reads, writes and runs
+# commands in the workspace with this user's full privileges and nothing in the way -
+# see the isolation note at the top of this crate, and prefer `sandbox` below to
+# trusting a flag.
+#
+# Give the engine an absolute path if the same name resolves differently for a service
+# than it does for you. On WSL, `claude` on your PATH is often the Windows install,
+# which a Linux worker cannot use.
 command = "{command}"
 args = {args}
 
