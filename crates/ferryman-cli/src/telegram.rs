@@ -1,0 +1,607 @@
+//! Issue work from a phone.
+//!
+//! Everything Ferryman does is already reachable from a terminal, which is exactly where
+//! an operator is not when the fleet has a question. This is a long-poll bridge between one
+//! Telegram chat and one project's channel: a message becomes a signed order, and a result
+//! comes back to the same chat when a worker submits it.
+//!
+//! It is deliberately *not* a second control plane. It writes the same signed artifacts
+//! `ferry channel order` writes, into the same folder, and reads state the same way every
+//! other reader does - so a bridge that dies loses nothing but its own notifications, and a
+//! fleet that never sees one behaves identically.
+//!
+//! # Authorization
+//!
+//! One numeric Telegram user id may command it, and the bridge refuses to start without one.
+//! Telegram authenticates `from.id` server-side, so it is the one field in an update that a
+//! stranger cannot forge - but it is only meaningful if something checks it, and a bridge
+//! that starts with the check unset would take orders from whoever finds the bot.
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// How long Telegram holds a `getUpdates` request open with nothing to say. Long-polling
+/// rather than a timer: a message arrives in the second it was sent, and an idle bridge
+/// costs one open connection instead of a request every few seconds.
+const LONG_POLL_SECS: u64 = 25;
+
+/// Telegram rejects anything over 4096 characters, and a wall of engine output is not what
+/// a phone is for. The whole result is in the channel either way.
+const EXCERPT_CHARS: usize = 600;
+
+/// How many announced results to remember. Enough that a restart does not repeat itself,
+/// bounded so the state file cannot grow without limit on a long-lived fleet.
+const SEEN_LIMIT: usize = 500;
+
+/// What a chat message asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Instruction {
+    Help,
+    Agents,
+    Status,
+    /// Put work into the channel. `to` addresses one machine; `None` is open to anyone.
+    Order { to: Option<String>, task: String },
+}
+
+/// Read one chat message as an instruction.
+///
+/// Bare text is an open order, because that is what an operator reaching for their phone
+/// almost always means, and making them remember a verb to do the common thing is how a
+/// tool stops getting used.
+#[must_use]
+pub fn parse_instruction(text: &str) -> Option<Instruction> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    // `/help@ferrymanbot` is what Telegram sends in a group; the suffix is addressing, not
+    // part of the command.
+    let (head, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let command = head.split('@').next().unwrap_or(head).to_ascii_lowercase();
+    let rest = rest.trim();
+    match command.as_str() {
+        "/help" | "/start" => Some(Instruction::Help),
+        "/agents" | "/roster" => Some(Instruction::Agents),
+        "/status" | "/tasks" => Some(Instruction::Status),
+        "/order" => (!rest.is_empty()).then(|| Instruction::Order {
+            to: None,
+            task: rest.to_string(),
+        }),
+        "/to" => {
+            let (who, task) = rest.split_once(char::is_whitespace)?;
+            let who = ferryman_channel::canonical_agent_name(who);
+            let task = task.trim();
+            (!who.is_empty() && !task.is_empty()).then_some(Instruction::Order {
+                to: Some(who),
+                task: task.to_string(),
+            })
+        }
+        // An unrecognised slash command is a typo, not a task. Turning `/stauts` into an
+        // order for the fleet to carry out is the kind of helpfulness nobody wants.
+        _ if command.starts_with('/') => None,
+        _ => Some(Instruction::Order {
+            to: None,
+            task: text.to_string(),
+        }),
+    }
+}
+
+/// The identity of one submitted result, for "have I already said this".
+#[must_use]
+pub fn result_key(order_id: &str, agent: &str, revision: u32) -> String {
+    format!("{order_id}:{agent}:{revision}")
+}
+
+/// Cut a string to `limit` characters on a character boundary, marking that it was cut.
+#[must_use]
+pub fn excerpt(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(limit).collect();
+    format!("{kept}...")
+}
+
+/// What the bridge remembers between restarts: which updates it has consumed, and which
+/// results it has already reported.
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
+struct BridgeState {
+    /// Telegram's own cursor. Acknowledging by offset is what stops a restart replaying
+    /// the last 24 hours of messages as fresh orders.
+    #[serde(default)]
+    offset: i64,
+    #[serde(default)]
+    seen: Vec<String>,
+}
+
+impl BridgeState {
+    fn remember(&mut self, key: String) {
+        self.seen.push(key);
+        if self.seen.len() > SEEN_LIMIT {
+            let excess = self.seen.len() - SEEN_LIMIT;
+            self.seen.drain(..excess);
+        }
+    }
+
+    fn knows(&self, key: &str) -> bool {
+        self.seen.iter().any(|seen| seen == key)
+    }
+}
+
+/// Where this bridge's state lives: beside the key store in the attachment, which is local
+/// to this machine - the synced folder is the `communications` directory inside it. A cursor
+/// that synced would be a cursor two machines fought over. Named after the signing agent so
+/// that even two bridges on one machine keep their own.
+fn state_path(attachment: &Path, agent: &str) -> PathBuf {
+    attachment.join(format!("telegram-{agent}.json"))
+}
+
+#[derive(Debug, Deserialize)]
+struct TgResponse<T> {
+    ok: bool,
+    #[serde(default)]
+    result: Option<T>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgUpdate {
+    update_id: i64,
+    #[serde(default)]
+    message: Option<TgMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgMessage {
+    #[serde(default)]
+    message_id: i64,
+    #[serde(default)]
+    from: Option<TgUser>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgUser {
+    id: i64,
+}
+
+/// The bot's side of one chat.
+struct Chat {
+    http: reqwest::Client,
+    token: String,
+    chat_id: i64,
+}
+
+impl Chat {
+    async fn send(&self, text: &str) -> Result<()> {
+        let response = self
+            .http
+            .post(format!(
+                "https://api.telegram.org/bot{}/sendMessage",
+                self.token
+            ))
+            .json(&json!({ "chat_id": self.chat_id, "text": excerpt(text, 3900) }))
+            .send()
+            .await
+            .context("send a Telegram message")?;
+        if !response.status().is_success() {
+            // The body of a Telegram error carries the reason ("chat not found"), and the
+            // status alone sends an operator hunting. The token is in the URL, never here.
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("telegram sendMessage returned {status}: {}", excerpt(&body, 200));
+        }
+        Ok(())
+    }
+
+    async fn updates(&self, offset: i64) -> Result<Vec<TgUpdate>> {
+        let response: TgResponse<Vec<TgUpdate>> = self
+            .http
+            .get(format!(
+                "https://api.telegram.org/bot{}/getUpdates",
+                self.token
+            ))
+            .query(&[
+                ("offset", offset.to_string()),
+                ("timeout", LONG_POLL_SECS.to_string()),
+                ("allowed_updates", "[\"message\"]".to_string()),
+            ])
+            .timeout(Duration::from_secs(LONG_POLL_SECS + 15))
+            .send()
+            .await
+            .context("poll Telegram for updates")?
+            .json()
+            .await
+            .context("parse Telegram's reply to getUpdates")?;
+        if !response.ok {
+            bail!(
+                "telegram getUpdates refused: {}",
+                response.description.unwrap_or_else(|| "no reason given".to_string())
+            );
+        }
+        Ok(response.result.unwrap_or_default())
+    }
+}
+
+/// Read the bot token. The token is a password for the bot: it stays in the environment,
+/// never in a config file the channel syncs and never on a command line `ps` can read.
+fn bot_token() -> Result<String> {
+    match std::env::var("TELEGRAM_BOT_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Ok(token),
+        _ => bail!(
+            "TELEGRAM_BOT_TOKEN is not set. Create a bot with @BotFather, then put the token \
+             in this process's environment - a systemd EnvironmentFile with mode 600, or your \
+             shell's own secrets file. Not in the channel: it syncs."
+        ),
+    }
+}
+
+/// Read the one user id allowed to command the fleet.
+fn approver_id() -> Result<i64> {
+    let raw = std::env::var("TELEGRAM_APPROVER_ID").unwrap_or_default();
+    match raw.trim().parse::<i64>() {
+        Ok(id) => Ok(id),
+        Err(_) => bail!(
+            "TELEGRAM_APPROVER_ID must be your numeric Telegram user id (ask @userinfobot). \
+             Without it every message reaching this bot would be an order, so the bridge \
+             refuses to start rather than opening the fleet to whoever finds it."
+        ),
+    }
+}
+
+/// Run the bridge until it is stopped.
+///
+/// `workspace` picks the project; `agent` is the identity the orders are signed with, which
+/// is the operator, not a worker - a bridge that signed as a machine would put that
+/// machine's name on work a human asked for.
+pub async fn bridge(workspace: Option<PathBuf>, agent: Option<String>) -> Result<()> {
+    let start = match workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    let route = ferryman_channel::route_for(&start)?;
+    let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+    let token = bot_token()?;
+    let approver = approver_id()?;
+    let chat_id = match std::env::var("TELEGRAM_CHAT_ID") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse::<i64>()
+            .context("TELEGRAM_CHAT_ID must be numeric")?,
+        // A direct message to the approver is the common case and needs no configuration.
+        _ => approver,
+    };
+    let chat = Chat {
+        http: reqwest::Client::new(),
+        token,
+        chat_id,
+    };
+
+    let path = state_path(&route.attachment, &issuer);
+    let first_run = !path.exists();
+    let mut state: BridgeState = match std::fs::read_to_string(&path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => BridgeState::default(),
+    };
+    if first_run {
+        // Everything already in the channel is history, not news. Announcing it would
+        // greet a new operator with every result the project has ever produced.
+        for task in ferryman_channel::list_tasks(&route)? {
+            for result in &task.results {
+                state.remember(result_key(&task.order.id, &result.agent, result.revision));
+            }
+        }
+        save(&path, &state)?;
+        chat.send(&format!(
+            "Ferryman bridge up on {} as {issuer}.\nSend a line to make it an order; /help for the rest.",
+            route.project_id
+        ))
+        .await?;
+    }
+
+    println!(
+        "telegram bridge: project {} as {issuer}, chat {chat_id}",
+        route.project_id
+    );
+
+    loop {
+        match chat.updates(state.offset).await {
+            Ok(updates) => {
+                for update in updates {
+                    // Acknowledge before acting. A message that makes the bridge panic
+                    // would otherwise be redelivered forever, and a crash loop that reissues
+                    // the same order every restart is worse than a lost message.
+                    state.offset = state.offset.max(update.update_id + 1);
+                    save(&path, &state)?;
+                    if let Some(message) = update.message {
+                        handle(&chat, &route, &issuer, approver, &message).await;
+                    }
+                }
+            }
+            Err(error) => {
+                // A phone with no signal, Telegram rate-limiting, a laptop lid: none of
+                // these are reasons to stop being the fleet's ear.
+                eprintln!("telegram: {error}; retrying");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+
+        if let Err(error) = announce(&chat, &route, &mut state, &path).await {
+            eprintln!("telegram: could not report results: {error}");
+        }
+    }
+}
+
+fn save(path: &Path, state: &BridgeState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(state)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// Act on one message. Errors are reported into the chat rather than returned: the operator
+/// is holding the only screen that will show them, and a bridge that exits on a bad order
+/// stops answering the good ones.
+async fn handle(
+    chat: &Chat,
+    route: &ferryman_channel::ProjectRoute,
+    issuer: &str,
+    approver: i64,
+    message: &TgMessage,
+) {
+    let from = message.from.as_ref().map(|user| user.id).unwrap_or_default();
+    if from != approver {
+        // Not an error worth answering: replying would confirm the bot exists to whoever
+        // is probing it.
+        eprintln!("telegram: ignored a message from {from}, who is not the approver");
+        return;
+    }
+    let Some(text) = message.text.as_deref() else {
+        return;
+    };
+    let reply = match parse_instruction(text) {
+        None => help_text(),
+        Some(Instruction::Help) => help_text(),
+        Some(Instruction::Agents) => match ferryman_channel::read_agent_roster(&route.communications)
+        {
+            Ok(roster) if roster.is_empty() => "no agents have joined this channel yet".to_string(),
+            Ok(roster) => {
+                let mut lines = vec![format!("{} agents:", roster.len())];
+                for agent in roster {
+                    let keyed = agent
+                        .public_key
+                        .as_ref()
+                        .is_some_and(|key| !key.is_empty());
+                    lines.push(format!(
+                        "  {} {}",
+                        agent.name,
+                        if keyed { "" } else { "(no key yet)" }
+                    ));
+                }
+                lines.join("\n")
+            }
+            Err(error) => format!("could not read the roster: {error}"),
+        },
+        Some(Instruction::Status) => status_text(route),
+        Some(Instruction::Order { to, task }) => {
+            match issue(route, issuer, message.message_id, to.clone(), &task) {
+                Ok(id) => match to {
+                    Some(who) => format!("issued {id} to {who}"),
+                    None => format!("issued {id}, open to whoever claims it first"),
+                },
+                Err(error) => format!("could not issue that: {error}"),
+            }
+        }
+    };
+    if let Err(error) = chat.send(&reply).await {
+        eprintln!("telegram: could not reply: {error}");
+    }
+}
+
+fn help_text() -> String {
+    "Send any line to make it an order, open to whichever machine claims it first.\n\
+     /to <agent> <task>  address one machine\n\
+     /order <task>       the same as sending the line alone\n\
+     /status             every task and where it has got to\n\
+     /agents             who is in this channel"
+        .to_string()
+}
+
+fn status_text(route: &ferryman_channel::ProjectRoute) -> String {
+    let tasks = match ferryman_channel::list_tasks(route) {
+        Ok(tasks) => tasks,
+        Err(error) => return format!("could not read the channel: {error}"),
+    };
+    if tasks.is_empty() {
+        return "no tasks yet".to_string();
+    }
+    let mut lines = Vec::new();
+    // Newest first: the phone is for what is happening now, and the oldest task in a long
+    // project is rarely the one being asked about.
+    let mut tasks = tasks;
+    tasks.sort_by(|a, b| b.order.created_at.cmp(&a.order.created_at));
+    for task in tasks.iter().take(12) {
+        lines.push(format!(
+            "{}  {}  {:?}",
+            task.order.id,
+            task.holder().unwrap_or("-"),
+            task.state()
+        ));
+    }
+    if tasks.len() > 12 {
+        lines.push(format!("... and {} older", tasks.len() - 12));
+    }
+    lines.join("\n")
+}
+
+/// Turn a message into a signed order.
+///
+/// The order id carries the Telegram message id, so an order can be traced back to the
+/// message that asked for it - and a redelivered update cannot mint a second order, because
+/// the id is already taken.
+fn issue(
+    route: &ferryman_channel::ProjectRoute,
+    issuer: &str,
+    message_id: i64,
+    to: Option<String>,
+    task: &str,
+) -> Result<String> {
+    let id = format!("tg-{message_id}");
+    let mut order = ferryman_channel::Order {
+        id: id.clone(),
+        project_id: route.project_id.clone(),
+        issued_by: issuer.to_string(),
+        assigned_to: to,
+        created_at: chrono::Utc::now(),
+        payload: json!({ "task": task }),
+        requires_review: false,
+        requires_approval: false,
+        depends_on: Vec::new(),
+        signed_by: None,
+        signature: None,
+        result_contract: None,
+    };
+    // Unsigned work is work nobody can attribute. If this identity can sign, it does.
+    if let Some(identity) = crate::sign_as(route, issuer)? {
+        identity.sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order)?;
+        let _ = ferryman_channel::ledger::append_ledger_entry(
+            route,
+            &identity,
+            "order",
+            issuer,
+            &format!("issued order {id} from Telegram"),
+            Some(&id),
+        );
+    } else {
+        ferryman_channel::issue_order(route, &order)?;
+    }
+    Ok(id)
+}
+
+/// Report results that have arrived since the last look.
+async fn announce(
+    chat: &Chat,
+    route: &ferryman_channel::ProjectRoute,
+    state: &mut BridgeState,
+    path: &Path,
+) -> Result<()> {
+    let mut fresh: Vec<(String, String)> = Vec::new();
+    for task in ferryman_channel::list_tasks(route)? {
+        for result in &task.results {
+            let key = result_key(&task.order.id, &result.agent, result.revision);
+            if state.knows(&key) {
+                continue;
+            }
+            let output = result
+                .payload
+                .get("output")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| result.payload.to_string());
+            let signature = ferryman_channel::verify_result(result, &route.agents);
+            fresh.push((
+                key,
+                format!(
+                    "{} r{} by {} ({signature:?})\n\n{}",
+                    task.order.id,
+                    result.revision,
+                    result.agent,
+                    excerpt(&output, EXCERPT_CHARS)
+                ),
+            ));
+        }
+    }
+    // Remember first, then speak. The other order repeats an announcement every restart if
+    // the send is what failed, and a phone that buzzes with yesterday's results twice is a
+    // bridge an operator turns off.
+    for (key, text) in fresh {
+        state.remember(key);
+        save(path, state)?;
+        chat.send(&text).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bare_line_is_an_open_order() {
+        assert_eq!(
+            parse_instruction("check the README opening"),
+            Some(Instruction::Order {
+                to: None,
+                task: "check the README opening".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn an_addressed_order_folds_the_agent_name() {
+        // The same folding every other entry point uses, or `/to BEASTLYWSL` addresses a
+        // machine the roster does not have.
+        assert_eq!(
+            parse_instruction("/to BeastlyWSL  run the tests"),
+            Some(Instruction::Order {
+                to: Some("beastlywsl".to_string()),
+                task: "run the tests".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_group_suffix_is_addressing_not_part_of_the_command() {
+        assert_eq!(parse_instruction("/status@ferrymanbot"), Some(Instruction::Status));
+    }
+
+    #[test]
+    fn a_mistyped_command_is_not_quietly_turned_into_work() {
+        // `/stauts` becoming an order for the fleet to carry out is the kind of
+        // helpfulness that wastes an engine run and confuses the person who typed it.
+        assert_eq!(parse_instruction("/stauts"), None);
+    }
+
+    #[test]
+    fn an_order_verb_with_nothing_after_it_is_not_an_order() {
+        assert_eq!(parse_instruction("/order   "), None);
+        assert_eq!(parse_instruction("/to beastlywsl"), None);
+    }
+
+    #[test]
+    fn seen_results_are_remembered_but_bounded() {
+        let mut state = BridgeState::default();
+        for index in 0..(SEEN_LIMIT + 10) {
+            state.remember(result_key("t", "a", u32::try_from(index).unwrap()));
+        }
+        assert_eq!(state.seen.len(), SEEN_LIMIT);
+        // The oldest fall off, not the newest: a restart must not re-announce what just
+        // happened.
+        assert!(!state.knows(&result_key("t", "a", 0)));
+        assert!(state.knows(&result_key("t", "a", u32::try_from(SEEN_LIMIT + 9).unwrap())));
+    }
+
+    #[test]
+    fn an_excerpt_cuts_on_a_character_boundary() {
+        let text = "e\u{301}".repeat(400);
+        let cut = excerpt(&text, 10);
+        assert!(cut.ends_with("..."));
+        assert_eq!(cut.chars().count(), 13);
+    }
+
+    #[test]
+    fn state_is_named_for_the_agent_that_writes_it() {
+        // One writer per path is what makes the synced folder conflict-free; two bridges
+        // sharing a cursor file would fight over it.
+        let path = state_path(Path::new("/w/.ferryman"), "beastlywsl");
+        assert!(path.ends_with("telegram-beastlywsl.json"));
+    }
+}

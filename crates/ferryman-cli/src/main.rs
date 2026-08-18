@@ -2,6 +2,7 @@
 mod license;
 mod mcp;
 mod mcp_client;
+mod telegram;
 
 use ferryman_ops::Progress;
 use ferryman_ops::agent;
@@ -832,6 +833,21 @@ enum Channel {
         #[command(subcommand)]
         action: LeaseAction,
     },
+    /// Bridge one Telegram chat to this channel: a message becomes a signed order,
+    /// and a result comes back to the chat. Runs until stopped.
+    ///
+    /// Reads TELEGRAM_BOT_TOKEN and TELEGRAM_APPROVER_ID from the environment, and
+    /// refuses to start without both: an unauthenticated bridge would take orders
+    /// from whoever finds the bot.
+    Telegram {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who the orders are signed by. Defaults to this machine's name, but the
+        /// operator's own identity is usually what you want - a human asked for this
+        /// work, and the ledger should say so.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -1604,7 +1620,13 @@ async fn run(cli: Cli) -> Result<()> {
                 call(&cli, "DELETE", format!("/v1/projects/{id}"), None).await?
             }
         },
-        Command::Channel { command } => channel(command)?,
+        // `channel` is sync, and the Telegram bridge is a long-poll loop that needs the
+        // runtime this function already has. Splitting it here keeps every other channel
+        // command free of async it does not use.
+        Command::Channel { command } => match command {
+            Channel::Telegram { workspace, agent } => telegram::bridge(workspace, agent).await?,
+            rest => channel(rest)?,
+        },
         Command::Dashboard {
             workspace,
             port,
@@ -4499,6 +4521,11 @@ fn channel(command: Channel) -> Result<()> {
                 }
             }
         }
+        // Dispatched in `run`, which has the async runtime its long poll needs.
+        Channel::Telegram { .. } => {
+            bail!("internal: the telegram bridge is dispatched before this point")
+        }
+
         Channel::Lease { workspace, action } => {
             let route = here(workspace)?;
             match action {

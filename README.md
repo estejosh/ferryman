@@ -90,6 +90,9 @@ Two consequences worth caring about:
 - **An audit trail** of every decision, hash-chained and backed by private Git.
 - **Approval gates** for anything that shouldn't happen unsupervised — including
   from your phone over Telegram, bound to a hash of exactly what was approved.
+- **Your phone as a terminal.** `ferry channel telegram` turns a message into a
+  signed order and sends the result back when a worker submits it, so the fleet
+  is reachable from the one device you always have.
 - **A master, grants, and short-lived lease tokens.** Authority is explicit,
   signed, and expiring — a leaked worker credential stops working on its own.
 - **A web dashboard** to watch tasks, ledger, cost and learnings, and to
@@ -137,6 +140,27 @@ A real recording, not a mockup — replay it from
 [`docs/assets/demo.cast`](docs/assets/demo.cast). Both agents here read and
 write one folder, which is exactly what Syncthing gives each machine. Nothing is
 running: no server, no daemon, no token.
+
+## From your phone
+
+```bash
+export TELEGRAM_BOT_TOKEN=...        # from @BotFather
+export TELEGRAM_APPROVER_ID=...      # your numeric user id; ask @userinfobot
+ferry channel telegram --workspace ~/your-project-ferryman --agent you
+```
+
+Send a line and it becomes an open order; `/to <agent> <task>` addresses one
+machine; `/status` and `/agents` read the channel back. Results arrive in the
+same chat with their signature verdict.
+
+Only that one user id is obeyed — Telegram authenticates `from.id` server-side,
+and the bridge refuses to start without an id to check, because a bridge that
+started without one would take orders from whoever found the bot. Keep the token
+in the environment or a mode-600 `EnvironmentFile`, never in the channel: it
+syncs.
+
+It writes the same signed artifacts `ferry channel order` writes, so it is not a
+second control plane. Stop it and the fleet does not notice.
 
 ## Documentation
 
