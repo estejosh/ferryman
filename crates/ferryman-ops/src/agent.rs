@@ -510,6 +510,70 @@ struct AgentRun {
     ok: bool,
 }
 
+/// The most bytes of engine output worth putting in one error.
+///
+/// Enough for the useful end of a stack trace, small enough that an engine printing a
+/// megabyte of progress bars cannot turn one failure into an unreadable log.
+const FAILURE_DETAIL_BYTES: usize = 400;
+
+/// Why the engine failed, said as precisely as its own output allows.
+///
+/// # What this replaced, and why "no output" was a lie
+///
+/// Three call sites each wrote
+/// `run.stderr.trim().lines().next().unwrap_or("no output")`, wrong in three separate
+/// ways, which together produced an unusable report in the one case that mattered.
+///
+/// **It ignored stdout.** An engine that reports failure on stdout - and they do; the one
+/// that found this printed "Failed to authenticate: OAuth session expired and could not
+/// be refreshed" there - had its explanation thrown away, and the operator was told "no
+/// output" about a process that printed exactly the sentence they needed.
+///
+/// **It took the FIRST line.** The first line of a failing CLI is often a warning emitted
+/// before it gets to the point. In the case above, line one was a note about stdin and
+/// the real cause was line two.
+///
+/// **And "no output" is not what it meant.** It meant "stderr was empty", which reads as
+/// "the engine produced nothing" - a different and more alarming claim. When both streams
+/// genuinely are empty that is worth saying plainly, because it points at a different
+/// fault (a wrapper that exec'd nothing) than an engine that explained itself.
+///
+/// Prefers stderr, falls back to stdout, and names which one it is quoting so a reader
+/// can tell "the engine complained" from "the engine answered on the wrong stream".
+fn engine_failure_detail(run: &AgentRun) -> String {
+    fn tail(text: &str) -> Option<String> {
+        // The LAST lines, not the first: a process that fails after printing progress
+        // puts the reason at the end.
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        let start = lines.len().saturating_sub(3);
+        let mut joined = lines[start..].join("; ");
+        if joined.len() > FAILURE_DETAIL_BYTES {
+            // Truncate on a char boundary - engine output is not guaranteed to be ASCII,
+            // and slicing mid-character would panic on the error path, which is the worst
+            // possible place to panic.
+            let mut cut = FAILURE_DETAIL_BYTES;
+            while cut > 0 && !joined.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            joined.truncate(cut);
+            joined.push_str("... (truncated)");
+        }
+        Some(joined)
+    }
+    match (tail(&run.stderr), tail(&run.stdout)) {
+        (Some(err), _) => err,
+        (None, Some(out)) => format!("nothing on stderr; on stdout: {out}"),
+        (None, None) => "exited without printing anything on stdout or stderr".to_string(),
+    }
+}
+
 /// The bind-mount argument for the container runner, computed per platform so
 /// the workspace mounts correctly everywhere.
 fn workspace_mount(workspace: &Path) -> String {
@@ -853,11 +917,7 @@ pub async fn run_engine_prompt(
     config.runner = runner.clone();
     let run = run_agent(&config, workspace, prompt, &[]).await?;
     if !run.ok {
-        bail!(
-            "'{}' failed: {}",
-            command,
-            run.stderr.trim().lines().next().unwrap_or("no output")
-        );
+        bail!("'{}' failed: {}", command, engine_failure_detail(&run));
     }
     Ok(run.stdout)
 }
@@ -1287,17 +1347,195 @@ pub async fn work_once(
                     ));
                     continue;
                 }
-                do_work(route, config, &identity, &task, report).await?;
-                acted += 1;
+                if attempt(route, config, &identity, &task, report).await {
+                    acted += 1;
+                }
             }
             TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
-                do_work(route, config, &identity, &task, report).await?;
-                acted += 1;
+                if attempt(route, config, &identity, &task, report).await {
+                    acted += 1;
+                }
             }
             _ => {}
         }
     }
     Ok(acted)
+}
+
+/// How many times one task may fail on this machine before the worker stops trying it.
+const MAX_TASK_ATTEMPTS: u32 = 5;
+/// The first backoff after a failure. Each later one doubles, up to the cap.
+const FIRST_BACKOFF: Duration = Duration::from_secs(30);
+/// The longest a task waits between attempts. Half an hour is long enough that a broken
+/// credential stops costing anything, and short enough that fixing it does not need the
+/// worker restarted.
+const MAX_BACKOFF: Duration = Duration::from_secs(30 * 60);
+
+/// Per-task failure counts and backoff, for the life of this process.
+///
+/// # Why this exists
+///
+/// A task that failed for an unrecoverable reason was retried every `poll_secs` forever.
+/// Observed: an expired engine credential produced a failure every ten seconds, and each
+/// attempt created and destroyed a git worktree on the way. Nothing escalated, nothing
+/// backed off, and the claim was held throughout. An expired credential and a missing
+/// binary will not succeed on the two hundredth attempt either.
+///
+/// Keyed by project AND task, not task alone, so a process serving more than one project
+/// cannot confuse two tasks that happen to share an id.
+///
+/// Time is passed in rather than read, so the backoff schedule can be tested without
+/// sleeping - the same reason `governor`'s window logic takes the time as an argument.
+#[derive(Debug, Default)]
+struct AttemptLedger {
+    failures: HashMap<(String, String), u32>,
+    next_due: HashMap<(String, String), Duration>,
+}
+
+impl AttemptLedger {
+    /// Whether this task may be attempted at `now`, and if not, why not.
+    fn may_attempt(&self, project: &str, id: &str, now: Duration) -> Attempt {
+        let key = (project.to_string(), id.to_string());
+        let failures = self.failures.get(&key).copied().unwrap_or(0);
+        if failures >= MAX_TASK_ATTEMPTS {
+            return Attempt::GivenUp { failures };
+        }
+        match self.next_due.get(&key) {
+            Some(due) if *due > now => Attempt::Waiting { until: *due },
+            _ => Attempt::Now,
+        }
+    }
+
+    /// Record that an attempt failed, and schedule the next one.
+    fn failed(&mut self, project: &str, id: &str, now: Duration) -> u32 {
+        let key = (project.to_string(), id.to_string());
+        let failures = self.failures.entry(key.clone()).or_insert(0);
+        *failures += 1;
+        let backoff = FIRST_BACKOFF
+            .saturating_mul(1u32 << (*failures - 1).min(10))
+            .min(MAX_BACKOFF);
+        self.next_due.insert(key, now + backoff);
+        *failures
+    }
+
+    /// Record that the task succeeded, so a later failure starts from a clean count.
+    fn succeeded(&mut self, project: &str, id: &str) {
+        let key = (project.to_string(), id.to_string());
+        self.failures.remove(&key);
+        self.next_due.remove(&key);
+    }
+}
+
+/// What the ledger says about attempting a task right now.
+#[derive(Debug, PartialEq, Eq)]
+enum Attempt {
+    Now,
+    Waiting { until: Duration },
+    GivenUp { failures: u32 },
+}
+
+/// The process-wide ledger, and the monotonic clock it measures against.
+fn attempt_ledger() -> &'static std::sync::Mutex<AttemptLedger> {
+    static LEDGER: std::sync::OnceLock<std::sync::Mutex<AttemptLedger>> =
+        std::sync::OnceLock::new();
+    LEDGER.get_or_init(|| std::sync::Mutex::new(AttemptLedger::default()))
+}
+
+fn worker_uptime() -> Duration {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// One attempt at a task, subject to the backoff ledger. Returns whether work was done.
+///
+/// # Why a failure here no longer aborts the pass
+///
+/// This used to be `do_work(..).await?` inside the dispatch loop, so the FIRST task that
+/// failed took the whole pass with it and every task behind it in the queue waited for
+/// the next poll - or forever, if the first task's failure was permanent. One stuck task
+/// could stall a machine that had perfectly good work waiting behind it.
+///
+/// # Why the claim is NOT released when we give up
+///
+/// Releasing looks obviously right: another machine might have the engine this one is
+/// missing. It is still wrong, and this is the reasoning.
+///
+/// The protocol has no "failed" state - the note in `do_work` says so, and inventing one
+/// here would be a worse lie than silence. So releasing means marking the order Open
+/// again. The next machine claims it, fails the same way if the cause is the ORDER rather
+/// than this host, releases, and the task walks around the fleet failing once per machine.
+/// One stuck task becomes every machine's stuck task, in turn, quietly.
+///
+/// And the two cases cannot be reliably told apart from in here. A missing binary is
+/// host-specific; a malformed order is not; an expired credential looks host-specific but
+/// is host-specific *per host*, so every machine may fail it in turn anyway. The engine's
+/// exit status does not distinguish them, and guessing wrong in the releasing direction is
+/// the expensive mistake.
+///
+/// So the costs are asymmetric: holding one task costs one task, and is visible to
+/// `ferry agent pending` and to anyone reading the log. Releasing a
+/// machine-independent failure costs the whole fleet, repeatedly, and is visible nowhere
+/// in particular. Fail toward the cheap, legible outcome. An operator who knows the cause
+/// was local can re-dispatch deliberately, which is strictly better than the fleet
+/// discovering it one machine at a time.
+async fn attempt(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    task: &Task,
+    report: &dyn Progress,
+) -> bool {
+    let id = &task.order.id;
+    let now = worker_uptime();
+    let verdict = attempt_ledger()
+        .lock()
+        .map(|ledger| ledger.may_attempt(&route.project_id, id, now))
+        .unwrap_or(Attempt::Now);
+    match verdict {
+        Attempt::GivenUp { .. } => return false,
+        Attempt::Waiting { until } => {
+            report.info(&format!(
+                "  {id}: waiting {}s before trying again",
+                until.saturating_sub(now).as_secs()
+            ));
+            return false;
+        }
+        Attempt::Now => {}
+    }
+
+    match do_work(route, config, identity, task, report).await {
+        Ok(()) => {
+            if let Ok(mut ledger) = attempt_ledger().lock() {
+                ledger.succeeded(&route.project_id, id);
+            }
+            true
+        }
+        Err(error) => {
+            let failures = attempt_ledger()
+                .lock()
+                .map(|mut ledger| ledger.failed(&route.project_id, id, now))
+                .unwrap_or(MAX_TASK_ATTEMPTS);
+            if failures >= MAX_TASK_ATTEMPTS {
+                // Said once, loudly, with the cause - not every ten seconds forever.
+                report.warn(&format!(
+                    "  {id}: giving up after {failures} attempts: {error:#}"
+                ));
+                report.warn(&format!(
+                    "  {id}: still claimed by {} and NOT returned to the pool, because a \
+                     failure this machine cannot get past may be the order rather than the \
+                     machine - and an order that fails everywhere would then fail on every \
+                     machine in turn. Fix the cause and re-dispatch it, or hand it to \
+                     another agent deliberately.",
+                    config.agent
+                ));
+            } else {
+                report.warn(&format!(
+                    "  {id}: attempt {failures} of {MAX_TASK_ATTEMPTS} failed: {error:#}"
+                ));
+            }
+            false
+        }
+    }
 }
 
 #[tracing::instrument(name = "do_work", skip(route, config, identity, task, report), fields(order = %task.order.id, agent = %config.agent))]
@@ -1453,7 +1691,7 @@ async fn do_work(
         bail!(
             "'{}' failed on {id}: {}",
             config.command,
-            run.stderr.trim().lines().next().unwrap_or("no output")
+            engine_failure_detail(&run)
         )
     }
     let mut result = TaskResult {
@@ -1575,7 +1813,7 @@ pub async fn review_once(
             bail!(
                 "'{}' failed reviewing {id}: {}",
                 config.command,
-                run.stderr.trim().lines().next().unwrap_or("no output")
+                engine_failure_detail(&run)
             )
         }
         let verdict = parse_verdict(&run.stdout)
@@ -1657,6 +1895,168 @@ pub fn pending(route: &ProjectRoute) -> Result<Vec<(String, Recommendation)>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A failing engine must say WHY, not merely that it failed.
+    ///
+    /// The three call sites reported the first line of stderr and called an empty stderr
+    /// "no output". The engine that found this printed its reason on stdout, so the
+    /// operator was told "no output" about a process that had explained itself precisely.
+    #[test]
+    fn a_failing_engine_reports_why_not_just_that_it_failed() {
+        // The real case: the cause is on stdout, and stderr is empty.
+        let run = AgentRun {
+            stdout: "Failed to authenticate: OAuth session expired and could not be refreshed\n"
+                .into(),
+            stderr: String::new(),
+            ok: false,
+        };
+        let detail = engine_failure_detail(&run);
+        assert!(detail.contains("OAuth session expired"), "got: {detail}");
+        assert!(
+            detail.contains("stdout"),
+            "the reader must be told which stream this came from: {detail}"
+        );
+
+        // stderr is preferred when it has something to say.
+        let run = AgentRun {
+            stdout: "some progress chatter".into(),
+            stderr: "error: could not open config".into(),
+            ok: false,
+        };
+        assert_eq!(engine_failure_detail(&run), "error: could not open config");
+    }
+
+    /// The reason is usually the LAST thing printed, not the first. A warning ahead of it
+    /// must not displace it, which is what taking `lines().next()` did.
+    #[test]
+    fn the_reason_survives_a_warning_printed_before_it() {
+        let run = AgentRun {
+            stdout: String::new(),
+            stderr: "Warning: no stdin data received in 3s, proceeding without it\n\
+                     Failed to authenticate: OAuth session expired\n"
+                .into(),
+            ok: false,
+        };
+        assert!(
+            engine_failure_detail(&run).contains("Failed to authenticate"),
+            "the warning must not hide the cause"
+        );
+    }
+
+    /// Genuinely-silent is a different fault from wrong-stream, and worth saying exactly:
+    /// it points at a wrapper that exec'd nothing rather than an engine that complained.
+    #[test]
+    fn a_silent_engine_is_described_as_silent_not_as_no_output() {
+        let run = AgentRun {
+            stdout: "   \n".into(),
+            stderr: "\n\n".into(),
+            ok: false,
+        };
+        let detail = engine_failure_detail(&run);
+        assert!(
+            detail.contains("without printing anything"),
+            "got: {detail}"
+        );
+    }
+
+    /// An engine that floods must not make the log unreadable, and truncation must not
+    /// panic on a multi-byte character - the error path is the worst place to panic.
+    #[test]
+    fn a_flooding_engine_is_truncated_on_a_character_boundary() {
+        let run = AgentRun {
+            stdout: String::new(),
+            stderr: "é".repeat(5000),
+            ok: false,
+        };
+        let detail = engine_failure_detail(&run);
+        assert!(
+            detail.len() <= FAILURE_DETAIL_BYTES + 32,
+            "len {}",
+            detail.len()
+        );
+        assert!(detail.ends_with("... (truncated)"));
+    }
+
+    /// A task that cannot succeed must stop being attempted, and must back off on the way.
+    ///
+    /// Before this, an expired credential produced a failure every ten seconds forever,
+    /// building and tearing down a git worktree each time and holding the claim throughout.
+    #[test]
+    fn a_hopeless_task_is_given_up_on_rather_than_retried_forever() {
+        let mut ledger = AttemptLedger::default();
+        let (p, id) = ("ferryman", "t-1");
+        let mut now = Duration::ZERO;
+
+        assert_eq!(ledger.may_attempt(p, id, now), Attempt::Now);
+
+        let mut waits = Vec::new();
+        for expected in 1..=MAX_TASK_ATTEMPTS {
+            assert_eq!(
+                ledger.may_attempt(p, id, now),
+                Attempt::Now,
+                "attempt {expected} should be allowed once its backoff has elapsed"
+            );
+            assert_eq!(ledger.failed(p, id, now), expected);
+            match ledger.may_attempt(p, id, now) {
+                Attempt::Waiting { until } => {
+                    waits.push(until - now);
+                    now = until; // the operator waits; the next attempt becomes due
+                }
+                Attempt::GivenUp { failures } => {
+                    assert_eq!(failures, MAX_TASK_ATTEMPTS);
+                    assert_eq!(expected, MAX_TASK_ATTEMPTS, "gave up too early");
+                }
+                Attempt::Now => panic!("a just-failed task must not be immediately retryable"),
+            }
+        }
+
+        // Given up, and it stays given up however long anyone waits.
+        assert!(matches!(
+            ledger.may_attempt(p, id, now + Duration::from_secs(86_400)),
+            Attempt::GivenUp { .. }
+        ));
+
+        // The waits grew, and none exceeded the cap.
+        assert!(
+            waits.windows(2).all(|w| w[1] >= w[0]),
+            "backoff must not shrink: {waits:?}"
+        );
+        assert!(
+            waits.iter().all(|w| *w <= MAX_BACKOFF),
+            "backoff must be capped: {waits:?}"
+        );
+        assert_eq!(waits.first().copied(), Some(FIRST_BACKOFF));
+    }
+
+    /// Two projects in one process may hold tasks with the same id; giving up on one must
+    /// not give up on the other.
+    #[test]
+    fn giving_up_is_per_project_not_merely_per_task_id() {
+        let mut ledger = AttemptLedger::default();
+        let now = Duration::ZERO;
+        for _ in 0..MAX_TASK_ATTEMPTS {
+            ledger.failed("ferryman", "t-1", now);
+        }
+        assert!(matches!(
+            ledger.may_attempt("ferryman", "t-1", now),
+            Attempt::GivenUp { .. }
+        ));
+        assert_eq!(ledger.may_attempt("natv", "t-1", now), Attempt::Now);
+    }
+
+    /// A task that succeeds clears its history, so an unrelated failure months later
+    /// starts from a full budget instead of inheriting an old one.
+    #[test]
+    fn success_clears_the_failure_count() {
+        let mut ledger = AttemptLedger::default();
+        let now = Duration::ZERO;
+        ledger.failed("ferryman", "t-1", now);
+        ledger.failed("ferryman", "t-1", now);
+        ledger.succeeded("ferryman", "t-1");
+        assert_eq!(ledger.may_attempt("ferryman", "t-1", now), Attempt::Now);
+        assert_eq!(ledger.failed("ferryman", "t-1", now), 1, "count restarted");
+    }
+
     use super::*;
 
     #[test]
