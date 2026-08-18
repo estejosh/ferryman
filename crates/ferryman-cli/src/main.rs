@@ -3022,21 +3022,12 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
         } => {
             let route = here(workspace)?;
             let store = ferryman_server::operators::OperatorStore::new(&route.attachment);
-            // Typed twice, because there is no recovery. The seed is sealed under this
-            // password and nothing else opens it: a typo here does not lock you out of a
-            // service that can mail you a reset, it destroys an identity before it has
-            // signed anything.
-            let first =
-                rpassword::prompt_password(format!("password for new operator '{name}': "))?;
-            let second = rpassword::prompt_password("repeat it: ")?;
-            if first != second {
-                bail!("the passwords did not match; nothing was created");
-            }
+            let password = new_operator_password(&name)?;
             let identity = ferryman_server::operators::create_operator_identity_scoped(
                 &route,
                 &store,
                 &name,
-                &first,
+                &password,
                 this_project_only,
             )?;
             println!("created operator '{}'", identity.name());
@@ -3153,6 +3144,42 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The password for an operator being created now.
+///
+/// Typed twice when a person is present, because there is no recovery: nothing on any
+/// machine holds a copy of this, so a typo does not lock you out of a service that can
+/// mail you a reset - it destroys an identity before it has signed anything.
+///
+/// Read once from the environment when it is set, and NOT confirmed, because there is
+/// nothing to confirm against: a scripted caller cannot mistype twice differently, and
+/// asking a machine to repeat itself only turns a headless setup into a hang. It is the
+/// same variable the signing path reads, so an unattended machine has one answer to
+/// "where does the operator password come from" rather than two.
+///
+/// `rpassword` reads the terminal directly rather than stdin - correct, because a
+/// password echoed into a pipe is a password in a log - which is also why the environment
+/// variable is the only way to reach this without a human. Found by trying to script it,
+/// and watching it hang.
+fn new_operator_password(name: &str) -> anyhow::Result<String> {
+    if let Ok(password) = std::env::var("FERRYMAN_OPERATOR_PASSWORD")
+        && !password.is_empty()
+    {
+        return Ok(password);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        anyhow::bail!(
+            "creating operator '{name}' needs a password, and there is no terminal to ask \
+             on. Set FERRYMAN_OPERATOR_PASSWORD to create one unattended."
+        )
+    }
+    let first = rpassword::prompt_password(format!("password for new operator '{name}': "))?;
+    let second = rpassword::prompt_password("repeat it: ")?;
+    if first != second {
+        anyhow::bail!("the passwords did not match; nothing was created")
+    }
+    Ok(first)
 }
 
 /// The operator's password, from the environment when unattended, from the terminal when
