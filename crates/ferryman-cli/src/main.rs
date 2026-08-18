@@ -42,6 +42,23 @@ struct Cli {
 /// Carrying one human identity between the machines that person works from.
 #[derive(Subcommand, Clone)]
 enum Operator {
+    /// Create an operator identity on this machine.
+    ///
+    /// The person types their own password, here, at their own terminal. An agent
+    /// driving this never sees it - which is why the password is prompted for rather
+    /// than passed as an argument, where it would sit in shell history and in the
+    /// process list for anyone on the machine to read.
+    Create {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The operator name, e.g. your handle or the person's first name.
+        #[arg(long, value_parser = agent_name)]
+        name: String,
+        /// Make this operator THIS project's, rather than the machine's. The right
+        /// choice when the person operates one project here and not the others.
+        #[arg(long)]
+        this_project_only: bool,
+    },
     /// Write your sealed identity to a file, to carry to another machine.
     ///
     /// The file is encrypted with your password. Moving it is not moving a key: without
@@ -2998,6 +3015,42 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
         ferryman_channel::route_for(&start)
     };
     match command {
+        Operator::Create {
+            workspace,
+            name,
+            this_project_only,
+        } => {
+            let route = here(workspace)?;
+            let store = ferryman_server::operators::OperatorStore::new(&route.attachment);
+            // Typed twice, because there is no recovery. The seed is sealed under this
+            // password and nothing else opens it: a typo here does not lock you out of a
+            // service that can mail you a reset, it destroys an identity before it has
+            // signed anything.
+            let first =
+                rpassword::prompt_password(format!("password for new operator '{name}': "))?;
+            let second = rpassword::prompt_password("repeat it: ")?;
+            if first != second {
+                bail!("the passwords did not match; nothing was created");
+            }
+            let identity = ferryman_server::operators::create_operator_identity_scoped(
+                &route,
+                &store,
+                &name,
+                &first,
+                this_project_only,
+            )?;
+            println!("created operator '{}'", identity.name());
+            println!("  public key  {}", identity.public_key_hex());
+            if this_project_only {
+                println!("  scope       this project only");
+            } else {
+                println!("  scope       every project on this machine");
+            }
+            println!("  published to the roster, so the fleet can verify what they sign");
+            println!();
+            println!("  the password is the only thing that opens this identity: there is no");
+            println!("  reset, because nothing on any machine holds a copy of it.");
+        }
         Operator::Export {
             workspace,
             name,

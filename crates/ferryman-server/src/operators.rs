@@ -81,7 +81,18 @@ pub fn create_operator_identity_in(
     name: &str,
     password: &str,
 ) -> Result<AgentIdentity> {
-    let identity = store.create(name, password)?;
+    create_operator_identity_scoped(route, store, name, password, false)
+}
+
+/// The same, choosing whether the operator belongs to this project or to the machine.
+pub fn create_operator_identity_scoped(
+    route: &ProjectRoute,
+    store: &OperatorStore,
+    name: &str,
+    password: &str,
+    this_project_only: bool,
+) -> Result<AgentIdentity> {
+    let identity = store.create_scoped(name, password, this_project_only)?;
     let published = AgentRoute {
         name: identity.name().to_string(),
         role: "operator".to_string(),
@@ -236,6 +247,24 @@ impl OperatorStore {
     /// password. Refuses to replace an existing name: an operator is an
     /// identity, and quietly overwriting its key would lock it out.
     pub fn create(&self, name: &str, password: &str) -> Result<AgentIdentity> {
+        self.create_scoped(name, password, false)
+    }
+
+    /// The same, choosing whether the new record belongs to this project or to the
+    /// machine.
+    ///
+    /// Scope is a property of the WRITE, not of the store, and the difference is not
+    /// cosmetic. A store narrowed to the project would also narrow its reads, so the
+    /// duplicate check below would stop seeing a machine-wide record - and creating
+    /// `shin` for one project would silently mint a second key for a `shin` this machine
+    /// already knows. That is the exact fault the store exists to prevent, arriving
+    /// through the door built to allow the legitimate case.
+    pub fn create_scoped(
+        &self,
+        name: &str,
+        password: &str,
+        this_project_only: bool,
+    ) -> Result<AgentIdentity> {
         if !is_safe_component(name) {
             bail!("operator name must be a path-safe identifier (letters, digits, `-`, `_`, `.`)");
         }
@@ -273,7 +302,11 @@ impl OperatorStore {
             public_key_hex: identity.public_key_hex(),
         };
 
-        let dir = self.write_dir();
+        let dir = if this_project_only {
+            self.project.as_path()
+        } else {
+            self.write_dir()
+        };
         std::fs::create_dir_all(dir)?;
         // Owner-only on the directory before anything is written into it, so there is no
         // instant at which a world-readable file exists.
@@ -676,6 +709,77 @@ mod tests {
                 .unwrap()
                 .public_key_hex(),
             machine_wide.public_key_hex(),
+        );
+    }
+
+    /// The arrangement this was actually asked for: two people, one machine, one of them
+    /// the operator of a single project.
+    ///
+    /// Josh operates every project on the machine; Shin operates one of them and nothing
+    /// else. Both hold an identity here, neither can sign as the other, and Shin's does
+    /// not follow the machine into Josh's other projects.
+    #[test]
+    fn one_project_can_have_its_own_operator_alongside_the_machines() {
+        let machine = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let owner = store_on(&machine, &shared)
+            .create("op", "josh's password")
+            .unwrap();
+
+        // Shin is created for their project only.
+        let their_project = tempfile::tempdir().unwrap();
+        let theirs = store_on(&machine, &their_project);
+        let shin = theirs
+            .create_scoped("shin", "shin's password", true)
+            .unwrap();
+
+        assert!(theirs.is_project_local("shin"));
+        assert!(
+            !theirs.is_project_local("op"),
+            "op is the machine's, not this project's"
+        );
+        // Both are usable in the project they share, and only with their own password.
+        assert_eq!(
+            theirs
+                .login("shin", "shin's password")
+                .unwrap()
+                .public_key_hex(),
+            shin.public_key_hex()
+        );
+        assert_eq!(
+            theirs
+                .login("op", "josh's password")
+                .unwrap()
+                .public_key_hex(),
+            owner.public_key_hex()
+        );
+        assert!(theirs.login("shin", "josh's password").is_err());
+
+        // And Shin is absent from every other project on this machine.
+        let elsewhere = store_on(&machine, &tempfile::tempdir().unwrap());
+        assert!(
+            !elsewhere.exists("shin"),
+            "shin must not follow the machine"
+        );
+        assert!(elsewhere.exists("op"));
+    }
+
+    /// Creating a project-scoped operator must still SEE the machine, or it would mint a
+    /// second key for a person this machine already knows - the fault the store exists to
+    /// prevent, arriving through the door built for the legitimate case.
+    #[test]
+    fn a_project_scoped_create_cannot_duplicate_a_machine_wide_name() {
+        let machine = tempfile::tempdir().unwrap();
+        store_on(&machine, &tempfile::tempdir().unwrap())
+            .create("op", "josh's password")
+            .unwrap();
+
+        let error = store_on(&machine, &tempfile::tempdir().unwrap())
+            .create_scoped("op", "a different password", true)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("already exists on this machine"),
+            "got: {error:#}"
         );
     }
 
