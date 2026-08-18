@@ -267,6 +267,21 @@ them loses work or leaks anything.
 - **External MCP tool output is not marked as third-party** when it reaches an
   agent's prompt. Treat any MCP server you connect as something whose output can
   influence your agents, and prefer read-only ones.
+- **Claude Code in `-p` mode aborts on substantial tasks.** Pointed at
+  `@anthropic-ai/claude-code` as the engine, small tasks complete and larger ones fail
+  with `Execution error` on stdout — `is_error: true`, `terminal_reason:
+  aborted_streaming`, `stop_reason: tool_use`, typically at turn 8–12. It is
+  intermittent and gets likelier the more work a task needs: "list the first three
+  `unwrap()`s in this file" completes reliably, "list every place that could panic in
+  this file" mostly does not. Eliminated as causes, each tested directly: tool
+  permissions, the git worktree the worker runs in, the scrubbed child environment,
+  Ferryman's stall watchdog and timeout, output volume (a run producing 6,709 output
+  tokens succeeded while one producing 2,094 failed), the publishing notice in the
+  prompt (identical failure with and without it), and the `renice +10` applied to the
+  child. Failed runs cost nothing — they abort before or during the first request. The
+  practical rule until this is understood: **scope orders to a handful of tool calls**.
+  Bounded, specific tasks are what this is good at anyway.
+
 - **Windows has less test coverage than Linux and macOS.** CI runs all three, but
   several suites are Unix-only, and the two most recent platform bugs were both
   Windows-only and both found by running on a real machine rather than in review.
