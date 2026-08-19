@@ -664,6 +664,66 @@ fn engine_failure_detail(run: &AgentRun) -> String {
     }
 }
 
+/// The engine's answer, dug out of a machine-readable event stream if that is what it
+/// printed.
+///
+/// # What this replaced, and why the operator was told nothing
+///
+/// The result payload used to carry `run.stdout` verbatim. For an engine that prints
+/// prose that is exactly right. For an engine that prints a JSONL event stream - one
+/// object per token of reasoning, per tool call, per iteration boundary - it means the
+/// answer to "which machine are you, and what version do you run" arrives as twenty
+/// kilobytes of `{"type":"content_start","reasoning":" the"}` with the one sentence
+/// anyone wanted buried in the last line.
+///
+/// That is not a cosmetic problem. The result is what the operator reads in
+/// `ferry channel tasks`, what the Telegram bridge sends back to a phone, and what the
+/// next agent in a chain is handed as context. A fleet whose members cannot read each
+/// other's answers is a fleet of strangers.
+///
+/// So: if stdout parses as a stream of JSON objects, take the last final answer it
+/// carries - `run_result.text`, or a `done` event's `text` - and use that as the output.
+/// The full stream is not lost; [`ferryman_channel::trajectory`] already records it for
+/// replay, which is the right home for a transcript.
+///
+/// Anything that is not such a stream is returned untouched. A plain-prose engine, a
+/// single JSON object, a stream with no final text - all keep their stdout exactly as
+/// they printed it, because guessing at a summary would be worse than the noise.
+fn engine_answer(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+    let mut events = 0usize;
+    let mut answer: Option<String> = None;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        events += 1;
+        // The two shapes that carry a final answer. `run_result` is the whole run's
+        // verdict; `done` is the last event of the agent loop. Both may appear, and the
+        // later one wins, which is why this does not break out early.
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            answer = Some(text.to_string());
+        } else if let Some(text) = value
+            .get("event")
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some("done"))
+            .and_then(|event| event.get("text"))
+            .and_then(Value::as_str)
+        {
+            answer = Some(text.to_string());
+        }
+    }
+    // One JSON object is not a stream - it is an engine that answers in JSON, and its
+    // caller may well want the object. Two or more, and this is a transcript.
+    match answer {
+        Some(text) if events >= 2 && !text.trim().is_empty() => text.trim().to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
 /// The bind-mount argument for the container runner, computed per platform so
 /// the workspace mounts correctly everywhere.
 fn workspace_mount(workspace: &Path) -> String {
@@ -1764,8 +1824,7 @@ async fn do_work(
     if config.worktree && ferryman_channel::worktree::is_git_repo(&route.workspace) {
         match ferryman_channel::worktree::create_worktree(&route.workspace, id, &config.agent) {
             Ok((dir, _)) => {
-                base_commit =
-                    ferryman_channel::worktree::head_of(&dir).unwrap_or_default();
+                base_commit = ferryman_channel::worktree::head_of(&dir).unwrap_or_default();
                 workdir = dir;
                 used_worktree = true;
             }
@@ -1833,7 +1892,7 @@ async fn do_work(
     );
 
     let mut payload = json!({
-        "output": run.stdout.trim(),
+        "output": engine_answer(&run.stdout),
         "produced_by": config.command,
         "worktree_branch": branch,
     });
@@ -1853,13 +1912,13 @@ async fn do_work(
         match ferryman_channel::worktree::commit_all(&workdir, &config.agent, &subject) {
             Ok(Some(made)) => {
                 payload["committed"] = json!(made);
-                report.info(&format!("  {id}: committed {} on {branch}", &made[..12.min(made.len())]));
+                report.info(&format!(
+                    "  {id}: committed {} on {branch}",
+                    &made[..12.min(made.len())]
+                ));
                 if let Some(remote) = &config.push {
-                    match ferryman_channel::worktree::push_branch(
-                        &route.workspace,
-                        remote,
-                        &branch,
-                    ) {
+                    match ferryman_channel::worktree::push_branch(&route.workspace, remote, &branch)
+                    {
                         Ok(()) => {
                             payload["pushed"] = json!(remote);
                             report.info(&format!("  {id}: pushed {branch} to {remote}"));
@@ -2333,6 +2392,46 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_event_stream_is_reported_as_the_answer_not_as_the_transcript() {
+        let stream = concat!(
+            r#"{"ts":"1","type":"hook_event","hookEventName":"agent_start"}"#,
+            "\n",
+            r#"{"ts":"2","type":"agent_event","event":{"type":"content_start","reasoning":" the"}}"#,
+            "\n",
+            r#"{"ts":"3","type":"agent_event","event":{"type":"done","reason":"completed","text":"Grouchly - Linux - ferry 0.4.1"}}"#,
+            "\n",
+            r#"{"ts":"4","type":"run_result","finishReason":"completed","text":"Grouchly - Linux - ferry 0.4.1"}"#,
+        );
+        assert_eq!(engine_answer(stream), "Grouchly - Linux - ferry 0.4.1");
+    }
+
+    #[test]
+    fn prose_from_an_engine_that_speaks_prose_is_left_alone() {
+        let prose = "Done. The bridge now replies in the topic it was asked in.\nTwo tests added.";
+        assert_eq!(engine_answer(prose), prose);
+    }
+
+    #[test]
+    fn a_single_json_object_is_an_answer_not_a_transcript() {
+        // An engine that replies in JSON is answering, and its caller may need the
+        // object. Only a stream - two or more events - is a transcript to be condensed.
+        let object = r#"{"verdict":"pass","text":"looks right"}"#;
+        assert_eq!(engine_answer(object), object);
+    }
+
+    #[test]
+    fn a_stream_that_never_finished_keeps_every_line_it_printed() {
+        // No final text means the run was cut off. Condensing to nothing would hide the
+        // one thing an operator needs: how far it got before it stopped.
+        let cut_off = concat!(
+            r#"{"type":"hook_event","hookEventName":"agent_start"}"#,
+            "\n",
+            r#"{"type":"agent_event","event":{"type":"iteration_start","iteration":1}}"#,
+        );
+        assert_eq!(engine_answer(cut_off), cut_off);
+    }
 
     #[test]
     fn the_runner_parses_the_new_syntax_and_keeps_the_old() {
@@ -2848,7 +2947,11 @@ mod tests {
             ..order.clone()
         };
         let subject = commit_subject("t-4f2a", &long);
-        assert!(subject.chars().count() <= 72, "{} chars", subject.chars().count());
+        assert!(
+            subject.chars().count() <= 72,
+            "{} chars",
+            subject.chars().count()
+        );
         assert!(subject.ends_with("..."), "truncation is visible: {subject}");
 
         // An order carrying structured JSON rather than a task string still gets a
