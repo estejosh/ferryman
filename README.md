@@ -92,11 +92,13 @@ Two consequences worth caring about:
   from your phone over Telegram, bound to a hash of exactly what was approved.
 - **Your phone as a terminal.** `ferry channel telegram` turns a message into a
   signed order and sends the result back when a worker submits it, so the fleet
-  is reachable from the one device you always have.
+  is reachable from the one device you always have. (Secrets are deliberately
+  *not* carried here — a cloud chat is not end-to-end encrypted.)
 - **A master, grants, and short-lived lease tokens.** Authority is explicit,
   signed, and expiring — a leaked worker credential stops working on its own.
 - **A web dashboard** to watch tasks, ledger, cost and learnings, and to
-  approve or send work back from a browser.
+  approve or send work back from a browser — and to set secrets once, sealed to
+  exactly the machines that should receive them.
 - **Recovery you can rehearse.** Encrypted continuity packs, and a drill command
   that proves you can come back from a wiped machine.
 - **Opt-in sandboxing.** Run each worker inside a fresh podman or docker
@@ -161,6 +163,14 @@ syncs.
 
 It writes the same signed artifacts `ferry channel order` writes, so it is not a
 second control plane. Stop it and the fleet does not notice.
+
+**Secrets never travel through this bridge.** A Telegram chat is not
+end-to-end encrypted: a token you type there lives on Telegram's servers and
+syncs to every device signed into that account. Orders are fine to leak; a
+credential is not. Set secrets in the dashboard (`ferry dashboard`, then the
+Secrets tab) or with `ferry channel secret set` — they are encrypted for the
+specific machines that should receive them before they leave the machine that
+typed them.
 
 ## Documentation
 

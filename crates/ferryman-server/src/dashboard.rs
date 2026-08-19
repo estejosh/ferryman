@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Html,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use ferryman_channel::{AgentIdentity, ProjectRoute, SignatureCheck, TaskState};
 use serde::Deserialize;
@@ -322,6 +322,9 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/fleet", get(fleet))
         .route("/api/memory", get(memory))
         .route("/api/memory/suggest", post(suggest))
+        .route("/api/secrets", get(secrets_list))
+        .route("/api/secrets", post(secret_set))
+        .route("/api/secrets/{name}", delete(secret_remove))
         .route("/api/cost/rates", get(cost_rates))
         .route("/api/cost/plan", post(cost_plan))
         // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
@@ -848,6 +851,7 @@ async fn roster(
                 "capabilities": agent.capabilities,
                 "mcp": ferryman_channel::discovery::is_mcp(agent),
                 "key": agent.public_key.as_deref().map(fingerprint).unwrap_or_default(),
+                "encryption_key": agent.encryption_key.is_some(),
                 "engine": engine,
                 "last_active": last_active,
                 "runs": runs,
@@ -916,6 +920,98 @@ async fn suggest(
         .map_err(|e| internal(e.into()))?;
     std::io::Write::write_all(&mut file, entry.as_bytes()).map_err(|e| internal(e.into()))?;
     Ok(StatusCode::CREATED)
+}
+
+/// GET /api/secrets — the stored secrets, never their values. Enough for the
+/// form to list what exists and what setting a name again would overwrite.
+async fn secrets_list(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Vec<Value>>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let summaries = ferryman_channel::secrets::list_secrets(&route).map_err(internal)?;
+    let items = summaries
+        .iter()
+        .map(|s| {
+            json!({
+                "name": &s.name,
+                "recipients": &s.recipients,
+                "signed_by": &s.signed_by,
+                "created_at": &s.created_at,
+                "signature": s.signature,
+            })
+        })
+        .collect();
+    Ok(Json(items))
+}
+
+/// POST /api/secrets — seal a value to the chosen recipients, signed by the
+/// session's operator identity. The value is sealed in memory and written as
+/// ciphertext; it is never logged and never leaves the request as plaintext.
+#[derive(Deserialize)]
+struct SecretBody {
+    name: String,
+    value: String,
+    #[serde(default)]
+    recipients: Vec<String>,
+}
+
+async fn secret_set(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<SecretBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    // The seal is signed by the human who signed in - an operator identity the
+    // roster verifies - never by the machine's agent, and never unsigned.
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let recipients: Vec<String> = body
+        .recipients
+        .iter()
+        .map(|r| ferryman_channel::canonical_agent_name(r))
+        .collect();
+    let path = ferryman_channel::secrets::set_secret(
+        &state.route,
+        &identity,
+        &body.name,
+        &body.value,
+        &recipients,
+    )
+    .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({
+        "name": body.name,
+        "recipients": recipients,
+        "signed_by": identity.name(),
+        "path": path.display().to_string(),
+    })))
+}
+
+/// DELETE /api/secrets/{name} — remove a secret envelope.
+async fn secret_remove(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    // Removing is a write and must be attributable the same way setting is.
+    if state.sessions.resolve(session_token(&headers)).is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "no active session; sign in again".to_string(),
+        ));
+    }
+    if ferryman_channel::secrets::remove_secret(&state.route, &name).map_err(internal)? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err((StatusCode::NOT_FOUND, "no such secret".to_string()))
+    }
 }
 
 /// A short, still-identifiable prefix of a public key for display.
@@ -1750,12 +1846,14 @@ mod tests {
             role: "worker".into(),
             capabilities: Vec::new(),
             public_key: Some(alice.public_key_hex()),
+            encryption_key: None,
         });
         route.agents.push(AgentRoute {
             name: "reviewer".into(),
             role: "master".into(),
             capabilities: Vec::new(),
             public_key: Some(reviewer.public_key_hex()),
+            encryption_key: None,
         });
         let route = Arc::new(route);
 
@@ -1821,6 +1919,51 @@ mod tests {
             task.reviews[0].signature.is_some(),
             "the verdict must be signed"
         );
+    }
+
+    /// Setting a secret from the dashboard is signed by the operator, not the
+    /// machine, and lands in the project's channel as ciphertext.
+    #[tokio::test]
+    async fn secret_set_is_signed_by_the_operator_and_written_to_the_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = test_route(dir.path());
+        std::fs::create_dir_all(route.communications.join("agents")).unwrap();
+        // A recipient agent with a published encryption key.
+        let recipient = ferryman_channel::secrets::EncryptionIdentity::from_seed("beastly", [1_u8; 32]);
+        let roster = AgentRoute {
+            name: "beastly".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: None,
+            encryption_key: Some(recipient.public_key_hex()),
+        };
+        std::fs::write(
+            route.communications.join("agents").join("beastly.json"),
+            serde_json::to_vec_pretty(&roster).unwrap(),
+        )
+        .unwrap();
+        let route = Arc::new(route);
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let denied = post(&app, "/api/secrets", r#"{"name":"GH_TOKEN","value":"x","recipients":["beastly"]}"#, None).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let created = post(&app, "/api/secrets", r#"{"name":"GH_TOKEN","value":"ghp_secret","recipients":["beastly"]}"#, Some(&token)).await;
+        assert_eq!(created.status(), StatusCode::OK, "body: {:?}", {
+            let body = created.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8_lossy(&body).to_string()
+        });
+
+        let path = route.communications.join("secrets").join("GH_TOKEN.json");
+        assert!(path.is_file(), "envelope must be written to the channel");
+        let envelope: ferryman_channel::secrets::SecretEnvelope =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(envelope.signed_by.as_deref(), Some("alice"));
+        // The value never appears in the envelope.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("ghp_secret"), "value leaked into the channel");
     }
 
     #[test]

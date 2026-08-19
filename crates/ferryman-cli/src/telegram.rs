@@ -16,6 +16,15 @@
 //! Telegram authenticates `from.id` server-side, so it is the one field in an update that a
 //! stranger cannot forge - but it is only meaningful if something checks it, and a bridge
 //! that starts with the check unset would take orders from whoever finds the bot.
+//!
+//! # What never goes through here
+//!
+//! A Telegram chat is not end-to-end encrypted: a token typed there lives on
+//! Telegram's servers and syncs to every device signed into that account. Orders
+//! are fine to leak; a credential is not. So this bridge never accepts, carries,
+//! or echoes a secret. Set them in the dashboard (`ferry dashboard`, Secrets tab)
+//! or with `ferry channel secret set`, which seal them to the specific machines
+//! that should receive them before they leave the one that typed them.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;

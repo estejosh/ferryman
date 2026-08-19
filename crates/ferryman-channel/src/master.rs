@@ -164,6 +164,7 @@ pub fn transfer_master(
         role: "master".to_owned(),
         capabilities: Vec::new(),
         public_key: Some(current.public_key_hex()),
+        encryption_key: None,
     };
     if check_signature(
         existing.signed_by.as_ref(),
@@ -389,6 +390,7 @@ mod tests {
             role: "master".into(),
             capabilities: Vec::new(),
             public_key: Some(alice.public_key_hex()),
+            encryption_key: None,
         }];
         initialize_master(&route, &alice, "alice").unwrap();
 
@@ -422,6 +424,7 @@ mod tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }];
 
         let declaration = initialize_master(&route, &identity, "johnny").unwrap();
@@ -447,6 +450,7 @@ mod tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }];
 
         initialize_master(&route, &identity, "johnny").unwrap();
@@ -473,6 +477,7 @@ mod tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(johnny.public_key_hex()),
+            encryption_key: None,
         }];
 
         initialize_master(&route, &johnny, "johnny").unwrap();
@@ -502,12 +507,14 @@ mod tests {
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(johnny.public_key_hex()),
+                encryption_key: None,
             },
             AgentRoute {
                 name: "bob".into(),
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(bob.public_key_hex()),
+                encryption_key: None,
             },
         ];
 

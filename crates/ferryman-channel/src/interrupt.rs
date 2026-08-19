@@ -229,6 +229,7 @@ mod tests {
             role: "operator".into(),
             capabilities: Vec::new(),
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }];
         let mut interrupt = Interrupt {
             order_id: "t-1".into(),
@@ -279,6 +280,7 @@ mod tests {
             role: "operator".into(),
             capabilities: Vec::new(),
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }];
         let task = crate::task_dir(&route, "t-1");
         std::fs::create_dir_all(&task).unwrap();
@@ -330,6 +332,7 @@ mod tests {
             role: "worker".into(),
             capabilities: Vec::new(),
             public_key: Some(mallory.public_key_hex()),
+            encryption_key: None,
         }];
         let mut interrupt = Interrupt {
             order_id: "t-1".into(),
@@ -370,6 +373,7 @@ mod tests {
             role: "operator".into(),
             capabilities: Vec::new(),
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }];
         let mut interrupt = Interrupt {
             order_id: "t-1".into(),

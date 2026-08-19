@@ -848,6 +848,49 @@ enum Channel {
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
     },
+    /// Set, list and remove sealed secrets.
+    ///
+    /// The dashboard form is the normal way a human does this; these commands are
+    /// the thing the form calls, and exist for scripts and machines with no
+    /// browser. A value is read from the terminal or stdin, never from argv.
+    Secret {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum SecretCommand {
+    /// Seal a value to one or more recipients and write the signed envelope
+    /// into this project's channel. Reads the value from the terminal, or from
+    /// stdin when piped - never from argv.
+    Set {
+        /// The secret name, e.g. GH_TOKEN.
+        name: String,
+        /// Comma-separated recipients (agents with a published encryption key).
+        #[arg(long)]
+        to: String,
+        /// Sign as this roster identity. Defaults to this machine's agent; pass
+        /// your operator name to be on the record as a person.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
+    /// List secret names, recipients, who sealed each, and when - never values.
+    List,
+    /// Decrypt and print one secret's value, for debugging or scripts. Refuses
+    /// if this machine's agent is not a recipient.
+    Get {
+        /// The secret name.
+        name: String,
+    },
+    /// Remove a secret envelope. The copies already synced remain, so the real
+    /// way to revoke a value is to rotate it and re-seal.
+    Rm {
+        /// The secret name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -3575,6 +3618,89 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Resul
     bail!("no prompt given; use --prompt, --prompt-file, or pipe one in on stdin")
 }
 
+fn read_secret_value(name: &str) -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        let value = rpassword::prompt_password(format!("secret value for '{name}': "))?;
+        if value.is_empty() {
+            bail!("a secret value cannot be empty");
+        }
+        return Ok(value);
+    }
+    use std::io::Read;
+    let mut value = String::new();
+    std::io::stdin().read_to_string(&mut value)?;
+    let value = value.trim_end_matches(['\n', '\r']).to_string();
+    if value.is_empty() {
+        bail!("a secret value cannot be empty");
+    }
+    Ok(value)
+}
+
+fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand) -> Result<()> {
+    match command {
+        SecretCommand::Set { name, to, signer } => {
+            let signer_name = match signer {
+                Some(s) => s,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            // Signing is not optional for a secret: an unsigned envelope is a
+            // forged one. `signing_identity` refuses when this machine cannot
+            // sign as the named identity rather than silently downgrading.
+            let identity = signing_identity(route, &signer_name)?;
+            let value = read_secret_value(&name)?;
+            let recipients: Vec<String> = to
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            let path =
+                ferryman_channel::secrets::set_secret(route, &identity, &name, &value, &recipients)?;
+            println!("sealed '{name}' for {} recipient(s)", recipients.len());
+            println!("  written to {}", path.display());
+            println!("  signed by '{signer_name}'");
+        }
+        SecretCommand::List => {
+            let summaries = ferryman_channel::secrets::list_secrets(route)?;
+            if summaries.is_empty() {
+                println!("no secrets in this channel");
+                return Ok(());
+            }
+            for s in summaries {
+                println!(
+                    "{:<24} -> {}  [{}]  by {}  {}",
+                    s.name,
+                    s.recipients.join(","),
+                    s.signature,
+                    s.signed_by.as_deref().unwrap_or("nobody"),
+                    s.created_at
+                );
+            }
+        }
+        SecretCommand::Get { name } => {
+            let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let Some(identity) =
+                ferryman_channel::secrets::EncryptionIdentity::load_existing(&agent, &route.attachment)?
+            else {
+                bail!(
+                    "this machine's agent ('{agent}') has no encryption key; \
+                     run 'ferry channel join' on this machine first"
+                );
+            };
+            let value = ferryman_channel::secrets::open_secret(route, &name, &identity)?;
+            println!("{value}");
+        }
+        SecretCommand::Rm { name } => {
+            if ferryman_channel::secrets::remove_secret(route, &name)? {
+                println!("removed secret '{name}'");
+            } else {
+                println!("no secret named '{name}'");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn channel(command: Channel) -> Result<()> {
     let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
@@ -3585,6 +3711,10 @@ fn channel(command: Channel) -> Result<()> {
     };
 
     match command {
+        Channel::Secret { workspace, command } => {
+            let route = here(workspace)?;
+            secret_command(&route, command)?;
+        }
         Channel::Status { workspace } => {
             let route = here(workspace)?;
             let (outbox, acknowledgements, oldest, quarantined) =
@@ -3634,8 +3764,16 @@ fn channel(command: Channel) -> Result<()> {
             mcp,
         } => {
             let route = here(workspace)?;
+            let agent_name = ferryman_ops::identity::resolve(name, &route.attachment)?;
+            // The encryption key is the recipient half of sealed secrets: X25519,
+            // kept beside the signing key, never synced. Generated at join so this
+            // machine can be a recipient the moment it is registered.
+            let encryption = ferryman_channel::secrets::EncryptionIdentity::load_or_create(
+                &agent_name,
+                &route.attachment,
+            )?;
             let agent = ferryman_channel::AgentRoute {
-                name: ferryman_ops::identity::resolve(name, &route.attachment)?,
+                name: agent_name,
                 role,
                 capabilities: {
                     let mut caps: Vec<String> = capabilities
@@ -3654,6 +3792,7 @@ fn channel(command: Channel) -> Result<()> {
                     caps
                 },
                 public_key: None,
+                encryption_key: Some(encryption.public_key_hex()),
             };
             // The private key is created here and stays in the attachment, which is
             // machine-local and outside the folder Syncthing carries. Only the public

@@ -177,6 +177,7 @@ button.primary:hover{box-shadow:0 3px 12px rgba(79,156,249,.35)}
     <button data-tab="ledger">Ledger</button>
     <button data-tab="learnings">Learnings</button>
     <button data-tab="memory">Memory</button>
+    <button data-tab="secrets">Secrets</button>
   </nav>
   <section id="tab-fleet" class="tab">
     <div class="section-title">Machines on the network</div>
@@ -231,6 +232,21 @@ button.primary:hover{box-shadow:0 3px 12px rgba(79,156,249,.35)}
       <textarea id="suggest-text" placeholder="Suggest an improvement to the project's memory…"></textarea>
       <div class="review-actions"><button id="suggest-submit" class="primary">submit suggestion</button><span class="muted" id="suggest-status"></span></div>
     </div>
+  </section>
+  <section id="tab-secrets" class="tab">
+    <div class="section-title">Set a secret</div>
+    <div class="detail">
+      <p class="muted">A secret is set once, here, and sealed to the machines you pick. The value is encrypted before it is written, signed by your operator identity, and never travels through the Telegram bridge.</p>
+      <div class="filters">
+        <input id="secret-name" type="text" placeholder="name, e.g. GH_TOKEN">
+        <input id="secret-value" type="password" placeholder="value" autocomplete="off">
+      </div>
+      <div class="section-title">Recipients</div>
+      <div id="secret-recipients" class="filters"></div>
+      <div class="review-actions"><button id="secret-submit" class="primary">set secret</button><span class="muted" id="secret-status"></span></div>
+    </div>
+    <div class="section-title">Stored secrets</div>
+    <table><thead><tr><th>name</th><th>recipients</th><th>signed by</th><th>signature</th><th>created</th><th></th></tr></thead><tbody id="secrets-body"></tbody></table>
   </section>
 </main>
 <div id="login-overlay" style="display:none">
@@ -393,7 +409,16 @@ function showGraphTip(id){
 function hideGraphTip(){document.getElementById('graph-tip').style.display='none';}
 function renderLedger(d){document.getElementById('ledger-body').innerHTML=(d.entries||[]).map(e=>'<tr><td class="muted mono">'+esc((e.at||'').replace('T',' ').slice(0,19))+'</td><td>'+esc(e.kind)+'</td><td class="mono">'+esc(e.actor)+'</td><td>'+esc(e.summary)+'</td><td class="muted mono">'+esc(e.reference||'')+'</td></tr>').join('')||'<tr><td colspan="5"><div class="empty">No ledger entries yet — they appear as work is issued and reviewed.</div></td></tr>';}
 function renderLearnings(l){document.getElementById('learnings-body').innerHTML=l.map(x=>'<tr><td class="muted mono">'+esc((x.at||'').replace('T',' ').slice(0,19))+'</td><td class="mono">'+esc(x.engine)+'</td><td class="mono">'+esc(x.task_id)+'</td><td>'+esc(x.source)+'</td><td>'+(x.accepted?'<span class="badge ok">ok</span>':'<span class="badge bad">no</span>')+'</td><td class="muted">'+esc(x.note||'')+'</td></tr>').join('')||'<tr><td colspan="6"><div class="empty">Nothing learned yet — learnings appear when agents record what worked.</div></td></tr>';}
-async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j(qs('/api/tasks'));renderKpis();renderTasks();renderMachines(await j(qs('/api/roster')));renderFleet(await j('/api/fleet'));renderMemory(await j('/api/memory'));renderEngines(await j(qs('/api/stats')));renderLedger(await j(qs('/api/ledger')));renderLearnings(await j(qs('/api/learnings')));document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
+async function refresh(){try{if(!window.__dash.readonly&&session){if(!(await checkSession())){doSignout();return;}document.getElementById('who').textContent='signed in as '+operator;document.getElementById('signout').style.display='';}tasks=await j(qs('/api/tasks'));renderKpis();renderTasks();const machines=await j(qs('/api/roster'));renderMachines(machines);renderFleet(await j('/api/fleet'));renderMemory(await j('/api/memory'));renderEngines(await j(qs('/api/stats')));renderLedger(await j(qs('/api/ledger')));renderLearnings(await j(qs('/api/learnings')));renderSecrets(await j(qs('/api/secrets')),machines);document.getElementById('updated').textContent='updated '+new Date().toLocaleTimeString();}catch(e){console.error(e);}}
+function renderSecrets(list,machines){
+  const recEl=document.getElementById('secret-recipients');
+  if(recEl){recEl.innerHTML=(machines||[]).filter(m=>m.encryption_key).map(m=>'<label class="switch"><input type="checkbox" class="secret-recipient" value="'+esc(m.name)+'">'+esc(m.name)+'</label>').join('')||'<span class="muted">No machines with an encryption key yet — a machine gets one when it runs <code>ferry enable</code> or <code>ferry channel join</code>.</span>';}
+  document.getElementById('secrets-body').innerHTML=(list||[]).map(s=>'<tr><td class="mono">'+esc(s.name)+'</td><td>'+esc((s.recipients||[]).join(', '))+'</td><td>'+esc(s.signed_by||'—')+'</td><td>'+sigBadge(s.signature)+'</td><td class="muted">'+esc((s.created_at||'').replace('T',' ').slice(0,19))+'</td><td><button class="secret-rm" data-name="'+esc(s.name)+'">remove</button></td></tr>').join('')||'<tr><td colspan="6"><div class="empty">No secrets yet. Set one above and it will sync to the machines you pick.</div></td></tr>';
+  document.querySelectorAll('#secrets-body .secret-rm').forEach(b=>b.onclick=()=>doRemoveSecret(b.dataset.name));
+}
+async function doRemoveSecret(name){
+  try{const r=await fetch('/api/secrets/'+encodeURIComponent(name),{method:'DELETE',headers:{'x-ferryman-dashboard-token':session||''}});if(r.status===401){doSignout();return;}if(r.ok){refresh();}else{alert('remove failed: '+await r.text());}}catch(e){alert('remove failed: '+e);}
+}
 async function auth(mode,name,password,setup){const h={'content-type':'application/json'};
 // Creating an operator is authorised one of two ways, and which one is not the page's
 // business: it sends both whatever it has. The setup token covers the first operator
@@ -406,6 +431,8 @@ async function checkSession(){if(!session)return false;try{const r=await fetch('
 function doSignout(){session=null;operator=null;sessionStorage.removeItem('ferry-dash-token');document.getElementById('signout').style.display='none';document.getElementById('who').textContent='';if(!window.__dash.readonly)showLogin(window.__dash.anyOperators?'login':'create');}
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.getElementById('tab-'+b.dataset.tab).classList.add('active');});
 document.getElementById('refresh').onclick=refresh;document.getElementById('signout').onclick=doSignout;document.getElementById('suggest-submit').onclick=async()=>{const text=document.getElementById('suggest-text').value.trim(),status=document.getElementById('suggest-status');if(!text){status.textContent='type something first';return;}try{const r=await fetch('/api/memory/suggest',{method:'POST',headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},body:JSON.stringify({text})});if(r.ok){document.getElementById('suggest-text').value='';status.textContent='suggestion recorded';refresh();}else{status.textContent='failed: '+await r.text();}}catch(e){status.textContent='failed: '+e;}};document.getElementById('back').onclick=()=>setProject(null);document.getElementById('zoomin').onclick=()=>graphZoomBy(1.3);document.getElementById('zoomout').onclick=()=>graphZoomBy(0.77);document.getElementById('reset').onclick=resetGraph;document.getElementById('fontminus').onclick=()=>graphFontBy(-1);document.getElementById('fontplus').onclick=()=>graphFontBy(1);document.getElementById('fullscreen').onclick=()=>{const p=document.getElementById('graph-panel');document.fullscreenElement?document.exitFullscreen():p.requestFullscreen&&p.requestFullscreen();};document.getElementById('maximize').onclick=()=>{const p=document.getElementById('graph-panel');p.classList.toggle('maximized');document.getElementById('maximize').textContent=p.classList.contains('maximized')?'⤡':'⤢';};attachGraphPan();document.getElementById('auth-submit').onclick=doAuth;document.getElementById('auth-toggle').onclick=()=>showLogin(authMode==='login'?'create':'login');
+document.getElementById('secret-submit').onclick=async()=>{const name=document.getElementById('secret-name').value.trim(),value=document.getElementById('secret-value').value,st=document.getElementById('secret-status'),recipients=[...document.querySelectorAll('.secret-recipient:checked')].map(c=>c.value);if(!name){st.textContent='give the secret a name';return;}if(!value){st.textContent='give it a value';return;}if(!recipients.length){st.textContent='pick at least one recipient';return;}if(window.__dash.readonly){st.textContent='dashboard is read-only';return;}try{const r=await fetch('/api/secrets',{method:'POST',headers:{'content-type':'application/json','x-ferryman-dashboard-token':session||''},body:JSON.stringify({name,value,recipients})});if(r.ok){document.getElementById('secret-value').value='';st.textContent='secret set';refresh();}else if(r.status===401){doSignout();}else{st.textContent='failed: '+await r.text();}}catch(e){st.textContent='failed: '+e;}};
+
 const onEnter=e=>{if(e.key==='Enter')doAuth();};document.getElementById('auth-name').addEventListener('keydown',onEnter);document.getElementById('auth-password').addEventListener('keydown',onEnter);
 document.getElementById('search').oninput=renderTasks;document.getElementById('statefilter').onchange=renderTasks;
 document.addEventListener('keydown',e=>{if(e.key==='/'&&!/^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement.tagName)){e.preventDefault();document.getElementById('search').focus();}});
