@@ -162,6 +162,12 @@ syncs.
 It writes the same signed artifacts `ferry channel order` writes, so it is not a
 second control plane. Stop it and the fleet does not notice.
 
+**Do not send secrets through it.** A Telegram cloud chat is not end-to-end encrypted, so a
+token typed into one is stored on Telegram's servers and syncs to every device signed into
+that account — and stays in that history indefinitely. Orders are meant to be shared; a
+credential is not. Nothing in the code can tell the difference between a task and a token,
+so this one is on you.
+
 ## Documentation
 
 | Guide | What it covers |

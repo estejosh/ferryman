@@ -10,6 +10,19 @@
 //! other reader does - so a bridge that dies loses nothing but its own notifications, and a
 //! fleet that never sees one behaves identically.
 //!
+//! # Not a path for secrets
+//!
+//! Orders, yes. Credentials, never. A Telegram cloud chat is not end-to-end encrypted: a
+//! token typed into one is stored on Telegram's servers and syncs to every device signed
+//! into that account, and it stays in that history long after whoever sent it has forgotten.
+//! Losing an order to a leak costs nothing - it was going into a shared folder anyway.
+//! Losing a repository token costs the repository.
+//!
+//! So the bridge carries instructions and results, and secrets travel by a path that is
+//! encrypted to a specific recipient. This is a rule about what to send, not something the
+//! code can enforce - it cannot tell a task from a token - which is exactly why it is
+//! written down here and in the README rather than left to be worked out later.
+//!
 //! # Authorization
 //!
 //! One numeric Telegram user id may command it, and the bridge refuses to start without one.
