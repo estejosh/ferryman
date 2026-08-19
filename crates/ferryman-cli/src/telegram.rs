@@ -177,6 +177,20 @@ struct TgMessage {
     from: Option<TgUser>,
     #[serde(default)]
     text: Option<String>,
+    /// Which chat it arrived in. A bridge that only knows its configured chat answers a
+    /// group in a private message, which is how you end up talking past someone.
+    #[serde(default)]
+    chat: Option<TgChat>,
+    /// The forum topic, in a group that has them. Absent in a private chat and in a
+    /// group's General topic. A reply without it lands in General rather than in the
+    /// conversation it belongs to.
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TgChat {
+    id: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -192,14 +206,31 @@ struct Chat {
 }
 
 impl Chat {
+    /// Send to the configured chat. For anything the bridge says on its own initiative -
+    /// the greeting, a result arriving - because there is no incoming message to answer.
     async fn send(&self, text: &str) -> Result<()> {
+        self.send_to(self.chat_id, None, text).await
+    }
+
+    /// Answer where the question was asked.
+    ///
+    /// The bridge used to reply only to the chat it was configured with, so a message sent
+    /// in a group was answered in a private chat, and the group looked like it was being
+    /// ignored. `message_thread_id` carries the same rule one level down: in a group with
+    /// forum topics, omitting it drops the reply into General instead of the topic the
+    /// conversation is in.
+    async fn send_to(&self, chat_id: i64, thread: Option<i64>, text: &str) -> Result<()> {
+        let mut body = json!({ "chat_id": chat_id, "text": excerpt(text, 3900) });
+        if let Some(thread) = thread {
+            body["message_thread_id"] = json!(thread);
+        }
         let response = self
             .http
             .post(format!(
                 "https://api.telegram.org/bot{}/sendMessage",
                 self.token
             ))
-            .json(&json!({ "chat_id": self.chat_id, "text": excerpt(text, 3900) }))
+            .json(&body)
             .send()
             .await
             .context("send a Telegram message")?;
@@ -431,7 +462,13 @@ async fn handle(
             }
         }
     };
-    if let Err(error) = chat.send(&reply).await {
+    // Answer in the chat and topic the message came from, falling back to the configured
+    // chat only when Telegram did not tell us where it was.
+    let where_from = message.chat.as_ref().map_or(chat.chat_id, |c| c.id);
+    if let Err(error) = chat
+        .send_to(where_from, message.message_thread_id, &reply)
+        .await
+    {
         eprintln!("telegram: could not reply: {error}");
     }
 }
