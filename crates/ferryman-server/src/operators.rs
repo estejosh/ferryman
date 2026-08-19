@@ -102,6 +102,7 @@ pub fn create_operator_identity_scoped(
         // exists to be told things could not be told anything.
         capabilities: vec!["messages.receive".to_string()],
         public_key: Some(identity.public_key_hex()),
+        encryption_key: None,
     };
     // Publish the public key to the roster so the fleet can verify this
     // operator's signatures. If publication fails, remove the just-written

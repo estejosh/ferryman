@@ -97,7 +97,8 @@ Two consequences worth caring about:
 - **A master, grants, and short-lived lease tokens.** Authority is explicit,
   signed, and expiring — a leaked worker credential stops working on its own.
 - **A web dashboard** to watch tasks, ledger, cost and learnings, and to
-  approve or send work back from a browser.
+  approve or send work back from a browser — and to set secrets once, sealed to
+  exactly the machines that should receive them.
 - **Recovery you can rehearse.** Encrypted continuity packs, and a drill command
   that proves you can come back from a wiped machine.
 - **Opt-in sandboxing.** Run each worker inside a fresh podman or docker
@@ -174,11 +175,15 @@ syncs.
 It writes the same signed artifacts `ferry channel order` writes, so it is not a
 second control plane. Stop it and the fleet does not notice.
 
-**Do not send secrets through it.** A Telegram cloud chat is not end-to-end encrypted, so a
-token typed into one is stored on Telegram's servers and syncs to every device signed into
-that account — and stays in that history indefinitely. Orders are meant to be shared; a
-credential is not. Nothing in the code can tell the difference between a task and a token,
-so this one is on you.
+**Never type a credential into it.** A Telegram cloud chat is not end-to-end encrypted, so a
+token typed into one is stored on Telegram's servers, syncs to every device signed into that
+account, and stays in that history indefinitely. Nothing in the code can tell a task from a
+token, so this one is on you.
+
+Secrets themselves are meant to move — that is what sealing is for. Set them with
+`ferry channel secret set`, or in the dashboard, and they are encrypted to the specific
+machines that should receive them before they ever leave the machine that typed them. What
+must not travel is the plaintext, and the bridge is the one path that cannot carry ciphertext.
 
 ## Documentation
 

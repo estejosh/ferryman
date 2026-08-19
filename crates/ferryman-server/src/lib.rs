@@ -623,6 +623,7 @@ fn registered_communication_participants(
             role: agent.role,
             capabilities: Vec::new(),
             public_key: None,
+            encryption_key: None,
         })
         .collect::<Vec<_>>();
     participants.extend(
@@ -635,6 +636,7 @@ fn registered_communication_participants(
                 role: "worker".into(),
                 capabilities: worker.capabilities,
                 public_key: None,
+                encryption_key: None,
             }),
     );
     Ok(participants)
@@ -692,6 +694,7 @@ async fn configure_communications(
             role: "project".into(),
             capabilities: vec!["messages.receive".into()],
             public_key: None,
+            encryption_key: None,
         });
     }
     let route = communications::ProjectRoute {

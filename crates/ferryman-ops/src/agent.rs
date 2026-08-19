@@ -2345,11 +2345,21 @@ async fn do_work(
         );
     }
     // Operator-listed credentials are the only secrets the agent CLI receives.
-    let credentials: Vec<(String, String)> =
-        ferryman_channel::credentials::load_credentials(&route.attachment)
-            .unwrap_or_default()
+    // A value of `secret:<name>` is resolved here, in the worker, before the
+    // agent CLI ever runs: the decrypted value is injected like any other
+    // credential, and a reference this machine cannot decrypt fails loudly
+    // rather than reaching the engine as an empty or literal string.
+    let credentials: Vec<(String, String)> = {
+        let loaded = ferryman_channel::credentials::load_credentials(&route.attachment)
+            .unwrap_or_default();
+        let encryption = ferryman_channel::secrets::EncryptionIdentity::load_existing(
+            &config.agent,
+            &route.attachment,
+        )?;
+        ferryman_channel::secrets::resolve_credentials(route, loaded, encryption.as_ref())?
             .into_iter()
-            .collect();
+            .collect()
+    };
     if config.mcp {
         std::fs::write(workdir.join(".mcp.json"), gateway_config(&route.workspace))
             .context("write .mcp.json for the agent's MCP access")?;
