@@ -83,6 +83,58 @@ access to the repository can replace them. That is the specific thing to beat.
 
 ---
 
+## The bridge should answer like a person, not a form
+
+**Next, after secrets.** Message the fleet from a phone today and you get a receipt:
+`issued tg-4821 to grouchly`. Ask the same thing at a desk, of something that can think, and
+you get an answer — it works out what you meant, says who should do it and why, tells you
+what it found, and asks when the request is ambiguous rather than guessing.
+
+The gap is not politeness. A receipt makes the operator do the reasoning: which machine
+should have this, is this the same as the thing I asked yesterday, did that other task ever
+finish, is this even worth doing. All of that is knowable from the channel, and none of it
+is in the reply.
+
+Two capabilities, and they are the same feature approached from opposite ends:
+
+**Routing.** `--default-to` fixes the worst of it — before it, an unaddressed message went
+to whichever machine polled fastest, which in a mixed fleet reliably means the most
+expensive one. But a fixed default is still not a decision. Who *should* do this depends on
+what it is, what each machine is good at, what they cost to run, what they are already
+doing, and whether one of them has done something similar before. The channel knows all of
+that: roles and specialisations in the roster, cost per engine, live task states, and a
+learning database of which engine wins on this project.
+
+**Conversation.** The bridge is a channel client with no engine behind it, which is why it
+is free and why it cannot think. Putting an orchestrator between the phone and the fleet —
+an agent whose task is "handle this request" and which can read the channel, dispatch work,
+and reply — closes the gap. It is the same shape as any other Ferryman task, with the
+operator's chat as its input and its output.
+
+**What it costs, honestly:**
+
+- **An engine run per message.** Today a bridge costs nothing. This makes every "so?" a
+  billable thought. It belongs on the cheap machine, and obvious commands — `/status`,
+  `/agents` — should keep answering directly without waking a model.
+- **Latency.** A chat reply that takes ninety seconds is a bad chat. Acknowledge
+  immediately, answer properly when it lands. That is what a person does.
+- **Memory.** This is the real work. A desk conversation carries context; each chat message
+  arrives alone. Loading the memory bank and recent channel state gets most of the way, but
+  genuine continuity across messages needs a thread the orchestrator can read and append to,
+  and that does not exist yet.
+- **A new trust boundary, and the sharpest one here.** An agent that turns chat into orders
+  is a confused deputy waiting to happen. Checking `from.id` proves *who sent the message*
+  and nothing about what it says. If the orchestrator then reads a document, an issue
+  tracker, or another agent's result, instructions embedded in that content must never be
+  able to dispatch work — the operator's message is the instruction, everything else is
+  data. Ferryman already refuses to act on orders whose signatures do not verify; the same
+  discipline has to extend to text that merely *looks* like an instruction.
+
+**The measure:** the operator should be able to ask "so?" and get something worth reading.
+If the reply is a receipt, this is not done.
+
+---
+
 ## A sovereign password manager
 
 **Later, and only after the above has been audited.** The interesting version of the idea:
