@@ -53,14 +53,18 @@ workspace = "ferryman-ferryman"
 # thread: not created yet
 ```
 
-Fill in `group`, start it again, and it creates a topic per project and writes each id back
-into the file. That is the whole setup.
+Start it again and it says it does not know which group to use yet. Say anything in your
+group. That message is how it learns the id - Telegram does not show chat ids anywhere in
+the app, and it can see the number for itself the moment someone types. It writes the id
+into the map, creates a topic per project, writes each thread id back, and starts serving.
+
+That is the whole setup: add the bot, run it, say hello.
 
 ## The fields
 
 | Field | Where | Means |
 | --- | --- | --- |
-| `group` | top | The forum group's chat id. Negative, begins `-100`. |
+| `group` | top | The forum group's chat id. Negative, begins `-100`. Ferryman fills this in the first time you speak to it in the group. |
 | `default_to` | top | The machine an unaddressed order goes to, fleet-wide. |
 | `name` | `[[topic]]` | What the topic is called in Telegram. |
 | `workspace` | `[[topic]]` | The project. Relative paths resolve against the map's own folder, so the same file works on two machines that lay their channels out the same way. |

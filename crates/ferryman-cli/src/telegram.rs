@@ -419,9 +419,9 @@ pub async fn bridge(
                 starter.save(&path)?;
                 bail!(
                     "wrote a starter map at {} listing {} channel{} found in {}.\n\n\
-                     Add your bot to the Telegram group as an administrator with \"Manage \
-                     topics\", put the group's chat id in the file as `group = ...`, and start \
-                     me again - I will create a topic for each one and write down its id.",
+                     Add your bot to your Telegram group as an administrator with \"Manage \
+                     topics\", turn Topics on in the group's settings, and start me again. \
+                     Say anything in the group and I will take it from there.",
                     path.display(),
                     starter.topics.len(),
                     if starter.topics.len() == 1 { "" } else { "s" },
@@ -450,19 +450,42 @@ async fn group_bridge(
 ) -> Result<()> {
     let mut map = crate::tgmap::TopicMap::load(map_path)?;
     let base = map_path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    let Some(group) = map.group else {
-        bail!(
-            "{} does not say which group to use. Add the bot to your Telegram group as an \
-             administrator with \"Manage topics\", then put the group's chat id (negative, \
-             starting -100) in the file as `group = ...`",
-            map_path.display()
-        )
+    let cursor_file = cursor_path(&base);
+    let mut cursor: Cursor = match std::fs::read_to_string(&cursor_file) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => Cursor::default(),
+    };
+    let known_group = map.group.is_some();
+    let group = match map.group {
+        Some(group) => group,
+        None => {
+            let mut chat = Chat {
+                http: http.clone(),
+                token: token.clone(),
+                // Nothing to answer in yet, so anything said before the group is known goes
+                // to the operator directly.
+                chat_id: approver,
+            };
+            let group = learn_group(&chat, approver, &mut cursor, &cursor_file).await?;
+            map.group = Some(group);
+            map.save(map_path)?;
+            chat.chat_id = group;
+            group
+        }
     };
     let chat = Chat {
         http,
         token,
         chat_id: group,
     };
+    if !known_group {
+        chat.send(&format!(
+            "Got it - this group is {group}, written into {}.",
+            crate::tgmap::FILE
+        ))
+        .await
+        .ok();
+    }
 
     // Build out the group to match the file. Saved after each one: an id Telegram has
     // handed out and Ferryman has not written down belongs to a topic nothing can ever
@@ -520,21 +543,15 @@ async fn group_bridge(
         );
     }
 
-    let cursor_file = cursor_path(&base);
-    let mut cursor: Cursor = match std::fs::read_to_string(&cursor_file) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => {
-            // Nothing has been polled from this map before, so say hello where the
-            // operator will see it - and say what was built, since a topic appearing in a
-            // group with no explanation is alarming rather than useful.
-            let hello = group_opening(&desks, &created);
-            let general = desks.iter().find(|desk| desk.thread.is_none());
-            chat.send_to(group, general.and_then(|desk| desk.thread), &hello)
-                .await
-                .ok();
-            Cursor::default()
-        }
-    };
+    if !known_group || !created.is_empty() {
+        // A topic appearing in a group with no explanation is alarming rather than useful,
+        // and a bridge that has just built the place should say what it built.
+        let hello = group_opening(&desks, &created);
+        let general = desks.iter().find(|desk| desk.thread.is_none());
+        chat.send_to(group, general.and_then(|desk| desk.thread), &hello)
+            .await
+            .ok();
+    }
 
     println!("telegram bridge: {} desks in group {group}", desks.len());
     for desk in &desks {
@@ -551,6 +568,67 @@ async fn group_bridge(
     }
 
     serve(&chat, &mut desks, approver, &mut cursor, &cursor_file).await
+}
+
+/// Wait to be spoken to, and take the group's id from the message.
+///
+/// A chat id is not something a person has. Telegram does not show it anywhere in the app,
+/// and the usual answer - "ask @userinfobot, then paste the number into a config file" - is
+/// three steps of clerical work to tell a program something it can see for itself the
+/// moment anyone types in the group.
+///
+/// So it watches instead. The first message from the approver in a group becomes the
+/// group, and is written into the map. A message in a private chat is not: the whole point
+/// of the map is topics, and a private chat has none, so it says so and keeps waiting
+/// rather than wiring itself to the wrong place and being hard to unpick later.
+async fn learn_group(
+    chat: &Chat,
+    approver: i64,
+    cursor: &mut Cursor,
+    cursor_file: &Path,
+) -> Result<i64> {
+    println!("telegram: waiting to be added - say anything in the group you want me to use");
+    chat.send(
+        "I do not know which group to use yet. Say anything in the group you want me to \
+         work in, and I will take it from there.\n\nI need to be an administrator there \
+         with \"Manage topics\", and the group needs Topics turned on.",
+    )
+    .await
+    .ok();
+    loop {
+        let updates = match chat.updates(cursor.offset).await {
+            Ok(updates) => updates,
+            Err(error) => {
+                eprintln!("telegram: {error}; retrying");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+        for update in updates {
+            cursor.offset = cursor.offset.max(update.update_id + 1);
+            write_cursor(cursor_file, cursor)?;
+            let Some(message) = update.message else {
+                continue;
+            };
+            if message.from.as_ref().map(|user| user.id) != Some(approver) {
+                continue;
+            }
+            let Some(chat_id) = message.chat.as_ref().map(|c| c.id) else {
+                continue;
+            };
+            // Group and supergroup ids are negative; a positive id is a person.
+            if chat_id < 0 {
+                return Ok(chat_id);
+            }
+            chat.send_to(
+                chat_id,
+                None,
+                "That is our private chat, and it has no topics. Say it in the group instead.",
+            )
+            .await
+            .ok();
+        }
+    }
 }
 
 /// The older shape: one chat, one project, no map.
@@ -733,6 +811,10 @@ fn save_cursor(path: &Path, cursor: &Cursor, desks: &mut [Desk]) -> Result<()> {
         desk.state.offset = cursor.offset;
         return save(path, &desk.state);
     }
+    write_cursor(path, cursor)
+}
+
+fn write_cursor(path: &Path, cursor: &Cursor) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
