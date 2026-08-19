@@ -273,7 +273,11 @@ fn approver_id() -> Result<i64> {
 /// `workspace` picks the project; `agent` is the identity the orders are signed with, which
 /// is the operator, not a worker - a bridge that signed as a machine would put that
 /// machine's name on work a human asked for.
-pub async fn bridge(workspace: Option<PathBuf>, agent: Option<String>) -> Result<()> {
+pub async fn bridge(
+    workspace: Option<PathBuf>,
+    agent: Option<String>,
+    default_to: Option<String>,
+) -> Result<()> {
     let start = match workspace {
         Some(path) => path,
         None => std::env::current_dir().context("read the current directory")?,
@@ -311,11 +315,10 @@ pub async fn bridge(workspace: Option<PathBuf>, agent: Option<String>) -> Result
             }
         }
         save(&path, &state)?;
-        chat.send(&format!(
-            "Ferryman bridge up on {} as {issuer}.\nSend a line to make it an order; /help for the rest.",
-            route.project_id
-        ))
-        .await?;
+        // A greeting that only says "up" tells the operator nothing they could not have
+        // assumed. What they actually need to know is where their next message will land,
+        // who is available to do it, and whether anything is already in flight.
+        chat.send(&opening(&route, &issuer, default_to.as_deref())).await?;
     }
 
     println!(
@@ -333,7 +336,15 @@ pub async fn bridge(workspace: Option<PathBuf>, agent: Option<String>) -> Result
                     state.offset = state.offset.max(update.update_id + 1);
                     save(&path, &state)?;
                     if let Some(message) = update.message {
-                        handle(&chat, &route, &issuer, approver, &message).await;
+                        handle(
+                            &chat,
+                            &route,
+                            &issuer,
+                            approver,
+                            default_to.as_deref(),
+                            &message,
+                        )
+                        .await;
                     }
                 }
             }
@@ -367,6 +378,7 @@ async fn handle(
     route: &ferryman_channel::ProjectRoute,
     issuer: &str,
     approver: i64,
+    default_to: Option<&str>,
     message: &TgMessage,
 ) {
     let from = message.from.as_ref().map(|user| user.id).unwrap_or_default();
@@ -380,8 +392,8 @@ async fn handle(
         return;
     };
     let reply = match parse_instruction(text) {
-        None => help_text(),
-        Some(Instruction::Help) => help_text(),
+        None => help_text(default_to),
+        Some(Instruction::Help) => help_text(default_to),
         Some(Instruction::Agents) => match ferryman_channel::read_agent_roster(&route.communications)
         {
             Ok(roster) if roster.is_empty() => "no agents have joined this channel yet".to_string(),
@@ -404,10 +416,16 @@ async fn handle(
         },
         Some(Instruction::Status) => status_text(route),
         Some(Instruction::Order { to, task }) => {
-            match issue(route, issuer, message.message_id, to.clone(), &task) {
-                Ok(id) => match to {
-                    Some(who) => format!("issued {id} to {who}"),
-                    None => format!("issued {id}, open to whoever claims it first"),
+            // An unaddressed order goes to whichever machine claims it first, which is the
+            // wrong default when machines are not interchangeable: they differ in what they
+            // cost to run, and the fastest poller wins rather than the cheapest engine. So a
+            // configured default decides, and `/to` still overrides it per message.
+            let target = to.clone().or_else(|| default_to.map(str::to_string));
+            match issue(route, issuer, message.message_id, target.clone(), &task) {
+                Ok(id) => match (target, to.is_some()) {
+                    (Some(who), true) => format!("issued {id} to {who}"),
+                    (Some(who), false) => format!("issued {id} to {who} (default)"),
+                    (None, _) => format!("issued {id}, open to whoever claims it first"),
                 },
                 Err(error) => format!("could not issue that: {error}"),
             }
@@ -418,13 +436,72 @@ async fn handle(
     }
 }
 
-fn help_text() -> String {
-    "Send any line to make it an order, open to whichever machine claims it first.\n\
-     /to <agent> <task>  address one machine\n\
-     /order <task>       the same as sending the line alone\n\
-     /status             every task and where it has got to\n\
-     /agents             who is in this channel"
-        .to_string()
+fn help_text(default_to: Option<&str>) -> String {
+    let lands = match default_to {
+        Some(who) => format!("Send any line to make it an order. It goes to {who}."),
+        None => "Send any line to make it an order, open to whichever machine claims it first."
+            .to_string(),
+    };
+    format!(
+        "{lands}\n\
+         /to <agent> <task>  send it to one machine instead\n\
+         /order <task>       the same as sending the line alone\n\
+         /status             every task and where it has got to\n\
+         /agents             who is in this channel\n\
+         \n\
+         Do not send credentials here. This chat is not end-to-end encrypted."
+    )
+}
+
+/// What to say on first contact.
+///
+/// "Bridge up" is not news to whoever just started it. The useful facts are where the next
+/// message will land, who could pick it up, and whether the channel is already busy - all of
+/// which are one roster read away and none of which the operator can see from a phone.
+fn opening(
+    route: &ferryman_channel::ProjectRoute,
+    issuer: &str,
+    default_to: Option<&str>,
+) -> String {
+    let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+    let names: Vec<String> = roster
+        .iter()
+        .filter(|agent| agent.name != issuer)
+        .map(|agent| agent.name.clone())
+        .collect();
+
+    let (open, running) = match ferryman_channel::list_tasks(route) {
+        Ok(tasks) => tasks.iter().fold((0, 0), |(open, running), task| {
+            match task.state() {
+                ferryman_channel::TaskState::Open => (open + 1, running),
+                ferryman_channel::TaskState::Claimed { .. }
+                | ferryman_channel::TaskState::ChangesRequested { .. } => (open, running + 1),
+                _ => (open, running),
+            }
+        }),
+        Err(_) => (0, 0),
+    };
+
+    let lands = match default_to {
+        Some(who) => format!("Anything you send goes to {who}."),
+        None => "Anything you send is open to whichever machine claims it first.".to_string(),
+    };
+
+    format!(
+        "Ferryman bridge up on {project}, signing as {issuer}.\n\
+         {lands} /to <agent> to pick one.\n\
+         \n\
+         Fleet: {fleet}\n\
+         Now: {open} waiting, {running} in progress\n\
+         \n\
+         /help for the rest. Do not send credentials here.",
+        project = route.project_id,
+        fleet = if names.is_empty() {
+            "nobody has joined yet".to_string()
+        } else {
+            names.join(", ")
+        },
+    )
 }
 
 fn status_text(route: &ferryman_channel::ProjectRoute) -> String {
@@ -587,6 +664,46 @@ mod tests {
     fn an_order_verb_with_nothing_after_it_is_not_an_order() {
         assert_eq!(parse_instruction("/order   "), None);
         assert_eq!(parse_instruction("/to beastlywsl"), None);
+    }
+
+    /// The default recipient is the difference between "the fleet does this" and "whichever
+    /// machine polls fastest does this", and those machines do not cost the same to run.
+    #[test]
+    fn an_unaddressed_message_goes_to_the_default_and_to_overrides_it() {
+        let bare = parse_instruction("run the tests").unwrap();
+        let Instruction::Order { to, .. } = bare else {
+            panic!("a bare line is an order")
+        };
+        assert_eq!(to, None, "parsing does not know about the default");
+
+        // The default is applied where the order is issued, not where it is parsed, so
+        // `/to` keeps overriding it and a fleet with no default still races as before.
+        let applied = to.clone().or_else(|| Some("grouchly".to_string()));
+        assert_eq!(applied.as_deref(), Some("grouchly"));
+
+        let addressed = parse_instruction("/to beastlywsl run the tests").unwrap();
+        let Instruction::Order { to, .. } = addressed else {
+            panic!("addressed order")
+        };
+        assert_eq!(
+            to.clone().or_else(|| Some("grouchly".to_string())).as_deref(),
+            Some("beastlywsl"),
+            "an explicit target wins over the default"
+        );
+    }
+
+    #[test]
+    fn help_says_where_a_bare_line_actually_goes() {
+        // Telling someone their message is "open to whoever claims it first" when it is in
+        // fact pinned to one machine is worse than saying nothing.
+        assert!(help_text(Some("grouchly")).contains("goes to grouchly"));
+        assert!(help_text(None).contains("claims it first"));
+        for text in [help_text(Some("grouchly")), help_text(None)] {
+            assert!(
+                text.contains("Do not send credentials"),
+                "the warning belongs on the surface an operator actually reads"
+            );
+        }
     }
 
     #[test]

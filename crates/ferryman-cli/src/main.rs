@@ -847,6 +847,17 @@ enum Channel {
         /// work, and the ledger should say so.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
+        /// Where an unaddressed message goes. Without it, a bare line is an open order
+        /// and the fastest poller wins.
+        ///
+        /// That is the wrong race to leave running once machines stop being
+        /// interchangeable. They differ in what they cost per task - a fleet mixing a
+        /// metered engine with a subscription one has a cheap machine and an expensive
+        /// one, and "whoever claims first" reliably picks whichever polls more often
+        /// rather than whichever you would have chosen. `/to <agent>` still overrides
+        /// this per message.
+        #[arg(long, value_parser = agent_name)]
+        default_to: Option<String>,
     },
 }
 
@@ -1624,7 +1635,11 @@ async fn run(cli: Cli) -> Result<()> {
         // runtime this function already has. Splitting it here keeps every other channel
         // command free of async it does not use.
         Command::Channel { command } => match command {
-            Channel::Telegram { workspace, agent } => telegram::bridge(workspace, agent).await?,
+            Channel::Telegram {
+                workspace,
+                agent,
+                default_to,
+            } => telegram::bridge(workspace, agent, default_to).await?,
             rest => channel(rest)?,
         },
         Command::Dashboard {
