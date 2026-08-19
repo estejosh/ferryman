@@ -4061,6 +4061,9 @@ fn channel(command: Channel) -> Result<()> {
                             ferryman_channel::TaskState::Claimed { by } => {
                                 format!("held by {by}")
                             }
+                            ferryman_channel::TaskState::Offered { to } => {
+                                format!("addressed to {to}, who has not picked it up")
+                            }
                             ferryman_channel::TaskState::ChangesRequested { revision } => {
                                 format!(
                                     "revision {revision} owed by {}",

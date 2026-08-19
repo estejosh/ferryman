@@ -120,6 +120,7 @@ pub fn categorize(line: &str) -> &'static str {
 fn state_name(state: &TaskState) -> &'static str {
     match state {
         TaskState::Open => "open",
+        TaskState::Offered { .. } => "offered",
         // NOTE: `claimed` here currently also covers an addressed order that nobody has
         // picked up, because `Task::holder` returns the assignee whether or not a claim file
         // exists. That is a known bug (see README, "Known issues"), and it means a soak

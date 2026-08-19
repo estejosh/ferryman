@@ -967,7 +967,12 @@ fn opening(
         Ok(tasks) => tasks
             .iter()
             .fold((0, 0), |(open, running), task| match task.state() {
-                ferryman_channel::TaskState::Open => (open + 1, running),
+                // Offered counts as waiting, not running. An order addressed to a
+                // machine that has not picked it up is exactly as un-started as an open
+                // one, and counting it as in-progress is how a stalled fleet looks busy.
+                ferryman_channel::TaskState::Open | ferryman_channel::TaskState::Offered { .. } => {
+                    (open + 1, running)
+                }
                 ferryman_channel::TaskState::Claimed { .. }
                 | ferryman_channel::TaskState::ChangesRequested { .. } => (open, running + 1),
                 _ => (open, running),

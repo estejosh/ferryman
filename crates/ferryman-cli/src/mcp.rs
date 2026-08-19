@@ -241,6 +241,7 @@ fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
 fn state_name(state: &TaskState) -> &'static str {
     match state {
         TaskState::Open => "open",
+        TaskState::Offered { .. } => "offered",
         TaskState::Claimed { .. } => "claimed",
         TaskState::AwaitingReview { .. } => "awaiting_review",
         TaskState::ChangesRequested { .. } => "changes_requested",

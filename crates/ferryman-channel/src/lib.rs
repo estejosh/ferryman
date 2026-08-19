@@ -767,8 +767,23 @@ pub struct Recommendation {
 /// Where a task has got to, worked out by reading its directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskState {
-    /// Nobody has claimed it.
+    /// Nobody has claimed it, and it is addressed to nobody.
     Open,
+    /// Addressed to one machine, which has not picked it up yet.
+    ///
+    /// # Why this is not `Claimed`
+    ///
+    /// It used to be. [`Task::holder`] answers "whose task is this", and for an addressed
+    /// order that is the assignee from the moment it is written - so `state()` reported
+    /// `Claimed { by: "grouchly" }` for an order grouchly had never seen, could not see
+    /// (its worker was down), or had given up on.
+    ///
+    /// An operator reading that has no way to tell "a machine is working on this right
+    /// now" from "this has been sitting untouched since this morning". Those call for
+    /// opposite responses - wait, or go and find out why nothing is running - and the
+    /// status display was giving the reassuring one in both cases. A fleet you cannot ask
+    /// "has anyone actually picked this up" is a fleet you have to guess about.
+    Offered { to: String },
     /// Claimed, being worked on.
     Claimed { by: String },
     /// A result is in, waiting on a reviewer.
@@ -860,8 +875,16 @@ impl Task {
             return TaskState::Open;
         };
         let Some(revision) = self.latest_revision() else {
-            return TaskState::Claimed {
-                by: holder.to_string(),
+            // A claim is a record someone wrote: it says who took it and when. An
+            // assignment is only a wish until then.
+            return if self.claims.is_empty() {
+                TaskState::Offered {
+                    to: holder.to_string(),
+                }
+            } else {
+                TaskState::Claimed {
+                    by: holder.to_string(),
+                }
             };
         };
         let verdict = self.reviews.iter().find(|r| r.revision == revision);
@@ -1140,7 +1163,7 @@ pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
             continue;
         }
         match task.state() {
-            TaskState::Open => {
+            TaskState::Open | TaskState::Offered { .. } => {
                 if task
                     .order
                     .assigned_to
@@ -7748,9 +7771,54 @@ mod work_over_files_tests {
     }
 
     #[test]
+    fn an_order_nobody_picked_up_does_not_read_as_being_worked_on() {
+        // The failure this prevents: four orders addressed to a machine whose worker was
+        // not running all read as "Claimed { by: grouchly }". The operator waited on work
+        // that had never started, and the status display was the reason they waited.
+        let (_t, route, _identities) = signed_channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        let task = read_task(&route, "t-1").unwrap();
+        assert_eq!(
+            task.state(),
+            TaskState::Offered {
+                to: "grouchly".into()
+            }
+        );
+        // Whose task it is has not changed - only whether anyone has taken it.
+        assert_eq!(task.holder(), Some("grouchly"));
+
+        claim_order(&route, "t-1", "grouchly").unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::Claimed {
+                by: "grouchly".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_offered_order_is_still_work_its_machine_can_see() {
+        // Offered must not become a state that hides work from the machine it was
+        // addressed to, or an addressed order would never be done at all.
+        let (_t, route, _identities) = signed_channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        assert_eq!(work_for(&route, "grouchly").unwrap().len(), 1);
+        assert_eq!(work_for(&route, "beastlywsl").unwrap().len(), 0);
+    }
+
+    #[test]
     fn the_whole_review_cycle_is_just_more_files_in_one_directory() {
         let (_t, route, identities) = signed_channel();
         issue_order(&route, &order("t-1", Some("grouchly"), true)).unwrap();
+        // Addressed, not yet picked up. This used to read as Claimed, which is the same
+        // word the display uses for "a machine is working on it right now".
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::Offered {
+                to: "grouchly".into()
+            }
+        );
+        claim_order(&route, "t-1", "grouchly").unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
             TaskState::Claimed {

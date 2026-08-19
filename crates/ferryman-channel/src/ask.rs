@@ -279,6 +279,7 @@ fn result_text(payload: &Value) -> String {
 fn state_name(state: &TaskState) -> &'static str {
     match state {
         TaskState::Open => "open",
+        TaskState::Offered { .. } => "offered",
         TaskState::Claimed { .. } => "claimed",
         TaskState::AwaitingReview { .. } => "awaiting review",
         TaskState::ChangesRequested { .. } => "changes requested",

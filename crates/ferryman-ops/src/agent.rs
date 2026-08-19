@@ -1466,7 +1466,9 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
         .filter_map(|task| {
             let id = task.order.id.clone();
             match task.state() {
-                TaskState::Open => Some((id, "claim it, then run the agent".to_string())),
+                TaskState::Open | TaskState::Offered { .. } => {
+                    Some((id, "claim it, then run the agent".to_string()))
+                }
                 TaskState::Claimed { .. } => {
                     Some((id, "already claimed here; run the agent".to_string()))
                 }
@@ -1541,7 +1543,11 @@ pub async fn work_once(
             continue;
         }
         match task.state() {
-            TaskState::Open => {
+            // An addressed order is claimed too, and for the same reason an open one is:
+            // the claim is the only record that this machine picked the task up, and when.
+            // Without it an order addressed to a machine that never ran looks exactly like
+            // one being worked on.
+            TaskState::Open | TaskState::Offered { .. } => {
                 ferryman_channel::claim_order(route, &id, &config.agent)?;
                 ferryman_channel::ledger::append_ledger_entry(
                     route,

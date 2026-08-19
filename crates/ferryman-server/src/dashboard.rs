@@ -1201,6 +1201,7 @@ async fn index(State(state): State<DashboardState>) -> Html<String> {
 fn state_value(state: &TaskState) -> Value {
     match state {
         TaskState::Open => json!({ "status": "open" }),
+        TaskState::Offered { to } => json!({ "status": "offered", "to": to }),
         TaskState::Claimed { by } => json!({ "status": "claimed", "by": by }),
         TaskState::AwaitingReview { by, revision } => {
             json!({ "status": "awaiting_review", "by": by, "revision": revision })
