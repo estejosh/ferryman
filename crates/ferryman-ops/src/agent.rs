@@ -189,6 +189,15 @@ pub struct AgentConfig {
     /// Run each task in its own git worktree (branch derived from the signed
     /// order + agent) when the workspace is a git repo. Off by default.
     pub worktree: bool,
+    /// The git remote to publish a finished task's branch to, e.g. `origin`.
+    /// `None` keeps the branch on the machine that produced it.
+    ///
+    /// Pushing is what stops a fleet's output living on whichever disk happened to
+    /// claim the order. It is opt-in because a worker cannot know that a remote
+    /// exists or that it is allowed to write to it, and it fails soft: the commit
+    /// is already made before the push is attempted, so an unreachable remote costs
+    /// a warning rather than the work.
+    pub push: Option<String>,
     /// How much network the sandboxed agent gets. Only applies to the podman /
     /// docker runners; the bare runner is unaffected.
     pub network: NetworkPolicy,
@@ -356,6 +365,10 @@ impl AgentConfig {
                 Some("true") => true,
                 Some(other) => bail!("worktree must be true or false, not '{other}'"),
             },
+            push: match fields.get("push").map(|value| value.trim()) {
+                None | Some("") | Some("none") => None,
+                Some(remote) => Some(remote.to_string()),
+            },
             network: NetworkPolicy::parse(&fields.get("net").cloned().unwrap_or_default())?,
             mounts: parse_mounts(fields.get("mounts").map(String::as_str).unwrap_or(""))?,
             timeout: Duration::from_secs(number("timeout_secs", 900)?),
@@ -483,7 +496,25 @@ stall_secs = "600"
 # result, so the work is attributable and a re-dispatched task lands in the same
 # worktree rather than a fresh one. Off by default; harmless on a non-git
 # workspace.
+#
+# When a task leaves changed files behind, they are committed to that branch and
+# the branch is kept. A task that changed nothing leaves no branch.
 worktree = "{worktree}"
+
+# Where to publish a finished task's branch, e.g. "origin". Empty keeps the work
+# on the machine that produced it.
+#
+# A fleet without this puts every agent's output on whichever disk happened to
+# claim the order, which is a backup strategy of "hope". With it, the branch is
+# on the remote before you go looking for it, and you review and merge it like
+# anyone else's.
+#
+# It never pushes anything but its own task branches - never your default branch -
+# and it pushes with --force-with-lease, so a re-dispatched task may rewrite its
+# own branch but not overwrite someone else who has pushed there since. The commit
+# is made before the push is attempted: an unreachable remote or a missing
+# credential costs a warning in the result, never the work.
+push = ""
 
 # How much network the sandboxed agent gets (podman/docker runners only):
 #   open      full network - the default, and what a cloud agent needs
@@ -722,6 +753,38 @@ fn parse_mounts(raw: &str) -> Result<Vec<String>> {
         out.push(entry.to_string());
     }
     Ok(out)
+}
+
+/// The commit message for a task's work: the order id, then what was asked.
+///
+/// The id first, because that is what ties the commit to a signed order, a claim, a
+/// result and a ledger entry - `git log` becomes searchable by the thing the fleet
+/// actually indexes on. The task text after it, trimmed to a subject line, because a
+/// history of "ferryman task" tells a reader nothing they could not guess.
+///
+/// No trailer naming the engine. The result is signed by the agent's key and records
+/// `produced_by`; a line of prose in the commit would be a weaker claim about the same
+/// fact, and the one that survives `git log --format=%s` should be what was done.
+fn commit_subject(id: &str, order: &ferryman_channel::Order) -> String {
+    const SUBJECT_CHARS: usize = 72;
+    let asked = order
+        .payload
+        .get("task")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if asked.is_empty() {
+        return id.to_string();
+    }
+    let room = SUBJECT_CHARS.saturating_sub(id.chars().count() + 2);
+    if asked.chars().count() <= room {
+        return format!("{id}: {asked}");
+    }
+    let kept: String = asked.chars().take(room.saturating_sub(3)).collect();
+    format!("{id}: {}...", kept.trim_end())
 }
 
 /// Run the configured agent CLI over a prompt.
@@ -1694,9 +1757,15 @@ async fn do_work(
     let branch = ferryman_channel::worktree::branch_name(id, &config.agent);
     let mut workdir = route.workspace.clone();
     let mut used_worktree = false;
+    // Where the branch starts. Kept so that afterwards we can tell work from the
+    // commit it was branched from, which is the difference between a branch worth
+    // keeping and one worth deleting.
+    let mut base_commit = String::new();
     if config.worktree && ferryman_channel::worktree::is_git_repo(&route.workspace) {
         match ferryman_channel::worktree::create_worktree(&route.workspace, id, &config.agent) {
             Ok((dir, _)) => {
+                base_commit =
+                    ferryman_channel::worktree::head_of(&dir).unwrap_or_default();
                 workdir = dir;
                 used_worktree = true;
             }
@@ -1772,10 +1841,53 @@ async fn do_work(
         payload["model"] = json!(model);
     }
     if used_worktree {
+        // The work is committed here, before anything is torn down.
+        //
+        // This used to be `remove_worktree`, which force-removes the checkout and then
+        // runs `git branch -D`. An agent that committed had its commit orphaned; an
+        // agent that did not had its files deleted. Either way the task's output did
+        // not outlive the task, while the result recorded the branch point as
+        // `worktree_head` - a hash that reads like provenance and points at the tree as
+        // it was before the agent touched it.
+        let subject = commit_subject(id, &task.order);
+        match ferryman_channel::worktree::commit_all(&workdir, &config.agent, &subject) {
+            Ok(Some(made)) => {
+                payload["committed"] = json!(made);
+                report.info(&format!("  {id}: committed {} on {branch}", &made[..12.min(made.len())]));
+                if let Some(remote) = &config.push {
+                    match ferryman_channel::worktree::push_branch(
+                        &route.workspace,
+                        remote,
+                        &branch,
+                    ) {
+                        Ok(()) => {
+                            payload["pushed"] = json!(remote);
+                            report.info(&format!("  {id}: pushed {branch} to {remote}"));
+                        }
+                        // Not fatal, and deliberately loud. The commit exists either way;
+                        // what is lost is only the copy on the remote, and a reviewer who
+                        // cannot find the branch needs to know it stayed here.
+                        Err(e) => {
+                            payload["push_failed"] = json!(e.to_string());
+                            report.warn(&format!(
+                                "  {id}: committed but could not push to {remote}: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
+        }
+
         if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, &branch) {
             payload["worktree_head"] = json!(head);
         }
-        let _ = ferryman_channel::worktree::remove_worktree(&route.workspace, &branch);
+        match ferryman_channel::worktree::retire_worktree(&route.workspace, &branch, &base_commit) {
+            Ok(true) => payload["branch_kept"] = json!(true),
+            Ok(false) => {}
+            Err(e) => report.warn(&format!("  {id}: could not retire the worktree: {e}")),
+        }
     }
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
@@ -2673,6 +2785,79 @@ mod tests {
         assert_eq!(config.timeout, Duration::from_secs(900));
         assert_eq!(config.stall, Duration::from_secs(600));
         assert!(!config.worktree);
+        assert_eq!(config.push, None, "publishing is opt-in");
+    }
+
+    #[test]
+    fn a_push_remote_is_read_and_absence_means_keep_it_here() {
+        let with = AgentConfig::parse(
+            "agent = \"a\"\ncommand = \"c\"\nworktree = \"true\"\npush = \"origin\"\n",
+        )
+        .unwrap();
+        assert_eq!(with.push.as_deref(), Some("origin"));
+        // Empty and the word "none" both mean the same thing an operator means by
+        // leaving the line alone, and a template that ships `push = ""` must parse.
+        for text in [
+            "agent = \"a\"\ncommand = \"c\"\n",
+            "agent = \"a\"\ncommand = \"c\"\npush = \"\"\n",
+            "agent = \"a\"\ncommand = \"c\"\npush = \"none\"\n",
+        ] {
+            assert_eq!(AgentConfig::parse(text).unwrap().push, None, "{text}");
+        }
+    }
+
+    #[test]
+    fn the_generated_template_still_parses_with_the_push_line_in_it() {
+        let rendered = AgentConfig::render(
+            "beastly",
+            "worker",
+            "claude",
+            &["-p".into()],
+            ReviewMode::Confirm,
+            None,
+            true,
+        );
+        assert!(rendered.contains("push = \"\""));
+        assert_eq!(AgentConfig::parse(&rendered).unwrap().push, None);
+    }
+
+    #[test]
+    fn a_commit_subject_leads_with_the_order_id_and_fits_on_one_line() {
+        let order = ferryman_channel::Order {
+            id: "t-4f2a".into(),
+            project_id: "p".into(),
+            issued_by: "op".into(),
+            assigned_to: None,
+            created_at: chrono::Utc::now(),
+            payload: serde_json::json!({ "task": "Fix the retry loop\nand the logging" }),
+            requires_review: false,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        assert_eq!(
+            commit_subject("t-4f2a", &order),
+            "t-4f2a: Fix the retry loop",
+            "the first non-empty line is the subject, not the whole task"
+        );
+
+        let long = ferryman_channel::Order {
+            payload: serde_json::json!({ "task": "x".repeat(200) }),
+            ..order.clone()
+        };
+        let subject = commit_subject("t-4f2a", &long);
+        assert!(subject.chars().count() <= 72, "{} chars", subject.chars().count());
+        assert!(subject.ends_with("..."), "truncation is visible: {subject}");
+
+        // An order carrying structured JSON rather than a task string still gets a
+        // message, because a commit with an empty subject is a commit nobody can find.
+        let structured = ferryman_channel::Order {
+            payload: serde_json::json!({ "ticket": 7 }),
+            ..order
+        };
+        assert_eq!(commit_subject("t-4f2a", &structured), "t-4f2a");
     }
 
     #[test]
