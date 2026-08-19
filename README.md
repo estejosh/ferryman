@@ -92,7 +92,8 @@ Two consequences worth caring about:
   from your phone over Telegram, bound to a hash of exactly what was approved.
 - **Your phone as a terminal.** `ferry channel telegram` turns a message into a
   signed order and sends the result back when a worker submits it, so the fleet
-  is reachable from the one device you always have.
+  is reachable from the one device you always have. One Telegram group, a topic
+  per project — Ferryman builds the topics and remembers which is which.
 - **A master, grants, and short-lived lease tokens.** Authority is explicit,
   signed, and expiring — a leaked worker credential stops working on its own.
 - **A web dashboard** to watch tasks, ledger, cost and learnings, and to
@@ -152,6 +153,17 @@ ferry channel telegram --workspace ~/your-project-ferryman --agent you
 Send a line and it becomes an open order; `/to <agent> <task>` addresses one
 machine; `/status` and `/agents` read the channel back. Results arrive in the
 same chat with their signature verdict.
+
+For more than one project, point it at a map instead and it serves a whole
+Telegram group — a topic per project, each wired to that project's channel:
+
+```bash
+ferry channel telegram --map ~/ferryman-comms/.tgferryman --agent you
+```
+
+The first run writes the map from the channels it finds, creates a topic for
+each one, and writes down the ids — Telegram has no way to list topics, so that
+file is the only record. See [docs/TELEGRAM_TOPICS.md](docs/TELEGRAM_TOPICS.md).
 
 Only that one user id is obeyed — Telegram authenticates `from.id` server-side,
 and the bridge refuses to start without an id to check, because a bridge that

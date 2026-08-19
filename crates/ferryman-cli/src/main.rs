@@ -3,6 +3,7 @@ mod license;
 mod mcp;
 mod mcp_client;
 mod telegram;
+mod tgmap;
 
 use ferryman_ops::Progress;
 use ferryman_ops::agent;
@@ -858,6 +859,15 @@ enum Channel {
         /// this per message.
         #[arg(long, value_parser = agent_name)]
         default_to: Option<String>,
+        /// The `.tgferryman` map: which Telegram topic is which project. Without it, the
+        /// bridge looks for one from the working directory upwards, and serves a single
+        /// project the old way if there is none.
+        ///
+        /// Telegram has no call that lists a group's topics, so this file is the only
+        /// record of the thread ids - Ferryman writes every id it is given back into it.
+        /// A topic listed with no id is one it creates on the next start.
+        #[arg(long)]
+        map: Option<PathBuf>,
     },
 }
 
@@ -1639,7 +1649,8 @@ async fn run(cli: Cli) -> Result<()> {
                 workspace,
                 agent,
                 default_to,
-            } => telegram::bridge(workspace, agent, default_to).await?,
+                map,
+            } => telegram::bridge(workspace, agent, default_to, map).await?,
             rest => channel(rest)?,
         },
         Command::Dashboard {

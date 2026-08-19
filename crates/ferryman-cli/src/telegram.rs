@@ -56,7 +56,10 @@ pub enum Instruction {
     Agents,
     Status,
     /// Put work into the channel. `to` addresses one machine; `None` is open to anyone.
-    Order { to: Option<String>, task: String },
+    Order {
+        to: Option<String>,
+        task: String,
+    },
 }
 
 /// Read one chat message as an instruction.
@@ -153,6 +156,42 @@ fn state_path(attachment: &Path, agent: &str) -> PathBuf {
     attachment.join(format!("telegram-{agent}.json"))
 }
 
+/// One project the bridge serves, and the topic it serves it in.
+///
+/// A bridge used to be one chat and one project. A fleet is not shaped like that: an
+/// operator runs several projects and wants one place to talk to all of them, with the
+/// answers kept apart. A forum group gives that shape - a topic per project - and a desk is
+/// one seat at it: the topic on the Telegram side, the channel on the Ferryman side, and
+/// the identity orders raised here are signed with.
+struct Desk {
+    /// The topic's name, for what the bridge says about itself.
+    name: String,
+    /// Where this desk answers on its own initiative. The topic id is `None` for a private
+    /// chat and for a group's General, both of which take a plain message.
+    chat_id: i64,
+    thread: Option<i64>,
+    route: ferryman_channel::ProjectRoute,
+    issuer: String,
+    default_to: Option<String>,
+    state: BridgeState,
+    state_path: PathBuf,
+}
+
+/// Telegram's cursor, kept beside the map rather than in a channel.
+///
+/// `getUpdates` is per bot token, not per project, so one bridge has exactly one cursor no
+/// matter how many desks it keeps. Putting it in any one project's attachment would make
+/// that project's folder quietly load-bearing for all the others.
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
+struct Cursor {
+    #[serde(default)]
+    offset: i64,
+}
+
+fn cursor_path(dir: &Path) -> PathBuf {
+    dir.join(".tgferryman-cursor.json")
+}
+
 #[derive(Debug, Deserialize)]
 struct TgResponse<T> {
     ok: bool,
@@ -239,9 +278,52 @@ impl Chat {
             // status alone sends an operator hunting. The token is in the URL, never here.
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            bail!("telegram sendMessage returned {status}: {}", excerpt(&body, 200));
+            bail!(
+                "telegram sendMessage returned {status}: {}",
+                excerpt(&body, 200)
+            );
         }
         Ok(())
+    }
+
+    /// Make a topic, and take the only copy of its id.
+    ///
+    /// `createForumTopic` is the whole of Telegram's topic API that matters here: there is
+    /// no call that lists topics, so the `message_thread_id` this returns is not
+    /// recoverable from Telegram afterwards. It goes straight into `.tgferryman`, and if
+    /// that write is lost the topic is still there in the group and Ferryman can never
+    /// speak into it again.
+    ///
+    /// Needs the bot to be an administrator of the group with "Manage topics".
+    async fn create_forum_topic(&self, chat_id: i64, name: &str) -> Result<i64> {
+        #[derive(Default, Deserialize)]
+        struct ForumTopic {
+            message_thread_id: i64,
+        }
+        let response: TgResponse<ForumTopic> = self
+            .http
+            .post(format!(
+                "https://api.telegram.org/bot{}/createForumTopic",
+                self.token
+            ))
+            .json(&json!({ "chat_id": chat_id, "name": name }))
+            .send()
+            .await
+            .context("ask Telegram to create a forum topic")?
+            .json()
+            .await
+            .context("parse Telegram's reply to createForumTopic")?;
+        match (response.ok, response.result) {
+            (true, Some(topic)) => Ok(topic.message_thread_id),
+            _ => bail!(
+                "telegram refused to create the topic '{name}': {}. The bot must be an \
+                 administrator of the group with the \"Manage topics\" right, and the group \
+                 must have topics turned on",
+                response
+                    .description
+                    .unwrap_or_else(|| "no reason given".to_string())
+            ),
+        }
     }
 
     async fn updates(&self, offset: i64) -> Result<Vec<TgUpdate>> {
@@ -266,7 +348,9 @@ impl Chat {
         if !response.ok {
             bail!(
                 "telegram getUpdates refused: {}",
-                response.description.unwrap_or_else(|| "no reason given".to_string())
+                response
+                    .description
+                    .unwrap_or_else(|| "no reason given".to_string())
             );
         }
         Ok(response.result.unwrap_or_default())
@@ -301,22 +385,185 @@ fn approver_id() -> Result<i64> {
 
 /// Run the bridge until it is stopped.
 ///
-/// `workspace` picks the project; `agent` is the identity the orders are signed with, which
-/// is the operator, not a worker - a bridge that signed as a machine would put that
-/// machine's name on work a human asked for.
+/// Two shapes, one loop. With a [`crate::tgmap`] map it keeps a desk per topic and serves
+/// several projects from one group; without one it is what it always was - one chat, one
+/// project - so an existing install keeps working with no file and no flag.
+///
+/// `agent` is the identity orders are signed with, which is the operator, not a worker: a
+/// bridge that signed as a machine would put that machine's name on work a human asked for.
 pub async fn bridge(
     workspace: Option<PathBuf>,
     agent: Option<String>,
     default_to: Option<String>,
+    map: Option<PathBuf>,
 ) -> Result<()> {
     let start = match workspace {
         Some(path) => path,
         None => std::env::current_dir().context("read the current directory")?,
     };
-    let route = ferryman_channel::route_for(&start)?;
-    let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
     let token = bot_token()?;
     let approver = approver_id()?;
+    let http = reqwest::Client::new();
+
+    // An explicit --map is a promise the file is there; a discovered one is a convenience,
+    // and its absence just means the older single-project shape.
+    let map_file = match map {
+        Some(path) => {
+            if !path.is_file() {
+                // Asked for a map that is not there. Rather than an error telling the
+                // operator to go and write TOML, write the one the machine already implies:
+                // every channel beside it, listed and waiting for a group id. One restart
+                // after that builds the whole group.
+                let dir = path.parent().unwrap_or(Path::new("."));
+                let starter = crate::tgmap::starter(dir);
+                starter.save(&path)?;
+                bail!(
+                    "wrote a starter map at {} listing {} channel{} found in {}.\n\n\
+                     Add your bot to the Telegram group as an administrator with \"Manage \
+                     topics\", put the group's chat id in the file as `group = ...`, and start \
+                     me again - I will create a topic for each one and write down its id.",
+                    path.display(),
+                    starter.topics.len(),
+                    if starter.topics.len() == 1 { "" } else { "s" },
+                    dir.display()
+                );
+            }
+            Some(path)
+        }
+        None => crate::tgmap::discover(&start),
+    };
+
+    match map_file {
+        Some(path) => group_bridge(http, token, approver, agent, default_to, &path).await,
+        None => single_bridge(http, token, approver, start, agent, default_to).await,
+    }
+}
+
+/// One group, a topic per project.
+async fn group_bridge(
+    http: reqwest::Client,
+    token: String,
+    approver: i64,
+    agent: Option<String>,
+    default_to: Option<String>,
+    map_path: &Path,
+) -> Result<()> {
+    let mut map = crate::tgmap::TopicMap::load(map_path)?;
+    let base = map_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let Some(group) = map.group else {
+        bail!(
+            "{} does not say which group to use. Add the bot to your Telegram group as an \
+             administrator with \"Manage topics\", then put the group's chat id (negative, \
+             starting -100) in the file as `group = ...`",
+            map_path.display()
+        )
+    };
+    let chat = Chat {
+        http,
+        token,
+        chat_id: group,
+    };
+
+    // Build out the group to match the file. Saved after each one: an id Telegram has
+    // handed out and Ferryman has not written down belongs to a topic nothing can ever
+    // speak into again, so losing four of them to one failed write is not acceptable.
+    let unmade: Vec<String> = map
+        .unmade()
+        .into_iter()
+        .map(|topic| topic.name.clone())
+        .collect();
+    let mut created = Vec::new();
+    for name in unmade {
+        let thread = chat.create_forum_topic(group, &name).await?;
+        map.record_thread(&name, thread);
+        map.save(map_path)?;
+        println!("telegram: created topic {name} ({thread})");
+        created.push(name);
+    }
+
+    let mut desks = Vec::new();
+    for topic in &map.topics {
+        let workspace = topic.resolved_workspace(&base);
+        // One unreachable project must not silence the others. A channel that has not been
+        // cloned onto this machine yet is the ordinary case on a new box.
+        let route = match ferryman_channel::route_for(&workspace) {
+            Ok(route) => route,
+            Err(error) => {
+                eprintln!(
+                    "telegram: topic '{}' has no channel at {}: {error}",
+                    topic.name,
+                    workspace.display()
+                );
+                continue;
+            }
+        };
+        let issuer = ferryman_ops::identity::resolve(agent.clone(), &route.attachment)?;
+        let state_path = state_path(&route.attachment, &issuer);
+        let (state, first_run) = load_state(&state_path, &route)?;
+        desks.push(Desk {
+            name: topic.name.clone(),
+            chat_id: group,
+            thread: topic.thread,
+            route,
+            issuer,
+            default_to: topic.default_to.clone().or_else(|| default_to.clone()),
+            state,
+            state_path,
+        });
+        let _ = first_run;
+    }
+    if desks.is_empty() {
+        bail!(
+            "{} lists {} topics and none of them has a Ferryman channel on this machine",
+            map_path.display(),
+            map.topics.len()
+        );
+    }
+
+    let cursor_file = cursor_path(&base);
+    let mut cursor: Cursor = match std::fs::read_to_string(&cursor_file) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => {
+            // Nothing has been polled from this map before, so say hello where the
+            // operator will see it - and say what was built, since a topic appearing in a
+            // group with no explanation is alarming rather than useful.
+            let hello = group_opening(&desks, &created);
+            let general = desks.iter().find(|desk| desk.thread.is_none());
+            chat.send_to(group, general.and_then(|desk| desk.thread), &hello)
+                .await
+                .ok();
+            Cursor::default()
+        }
+    };
+
+    println!("telegram bridge: {} desks in group {group}", desks.len());
+    for desk in &desks {
+        println!(
+            "  {} -> {} as {}{}",
+            desk.name,
+            desk.route.project_id,
+            desk.issuer,
+            match desk.thread {
+                Some(thread) => format!(" (topic {thread})"),
+                None => " (general)".to_string(),
+            }
+        );
+    }
+
+    serve(&chat, &mut desks, approver, &mut cursor, &cursor_file).await
+}
+
+/// The older shape: one chat, one project, no map.
+async fn single_bridge(
+    http: reqwest::Client,
+    token: String,
+    approver: i64,
+    start: PathBuf,
+    agent: Option<String>,
+    default_to: Option<String>,
+) -> Result<()> {
+    let route = ferryman_channel::route_for(&start)?;
+    let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
     let chat_id = match std::env::var("TELEGRAM_CHAT_ID") {
         Ok(raw) if !raw.trim().is_empty() => raw
             .trim()
@@ -326,56 +573,87 @@ pub async fn bridge(
         _ => approver,
     };
     let chat = Chat {
-        http: reqwest::Client::new(),
+        http,
         token,
         chat_id,
     };
 
-    let path = state_path(&route.attachment, &issuer);
-    let first_run = !path.exists();
-    let mut state: BridgeState = match std::fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => BridgeState::default(),
-    };
+    let state_path = state_path(&route.attachment, &issuer);
+    let (state, first_run) = load_state(&state_path, &route)?;
     if first_run {
-        // Everything already in the channel is history, not news. Announcing it would
-        // greet a new operator with every result the project has ever produced.
-        for task in ferryman_channel::list_tasks(&route)? {
-            for result in &task.results {
-                state.remember(result_key(&task.order.id, &result.agent, result.revision));
-            }
-        }
-        save(&path, &state)?;
         // A greeting that only says "up" tells the operator nothing they could not have
         // assumed. What they actually need to know is where their next message will land,
         // who is available to do it, and whether anything is already in flight.
-        chat.send(&opening(&route, &issuer, default_to.as_deref())).await?;
+        chat.send(&opening(&route, &issuer, default_to.as_deref()))
+            .await?;
     }
-
     println!(
         "telegram bridge: project {} as {issuer}, chat {chat_id}",
         route.project_id
     );
 
+    // The cursor lived in this file before there were maps, and still does here.
+    let mut cursor = Cursor {
+        offset: state.offset,
+    };
+    let cursor_file = state_path.clone();
+    let mut desks = vec![Desk {
+        name: route.project_id.clone(),
+        chat_id,
+        thread: None,
+        route,
+        issuer,
+        default_to,
+        state,
+        state_path,
+    }];
+    serve(&chat, &mut desks, approver, &mut cursor, &cursor_file).await
+}
+
+/// Read a desk's memory, seeding it on first sight.
+///
+/// Everything already in the channel is history, not news. Announcing it would greet a new
+/// operator with every result the project has ever produced.
+fn load_state(path: &Path, route: &ferryman_channel::ProjectRoute) -> Result<(BridgeState, bool)> {
+    let first_run = !path.exists();
+    let mut state: BridgeState = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => BridgeState::default(),
+    };
+    if first_run {
+        for task in ferryman_channel::list_tasks(route)? {
+            for result in &task.results {
+                state.remember(result_key(&task.order.id, &result.agent, result.revision));
+            }
+        }
+        save(path, &state)?;
+    }
+    Ok((state, first_run))
+}
+
+/// Poll, act, report - the same loop whatever the desks are.
+async fn serve(
+    chat: &Chat,
+    desks: &mut [Desk],
+    approver: i64,
+    cursor: &mut Cursor,
+    cursor_file: &Path,
+) -> Result<()> {
     loop {
-        match chat.updates(state.offset).await {
+        match chat.updates(cursor.offset).await {
             Ok(updates) => {
                 for update in updates {
                     // Acknowledge before acting. A message that makes the bridge panic
                     // would otherwise be redelivered forever, and a crash loop that reissues
                     // the same order every restart is worse than a lost message.
-                    state.offset = state.offset.max(update.update_id + 1);
-                    save(&path, &state)?;
-                    if let Some(message) = update.message {
-                        handle(
-                            &chat,
-                            &route,
-                            &issuer,
-                            approver,
-                            default_to.as_deref(),
-                            &message,
-                        )
-                        .await;
+                    cursor.offset = cursor.offset.max(update.update_id + 1);
+                    save_cursor(cursor_file, cursor, desks)?;
+                    let Some(message) = update.message else {
+                        continue;
+                    };
+                    match desk_for(desks, &message) {
+                        Some(index) => handle(chat, &desks[index], approver, &message).await,
+                        None => unmapped(chat, desks, &message).await,
                     }
                 }
             }
@@ -387,10 +665,106 @@ pub async fn bridge(
             }
         }
 
-        if let Err(error) = announce(&chat, &route, &mut state, &path).await {
-            eprintln!("telegram: could not report results: {error}");
+        for desk in desks.iter_mut() {
+            if let Err(error) = announce(chat, desk).await {
+                eprintln!("telegram: could not report {} results: {error}", desk.name);
+            }
         }
     }
+}
+
+/// Which desk a message belongs to.
+///
+/// Matched on the topic it arrived in. A message with no topic - a private chat, or the
+/// group's General - goes to the desk that has no topic of its own, if there is one.
+fn desk_for(desks: &[Desk], message: &TgMessage) -> Option<usize> {
+    let threads: Vec<Option<i64>> = desks.iter().map(|desk| desk.thread).collect();
+    crate::tgmap::index_for(&threads, message.message_thread_id)
+}
+
+/// Answer a message from a topic that is not in the map.
+///
+/// Not silence: the operator is standing in a topic that looks like every other one, and
+/// the reason it does nothing is a line missing from a file they can edit. But not a guess
+/// either - putting the order in some other project's channel would sign work into a
+/// project nobody asked about.
+async fn unmapped(chat: &Chat, desks: &[Desk], message: &TgMessage) {
+    let from = message
+        .from
+        .as_ref()
+        .map(|user| user.id)
+        .unwrap_or_default();
+    let known: Vec<&str> = desks.iter().map(|desk| desk.name.as_str()).collect();
+    let text = format!(
+        "This topic is not in {}, so I do not know which project it is for.\n\n\
+         Add a [[topic]] for it with the thread id {}, then restart me.\n\n\
+         I am serving: {}",
+        crate::tgmap::FILE,
+        message
+            .message_thread_id
+            .map_or_else(|| "(none)".to_string(), |id| id.to_string()),
+        if known.is_empty() {
+            "nothing".to_string()
+        } else {
+            known.join(", ")
+        }
+    );
+    eprintln!(
+        "telegram: a message from {from} in unmapped topic {:?}",
+        message.message_thread_id
+    );
+    let where_from = message.chat.as_ref().map_or(chat.chat_id, |c| c.id);
+    if let Err(error) = chat
+        .send_to(where_from, message.message_thread_id, &text)
+        .await
+    {
+        eprintln!("telegram: could not reply: {error}");
+    }
+}
+
+fn save_cursor(path: &Path, cursor: &Cursor, desks: &mut [Desk]) -> Result<()> {
+    // Without a map the cursor shares a file with the one desk's memory, which is where it
+    // has always lived; rewriting that file as a bare cursor would drop what it has already
+    // announced and repeat every result on the next restart.
+    if let Some(desk) = desks
+        .iter_mut()
+        .find(|desk| desk.state_path.as_path() == path)
+    {
+        desk.state.offset = cursor.offset;
+        return save(path, &desk.state);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(cursor)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// What to say when a group bridge starts for the first time.
+fn group_opening(desks: &[Desk], created: &[String]) -> String {
+    let mut lines = vec![format!(
+        "Ferryman bridge up, serving {} topic{}.",
+        desks.len(),
+        if desks.len() == 1 { "" } else { "s" }
+    )];
+    if !created.is_empty() {
+        lines.push(format!("Created: {}.", created.join(", ")));
+    }
+    lines.push(String::new());
+    for desk in desks {
+        let lands = match &desk.default_to {
+            Some(who) => who.clone(),
+            None => "whoever claims it first".to_string(),
+        };
+        lines.push(format!(
+            "{} -> {} (signed {}, goes to {lands})",
+            desk.name, desk.route.project_id, desk.issuer
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Say anything in a topic to put work in that project's channel.".to_string());
+    lines.push("/help for the rest. Do not send credentials here.".to_string());
+    lines.join("\n")
 }
 
 fn save(path: &Path, state: &BridgeState) -> Result<()> {
@@ -404,15 +778,15 @@ fn save(path: &Path, state: &BridgeState) -> Result<()> {
 /// Act on one message. Errors are reported into the chat rather than returned: the operator
 /// is holding the only screen that will show them, and a bridge that exits on a bad order
 /// stops answering the good ones.
-async fn handle(
-    chat: &Chat,
-    route: &ferryman_channel::ProjectRoute,
-    issuer: &str,
-    approver: i64,
-    default_to: Option<&str>,
-    message: &TgMessage,
-) {
-    let from = message.from.as_ref().map(|user| user.id).unwrap_or_default();
+async fn handle(chat: &Chat, desk: &Desk, approver: i64, message: &TgMessage) {
+    let route = &desk.route;
+    let issuer = desk.issuer.as_str();
+    let default_to = desk.default_to.as_deref();
+    let from = message
+        .from
+        .as_ref()
+        .map(|user| user.id)
+        .unwrap_or_default();
     if from != approver {
         // Not an error worth answering: replying would confirm the bot exists to whoever
         // is probing it.
@@ -425,26 +799,26 @@ async fn handle(
     let reply = match parse_instruction(text) {
         None => help_text(default_to),
         Some(Instruction::Help) => help_text(default_to),
-        Some(Instruction::Agents) => match ferryman_channel::read_agent_roster(&route.communications)
-        {
-            Ok(roster) if roster.is_empty() => "no agents have joined this channel yet".to_string(),
-            Ok(roster) => {
-                let mut lines = vec![format!("{} agents:", roster.len())];
-                for agent in roster {
-                    let keyed = agent
-                        .public_key
-                        .as_ref()
-                        .is_some_and(|key| !key.is_empty());
-                    lines.push(format!(
-                        "  {} {}",
-                        agent.name,
-                        if keyed { "" } else { "(no key yet)" }
-                    ));
+        Some(Instruction::Agents) => {
+            match ferryman_channel::read_agent_roster(&route.communications) {
+                Ok(roster) if roster.is_empty() => {
+                    "no agents have joined this channel yet".to_string()
                 }
-                lines.join("\n")
+                Ok(roster) => {
+                    let mut lines = vec![format!("{} agents:", roster.len())];
+                    for agent in roster {
+                        let keyed = agent.public_key.as_ref().is_some_and(|key| !key.is_empty());
+                        lines.push(format!(
+                            "  {} {}",
+                            agent.name,
+                            if keyed { "" } else { "(no key yet)" }
+                        ));
+                    }
+                    lines.join("\n")
+                }
+                Err(error) => format!("could not read the roster: {error}"),
             }
-            Err(error) => format!("could not read the roster: {error}"),
-        },
+        }
         Some(Instruction::Status) => status_text(route),
         Some(Instruction::Order { to, task }) => {
             // An unaddressed order goes to whichever machine claims it first, which is the
@@ -508,14 +882,14 @@ fn opening(
         .collect();
 
     let (open, running) = match ferryman_channel::list_tasks(route) {
-        Ok(tasks) => tasks.iter().fold((0, 0), |(open, running), task| {
-            match task.state() {
+        Ok(tasks) => tasks
+            .iter()
+            .fold((0, 0), |(open, running), task| match task.state() {
                 ferryman_channel::TaskState::Open => (open + 1, running),
                 ferryman_channel::TaskState::Claimed { .. }
                 | ferryman_channel::TaskState::ChangesRequested { .. } => (open, running + 1),
                 _ => (open, running),
-            }
-        }),
+            }),
         Err(_) => (0, 0),
     };
 
@@ -614,17 +988,13 @@ fn issue(
 }
 
 /// Report results that have arrived since the last look.
-async fn announce(
-    chat: &Chat,
-    route: &ferryman_channel::ProjectRoute,
-    state: &mut BridgeState,
-    path: &Path,
-) -> Result<()> {
+async fn announce(chat: &Chat, desk: &mut Desk) -> Result<()> {
+    let route = &desk.route;
     let mut fresh: Vec<(String, String)> = Vec::new();
     for task in ferryman_channel::list_tasks(route)? {
         for result in &task.results {
             let key = result_key(&task.order.id, &result.agent, result.revision);
-            if state.knows(&key) {
+            if desk.state.knows(&key) {
                 continue;
             }
             let output = result
@@ -650,9 +1020,12 @@ async fn announce(
     // the send is what failed, and a phone that buzzes with yesterday's results twice is a
     // bridge an operator turns off.
     for (key, text) in fresh {
-        state.remember(key);
-        save(path, state)?;
-        chat.send(&text).await?;
+        desk.state.remember(key);
+        save(&desk.state_path, &desk.state)?;
+        // Into this project's topic, not into whatever chat the bridge was started with.
+        // A result that lands in the wrong topic is a result the operator has to work out
+        // the owner of, which is the whole thing the topics were for.
+        chat.send_to(desk.chat_id, desk.thread, &text).await?;
     }
     Ok(())
 }
@@ -687,7 +1060,10 @@ mod tests {
 
     #[test]
     fn a_group_suffix_is_addressing_not_part_of_the_command() {
-        assert_eq!(parse_instruction("/status@ferrymanbot"), Some(Instruction::Status));
+        assert_eq!(
+            parse_instruction("/status@ferrymanbot"),
+            Some(Instruction::Status)
+        );
     }
 
     #[test]
@@ -723,7 +1099,9 @@ mod tests {
             panic!("addressed order")
         };
         assert_eq!(
-            to.clone().or_else(|| Some("grouchly".to_string())).as_deref(),
+            to.clone()
+                .or_else(|| Some("grouchly".to_string()))
+                .as_deref(),
             Some("beastlywsl"),
             "an explicit target wins over the default"
         );
@@ -753,7 +1131,11 @@ mod tests {
         // The oldest fall off, not the newest: a restart must not re-announce what just
         // happened.
         assert!(!state.knows(&result_key("t", "a", 0)));
-        assert!(state.knows(&result_key("t", "a", u32::try_from(SEEN_LIMIT + 9).unwrap())));
+        assert!(state.knows(&result_key(
+            "t",
+            "a",
+            u32::try_from(SEEN_LIMIT + 9).unwrap()
+        )));
     }
 
     #[test]
