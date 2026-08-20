@@ -27,7 +27,7 @@ use ferryman_channel::{
     AgentIdentity, ProjectRoute, Recommendation, Review, Task, TaskResult, TaskState,
 };
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -918,6 +918,38 @@ pub fn gateway_config(workspace: &Path) -> String {
     .to_string()
 }
 
+/// What identifies one execution of a task in its heartbeat file, and keeps it fresh
+/// while the engine runs. The heartbeat is removed when this value drops, so a file
+/// left behind can only mean the worker died with the engine still running.
+struct TaskHeartbeat {
+    route: ProjectRoute,
+    order_id: String,
+    agent: String,
+    run: String,
+    pid: u32,
+}
+
+impl TaskHeartbeat {
+    fn write(&self) {
+        let heartbeat = ferryman_channel::Heartbeat {
+            order_id: self.order_id.clone(),
+            agent: self.agent.clone(),
+            run: self.run.clone(),
+            pid: self.pid,
+            at: chrono::Utc::now(),
+        };
+        if let Err(error) = ferryman_channel::write_heartbeat(&self.route, &heartbeat) {
+            tracing::warn!("could not write heartbeat for {}: {error:#}", self.order_id);
+        }
+    }
+}
+
+impl Drop for TaskHeartbeat {
+    fn drop(&mut self) {
+        ferryman_channel::remove_heartbeat(&self.route, &self.order_id, &self.agent);
+    }
+}
+
 /// stdout is the result. stderr is kept because a failed run's only explanation is
 /// usually there, and discarding it turns a diagnosable problem into a silent retry.
 async fn run_agent(
@@ -925,6 +957,7 @@ async fn run_agent(
     workspace: &Path,
     prompt: &str,
     credentials: &[(String, String)],
+    heartbeat: Option<TaskHeartbeat>,
 ) -> Result<AgentRun> {
     let (binary, args) = run_command(config, workspace, prompt, credentials);
     for warning in mount_warnings(workspace) {
@@ -973,6 +1006,16 @@ async fn run_agent(
     if let Some(pid) = child.id() {
         crate::priority::lower(pid);
     }
+    // ADR 0011: write the heartbeat carrying this run's id and the child's pid. The
+    // pid is local truth, read back only by this machine; the file is removed when the
+    // heartbeat drops, so one left behind can only mean the worker died mid-run.
+    let heartbeat = heartbeat.map(|mut heartbeat| {
+        heartbeat.pid = child.id().unwrap_or_else(std::process::id);
+        heartbeat.write();
+        heartbeat
+    });
+    let mut next_beat =
+        Instant::now() + Duration::from_secs(ferryman_channel::HEARTBEAT_INTERVAL_SECS as u64);
     let stdout_pipe = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
     let stderr_pipe = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
 
@@ -1001,6 +1044,14 @@ async fn run_agent(
             });
         }
         poll.tick().await;
+
+        if let Some(heartbeat) = &heartbeat
+            && Instant::now() >= next_beat
+        {
+            heartbeat.write();
+            next_beat = Instant::now()
+                + Duration::from_secs(ferryman_channel::HEARTBEAT_INTERVAL_SECS as u64);
+        }
 
         // A frozen agent holds the claim forever while the machine stays busy for
         // nothing. Kill it; the task fails and can be retried by someone else.
@@ -1130,7 +1181,7 @@ pub async fn run_engine_prompt(
     ))?;
     let mut config = config;
     config.runner = runner.clone();
-    let run = run_agent(&config, workspace, prompt, &[]).await?;
+    let run = run_agent(&config, workspace, prompt, &[], None).await?;
     if !run.ok {
         bail!("'{}' failed: {}", command, engine_failure_detail(&run));
     }
@@ -1500,6 +1551,154 @@ fn process_alive(pid: u32) -> bool {
     true
 }
 
+/// Whether a worker for `agent` is currently alive on this machine, by reading the
+/// same lock the worker takes. A `retire` refuses while this is true.
+pub fn worker_alive(attachment: &Path, agent: &str) -> bool {
+    let path = attachment.join(format!("worker-{}.lock", canonical(agent)));
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .is_some_and(process_alive)
+}
+
+/// Kill a lingering orphan process by pid, best effort. Only ever this machine's own
+/// children: a worker never judges another machine's processes.
+fn kill_pid(pid: u32) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+    #[cfg(windows)]
+    let _ = std::process::Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .status();
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+}
+
+/// Part 3 of ADR 0011: a worker kills and releases its own dead runs. A heartbeat
+/// under its own name whose pid is no longer alive is a run that died with its
+/// parent; an alive pid is an orphaned child that outlived it. Either way the run is
+/// over, so kill anything lingering and write a signed release. This is the only place
+/// a machine may judge a task abandoned, and only about itself.
+fn release_own_dead_runs(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    report: &dyn Progress,
+) -> Result<usize> {
+    let mut released = 0;
+    for task in ferryman_channel::list_tasks(route)? {
+        let Some(heartbeat) =
+            ferryman_channel::read_heartbeat(route, &task.order.id, &config.agent)?
+        else {
+            continue;
+        };
+        if process_alive(heartbeat.pid) {
+            kill_pid(heartbeat.pid);
+        }
+        if task
+            .holder()
+            .is_some_and(|held| held.eq_ignore_ascii_case(&config.agent))
+        {
+            match ferryman_channel::release_own_claim(
+                route,
+                &task.order.id,
+                &config.agent,
+                "worker died mid-run",
+                identity,
+            ) {
+                Ok(_) => {
+                    report.info(&format!("  {}: released (dead run)", task.order.id));
+                    released += 1;
+                }
+                Err(error) => report.warn(&format!(
+                    "  {}: could not release dead run: {error:#}",
+                    task.order.id
+                )),
+            }
+        }
+    }
+    Ok(released)
+}
+
+/// Part 4 of ADR 0011: a worker reclaims its own orphans at startup. A claim under
+/// its own name, with no result and no live run, is released so the task returns to
+/// the pool - and then the normal loop may re-claim it, which is the "resume" half of
+/// the decision, with the release as the record of the drop.
+fn reclaim_own_orphans(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    report: &dyn Progress,
+) -> Result<usize> {
+    let mut released = 0;
+    for task in ferryman_channel::list_tasks(route)? {
+        if !task
+            .holder()
+            .is_some_and(|held| held.eq_ignore_ascii_case(&config.agent))
+        {
+            continue;
+        }
+        // Only a claim with no result and no heartbeat is an orphan. A task with a
+        // result progressed; a task with a heartbeat is handled by the dead-run pass.
+        if task.latest_revision().is_some() {
+            continue;
+        }
+        if ferryman_channel::read_heartbeat(route, &task.order.id, &config.agent)?.is_some() {
+            continue;
+        }
+        match ferryman_channel::release_own_claim(
+            route,
+            &task.order.id,
+            &config.agent,
+            "orphaned at startup",
+            identity,
+        ) {
+            Ok(_) => {
+                report.info(&format!("  {}: released (orphaned)", task.order.id));
+                released += 1;
+            }
+            Err(error) => report.warn(&format!(
+                "  {}: could not release orphan: {error:#}",
+                task.order.id
+            )),
+        }
+    }
+    Ok(released)
+}
+
+/// Run the two startup recoveries once per process per channel. A claim or heartbeat
+/// from a previous incarnation is only judged at the moment a worker starts, never on
+/// every poll.
+fn recover_own_tasks(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    report: &dyn Progress,
+) -> Result<()> {
+    static RECOVERED: std::sync::LazyLock<std::sync::Mutex<HashSet<(String, String)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    let key = (route.project_id.clone(), config.agent.clone());
+    {
+        let mut seen = RECOVERED
+            .lock()
+            .map_err(|_| anyhow!("recovery guard poisoned"))?;
+        if !seen.insert(key) {
+            return Ok(());
+        }
+    }
+    let dead = release_own_dead_runs(route, config, identity, report)?;
+    let orphans = reclaim_own_orphans(route, config, identity, report)?;
+    if dead + orphans > 0 {
+        report.info(&format!(
+            "recovered {} task(s) I held but was not running",
+            dead + orphans
+        ));
+    }
+    Ok(())
+}
+
 fn canonical(agent: &str) -> String {
     ferryman_channel::canonical_agent_name(agent)
 }
@@ -1635,6 +1834,10 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
                 TaskState::Claimed { .. } => {
                     Some((id, "already claimed here; run the agent".to_string()))
                 }
+                TaskState::Stale { by, .. } => Some((
+                    id,
+                    format!("held by {by} but its heartbeat has lapsed; run it here again"),
+                )),
                 TaskState::ChangesRequested { revision, .. } => Some((
                     id,
                     format!("revision {revision} was rejected; run the agent again"),
@@ -1661,6 +1864,9 @@ pub async fn work_once(
     report: &dyn Progress,
 ) -> Result<usize> {
     let identity = AgentIdentity::load_or_create(&config.agent, &route.attachment)?;
+    // ADR 0011: at startup, and only at startup, a worker adjudicates what its own
+    // previous incarnation left behind - a claim with no result and no live run.
+    recover_own_tasks(route, config, &identity, report)?;
     // Always-on imports: any running worker re-polls the project's configured
     // sources and turns new external tickets into signed orders. This is what
     // makes an idle-but-running fleet pick work up without a human issuing it.
@@ -1735,7 +1941,9 @@ pub async fn work_once(
                     acted += 1;
                 }
             }
-            TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
+            TaskState::Claimed { .. }
+            | TaskState::ChangesRequested { .. }
+            | TaskState::Stale { .. } => {
                 if attempt(route, config, &identity, &task, report).await {
                     acted += 1;
                 }
@@ -2042,7 +2250,14 @@ async fn do_work(
         std::fs::write(workdir.join(".mcp.json"), gateway_config(&route.workspace))
             .context("write .mcp.json for the agent's MCP access")?;
     }
-    let run = run_agent(config, &workdir, &prompt, &credentials).await?;
+    let heartbeat = TaskHeartbeat {
+        route: route.clone(),
+        order_id: task.order.id.clone(),
+        agent: config.agent.clone(),
+        run: ferryman_channel::new_run_id(),
+        pid: 0,
+    };
+    let run = run_agent(config, &workdir, &prompt, &credentials, Some(heartbeat)).await?;
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
     // never fail the run itself.
@@ -2077,45 +2292,17 @@ async fn do_work(
         // not outlive the task, while the result recorded the branch point as
         // `worktree_head` - a hash that reads like provenance and points at the tree as
         // it was before the agent touched it.
-        let subject = commit_subject(id, &task.order);
-        match ferryman_channel::worktree::commit_all(&workdir, &config.agent, &subject) {
-            Ok(Some(made)) => {
-                payload["committed"] = json!(made);
-                report.info(&format!(
-                    "  {id}: committed {} on {branch}",
-                    &made[..12.min(made.len())]
-                ));
-                if let Some(remote) = &config.push {
-                    match ferryman_channel::worktree::push_branch(&route.workspace, remote, &branch)
-                    {
-                        Ok(()) => {
-                            payload["pushed"] = json!(remote);
-                            report.info(&format!("  {id}: pushed {branch} to {remote}"));
-                        }
-                        // Not fatal, and deliberately loud. The commit exists either way;
-                        // what is lost is only the copy on the remote, and a reviewer who
-                        // cannot find the branch needs to know it stayed here.
-                        Err(e) => {
-                            payload["push_failed"] = json!(e.to_string());
-                            report.warn(&format!(
-                                "  {id}: committed but could not push to {remote}: {e}"
-                            ));
-                        }
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
-        }
-
-        if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, &branch) {
-            payload["worktree_head"] = json!(head);
-        }
-        match ferryman_channel::worktree::retire_worktree(&route.workspace, &branch, &base_commit) {
-            Ok(true) => payload["branch_kept"] = json!(true),
-            Ok(false) => {}
-            Err(e) => report.warn(&format!("  {id}: could not retire the worktree: {e}")),
-        }
+        settle_worktree(
+            route,
+            config,
+            task,
+            id,
+            &branch,
+            &base_commit,
+            &workdir,
+            &mut payload,
+            report,
+        );
     }
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
@@ -2164,6 +2351,74 @@ async fn do_work(
         identity,
     );
     Ok(())
+}
+
+/// Commit the worktree, retire it, and publish the branch when it is worth keeping.
+///
+/// The push is keyed off whether the branch has work, not off whether this worker
+/// made the commit. The engine may have committed directly on the branch - for
+/// example when a previous worker's result is being replayed - in which case the
+/// tree is clean, [`ferryman_channel::worktree::commit_all`] returns `None`, and a
+/// push gated on `Ok(Some(..))` would keep the branch but never publish it. That is
+/// how a recovered task ended up committed on one machine and invisible everywhere
+/// else.
+///
+/// [`ferryman_channel::worktree::retire_worktree`] already makes the judgement: it
+/// returns `Ok(true)` when the branch carries anything not reachable from `base`.
+/// So the push happens after the worktree is retired, which makes a kept branch
+/// always a pushed branch. A branch with no work is retired without a push.
+fn settle_worktree(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    task: &Task,
+    id: &str,
+    branch: &str,
+    base_commit: &str,
+    workdir: &Path,
+    payload: &mut Value,
+    report: &dyn Progress,
+) {
+    let subject = commit_subject(id, &task.order);
+    match ferryman_channel::worktree::commit_all(workdir, &config.agent, &subject) {
+        Ok(Some(made)) => {
+            payload["committed"] = json!(made);
+            report.info(&format!(
+                "  {id}: committed {} on {branch}",
+                &made[..12.min(made.len())]
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
+    }
+
+    if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, branch) {
+        payload["worktree_head"] = json!(head);
+    }
+
+    match ferryman_channel::worktree::retire_worktree(&route.workspace, branch, base_commit) {
+        Ok(true) => {
+            payload["branch_kept"] = json!(true);
+            if let Some(remote) = &config.push {
+                match ferryman_channel::worktree::push_branch(&route.workspace, remote, branch) {
+                    Ok(()) => {
+                        payload["pushed"] = json!(remote);
+                        report.info(&format!("  {id}: pushed {branch} to {remote}"));
+                    }
+                    // Not fatal, and deliberately loud. The commit exists either way;
+                    // what is lost is only the copy on the remote, and a reviewer who
+                    // cannot find the branch needs to know it stayed here.
+                    Err(e) => {
+                        payload["push_failed"] = json!(e.to_string());
+                        report.warn(&format!(
+                            "  {id}: committed but could not push to {remote}: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(e) => report.warn(&format!("  {id}: could not retire the worktree: {e}")),
+    }
 }
 
 /// Judge whatever is waiting, according to the authority the operator granted.
@@ -2239,6 +2494,7 @@ pub async fn review_once(
             &route.workspace,
             &review_prompt(config, &task, revision, &roster),
             &credentials,
+            None,
         )
         .await?;
         if !run.ok {
@@ -2681,6 +2937,22 @@ mod tests {
         std::fs::write(dir.path().join("worker-fang.lock"), "999999999").unwrap();
         assert!(WorkerLock::take(dir.path(), "fang").unwrap().is_some());
     }
+    #[test]
+    fn retire_refuses_while_that_worker_is_alive() {
+        let dir = tempfile::tempdir().unwrap();
+        // A lock naming this process's own pid (alive) means the worker is alive, which
+        // is exactly what `retire` checks before releasing anything.
+        std::fs::write(
+            dir.path().join("worker-grouchly.lock"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        assert!(worker_alive(dir.path(), "grouchly"));
+
+        // A lock naming a pid that no longer exists means the worker is gone.
+        std::fs::write(dir.path().join("worker-grouchly.lock"), "999999999").unwrap();
+        assert!(!worker_alive(dir.path(), "grouchly"));
+    }
 
     #[test]
     fn the_name_is_folded_the_way_every_other_store_folds_it() {
@@ -3012,6 +3284,8 @@ mod tests {
             results,
             reviews,
             recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
         }
     }
 
@@ -3358,7 +3632,9 @@ mod tests {
             "agent = \"w\"\ncommand = \"sleep\"\nargs = [\"30\"]\nstall_secs = \"1\"\ntimeout_secs = \"60\"\n",
         )
         .unwrap();
-        let error = run_agent(&config, &dir, "hello", &[]).await.unwrap_err();
+        let error = run_agent(&config, &dir, "hello", &[], None)
+            .await
+            .unwrap_err();
         assert!(
             format!("{error}").contains("frozen"),
             "expected the stall watchdog, got: {error:#}"
@@ -3392,5 +3668,243 @@ mod tests {
         assert_eq!(json["mcpServers"]["ferryman"]["command"], "ferry");
         assert_eq!(json["mcpServers"]["ferryman"]["args"][1], "serve");
         assert_eq!(json["mcpServers"]["ferryman"]["args"][3], "/srv/project");
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_bare(remote: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", remote.to_str().unwrap()])
+            .status()
+            .expect("run git init --bare");
+        assert!(status.success());
+    }
+
+    fn unique(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn project_route(workspace: &Path) -> ProjectRoute {
+        ProjectRoute {
+            project_id: "test".to_string(),
+            workspace: workspace.to_path_buf(),
+            attachment: workspace.join(".ferryman"),
+            communications: workspace.join(".ferryman").join("ferryman"),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn test_task(id: &str) -> Task {
+        Task {
+            order: ferryman_channel::Order {
+                id: id.to_string(),
+                project_id: "test".to_string(),
+                issued_by: "operator".to_string(),
+                assigned_to: None,
+                created_at: chrono::Utc::now(),
+                payload: json!({ "task": "do the thing" }),
+                requires_review: false,
+                requires_approval: false,
+                depends_on: Vec::new(),
+                signed_by: None,
+                signature: None,
+                result_contract: None,
+            },
+            claims: Vec::new(),
+            results: Vec::new(),
+            reviews: Vec::new(),
+            recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
+        }
+    }
+
+    /// A commit the worker did not make must still be published: the engine may have
+    /// committed directly on the branch, which leaves a clean tree (`commit_all` returns
+    /// `None`) while the branch still carries the work. Pushing must be keyed off the
+    /// branch having work, which `retire_worktree` already decides.
+    #[test]
+    fn a_branch_the_engine_committed_itself_still_gets_pushed() {
+        let repo = unique("ferryman-agent-repo");
+        let remote = unique("ferryman-agent-remote.git");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        init_bare(&remote);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "PUSH-A", "worker").unwrap();
+        fs::write(dir.join("answer.txt"), "the engine wrote this").unwrap();
+        run_git(&dir, &["add", "answer.txt"]);
+        run_git(&dir, &["commit", "-q", "-m", "engine commit"]);
+
+        let route = project_route(&repo);
+        let task = test_task("PUSH-A");
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "PUSH-A",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        assert_eq!(payload["branch_kept"], json!(true));
+        assert_eq!(payload["pushed"], json!("origin"));
+        let on_remote = run_git(&repo, &["ls-remote", "origin", branch.as_str()]);
+        assert!(
+            !on_remote.is_empty(),
+            "the kept branch must be on the remote"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// No work means no branch means nothing to publish: `retire_worktree` deletes the
+    /// branch when it carries nothing beyond its base, and a push must not resurrect it.
+    #[test]
+    fn a_branch_with_no_work_is_not_pushed() {
+        let repo = unique("ferryman-agent-repo");
+        let remote = unique("ferryman-agent-remote.git");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        init_bare(&remote);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "PUSH-B", "worker").unwrap();
+
+        let route = project_route(&repo);
+        let task = test_task("PUSH-B");
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "PUSH-B",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        assert!(payload.get("pushed").is_none(), "no work means no push");
+        assert!(payload.get("branch_kept").is_none());
+        let on_remote = run_git(&repo, &["ls-remote", "origin", branch.as_str()]);
+        assert!(
+            on_remote.is_empty(),
+            "a branch with no work must not reach the remote"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// A push that fails is loud but not fatal: the work is already committed and the
+    /// result still goes out, with `push_failed` saying where the copy is missing.
+    #[test]
+    fn a_push_failure_does_not_fail_the_task() {
+        let repo = unique("ferryman-agent-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "PUSH-C", "worker").unwrap();
+        fs::write(dir.join("answer.txt"), "work that stays local").unwrap();
+        run_git(&dir, &["add", "answer.txt"]);
+        run_git(&dir, &["commit", "-q", "-m", "engine commit"]);
+
+        let route = project_route(&repo);
+        let task = test_task("PUSH-C");
+        // `origin` is configured as the publish target but no such remote exists, so the
+        // push fails. The branch is still kept, and the task does not fail.
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "PUSH-C",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        assert_eq!(payload["branch_kept"], json!(true));
+        assert!(payload.get("pushed").is_none());
+        assert!(
+            payload["push_failed"].is_string(),
+            "the failure must be recorded, not swallowed"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
     }
 }

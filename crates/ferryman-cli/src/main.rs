@@ -619,6 +619,18 @@ enum Channel {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Retire an identity that is gone, releasing every claim it holds. Signed and
+    /// recorded, so the ledger keeps who held a task, who let it go, and why. Refuses
+    /// to retire a name whose worker is currently alive on this machine.
+    Retire {
+        /// The folder holding the channels. Defaults to the parent of the current
+        /// directory, so it can be run from inside one of the channels.
+        #[arg(long)]
+        comms: Option<PathBuf>,
+        /// The name being retired: whose claims are released.
+        #[arg(long, value_parser = agent_name)]
+        agent: String,
+    },
     /// Announce this agent to the fleet so others can address it.
     Join {
         #[arg(long)]
@@ -3944,6 +3956,77 @@ fn channel(command: Channel) -> Result<()> {
                 println!("seated in {seated} channel(s)");
             }
         }
+        Channel::Retire { comms, agent } => {
+            // Default to the folder this channel lives in: running `ferry channel retire`
+            // from inside a project should find the whole fleet, not just this project.
+            let comms = comms.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| cwd.parent().map(|parent| parent.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("."))
+            });
+            let fleet = ferryman_ops::agent::fleet_under(&comms)?;
+            if fleet.served.is_empty() {
+                bail!("no Ferryman channels under {}", comms.display());
+            }
+            // Refuse while that worker is alive on this machine. Retiring is for a holder
+            // that is gone, not one that is mid-task.
+            let mut live = Vec::new();
+            for (route, _) in &fleet.served {
+                if ferryman_ops::agent::worker_alive(&route.attachment, &agent) {
+                    live.push(route.project_id.clone());
+                }
+            }
+            if !live.is_empty() {
+                bail!(
+                    "refusing to retire '{agent}': a worker is alive on this machine in {}",
+                    live.join(", ")
+                );
+            }
+            let mut released = 0;
+            let mut tasks = 0;
+            for (route, _) in &fleet.served {
+                // The releaser is this machine, resolved the same way every other
+                // command resolves an acting identity - so the record says who retired
+                // the name, not merely that someone did.
+                let releaser = ferryman_ops::identity::resolve(None, &route.attachment)?;
+                let identity = signing_identity(route, &releaser)?;
+                for task in ferryman_channel::list_tasks(route)? {
+                    if task.holder() != Some(agent.as_str()) {
+                        continue;
+                    }
+                    // Only a claim that is actually holding the task - no result yet - is
+                    // released. A claim beside a finished task is history, not a hold.
+                    if task.latest_revision().is_some() {
+                        continue;
+                    }
+                    tasks += 1;
+                    match ferryman_channel::release_claim(
+                        route,
+                        &task.order.id,
+                        &agent,
+                        &releaser,
+                        "retired",
+                        &identity,
+                    ) {
+                        Ok(_) => {
+                            println!(
+                                "  {}: released {}'s claim on {}",
+                                route.project_id, agent, task.order.id
+                            );
+                            released += 1;
+                        }
+                        Err(error) => {
+                            println!(
+                                "  {}: refused {}: {error:#}",
+                                route.project_id, task.order.id
+                            );
+                        }
+                    }
+                }
+            }
+            println!("retired '{agent}': released {released} of {tasks} held claim(s)");
+        }
         Channel::Join {
             workspace,
             name,
@@ -4357,6 +4440,9 @@ fn channel(command: Channel) -> Result<()> {
                             }
                             ferryman_channel::TaskState::Claimed { by } => {
                                 format!("held by {by}")
+                            }
+                            ferryman_channel::TaskState::Stale { by, .. } => {
+                                format!("held by {by}, but its heartbeat has lapsed")
                             }
                             ferryman_channel::TaskState::Offered { to } => {
                                 format!("addressed to {to}, who has not picked it up")

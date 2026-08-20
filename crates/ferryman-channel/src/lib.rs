@@ -706,6 +706,53 @@ pub struct Claim {
     pub claimed_at: DateTime<Utc>,
 }
 
+/// How often a running worker rewrites its heartbeat.
+pub const HEARTBEAT_INTERVAL_SECS: i64 = 30;
+/// A heartbeat this many intervals old reads as `Stale` (display only).
+pub const HEARTBEAT_STALE_MULTIPLE: i64 = 10;
+
+/// A heartbeat a worker rewrites while a task runs.
+///
+/// `run` names *this* execution, so a retry after a failure is distinguishable from
+/// the attempt before it. `pid` is local truth on the machine that wrote it and
+/// meaningless anywhere else - it is only ever read back by that machine, to decide
+/// whether its own child is still alive. See ADR 0011.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Heartbeat {
+    pub order_id: String,
+    pub agent: String,
+    pub run: String,
+    pub pid: u32,
+    pub at: DateTime<Utc>,
+}
+
+/// A signed, recorded release of a claim.
+///
+/// The claim file is kept beside the release on purpose: the history should say who
+/// held a task, who let it go, and why. A release is never a result - it says the
+/// work was abandoned, never that it was done.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Release {
+    pub order_id: String,
+    /// The agent whose claim is being released.
+    pub released: String,
+    /// The agent (or operator) doing the releasing.
+    pub releaser: String,
+    pub reason: String,
+    pub at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A short, unique name for one execution of a task, so a retry is distinguishable
+/// from the attempt before it. Uniqueness matters, not beauty.
+#[must_use]
+pub fn new_run_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
 /// A submitted result, at a revision.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TaskResult {
@@ -787,6 +834,11 @@ pub enum TaskState {
     Offered { to: String },
     /// Claimed, being worked on.
     Claimed { by: String },
+    /// Claimed, but the holder's heartbeat has lapsed past a generous multiple of the
+    /// interval. Display only: it must not make the task claimable by anyone. It
+    /// exists because "nobody is doing this" currently looks identical to "someone is
+    /// doing this". See ADR 0011.
+    Stale { by: String, since: DateTime<Utc> },
     /// A result is in, waiting on a reviewer.
     AwaitingReview { by: String, revision: u32 },
     /// Sent back; the next revision is owed.
@@ -808,9 +860,45 @@ pub struct Task {
     /// never change `state()`, so a machine that does not understand them behaves
     /// exactly as it did before.
     pub recommendations: Vec<Recommendation>,
+    /// Heartbeats written by workers while they run the task. Read for display (see
+    /// [`TaskState::Stale`]) and, by the machine that wrote one, to decide whether its
+    /// own child is still alive.
+    pub heartbeats: Vec<Heartbeat>,
+    /// Signed releases of claims. A released claim is no longer held, so the task
+    /// returns to `Open` or `Offered`.
+    pub releases: Vec<Release>,
 }
 
 impl Task {
+    /// Whether the given agent's claim on this task has been released.
+    #[must_use]
+    pub fn released(&self, agent: &str) -> bool {
+        self.releases
+            .iter()
+            .any(|release| release.released.eq_ignore_ascii_case(agent))
+    }
+
+    /// The claims that still count: every claim except one its holder has released.
+    fn active_claims(&self) -> impl Iterator<Item = &Claim> {
+        self.claims
+            .iter()
+            .filter(|claim| !self.released(&claim.agent))
+    }
+
+    /// Whether the holder holds the task via an actual (unreleased) claim, rather than
+    /// merely by being the assignee of an order nobody has picked up yet.
+    fn held_by_claim(&self, holder: &str) -> bool {
+        self.active_claims()
+            .any(|claim| claim.agent.eq_ignore_ascii_case(holder))
+    }
+
+    /// The holder's heartbeat, if one was written under the holder's own name.
+    fn heartbeat_for(&self, agent: &str) -> Option<&Heartbeat> {
+        self.heartbeats
+            .iter()
+            .find(|heartbeat| heartbeat.agent.eq_ignore_ascii_case(agent))
+    }
+
     /// Who holds this task.
     ///
     /// An addressed order belongs to its assignee and nobody else. For an open order the
@@ -819,13 +907,15 @@ impl Task {
     /// from the same files resolves that without anyone having to be authoritative. The
     /// loser discovers it lost and stops, having wasted seconds rather than corrupted
     /// anything.
+    ///
+    /// A released claim no longer counts: releasing is what returns a task to `Open` or
+    /// `Offered`, so the holder must be recomputed as if that claim never existed.
     #[must_use]
     pub fn holder(&self) -> Option<&str> {
         if let Some(assignee) = &self.order.assigned_to {
             return Some(assignee.as_str());
         }
-        self.claims
-            .iter()
+        self.active_claims()
             .min_by(|a, b| {
                 a.claimed_at
                     .cmp(&b.claimed_at)
@@ -872,20 +962,38 @@ impl Task {
 
     #[must_use]
     pub fn state(&self) -> TaskState {
+        self.state_at(Utc::now())
+    }
+
+    /// `state`, with the current instant passed in rather than read, so staleness can be
+    /// reasoned about without sleeping in a test.
+    #[must_use]
+    pub fn state_at(&self, now: DateTime<Utc>) -> TaskState {
         let Some(holder) = self.holder() else {
             return TaskState::Open;
         };
         let Some(revision) = self.latest_revision() else {
             // A claim is a record someone wrote: it says who took it and when. An
             // assignment is only a wish until then.
-            return if self.claims.is_empty() {
-                TaskState::Offered {
+            if !self.held_by_claim(holder) {
+                return TaskState::Offered {
                     to: holder.to_string(),
-                }
-            } else {
-                TaskState::Claimed {
+                };
+            }
+            // A heartbeat that has lapsed reads as stale. This is display only: it
+            // must not make the task claimable by anyone. The threshold is a generous
+            // multiple of the interval so that a wrong clock does not start lying about
+            // a task that is merely slow to sync.
+            if let Some(heartbeat) = self.heartbeat_for(holder)
+                && heartbeat_lapsed(heartbeat, now)
+            {
+                return TaskState::Stale {
                     by: holder.to_string(),
-                }
+                    since: heartbeat.at,
+                };
+            }
+            return TaskState::Claimed {
+                by: holder.to_string(),
             };
         };
         let verdict = self.reviews.iter().find(|r| r.revision == revision);
@@ -901,6 +1009,12 @@ impl Task {
             None => TaskState::Done,
         }
     }
+}
+
+/// Whether a heartbeat is old enough to report its task as stale.
+fn heartbeat_lapsed(heartbeat: &Heartbeat, now: DateTime<Utc>) -> bool {
+    let threshold = chrono::Duration::seconds(HEARTBEAT_INTERVAL_SECS * HEARTBEAT_STALE_MULTIPLE);
+    now.signed_duration_since(heartbeat.at) > threshold
 }
 
 fn tasks_root(route: &ProjectRoute) -> PathBuf {
@@ -964,6 +1078,136 @@ pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<
         write_task_file(&path, &claim)?;
     }
     Ok(claim)
+}
+
+fn heartbeat_path(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
+    task_dir(route, order_id).join(format!("heartbeat.{agent}.json"))
+}
+
+fn release_path(route: &ProjectRoute, order_id: &str, releaser: &str) -> PathBuf {
+    task_dir(route, order_id).join(format!("release.{releaser}.json"))
+}
+
+/// Write (or rewrite) this agent's heartbeat for a task. One writer per path.
+pub fn write_heartbeat(route: &ProjectRoute, heartbeat: &Heartbeat) -> Result<PathBuf> {
+    if !is_safe_component(&heartbeat.agent) {
+        bail!("agent name must be a path-safe identifier")
+    }
+    if !is_safe_component(&heartbeat.order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
+    let path = heartbeat_path(route, &heartbeat.order_id, &heartbeat.agent);
+    write_task_file(&path, heartbeat)?;
+    Ok(path)
+}
+
+/// Remove this agent's heartbeat for a task once the run has finished. Best effort: a
+/// heartbeat left behind by a killed worker is exactly what the dead-run recovery in
+/// the worker reads back.
+pub fn remove_heartbeat(route: &ProjectRoute, order_id: &str, agent: &str) {
+    let path = heartbeat_path(route, order_id, agent);
+    let _ = fs::remove_file(path);
+}
+
+/// Read this agent's heartbeat for a task, if one has been written.
+pub fn read_heartbeat(
+    route: &ProjectRoute,
+    order_id: &str,
+    agent: &str,
+) -> Result<Option<Heartbeat>> {
+    let path = heartbeat_path(route, order_id, agent);
+    match fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(serde_json::from_str(&text)?)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// Write a signed release into the channel, atomically. One writer per path: each
+/// releaser writes only its own `release.<releaser>.json`.
+pub fn write_release(route: &ProjectRoute, release: &Release) -> Result<PathBuf> {
+    if !is_safe_component(&release.releaser) {
+        bail!("releaser name must be a path-safe identifier")
+    }
+    if !is_safe_component(&release.released) {
+        bail!("released name must be a path-safe identifier")
+    }
+    if !is_safe_component(&release.order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
+    let path = release_path(route, &release.order_id, &release.releaser);
+    write_task_file(&path, release)?;
+    Ok(path)
+}
+
+/// Release a claim, signed and recorded, and return the written release.
+///
+/// The caller chooses `released` (whose claim is freed) and `releaser` (who is doing
+/// the freeing). A worker freeing its own claim passes the same name for both; a
+/// deliberate retire passes the retired name as `released` and the operator or machine
+/// acting as `releaser`. The ledger entry records who let the task go and why, and the
+/// claim file is left in place so the history keeps both sides of the hand-over.
+pub fn release_claim(
+    route: &ProjectRoute,
+    order_id: &str,
+    released: &str,
+    releaser: &str,
+    reason: &str,
+    identity: &AgentIdentity,
+) -> Result<Release> {
+    if !is_safe_component(order_id) {
+        bail!("order id must be a path-safe identifier")
+    }
+    if !is_safe_component(released) {
+        bail!("released name must be a path-safe identifier")
+    }
+    if !is_safe_component(releaser) {
+        bail!("releaser name must be a path-safe identifier")
+    }
+    let mut release = Release {
+        order_id: order_id.to_string(),
+        released: released.to_string(),
+        releaser: releaser.to_string(),
+        reason: reason.to_string(),
+        at: Utc::now(),
+        signed_by: None,
+        signature: None,
+    };
+    identity.sign_release(&mut release);
+    write_release(route, &release)?;
+    crate::ledger::append_ledger_entry(
+        route,
+        identity,
+        "release",
+        releaser,
+        &format!("released {released}'s claim on {order_id} ({reason})"),
+        Some(order_id),
+    )?;
+    Ok(release)
+}
+
+/// Release the caller's own claim, and nothing else.
+///
+/// A worker may only decide a task is abandoned about itself. Releasing a claim held
+/// by another agent is refused here, because the whole point of a signed release is
+/// that it says who let a task go - and a machine has no authority to say that about
+/// someone else's claim. A deliberate retire of a gone identity is the separate,
+/// operator-invoked path.
+pub fn release_own_claim(
+    route: &ProjectRoute,
+    order_id: &str,
+    agent: &str,
+    reason: &str,
+    identity: &AgentIdentity,
+) -> Result<Release> {
+    let task = read_task(route, order_id)?;
+    if task
+        .holder()
+        .is_none_or(|held| !held.eq_ignore_ascii_case(agent))
+    {
+        bail!("{agent} does not hold {order_id}; a worker may only release its own claim");
+    }
+    release_claim(route, order_id, agent, agent, reason, identity)
 }
 
 /// Submit a result at a revision.
@@ -1073,6 +1317,8 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let mut results = Vec::new();
     let mut reviews = Vec::new();
     let mut recommendations = Vec::new();
+    let mut heartbeats = Vec::new();
+    let mut releases = Vec::new();
     for entry in fs::read_dir(&directory)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1101,6 +1347,18 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             && verify_recommendation(&value, &route.agents) == SignatureCheck::Valid
         {
             recommendations.push(value);
+        } else if name.starts_with("heartbeat.")
+            && let Ok(value) = serde_json::from_str::<Heartbeat>(&text)
+        {
+            // Heartbeats are unsigned local truth; the pid is only meaningful to the
+            // machine that wrote it, and no signature is checked here for the same
+            // reason a claim carries none - it is a marker, not an assertion of work.
+            heartbeats.push(value);
+        } else if name.starts_with("release.")
+            && let Ok(value) = serde_json::from_str::<Release>(&text)
+            && verify_release(&value, &route.agents) == SignatureCheck::Valid
+        {
+            releases.push(value);
         }
     }
     results.sort_by_key(|r: &TaskResult| r.revision);
@@ -1112,6 +1370,8 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         results,
         reviews,
         recommendations,
+        heartbeats,
+        releases,
     })
 }
 
@@ -1174,7 +1434,11 @@ pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
                     out.push(task);
                 }
             }
-            TaskState::Claimed { .. } | TaskState::ChangesRequested { .. } => {
+            // Stale is display only: it is treated here exactly as `Claimed`, offered
+            // only to its holder. It must not make the task claimable by anyone else.
+            TaskState::Claimed { .. }
+            | TaskState::ChangesRequested { .. }
+            | TaskState::Stale { .. } => {
                 if task
                     .holder()
                     .is_some_and(|held| held.eq_ignore_ascii_case(agent))
@@ -1526,6 +1790,12 @@ impl AgentIdentity {
         interrupt.signed_by = Some(self.name.clone());
         interrupt.signature = Some(hex::encode(signature.to_bytes()));
     }
+    /// Sign a release, so freeing a claim cannot be forged onto an agent.
+    pub fn sign_release(&self, release: &mut Release) {
+        let signature = self.signing.sign(release_payload(release).as_bytes());
+        release.signed_by = Some(self.name.clone());
+        release.signature = Some(hex::encode(signature.to_bytes()));
+    }
 }
 
 fn order_payload(order: &Order) -> String {
@@ -1591,6 +1861,16 @@ fn recommendation_payload(recommendation: &Recommendation) -> String {
         recommendation.recommended_at.to_rfc3339(),
         recommendation.accept,
         recommendation.reasoning,
+    )
+}
+fn release_payload(release: &Release) -> String {
+    format!(
+        "ferryman-release-v1\n{}\n{}\n{}\n{}\n{}",
+        release.order_id,
+        release.released,
+        release.releaser,
+        release.reason,
+        release.at.to_rfc3339(),
     )
 }
 
@@ -1672,6 +1952,17 @@ pub fn verify_review(review: &Review, roster: &[AgentRoute]) -> SignatureCheck {
         review.signed_by.as_ref(),
         review.signature.as_ref(),
         &review_payload(review),
+        roster,
+    )
+}
+/// Who released this claim, checkably. A release is a security-relevant act - it frees
+/// a claim so another machine can take the task - so only a verified one is honoured.
+#[must_use]
+pub fn verify_release(release: &Release, roster: &[AgentRoute]) -> SignatureCheck {
+    check_signature(
+        release.signed_by.as_ref(),
+        release.signature.as_ref(),
+        &release_payload(release),
         roster,
     )
 }
@@ -7754,6 +8045,142 @@ mod work_over_files_tests {
             task.holder(),
             Some("fang"),
             "oldest claim wins, and every machine computes that identically from the same files"
+        );
+    }
+    #[test]
+    fn a_claim_whose_heartbeat_has_lapsed_reads_stale_and_stays_held() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        claim_order(&route, "t-1", "grouchly").unwrap();
+        write_heartbeat(
+            &route,
+            &Heartbeat {
+                order_id: "t-1".into(),
+                agent: "grouchly".into(),
+                run: "1a".into(),
+                pid: 12345,
+                at: Utc::now()
+                    - chrono::Duration::seconds(
+                        HEARTBEAT_INTERVAL_SECS * HEARTBEAT_STALE_MULTIPLE + 60,
+                    ),
+            },
+        )
+        .unwrap();
+
+        let task = read_task(&route, "t-1").unwrap();
+        assert!(
+            matches!(task.state(), TaskState::Stale { ref by, .. } if by == "grouchly"),
+            "a lapsed heartbeat must read as stale, got {:?}",
+            task.state()
+        );
+        // Display only: it is not offered to another machine...
+        assert!(work_for(&route, "beastly").unwrap().is_empty());
+        // ...but it is still offered to its own holder, exactly as Claimed is.
+        assert_eq!(work_for(&route, "grouchly").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_release_returns_the_task_to_open_and_to_offered_when_addressed() {
+        let (_t, route, identities) = signed_channel();
+
+        // An open order: releasing the claim returns it to Open.
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        claim_order(&route, "t-1", "grouchly").unwrap();
+        release_claim(
+            &route,
+            "t-1",
+            "grouchly",
+            "grouchly",
+            "test",
+            &identities["grouchly"],
+        )
+        .unwrap();
+        assert_eq!(read_task(&route, "t-1").unwrap().state(), TaskState::Open);
+
+        // An addressed order: releasing the claim returns it to Offered.
+        issue_order(&route, &order("t-2", Some("grouchly"), false)).unwrap();
+        claim_order(&route, "t-2", "grouchly").unwrap();
+        release_claim(
+            &route,
+            "t-2",
+            "grouchly",
+            "grouchly",
+            "test",
+            &identities["grouchly"],
+        )
+        .unwrap();
+        assert!(matches!(
+            read_task(&route, "t-2").unwrap().state(),
+            TaskState::Offered { ref to } if to == "grouchly"
+        ));
+    }
+
+    #[test]
+    fn a_worker_will_not_release_a_claim_it_does_not_hold() {
+        let (_t, route, identities) = signed_channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        claim_order(&route, "t-1", "grouchly").unwrap();
+
+        let error = release_own_claim(&route, "t-1", "nebra", "test", &identities["nebra"])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not hold"), "must refuse: {error}");
+
+        // The claim is untouched: grouchly still holds it.
+        assert_eq!(read_task(&route, "t-1").unwrap().holder(), Some("grouchly"));
+    }
+
+    #[test]
+    fn a_release_is_not_a_result() {
+        let (_t, route, identities) = signed_channel();
+        issue_order(&route, &order("t-1", None, true)).unwrap();
+        claim_order(&route, "t-1", "grouchly").unwrap();
+        release_claim(
+            &route,
+            "t-1",
+            "grouchly",
+            "grouchly",
+            "test",
+            &identities["grouchly"],
+        )
+        .unwrap();
+
+        let task = read_task(&route, "t-1").unwrap();
+        // A release says the work was abandoned, never that it was done: no revision was
+        // submitted, and the task is back to Open rather than Accepted/Done.
+        assert_eq!(task.latest_revision(), None);
+        assert_eq!(task.state(), TaskState::Open);
+    }
+
+    #[test]
+    fn a_release_is_signed_and_recorded_beside_the_claim() {
+        let (_t, route, identities) = signed_channel();
+        issue_order(&route, &order("t-1", None, false)).unwrap();
+        claim_order(&route, "t-1", "grouchly").unwrap();
+        release_claim(
+            &route,
+            "t-1",
+            "grouchly",
+            "grouchly",
+            "retired",
+            &identities["grouchly"],
+        )
+        .unwrap();
+
+        let dir = task_dir(&route, "t-1");
+        assert!(
+            dir.join("claim.grouchly.json").is_file(),
+            "the claim is kept so the history keeps both sides of the hand-over"
+        );
+        assert!(dir.join("release.grouchly.json").is_file());
+        let release: Release =
+            serde_json::from_str(&fs::read_to_string(dir.join("release.grouchly.json")).unwrap())
+                .unwrap();
+        assert_eq!(release.released, "grouchly");
+        assert_eq!(release.reason, "retired");
+        assert_eq!(
+            verify_release(&release, &route.agents),
+            SignatureCheck::Valid
         );
     }
 

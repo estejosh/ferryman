@@ -1203,6 +1203,9 @@ fn state_value(state: &TaskState) -> Value {
         TaskState::Open => json!({ "status": "open" }),
         TaskState::Offered { to } => json!({ "status": "offered", "to": to }),
         TaskState::Claimed { by } => json!({ "status": "claimed", "by": by }),
+        TaskState::Stale { by, since } => {
+            json!({ "status": "stale", "by": by, "since": since.to_rfc3339() })
+        }
         TaskState::AwaitingReview { by, revision } => {
             json!({ "status": "awaiting_review", "by": by, "revision": revision })
         }

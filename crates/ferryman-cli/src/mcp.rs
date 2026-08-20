@@ -243,6 +243,7 @@ fn state_name(state: &TaskState) -> &'static str {
         TaskState::Open => "open",
         TaskState::Offered { .. } => "offered",
         TaskState::Claimed { .. } => "claimed",
+        TaskState::Stale { .. } => "stale",
         TaskState::AwaitingReview { .. } => "awaiting_review",
         TaskState::ChangesRequested { .. } => "changes_requested",
         TaskState::Accepted => "accepted",
