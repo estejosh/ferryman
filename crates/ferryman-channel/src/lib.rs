@@ -8051,12 +8051,12 @@ mod work_over_files_tests {
     fn a_claim_whose_heartbeat_has_lapsed_reads_stale_and_stays_held() {
         let (_t, route) = channel();
         issue_order(&route, &order("t-1", None, false)).unwrap();
-        claim_order(&route, "t-1", "grouchly").unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
         write_heartbeat(
             &route,
             &Heartbeat {
                 order_id: "t-1".into(),
-                agent: "grouchly".into(),
+                agent: "fang".into(),
                 run: "1a".into(),
                 pid: 12345,
                 at: Utc::now()
@@ -8069,14 +8069,14 @@ mod work_over_files_tests {
 
         let task = read_task(&route, "t-1").unwrap();
         assert!(
-            matches!(task.state(), TaskState::Stale { ref by, .. } if by == "grouchly"),
+            matches!(task.state(), TaskState::Stale { ref by, .. } if by == "fang"),
             "a lapsed heartbeat must read as stale, got {:?}",
             task.state()
         );
         // Display only: it is not offered to another machine...
-        assert!(work_for(&route, "beastly").unwrap().is_empty());
+        assert!(work_for(&route, "wisp").unwrap().is_empty());
         // ...but it is still offered to its own holder, exactly as Claimed is.
-        assert_eq!(work_for(&route, "grouchly").unwrap().len(), 1);
+        assert_eq!(work_for(&route, "fang").unwrap().len(), 1);
     }
 
     #[test]
@@ -8085,33 +8085,17 @@ mod work_over_files_tests {
 
         // An open order: releasing the claim returns it to Open.
         issue_order(&route, &order("t-1", None, false)).unwrap();
-        claim_order(&route, "t-1", "grouchly").unwrap();
-        release_claim(
-            &route,
-            "t-1",
-            "grouchly",
-            "grouchly",
-            "test",
-            &identities["grouchly"],
-        )
-        .unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
+        release_claim(&route, "t-1", "fang", "fang", "test", &identities["fang"]).unwrap();
         assert_eq!(read_task(&route, "t-1").unwrap().state(), TaskState::Open);
 
         // An addressed order: releasing the claim returns it to Offered.
-        issue_order(&route, &order("t-2", Some("grouchly"), false)).unwrap();
-        claim_order(&route, "t-2", "grouchly").unwrap();
-        release_claim(
-            &route,
-            "t-2",
-            "grouchly",
-            "grouchly",
-            "test",
-            &identities["grouchly"],
-        )
-        .unwrap();
+        issue_order(&route, &order("t-2", Some("fang"), false)).unwrap();
+        claim_order(&route, "t-2", "fang").unwrap();
+        release_claim(&route, "t-2", "fang", "fang", "test", &identities["fang"]).unwrap();
         assert!(matches!(
             read_task(&route, "t-2").unwrap().state(),
-            TaskState::Offered { ref to } if to == "grouchly"
+            TaskState::Offered { ref to } if to == "fang"
         ));
     }
 
@@ -8119,31 +8103,23 @@ mod work_over_files_tests {
     fn a_worker_will_not_release_a_claim_it_does_not_hold() {
         let (_t, route, identities) = signed_channel();
         issue_order(&route, &order("t-1", None, false)).unwrap();
-        claim_order(&route, "t-1", "grouchly").unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
 
         let error = release_own_claim(&route, "t-1", "nebra", "test", &identities["nebra"])
             .unwrap_err()
             .to_string();
         assert!(error.contains("does not hold"), "must refuse: {error}");
 
-        // The claim is untouched: grouchly still holds it.
-        assert_eq!(read_task(&route, "t-1").unwrap().holder(), Some("grouchly"));
+        // The claim is untouched: fang still holds it.
+        assert_eq!(read_task(&route, "t-1").unwrap().holder(), Some("fang"));
     }
 
     #[test]
     fn a_release_is_not_a_result() {
         let (_t, route, identities) = signed_channel();
         issue_order(&route, &order("t-1", None, true)).unwrap();
-        claim_order(&route, "t-1", "grouchly").unwrap();
-        release_claim(
-            &route,
-            "t-1",
-            "grouchly",
-            "grouchly",
-            "test",
-            &identities["grouchly"],
-        )
-        .unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
+        release_claim(&route, "t-1", "fang", "fang", "test", &identities["fang"]).unwrap();
 
         let task = read_task(&route, "t-1").unwrap();
         // A release says the work was abandoned, never that it was done: no revision was
@@ -8156,27 +8132,27 @@ mod work_over_files_tests {
     fn a_release_is_signed_and_recorded_beside_the_claim() {
         let (_t, route, identities) = signed_channel();
         issue_order(&route, &order("t-1", None, false)).unwrap();
-        claim_order(&route, "t-1", "grouchly").unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
         release_claim(
             &route,
             "t-1",
-            "grouchly",
-            "grouchly",
+            "fang",
+            "fang",
             "retired",
-            &identities["grouchly"],
+            &identities["fang"],
         )
         .unwrap();
 
         let dir = task_dir(&route, "t-1");
         assert!(
-            dir.join("claim.grouchly.json").is_file(),
+            dir.join("claim.fang.json").is_file(),
             "the claim is kept so the history keeps both sides of the hand-over"
         );
-        assert!(dir.join("release.grouchly.json").is_file());
+        assert!(dir.join("release.fang.json").is_file());
         let release: Release =
-            serde_json::from_str(&fs::read_to_string(dir.join("release.grouchly.json")).unwrap())
+            serde_json::from_str(&fs::read_to_string(dir.join("release.fang.json")).unwrap())
                 .unwrap();
-        assert_eq!(release.released, "grouchly");
+        assert_eq!(release.released, "fang");
         assert_eq!(release.reason, "retired");
         assert_eq!(
             verify_release(&release, &route.agents),

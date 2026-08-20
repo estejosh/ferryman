@@ -2943,15 +2943,15 @@ mod tests {
         // A lock naming this process's own pid (alive) means the worker is alive, which
         // is exactly what `retire` checks before releasing anything.
         std::fs::write(
-            dir.path().join("worker-grouchly.lock"),
+            dir.path().join("worker-fang.lock"),
             std::process::id().to_string(),
         )
         .unwrap();
-        assert!(worker_alive(dir.path(), "grouchly"));
+        assert!(worker_alive(dir.path(), "fang"));
 
         // A lock naming a pid that no longer exists means the worker is gone.
-        std::fs::write(dir.path().join("worker-grouchly.lock"), "999999999").unwrap();
-        assert!(!worker_alive(dir.path(), "grouchly"));
+        std::fs::write(dir.path().join("worker-fang.lock"), "999999999").unwrap();
+        assert!(!worker_alive(dir.path(), "fang"));
     }
 
     #[test]

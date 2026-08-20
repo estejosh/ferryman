@@ -1772,7 +1772,7 @@ mod tests {
 
     #[test]
     fn an_addressed_order_folds_the_agent_name() {
-        // The same folding every other entry point uses, or `/to BEASTLYWSL` addresses a
+        // The same folding every other entry point uses, or `/to WISP` addresses a
         // machine the roster does not have.
         assert_eq!(
             parse_instruction("/to Wisp  run the tests"),
