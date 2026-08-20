@@ -280,7 +280,7 @@ pub fn effective_quality(
 
 /// Measured quality for an engine family from recorded outcomes: matches both
 /// the recorded engine (command) and the agent name, so an agent named
-/// `grouchly-deepseek` counts toward the "deepseek" family. Returns
+/// `fang-deepseek` counts toward the "deepseek" family. Returns
 /// `(confidence, total, accepted)` when there are any matching outcomes.
 fn measured_quality(route: &ProjectRoute, engine_key: &str) -> Option<(f64, usize, usize)> {
     let key = engine_key.to_ascii_lowercase();
@@ -649,7 +649,7 @@ mod tests {
         // when the recorded command is something else (e.g. the CLI shim).
         let mut l = learning("cline", true);
         l.source = "live".into();
-        l.agent = Some("grouchly-deepseek".into());
+        l.agent = Some("fang-deepseek".into());
         crate::learning::record_learning(&route, &l).unwrap();
         let (score, measured, total, accepted) = effective_quality(&route, &rates, "deepseek");
         assert!(measured);
@@ -667,7 +667,7 @@ mod tests {
         // credits the engine family, not the nickname.
         let mut l = learning("cline", true);
         l.source = "live".into();
-        l.agent = Some("grouchly".into());
+        l.agent = Some("fang".into());
         l.model = Some("deepseek-v4-pro".into());
         crate::learning::record_learning(&route, &l).unwrap();
         let (_, measured, total, accepted) = effective_quality(&route, &rates, "deepseek");

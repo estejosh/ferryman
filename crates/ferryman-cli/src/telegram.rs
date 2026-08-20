@@ -49,6 +49,10 @@ const EXCERPT_CHARS: usize = 600;
 /// bounded so the state file cannot grow without limit on a long-lived fleet.
 const SEEN_LIMIT: usize = 500;
 
+/// How many turns of a topic the seat is shown. Enough that an answer still has its
+/// question attached; short enough that a long topic does not become the prompt.
+const TURN_LIMIT: usize = 8;
+
 /// What a chat message asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
@@ -285,6 +289,10 @@ struct TgChat {
 #[derive(Debug, Deserialize)]
 struct TgUser {
     id: i64,
+    /// Telegram's own name for the account. Used when the map does not say what to call the
+    /// operator, so a brief can name who sent a message without anyone configuring it.
+    #[serde(default)]
+    first_name: Option<String>,
 }
 
 /// The bot's side of one chat.
@@ -713,6 +721,7 @@ async fn group_bridge(
                 agent: orchestrator.agent.clone(),
                 route,
                 issuer,
+                operator: map.operator.clone(),
             })
         }
         None => {
@@ -1047,8 +1056,9 @@ async fn serve(
             }
         }
 
+        let rooms = rooms_of(desks);
         for desk in desks.iter_mut() {
-            if let Err(error) = announce(chat, desk, Some(origins)).await {
+            if let Err(error) = announce(chat, desk, Some(origins), &rooms).await {
                 eprintln!("telegram: could not report {} results: {error}", desk.name);
             }
         }
@@ -1227,7 +1237,32 @@ async fn handle(
         // operator choosing to bypass the seat, and they are allowed to.
         Some(Instruction::Order { to: None, task }) if seat.is_some() => {
             let seat = seat.expect("guarded by the match");
-            let brief = orchestrator_brief(&desk.name, &route.project_id, "Josh", &task);
+            let roster =
+                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+            let bank = ferryman_channel::memory::memory_bank_dir(route);
+            // Read before writing this turn, so the recap is what was said BEFORE the
+            // message being answered - the message itself is quoted underneath it.
+            let (earlier, check) = ferryman_channel::conversation::recent_turns(
+                &bank, &desk.name, TURN_LIMIT, &roster,
+            );
+            // An unverifiable conversation is not read into a prompt. It is said out loud
+            // instead: silently dropping the history would look exactly like the bug this
+            // whole thing fixes.
+            let earlier = match check {
+                ferryman_channel::SignatureCheck::Valid => earlier,
+                ferryman_channel::SignatureCheck::Unsigned if earlier.is_empty() => earlier,
+                other => {
+                    eprintln!(
+                        "telegram: the {} conversation does not verify ({other:?}); \
+                         asking without it",
+                        desk.name
+                    );
+                    String::new()
+                }
+            };
+            let asked_by = operator_name(seat.operator.as_deref(), message.from.as_ref());
+            let brief =
+                orchestrator_brief(&desk.name, &route.project_id, &asked_by, &task, &earlier);
             match issue(
                 &seat.route,
                 &seat.issuer,
@@ -1242,6 +1277,7 @@ async fn handle(
                     // different room.
                     let where_from = message.chat.as_ref().map_or(chat.chat_id, |c| c.id);
                     origins.remember(id.clone(), where_from, message.message_thread_id);
+                    remember_turn(route, &desk.name, &asked_by, &task, issuer);
                     format!("asked {} about {} - {id}", seat.agent, desk.name)
                 }
                 Err(error) => format!("could not ask that: {error}"),
@@ -1308,6 +1344,25 @@ struct Seat {
     agent: String,
     route: ferryman_channel::ProjectRoute,
     issuer: String,
+    /// What to call the operator, from the map. `None` falls back to the Telegram account
+    /// name, and then to the role.
+    operator: Option<String>,
+}
+
+/// What to call the person who sent this, in the brief the seat is given.
+///
+/// This was a string literal for a while - one operator's first name, compiled in - so every
+/// other deployment of Ferryman told its orchestrator that somebody else had sent the
+/// message. The map wins, because it is the operator's own choice of what to be called.
+/// Telegram's account name is the next best thing and needs no configuration. The last
+/// resort names the role rather than guessing at a person: "the operator sent this" is true
+/// of every deployment, which a first name is not.
+fn operator_name(configured: Option<&str>, from: Option<&TgUser>) -> String {
+    configured
+        .map(str::to_string)
+        .or_else(|| from.and_then(|user| user.first_name.clone()))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "the operator".to_string())
 }
 
 /// What the orchestrator is actually asked, when a message arrives from a topic.
@@ -1321,9 +1376,26 @@ struct Seat {
 /// It is also told where its answer goes. A reply that will be read on a phone, in a
 /// conversation, should not arrive as a build log - and an engine that does not know its
 /// audience writes for the wrong one.
-fn orchestrator_brief(topic: &str, project: &str, asked_by: &str, message: &str) -> String {
+fn orchestrator_brief(
+    topic: &str,
+    project: &str,
+    asked_by: &str,
+    message: &str,
+    earlier: &str,
+) -> String {
+    let recap = if earlier.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Earlier in this topic, oldest first. {asked_by} may be answering something you \
+             asked, so read this before deciding anything is missing:\n\
+             \n\
+             {earlier}\n\
+             \n"
+        )
+    };
     format!(
-        "{asked_by} sent this from the {topic} topic on Telegram, about the {project} \
+        "{recap}{asked_by} sent this from the {topic} topic on Telegram, about the {project} \
          project:\n\
          \n\
          {message}\n\
@@ -1336,7 +1408,13 @@ fn orchestrator_brief(topic: &str, project: &str, asked_by: &str, message: &str)
          addressed to the machine that should do it. Not to yourself.\n\
          If it is a question: answer it.\n\
          If it is neither, or if you need something from {asked_by} before anything can \
-         start, say exactly what.\n\
+         start, say exactly what - and ask for it once. Something you already asked and were \
+         answered is above; do not ask it again.\n\
+         \n\
+         Never ask {asked_by} where a project's code lives or which machine holds it. That is \
+         yours to find out: read the project's roster and address the order to a machine on \
+         it. The only thing worth asking for is the goal, which is the one thing you cannot \
+         look up.\n\
          \n\
          Answer in one short paragraph of plain prose. It goes straight back to a phone, \
          into the topic it was asked in, so write it for a person reading in a chat - not a \
@@ -1346,10 +1424,10 @@ fn orchestrator_brief(topic: &str, project: &str, asked_by: &str, message: &str)
 
 /// Who an order should go to, and what to tell the operator will happen to it.
 ///
-/// # What "issued tg-69 to grouchly (default)" left out
+/// # What "issued tg-69 to fang (default)" left out
 ///
 /// That receipt was true and useless. The order had been addressed to a machine that has
-/// never joined that project - grouchly works on `ferryman`, and the message was sent in
+/// never joined that project - fang works on `ferryman`, and the message was sent in
 /// the Bullship topic - so nothing would ever pick it up. The operator was told the order
 /// existed, which they could see, and not the one thing that mattered: that it was already
 /// dead.
@@ -1525,10 +1603,71 @@ fn issue(
     Ok(id)
 }
 
+/// A topic, flattened so a reply can find its way back to the right conversation.
+///
+/// `announce` walks the desks one at a time, but an answer raised from one project's topic is
+/// filed in the seat's channel and has to be recorded against that topic. Cloning the few
+/// fields that identify a topic costs nothing and avoids borrowing the desks twice.
+#[derive(Clone)]
+struct Room {
+    chat: i64,
+    thread: Option<i64>,
+    name: String,
+    route: ferryman_channel::ProjectRoute,
+    issuer: String,
+}
+
+fn rooms_of(desks: &[Desk]) -> Vec<Room> {
+    desks
+        .iter()
+        .map(|desk| Room {
+            chat: desk.chat_id,
+            thread: desk.thread,
+            name: desk.name.clone(),
+            route: desk.route.clone(),
+            issuer: desk.issuer.clone(),
+        })
+        .collect()
+}
+
+/// Write one turn into the topic's conversation, in its own project's memory bank.
+///
+/// Best effort on purpose. A conversation that cannot be recorded is worth an eprintln and
+/// nothing more: refusing to answer the operator because the memory write failed would trade
+/// a small loss for a total one.
+fn remember_turn(
+    route: &ferryman_channel::ProjectRoute,
+    topic: &str,
+    who: &str,
+    said: &str,
+    issuer: &str,
+) {
+    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    match crate::sign_as(route, issuer) {
+        Ok(Some(identity)) => {
+            if let Err(error) =
+                ferryman_channel::conversation::append_turn(&bank, topic, who, said, &identity)
+            {
+                eprintln!("telegram: could not record the {topic} conversation: {error}");
+            }
+        }
+        Ok(None) => eprintln!(
+            "telegram: no key for '{issuer}' in {}, so the {topic} conversation went unrecorded",
+            route.project_id
+        ),
+        Err(error) => eprintln!("telegram: could not sign the {topic} conversation: {error}"),
+    }
+}
+
 /// Report results that have arrived since the last look.
-async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Result<()> {
+async fn announce(
+    chat: &Chat,
+    desk: &mut Desk,
+    origins: Option<&Origins>,
+    rooms: &[Room],
+) -> Result<()> {
     let route = &desk.route;
-    let mut fresh: Vec<(String, String, String)> = Vec::new();
+    let mut fresh: Vec<(String, String, String, String)> = Vec::new();
     for task in ferryman_channel::list_tasks(route)? {
         for result in &task.results {
             let key = result_key(&task.order.id, &result.agent, result.revision);
@@ -1545,6 +1684,7 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
             fresh.push((
                 key,
                 task.order.id.clone(),
+                output.clone(),
                 format!(
                     "{} r{} by {} ({signature:?})\n\n{}",
                     task.order.id,
@@ -1558,7 +1698,7 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
     // Remember first, then speak. The other order repeats an announcement every restart if
     // the send is what failed, and a phone that buzzes with yesterday's results twice is a
     // bridge an operator turns off.
-    for (key, order, text) in fresh {
+    for (key, order, answer, text) in fresh {
         desk.state.remember(key);
         save(&desk.state_path, &desk.state)?;
         // Back to the conversation it started in. A request raised from the Bullship topic
@@ -1570,6 +1710,15 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
             .and_then(|origins| origins.of(&order))
             .unwrap_or((desk.chat_id, desk.thread));
         chat.send_to(chat_id, thread, &text).await?;
+        // Recorded against the topic it was sent to, not the channel it was filed in. An
+        // answer kept in the seat's own memory would be an answer nobody can find beside the
+        // question it answers.
+        if let Some(room) = rooms
+            .iter()
+            .find(|room| room.chat == chat_id && room.thread == thread)
+        {
+            remember_turn(&room.route, &room.name, "you", &answer, &room.issuer);
+        }
     }
     Ok(())
 }
@@ -1577,6 +1726,37 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_is_briefed_with_the_question_it_answers() {
+        // The failure this covers, exactly as it happened once: the operator was asked which
+        // machine held a project, answered with the machine's name, and the seat - seeing only
+        // that sentence - said it named a machine but no work, and asked again.
+        let earlier = "- 2026-08-20T21:30Z **the operator**: get the shop ready for daily players\n- 2026-08-20T21:35Z **you**: which machine holds the shop?";
+        let brief = orchestrator_brief(
+            "Shop",
+            "shop",
+            "the operator",
+            "The shop is on the other machine.",
+            earlier,
+        );
+        assert!(brief.contains("ready for daily players"));
+        assert!(brief.contains("which machine holds the shop?"));
+        assert!(brief.contains("do not ask it again"));
+    }
+
+    #[test]
+    fn a_first_message_reads_exactly_as_it_did_before() {
+        let brief = orchestrator_brief("Ferryman", "ferryman", "the operator", "where are we?", "");
+        assert!(!brief.contains("Earlier in this topic"));
+        assert!(brief.starts_with("the operator sent this"));
+    }
+
+    #[test]
+    fn the_seat_is_told_to_look_up_where_a_project_lives_rather_than_ask() {
+        let brief = orchestrator_brief("Shop", "shop", "the operator", "status?", "");
+        assert!(brief.contains("Never ask the operator where a project's code lives"));
+    }
 
     #[test]
     fn a_bare_line_is_an_open_order() {
@@ -1594,9 +1774,9 @@ mod tests {
         // The same folding every other entry point uses, or `/to BEASTLYWSL` addresses a
         // machine the roster does not have.
         assert_eq!(
-            parse_instruction("/to BeastlyWSL  run the tests"),
+            parse_instruction("/to Wisp  run the tests"),
             Some(Instruction::Order {
-                to: Some("beastlywsl".to_string()),
+                to: Some("wisp".to_string()),
                 task: "run the tests".to_string()
             })
         );
@@ -1620,7 +1800,7 @@ mod tests {
     #[test]
     fn an_order_verb_with_nothing_after_it_is_not_an_order() {
         assert_eq!(parse_instruction("/order   "), None);
-        assert_eq!(parse_instruction("/to beastlywsl"), None);
+        assert_eq!(parse_instruction("/to wisp"), None);
     }
 
     /// The default recipient is the difference between "the fleet does this" and "whichever
@@ -1635,18 +1815,16 @@ mod tests {
 
         // The default is applied where the order is issued, not where it is parsed, so
         // `/to` keeps overriding it and a fleet with no default still races as before.
-        let applied = to.clone().or_else(|| Some("grouchly".to_string()));
-        assert_eq!(applied.as_deref(), Some("grouchly"));
+        let applied = to.clone().or_else(|| Some("fang".to_string()));
+        assert_eq!(applied.as_deref(), Some("fang"));
 
-        let addressed = parse_instruction("/to beastlywsl run the tests").unwrap();
+        let addressed = parse_instruction("/to wisp run the tests").unwrap();
         let Instruction::Order { to, .. } = addressed else {
             panic!("addressed order")
         };
         assert_eq!(
-            to.clone()
-                .or_else(|| Some("grouchly".to_string()))
-                .as_deref(),
-            Some("beastlywsl"),
+            to.clone().or_else(|| Some("fang".to_string())).as_deref(),
+            Some("wisp"),
             "an explicit target wins over the default"
         );
     }
@@ -1655,9 +1833,9 @@ mod tests {
     fn help_says_where_a_bare_line_actually_goes() {
         // Telling someone their message is "open to whoever claims it first" when it is in
         // fact pinned to one machine is worse than saying nothing.
-        assert!(help_text(Some("grouchly")).contains("goes to grouchly"));
+        assert!(help_text(Some("fang")).contains("goes to fang"));
         assert!(help_text(None).contains("claims it first"));
-        for text in [help_text(Some("grouchly")), help_text(None)] {
+        for text in [help_text(Some("fang")), help_text(None)] {
             assert!(
                 text.contains("Do not send credentials"),
                 "the warning belongs on the surface an operator actually reads"
@@ -1694,15 +1872,21 @@ mod tests {
     fn state_is_named_for_the_agent_that_writes_it() {
         // One writer per path is what makes the synced folder conflict-free; two bridges
         // sharing a cursor file would fight over it.
-        let path = state_path(Path::new("/w/.ferryman"), "beastlywsl");
-        assert!(path.ends_with("telegram-beastlywsl.json"));
+        let path = state_path(Path::new("/w/.ferryman"), "wisp");
+        assert!(path.ends_with("telegram-wisp.json"));
     }
 
     #[test]
     fn a_message_reaches_the_orchestrator_as_something_to_judge_not_to_do() {
         // The failure this prevents: "Testing @FerrymanClinebot" became a unit of work for
         // a build machine, because a worker handed a bare sentence does it.
-        let brief = orchestrator_brief("Bullship", "bullship", "Josh", "the login page is broken");
+        let brief = orchestrator_brief(
+            "Bullship",
+            "bullship",
+            "the operator",
+            "the login page is broken",
+            "",
+        );
         assert!(brief.contains("the login page is broken"));
         assert!(brief.contains("Bullship topic"));
         assert!(brief.contains("You are the orchestrator"));
@@ -1716,7 +1900,7 @@ mod tests {
     fn the_orchestrator_is_told_who_will_read_the_answer() {
         // An engine that does not know its audience writes for the wrong one, which is how
         // a phone gets sent a build log.
-        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?");
+        let brief = orchestrator_brief("Ferryman", "ferryman", "the operator", "where are we?", "");
         assert!(brief.contains("goes straight back to a phone"));
         assert!(brief.contains("no headings"));
     }
@@ -1755,28 +1939,28 @@ mod tests {
 
     #[test]
     fn a_default_target_that_does_not_work_here_leaves_the_order_open() {
-        // The failure: --default-to grouchly addressed a Bullship order to a machine that
+        // The failure: --default-to fang addressed a Bullship order to a machine that
         // has never joined Bullship. An addressed order is offered to its assignee alone,
         // so it was invisible to the two machines that could have done it.
-        let roster = vec!["beastlywsl".to_string(), "beastly".to_string()];
-        let (target, caveat) = route_order(None, Some("grouchly"), &roster);
+        let roster = vec!["wisp".to_string(), "wisp".to_string()];
+        let (target, caveat) = route_order(None, Some("fang"), &roster);
         assert_eq!(target, None);
         let caveat = caveat.unwrap();
         assert!(
-            caveat.contains("grouchly does not work on this one"),
+            caveat.contains("fang does not work on this one"),
             "{caveat}"
         );
-        assert!(caveat.contains("beastlywsl, beastly"), "{caveat}");
+        assert!(caveat.contains("wisp, wisp"), "{caveat}");
     }
 
     #[test]
     fn a_default_target_that_does_work_here_still_gets_the_order() {
         // The default exists because machines are not interchangeable in what they cost.
         // Where it applies, it must still apply.
-        let roster = vec!["grouchly".to_string(), "beastlywsl".to_string()];
+        let roster = vec!["fang".to_string(), "wisp".to_string()];
         assert_eq!(
-            route_order(None, Some("grouchly"), &roster),
-            (Some("grouchly".to_string()), None)
+            route_order(None, Some("fang"), &roster),
+            (Some("fang".to_string()), None)
         );
     }
 
@@ -1784,9 +1968,9 @@ mod tests {
     fn naming_a_machine_outranks_the_rule_but_is_not_silent_about_it() {
         // The operator may be about to bring that machine online. Honour it - and say it
         // is not there yet, rather than letting them find out through silence.
-        let roster = vec!["beastlywsl".to_string()];
-        let (target, caveat) = route_order(Some("grouchly"), None, &roster);
-        assert_eq!(target, Some("grouchly".to_string()));
+        let roster = vec!["wisp".to_string()];
+        let (target, caveat) = route_order(Some("fang"), None, &roster);
+        assert_eq!(target, Some("fang".to_string()));
         assert!(caveat.unwrap().contains("has not joined this channel"));
     }
 
@@ -1805,9 +1989,9 @@ mod tests {
     fn an_open_order_names_who_could_take_it() {
         // "open to whoever claims it first" is true and tells the operator nothing. Who
         // is actually listening is the thing they cannot see from a phone.
-        let roster = vec!["beastlywsl".to_string()];
+        let roster = vec!["wisp".to_string()];
         let (_, caveat) = route_order(None, None, &roster);
-        assert_eq!(caveat.unwrap(), "beastlywsl can pick it up");
+        assert_eq!(caveat.unwrap(), "wisp can pick it up");
     }
 
     #[test]

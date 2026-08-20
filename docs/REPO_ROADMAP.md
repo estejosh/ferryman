@@ -382,7 +382,7 @@ statement of one member's `projects`/`roles`/`capabilities`. `grant_member`,
 - **`portable_auth`** — see §5 (v2 signed envelopes + trust store).
 
 A memory-bank exists at the repo root as a symlink
-(`memory-bank -> /mnt/nvme-storage/repos/ferryman-ferryman/.ferryman/ferryman/memory-bank`).
+(`memory-bank -> /srv/repos/ferryman-ferryman/.ferryman/ferryman/memory-bank`).
 It is this project's own shared agent memory (read order documented in
 `memory-bank/README.md`: `projectbrief.md`, `productContext.md`, `systemPatterns.md`,
 `techContext.md`, `activeContext.md`, `progress.md`), not a compiled crate.

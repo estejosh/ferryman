@@ -22,7 +22,7 @@ doing one task — but it means that when the holder is gone, the task is offere
 for ever. The only exit is `ferry channel interrupt --action kill`, which is a human
 typing.
 
-This was not theoretical. `ichabod-1650` was claimed by `grouchly`, which was then stopped
+This was not theoretical. `ichabod-1650` was claimed by `fang`, which was then stopped
 mid-task during its own switchover: it was told to submit before stopping its parent, did
 it the other way round, and killed the process that was writing the report. The work
 completed. The report was lost. The claim will outlive the machine.
@@ -31,7 +31,7 @@ completed. The report was lost. The claim will outlive the machine.
 
 "Expire a claim after N minutes" fails in this system specifically.
 
-Clocks disagree. Timestamps written by `grouchly` and by `beastlywsl` have been hours
+Clocks disagree. Timestamps written by `fang` and by `wisp` have been hours
 apart all along; neither is authoritative, and there is no server to ask. Delivery is
 eventual: a claim written on one machine reaches the others when Syncthing gets to it, so
 a claim can be simultaneously fresh where it was written and absent where it is read.
@@ -95,8 +95,8 @@ starting up is the moment to ask "what do I already hold, and am I running it?"
 `ferry channel retire --agent <name> --comms <dir>`: signed, recorded, deliberate.
 
 For the case nothing time-based can catch, because the holder is not late — it is gone.
-`ichabod-1650` is held by `grouchly`, and `grouchly` will never run again: that machine's
-unattended worker is `ichabod-grouchly-deepseek` now. No heartbeat will ever lapse,
+`ichabod-1650` is held by `fang`, and `fang` will never run again: that machine's
+unattended worker is `ichabod-fang-deepseek` now. No heartbeat will ever lapse,
 because none was ever written.
 
 ### The release record
@@ -104,7 +104,7 @@ because none was ever written.
 `<task>/release.<releaser>.json`, signed like everything else:
 
 ```json
-{ "order_id": "...", "released": "grouchly", "releaser": "...",
+{ "order_id": "...", "released": "fang", "releaser": "...",
   "reason": "retired", "at": "...", "signed_by": "...", "signature": "..." }
 ```
 

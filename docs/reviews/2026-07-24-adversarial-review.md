@@ -351,7 +351,7 @@ operations until ready, and implement tested rollback/resume instructions.
 **Severity: Medium**
 
 The README calls Ferryman provider-neutral, but live route validation hardcodes
-the GitHub owner `estejosh` and `/beastly-bridges/<project>`. Windows conversion
+the GitHub owner `estejosh` and `/wisp-bridges/<project>`. Windows conversion
 assumes drive-letter paths map to `/mnt/<drive>`, and attachment defaults to an
 Ubuntu WSL distribution.
 

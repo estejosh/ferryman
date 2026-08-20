@@ -83,6 +83,14 @@ pub struct TopicMap {
     /// is no orchestrator; with one, every message goes to it.
     #[serde(default)]
     pub default_to: Option<String>,
+    /// What to call the person the bridge answers to, in the briefs it writes.
+    ///
+    /// This was a string literal in the source for a while - the author's own first name -
+    /// so every deployment of Ferryman told its orchestrator that somebody else's operator
+    /// had sent the message. Unset, the bridge uses the name Telegram gives for the account
+    /// it accepts messages from, and falls back to "the operator".
+    #[serde(default)]
+    pub operator: Option<String>,
     /// Who thinks about what arrives, and where their requests are filed.
     #[serde(default)]
     pub orchestrator: Option<Orchestrator>,
@@ -210,6 +218,14 @@ impl TopicMap {
                  default_to = \"{default_to}\"\n"
             ));
         }
+        if let Some(operator) = &self.operator {
+            out.push_str(&format!(
+                "\n# What to call you in the briefs the orchestrator is given. Without this,\n\
+                 # the name on your Telegram account is used.\n\
+                 operator = \"{}\"\n",
+                escape(operator)
+            ));
+        }
         match &self.orchestrator {
             Some(orchestrator) => out.push_str(&format!(
                 "\n# Who reads what you send and decides what work it means. Every topic's\n\
@@ -225,7 +241,7 @@ impl TopicMap {
                  # message goes straight to a worker as a task, which is forwarding rather\n\
                  # than delegation - the bridge cannot judge what a sentence is worth.\n\
                  # [orchestrator]\n\
-                 # agent = \"beastlywsl\"\n\
+                 # agent = \"wisp\"\n\
                  # workspace = \"ferryman-ferryman\"\n",
             ),
         }
@@ -336,6 +352,7 @@ pub fn starter(dir: &Path) -> TopicMap {
         });
     }
     TopicMap {
+        operator: None,
         group: None,
         default_to: None,
         orchestrator: None,
@@ -388,10 +405,11 @@ mod tests {
 
     fn sample() -> TopicMap {
         TopicMap {
+            operator: None,
             group: Some(-1001234567890),
-            default_to: Some("grouchly".to_string()),
+            default_to: Some("fang".to_string()),
             orchestrator: Some(Orchestrator {
-                agent: "beastlywsl".to_string(),
+                agent: "wisp".to_string(),
                 workspace: PathBuf::from("ferryman-ferryman"),
             }),
             topics: vec![
@@ -406,7 +424,7 @@ mod tests {
                     name: "Bullship".to_string(),
                     workspace: PathBuf::from("bullship-ferryman"),
                     thread: None,
-                    default_to: Some("beastlywsl".to_string()),
+                    default_to: Some("wisp".to_string()),
                     general: false,
                 },
             ],

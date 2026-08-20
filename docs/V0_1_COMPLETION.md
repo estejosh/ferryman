@@ -50,9 +50,9 @@ bash -n scripts/scan-project-safety.sh
 
 # Read-only dry-run against this checkout; skips all external registration.
 bash scripts/attach-project.sh `
-  --workspace /mnt/x/ferryman `
+  --workspace /home/you/ferryman `
   --project ferryman `
-  --shared-remote /beastly-bridges/ferryman `
+  --shared-remote /wisp-bridges/ferryman `
   --git-remote https://github.com/estejosh/ferryman-bridge.git `
   --integration-mode unmanaged `
   --dry-run --skip-sync-registration --skip-hub-registration

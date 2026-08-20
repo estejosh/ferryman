@@ -71,7 +71,7 @@ PowerShell:
 & X:\ferryman\scripts\attach-project.ps1 `
   -Workspace X:\example `
   -Project example `
-  -SharedRemote /beastly-bridges/example `
+  -SharedRemote /wisp-bridges/example `
   -GitRemote https://github.com/estejosh/example-bridge.git `
   -IntegrationMode unmanaged `
   -UpdateStandard `
@@ -84,7 +84,7 @@ WSL/Linux:
 scripts/attach-project.sh \
   --workspace /path/to/example \
   --project example \
-  --shared-remote /beastly-bridges/example \
+  --shared-remote /wisp-bridges/example \
   --git-remote https://github.com/estejosh/example-bridge.git \
   --integration-mode unmanaged \
   --update-standard \

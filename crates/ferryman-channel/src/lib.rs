@@ -14,6 +14,7 @@ use std::{
 
 pub mod ask;
 pub mod contract;
+pub mod conversation;
 pub mod cost;
 pub mod credentials;
 pub mod discovery;
@@ -277,7 +278,7 @@ impl ProjectRoute {
             if agent.name.len() > 128 || agent.role.len() > 128 {
                 bail!("registered participant name or role exceeds 128 bytes")
             }
-            // Grouchly's catch, kept as the backstop for the fold. `route.agents` is
+            // Fang's catch, kept as the backstop for the fold. `route.agents` is
             // built by `read_agent_roster`, which folds case variants away, so two
             // spellings should be impossible by the time validation runs - and that is
             // exactly what makes this worth asserting. If it ever fires, the fold has a
@@ -652,9 +653,9 @@ fn acknowledgement_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
 /// ```text
 /// tasks/t-4f2a/
 ///   order.json                 written once, by the orchestrator
-///   claim.grouchly.json        grouchly's claim; only grouchly writes it
+///   claim.fang.json        fang's claim; only fang writes it
 ///   claim.nebra.json           nebra's claim; only nebra writes it
-///   result.grouchly.001.json   a result, at a revision
+///   result.fang.001.json   a result, at a revision
 ///   review.001.json            accepted, or changes requested with notes
 /// ```
 ///
@@ -775,7 +776,7 @@ pub enum TaskState {
     ///
     /// It used to be. [`Task::holder`] answers "whose task is this", and for an addressed
     /// order that is the assignee from the moment it is written - so `state()` reported
-    /// `Claimed { by: "grouchly" }` for an order grouchly had never seen, could not see
+    /// `Claimed { by: "fang" }` for an order fang had never seen, could not see
     /// (its worker was down), or had given up on.
     ///
     /// An operator reading that has no way to tell "a machine is working on this right
@@ -1228,7 +1229,7 @@ impl AgentIdentity {
     ///
     /// The key used to live only under the project's `.ferryman/`, so a machine working
     /// on three projects had three different keys under one name. Every project saw a
-    /// different public key for "beastly", and the roster - which is keyed by name -
+    /// different public key for "wisp", and the roster - which is keyed by name -
     /// could not tell that apart from an impostor. An identity that changes per directory
     /// is not an identity.
     ///
@@ -1256,7 +1257,7 @@ impl AgentIdentity {
             bail!("agent name must be a path-safe identifier")
         }
         // One spelling, everywhere. See `canonical_agent_name`: the name is a filename in
-        // three stores, and on a case-sensitive filesystem `Grouchly` and `grouchly` were
+        // three stores, and on a case-sensitive filesystem `Fang` and `fang` were
         // two identities with two keys. Folded here, at the point a key is minted, so no
         // new split can be created; `from_state_file` adopts the ones already on disk.
         let name = &canonical_agent_name(name);
@@ -1299,7 +1300,7 @@ impl AgentIdentity {
     ///
     /// The distinction matters wherever a name comes from the operator rather than from this
     /// machine's own config. `load_or_create` would happily mint a brand-new key called
-    /// `grouchly` on a machine that is not grouchly - a second identity under a name the
+    /// `fang` on a machine that is not fang - a second identity under a name the
     /// roster already knows, whose signatures every other machine would then reject as an
     /// impostor. For "sign something as <name>", the only correct answer when the key is
     /// absent is to refuse.
@@ -1315,7 +1316,7 @@ impl AgentIdentity {
     /// A key file on disk written under a different capitalisation of this same name.
     ///
     /// Only consulted when the canonical path is absent, which is exactly the upgrade
-    /// case: a machine that joined as `Grouchly` has `keys/Grouchly.key` and nothing
+    /// case: a machine that joined as `Fang` has `keys/Fang.key` and nothing
     /// else. Without this it would find no key under the folded name and **mint a new
     /// one** - a second key under a name the roster already knows, which is the single
     /// worst thing this code can do, and precisely what `load_existing` exists to
@@ -1331,7 +1332,7 @@ impl AgentIdentity {
                     .then_some(path)
             })
             .collect();
-        // Sorted so a machine that somehow holds `Grouchly.key` and `GROUCHLY.key` picks
+        // Sorted so a machine that somehow holds `Fang.key` and `FANG.key` picks
         // the same one on every run rather than whichever the directory listing happened
         // to yield. Deterministically wrong beats non-deterministically wrong: the
         // operator sees one stable public key and can act on it.
@@ -1606,7 +1607,7 @@ fn check_signature(
     };
     // Case-insensitive, because a message already in flight was signed under whatever
     // spelling its sender used. The roster it is checked against is folded, so an exact
-    // match would report a perfectly good signature from `Grouchly` as `UnknownSigner` -
+    // match would report a perfectly good signature from `Fang` as `UnknownSigner` -
     // turning an upgrade into a fleet-wide impersonation alarm.
     let Some(agent) = roster
         .iter()
@@ -2569,7 +2570,7 @@ mod portable_auth_route_tests {
         assert!(verify_v2_message(&route, &message).is_err());
     }
 
-    /// A machine that joined as `Grouchly` must keep the key it already signed with.
+    /// A machine that joined as `Fang` must keep the key it already signed with.
     ///
     /// This is the whole risk in folding names: the key store is `keys/<name>.key`, so a
     /// folded lookup finds nothing where an unfolded one found a key, and
@@ -2586,14 +2587,10 @@ mod portable_auth_route_tests {
         let mut seed = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
         let established = SigningKey::from_bytes(&seed);
-        std::fs::write(
-            keys.join("Grouchly.key"),
-            hex::encode(established.to_bytes()),
-        )
-        .unwrap();
+        std::fs::write(keys.join("Fang.key"), hex::encode(established.to_bytes())).unwrap();
 
         // Asked for under either spelling, it is the same key - the one already on disk.
-        for asked in ["grouchly", "Grouchly", "GROUCHLY"] {
+        for asked in ["fang", "Fang", "FANG"] {
             let identity = AgentIdentity::load_or_create_in(
                 asked,
                 dir.path(),
@@ -2605,12 +2602,12 @@ mod portable_auth_route_tests {
                 hex::encode(established.verifying_key().to_bytes()),
                 "asking as '{asked}' minted a new key instead of adopting the existing one"
             );
-            assert_eq!(identity.name(), "grouchly", "the name itself is folded");
+            assert_eq!(identity.name(), "fang", "the name itself is folded");
         }
 
         // And it was written under the canonical name, so the variant scan stops being
         // load-bearing after the first run.
-        assert!(keys.join("grouchly.key").is_file());
+        assert!(keys.join("fang.key").is_file());
     }
 
     /// Both spellings in the roster are one agent, and the entry that survives is the
@@ -2636,12 +2633,12 @@ mod portable_auth_route_tests {
             .unwrap();
         };
         // The stale entry from before folding, and the live one written since.
-        write("Grouchly.json", "Grouchly", &"aa".repeat(32));
-        write("grouchly.json", "grouchly", &"bb".repeat(32));
+        write("Fang.json", "Fang", &"aa".repeat(32));
+        write("fang.json", "fang", &"bb".repeat(32));
 
         let roster = read_agent_roster(&route.communications).unwrap();
         assert_eq!(roster.len(), 1, "two spellings are one agent");
-        assert_eq!(roster[0].name, "grouchly");
+        assert_eq!(roster[0].name, "fang");
         assert_eq!(
             roster[0].public_key.as_deref(),
             Some("bb".repeat(32).as_str()),
@@ -2652,7 +2649,7 @@ mod portable_auth_route_tests {
         // roster: it was signed before the upgrade and is legitimately in flight.
         assert_ne!(
             check_signature(
-                Some(&"Grouchly".to_string()),
+                Some(&"Fang".to_string()),
                 Some(&String::new()),
                 "payload",
                 &roster,
@@ -2667,13 +2664,13 @@ mod portable_auth_route_tests {
     #[test]
     fn a_reservation_never_outranks_the_agent_that_holds_the_key() {
         let reservation = AgentRoute {
-            name: "grouchly".into(),
+            name: "fang".into(),
             role: "worker".into(),
             capabilities: Vec::new(),
             public_key: None,
         };
         let real = AgentRoute {
-            name: "Grouchly".into(),
+            name: "Fang".into(),
             public_key: Some("cc".repeat(32)),
             ..reservation.clone()
         };
@@ -2683,7 +2680,7 @@ mod portable_auth_route_tests {
         ] {
             let folded = fold_case_variants(input);
             assert_eq!(folded.len(), 1);
-            assert_eq!(folded[0].name, "grouchly");
+            assert_eq!(folded[0].name, "fang");
             assert_eq!(
                 folded[0].public_key.as_deref(),
                 Some("cc".repeat(32).as_str())
@@ -2696,18 +2693,18 @@ mod portable_auth_route_tests {
     fn registering_a_mixed_case_name_writes_the_folded_entry() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route(dir.path());
-        let path = register_expected_agent(&route, "Grouchly", "worker", &[]).unwrap();
-        assert_eq!(path.file_name().unwrap(), "grouchly.json");
+        let path = register_expected_agent(&route, "Fang", "worker", &[]).unwrap();
+        assert_eq!(path.file_name().unwrap(), "fang.json");
 
         let roster = read_agent_roster(&route.communications).unwrap();
         assert_eq!(roster.len(), 1);
         assert_eq!(
-            roster[0].name, "grouchly",
+            roster[0].name, "fang",
             "the name inside the file is folded too, not just the filename"
         );
     }
 
-    /// Grouchly's test, kept verbatim in intent: a route that somehow carries both
+    /// Fang's test, kept verbatim in intent: a route that somehow carries both
     /// spellings must refuse to route rather than pick one. With the fold in
     /// `read_agent_roster` this should be unreachable through any real path, which is
     /// the point of asserting it - it is how we find out if the fold ever regresses.
@@ -2717,13 +2714,13 @@ mod portable_auth_route_tests {
         let mut route = test_route(dir.path());
         route.agents = vec![
             AgentRoute {
-                name: "grouchly".into(),
+                name: "fang".into(),
                 role: "orchestrator".into(),
                 capabilities: Vec::new(),
                 public_key: None,
             },
             AgentRoute {
-                name: "Grouchly".into(),
+                name: "Fang".into(),
                 role: "operator".into(),
                 capabilities: Vec::new(),
                 public_key: None,
@@ -2733,7 +2730,7 @@ mod portable_auth_route_tests {
         assert!(format!("{error:#}").contains("ignoring case"));
     }
 
-    /// Grouchly's other test, and the bug that actually broke the live channel: a
+    /// Fang's other test, and the bug that actually broke the live channel: a
     /// Syncthing conflict copy names the same agent, so it was read as a second one.
     #[test]
     fn roster_ignores_syncthing_conflict_copies() {
@@ -2741,21 +2738,21 @@ mod portable_auth_route_tests {
         let agents = dir.path().join("agents");
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
-            agents.join("beastly.json"),
-            r#"{"name":"beastly","role":"orchestrator","capabilities":[],"public_key":"aa"}"#,
+            agents.join("wisp.json"),
+            r#"{"name":"wisp","role":"orchestrator","capabilities":[],"public_key":"aa"}"#,
         )
         .unwrap();
         // The conflict copy is the older, KEYLESS one - so reading it was not merely
         // double-counting, it could displace the real agent's published key.
         std::fs::write(
-            agents.join("beastly.sync-conflict-20260817-144138-O4SHF2J.json"),
-            r#"{"name":"beastly","role":"orchestrator","capabilities":[]}"#,
+            agents.join("wisp.sync-conflict-20260817-144138-O4SHF2J.json"),
+            r#"{"name":"wisp","role":"orchestrator","capabilities":[]}"#,
         )
         .unwrap();
 
         let roster = read_roster_in(&agents).unwrap();
         assert_eq!(roster.len(), 1);
-        assert_eq!(roster[0].name, "beastly");
+        assert_eq!(roster[0].name, "wisp");
         assert_eq!(
             roster[0].public_key.as_deref(),
             Some("aa"),
@@ -2769,27 +2766,27 @@ mod portable_auth_route_tests {
         let dir = tempfile::tempdir().unwrap();
         let route = ProjectRoute {
             agents: vec![AgentRoute {
-                name: "grouchly".into(),
+                name: "fang".into(),
                 role: "worker".into(),
                 capabilities: vec!["build".into()],
                 public_key: None,
             }],
             ..test_route(dir.path())
         };
-        assert!(route.permits("Grouchly", Some("build")));
-        assert!(route.permits("GROUCHLY", None));
+        assert!(route.permits("Fang", Some("build")));
+        assert!(route.permits("FANG", None));
 
         let message = Message::new(
             "ferryman",
-            "Beastly",
-            "Grouchly",
+            "Wisp",
+            "Fang",
             "r",
             serde_json::json!({}),
             false,
             None,
         );
-        assert_eq!(message.sender, "beastly");
-        assert_eq!(message.recipient, "grouchly");
+        assert_eq!(message.sender, "wisp");
+        assert_eq!(message.recipient, "fang");
     }
 }
 
@@ -2949,7 +2946,7 @@ fn pin_path(attachment: &Path, name: &str) -> PathBuf {
 /// files - a live one written by current code and a stale one from before - and the
 /// stale entry carries a key that nothing signs with any more. Deleting it is not this
 /// function's business: the synced folder is one-writer-per-path, and the writer of
-/// `agents/Grouchly.json` is grouchly, not whoever happens to be reading. So it is
+/// `agents/Fang.json` is fang, not whoever happens to be reading. So it is
 /// folded away on read instead, everywhere, and the file may be removed at leisure.
 ///
 /// Which survives, in order:
@@ -2957,8 +2954,8 @@ fn pin_path(attachment: &Path, name: &str) -> PathBuf {
 ///     made by `register_expected_agent` for an agent that has not come online yet;
 ///     a key is proof that a machine actually holds this identity, and no spelling
 ///     convention outranks that. Getting this the other way round - preferring the
-///     canonical filename first - let a `ferry channel expect grouchly` reservation
-///     erase the real `Grouchly`'s published key, which is the fold doing exactly the
+///     canonical filename first - let a `ferry channel expect fang` reservation
+///     erase the real `Fang`'s published key, which is the fold doing exactly the
 ///     damage it exists to prevent.
 ///  2. among keyed entries, the one already stored under the canonical spelling: that
 ///     is current code writing, so it is the identity in use now rather than the
@@ -2994,7 +2991,7 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
     // channel; `communications` is its `ferryman` subdirectory.
     let attachment = communications.parent().unwrap_or(communications);
     // Folded before the pinning loop below, not after: pins are keyed by agent name, and
-    // pinning `Grouchly` and `grouchly` separately would re-create the split in the one
+    // pinning `Fang` and `fang` separately would re-create the split in the one
     // store whose whole job is to notice when an agent's key changes.
     let mut agents = fold_case_variants(read_roster_in(&communications.join("agents"))?);
     // Pin keys: an agent's public key is pinned to this operator's local store
@@ -3046,9 +3043,9 @@ fn read_roster_in(directory: &Path) -> Result<Vec<AgentRoute>> {
         if path.extension().is_none_or(|ext| ext != "json") {
             continue;
         }
-        // Grouchly's find, and the more valuable half of the two fixes: a Syncthing
+        // Fang's find, and the more valuable half of the two fixes: a Syncthing
         // conflict copy of an agent file was being read as a SECOND participant. It
-        // carries the same `name`, so the roster held two `beastly` entries - and the
+        // carries the same `name`, so the roster held two `wisp` entries - and the
         // conflict copy is usually the older, keyless one, so it could displace the real
         // key. That is what actually broke this channel with "registered participant
         // names must be unique"; the capitalisation split was a separate fault that
@@ -3785,11 +3782,11 @@ pub fn syncthing_add_device(device_id: &str, name: &str) -> Result<()> {
 /// `.gitattributes`, and `README.md`, which belong to the repository itself.
 const LEGACY_BRIDGE_ARTIFACTS: &[&str] = &[
     "send.sh",
-    "watch-beastly.sh",
-    "watch-grouchly.sh",
+    "watch-wisp.sh",
+    "watch-fang.sh",
     "_kc.sh",
-    "beastly",
-    "grouchly",
+    "wisp",
+    "fang",
     "claw",
     "fang",
     "outbox",
@@ -4533,8 +4530,8 @@ fn normalize_path(path: &Path) -> String {
 /// two spellings are the same file therefore depends on the filesystem, and Ferryman
 /// deliberately runs across all of them: NTFS and APFS fold case, ext4 does not.
 ///
-/// So `--agent Grouchly` on Linux minted a *second* key under a *second* roster entry,
-/// and the fleet ended up with `Grouchly` and `grouchly` as two agents with two different
+/// So `--agent Fang` on Linux minted a *second* key under a *second* roster entry,
+/// and the fleet ended up with `Fang` and `fang` as two agents with two different
 /// public keys. Messages addressed to one were invisible to the other, and a message
 /// signed as one read as `UnknownSigner` to a machine that only knew the other. On
 /// Windows the very same pair of commands silently shared one key, so the bug did not
@@ -7214,7 +7211,7 @@ mod serverless_tests {
         let route = route_for(&workspace).unwrap();
         register_expected_agent(
             &route,
-            "beastly",
+            "wisp",
             "orchestrator",
             &["messages.receive".to_string()],
         )
@@ -7222,12 +7219,12 @@ mod serverless_tests {
 
         // A freshly loaded route sees the reservation and permits messages to it.
         let reloaded = route_for(&workspace).unwrap();
-        assert!(reloaded.permits("beastly", None));
+        assert!(reloaded.permits("wisp", None));
         // The reservation is a name, not an identity: no key was published.
         let entry = reloaded
             .agents
             .iter()
-            .find(|agent| agent.name == "beastly")
+            .find(|agent| agent.name == "wisp")
             .unwrap();
         assert!(entry.public_key.is_none());
     }
@@ -7247,7 +7244,7 @@ mod serverless_tests {
         register_agent(
             &route,
             &AgentRoute {
-                name: "grouchly".into(),
+                name: "fang".into(),
                 role: "worker".into(),
                 capabilities: vec!["messages.receive".into()],
                 public_key: None,
@@ -7257,7 +7254,7 @@ mod serverless_tests {
         register_agent(
             &route,
             &AgentRoute {
-                name: "beastly".into(),
+                name: "wisp".into(),
                 role: "orchestrator".into(),
                 capabilities: vec!["messages.receive".into(), "review".into()],
                 public_key: None,
@@ -7268,12 +7265,8 @@ mod serverless_tests {
         // Re-read from disk: this is what another machine does after Syncthing carries it.
         let reloaded = route_for(&workspace).unwrap();
         let names: Vec<_> = reloaded.agents.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["beastly", "grouchly"],
-            "sorted, and both present"
-        );
-        assert!(reloaded.permits("grouchly", None));
+        assert_eq!(names, vec!["fang", "wisp"], "sorted, and both present");
+        assert!(reloaded.permits("fang", None));
         assert!(
             reloaded.permits("orchestrator", None),
             "role addressing works"
@@ -7288,7 +7281,7 @@ mod serverless_tests {
         register_agent(
             &route,
             &AgentRoute {
-                name: "grouchly".into(),
+                name: "fang".into(),
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: None,
@@ -7336,7 +7329,7 @@ mod serverless_tests {
         register_agent(
             &route,
             &AgentRoute {
-                name: "grouchly".into(),
+                name: "fang".into(),
                 role: "worker".into(),
                 capabilities: vec!["messages.receive".into()],
                 public_key: None,
@@ -7347,8 +7340,8 @@ mod serverless_tests {
 
         let message = Message::new(
             "demo",
-            "beastly",
-            "grouchly",
+            "wisp",
+            "fang",
             "text/plain",
             json!({"text": "check this against the real code"}),
             true,
@@ -7359,7 +7352,7 @@ mod serverless_tests {
 
         let listed = list_messages(&route).unwrap();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].sender, "beastly");
+        assert_eq!(listed[0].sender, "wisp");
         assert!(
             listed[0].reply_required,
             "reply expectation is declared, not inferred"
@@ -7400,8 +7393,8 @@ mod identity_tests {
     fn message(text: &str) -> Message {
         Message::new(
             "demo",
-            "beastly",
-            "grouchly",
+            "wisp",
+            "fang",
             "text/plain",
             json!({ "text": text }),
             true,
@@ -7426,24 +7419,24 @@ mod identity_tests {
 
     #[test]
     fn a_signed_message_verifies_against_the_published_key() {
-        let (_dir, beastly) = identity("beastly");
+        let (_dir, wisp) = identity("wisp");
         let mut m = message("deploy the thing");
-        beastly.sign(&mut m);
-        assert_eq!(m.signed_by.as_deref(), Some("beastly"));
+        wisp.sign(&mut m);
+        assert_eq!(m.signed_by.as_deref(), Some("wisp"));
         assert_eq!(
-            verify_message(&m, &roster("beastly", &beastly)),
+            verify_message(&m, &roster("wisp", &wisp)),
             SignatureCheck::Valid
         );
     }
 
     #[test]
     fn changing_the_body_after_signing_is_caught() {
-        let (_dir, beastly) = identity("beastly");
+        let (_dir, wisp) = identity("wisp");
         let mut m = message("deploy the thing");
-        beastly.sign(&mut m);
+        wisp.sign(&mut m);
         m.payload = json!({ "text": "delete everything" });
         assert_eq!(
-            verify_message(&m, &roster("beastly", &beastly)),
+            verify_message(&m, &roster("wisp", &wisp)),
             SignatureCheck::Invalid,
             "a signature must cover the payload, not merely accompany it"
         );
@@ -7451,12 +7444,12 @@ mod identity_tests {
 
     #[test]
     fn changing_the_recipient_after_signing_is_caught() {
-        let (_dir, beastly) = identity("beastly");
+        let (_dir, wisp) = identity("wisp");
         let mut m = message("deploy the thing");
-        beastly.sign(&mut m);
+        wisp.sign(&mut m);
         m.recipient = "someone-else".into();
         assert_eq!(
-            verify_message(&m, &roster("beastly", &beastly)),
+            verify_message(&m, &roster("wisp", &wisp)),
             SignatureCheck::Invalid,
             "redirecting a signed order to another agent must not verify"
         );
@@ -7464,14 +7457,14 @@ mod identity_tests {
 
     #[test]
     fn one_agent_cannot_sign_as_another() {
-        let (_a, beastly) = identity("beastly");
+        let (_a, wisp) = identity("wisp");
         let (_b, impostor) = identity("impostor");
         let mut m = message("deploy the thing");
-        // The impostor signs, then relabels the message as though beastly sent it.
+        // The impostor signs, then relabels the message as though wisp sent it.
         impostor.sign(&mut m);
-        m.signed_by = Some("beastly".into());
+        m.signed_by = Some("wisp".into());
         assert_eq!(
-            verify_message(&m, &roster("beastly", &beastly)),
+            verify_message(&m, &roster("wisp", &wisp)),
             SignatureCheck::Invalid,
             "a compromised machine must only be able to forge its OWN agents"
         );
@@ -7479,10 +7472,10 @@ mod identity_tests {
 
     #[test]
     fn an_unsigned_message_is_reported_as_unsigned_not_valid() {
-        let (_dir, beastly) = identity("beastly");
+        let (_dir, wisp) = identity("wisp");
         let m = message("no signature here");
         assert_eq!(
-            verify_message(&m, &roster("beastly", &beastly)),
+            verify_message(&m, &roster("wisp", &wisp)),
             SignatureCheck::Unsigned,
             "a fleet that has not adopted signing keeps working, but is never called valid"
         );
@@ -7503,8 +7496,8 @@ mod identity_tests {
     #[test]
     fn the_key_survives_a_restart_rather_than_being_regenerated() {
         let dir = tempfile::tempdir().unwrap();
-        let first = AgentIdentity::load_or_create("beastly", dir.path()).unwrap();
-        let again = AgentIdentity::load_or_create("beastly", dir.path()).unwrap();
+        let first = AgentIdentity::load_or_create("wisp", dir.path()).unwrap();
+        let again = AgentIdentity::load_or_create("wisp", dir.path()).unwrap();
         assert_eq!(
             first.public_key_hex(),
             again.public_key_hex(),
@@ -7519,11 +7512,11 @@ mod identity_tests {
         let attachment = workspace.join(".ferryman");
         let communications = attachment.join("ferryman");
         fs::create_dir_all(communications.join("messages/demo")).unwrap();
-        let identity = AgentIdentity::load_or_create("beastly", &attachment).unwrap();
+        let identity = AgentIdentity::load_or_create("wisp", &attachment).unwrap();
 
         // The key lives in the attachment, which is machine-local. The channel is the
         // subdirectory Syncthing carries. The key must not be inside it.
-        let key_path = attachment.join("keys/beastly.key");
+        let key_path = attachment.join("keys/wisp.key");
         assert!(key_path.is_file(), "the key is kept on this machine");
         assert!(
             !key_path.starts_with(&communications),
@@ -7552,13 +7545,13 @@ mod identity_tests {
         .unwrap();
         let route = route_for(&workspace).unwrap();
         let agent = AgentRoute {
-            name: "beastly".into(),
+            name: "wisp".into(),
             role: "orchestrator".into(),
             capabilities: vec![],
             public_key: None,
         };
 
-        let first = AgentIdentity::load_or_create("beastly", &attachment).unwrap();
+        let first = AgentIdentity::load_or_create("wisp", &attachment).unwrap();
         register_agent_key(&route, &agent, &first).unwrap();
 
         // Same key again is fine - re-registering after a restart must not be an error.
@@ -7571,7 +7564,7 @@ mod identity_tests {
         let elsewhere = tempfile::tempdir().unwrap();
         let other_machine = tempfile::tempdir().unwrap();
         let other = AgentIdentity::load_or_create_in(
-            "beastly",
+            "wisp",
             elsewhere.path(),
             Some(other_machine.path().to_path_buf()),
         )
@@ -7621,7 +7614,7 @@ mod work_over_files_tests {
         let (temp, mut route) = channel();
         let mut identities = HashMap::new();
         let mut roster = Vec::new();
-        for name in ["grouchly", "beastly", "nebra", "worker", "orchestrator"] {
+        for name in ["fang", "wisp", "nebra", "worker", "orchestrator"] {
             let identity = AgentIdentity::load_or_create(name, &route.attachment).unwrap();
             roster.push(AgentRoute {
                 name: name.to_string(),
@@ -7639,7 +7632,7 @@ mod work_over_files_tests {
         Order {
             id: id.into(),
             project_id: "demo".into(),
-            issued_by: "beastly".into(),
+            issued_by: "wisp".into(),
             assigned_to: assigned_to.map(ToString::to_string),
             created_at: Utc::now(),
             payload: json!({"task": "write the report"}),
@@ -7712,11 +7705,11 @@ mod work_over_files_tests {
     #[test]
     fn an_addressed_order_has_nothing_to_race_over() {
         let (_t, route) = channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
         // Someone else claims it anyway. It changes nothing.
         claim_order(&route, "t-1", "nebra").unwrap();
         let task = read_task(&route, "t-1").unwrap();
-        assert_eq!(task.holder(), Some("grouchly"), "the assignee holds it");
+        assert_eq!(task.holder(), Some("fang"), "the assignee holds it");
     }
 
     #[test]
@@ -7728,7 +7721,7 @@ mod work_over_files_tests {
         issue_order(&route, &dependent).unwrap();
         // t-1 is still open, so t-2 must not be offered for work.
         assert!(
-            work_for(&route, "grouchly")
+            work_for(&route, "fang")
                 .unwrap()
                 .iter()
                 .all(|t| t.order.id != "t-2"),
@@ -7745,7 +7738,7 @@ mod work_over_files_tests {
         // Both claim before either has seen the other - exactly the sync-window race.
         let early = Claim {
             order_id: "t-1".into(),
-            agent: "grouchly".into(),
+            agent: "fang".into(),
             claimed_at: Utc::now() - chrono::Duration::seconds(3),
         };
         let late = Claim {
@@ -7753,13 +7746,13 @@ mod work_over_files_tests {
             agent: "nebra".into(),
             claimed_at: Utc::now(),
         };
-        write_task_file(&task_dir(&route, "t-1").join("claim.grouchly.json"), &early).unwrap();
+        write_task_file(&task_dir(&route, "t-1").join("claim.fang.json"), &early).unwrap();
         write_task_file(&task_dir(&route, "t-1").join("claim.nebra.json"), &late).unwrap();
 
         let task = read_task(&route, "t-1").unwrap();
         assert_eq!(
             task.holder(),
-            Some("grouchly"),
+            Some("fang"),
             "oldest claim wins, and every machine computes that identically from the same files"
         );
     }
@@ -7769,7 +7762,7 @@ mod work_over_files_tests {
         let (_t, route) = channel();
         issue_order(&route, &order("t-1", None, false)).unwrap();
         let at = Utc::now();
-        for agent in ["nebra", "grouchly"] {
+        for agent in ["nebra", "fang"] {
             write_task_file(
                 &task_dir(&route, "t-1").join(format!("claim.{agent}.json")),
                 &Claim {
@@ -7783,7 +7776,7 @@ mod work_over_files_tests {
         let task = read_task(&route, "t-1").unwrap();
         assert_eq!(
             task.holder(),
-            Some("grouchly"),
+            Some("fang"),
             "identical timestamps must not leave each machine picking its own favourite"
         );
     }
@@ -7793,10 +7786,10 @@ mod work_over_files_tests {
         let (_t, route) = channel();
         issue_order(&route, &order("t-1", None, false)).unwrap();
         write_task_file(
-            &task_dir(&route, "t-1").join("claim.grouchly.json"),
+            &task_dir(&route, "t-1").join("claim.fang.json"),
             &Claim {
                 order_id: "t-1".into(),
-                agent: "grouchly".into(),
+                agent: "fang".into(),
                 claimed_at: Utc::now() - chrono::Duration::seconds(10),
             },
         )
@@ -7805,7 +7798,7 @@ mod work_over_files_tests {
         // nebra claims again, later. Its original timestamp must stand.
         claim_order(&route, "t-1", "nebra").unwrap();
         let task = read_task(&route, "t-1").unwrap();
-        assert_eq!(task.holder(), Some("grouchly"));
+        assert_eq!(task.holder(), Some("fang"));
     }
 
     #[test]
@@ -7878,26 +7871,19 @@ mod work_over_files_tests {
     #[test]
     fn an_order_nobody_picked_up_does_not_read_as_being_worked_on() {
         // The failure this prevents: four orders addressed to a machine whose worker was
-        // not running all read as "Claimed { by: grouchly }". The operator waited on work
+        // not running all read as "Claimed { by: fang }". The operator waited on work
         // that had never started, and the status display was the reason they waited.
         let (_t, route, _identities) = signed_channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
         let task = read_task(&route, "t-1").unwrap();
-        assert_eq!(
-            task.state(),
-            TaskState::Offered {
-                to: "grouchly".into()
-            }
-        );
+        assert_eq!(task.state(), TaskState::Offered { to: "fang".into() });
         // Whose task it is has not changed - only whether anyone has taken it.
-        assert_eq!(task.holder(), Some("grouchly"));
+        assert_eq!(task.holder(), Some("fang"));
 
-        claim_order(&route, "t-1", "grouchly").unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
-            TaskState::Claimed {
-                by: "grouchly".into()
-            }
+            TaskState::Claimed { by: "fang".into() }
         );
     }
 
@@ -7906,46 +7892,42 @@ mod work_over_files_tests {
         // Offered must not become a state that hides work from the machine it was
         // addressed to, or an addressed order would never be done at all.
         let (_t, route, _identities) = signed_channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
-        assert_eq!(work_for(&route, "grouchly").unwrap().len(), 1);
-        assert_eq!(work_for(&route, "beastlywsl").unwrap().len(), 0);
+        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
+        assert_eq!(work_for(&route, "fang").unwrap().len(), 1);
+        assert_eq!(work_for(&route, "wisp").unwrap().len(), 0);
     }
 
     #[test]
     fn the_whole_review_cycle_is_just_more_files_in_one_directory() {
         let (_t, route, identities) = signed_channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), true)).unwrap();
+        issue_order(&route, &order("t-1", Some("fang"), true)).unwrap();
         // Addressed, not yet picked up. This used to read as Claimed, which is the same
         // word the display uses for "a machine is working on it right now".
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
-            TaskState::Offered {
-                to: "grouchly".into()
-            }
+            TaskState::Offered { to: "fang".into() }
         );
-        claim_order(&route, "t-1", "grouchly").unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
-            TaskState::Claimed {
-                by: "grouchly".into()
-            }
+            TaskState::Claimed { by: "fang".into() }
         );
 
         let mut result = TaskResult {
             order_id: "t-1".into(),
-            agent: "grouchly".into(),
+            agent: "fang".into(),
             revision: 1,
             submitted_at: Utc::now(),
             payload: json!({"draft": 1}),
             signed_by: None,
             signature: None,
         };
-        identities["grouchly"].sign_result(&mut result);
+        identities["fang"].sign_result(&mut result);
         submit_result(&route, &result).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
             TaskState::AwaitingReview {
-                by: "grouchly".into(),
+                by: "fang".into(),
                 revision: 1
             }
         );
@@ -7953,14 +7935,14 @@ mod work_over_files_tests {
         let mut review = Review {
             order_id: "t-1".into(),
             revision: 1,
-            reviewer: "beastly".into(),
+            reviewer: "wisp".into(),
             reviewed_at: Utc::now(),
             accepted: false,
             notes: Some("the summary contradicts the table".into()),
             signed_by: None,
             signature: None,
         };
-        identities["beastly"].sign_review(&mut review);
+        identities["wisp"].sign_review(&mut review);
         submit_review(&route, &review).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
@@ -7969,26 +7951,26 @@ mod work_over_files_tests {
 
         let mut result = TaskResult {
             order_id: "t-1".into(),
-            agent: "grouchly".into(),
+            agent: "fang".into(),
             revision: 2,
             submitted_at: Utc::now(),
             payload: json!({"draft": 2}),
             signed_by: None,
             signature: None,
         };
-        identities["grouchly"].sign_result(&mut result);
+        identities["fang"].sign_result(&mut result);
         submit_result(&route, &result).unwrap();
         let mut review = Review {
             order_id: "t-1".into(),
             revision: 2,
-            reviewer: "beastly".into(),
+            reviewer: "wisp".into(),
             reviewed_at: Utc::now(),
             accepted: true,
             notes: None,
             signed_by: None,
             signature: None,
         };
-        identities["beastly"].sign_review(&mut review);
+        identities["wisp"].sign_review(&mut review);
         submit_review(&route, &review).unwrap();
         assert_eq!(
             read_task(&route, "t-1").unwrap().state(),
@@ -7999,17 +7981,17 @@ mod work_over_files_tests {
     #[test]
     fn work_without_review_is_done_when_the_result_lands() {
         let (_t, route, identities) = signed_channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
         let mut result = TaskResult {
             order_id: "t-1".into(),
-            agent: "grouchly".into(),
+            agent: "fang".into(),
             revision: 1,
             submitted_at: Utc::now(),
             payload: json!({"ok": true}),
             signed_by: None,
             signature: None,
         };
-        identities["grouchly"].sign_result(&mut result);
+        identities["fang"].sign_result(&mut result);
         submit_result(&route, &result).unwrap();
         assert_eq!(read_task(&route, "t-1").unwrap().state(), TaskState::Done);
     }
@@ -8017,7 +7999,7 @@ mod work_over_files_tests {
     #[test]
     fn sending_work_back_without_notes_is_refused() {
         let (_t, route) = channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), true)).unwrap();
+        issue_order(&route, &order("t-1", Some("fang"), true)).unwrap();
         for notes in [None, Some(String::from("   "))] {
             assert!(
                 submit_review(
@@ -8025,7 +8007,7 @@ mod work_over_files_tests {
                     &Review {
                         order_id: "t-1".into(),
                         revision: 1,
-                        reviewer: "beastly".into(),
+                        reviewer: "wisp".into(),
                         reviewed_at: Utc::now(),
                         accepted: false,
                         notes,
@@ -8043,10 +8025,10 @@ mod work_over_files_tests {
     fn an_agent_only_sees_work_that_is_actually_its_own() {
         let (_t, route) = channel();
         issue_order(&route, &order("t-open", None, false)).unwrap();
-        issue_order(&route, &order("t-mine", Some("grouchly"), false)).unwrap();
+        issue_order(&route, &order("t-mine", Some("fang"), false)).unwrap();
         issue_order(&route, &order("t-theirs", Some("nebra"), false)).unwrap();
 
-        let mine: Vec<_> = work_for(&route, "grouchly")
+        let mine: Vec<_> = work_for(&route, "fang")
             .unwrap()
             .into_iter()
             .map(|t| t.order.id)
@@ -8065,7 +8047,7 @@ mod work_over_files_tests {
     #[test]
     fn an_unreadable_file_does_not_hide_the_rest_of_the_task() {
         let (_t, route) = channel();
-        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
         fs::write(
             task_dir(&route, "t-1").join("claim.broken.json"),
             "{ not json",
@@ -8074,7 +8056,7 @@ mod work_over_files_tests {
         let task = read_task(&route, "t-1").unwrap();
         assert_eq!(
             task.holder(),
-            Some("grouchly"),
+            Some("fang"),
             "one bad file must not stall the task"
         );
     }
@@ -8082,73 +8064,73 @@ mod work_over_files_tests {
     #[test]
     fn a_signed_order_result_and_review_all_verify() {
         let keys = tempfile::tempdir().unwrap();
-        let beastly = AgentIdentity::load_or_create("beastly", keys.path()).unwrap();
-        let grouchly = AgentIdentity::load_or_create("grouchly", keys.path()).unwrap();
+        let wisp = AgentIdentity::load_or_create("wisp", keys.path()).unwrap();
+        let fang = AgentIdentity::load_or_create("fang", keys.path()).unwrap();
         let roster = vec![
             AgentRoute {
-                name: "beastly".into(),
+                name: "wisp".into(),
                 role: "orchestrator".into(),
                 capabilities: vec![],
-                public_key: Some(beastly.public_key_hex()),
+                public_key: Some(wisp.public_key_hex()),
             },
             AgentRoute {
-                name: "grouchly".into(),
+                name: "fang".into(),
                 role: "worker".into(),
                 capabilities: vec![],
-                public_key: Some(grouchly.public_key_hex()),
+                public_key: Some(fang.public_key_hex()),
             },
         ];
 
-        let mut o = order("t-1", Some("grouchly"), true);
-        beastly.sign_order(&mut o);
+        let mut o = order("t-1", Some("fang"), true);
+        wisp.sign_order(&mut o);
         assert_eq!(verify_order(&o, &roster), SignatureCheck::Valid);
 
         let mut r = TaskResult {
             order_id: "t-1".into(),
-            agent: "grouchly".into(),
+            agent: "fang".into(),
             revision: 1,
             submitted_at: Utc::now(),
             payload: json!({"draft": 1}),
             signed_by: None,
             signature: None,
         };
-        grouchly.sign_result(&mut r);
+        fang.sign_result(&mut r);
         assert_eq!(verify_result(&r, &roster), SignatureCheck::Valid);
 
         let mut v = Review {
             order_id: "t-1".into(),
             revision: 1,
-            reviewer: "beastly".into(),
+            reviewer: "wisp".into(),
             reviewed_at: Utc::now(),
             accepted: true,
             notes: None,
             signed_by: None,
             signature: None,
         };
-        beastly.sign_review(&mut v);
+        wisp.sign_review(&mut v);
         assert_eq!(verify_review(&v, &roster), SignatureCheck::Valid);
     }
 
     #[test]
     fn tampering_with_submitted_work_is_caught() {
         let keys = tempfile::tempdir().unwrap();
-        let grouchly = AgentIdentity::load_or_create("grouchly", keys.path()).unwrap();
+        let fang = AgentIdentity::load_or_create("fang", keys.path()).unwrap();
         let roster = vec![AgentRoute {
-            name: "grouchly".into(),
+            name: "fang".into(),
             role: "worker".into(),
             capabilities: vec![],
-            public_key: Some(grouchly.public_key_hex()),
+            public_key: Some(fang.public_key_hex()),
         }];
         let mut r = TaskResult {
             order_id: "t-1".into(),
-            agent: "grouchly".into(),
+            agent: "fang".into(),
             revision: 1,
             submitted_at: Utc::now(),
             payload: json!({"finding": "no problems found"}),
             signed_by: None,
             signature: None,
         };
-        grouchly.sign_result(&mut r);
+        fang.sign_result(&mut r);
         r.payload = json!({"finding": "everything is broken"});
         assert_eq!(
             verify_result(&r, &roster),
@@ -8160,24 +8142,24 @@ mod work_over_files_tests {
     #[test]
     fn a_verdict_cannot_be_flipped_after_it_was_given() {
         let keys = tempfile::tempdir().unwrap();
-        let beastly = AgentIdentity::load_or_create("beastly", keys.path()).unwrap();
+        let wisp = AgentIdentity::load_or_create("wisp", keys.path()).unwrap();
         let roster = vec![AgentRoute {
-            name: "beastly".into(),
+            name: "wisp".into(),
             role: "orchestrator".into(),
             capabilities: vec![],
-            public_key: Some(beastly.public_key_hex()),
+            public_key: Some(wisp.public_key_hex()),
         }];
         let mut v = Review {
             order_id: "t-1".into(),
             revision: 1,
-            reviewer: "beastly".into(),
+            reviewer: "wisp".into(),
             reviewed_at: Utc::now(),
             accepted: false,
             notes: Some("this is wrong".into()),
             signed_by: None,
             signature: None,
         };
-        beastly.sign_review(&mut v);
+        wisp.sign_review(&mut v);
         // Turn a rejection into an approval.
         v.accepted = true;
         v.notes = None;

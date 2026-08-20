@@ -475,11 +475,9 @@ mod tests {
         // Attribution has to survive into git history, and a machine must not be
         // given an address that looks like it could receive mail.
         let repo = temp_repo();
-        let (dir, branch) = create_worktree(&repo, "ENG-4", "grouchly").unwrap();
+        let (dir, branch) = create_worktree(&repo, "ENG-4", "fang").unwrap();
         fs::write(dir.join("x.txt"), "work").unwrap();
-        commit_all(&dir, "grouchly", "ENG-4: work")
-            .unwrap()
-            .unwrap();
+        commit_all(&dir, "fang", "ENG-4: work").unwrap().unwrap();
 
         let out = Command::new("git")
             .args([
@@ -493,7 +491,7 @@ mod tests {
             .output()
             .unwrap();
         let who = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        assert_eq!(who, "grouchly <grouchly@ferryman.invalid>");
+        assert_eq!(who, "fang <fang@ferryman.invalid>");
         let _ = fs::remove_dir_all(&repo);
     }
 

@@ -1060,7 +1060,7 @@ fn load_graph() -> Option<Value> {
         .map(std::path::PathBuf::from)
         .filter(|path| path.is_file())
         .or_else(|| {
-            ["/mnt/nvme-storage/cline/projects/ferryman/graphify-out/graph.json"]
+            ["/srv/cline/projects/ferryman/graphify-out/graph.json"]
                 .iter()
                 .map(std::path::PathBuf::from)
                 .find(|path| path.is_file())
