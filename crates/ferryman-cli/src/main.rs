@@ -568,6 +568,32 @@ enum Channel {
         #[arg(long)]
         all: bool,
     },
+    /// Put one identity's key into every channel under a folder, so it can sign in all
+    /// of them.
+    ///
+    /// A key lives per attachment, and an attachment is per project. That is right for a
+    /// worker - one machine, one project's work - and wrong for anything that spans
+    /// projects. An orchestrator that reads a request about one project and issues the
+    /// order into another needs to sign in both, and finds out it cannot at the moment it
+    /// tries.
+    ///
+    /// This moves the key this machine already holds. It does not mint one: a second key
+    /// under a name the roster knows makes every signature it produces read as an
+    /// impostor, so a name this machine has never held is a refusal, not an invitation.
+    Seat {
+        /// The folder holding the channels.
+        #[arg(long)]
+        comms: PathBuf,
+        /// Whose key to seat. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// What to call it in the rosters it is published to.
+        #[arg(long, default_value = "operator")]
+        role: String,
+        /// List what would be seated, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Announce this agent to the fleet so others can address it.
     Join {
         #[arg(long)]
@@ -3744,6 +3770,73 @@ fn channel(command: Channel) -> Result<()> {
             }
         }
 
+        Channel::Seat {
+            comms,
+            agent,
+            role,
+            dry_run,
+        } => {
+            let fleet = ferryman_ops::agent::fleet_under(&comms)?;
+            for (path, why) in &fleet.skipped {
+                println!("  skipping {}: {why}", path.display());
+            }
+            if fleet.served.is_empty() {
+                bail!("no Ferryman channels under {}", comms.display());
+            }
+            // Whose key, resolved once against a channel that has one. Resolving per
+            // channel would let a machine seat two different names in one pass.
+            let name = ferryman_ops::identity::resolve(agent, &fleet.served[0].0.attachment)?;
+            let Some(identity) = fleet.served.iter().find_map(|(route, _)| {
+                ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)
+                    .ok()
+                    .flatten()
+            }) else {
+                bail!(
+                    "this machine holds no key for '{name}' in any channel under {}. Join \
+                     once, in any one of them, and then seat it in the rest - a key cannot \
+                     be created here, because a second key under a name the roster already \
+                     knows makes every signature it produces read as an impostor.",
+                    comms.display()
+                )
+            };
+            println!("seating '{name}' ({})", identity.public_key_hex());
+            let mut seated = 0;
+            for (route, _) in &fleet.served {
+                let held =
+                    ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)?;
+                if held.is_some() {
+                    println!("  {}  already has it", route.project_id);
+                    continue;
+                }
+                if dry_run {
+                    println!("  {}  would seat and publish", route.project_id);
+                    continue;
+                }
+                let published = ferryman_channel::AgentRoute {
+                    name: name.clone(),
+                    role: role.clone(),
+                    capabilities: Vec::new(),
+                    public_key: None,
+                };
+                match identity.seat_in(&route.attachment).and_then(|()| {
+                    ferryman_channel::register_agent_key(route, &published, &identity)
+                }) {
+                    Ok(_) => {
+                        println!("  {}  seated and published", route.project_id);
+                        seated += 1;
+                    }
+                    // Named and stepped over. The case that fails here is a roster that
+                    // already knows this name under another key, which is a conflict worth
+                    // seeing rather than a reason to abandon the other channels.
+                    Err(error) => println!("  {}  refused: {error}", route.project_id),
+                }
+            }
+            if dry_run {
+                println!("nothing was written");
+            } else {
+                println!("seated in {seated} channel(s)");
+            }
+        }
         Channel::Join {
             workspace,
             name,
