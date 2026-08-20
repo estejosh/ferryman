@@ -32,6 +32,14 @@
 //! writer per path is a rule this file would break: every machine that runs a bridge would
 //! write its own view of the same topics. It is local, small, and plain text - and it is
 //! the only copy of ids nothing can re-derive, so it is worth backing up.
+//!
+//! # The bot is an administrator, on purpose
+//!
+//! Making the topics needs the "Manage topics" administrator right, which also lets the bot
+//! rename, close and delete them. That is materially more power than a bridge that only
+//! posts into a chat. It is proportionate here - the operator owns the group, and a wrong
+//! group is caught the moment it is adopted - but it belongs in the threat model, not
+//! something to be discovered later.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;

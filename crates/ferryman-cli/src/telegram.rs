@@ -326,6 +326,70 @@ impl Chat {
         }
     }
 
+    /// Check the bot can manage topics in this group, and say exactly what is wrong if it
+    /// cannot.
+    ///
+    /// `createForumTopic` needs the bot to be an administrator with the "Manage topics"
+    /// right, and its failure is a bare Bad Request with no hint about which of the two is
+    /// missing. That is checked here at startup instead, so the operator reads the reason
+    /// rather than an error Telegram phrased for a bot.
+    async fn require_manage_topics(&self, chat_id: i64) -> Result<()> {
+        #[derive(Default, Deserialize)]
+        struct Me {
+            id: i64,
+        }
+        let me: TgResponse<Me> = self
+            .http
+            .get(format!("https://api.telegram.org/bot{}/getMe", self.token))
+            .send()
+            .await
+            .context("ask Telegram who the bot is")?
+            .json()
+            .await
+            .context("parse Telegram's reply to getMe")?;
+        let Some(bot_id) = me.result.map(|me| me.id) else {
+            bail!(
+                "telegram getMe returned no id: {}",
+                me.description
+                    .unwrap_or_else(|| "no reason given".to_string())
+            );
+        };
+
+        #[derive(Default, Deserialize)]
+        struct Member {
+            #[serde(default)]
+            can_manage_topics: Option<bool>,
+        }
+        let response: TgResponse<Member> = self
+            .http
+            .get(format!(
+                "https://api.telegram.org/bot{}/getChatMember",
+                self.token
+            ))
+            .query(&[
+                ("chat_id", chat_id.to_string()),
+                ("user_id", bot_id.to_string()),
+            ])
+            .send()
+            .await
+            .context("ask Telegram about the bot's rights in the group")?
+            .json()
+            .await
+            .context("parse Telegram's reply to getChatMember")?;
+        let Some(member) = response.result else {
+            bail!(
+                "telegram could not read the bot's rights in group {chat_id}: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "no reason given".to_string())
+            );
+        };
+        if member.can_manage_topics == Some(true) {
+            return Ok(());
+        }
+        bail!("the bot needs to be an administrator with Manage Topics in this group")
+    }
+
     async fn updates(&self, offset: i64) -> Result<Vec<TgUpdate>> {
         let response: TgResponse<Vec<TgUpdate>> = self
             .http
@@ -487,6 +551,10 @@ async fn group_bridge(
         .ok();
     }
 
+    // The first topic creation would tell us this with a bare Bad Request; asking up front
+    // means the operator reads the reason once, at startup, instead of at the first topic.
+    chat.require_manage_topics(group).await?;
+
     // Build out the group to match the file. Saved after each one: an id Telegram has
     // handed out and Ferryman has not written down belongs to a topic nothing can ever
     // speak into again, so losing four of them to one failed write is not acceptable.
@@ -610,25 +678,43 @@ async fn learn_group(
             let Some(message) = update.message else {
                 continue;
             };
-            if message.from.as_ref().map(|user| user.id) != Some(approver) {
-                continue;
-            }
-            let Some(chat_id) = message.chat.as_ref().map(|c| c.id) else {
-                continue;
-            };
-            // Group and supergroup ids are negative; a positive id is a person.
-            if chat_id < 0 {
+            if let Some(chat_id) = adopt_group(approver, &message) {
                 return Ok(chat_id);
             }
-            chat.send_to(
-                chat_id,
-                None,
-                "That is our private chat, and it has no topics. Say it in the group instead.",
-            )
-            .await
-            .ok();
+            // The approver spoke, but not in a group. A private chat has no topics, so say
+            // where to speak instead rather than wiring the bridge to a place topics cannot
+            // exist.
+            if message.from.as_ref().map(|user| user.id) == Some(approver)
+                && let Some(chat_id) = message.chat.as_ref().map(|c| c.id)
+            {
+                chat.send_to(
+                    chat_id,
+                    None,
+                    "That is our private chat, and it has no topics. Say it in the group instead.",
+                )
+                .await
+                .ok();
+            }
         }
     }
+}
+
+/// Whether a message adopts the group, and which group.
+///
+/// The whole rule in one place, because the two halves of it are easy to get wrong in
+/// opposite directions: a message from anyone but the approver is not an adoption - group
+/// membership changes, and Telegram authenticates the sender, not the room - and a private
+/// chat is not an adoption either, because it has no topics for the bridge to work in.
+///
+/// Returns `None` to keep waiting, `Some(chat_id)` for the group to adopt.
+#[must_use]
+fn adopt_group(approver: i64, message: &TgMessage) -> Option<i64> {
+    if message.from.as_ref().map(|user| user.id) != Some(approver) {
+        return None;
+    }
+    let chat_id = message.chat.as_ref()?.id;
+    // Group and supergroup ids are negative; a positive id is a person.
+    (chat_id < 0).then_some(chat_id)
 }
 
 /// The older shape: one chat, one project, no map.
@@ -1239,5 +1325,37 @@ mod tests {
         // sharing a cursor file would fight over it.
         let path = state_path(Path::new("/w/.ferryman"), "beastlywsl");
         assert!(path.ends_with("telegram-beastlywsl.json"));
+    }
+
+    #[test]
+    fn a_non_approver_message_does_not_adopt_the_group() {
+        // Group membership is not authority: Telegram authenticates the sender, not the
+        // room, and a room whose membership changes is no basis for taking orders.
+        let message: TgMessage = serde_json::from_str(
+            r#"{"message_id":1,"from":{"id":999},"chat":{"id":-100123},"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(adopt_group(42, &message), None);
+    }
+
+    #[test]
+    fn an_approver_message_in_a_private_chat_does_not_adopt_the_group() {
+        // A private chat has no topics, so adopting it would wire the bridge to a place
+        // topics cannot exist. The caller tells the approver to speak in the group instead.
+        let message: TgMessage = serde_json::from_str(
+            r#"{"message_id":2,"from":{"id":42},"chat":{"id":123},"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(adopt_group(42, &message), None);
+    }
+
+    #[test]
+    fn an_approver_message_in_a_group_adopts_it() {
+        // Negative chat ids are groups and supergroups; a positive id is a person.
+        let message: TgMessage = serde_json::from_str(
+            r#"{"message_id":3,"from":{"id":42},"chat":{"id":-100123},"text":"hi"}"#,
+        )
+        .unwrap();
+        assert_eq!(adopt_group(42, &message), Some(-100123));
     }
 }
