@@ -1437,6 +1437,73 @@ fn parse_verdict(output: &str) -> Result<Verdict> {
     })
 }
 
+/// Stop two workers on one machine sharing one identity and one channel.
+///
+/// # The failure this prevents
+///
+/// A fleet poller was started while the old per-project worker was still running. Both
+/// were `grouchly`, both watched the ferryman channel, and a claim already held by
+/// `grouchly` reads to a `grouchly` worker as *its own work, resumed*. So the second
+/// process spawned a second engine for a task the first was already running - two agents,
+/// one order, and whichever finished last would have written the result.
+///
+/// It was caught by the machine that did it, before either could submit. Nothing in the
+/// code noticed, which is the part worth fixing: the claim protocol settles races between
+/// *different* agents, and has nothing to say about one agent racing itself.
+///
+/// A lock file per identity and channel, holding the pid. Taken for the life of the
+/// process, released on exit; a lock naming a pid that is no longer running is stale and
+/// taken over, because the common way to leave one behind is a machine losing power.
+pub struct WorkerLock {
+    path: PathBuf,
+}
+
+impl WorkerLock {
+    /// Take the lock, or say who holds it.
+    pub fn take(attachment: &Path, agent: &str) -> Result<Option<Self>> {
+        let path = attachment.join(format!("worker-{}.lock", canonical(agent)));
+        // No exemption for this process's own pid. Taking the same lock twice from one
+        // process is the same bug as taking it from two - the fleet poller holds one per
+        // channel, and two of those naming one channel would be two loops over it.
+        if let Ok(text) = fs::read_to_string(&path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && process_alive(pid)
+        {
+            return Ok(None);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
+        fs::write(&path, std::process::id().to_string())
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(Some(Self { path }))
+    }
+}
+
+impl Drop for WorkerLock {
+    fn drop(&mut self) {
+        // Best effort. A lock left behind by a kill -9 is handled by the pid check on the
+        // next start, so failing to clean up here costs nothing.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Whether a pid belongs to a process that still exists.
+///
+/// `/proc` on Linux, which is where this runs unattended. Anywhere else the honest answer
+/// is "cannot tell", and the safe reading of that is "assume it is alive": refusing to
+/// start twice is recoverable, and two engines writing one result is not.
+fn process_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        return Path::new(&format!("/proc/{pid}")).exists();
+    }
+    true
+}
+
+fn canonical(agent: &str) -> String {
+    ferryman_channel::canonical_agent_name(agent)
+}
+
 /// Every channel under one folder, and the config each will be worked under.
 ///
 /// # Why the poller is not per project
@@ -1499,6 +1566,35 @@ pub fn fleet_under(dir: &Path) -> Result<Fleet> {
                 }
             },
         };
+        // Can this machine actually sign as the name it is configured to work under?
+        //
+        // Checked here, once, at startup - because the alternative is finding out at the
+        // moment a result is submitted, and for one particular name the failure is worse
+        // than an error. An operator identity is a *person's*, sealed under their
+        // password, and asking for it is what `ferry` does when it cannot find a machine
+        // key. A headless worker has nobody to ask: it either fails on every task or sits
+        // waiting on a terminal that will never answer.
+        //
+        // Observed exactly that way round: eighteen channels pinned `agent = "operator"`,
+        // and a machine told to be a person spent its time asking for a password.
+        if ferryman_channel::AgentIdentity::load_existing(&config.agent, &route.attachment)?
+            .is_none()
+        {
+            skipped.push((
+                path,
+                format!(
+                    "no key for '{}' here, so nothing it did could be signed. If '{}' is a \
+                     person, this is the wrong name for a machine to work under - set \
+                     `agent` in {} to this machine's own name. If it is this machine, \
+                     'ferry channel seat --comms <dir> --agent {}' will put its key here.",
+                    config.agent,
+                    config.agent,
+                    AgentConfig::path(&route.attachment).display(),
+                    config.agent
+                ),
+            ));
+            continue;
+        }
         served.push((route, config));
     }
     Ok(Fleet { served, skipped })
@@ -2532,6 +2628,70 @@ mod tests {
             "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
         )
         .unwrap();
+        // A channel this machine cannot sign in is not one it can work, so the fixture
+        // has to hold a key the same way a real enabled channel does.
+        holds_key(&attachment, "beastlywsl");
+    }
+
+    /// Give `attachment` a signing key for `agent`, without reaching for the machine's
+    /// real one.
+    fn holds_key(attachment: &Path, agent: &str) {
+        std::fs::create_dir_all(attachment.join("keys")).unwrap();
+        std::fs::write(
+            attachment.join("keys").join(format!("{agent}.key")),
+            "07".repeat(32),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn one_identity_gets_one_worker_per_channel() {
+        // The observed failure: a fleet poller started beside the old per-project worker,
+        // both as grouchly, both on ferryman. A claim held by grouchly reads to a grouchly
+        // worker as its own work resumed, so it spawned a second engine for a task the
+        // first was already running.
+        let dir = tempfile::tempdir().unwrap();
+        let held = WorkerLock::take(dir.path(), "grouchly").unwrap();
+        assert!(held.is_some());
+        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_different_identity_is_not_blocked() {
+        // Two engines under two names is the ordinary case the claim protocol settles.
+        let dir = tempfile::tempdir().unwrap();
+        let _held = WorkerLock::take(dir.path(), "grouchly").unwrap().unwrap();
+        assert!(
+            WorkerLock::take(dir.path(), "beastlywsl")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn the_lock_goes_when_the_worker_does() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _held = WorkerLock::take(dir.path(), "grouchly").unwrap().unwrap();
+        }
+        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_lock_left_by_a_dead_worker_is_taken_over() {
+        // The usual way one is left behind is a machine losing power, and a fleet that
+        // will not start until someone deletes a file is a fleet that stays down.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("worker-grouchly.lock"), "999999999").unwrap();
+        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_some());
+    }
+
+    #[test]
+    fn the_name_is_folded_the_way_every_other_store_folds_it() {
+        // Grouchly and grouchly are one machine; two locks would be two workers.
+        let dir = tempfile::tempdir().unwrap();
+        let _held = WorkerLock::take(dir.path(), "Grouchly").unwrap().unwrap();
+        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_none());
     }
 
     #[test]
@@ -2594,6 +2754,7 @@ mod tests {
             "agent = \"grouchly\"\ncommand = \"ferryman-cline\"\n",
         )
         .unwrap();
+        holds_key(&workspace.join(".ferryman"), "grouchly");
         std::fs::write(
             AgentConfig::path(comms.path()),
             "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
@@ -2602,6 +2763,31 @@ mod tests {
 
         let fleet = fleet_under(comms.path()).unwrap();
         assert_eq!(fleet.served[0].1.command, "ferryman-cline");
+    }
+
+    #[test]
+    fn a_channel_this_machine_cannot_sign_in_is_refused_with_the_reason() {
+        // The failure: eighteen channels pinned `agent = "operator"` - a person's
+        // identity, sealed under their password. A headless machine told to be a person
+        // has nobody to ask for it, so it spent its time asking for a password instead of
+        // working. Caught at startup, once, rather than at every submission.
+        let comms = tempfile::tempdir().unwrap();
+        let workspace = comms.path().join("obscura-ferryman");
+        enabled_channel(&workspace, "obscura");
+        std::fs::write(
+            AgentConfig::path(&workspace.join(".ferryman")),
+            "agent = \"operator\"\ncommand = \"claude\"\n",
+        )
+        .unwrap();
+
+        let fleet = fleet_under(comms.path()).unwrap();
+        assert!(fleet.served.is_empty());
+        assert_eq!(fleet.skipped.len(), 1);
+        let why = &fleet.skipped[0].1;
+        assert!(why.contains("no key for 'operator' here"), "{why}");
+        // And it says both ways out: rename the agent, or seat the key.
+        assert!(why.contains("this machine's own name"), "{why}");
+        assert!(why.contains("ferry channel seat"), "{why}");
     }
 
     #[test]

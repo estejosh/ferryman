@@ -584,7 +584,14 @@ enum Channel {
         /// The folder holding the channels.
         #[arg(long)]
         comms: PathBuf,
-        /// Whose key to seat. Defaults to this machine's name.
+        /// Whose key to seat.
+        ///
+        /// Defaults to the name this machine is *configured* to work under, which is the
+        /// `agent` key in the first channel's `agent.toml` - not the hostname. Those
+        /// differ more often than they look: a fleet whose channels all pin
+        /// `agent = "operator"` will default to seating the operator, who already has a
+        /// key everywhere, and report "already has it" nineteen times while seating
+        /// nothing. Name it explicitly when you mean a machine.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
         /// What to call it in the rosters it is published to.
@@ -2689,6 +2696,24 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("nothing was claimed, written or sent");
                 return Ok(());
             }
+            // One worker per identity per channel. Two under one name resume each other's
+            // claims and run the same order twice; see WorkerLock.
+            let mut locks = Vec::new();
+            let mut contested = Vec::new();
+            for (route, config) in &fleet.served {
+                match agent::WorkerLock::take(&route.attachment, &config.agent)? {
+                    Some(lock) => locks.push(lock),
+                    None => contested.push(route.project_id.clone()),
+                }
+            }
+            if !contested.is_empty() {
+                bail!(
+                    "another worker on this machine is already watching {} as the same \
+                     agent. Two workers under one identity resume each other's claims and \
+                     run the same order twice - stop the other one first.",
+                    contested.join(", ")
+                );
+            }
             report.info(&format!(
                 "worker watching {} channel(s) under {}",
                 fleet.served.len(),
@@ -2778,6 +2803,16 @@ async fn agent_command(command: Agent) -> Result<()> {
             // failed on every pass look the same in an empty log, and "why did nothing
             // happen last night" is the question this has to be able to answer.
             let report = worker_progress();
+            let _lock = match agent::WorkerLock::take(&route.attachment, &config.agent)? {
+                Some(lock) => lock,
+                None => bail!(
+                    "another worker on this machine is already watching {} as '{}'. Two \
+                     workers under one identity resume each other's claims and run the \
+                     same order twice - stop the other one first.",
+                    route.project_id,
+                    config.agent
+                ),
+            };
             report.info(&format!(
                 "worker '{}' started on {}, running '{}'",
                 config.agent, route.project_id, config.command
