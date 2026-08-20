@@ -289,6 +289,10 @@ struct TgChat {
 #[derive(Debug, Deserialize)]
 struct TgUser {
     id: i64,
+    /// Telegram's own name for the account. Used when the map does not say what to call the
+    /// operator, so a brief can name who sent a message without anyone configuring it.
+    #[serde(default)]
+    first_name: Option<String>,
 }
 
 /// The bot's side of one chat.
@@ -717,6 +721,7 @@ async fn group_bridge(
                 agent: orchestrator.agent.clone(),
                 route,
                 issuer,
+                operator: map.operator.clone(),
             })
         }
         None => {
@@ -1255,7 +1260,9 @@ async fn handle(
                     String::new()
                 }
             };
-            let brief = orchestrator_brief(&desk.name, &route.project_id, "Josh", &task, &earlier);
+            let asked_by = operator_name(seat.operator.as_deref(), message.from.as_ref());
+            let brief =
+                orchestrator_brief(&desk.name, &route.project_id, &asked_by, &task, &earlier);
             match issue(
                 &seat.route,
                 &seat.issuer,
@@ -1270,7 +1277,7 @@ async fn handle(
                     // different room.
                     let where_from = message.chat.as_ref().map_or(chat.chat_id, |c| c.id);
                     origins.remember(id.clone(), where_from, message.message_thread_id);
-                    remember_turn(route, &desk.name, "Josh", &task, issuer);
+                    remember_turn(route, &desk.name, &asked_by, &task, issuer);
                     format!("asked {} about {} - {id}", seat.agent, desk.name)
                 }
                 Err(error) => format!("could not ask that: {error}"),
@@ -1337,6 +1344,25 @@ struct Seat {
     agent: String,
     route: ferryman_channel::ProjectRoute,
     issuer: String,
+    /// What to call the operator, from the map. `None` falls back to the Telegram account
+    /// name, and then to the role.
+    operator: Option<String>,
+}
+
+/// What to call the person who sent this, in the brief the seat is given.
+///
+/// This was a string literal for a while - one operator's first name, compiled in - so every
+/// other deployment of Ferryman told its orchestrator that somebody else had sent the
+/// message. The map wins, because it is the operator's own choice of what to be called.
+/// Telegram's account name is the next best thing and needs no configuration. The last
+/// resort names the role rather than guessing at a person: "the operator sent this" is true
+/// of every deployment, which a first name is not.
+fn operator_name(configured: Option<&str>, from: Option<&TgUser>) -> String {
+    configured
+        .map(str::to_string)
+        .or_else(|| from.and_then(|user| user.first_name.clone()))
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "the operator".to_string())
 }
 
 /// What the orchestrator is actually asked, when a message arrives from a topic.
@@ -1579,8 +1605,8 @@ fn issue(
 
 /// A topic, flattened so a reply can find its way back to the right conversation.
 ///
-/// `announce` walks the desks one at a time, but an answer raised from the Bullship topic is
-/// filed in the seat's channel and has to be recorded against Bullship. Cloning the few
+/// `announce` walks the desks one at a time, but an answer raised from one project's topic is
+/// filed in the seat's channel and has to be recorded against that topic. Cloning the few
 /// fields that identify a topic costs nothing and avoids borrowing the desks twice.
 #[derive(Clone)]
 struct Room {
@@ -1703,33 +1729,33 @@ mod tests {
 
     #[test]
     fn an_answer_is_briefed_with_the_question_it_answers() {
-        // The failure this covers, exactly as it happened: Josh was asked which machine
-        // holds bullship, answered "Bullship is on grouchly", and the seat - seeing only
+        // The failure this covers, exactly as it happened once: the operator was asked which
+        // machine held a project, answered with the machine's name, and the seat - seeing only
         // that sentence - said it named a machine but no work, and asked again.
-        let earlier = "- 2026-08-20T21:30Z **Josh**: get bullship ready for daily players\n- 2026-08-20T21:35Z **you**: which machine holds bullship?";
+        let earlier = "- 2026-08-20T21:30Z **the operator**: get the shop ready for daily players\n- 2026-08-20T21:35Z **you**: which machine holds the shop?";
         let brief = orchestrator_brief(
-            "Bullship",
-            "bullship",
-            "Josh",
-            "Bullship is on grouchly.",
+            "Shop",
+            "shop",
+            "the operator",
+            "The shop is on the other machine.",
             earlier,
         );
         assert!(brief.contains("ready for daily players"));
-        assert!(brief.contains("which machine holds bullship?"));
+        assert!(brief.contains("which machine holds the shop?"));
         assert!(brief.contains("do not ask it again"));
     }
 
     #[test]
     fn a_first_message_reads_exactly_as_it_did_before() {
-        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?", "");
+        let brief = orchestrator_brief("Ferryman", "ferryman", "the operator", "where are we?", "");
         assert!(!brief.contains("Earlier in this topic"));
-        assert!(brief.starts_with("Josh sent this"));
+        assert!(brief.starts_with("the operator sent this"));
     }
 
     #[test]
     fn the_seat_is_told_to_look_up_where_a_project_lives_rather_than_ask() {
-        let brief = orchestrator_brief("Bullship", "bullship", "Josh", "status?", "");
-        assert!(brief.contains("Never ask Josh where a project's code lives"));
+        let brief = orchestrator_brief("Shop", "shop", "the operator", "status?", "");
+        assert!(brief.contains("Never ask the operator where a project's code lives"));
     }
 
     #[test]
@@ -1859,7 +1885,7 @@ mod tests {
         let brief = orchestrator_brief(
             "Bullship",
             "bullship",
-            "Josh",
+            "the operator",
             "the login page is broken",
             "",
         );
@@ -1876,7 +1902,7 @@ mod tests {
     fn the_orchestrator_is_told_who_will_read_the_answer() {
         // An engine that does not know its audience writes for the wrong one, which is how
         // a phone gets sent a build log.
-        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?", "");
+        let brief = orchestrator_brief("Ferryman", "ferryman", "the operator", "where are we?", "");
         assert!(brief.contains("goes straight back to a phone"));
         assert!(brief.contains("no headings"));
     }

@@ -209,15 +209,15 @@ mod tests {
         let id = identity(tmp.path(), "telegram");
         append_turn(
             &bank,
-            "Bullship",
-            "Josh",
-            "get bullship ready\nfor daily players",
+            "Shop",
+            "the operator",
+            "get the shop ready\nfor daily players",
             &id,
         )
         .expect("append");
-        let text = load_conversation(&bank, "Bullship").expect("written");
+        let text = load_conversation(&bank, "Shop").expect("written");
         assert_eq!(text.lines().count(), 1);
-        assert!(text.contains("get bullship ready for daily players"));
+        assert!(text.contains("get the shop ready for daily players"));
     }
 
     #[test]
@@ -227,24 +227,24 @@ mod tests {
         let id = identity(tmp.path(), "telegram");
         append_turn(
             &bank,
-            "Bullship",
-            "Josh",
-            "get bullship ready for daily players",
+            "Shop",
+            "the operator",
+            "get the shop ready for daily players",
             &id,
         )
         .expect("one");
+        append_turn(&bank, "Shop", "you", "which machine holds the shop?", &id).expect("two");
         append_turn(
             &bank,
-            "Bullship",
-            "you",
-            "which machine holds bullship?",
+            "Shop",
+            "the operator",
+            "the shop is on the other machine",
             &id,
         )
-        .expect("two");
-        append_turn(&bank, "Bullship", "Josh", "bullship is on grouchly", &id).expect("three");
-        let (recent, _) = recent_turns(&bank, "Bullship", 8, &[]);
+        .expect("three");
+        let (recent, _) = recent_turns(&bank, "Shop", 8, &[]);
         assert!(recent.contains("ready for daily players"));
-        assert!(recent.contains("on grouchly"));
+        assert!(recent.contains("on the other machine"));
     }
 
     #[test]
@@ -253,7 +253,14 @@ mod tests {
         let bank = tmp.path().join("memory-bank");
         let id = identity(tmp.path(), "telegram");
         for n in 0..12 {
-            append_turn(&bank, "Ferryman", "Josh", &format!("message {n}"), &id).expect("append");
+            append_turn(
+                &bank,
+                "Ferryman",
+                "the operator",
+                &format!("message {n}"),
+                &id,
+            )
+            .expect("append");
         }
         let (recent, _) = recent_turns(&bank, "Ferryman", 4, &[]);
         assert_eq!(recent.lines().count(), 4);
@@ -266,10 +273,10 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let bank = tmp.path().join("memory-bank");
         let id = identity(tmp.path(), "telegram");
-        append_turn(&bank, "Bullship", "Josh", "the real instruction", &id).expect("append");
+        append_turn(&bank, "Shop", "the operator", "the real instruction", &id).expect("append");
         std::fs::write(
-            conversation_path(&bank, "Bullship"),
-            "- 2026-01-01T00:00Z **Josh**: something he never said\n",
+            conversation_path(&bank, "Shop"),
+            "- 2026-01-01T00:00Z **the operator**: something he never said\n",
         )
         .expect("tamper");
         let roster = vec![AgentRoute {
@@ -279,7 +286,7 @@ mod tests {
             public_key: Some(id.public_key_hex()),
         }];
         assert!(matches!(
-            verify_conversation(&bank, "Bullship", &roster),
+            verify_conversation(&bank, "Shop", &roster),
             SignatureCheck::Invalid
         ));
     }

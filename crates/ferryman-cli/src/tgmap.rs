@@ -83,6 +83,14 @@ pub struct TopicMap {
     /// is no orchestrator; with one, every message goes to it.
     #[serde(default)]
     pub default_to: Option<String>,
+    /// What to call the person the bridge answers to, in the briefs it writes.
+    ///
+    /// This was a string literal in the source for a while - the author's own first name -
+    /// so every deployment of Ferryman told its orchestrator that somebody else's operator
+    /// had sent the message. Unset, the bridge uses the name Telegram gives for the account
+    /// it accepts messages from, and falls back to "the operator".
+    #[serde(default)]
+    pub operator: Option<String>,
     /// Who thinks about what arrives, and where their requests are filed.
     #[serde(default)]
     pub orchestrator: Option<Orchestrator>,
@@ -208,6 +216,14 @@ impl TopicMap {
             out.push_str(&format!(
                 "\n# Where an order goes when there is no orchestrator to decide.\n\
                  default_to = \"{default_to}\"\n"
+            ));
+        }
+        if let Some(operator) = &self.operator {
+            out.push_str(&format!(
+                "\n# What to call you in the briefs the orchestrator is given. Without this,\n\
+                 # the name on your Telegram account is used.\n\
+                 operator = \"{}\"\n",
+                escape(operator)
             ));
         }
         match &self.orchestrator {
@@ -336,6 +352,7 @@ pub fn starter(dir: &Path) -> TopicMap {
         });
     }
     TopicMap {
+        operator: None,
         group: None,
         default_to: None,
         orchestrator: None,
@@ -388,6 +405,7 @@ mod tests {
 
     fn sample() -> TopicMap {
         TopicMap {
+            operator: None,
             group: Some(-1001234567890),
             default_to: Some("grouchly".to_string()),
             orchestrator: Some(Orchestrator {
