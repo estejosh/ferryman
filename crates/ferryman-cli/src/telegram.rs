@@ -685,25 +685,50 @@ fn seat_signer(agent: &str, desks: &[Desk]) -> Result<()> {
         )
     };
 
+    // One project that cannot be seated must not take the bridge down. The case that
+    // fails here is a roster that already knows this name under a different key - a real
+    // conflict, worth shouting about - but the other eighteen topics work, and refusing to
+    // start would mean the operator loses all of them to fix one.
+    let mut refused = Vec::new();
     for desk in desks {
         if ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)?.is_some()
         {
             continue;
         }
-        identity.seat_in(&desk.route.attachment)?;
         // Published as well as seated. A key nobody else has seen produces signatures every
         // other machine reports as UnknownSigner, which is the same practical outcome as
         // not signing at all.
-        let route = ferryman_channel::AgentRoute {
+        let published = ferryman_channel::AgentRoute {
             name: identity.name().to_string(),
             role: "operator".to_string(),
             capabilities: Vec::new(),
             public_key: None,
         };
-        ferryman_channel::register_agent_key(&desk.route, &route, &identity)?;
-        println!(
-            "telegram: seated {agent} in {} and published it to the roster",
-            desk.route.project_id
+        match identity
+            .seat_in(&desk.route.attachment)
+            .and_then(|()| ferryman_channel::register_agent_key(&desk.route, &published, &identity))
+        {
+            Ok(_) => println!(
+                "telegram: seated {agent} in {} and published it to the roster",
+                desk.route.project_id
+            ),
+            Err(error) => {
+                eprintln!(
+                    "telegram: {agent} cannot sign in {}: {error}",
+                    desk.route.project_id
+                );
+                refused.push(desk.name.clone());
+            }
+        }
+    }
+    if !refused.is_empty() {
+        // Said once, at startup, and said again in the greeting - because the alternative
+        // is the operator discovering it by sending a message into one of these topics and
+        // being refused, which is the whole failure this function exists to end.
+        eprintln!(
+            "telegram: {} topic(s) cannot be signed for and will refuse work: {}",
+            refused.len(),
+            refused.join(", ")
         );
     }
     Ok(())
