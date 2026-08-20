@@ -1463,6 +1463,13 @@ async fn run(cli: Cli) -> Result<()> {
             dashboard,
             dashboard_operator,
         } => {
+            // Before anything is written: a machine may not be configured to be a person.
+            if let Some(name) = &agent_name {
+                let start = workspace
+                    .clone()
+                    .unwrap_or(std::env::current_dir().context("read the current directory")?);
+                refuse_person_as_machine(&start.join(".ferryman"), name)?;
+            }
             let outcome = enable::perform(enable::Request {
                 workspace,
                 project,
@@ -3166,6 +3173,41 @@ fn sign_as(
     }
 }
 
+/// Refuse to configure a machine to work as a person.
+///
+/// # Why this is worth a hard refusal
+///
+/// An operator identity is a human's: sealed under their password, opened by typing it.
+/// A worker's identity is a machine's: a key on disk, usable with nobody present. They are
+/// not two flavours of the same thing, and the difference only shows up later.
+///
+/// `ferry enable --agent operator` was run in eighteen projects. Nothing objected. What
+/// followed: every worker in those channels looked for a machine key called `operator`,
+/// found none, fell back to the sealed store, and asked for a password - on headless
+/// boxes, with nobody there. A fleet spent its nights at a prompt. The configuration was
+/// wrong at the moment it was written and stayed silent for as long as it took someone to
+/// notice the machines were idle.
+///
+/// The operator issues work. The machine does it, as itself. Anything that blurs those two
+/// produces a signature that says a person did something a machine did, which is also the
+/// one claim this project's whole signing scheme exists to keep honest.
+fn refuse_person_as_machine(attachment: &std::path::Path, name: &str) -> anyhow::Result<()> {
+    let operators = ferryman_server::operators::OperatorStore::new(attachment);
+    if !operators.exists(name) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "'{name}' is an operator identity on this machine - a person's, sealed under their \
+         password - so a worker cannot sign as it without someone present to type that \
+         password.\n\
+         \n\
+         A machine works under its own name. The operator issues the work; the machine \
+         does it, as itself, and the signature says which.\n\
+         \n\
+         Leave --agent off to use this machine's own name."
+    )
+}
+
 fn signing_identity(
     route: &ferryman_channel::ProjectRoute,
     name: &str,
@@ -3880,6 +3922,11 @@ fn channel(command: Channel) -> Result<()> {
             mcp,
         } => {
             let route = here(workspace)?;
+            // Joining is where a machine takes a name. The same rule as `enable`: it may
+            // not take a person's.
+            if let Some(name) = &name {
+                refuse_person_as_machine(&route.attachment, name)?;
+            }
             let agent = ferryman_channel::AgentRoute {
                 name: ferryman_ops::identity::resolve(name, &route.attachment)?,
                 role,
