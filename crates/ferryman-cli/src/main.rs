@@ -1110,6 +1110,19 @@ enum Agent {
     Run {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Watch every channel under this folder instead of one project.
+        ///
+        /// A channel is the unit of work, and the agent that does the work is already
+        /// spun up per task and torn down after it. Only the polling was pinned to one
+        /// project, which meant one process per project - and so a channel nobody had
+        /// started a process for could accept a signed order that nothing would ever
+        /// read. Watching is a directory listing; doing is what costs, and that is paid
+        /// per task either way.
+        ///
+        /// Each channel uses its own agent.toml if it has one, and otherwise an
+        /// agent.toml beside the channels.
+        #[arg(long, conflicts_with = "workspace")]
+        comms: Option<PathBuf>,
         /// Do one pass and exit, instead of looping. For cron, or for a caller that
         /// wants to own the scheduling.
         #[arg(long)]
@@ -2615,7 +2628,86 @@ async fn agent_command(command: Agent) -> Result<()> {
     };
     match command {
         Agent::Run {
+            // `--comms` and `--workspace` are mutually exclusive at the parser, so this
+            // arm is the fleet and has no single project to speak of.
+            workspace: _,
+            comms: Some(comms),
+            once,
+            dry_run,
+        } => {
+            let fleet = agent::fleet_under(&comms)?;
+            let report = worker_progress();
+            for (path, why) in &fleet.skipped {
+                // Named, not swallowed. A project missing from the served list is a
+                // project whose orders will sit unread.
+                report.warn(&format!("  not watching {}: {why}", path.display()));
+            }
+            if fleet.served.is_empty() {
+                bail!(
+                    "no Ferryman channels under {}. Each project's folder needs a \
+                     .ferryman directory - run 'ferry enable' in it.",
+                    comms.display()
+                );
+            }
+            if dry_run {
+                for (route, config) in &fleet.served {
+                    let plan = agent::plan(route, config)?;
+                    println!(
+                        "{} as '{}' running '{}'",
+                        route.project_id, plan.agent, config.command
+                    );
+                    for (id, what) in &plan.would_do {
+                        println!("  {id}  {what}");
+                    }
+                }
+                println!("nothing was claimed, written or sent");
+                return Ok(());
+            }
+            report.info(&format!(
+                "worker watching {} channel(s) under {}",
+                fleet.served.len(),
+                comms.display()
+            ));
+            for (route, config) in &fleet.served {
+                report.info(&format!(
+                    "  {} as '{}' running '{}'",
+                    route.project_id, config.agent, config.command
+                ));
+            }
+            // The shortest poll wins. A fleet paced by its slowest channel would leave the
+            // one that asked for attention every ten seconds waiting five minutes.
+            let poll = fleet
+                .served
+                .iter()
+                .map(|(_, config)| config.poll)
+                .min()
+                .unwrap_or(std::time::Duration::from_secs(300));
+            let mut fleet = fleet;
+            loop {
+                for (route, config) in &mut fleet.served {
+                    match agent::work_once(route, config, &report).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            report.info(&format!("did {count} task(s) on {}", route.project_id));
+                        }
+                        // One project's failure must not stop the other eighteen being
+                        // watched: a broken credential in one channel is not a reason to
+                        // stop reading the rest.
+                        Err(error) => report.warn(&format!(
+                            "{} failed, will retry: {error:#}",
+                            route.project_id
+                        )),
+                    }
+                }
+                if once {
+                    break;
+                }
+                tokio::time::sleep(poll).await;
+            }
+        }
+        Agent::Run {
             workspace,
+            comms: None,
             once,
             dry_run,
         } => {

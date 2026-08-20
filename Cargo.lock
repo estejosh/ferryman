@@ -853,6 +853,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "system-idle-time",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-opentelemetry",

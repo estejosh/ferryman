@@ -1437,6 +1437,73 @@ fn parse_verdict(output: &str) -> Result<Verdict> {
     })
 }
 
+/// Every channel under one folder, and the config each will be worked under.
+///
+/// # Why the poller is not per project
+///
+/// The agent itself was always ephemeral - [`work_once`] claims a task, spawns the engine
+/// in a fresh worktree, waits, takes the result and tears the worktree down. Spun up, used,
+/// spun down. What was pinned to one project was the thing doing the *polling*: a
+/// `ferry agent run --workspace <project>` process, and so one systemd unit per project.
+///
+/// That made "does this project have a worker" a question about daemons rather than about
+/// channels, and it had a bad answer. Nineteen channels existed and five processes were
+/// watching them, so fourteen projects could accept a signed order that nothing would ever
+/// pick up - correctly filed, correctly addressed, and never read.
+///
+/// A channel is the unit of work. One poller can watch all of them: the cost of watching is
+/// a directory read every `poll`, and the cost of *doing* is already paid per task and only
+/// when there is a task. Nineteen idle channels cost one process, not nineteen.
+pub struct Fleet {
+    /// Each channel to watch, with the config to work it under.
+    pub served: Vec<(ProjectRoute, AgentConfig)>,
+    /// Directories that looked like channels and could not be served, with the reason.
+    /// Reported rather than silently dropped: a project missing from this list is a
+    /// project whose orders will sit unread, and that must not be discovered later.
+    pub skipped: Vec<(PathBuf, String)>,
+}
+
+/// Find the channels under `dir` and work out how each should be run.
+///
+/// A channel with its own `agent.toml` uses it. One without falls back to an `agent.toml`
+/// beside the channels, so a fleet can be configured once rather than nineteen times - and
+/// a project that needs a different engine still says so locally.
+pub fn fleet_under(dir: &Path) -> Result<Fleet> {
+    let shared = AgentConfig::load(dir).ok();
+    let mut served = Vec::new();
+    let mut skipped = Vec::new();
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.join(".ferryman").is_dir())
+        .collect();
+    // Alphabetical, so two machines watching the same folder report it the same way and a
+    // restart does not reshuffle the log.
+    entries.sort();
+    for path in entries {
+        let route = match ferryman_channel::route_for(&path) {
+            Ok(route) => route,
+            Err(error) => {
+                skipped.push((path, format!("{error:#}")));
+                continue;
+            }
+        };
+        let config = match AgentConfig::load(&route.attachment) {
+            Ok(config) => config,
+            Err(error) => match shared.clone() {
+                Some(shared) => shared,
+                None => {
+                    skipped.push((path, format!("{error:#}")));
+                    continue;
+                }
+            },
+        };
+        served.push((route, config));
+    }
+    Ok(Fleet { served, skipped })
+}
+
 /// Do one pass of available work. Returns how many tasks were acted on.
 ///
 /// Separate from the loop so it can be run once (`--once`) in a cron job or a test,
@@ -2437,6 +2504,119 @@ mod tests {
             r#"{"type":"agent_event","event":{"type":"iteration_start","iteration":1}}"#,
         );
         assert_eq!(engine_answer(cut_off), cut_off);
+    }
+
+    /// A channel on disk, the way `ferry enable` leaves one, minus everything the fleet
+    /// discovery does not read.
+    fn enabled_channel(workspace: &Path, project: &str) {
+        let attachment = workspace.join(".ferryman");
+        // Always literally "ferryman", whatever the project is called: the channel's
+        // location is a fixed invariant, not a name that varies per project.
+        let communications = attachment.join("ferryman");
+        std::fs::create_dir_all(communications.join("agents")).unwrap();
+        std::fs::write(
+            attachment.join("bridge.toml"),
+            format!(
+                "project = \"{project}\"\n\
+                 workspace = \"{}\"\n\
+                 attachment = \"{}\"\n\
+                 communications = \"{}\"\n",
+                workspace.display(),
+                attachment.display(),
+                communications.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            AgentConfig::path(&attachment),
+            "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn every_channel_under_one_folder_is_watched_by_one_poller() {
+        // The failure: nineteen channels, five polling processes, and fourteen projects
+        // that could accept a signed order nothing would ever read.
+        let comms = tempfile::tempdir().unwrap();
+        for (folder, project) in [
+            ("bullship-ferryman", "bullship"),
+            ("ferryman-ferryman", "ferryman"),
+            ("obscura-ferryman", "obscura"),
+        ] {
+            enabled_channel(&comms.path().join(folder), project);
+        }
+        // A folder with no channel in it is not a channel.
+        std::fs::create_dir_all(comms.path().join("notes")).unwrap();
+
+        let fleet = fleet_under(comms.path()).unwrap();
+        let names: Vec<&str> = fleet
+            .served
+            .iter()
+            .map(|(route, _)| route.project_id.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["bullship", "ferryman", "obscura"],
+            "skipped: {:?}",
+            fleet.skipped
+        );
+        assert!(fleet.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_fleet_can_be_configured_once_instead_of_nineteen_times() {
+        let comms = tempfile::tempdir().unwrap();
+        let workspace = comms.path().join("obscura-ferryman");
+        enabled_channel(&workspace, "obscura");
+        // No agent.toml in the project; one beside the channels.
+        std::fs::remove_file(AgentConfig::path(&workspace.join(".ferryman"))).unwrap();
+        std::fs::write(
+            AgentConfig::path(comms.path()),
+            "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
+        )
+        .unwrap();
+
+        let fleet = fleet_under(comms.path()).unwrap();
+        assert_eq!(fleet.served.len(), 1, "skipped: {:?}", fleet.skipped);
+        assert_eq!(fleet.served[0].1.agent, "beastlywsl");
+    }
+
+    #[test]
+    fn a_project_that_says_so_locally_still_gets_its_own_engine() {
+        // The shared config is a default, not an override. A project that needs a
+        // different engine must keep it.
+        let comms = tempfile::tempdir().unwrap();
+        let workspace = comms.path().join("obscura-ferryman");
+        enabled_channel(&workspace, "obscura");
+        std::fs::write(
+            AgentConfig::path(&workspace.join(".ferryman")),
+            "agent = \"grouchly\"\ncommand = \"ferryman-cline\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            AgentConfig::path(comms.path()),
+            "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
+        )
+        .unwrap();
+
+        let fleet = fleet_under(comms.path()).unwrap();
+        assert_eq!(fleet.served[0].1.command, "ferryman-cline");
+    }
+
+    #[test]
+    fn a_channel_that_cannot_be_served_is_named_rather_than_dropped() {
+        // Silently serving eighteen of nineteen is how a project's orders go unread with
+        // nothing anywhere saying so.
+        let comms = tempfile::tempdir().unwrap();
+        enabled_channel(&comms.path().join("good-ferryman"), "good");
+        let broken = comms.path().join("broken-ferryman");
+        std::fs::create_dir_all(broken.join(".ferryman")).unwrap();
+
+        let fleet = fleet_under(comms.path()).unwrap();
+        assert_eq!(fleet.served.len(), 1);
+        assert_eq!(fleet.skipped.len(), 1);
+        assert!(fleet.skipped[0].0.ends_with("broken-ferryman"));
     }
 
     #[test]
