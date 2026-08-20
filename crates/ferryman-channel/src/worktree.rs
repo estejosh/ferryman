@@ -114,7 +114,9 @@ pub fn worktree_head(repo: &Path, branch: &str) -> Result<String> {
 /// and the answer "git could not tell me" must not collapse into "no" - that is
 /// how work gets thrown away without anyone being told.
 pub fn status_of(worktree: &Path) -> Result<String> {
-    let dir = worktree.to_str().context("worktree path is not valid UTF-8")?;
+    let dir = worktree
+        .to_str()
+        .context("worktree path is not valid UTF-8")?;
     let output = Command::new("git")
         .args(["-C", dir, "status", "--porcelain"])
         .output()
@@ -154,7 +156,9 @@ pub fn is_dirty(worktree: &Path) -> bool {
 /// with the agent's own key, which is the attribution that matters here; a git
 /// signature would only restate it less verifiably.
 pub fn commit_all(worktree: &Path, agent: &str, message: &str) -> Result<Option<String>> {
-    let dir = worktree.to_str().context("worktree path is not valid UTF-8")?;
+    let dir = worktree
+        .to_str()
+        .context("worktree path is not valid UTF-8")?;
     if status_of(worktree)?.trim().is_empty() {
         return Ok(None);
     }
@@ -199,7 +203,9 @@ pub fn head_of(worktree: &Path) -> Result<String> {
     let output = Command::new("git")
         .args([
             "-C",
-            worktree.to_str().context("worktree path is not valid UTF-8")?,
+            worktree
+                .to_str()
+                .context("worktree path is not valid UTF-8")?,
             "rev-parse",
             "HEAD",
         ])
@@ -327,7 +333,13 @@ pub fn has_commits_beyond(repo: &Path, branch: &str, base: &str) -> bool {
         return true;
     };
     let output = Command::new("git")
-        .args(["-C", dir, "rev-list", "--count", &format!("{base}..{branch}")])
+        .args([
+            "-C",
+            dir,
+            "rev-list",
+            "--count",
+            &format!("{base}..{branch}"),
+        ])
         .output();
     match output {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
@@ -422,7 +434,10 @@ mod tests {
         let base = worktree_head(&repo, &branch).unwrap();
 
         fs::write(dir.join("answer.txt"), "the agent wrote this").unwrap();
-        assert!(is_dirty(&dir), "an agent that changed a file leaves a dirty tree");
+        assert!(
+            is_dirty(&dir),
+            "an agent that changed a file leaves a dirty tree"
+        );
         let made = commit_all(&dir, "nebra", "ENG-2: do the thing").unwrap();
         let made = made.expect("a dirty tree produces a commit");
         assert_ne!(made, base, "the commit is new work, not the branch point");
@@ -462,10 +477,19 @@ mod tests {
         let repo = temp_repo();
         let (dir, branch) = create_worktree(&repo, "ENG-4", "grouchly").unwrap();
         fs::write(dir.join("x.txt"), "work").unwrap();
-        commit_all(&dir, "grouchly", "ENG-4: work").unwrap().unwrap();
+        commit_all(&dir, "grouchly", "ENG-4: work")
+            .unwrap()
+            .unwrap();
 
         let out = Command::new("git")
-            .args(["-C", repo.to_str().unwrap(), "log", "-1", "--format=%an <%ae>", &branch])
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "log",
+                "-1",
+                "--format=%an <%ae>",
+                &branch,
+            ])
             .output()
             .unwrap();
         let who = String::from_utf8_lossy(&out.stdout).trim().to_string();
@@ -485,9 +509,16 @@ mod tests {
 
         // Exactly the state a deleted or moved repo leaves behind: the directory and
         // its .git pointer survive, the thing they point at does not.
-        fs::write(dir.join(".git"), "gitdir: /tmp/does-not-exist/.git/worktrees/x").unwrap();
+        fs::write(
+            dir.join(".git"),
+            "gitdir: /tmp/does-not-exist/.git/worktrees/x",
+        )
+        .unwrap();
         assert!(!is_git_repo(&dir), "the leftover is not a working tree");
-        assert!(status_of(&dir).is_err(), "and git will not answer questions about it");
+        assert!(
+            status_of(&dir).is_err(),
+            "and git will not answer questions about it"
+        );
 
         let (again, branch2) = create_worktree(&repo, "ENG-5", "nebra").unwrap();
         assert_eq!(again, dir);
@@ -495,7 +526,11 @@ mod tests {
         assert!(is_git_repo(&again), "it was rebuilt into a real worktree");
 
         fs::write(again.join("work.txt"), "not lost").unwrap();
-        assert!(commit_all(&again, "nebra", "ENG-5: work").unwrap().is_some());
+        assert!(
+            commit_all(&again, "nebra", "ENG-5: work")
+                .unwrap()
+                .is_some()
+        );
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&again);
     }
@@ -507,7 +542,10 @@ mod tests {
         let missing = std::env::temp_dir().join("ferryman-not-a-repo-at-all");
         let _ = fs::create_dir_all(&missing);
         assert!(status_of(&missing).is_err());
-        assert!(!is_dirty(&missing), "the convenience form still answers false");
+        assert!(
+            !is_dirty(&missing),
+            "the convenience form still answers false"
+        );
         // ...and the committing path refuses rather than reporting "nothing to commit".
         assert!(commit_all(&missing, "nebra", "x").is_err());
         let _ = fs::remove_dir_all(&missing);

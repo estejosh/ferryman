@@ -71,9 +71,17 @@ not valid recipients until then.
 
 ### Sealed per recipient
 
-For each recipient the setter generates an *ephemeral* X25519 keypair, does ECDH against
-the recipient's published X25519 public key, and encrypts the value with
-XChaCha20-Poly1305 (24-byte nonce). The secret NAME, the PROJECT ID, and the RECIPIENT
+For each recipient the setter generates an *ephemeral* X25519 keypair and does ECDH
+against the recipient's published X25519 public key. The shared secret is **not** used as
+a key directly: it goes through HKDF-SHA256, salted with the ephemeral and recipient
+public keys, exactly as `age` does. An X25519 output is a curve point's x-coordinate, not
+thirty-two uniformly random bytes, and RFC 7748 says to hash it before use; NaCl's
+`crypto_box` runs it through HSalsa20 for the same reason. Using it raw was the one place
+this design contradicted its own rule below about not hand-writing constructions - the
+practical risk was small, since the envelope is signed and no attacker can inject an
+ephemeral key, but "probably fine" is worth less than not having to say it. Salting with
+both public keys binds the key to that exact pair rather than to the shared secret alone.
+The derived key encrypts the value with XChaCha20-Poly1305 (24-byte nonce). The secret NAME, the PROJECT ID, and the RECIPIENT
 name are bound in as AEAD associated data, so a ciphertext cannot be replayed under a
 different name, moved into another project, or swapped between recipient slots and still
 decrypt - independent of the signature.
@@ -125,6 +133,7 @@ endpoint that seals them in memory.
 
 - **Separate encryption keys from signing keys.** X25519 for decryption, ed25519 for
   attribution.
+- **The shared secret is put through a KDF**, never used as a key directly.
 - **Name and project bound as associated data**, and the recipient name too.
 - **Envelope signed and verified against the roster.** An unsigned envelope is a forged
   one.
