@@ -2292,45 +2292,17 @@ async fn do_work(
         // not outlive the task, while the result recorded the branch point as
         // `worktree_head` - a hash that reads like provenance and points at the tree as
         // it was before the agent touched it.
-        let subject = commit_subject(id, &task.order);
-        match ferryman_channel::worktree::commit_all(&workdir, &config.agent, &subject) {
-            Ok(Some(made)) => {
-                payload["committed"] = json!(made);
-                report.info(&format!(
-                    "  {id}: committed {} on {branch}",
-                    &made[..12.min(made.len())]
-                ));
-                if let Some(remote) = &config.push {
-                    match ferryman_channel::worktree::push_branch(&route.workspace, remote, &branch)
-                    {
-                        Ok(()) => {
-                            payload["pushed"] = json!(remote);
-                            report.info(&format!("  {id}: pushed {branch} to {remote}"));
-                        }
-                        // Not fatal, and deliberately loud. The commit exists either way;
-                        // what is lost is only the copy on the remote, and a reviewer who
-                        // cannot find the branch needs to know it stayed here.
-                        Err(e) => {
-                            payload["push_failed"] = json!(e.to_string());
-                            report.warn(&format!(
-                                "  {id}: committed but could not push to {remote}: {e}"
-                            ));
-                        }
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
-        }
-
-        if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, &branch) {
-            payload["worktree_head"] = json!(head);
-        }
-        match ferryman_channel::worktree::retire_worktree(&route.workspace, &branch, &base_commit) {
-            Ok(true) => payload["branch_kept"] = json!(true),
-            Ok(false) => {}
-            Err(e) => report.warn(&format!("  {id}: could not retire the worktree: {e}")),
-        }
+        settle_worktree(
+            route,
+            config,
+            task,
+            id,
+            &branch,
+            &base_commit,
+            &workdir,
+            &mut payload,
+            report,
+        );
     }
     if !run.ok {
         // Left claimed on purpose. Marking it failed would need a state this protocol
@@ -2379,6 +2351,74 @@ async fn do_work(
         identity,
     );
     Ok(())
+}
+
+/// Commit the worktree, retire it, and publish the branch when it is worth keeping.
+///
+/// The push is keyed off whether the branch has work, not off whether this worker
+/// made the commit. The engine may have committed directly on the branch - for
+/// example when a previous worker's result is being replayed - in which case the
+/// tree is clean, [`ferryman_channel::worktree::commit_all`] returns `None`, and a
+/// push gated on `Ok(Some(..))` would keep the branch but never publish it. That is
+/// how a recovered task ended up committed on one machine and invisible everywhere
+/// else.
+///
+/// [`ferryman_channel::worktree::retire_worktree`] already makes the judgement: it
+/// returns `Ok(true)` when the branch carries anything not reachable from `base`.
+/// So the push happens after the worktree is retired, which makes a kept branch
+/// always a pushed branch. A branch with no work is retired without a push.
+fn settle_worktree(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    task: &Task,
+    id: &str,
+    branch: &str,
+    base_commit: &str,
+    workdir: &Path,
+    payload: &mut Value,
+    report: &dyn Progress,
+) {
+    let subject = commit_subject(id, &task.order);
+    match ferryman_channel::worktree::commit_all(workdir, &config.agent, &subject) {
+        Ok(Some(made)) => {
+            payload["committed"] = json!(made);
+            report.info(&format!(
+                "  {id}: committed {} on {branch}",
+                &made[..12.min(made.len())]
+            ));
+        }
+        Ok(None) => {}
+        Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
+    }
+
+    if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, branch) {
+        payload["worktree_head"] = json!(head);
+    }
+
+    match ferryman_channel::worktree::retire_worktree(&route.workspace, branch, base_commit) {
+        Ok(true) => {
+            payload["branch_kept"] = json!(true);
+            if let Some(remote) = &config.push {
+                match ferryman_channel::worktree::push_branch(&route.workspace, remote, branch) {
+                    Ok(()) => {
+                        payload["pushed"] = json!(remote);
+                        report.info(&format!("  {id}: pushed {branch} to {remote}"));
+                    }
+                    // Not fatal, and deliberately loud. The commit exists either way;
+                    // what is lost is only the copy on the remote, and a reviewer who
+                    // cannot find the branch needs to know it stayed here.
+                    Err(e) => {
+                        payload["push_failed"] = json!(e.to_string());
+                        report.warn(&format!(
+                            "  {id}: committed but could not push to {remote}: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(false) => {}
+        Err(e) => report.warn(&format!("  {id}: could not retire the worktree: {e}")),
+    }
 }
 
 /// Judge whatever is waiting, according to the authority the operator granted.
@@ -3632,5 +3672,243 @@ mod tests {
         assert_eq!(json["mcpServers"]["ferryman"]["command"], "ferry");
         assert_eq!(json["mcpServers"]["ferryman"]["args"][1], "serve");
         assert_eq!(json["mcpServers"]["ferryman"]["args"][3], "/srv/project");
+    }
+
+    fn run_git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn init_bare(remote: &Path) {
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", remote.to_str().unwrap()])
+            .status()
+            .expect("run git init --bare");
+        assert!(status.success());
+    }
+
+    fn unique(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn project_route(workspace: &Path) -> ProjectRoute {
+        ProjectRoute {
+            project_id: "test".to_string(),
+            workspace: workspace.to_path_buf(),
+            attachment: workspace.join(".ferryman"),
+            communications: workspace.join(".ferryman").join("ferryman"),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn test_task(id: &str) -> Task {
+        Task {
+            order: ferryman_channel::Order {
+                id: id.to_string(),
+                project_id: "test".to_string(),
+                issued_by: "operator".to_string(),
+                assigned_to: None,
+                created_at: chrono::Utc::now(),
+                payload: json!({ "task": "do the thing" }),
+                requires_review: false,
+                requires_approval: false,
+                depends_on: Vec::new(),
+                signed_by: None,
+                signature: None,
+                result_contract: None,
+            },
+            claims: Vec::new(),
+            results: Vec::new(),
+            reviews: Vec::new(),
+            recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
+        }
+    }
+
+    /// A commit the worker did not make must still be published: the engine may have
+    /// committed directly on the branch, which leaves a clean tree (`commit_all` returns
+    /// `None`) while the branch still carries the work. Pushing must be keyed off the
+    /// branch having work, which `retire_worktree` already decides.
+    #[test]
+    fn a_branch_the_engine_committed_itself_still_gets_pushed() {
+        let repo = unique("ferryman-agent-repo");
+        let remote = unique("ferryman-agent-remote.git");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        init_bare(&remote);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "PUSH-A", "worker").unwrap();
+        fs::write(dir.join("answer.txt"), "the engine wrote this").unwrap();
+        run_git(&dir, &["add", "answer.txt"]);
+        run_git(&dir, &["commit", "-q", "-m", "engine commit"]);
+
+        let route = project_route(&repo);
+        let task = test_task("PUSH-A");
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "PUSH-A",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        assert_eq!(payload["branch_kept"], json!(true));
+        assert_eq!(payload["pushed"], json!("origin"));
+        let on_remote = run_git(&repo, &["ls-remote", "origin", branch.as_str()]);
+        assert!(
+            !on_remote.is_empty(),
+            "the kept branch must be on the remote"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// No work means no branch means nothing to publish: `retire_worktree` deletes the
+    /// branch when it carries nothing beyond its base, and a push must not resurrect it.
+    #[test]
+    fn a_branch_with_no_work_is_not_pushed() {
+        let repo = unique("ferryman-agent-repo");
+        let remote = unique("ferryman-agent-remote.git");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        init_bare(&remote);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "PUSH-B", "worker").unwrap();
+
+        let route = project_route(&repo);
+        let task = test_task("PUSH-B");
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "PUSH-B",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        assert!(payload.get("pushed").is_none(), "no work means no push");
+        assert!(payload.get("branch_kept").is_none());
+        let on_remote = run_git(&repo, &["ls-remote", "origin", branch.as_str()]);
+        assert!(
+            on_remote.is_empty(),
+            "a branch with no work must not reach the remote"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// A push that fails is loud but not fatal: the work is already committed and the
+    /// result still goes out, with `push_failed` saying where the copy is missing.
+    #[test]
+    fn a_push_failure_does_not_fail_the_task() {
+        let repo = unique("ferryman-agent-repo");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "PUSH-C", "worker").unwrap();
+        fs::write(dir.join("answer.txt"), "work that stays local").unwrap();
+        run_git(&dir, &["add", "answer.txt"]);
+        run_git(&dir, &["commit", "-q", "-m", "engine commit"]);
+
+        let route = project_route(&repo);
+        let task = test_task("PUSH-C");
+        // `origin` is configured as the publish target but no such remote exists, so the
+        // push fails. The branch is still kept, and the task does not fail.
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "PUSH-C",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        assert_eq!(payload["branch_kept"], json!(true));
+        assert!(payload.get("pushed").is_none());
+        assert!(
+            payload["push_failed"].is_string(),
+            "the failure must be recorded, not swallowed"
+        );
+
+        let _ = fs::remove_dir_all(&repo);
     }
 }
