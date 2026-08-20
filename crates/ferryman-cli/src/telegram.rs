@@ -49,6 +49,10 @@ const EXCERPT_CHARS: usize = 600;
 /// bounded so the state file cannot grow without limit on a long-lived fleet.
 const SEEN_LIMIT: usize = 500;
 
+/// How many turns of a topic the seat is shown. Enough that an answer still has its
+/// question attached; short enough that a long topic does not become the prompt.
+const TURN_LIMIT: usize = 8;
+
 /// What a chat message asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Instruction {
@@ -1047,8 +1051,9 @@ async fn serve(
             }
         }
 
+        let rooms = rooms_of(desks);
         for desk in desks.iter_mut() {
-            if let Err(error) = announce(chat, desk, Some(origins)).await {
+            if let Err(error) = announce(chat, desk, Some(origins), &rooms).await {
                 eprintln!("telegram: could not report {} results: {error}", desk.name);
             }
         }
@@ -1227,7 +1232,30 @@ async fn handle(
         // operator choosing to bypass the seat, and they are allowed to.
         Some(Instruction::Order { to: None, task }) if seat.is_some() => {
             let seat = seat.expect("guarded by the match");
-            let brief = orchestrator_brief(&desk.name, &route.project_id, "Josh", &task);
+            let roster =
+                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+            let bank = ferryman_channel::memory::memory_bank_dir(route);
+            // Read before writing this turn, so the recap is what was said BEFORE the
+            // message being answered - the message itself is quoted underneath it.
+            let (earlier, check) = ferryman_channel::conversation::recent_turns(
+                &bank, &desk.name, TURN_LIMIT, &roster,
+            );
+            // An unverifiable conversation is not read into a prompt. It is said out loud
+            // instead: silently dropping the history would look exactly like the bug this
+            // whole thing fixes.
+            let earlier = match check {
+                ferryman_channel::SignatureCheck::Valid => earlier,
+                ferryman_channel::SignatureCheck::Unsigned if earlier.is_empty() => earlier,
+                other => {
+                    eprintln!(
+                        "telegram: the {} conversation does not verify ({other:?}); \
+                         asking without it",
+                        desk.name
+                    );
+                    String::new()
+                }
+            };
+            let brief = orchestrator_brief(&desk.name, &route.project_id, "Josh", &task, &earlier);
             match issue(
                 &seat.route,
                 &seat.issuer,
@@ -1242,6 +1270,7 @@ async fn handle(
                     // different room.
                     let where_from = message.chat.as_ref().map_or(chat.chat_id, |c| c.id);
                     origins.remember(id.clone(), where_from, message.message_thread_id);
+                    remember_turn(route, &desk.name, "Josh", &task, issuer);
                     format!("asked {} about {} - {id}", seat.agent, desk.name)
                 }
                 Err(error) => format!("could not ask that: {error}"),
@@ -1321,9 +1350,26 @@ struct Seat {
 /// It is also told where its answer goes. A reply that will be read on a phone, in a
 /// conversation, should not arrive as a build log - and an engine that does not know its
 /// audience writes for the wrong one.
-fn orchestrator_brief(topic: &str, project: &str, asked_by: &str, message: &str) -> String {
+fn orchestrator_brief(
+    topic: &str,
+    project: &str,
+    asked_by: &str,
+    message: &str,
+    earlier: &str,
+) -> String {
+    let recap = if earlier.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "Earlier in this topic, oldest first. {asked_by} may be answering something you \
+             asked, so read this before deciding anything is missing:\n\
+             \n\
+             {earlier}\n\
+             \n"
+        )
+    };
     format!(
-        "{asked_by} sent this from the {topic} topic on Telegram, about the {project} \
+        "{recap}{asked_by} sent this from the {topic} topic on Telegram, about the {project} \
          project:\n\
          \n\
          {message}\n\
@@ -1336,7 +1382,13 @@ fn orchestrator_brief(topic: &str, project: &str, asked_by: &str, message: &str)
          addressed to the machine that should do it. Not to yourself.\n\
          If it is a question: answer it.\n\
          If it is neither, or if you need something from {asked_by} before anything can \
-         start, say exactly what.\n\
+         start, say exactly what - and ask for it once. Something you already asked and were \
+         answered is above; do not ask it again.\n\
+         \n\
+         Never ask {asked_by} where a project's code lives or which machine holds it. That is \
+         yours to find out: read the project's roster and address the order to a machine on \
+         it. The only thing worth asking for is the goal, which is the one thing you cannot \
+         look up.\n\
          \n\
          Answer in one short paragraph of plain prose. It goes straight back to a phone, \
          into the topic it was asked in, so write it for a person reading in a chat - not a \
@@ -1525,10 +1577,71 @@ fn issue(
     Ok(id)
 }
 
+/// A topic, flattened so a reply can find its way back to the right conversation.
+///
+/// `announce` walks the desks one at a time, but an answer raised from the Bullship topic is
+/// filed in the seat's channel and has to be recorded against Bullship. Cloning the few
+/// fields that identify a topic costs nothing and avoids borrowing the desks twice.
+#[derive(Clone)]
+struct Room {
+    chat: i64,
+    thread: Option<i64>,
+    name: String,
+    route: ferryman_channel::ProjectRoute,
+    issuer: String,
+}
+
+fn rooms_of(desks: &[Desk]) -> Vec<Room> {
+    desks
+        .iter()
+        .map(|desk| Room {
+            chat: desk.chat_id,
+            thread: desk.thread,
+            name: desk.name.clone(),
+            route: desk.route.clone(),
+            issuer: desk.issuer.clone(),
+        })
+        .collect()
+}
+
+/// Write one turn into the topic's conversation, in its own project's memory bank.
+///
+/// Best effort on purpose. A conversation that cannot be recorded is worth an eprintln and
+/// nothing more: refusing to answer the operator because the memory write failed would trade
+/// a small loss for a total one.
+fn remember_turn(
+    route: &ferryman_channel::ProjectRoute,
+    topic: &str,
+    who: &str,
+    said: &str,
+    issuer: &str,
+) {
+    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    match crate::sign_as(route, issuer) {
+        Ok(Some(identity)) => {
+            if let Err(error) =
+                ferryman_channel::conversation::append_turn(&bank, topic, who, said, &identity)
+            {
+                eprintln!("telegram: could not record the {topic} conversation: {error}");
+            }
+        }
+        Ok(None) => eprintln!(
+            "telegram: no key for '{issuer}' in {}, so the {topic} conversation went unrecorded",
+            route.project_id
+        ),
+        Err(error) => eprintln!("telegram: could not sign the {topic} conversation: {error}"),
+    }
+}
+
 /// Report results that have arrived since the last look.
-async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Result<()> {
+async fn announce(
+    chat: &Chat,
+    desk: &mut Desk,
+    origins: Option<&Origins>,
+    rooms: &[Room],
+) -> Result<()> {
     let route = &desk.route;
-    let mut fresh: Vec<(String, String, String)> = Vec::new();
+    let mut fresh: Vec<(String, String, String, String)> = Vec::new();
     for task in ferryman_channel::list_tasks(route)? {
         for result in &task.results {
             let key = result_key(&task.order.id, &result.agent, result.revision);
@@ -1545,6 +1658,7 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
             fresh.push((
                 key,
                 task.order.id.clone(),
+                output.clone(),
                 format!(
                     "{} r{} by {} ({signature:?})\n\n{}",
                     task.order.id,
@@ -1558,7 +1672,7 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
     // Remember first, then speak. The other order repeats an announcement every restart if
     // the send is what failed, and a phone that buzzes with yesterday's results twice is a
     // bridge an operator turns off.
-    for (key, order, text) in fresh {
+    for (key, order, answer, text) in fresh {
         desk.state.remember(key);
         save(&desk.state_path, &desk.state)?;
         // Back to the conversation it started in. A request raised from the Bullship topic
@@ -1570,6 +1684,15 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
             .and_then(|origins| origins.of(&order))
             .unwrap_or((desk.chat_id, desk.thread));
         chat.send_to(chat_id, thread, &text).await?;
+        // Recorded against the topic it was sent to, not the channel it was filed in. An
+        // answer kept in the seat's own memory would be an answer nobody can find beside the
+        // question it answers.
+        if let Some(room) = rooms
+            .iter()
+            .find(|room| room.chat == chat_id && room.thread == thread)
+        {
+            remember_turn(&room.route, &room.name, "you", &answer, &room.issuer);
+        }
     }
     Ok(())
 }
@@ -1577,6 +1700,37 @@ async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answer_is_briefed_with_the_question_it_answers() {
+        // The failure this covers, exactly as it happened: Josh was asked which machine
+        // holds bullship, answered "Bullship is on grouchly", and the seat - seeing only
+        // that sentence - said it named a machine but no work, and asked again.
+        let earlier = "- 2026-08-20T21:30Z **Josh**: get bullship ready for daily players\n- 2026-08-20T21:35Z **you**: which machine holds bullship?";
+        let brief = orchestrator_brief(
+            "Bullship",
+            "bullship",
+            "Josh",
+            "Bullship is on grouchly.",
+            earlier,
+        );
+        assert!(brief.contains("ready for daily players"));
+        assert!(brief.contains("which machine holds bullship?"));
+        assert!(brief.contains("do not ask it again"));
+    }
+
+    #[test]
+    fn a_first_message_reads_exactly_as_it_did_before() {
+        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?", "");
+        assert!(!brief.contains("Earlier in this topic"));
+        assert!(brief.starts_with("Josh sent this"));
+    }
+
+    #[test]
+    fn the_seat_is_told_to_look_up_where_a_project_lives_rather_than_ask() {
+        let brief = orchestrator_brief("Bullship", "bullship", "Josh", "status?", "");
+        assert!(brief.contains("Never ask Josh where a project's code lives"));
+    }
 
     #[test]
     fn a_bare_line_is_an_open_order() {
@@ -1702,7 +1856,13 @@ mod tests {
     fn a_message_reaches_the_orchestrator_as_something_to_judge_not_to_do() {
         // The failure this prevents: "Testing @FerrymanClinebot" became a unit of work for
         // a build machine, because a worker handed a bare sentence does it.
-        let brief = orchestrator_brief("Bullship", "bullship", "Josh", "the login page is broken");
+        let brief = orchestrator_brief(
+            "Bullship",
+            "bullship",
+            "Josh",
+            "the login page is broken",
+            "",
+        );
         assert!(brief.contains("the login page is broken"));
         assert!(brief.contains("Bullship topic"));
         assert!(brief.contains("You are the orchestrator"));
@@ -1716,7 +1876,7 @@ mod tests {
     fn the_orchestrator_is_told_who_will_read_the_answer() {
         // An engine that does not know its audience writes for the wrong one, which is how
         // a phone gets sent a build log.
-        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?");
+        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?", "");
         assert!(brief.contains("goes straight back to a phone"));
         assert!(brief.contains("no headings"));
     }

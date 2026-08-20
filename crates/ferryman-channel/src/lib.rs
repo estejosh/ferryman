@@ -14,6 +14,7 @@ use std::{
 
 pub mod ask;
 pub mod contract;
+pub mod conversation;
 pub mod cost;
 pub mod credentials;
 pub mod discovery;
