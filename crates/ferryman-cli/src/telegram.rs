@@ -188,6 +188,56 @@ struct Cursor {
     offset: i64,
 }
 
+/// Where each request came from, so its answer goes back to the same conversation.
+///
+/// A request is filed in the seat's channel, not in the topic's, because one seat serves
+/// every topic. That is the right place for it and the wrong place to answer from: without
+/// a record of the origin, every reply would surface in the orchestrator's own topic, which
+/// is a conversation answered in a different room.
+///
+/// Kept beside the cursor rather than in a channel: it is this bridge's own bookkeeping
+/// about a chat, and it means nothing to any other machine.
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
+struct Origins {
+    #[serde(default)]
+    of: Vec<(String, i64, Option<i64>)>,
+}
+
+impl Origins {
+    fn remember(&mut self, order: String, chat: i64, thread: Option<i64>) {
+        self.of.retain(|(id, _, _)| id != &order);
+        self.of.push((order, chat, thread));
+        if self.of.len() > SEEN_LIMIT {
+            let excess = self.of.len() - SEEN_LIMIT;
+            self.of.drain(..excess);
+        }
+    }
+
+    fn of(&self, order: &str) -> Option<(i64, Option<i64>)> {
+        self.of
+            .iter()
+            .find(|(id, _, _)| id == order)
+            .map(|(_, chat, thread)| (*chat, *thread))
+    }
+}
+
+fn origins_path(dir: &Path) -> PathBuf {
+    dir.join(".tgferryman-origins.json")
+}
+
+/// What the bridge remembers about the chat itself, as opposed to about the fleet.
+///
+/// Both halves are files beside the map: how far through Telegram's updates it has read,
+/// and which conversation each request came from. Neither means anything to another
+/// machine, and neither belongs in a channel - a synced cursor is a cursor two machines
+/// fight over.
+struct Books {
+    cursor: Cursor,
+    cursor_file: PathBuf,
+    origins: Origins,
+    origins_file: PathBuf,
+}
+
 fn cursor_path(dir: &Path) -> PathBuf {
     dir.join(".tgferryman-cursor.json")
 }
@@ -638,7 +688,55 @@ async fn group_bridge(
         );
     }
 
-    serve(&chat, &mut desks, approver, &mut cursor, &cursor_file).await
+    // The seat that decides. Resolved from the map, and reported plainly either way: a
+    // fleet whose messages go straight to a worker behaves very differently from one whose
+    // messages are read first, and the operator should not have to infer which they have.
+    let seat = match &map.orchestrator {
+        Some(orchestrator) => {
+            let workspace = if orchestrator.workspace.is_absolute() {
+                orchestrator.workspace.clone()
+            } else {
+                base.join(&orchestrator.workspace)
+            };
+            let route = ferryman_channel::route_for(&workspace).with_context(|| {
+                format!(
+                    "the orchestrator's workspace, {}, has no Ferryman channel",
+                    workspace.display()
+                )
+            })?;
+            let issuer = ferryman_ops::identity::resolve(agent.clone(), &route.attachment)?;
+            println!(
+                "telegram: everything goes to {} first, filed in {}",
+                orchestrator.agent, route.project_id
+            );
+            Some(Seat {
+                agent: orchestrator.agent.clone(),
+                route,
+                issuer,
+            })
+        }
+        None => {
+            println!(
+                "telegram: no orchestrator in the map - messages become tasks directly. Add \
+                 an [orchestrator] section to have them read first."
+            );
+            None
+        }
+    };
+
+    let origins_file = origins_path(&base);
+    let origins: Origins = match std::fs::read_to_string(&origins_file) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+        Err(_) => Origins::default(),
+    };
+
+    let mut books = Books {
+        cursor,
+        cursor_file,
+        origins,
+        origins_file,
+    };
+    serve(&chat, &mut desks, seat.as_ref(), approver, &mut books).await
 }
 
 /// Make sure the name the bridge signs with can actually sign in every project it serves.
@@ -839,6 +937,7 @@ async fn single_bridge(
     };
 
     let state_path = state_path(&route.attachment, &issuer);
+    let route_attachment = route.attachment.clone();
     let (state, first_run) = load_state(&state_path, &route)?;
     if first_run {
         // A greeting that only says "up" tells the operator nothing they could not have
@@ -853,7 +952,7 @@ async fn single_bridge(
     );
 
     // The cursor lived in this file before there were maps, and still does here.
-    let mut cursor = Cursor {
+    let cursor = Cursor {
         offset: state.offset,
     };
     let cursor_file = state_path.clone();
@@ -867,7 +966,17 @@ async fn single_bridge(
         state,
         state_path,
     }];
-    serve(&chat, &mut desks, approver, &mut cursor, &cursor_file).await
+    // No map means no seat: this shape predates the orchestrator and must keep behaving
+    // exactly as it did.
+    let origins = Origins::default();
+    let origins_file = origins_path(&route_attachment);
+    let mut books = Books {
+        cursor,
+        cursor_file,
+        origins,
+        origins_file,
+    };
+    serve(&chat, &mut desks, None, approver, &mut books).await
 }
 
 /// Read a desk's memory, seeding it on first sight.
@@ -895,10 +1004,16 @@ fn load_state(path: &Path, route: &ferryman_channel::ProjectRoute) -> Result<(Br
 async fn serve(
     chat: &Chat,
     desks: &mut [Desk],
+    seat: Option<&Seat>,
     approver: i64,
-    cursor: &mut Cursor,
-    cursor_file: &Path,
+    books: &mut Books,
 ) -> Result<()> {
+    let Books {
+        cursor,
+        cursor_file,
+        origins,
+        origins_file,
+    } = books;
     loop {
         match chat.updates(cursor.offset).await {
             Ok(updates) => {
@@ -912,7 +1027,14 @@ async fn serve(
                         continue;
                     };
                     match desk_for(desks, &message) {
-                        Some(index) => handle(chat, &desks[index], approver, &message).await,
+                        Some(index) => {
+                            handle(chat, &desks[index], seat, approver, &message, origins).await;
+                            // Written after handling, not before: an origin for a request
+                            // that was never raised would point at nothing.
+                            if let Err(error) = write_origins(origins_file, origins) {
+                                eprintln!("telegram: could not record where to reply: {error}");
+                            }
+                        }
                         None => unmapped(chat, desks, &message).await,
                     }
                 }
@@ -926,7 +1048,7 @@ async fn serve(
         }
 
         for desk in desks.iter_mut() {
-            if let Err(error) = announce(chat, desk).await {
+            if let Err(error) = announce(chat, desk, Some(origins)).await {
                 eprintln!("telegram: could not report {} results: {error}", desk.name);
             }
         }
@@ -996,6 +1118,14 @@ fn save_cursor(path: &Path, cursor: &Cursor, desks: &mut [Desk]) -> Result<()> {
     write_cursor(path, cursor)
 }
 
+fn write_origins(path: &Path, origins: &Origins) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(path, serde_json::to_string_pretty(origins)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
 fn write_cursor(path: &Path, cursor: &Cursor) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -1042,7 +1172,14 @@ fn save(path: &Path, state: &BridgeState) -> Result<()> {
 /// Act on one message. Errors are reported into the chat rather than returned: the operator
 /// is holding the only screen that will show them, and a bridge that exits on a bad order
 /// stops answering the good ones.
-async fn handle(chat: &Chat, desk: &Desk, approver: i64, message: &TgMessage) {
+async fn handle(
+    chat: &Chat,
+    desk: &Desk,
+    seat: Option<&Seat>,
+    approver: i64,
+    message: &TgMessage,
+    origins: &mut Origins,
+) {
     let route = &desk.route;
     let issuer = desk.issuer.as_str();
     let default_to = desk.default_to.as_deref();
@@ -1084,12 +1221,38 @@ async fn handle(chat: &Chat, desk: &Desk, approver: i64, message: &TgMessage) {
             }
         }
         Some(Instruction::Status) => status_text(route),
+        // With a seat, nothing the operator says becomes a task directly. It becomes a
+        // request to the one identity that can judge what it is worth, and that identity
+        // writes the orders. `/to` is the deliberate exception: naming a machine is the
+        // operator choosing to bypass the seat, and they are allowed to.
+        Some(Instruction::Order { to: None, task }) if seat.is_some() => {
+            let seat = seat.expect("guarded by the match");
+            let brief = orchestrator_brief(&desk.name, &route.project_id, "Josh", &task);
+            match issue(
+                &seat.route,
+                &seat.issuer,
+                message.message_id,
+                Some(seat.agent.clone()),
+                &brief,
+            ) {
+                Ok(id) => {
+                    // Remember where to bring the answer back to. The request lives in the
+                    // seat's channel, not the topic's, so without this the reply would come
+                    // back into the orchestrator's own topic - a conversation answered in a
+                    // different room.
+                    let where_from = message.chat.as_ref().map_or(chat.chat_id, |c| c.id);
+                    origins.remember(id.clone(), where_from, message.message_thread_id);
+                    format!("asked {} about {} - {id}", seat.agent, desk.name)
+                }
+                Err(error) => format!("could not ask that: {error}"),
+            }
+        }
         Some(Instruction::Order { to, task }) => {
-            // An unaddressed order goes to whichever machine claims it first, which is the
-            // wrong default when machines are not interchangeable: they differ in what they
-            // cost to run, and the fastest poller wins rather than the cheapest engine. So a
-            // configured default decides - but only among machines that work on this
-            // project. See `route_order`.
+            // No seat, or an explicit `/to`. An unaddressed order goes to whichever machine
+            // claims it first, which is the wrong default when machines are not
+            // interchangeable: they differ in what they cost to run, and the fastest poller
+            // wins rather than the cheapest engine. So a configured default decides - but
+            // only among machines that work on this project. See `route_order`.
             let workers: Vec<String> = ferryman_channel::read_agent_roster(&route.communications)
                 .unwrap_or_default()
                 .into_iter()
@@ -1137,6 +1300,47 @@ fn help_text(default_to: Option<&str>) -> String {
          /agents             who is in this channel\n\
          \n\
          Do not send credentials here. This chat is not end-to-end encrypted."
+    )
+}
+
+/// The seat that decides, resolved against this machine.
+struct Seat {
+    agent: String,
+    route: ferryman_channel::ProjectRoute,
+    issuer: String,
+}
+
+/// What the orchestrator is actually asked, when a message arrives from a topic.
+///
+/// The framing is the whole point. A worker handed a bare sentence treats it as a task and
+/// does it - which is how "Testing @FerrymanClinebot" became a unit of work. The seat has
+/// to be told three things the bridge knows and it does not: that this came from a person
+/// rather than from the fleet, which project it was about, and that deciding whether there
+/// is any work here at all is part of the job.
+///
+/// It is also told where its answer goes. A reply that will be read on a phone, in a
+/// conversation, should not arrive as a build log - and an engine that does not know its
+/// audience writes for the wrong one.
+fn orchestrator_brief(topic: &str, project: &str, asked_by: &str, message: &str) -> String {
+    format!(
+        "{asked_by} sent this from the {topic} topic on Telegram, about the {project} \
+         project:\n\
+         \n\
+         {message}\n\
+         \n\
+         You are the orchestrator. Work out what this actually means, and do the deciding \
+         yourself rather than passing the sentence on.\n\
+         \n\
+         If it is work: write the real order - context, what \"done\" looks like, anything \
+         the machine cannot be expected to know - and issue it into {project}'s own channel, \
+         addressed to the machine that should do it. Not to yourself.\n\
+         If it is a question: answer it.\n\
+         If it is neither, or if you need something from {asked_by} before anything can \
+         start, say exactly what.\n\
+         \n\
+         Answer in one short paragraph of plain prose. It goes straight back to a phone, \
+         into the topic it was asked in, so write it for a person reading in a chat - not a \
+         log, not a transcript, no headings."
     )
 }
 
@@ -1322,9 +1526,9 @@ fn issue(
 }
 
 /// Report results that have arrived since the last look.
-async fn announce(chat: &Chat, desk: &mut Desk) -> Result<()> {
+async fn announce(chat: &Chat, desk: &mut Desk, origins: Option<&Origins>) -> Result<()> {
     let route = &desk.route;
-    let mut fresh: Vec<(String, String)> = Vec::new();
+    let mut fresh: Vec<(String, String, String)> = Vec::new();
     for task in ferryman_channel::list_tasks(route)? {
         for result in &task.results {
             let key = result_key(&task.order.id, &result.agent, result.revision);
@@ -1340,6 +1544,7 @@ async fn announce(chat: &Chat, desk: &mut Desk) -> Result<()> {
             let signature = ferryman_channel::verify_result(result, &route.agents);
             fresh.push((
                 key,
+                task.order.id.clone(),
                 format!(
                     "{} r{} by {} ({signature:?})\n\n{}",
                     task.order.id,
@@ -1353,13 +1558,18 @@ async fn announce(chat: &Chat, desk: &mut Desk) -> Result<()> {
     // Remember first, then speak. The other order repeats an announcement every restart if
     // the send is what failed, and a phone that buzzes with yesterday's results twice is a
     // bridge an operator turns off.
-    for (key, text) in fresh {
+    for (key, order, text) in fresh {
         desk.state.remember(key);
         save(&desk.state_path, &desk.state)?;
-        // Into this project's topic, not into whatever chat the bridge was started with.
-        // A result that lands in the wrong topic is a result the operator has to work out
-        // the owner of, which is the whole thing the topics were for.
-        chat.send_to(desk.chat_id, desk.thread, &text).await?;
+        // Back to the conversation it started in. A request raised from the Bullship topic
+        // is answered there even though it was filed in the seat's channel; anything else
+        // goes to its own project's topic. A result that lands in the wrong topic is a
+        // result the operator has to work out the owner of, which is the whole thing the
+        // topics were for.
+        let (chat_id, thread) = origins
+            .and_then(|origins| origins.of(&order))
+            .unwrap_or((desk.chat_id, desk.thread));
+        chat.send_to(chat_id, thread, &text).await?;
     }
     Ok(())
 }
@@ -1486,6 +1696,61 @@ mod tests {
         // sharing a cursor file would fight over it.
         let path = state_path(Path::new("/w/.ferryman"), "beastlywsl");
         assert!(path.ends_with("telegram-beastlywsl.json"));
+    }
+
+    #[test]
+    fn a_message_reaches_the_orchestrator_as_something_to_judge_not_to_do() {
+        // The failure this prevents: "Testing @FerrymanClinebot" became a unit of work for
+        // a build machine, because a worker handed a bare sentence does it.
+        let brief = orchestrator_brief("Bullship", "bullship", "Josh", "the login page is broken");
+        assert!(brief.contains("the login page is broken"));
+        assert!(brief.contains("Bullship topic"));
+        assert!(brief.contains("You are the orchestrator"));
+        // Deciding there is no work is part of the job, and must be said so.
+        assert!(brief.contains("If it is neither"));
+        // And the orders it writes go to a machine, never back to itself.
+        assert!(brief.contains("Not to yourself."));
+    }
+
+    #[test]
+    fn the_orchestrator_is_told_who_will_read_the_answer() {
+        // An engine that does not know its audience writes for the wrong one, which is how
+        // a phone gets sent a build log.
+        let brief = orchestrator_brief("Ferryman", "ferryman", "Josh", "where are we?");
+        assert!(brief.contains("goes straight back to a phone"));
+        assert!(brief.contains("no headings"));
+    }
+
+    #[test]
+    fn an_answer_goes_back_to_the_conversation_that_asked() {
+        // The request is filed in the seat's channel, which is not the topic it came from.
+        // Without the origin, every reply would surface in the orchestrator's own topic.
+        let mut origins = Origins::default();
+        origins.remember("tg-7".to_string(), -100123, Some(9));
+        assert_eq!(origins.of("tg-7"), Some((-100123, Some(9))));
+        assert_eq!(origins.of("tg-8"), None);
+    }
+
+    #[test]
+    fn the_origin_record_cannot_grow_without_limit() {
+        // It is written on every message, forever, on a machine nobody logs into.
+        let mut origins = Origins::default();
+        for n in 0..SEEN_LIMIT + 50 {
+            origins.remember(format!("tg-{n}"), -1, None);
+        }
+        assert_eq!(origins.of.len(), SEEN_LIMIT);
+        // The newest survive; the oldest are the ones already answered.
+        assert!(origins.of(&format!("tg-{}", SEEN_LIMIT + 49)).is_some());
+        assert!(origins.of("tg-0").is_none());
+    }
+
+    #[test]
+    fn asking_twice_about_one_order_keeps_the_later_conversation() {
+        let mut origins = Origins::default();
+        origins.remember("tg-7".to_string(), -1, Some(1));
+        origins.remember("tg-7".to_string(), -2, Some(2));
+        assert_eq!(origins.of.len(), 1);
+        assert_eq!(origins.of("tg-7"), Some((-2, Some(2))));
     }
 
     #[test]

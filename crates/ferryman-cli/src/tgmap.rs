@@ -79,11 +79,41 @@ pub struct TopicMap {
     /// fills it in, which is the one thing they must do by hand.
     #[serde(default)]
     pub group: Option<i64>,
-    /// The fleet-wide default machine for an unaddressed order.
+    /// The fleet-wide default machine for an unaddressed order. Only consulted when there
+    /// is no orchestrator; with one, every message goes to it.
     #[serde(default)]
     pub default_to: Option<String>,
+    /// Who thinks about what arrives, and where their requests are filed.
+    #[serde(default)]
+    pub orchestrator: Option<Orchestrator>,
     #[serde(default, rename = "topic")]
     pub topics: Vec<Topic>,
+}
+
+/// The seat that reads what the operator sent and decides what work it means.
+///
+/// # Why a message does not go straight to a worker
+///
+/// The bridge cannot orchestrate. It has no view of what a project needs, no way to turn
+/// "the login page is broken" into an order a machine can act on, and no judgement about
+/// which machine should get it. Wrapping a sentence in a signature and filing it as a task
+/// is not delegation - it is forwarding, and it produced exactly what forwarding produces:
+/// "Testing @FerrymanClinebot" became a unit of work for a build machine.
+///
+/// So a message becomes a *request* addressed to one identity that can think about it. That
+/// seat reads it, decides what the job actually is, and issues the real orders itself -
+/// into whichever project's channel they belong to, addressed to whichever machine should
+/// do them. One seat serves every topic, because judgement is not per-project and a
+/// thinking engine running nineteen times over is the expensive half of the fleet run
+/// nineteen times over.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Orchestrator {
+    /// The identity the request is addressed to. A machine running a worker under this
+    /// name in the workspace below is what makes the seat occupied rather than notional.
+    pub agent: String,
+    /// The workspace whose channel holds the requests. Relative paths resolve against the
+    /// map's own folder, like a topic's.
+    pub workspace: PathBuf,
 }
 
 impl TopicMap {
@@ -176,9 +206,28 @@ impl TopicMap {
         }
         if let Some(default_to) = &self.default_to {
             out.push_str(&format!(
-                "\n# The machine an unaddressed order goes to, unless a topic says otherwise.\n\
+                "\n# Where an order goes when there is no orchestrator to decide.\n\
                  default_to = \"{default_to}\"\n"
             ));
+        }
+        match &self.orchestrator {
+            Some(orchestrator) => out.push_str(&format!(
+                "\n# Who reads what you send and decides what work it means. Every topic's\n\
+                 # messages become requests here; this seat issues the real orders itself.\n\
+                 [orchestrator]\n\
+                 agent = \"{}\"\n\
+                 workspace = \"{}\"\n",
+                escape(&orchestrator.agent),
+                escape(&orchestrator.workspace.to_string_lossy())
+            )),
+            None => out.push_str(
+                "\n# Who reads what you send and decides what work it means. Without this, a\n\
+                 # message goes straight to a worker as a task, which is forwarding rather\n\
+                 # than delegation - the bridge cannot judge what a sentence is worth.\n\
+                 # [orchestrator]\n\
+                 # agent = \"beastlywsl\"\n\
+                 # workspace = \"ferryman-ferryman\"\n",
+            ),
         }
         for topic in &self.topics {
             out.push_str("\n[[topic]]\n");
@@ -289,6 +338,7 @@ pub fn starter(dir: &Path) -> TopicMap {
     TopicMap {
         group: None,
         default_to: None,
+        orchestrator: None,
         topics,
     }
 }
@@ -340,6 +390,10 @@ mod tests {
         TopicMap {
             group: Some(-1001234567890),
             default_to: Some("grouchly".to_string()),
+            orchestrator: Some(Orchestrator {
+                agent: "beastlywsl".to_string(),
+                workspace: PathBuf::from("ferryman-ferryman"),
+            }),
             topics: vec![
                 Topic {
                     name: "Ferryman".to_string(),

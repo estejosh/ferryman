@@ -65,12 +65,45 @@ That is the whole setup: add the bot, run it, say hello.
 | Field | Where | Means |
 | --- | --- | --- |
 | `group` | top | The forum group's chat id. Negative, begins `-100`. Ferryman fills this in the first time you speak to it in the group. |
-| `default_to` | top | The machine an unaddressed order goes to, fleet-wide. |
+| `default_to` | top | The machine an unaddressed order goes to, fleet-wide. Only consulted when there is no orchestrator. |
+| `agent` | `[orchestrator]` | The identity that reads what you send and decides what it means. |
+| `workspace` | `[orchestrator]` | The project whose channel holds the requests. |
 | `name` | `[[topic]]` | What the topic is called in Telegram. |
 | `workspace` | `[[topic]]` | The project. Relative paths resolve against the map's own folder, so the same file works on two machines that lay their channels out the same way. |
 | `thread` | `[[topic]]` | Telegram's id. Leave it out and Ferryman creates the topic and fills it in. |
 | `default_to` | `[[topic]]` | Overrides the fleet-wide default for this project. |
 | `general` | `[[topic]]` | This project takes messages that arrive with no topic - a private chat, or the group's General. At most one topic may say this. |
+
+## The orchestrator
+
+A bridge cannot orchestrate. It has no view of what a project needs, no way to turn "the
+login page is broken" into an order a machine can act on, and no judgement about which
+machine should get it. Wrapping a sentence in a signature and filing it as a task is not
+delegation — it is forwarding, and forwarding is how `Testing @FerrymanClinebot` became a
+unit of work for a build machine.
+
+So name a seat:
+
+```toml
+[orchestrator]
+agent = "beastlywsl"
+workspace = "ferryman-ferryman"
+```
+
+Now a message from any topic becomes a **request** addressed to that identity, filed in
+that one channel, and told which project it was about. The seat reads it, decides what the
+work actually is, and issues the real orders itself — into the right project's channel,
+addressed to the machine that should do them. The answer comes back to the topic you asked
+in, because the bridge remembers where each request came from.
+
+One seat serves every topic. Judgement is not per-project, and running a thinking engine
+nineteen times over is the expensive half of the fleet run nineteen times over.
+
+`/to <agent> <task>` still bypasses the seat. Naming a machine is you choosing to, and you
+are allowed to.
+
+Without an `[orchestrator]` section the bridge behaves as it did before — a message becomes
+a task directly — and says so at startup, so you never have to infer which you have.
 
 ## What it does with it
 
