@@ -241,7 +241,7 @@ impl TopicMap {
                  # message goes straight to a worker as a task, which is forwarding rather\n\
                  # than delegation - the bridge cannot judge what a sentence is worth.\n\
                  # [orchestrator]\n\
-                 # agent = \"beastlywsl\"\n\
+                 # agent = \"wisp\"\n\
                  # workspace = \"ferryman-ferryman\"\n",
             ),
         }
@@ -407,9 +407,9 @@ mod tests {
         TopicMap {
             operator: None,
             group: Some(-1001234567890),
-            default_to: Some("grouchly".to_string()),
+            default_to: Some("fang".to_string()),
             orchestrator: Some(Orchestrator {
-                agent: "beastlywsl".to_string(),
+                agent: "wisp".to_string(),
                 workspace: PathBuf::from("ferryman-ferryman"),
             }),
             topics: vec![
@@ -424,7 +424,7 @@ mod tests {
                     name: "Bullship".to_string(),
                     workspace: PathBuf::from("bullship-ferryman"),
                     thread: None,
-                    default_to: Some("beastlywsl".to_string()),
+                    default_to: Some("wisp".to_string()),
                     general: false,
                 },
             ],

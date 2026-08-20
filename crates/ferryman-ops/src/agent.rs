@@ -758,7 +758,7 @@ fn selinux_enforcing() -> bool {
 ///   workspace outside those mounts empty inside the container.
 /// - **WSL**: a workspace on a Windows drive (`/mnt/<letter>/…`) is re-exported
 ///   through the VM with degraded permissions and performance. A normal Linux
-///   `/mnt` (e.g. `/mnt/nvme-storage`) has a multi-character first component
+///   `/mnt` (e.g. `/srv`) has a multi-character first component
 ///   and must not warn, so only a single ASCII drive letter counts.
 fn mount_warnings(workspace: &Path) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -1442,8 +1442,8 @@ fn parse_verdict(output: &str) -> Result<Verdict> {
 /// # The failure this prevents
 ///
 /// A fleet poller was started while the old per-project worker was still running. Both
-/// were `grouchly`, both watched the ferryman channel, and a claim already held by
-/// `grouchly` reads to a `grouchly` worker as *its own work, resumed*. So the second
+/// were `fang`, both watched the ferryman channel, and a claim already held by
+/// `fang` reads to a `fang` worker as *its own work, resumed*. So the second
 /// process spawned a second engine for a task the first was already running - two agents,
 /// one order, and whichever finished last would have written the result.
 ///
@@ -2569,11 +2569,11 @@ mod tests {
             "\n",
             r#"{"ts":"2","type":"agent_event","event":{"type":"content_start","reasoning":" the"}}"#,
             "\n",
-            r#"{"ts":"3","type":"agent_event","event":{"type":"done","reason":"completed","text":"Grouchly - Linux - ferry 0.4.1"}}"#,
+            r#"{"ts":"3","type":"agent_event","event":{"type":"done","reason":"completed","text":"Fang - Linux - ferry 0.4.1"}}"#,
             "\n",
-            r#"{"ts":"4","type":"run_result","finishReason":"completed","text":"Grouchly - Linux - ferry 0.4.1"}"#,
+            r#"{"ts":"4","type":"run_result","finishReason":"completed","text":"Fang - Linux - ferry 0.4.1"}"#,
         );
-        assert_eq!(engine_answer(stream), "Grouchly - Linux - ferry 0.4.1");
+        assert_eq!(engine_answer(stream), "Fang - Linux - ferry 0.4.1");
     }
 
     #[test]
@@ -2625,12 +2625,12 @@ mod tests {
         .unwrap();
         std::fs::write(
             AgentConfig::path(&attachment),
-            "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
+            "agent = \"wisp\"\ncommand = \"claude\"\n",
         )
         .unwrap();
         // A channel this machine cannot sign in is not one it can work, so the fixture
         // has to hold a key the same way a real enabled channel does.
-        holds_key(&attachment, "beastlywsl");
+        holds_key(&attachment, "wisp");
     }
 
     /// Give `attachment` a signing key for `agent`, without reaching for the machine's
@@ -2647,34 +2647,30 @@ mod tests {
     #[test]
     fn one_identity_gets_one_worker_per_channel() {
         // The observed failure: a fleet poller started beside the old per-project worker,
-        // both as grouchly, both on ferryman. A claim held by grouchly reads to a grouchly
+        // both as fang, both on ferryman. A claim held by fang reads to a fang
         // worker as its own work resumed, so it spawned a second engine for a task the
         // first was already running.
         let dir = tempfile::tempdir().unwrap();
-        let held = WorkerLock::take(dir.path(), "grouchly").unwrap();
+        let held = WorkerLock::take(dir.path(), "fang").unwrap();
         assert!(held.is_some());
-        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_none());
+        assert!(WorkerLock::take(dir.path(), "fang").unwrap().is_none());
     }
 
     #[test]
     fn a_different_identity_is_not_blocked() {
         // Two engines under two names is the ordinary case the claim protocol settles.
         let dir = tempfile::tempdir().unwrap();
-        let _held = WorkerLock::take(dir.path(), "grouchly").unwrap().unwrap();
-        assert!(
-            WorkerLock::take(dir.path(), "beastlywsl")
-                .unwrap()
-                .is_some()
-        );
+        let _held = WorkerLock::take(dir.path(), "fang").unwrap().unwrap();
+        assert!(WorkerLock::take(dir.path(), "wisp").unwrap().is_some());
     }
 
     #[test]
     fn the_lock_goes_when_the_worker_does() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let _held = WorkerLock::take(dir.path(), "grouchly").unwrap().unwrap();
+            let _held = WorkerLock::take(dir.path(), "fang").unwrap().unwrap();
         }
-        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_some());
+        assert!(WorkerLock::take(dir.path(), "fang").unwrap().is_some());
     }
 
     #[test]
@@ -2682,16 +2678,16 @@ mod tests {
         // The usual way one is left behind is a machine losing power, and a fleet that
         // will not start until someone deletes a file is a fleet that stays down.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("worker-grouchly.lock"), "999999999").unwrap();
-        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_some());
+        std::fs::write(dir.path().join("worker-fang.lock"), "999999999").unwrap();
+        assert!(WorkerLock::take(dir.path(), "fang").unwrap().is_some());
     }
 
     #[test]
     fn the_name_is_folded_the_way_every_other_store_folds_it() {
-        // Grouchly and grouchly are one machine; two locks would be two workers.
+        // Fang and fang are one machine; two locks would be two workers.
         let dir = tempfile::tempdir().unwrap();
-        let _held = WorkerLock::take(dir.path(), "Grouchly").unwrap().unwrap();
-        assert!(WorkerLock::take(dir.path(), "grouchly").unwrap().is_none());
+        let _held = WorkerLock::take(dir.path(), "Fang").unwrap().unwrap();
+        assert!(WorkerLock::take(dir.path(), "fang").unwrap().is_none());
     }
 
     #[test]
@@ -2733,13 +2729,13 @@ mod tests {
         std::fs::remove_file(AgentConfig::path(&workspace.join(".ferryman"))).unwrap();
         std::fs::write(
             AgentConfig::path(comms.path()),
-            "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
+            "agent = \"wisp\"\ncommand = \"claude\"\n",
         )
         .unwrap();
 
         let fleet = fleet_under(comms.path()).unwrap();
         assert_eq!(fleet.served.len(), 1, "skipped: {:?}", fleet.skipped);
-        assert_eq!(fleet.served[0].1.agent, "beastlywsl");
+        assert_eq!(fleet.served[0].1.agent, "wisp");
     }
 
     #[test]
@@ -2751,13 +2747,13 @@ mod tests {
         enabled_channel(&workspace, "obscura");
         std::fs::write(
             AgentConfig::path(&workspace.join(".ferryman")),
-            "agent = \"grouchly\"\ncommand = \"ferryman-cline\"\n",
+            "agent = \"fang\"\ncommand = \"ferryman-cline\"\n",
         )
         .unwrap();
-        holds_key(&workspace.join(".ferryman"), "grouchly");
+        holds_key(&workspace.join(".ferryman"), "fang");
         std::fs::write(
             AgentConfig::path(comms.path()),
-            "agent = \"beastlywsl\"\ncommand = \"claude\"\n",
+            "agent = \"wisp\"\ncommand = \"claude\"\n",
         )
         .unwrap();
 
@@ -2906,7 +2902,7 @@ mod tests {
 
     /// One rule per assertion, checked by what the warning SAYS.
     ///
-    /// This asserted `is_empty()` for `/mnt/nvme-storage/repos` and `/home/you/project`,
+    /// This asserted `is_empty()` for `/srv/repos` and `/home/you/project`,
     /// which quietly made it a test of two rules at once - and the other rule is
     /// macOS-only. On macOS every path outside `/Users`, `/Volumes`, `/tmp`, `/private`
     /// and `/var/folders` warns about the container VM's shared roots, correctly, so both
@@ -2925,7 +2921,7 @@ mod tests {
         };
         assert!(windows_drive("/mnt/c/project"), "/mnt/c is a drive letter");
         assert!(
-            !windows_drive("/mnt/nvme-storage/repos"),
+            !windows_drive("/srv/repos"),
             "a multi-character /mnt component is an ordinary Linux mount"
         );
         assert!(!windows_drive("/home/you/project"));
@@ -3240,7 +3236,7 @@ mod tests {
     #[test]
     fn config_round_trips_through_the_file_enable_writes() {
         let rendered = AgentConfig::render(
-            "beastly",
+            "wisp",
             "worker",
             "claude",
             &["-p".into(), "{prompt}".into()],
@@ -3249,7 +3245,7 @@ mod tests {
             false,
         );
         let config = AgentConfig::parse(&rendered).unwrap();
-        assert_eq!(config.agent, "beastly");
+        assert_eq!(config.agent, "wisp");
         assert_eq!(config.command, "claude");
         assert_eq!(config.args, vec!["-p", "{prompt}"]);
         assert_eq!(config.review, ReviewMode::Confirm);
@@ -3280,7 +3276,7 @@ mod tests {
     #[test]
     fn the_generated_template_still_parses_with_the_push_line_in_it() {
         let rendered = AgentConfig::render(
-            "beastly",
+            "wisp",
             "worker",
             "claude",
             &["-p".into()],

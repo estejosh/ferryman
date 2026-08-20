@@ -148,7 +148,7 @@ Detailed design to follow as `docs/LOG_DESIGN.md` before implementation.
 
 - **`X:\ferryman` git writes fail from the device bridge**: `unable to unlink .git/index.lock: Operation not permitted`. Reads are fine. Commits and pushes will run through Desktop Commander's native shell instead.
 - **CLI still defaults to `orchestrator.toml`** (`ferryman-cli/src/main.rs:22`) — a leftover from the crate rename. Rough edge for a public repo.
-- **Stray order `0de822dafdfc`** confirmed at `X:\hone-ferryman\beastly\20260810-1613-order-ferryman-phase0-extract-and-podman.md`, created today 16:13Z. It orders an "extract from HONE and scaffold a new repo" that is obsolete — the repo exists, has four crates and a `v0.1.0-preview` tag. Left cancelled.
+- **Stray order `0de822dafdfc`** confirmed at `X:\hone-ferryman\wisp\20260810-1613-order-ferryman-phase0-extract-and-podman.md`, created today 16:13Z. It orders an "extract from HONE and scaffold a new repo" that is obsolete — the repo exists, has four crates and a `v0.1.0-preview` tag. Left cancelled.
 - **Test coverage is thin outside the channel**: 30 tests total, 20 of them in `communications.rs`. `ferryman-core` — the job and lease engine — has **one**.
 
 ---

@@ -290,7 +290,7 @@ them loses work or leaks anything.
   not rely on it as provenance until it verifies, and prefer
   `ferry channel log` / `ferry channel tasks`, which do.
 - **An addressed order reports as `claimed` before anyone picks it up.** `--to
-  grouchly` shows as claimed by grouchly immediately, whether or not grouchly has
+  fang` shows as claimed by fang immediately, whether or not fang has
   started, because the holder is the assignee and no claim file is required. So
   "waiting for that machine" and "that machine is working" currently look the same.
 - **`checkin = "off"` in `agent.toml` does nothing.** PRIVACY.md mentions it; no

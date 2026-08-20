@@ -3137,10 +3137,10 @@ fn soak_endpoint() -> Option<String> {
 /// # Why this is a `value_parser` and not a rule
 ///
 /// Same lesson as `signing_identity` directly below, learned the same way. The channel
-/// folds names when it *writes* them, so the roster holds one `grouchly` however it was
-/// typed - but the CLI then compared the operator's raw `--agent GROUCHLY` against that
+/// folds names when it *writes* them, so the roster holds one `fang` however it was
+/// typed - but the CLI then compared the operator's raw `--agent FANG` against that
 /// folded roster with `==`, and told the operator that no such agent had joined while
-/// listing `grouchly` in the very same sentence. Rewriting the four or five comparisons
+/// listing `fang` in the very same sentence. Rewriting the four or five comparisons
 /// that happen to exist today is how you get a sixth one wrong next month.
 ///
 /// Attached to every argument that names an agent - `--agent`, `--to`, `--reviewer`,
@@ -3349,7 +3349,7 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
                 std::fs::read(&file).with_context(|| format!("read {}", file.display()))?;
             // Check the record against the roster BEFORE installing it.
             //
-            // Grouchly asked for this explicitly and was right to. An operator record
+            // Fang asked for this explicitly and was right to. An operator record
             // whose public key disagrees with the roster is not a usable identity: every
             // signature it produces reads as `KeyChanged` on every other machine, and the
             // person finds out at the moment their approval is rejected rather than at
@@ -5162,10 +5162,7 @@ mod tests {
 
     #[test]
     fn slug_derives_from_the_directory_name() {
-        assert_eq!(
-            slug_of(Path::new("/mnt/nvme-storage/repos/ferryman")),
-            "ferryman"
-        );
+        assert_eq!(slug_of(Path::new("/srv/repos/ferryman")), "ferryman");
         assert_eq!(slug_of(Path::new("/home/you/My Project")), "my-project");
         assert_eq!(
             slug_of(Path::new("/tmp/groundcrew_borrows")),

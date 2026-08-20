@@ -92,18 +92,18 @@ pub fn resolve(explicit: Option<String>, attachment: &Path) -> Result<String> {
 /// The operator is a person: they say what they want, and they sign with a key sealed
 /// under their password because they are present to type it.
 ///
-/// `grouchly` is an agent - an engine on that machine, with a human in the conversation.
+/// `fang` is an agent - an engine on that machine, with a human in the conversation.
 /// It writes the orders, not the operator; what the operator supplied was intent. It is
 /// not the person, and it is not unattended either.
 ///
-/// `ichabod-grouchly-deepseek` is the same machine's agent running alone, on a schedule,
+/// `ichabod-fang-deepseek` is the same machine's agent running alone, on a schedule,
 /// at three in the morning. Same hardware, same engine, nobody watching.
 ///
 /// The middle one is easy to collapse into either neighbour and both collapses are wrong.
 /// Called a person, it inherits an identity that cannot be signed with unattended. Called
 /// the same as the unattended worker, a signature stops being able to say whether anyone
 /// was there - and "was a human in the loop for this" is a question a ledger has to be
-/// able to answer. So: `ichabod` marks the one that ran alone, and `grouchly` keeps its
+/// able to answer. So: `ichabod` marks the one that ran alone, and `fang` keeps its
 /// key and its rosters, meaning what it already meant.
 ///
 /// Supervision is the axis, not humanity. Both are machine identities with machine keys;
@@ -180,31 +180,25 @@ mod tests {
 
     #[test]
     fn an_unattended_worker_is_named_for_its_machine_and_engine() {
-        assert_eq!(
-            headless_name("grouchly", "deepseek"),
-            "ichabod-grouchly-deepseek"
-        );
-        assert_eq!(
-            headless_name("beastlywsl", "claude"),
-            "ichabod-beastlywsl-claude"
-        );
+        assert_eq!(headless_name("fang", "deepseek"), "ichabod-fang-deepseek");
+        assert_eq!(headless_name("wisp", "claude"), "ichabod-wisp-claude");
     }
 
     #[test]
     fn the_generated_name_is_always_a_usable_path_component() {
         // It becomes a key filename, a roster filename and a lock filename. A name that
         // is not path-safe fails at the first of those, after the others were written.
-        let name = headless_name("Beastly WSL", "DeepSeek v4/pro");
+        let name = headless_name("Wisp WSL", "DeepSeek v4/pro");
         assert!(ferryman_channel::is_safe_component(&name), "{name}");
         assert_eq!(name, ferryman_channel::canonical_agent_name(&name));
     }
 
     #[test]
     fn a_missing_part_does_not_produce_a_name_with_a_hole_in_it() {
-        // "ichabod--deepseek" and "ichabod-grouchly-" are different identities to a
+        // "ichabod--deepseek" and "ichabod-fang-" are different identities to a
         // roster than the ones intended, and neither reads as anything.
         assert_eq!(headless_name("", "deepseek"), "ichabod-deepseek");
-        assert_eq!(headless_name("grouchly", ""), "ichabod-grouchly");
+        assert_eq!(headless_name("fang", ""), "ichabod-fang");
         assert_eq!(headless_name("", ""), "ichabod");
     }
 
@@ -222,14 +216,14 @@ mod tests {
     fn one_machine_can_run_two_engines_without_them_being_one_identity() {
         // The reason the engine is in the name at all.
         assert_ne!(
-            headless_name("grouchly", "deepseek"),
-            headless_name("grouchly", "claude")
+            headless_name("fang", "deepseek"),
+            headless_name("fang", "claude")
         );
     }
 
     #[test]
     fn slug_maps_rather_than_rejects() {
-        assert_eq!(slug("Beastly"), "beastly");
+        assert_eq!(slug("Wisp"), "wisp");
         assert_eq!(slug("  My Box!  "), "my-box");
         assert_eq!(slug("a_b-c"), "a_b-c");
         assert_eq!(slug("---"), "");
@@ -239,9 +233,9 @@ mod tests {
     fn with_no_environment_the_hostname_is_used_not_the_word_agent() {
         // The exact bug: nothing in the environment, so the old code returned "agent"
         // and two machines collided in the roster.
-        assert_eq!(choose(None, "Grouchly").unwrap(), "grouchly");
-        assert_eq!(choose(Some(""), "Beastly").unwrap(), "beastly");
-        assert_eq!(choose(None, "beastly.lan.example").unwrap(), "beastly");
+        assert_eq!(choose(None, "Fang").unwrap(), "fang");
+        assert_eq!(choose(Some(""), "Wisp").unwrap(), "wisp");
+        assert_eq!(choose(None, "wisp.lan.example").unwrap(), "wisp");
     }
 
     #[test]
@@ -263,8 +257,8 @@ mod tests {
     fn an_explicit_name_wins_and_is_slugged() {
         let dir = std::env::temp_dir().join("ferryman-identity-explicit");
         assert_eq!(
-            resolve(Some("Grouchly".into()), &dir).unwrap(),
-            "grouchly",
+            resolve(Some("Fang".into()), &dir).unwrap(),
+            "fang",
             "--agent should be taken as given, once path-safe"
         );
     }
@@ -279,7 +273,7 @@ mod tests {
         std::fs::write(
             AgentConfig::path(&dir),
             AgentConfig::render(
-                "grouchly",
+                "fang",
                 "worker",
                 "claude",
                 &["-p".to_string(), "{prompt}".to_string()],
@@ -290,7 +284,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(resolve(None, &dir).unwrap(), "grouchly");
+        assert_eq!(resolve(None, &dir).unwrap(), "fang");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

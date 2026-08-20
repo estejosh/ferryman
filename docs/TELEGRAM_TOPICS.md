@@ -86,7 +86,7 @@ So name a seat:
 
 ```toml
 [orchestrator]
-agent = "beastlywsl"
+agent = "wisp"
 workspace = "ferryman-ferryman"
 ```
 

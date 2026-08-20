@@ -23,10 +23,10 @@ read.
 Four of them are sitting on `origin` as this is written:
 
 ```
-ferryman-e2e-grouchly-122420-e2e-grouchly
-ferryman-proof-112843-beastlywsl
-ferryman-secrets-build-145457-grouchly
-ferryman-tg-topics-155625-grouchly
+ferryman-e2e-fang-122420-e2e-fang
+ferryman-proof-112843-wisp
+ferryman-secrets-build-145457-fang
+ferryman-tg-topics-155625-fang
 ```
 
 One of those four — `secrets-build` — shipped a real cryptographic defect: raw X25519
@@ -81,14 +81,14 @@ use one to rubber-stamp the other.
 {
   "order_id": "secrets-build-145457",
   "decision": "landed",
-  "branch": "ferryman-secrets-build-145457-grouchly",
+  "branch": "ferryman-secrets-build-145457-fang",
   "head": "1e5be57...",
   "base": "8fcc3ef...",
   "into": "main",
   "merge_commit": "...",
   "reason": "KDF defect fixed on the branch; dashboard endpoint still unread",
   "at": "...",
-  "signed_by": "beastlywsl",
+  "signed_by": "wisp",
   "signature": "..."
 }
 ```

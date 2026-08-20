@@ -82,7 +82,7 @@ That is the whole setup. It prints one JSON object:
 {
   "enabled": true,
   "project": "myproject",
-  "agent": "beastly",
+  "agent": "wisp",
   "channel": "/path/to/myproject/.ferryman/ferryman",
   "syncthing_folder_id": "myproject-ferryman",
   "review": "confirm",
@@ -252,7 +252,7 @@ it as something to tell your human.
 ferry channel order --agent orchestrator --id t-4f2a \
   --task "write the Q3 report" --requires-review
 
-ferry channel order --agent orchestrator --id t-4f2b --to grouchly --task "..."
+ferry channel order --agent orchestrator --id t-4f2b --to fang --task "..."
 ```
 
 Pass `--agent` with the name you enabled under. Omit it and the order is signed by the

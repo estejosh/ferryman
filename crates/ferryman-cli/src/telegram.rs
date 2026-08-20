@@ -1424,10 +1424,10 @@ fn orchestrator_brief(
 
 /// Who an order should go to, and what to tell the operator will happen to it.
 ///
-/// # What "issued tg-69 to grouchly (default)" left out
+/// # What "issued tg-69 to fang (default)" left out
 ///
 /// That receipt was true and useless. The order had been addressed to a machine that has
-/// never joined that project - grouchly works on `ferryman`, and the message was sent in
+/// never joined that project - fang works on `ferryman`, and the message was sent in
 /// the Bullship topic - so nothing would ever pick it up. The operator was told the order
 /// existed, which they could see, and not the one thing that mattered: that it was already
 /// dead.
@@ -1774,9 +1774,9 @@ mod tests {
         // The same folding every other entry point uses, or `/to BEASTLYWSL` addresses a
         // machine the roster does not have.
         assert_eq!(
-            parse_instruction("/to BeastlyWSL  run the tests"),
+            parse_instruction("/to Wisp  run the tests"),
             Some(Instruction::Order {
-                to: Some("beastlywsl".to_string()),
+                to: Some("wisp".to_string()),
                 task: "run the tests".to_string()
             })
         );
@@ -1800,7 +1800,7 @@ mod tests {
     #[test]
     fn an_order_verb_with_nothing_after_it_is_not_an_order() {
         assert_eq!(parse_instruction("/order   "), None);
-        assert_eq!(parse_instruction("/to beastlywsl"), None);
+        assert_eq!(parse_instruction("/to wisp"), None);
     }
 
     /// The default recipient is the difference between "the fleet does this" and "whichever
@@ -1815,18 +1815,16 @@ mod tests {
 
         // The default is applied where the order is issued, not where it is parsed, so
         // `/to` keeps overriding it and a fleet with no default still races as before.
-        let applied = to.clone().or_else(|| Some("grouchly".to_string()));
-        assert_eq!(applied.as_deref(), Some("grouchly"));
+        let applied = to.clone().or_else(|| Some("fang".to_string()));
+        assert_eq!(applied.as_deref(), Some("fang"));
 
-        let addressed = parse_instruction("/to beastlywsl run the tests").unwrap();
+        let addressed = parse_instruction("/to wisp run the tests").unwrap();
         let Instruction::Order { to, .. } = addressed else {
             panic!("addressed order")
         };
         assert_eq!(
-            to.clone()
-                .or_else(|| Some("grouchly".to_string()))
-                .as_deref(),
-            Some("beastlywsl"),
+            to.clone().or_else(|| Some("fang".to_string())).as_deref(),
+            Some("wisp"),
             "an explicit target wins over the default"
         );
     }
@@ -1835,9 +1833,9 @@ mod tests {
     fn help_says_where_a_bare_line_actually_goes() {
         // Telling someone their message is "open to whoever claims it first" when it is in
         // fact pinned to one machine is worse than saying nothing.
-        assert!(help_text(Some("grouchly")).contains("goes to grouchly"));
+        assert!(help_text(Some("fang")).contains("goes to fang"));
         assert!(help_text(None).contains("claims it first"));
-        for text in [help_text(Some("grouchly")), help_text(None)] {
+        for text in [help_text(Some("fang")), help_text(None)] {
             assert!(
                 text.contains("Do not send credentials"),
                 "the warning belongs on the surface an operator actually reads"
@@ -1874,8 +1872,8 @@ mod tests {
     fn state_is_named_for_the_agent_that_writes_it() {
         // One writer per path is what makes the synced folder conflict-free; two bridges
         // sharing a cursor file would fight over it.
-        let path = state_path(Path::new("/w/.ferryman"), "beastlywsl");
-        assert!(path.ends_with("telegram-beastlywsl.json"));
+        let path = state_path(Path::new("/w/.ferryman"), "wisp");
+        assert!(path.ends_with("telegram-wisp.json"));
     }
 
     #[test]
@@ -1941,28 +1939,28 @@ mod tests {
 
     #[test]
     fn a_default_target_that_does_not_work_here_leaves_the_order_open() {
-        // The failure: --default-to grouchly addressed a Bullship order to a machine that
+        // The failure: --default-to fang addressed a Bullship order to a machine that
         // has never joined Bullship. An addressed order is offered to its assignee alone,
         // so it was invisible to the two machines that could have done it.
-        let roster = vec!["beastlywsl".to_string(), "beastly".to_string()];
-        let (target, caveat) = route_order(None, Some("grouchly"), &roster);
+        let roster = vec!["wisp".to_string(), "wisp".to_string()];
+        let (target, caveat) = route_order(None, Some("fang"), &roster);
         assert_eq!(target, None);
         let caveat = caveat.unwrap();
         assert!(
-            caveat.contains("grouchly does not work on this one"),
+            caveat.contains("fang does not work on this one"),
             "{caveat}"
         );
-        assert!(caveat.contains("beastlywsl, beastly"), "{caveat}");
+        assert!(caveat.contains("wisp, wisp"), "{caveat}");
     }
 
     #[test]
     fn a_default_target_that_does_work_here_still_gets_the_order() {
         // The default exists because machines are not interchangeable in what they cost.
         // Where it applies, it must still apply.
-        let roster = vec!["grouchly".to_string(), "beastlywsl".to_string()];
+        let roster = vec!["fang".to_string(), "wisp".to_string()];
         assert_eq!(
-            route_order(None, Some("grouchly"), &roster),
-            (Some("grouchly".to_string()), None)
+            route_order(None, Some("fang"), &roster),
+            (Some("fang".to_string()), None)
         );
     }
 
@@ -1970,9 +1968,9 @@ mod tests {
     fn naming_a_machine_outranks_the_rule_but_is_not_silent_about_it() {
         // The operator may be about to bring that machine online. Honour it - and say it
         // is not there yet, rather than letting them find out through silence.
-        let roster = vec!["beastlywsl".to_string()];
-        let (target, caveat) = route_order(Some("grouchly"), None, &roster);
-        assert_eq!(target, Some("grouchly".to_string()));
+        let roster = vec!["wisp".to_string()];
+        let (target, caveat) = route_order(Some("fang"), None, &roster);
+        assert_eq!(target, Some("fang".to_string()));
         assert!(caveat.unwrap().contains("has not joined this channel"));
     }
 
@@ -1991,9 +1989,9 @@ mod tests {
     fn an_open_order_names_who_could_take_it() {
         // "open to whoever claims it first" is true and tells the operator nothing. Who
         // is actually listening is the thing they cannot see from a phone.
-        let roster = vec!["beastlywsl".to_string()];
+        let roster = vec!["wisp".to_string()];
         let (_, caveat) = route_order(None, None, &roster);
-        assert_eq!(caveat.unwrap(), "beastlywsl can pick it up");
+        assert_eq!(caveat.unwrap(), "wisp can pick it up");
     }
 
     #[test]

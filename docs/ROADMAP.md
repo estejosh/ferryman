@@ -45,7 +45,7 @@ secret. Three modes, per secret:
 `requires_approval` on orders, master-signed short-lived leases, consent records, and an
 approval gate that already reaches a phone. A secret request is the same shape as work that
 needs a human — and the *reason* belongs in the ledger beside everything else, so "why did
-grouchly have the deploy key on Tuesday" is a question with a signed answer rather than a
+fang have the deploy key on Tuesday" is a question with a signed answer rather than a
 shrug.
 
 Approving over Telegram is fine, incidentally, and worth distinguishing: approving a request
@@ -86,7 +86,7 @@ access to the repository can replace them. That is the specific thing to beat.
 ## The bridge should answer like a person, not a form
 
 **Next, after secrets.** Message the fleet from a phone today and you get a receipt:
-`issued tg-4821 to grouchly`. Ask the same thing at a desk, of something that can think, and
+`issued tg-4821 to fang`. Ask the same thing at a desk, of something that can think, and
 you get an answer — it works out what you meant, says who should do it and why, tells you
 what it found, and asks when the request is ambiguous rather than guessing.
 
