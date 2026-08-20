@@ -30,8 +30,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
 };
+use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
-use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
+use sha2::Sha256;
+use x25519_dalek::{PublicKey as XPublicKey, SharedSecret, StaticSecret};
 
 use crate::{AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck};
 
@@ -171,7 +173,6 @@ fn fs_read(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))
 }
 
-
 /// One recipient's slot: the ciphertext and everything a reader needs to open it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RecipientSlot {
@@ -258,6 +259,42 @@ fn associated_data(name: &str, project_id: &str, recipient: &str) -> Vec<u8> {
     format!("{SECRET_FORMAT}\n{name}\n{project_id}\n{recipient}").into_bytes()
 }
 
+/// The cipher for one recipient slot, keyed by a KDF over the shared secret.
+///
+/// # Why the Diffie-Hellman output is not used as a key directly
+///
+/// It was. `XChaCha20Poly1305::new_from_slice(shared.as_bytes())` reads like the obvious
+/// thing and is the one place this design hand-rolled something: an X25519 output is a
+/// curve point's x-coordinate, not thirty-two uniformly random bytes. RFC 7748 says to
+/// hash it before use, and every construction this is modelled on does - NaCl's
+/// `crypto_box` runs it through HSalsa20, `age` and HPKE use HKDF-SHA256 keyed with the
+/// public keys.
+///
+/// The practical risk in this envelope was small, because the envelope is signed and an
+/// attacker cannot inject an ephemeral key to be multiplied against. The argument for
+/// fixing it is not the attack; it is that ADR 0010 rests on "no new curve math or AEAD
+/// construction is hand-written", and this line was the exception to its own rule. An
+/// auditor comparing this to `age` finds it immediately, and the answer "it is probably
+/// fine" is worth less than not having to give it.
+///
+/// Both public keys go in the salt, as `age` does. That binds the key to this exact pair
+/// rather than to the shared secret alone, so a slot's key cannot be reused in a context
+/// where one side differs.
+fn slot_cipher(
+    shared: &SharedSecret,
+    ephemeral_public: &XPublicKey,
+    recipient_public: &XPublicKey,
+) -> Result<XChaCha20Poly1305> {
+    let mut salt = Vec::with_capacity(64);
+    salt.extend_from_slice(ephemeral_public.as_bytes());
+    salt.extend_from_slice(recipient_public.as_bytes());
+    let mut key = [0_u8; 32];
+    Hkdf::<Sha256>::new(Some(&salt), shared.as_bytes())
+        .expand(SECRET_FORMAT.as_bytes(), &mut key)
+        .map_err(|_| anyhow!("could not derive the slot key"))?;
+    XChaCha20Poly1305::new_from_slice(&key).map_err(|_| anyhow!("invalid derived key"))
+}
+
 /// Seal `value` to one recipient using an ephemeral X25519 keypair.
 fn seal_value(
     ephemeral: &StaticSecret,
@@ -268,8 +305,7 @@ fn seal_value(
     value: &str,
 ) -> Result<RecipientSlot> {
     let shared = ephemeral.diffie_hellman(recipient_public);
-    let cipher = XChaCha20Poly1305::new_from_slice(shared.as_bytes())
-        .map_err(|_| anyhow!("invalid encryption key"))?;
+    let cipher = slot_cipher(&shared, &XPublicKey::from(ephemeral), recipient_public)?;
     let mut nonce = [0_u8; 24];
     rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
     let ciphertext = cipher
@@ -288,7 +324,6 @@ fn seal_value(
         ciphertext_hex: hex::encode(ciphertext),
     })
 }
-
 
 /// Set a secret: seal it to `recipients` and write the signed envelope into this
 /// project's channel. `signer` is the roster identity on the record for it.
@@ -412,7 +447,6 @@ pub fn verify_envelope(envelope: &SecretEnvelope, roster: &[AgentRoute]) -> Sign
     )
 }
 
-
 /// Decrypt a secret for this machine's agent. Refuses - loudly and specifically -
 /// when the signature is bad, the name is unknown, this agent is not a
 /// recipient, or the local key cannot open it. It never returns an empty value.
@@ -440,8 +474,7 @@ pub fn open_secret(
 
     let ephemeral = XPublicKey::from(hex_decode_32(&slot.ephemeral_public_hex)?);
     let shared = identity.secret.diffie_hellman(&ephemeral);
-    let cipher = XChaCha20Poly1305::new_from_slice(shared.as_bytes())
-        .map_err(|_| anyhow!("invalid encryption key"))?;
+    let cipher = slot_cipher(&shared, &ephemeral, &identity.public())?;
     let nonce = hex::decode(&slot.nonce_hex).context("secret nonce is not valid hex")?;
     let nonce: [u8; 24] = nonce
         .try_into()
@@ -518,11 +551,8 @@ pub fn resolve_credentials(
 
 fn hex_decode_32(encoded: &str) -> Result<[u8; 32]> {
     let bytes = hex::decode(encoded).context("key is not valid hex")?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("key is not 32 bytes"))
+    bytes.try_into().map_err(|_| anyhow!("key is not 32 bytes"))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -583,6 +613,83 @@ mod tests {
         for agent in roster {
             crate::write_roster_entry(&route.communications.join("agents"), agent).unwrap();
         }
+    }
+
+    #[test]
+    fn the_slot_key_is_derived_and_is_not_the_raw_diffie_hellman_output() {
+        // The one place this design hand-rolled something. An X25519 output is a curve
+        // point's x-coordinate, not thirty-two uniformly random bytes: RFC 7748 says to
+        // hash it, and NaCl, age and HPKE all do. Using it directly was the exception to
+        // ADR 0010's own "no hand-written construction" rule.
+        //
+        // Proved by what the key is NOT: a ciphertext sealed with the derived key must not
+        // open under the raw shared secret.
+        let dir = tempfile::tempdir().unwrap();
+        let them = recipient(dir.path(), "them");
+        let ephemeral = StaticSecret::from([3_u8; 32]);
+        let slot = seal_value(
+            &ephemeral,
+            &them.public(),
+            "token",
+            "ferryman",
+            "them",
+            "hunter2",
+        )
+        .unwrap();
+
+        let raw = ephemeral.diffie_hellman(&them.public());
+        let naive = XChaCha20Poly1305::new_from_slice(raw.as_bytes()).unwrap();
+        let nonce = hex::decode(&slot.nonce_hex).unwrap();
+        let ciphertext = hex::decode(&slot.ciphertext_hex).unwrap();
+        assert!(
+            naive
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &ciphertext,
+                        aad: &associated_data("token", "ferryman", "them"),
+                    },
+                )
+                .is_err(),
+            "the raw shared secret still opens the slot, so no derivation happened"
+        );
+    }
+
+    #[test]
+    fn both_public_keys_are_bound_into_the_derivation() {
+        // The salt is ephemeral || recipient, as age does, so a slot key belongs to one
+        // exact pair rather than to the shared secret alone.
+        let dir = tempfile::tempdir().unwrap();
+        let them = recipient(dir.path(), "them");
+        let ephemeral = StaticSecret::from([3_u8; 32]);
+        let shared = ephemeral.diffie_hellman(&them.public());
+        let mine = XPublicKey::from(&ephemeral);
+
+        let right = slot_cipher(&shared, &mine, &them.public()).unwrap();
+        let swapped = slot_cipher(&shared, &them.public(), &mine).unwrap();
+
+        let nonce = [7_u8; 24];
+        let sealed = right
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: b"x",
+                    aad: b"",
+                },
+            )
+            .unwrap();
+        assert!(
+            swapped
+                .decrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: &sealed,
+                        aad: b""
+                    },
+                )
+                .is_err(),
+            "the order of the public keys in the salt does not affect the key"
+        );
     }
 
     #[test]
@@ -658,7 +765,6 @@ mod tests {
         assert!(err.contains("encryption key"), "got: {err}");
     }
 
-
     #[test]
     fn tampering_with_the_envelope_fails_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -683,7 +789,9 @@ mod tests {
         } else {
             "0"
         };
-        envelope.recipients[0].ciphertext_hex.replace_range(last.., flipped);
+        envelope.recipients[0]
+            .ciphertext_hex
+            .replace_range(last.., flipped);
         crate::atomic_json(&path, &envelope).unwrap();
 
         let err = open_secret(&route, "GH_TOKEN", &recipient)
@@ -769,7 +877,10 @@ mod tests {
 
         let credentials = HashMap::from([
             ("GH_TOKEN".to_string(), "secret:GH_TOKEN".to_string()),
-            ("LITERAL".to_string(), "secret:not-a-real-secret".to_string()),
+            (
+                "LITERAL".to_string(),
+                "secret:not-a-real-secret".to_string(),
+            ),
             ("PLAIN".to_string(), "plain-value".to_string()),
         ]);
         let resolved = resolve_credentials(&route, credentials, Some(&recipient)).unwrap();
@@ -831,4 +942,3 @@ mod tests {
         assert!(!json.contains("ciphertext"), "leaked slot: {json}");
     }
 }
-
