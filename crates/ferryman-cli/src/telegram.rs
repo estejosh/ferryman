@@ -610,6 +610,9 @@ async fn group_bridge(
             map.topics.len()
         );
     }
+    // Before answering anything: the same name has to be able to sign in every project,
+    // or the bridge takes a message in one topic and refuses it in the next.
+    seat_signer(&desks[0].issuer.clone(), &desks)?;
 
     if !known_group || !created.is_empty() {
         // A topic appearing in a group with no explanation is alarming rather than useful,
@@ -636,6 +639,74 @@ async fn group_bridge(
     }
 
     serve(&chat, &mut desks, approver, &mut cursor, &cursor_file).await
+}
+
+/// Make sure the name the bridge signs with can actually sign in every project it serves.
+///
+/// # The failure this replaces
+///
+/// A bridge serving nineteen topics signed the first order and refused the second:
+///
+/// > could not issue that: this machine holds no signing key for 'phone'
+///
+/// The name was set up in one project, because that is where the bridge used to live.
+/// Keys are per attachment, so every other topic had no key under that name - and the
+/// operator found out one topic at a time, by being refused, with a message telling them
+/// to go and run `ferry channel join` somewhere.
+///
+/// Two things are wrong with discovering it that way. It happens at the worst moment, in
+/// answer to a real message the operator expected to be work. And the remedy it suggests -
+/// joining - would mint a *new* key in each project, so the same person would sign as
+/// nineteen different public keys and the roster could not tell that from nineteen
+/// impostors.
+///
+/// So the identity is seated at startup instead, from the key this machine already holds,
+/// and published to each project's roster so the fleet can verify it. Same public key
+/// everywhere. If the machine holds no such key at all, that is a real problem and it is
+/// reported once, before the bridge starts answering, rather than nineteen times.
+fn seat_signer(agent: &str, desks: &[Desk]) -> Result<()> {
+    let Some(identity) = desks.iter().find_map(|desk| {
+        ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)
+            .ok()
+            .flatten()
+    }) else {
+        bail!(
+            "this machine holds no signing key for '{agent}' in any of the projects in the \
+             map, so the bridge could not sign anything it was sent.\n\
+             \n\
+             If '{agent}' is you, carry your identity here with 'ferry operator export \
+             --name {agent}' on the machine that has it and 'ferry operator import' here.\n\
+             If '{agent}' should be a new identity for this machine, run 'ferry channel \
+             join --agent {agent}' once, in any one of the map's projects - the bridge \
+             will seat it in the rest.\n\
+             \n\
+             Refusing here rather than starting: a bridge that cannot sign is a bridge \
+             that takes messages and drops them."
+        )
+    };
+
+    for desk in desks {
+        if ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)?.is_some()
+        {
+            continue;
+        }
+        identity.seat_in(&desk.route.attachment)?;
+        // Published as well as seated. A key nobody else has seen produces signatures every
+        // other machine reports as UnknownSigner, which is the same practical outcome as
+        // not signing at all.
+        let route = ferryman_channel::AgentRoute {
+            name: identity.name().to_string(),
+            role: "operator".to_string(),
+            capabilities: Vec::new(),
+            public_key: None,
+        };
+        ferryman_channel::register_agent_key(&desk.route, &route, &identity)?;
+        println!(
+            "telegram: seated {agent} in {} and published it to the roster",
+            desk.route.project_id
+        );
+    }
+    Ok(())
 }
 
 /// Wait to be spoken to, and take the group's id from the message.

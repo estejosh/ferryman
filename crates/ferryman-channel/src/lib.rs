@@ -1371,6 +1371,44 @@ impl AgentIdentity {
         }))
     }
 
+    /// Install this identity into another project's attachment on the same machine.
+    ///
+    /// # Why one machine's identity has to be seated per project
+    ///
+    /// A key lives per attachment, and an attachment is per project. That is right for a
+    /// worker, which is one machine doing one project's work. It is wrong for anything
+    /// that spans projects - and the Telegram bridge does exactly that: one process, one
+    /// operator name, a topic per project.
+    ///
+    /// The bridge signed its first order fine, because the project it was first set up in
+    /// had the key. Every other project refused: "this machine holds no signing key for
+    /// 'phone'". Refusing was correct - [`AgentIdentity::load_existing`] must never mint a
+    /// key for a name it does not already hold, or one typo would publish an impostor.
+    /// But the identity was not missing. It was one directory away.
+    ///
+    /// So this moves the key the machine already has, rather than making a new one. The
+    /// public half is identical in every project, which is the whole point: an operator is
+    /// a person, and a person who signs as a different key in each project is nineteen
+    /// strangers rather than one operator.
+    ///
+    /// Refuses to overwrite a *different* key already sitting there. That case is not a
+    /// machine spreading its own identity - it is two identities colliding under one name,
+    /// and silently replacing one of them would invalidate everything it had signed.
+    pub fn seat_in(&self, state_dir: &Path) -> Result<()> {
+        if let Some(existing) = Self::from_state_file(&self.name, state_dir)? {
+            if existing.public_key_hex() == self.public_key_hex() {
+                return Ok(());
+            }
+            bail!(
+                "'{}' already has a different key in {} - refusing to replace it, because \
+                 everything it has already signed would start reading as an impostor",
+                self.name,
+                state_dir.display()
+            )
+        }
+        Self::write_state_file(&self.name, state_dir, &self.signing)
+    }
+
     fn write_state_file(name: &str, state_dir: &Path, signing: &SigningKey) -> Result<()> {
         let path = Self::key_path(name, state_dir);
         if let Some(parent) = path.parent() {
@@ -7768,6 +7806,73 @@ mod work_over_files_tests {
         claim_order(&route, "t-1", "nebra").unwrap();
         let task = read_task(&route, "t-1").unwrap();
         assert_eq!(task.holder(), Some("grouchly"));
+    }
+
+    #[test]
+    fn one_machine_signs_as_one_key_in_every_project_it_serves() {
+        // The bridge failure this exists to prevent: set up in one project, refused in
+        // every other one, and the suggested remedy would have minted a second key.
+        let home = tempfile::tempdir().unwrap();
+        let first = home.path().join("one/.ferryman");
+        let second = home.path().join("two/.ferryman");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let identity = AgentIdentity::load_or_create_in("phone", &first, None).unwrap();
+        assert!(
+            AgentIdentity::load_existing("phone", &second)
+                .unwrap()
+                .is_none()
+        );
+
+        identity.seat_in(&second).unwrap();
+        let seated = AgentIdentity::load_existing("phone", &second)
+            .unwrap()
+            .unwrap();
+        // The same key, not merely a key: a different one would read as an impostor.
+        assert_eq!(seated.public_key_hex(), identity.public_key_hex());
+    }
+
+    #[test]
+    fn seating_the_same_identity_twice_changes_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".ferryman");
+        std::fs::create_dir_all(&dir).unwrap();
+        let identity = AgentIdentity::load_or_create_in("phone", &dir, None).unwrap();
+        identity.seat_in(&dir).unwrap();
+        identity.seat_in(&dir).unwrap();
+        assert_eq!(
+            AgentIdentity::load_existing("phone", &dir)
+                .unwrap()
+                .unwrap()
+                .public_key_hex(),
+            identity.public_key_hex()
+        );
+    }
+
+    #[test]
+    fn seating_refuses_to_overwrite_a_different_key_under_the_same_name() {
+        // Two identities colliding under one name is not a machine spreading its own.
+        // Replacing either would make everything it had already signed read as forged.
+        let home = tempfile::tempdir().unwrap();
+        let mine = home.path().join("mine/.ferryman");
+        let theirs = home.path().join("theirs/.ferryman");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::create_dir_all(&theirs).unwrap();
+        let ours = AgentIdentity::load_or_create_in("phone", &mine, None).unwrap();
+        let stranger = AgentIdentity::load_or_create_in("phone", &theirs, None).unwrap();
+        assert_ne!(ours.public_key_hex(), stranger.public_key_hex());
+
+        let error = ours.seat_in(&theirs).unwrap_err().to_string();
+        assert!(error.contains("refusing to replace it"), "{error}");
+        // And the key that was there is untouched.
+        assert_eq!(
+            AgentIdentity::load_existing("phone", &theirs)
+                .unwrap()
+                .unwrap()
+                .public_key_hex(),
+            stranger.public_key_hex()
+        );
     }
 
     #[test]
