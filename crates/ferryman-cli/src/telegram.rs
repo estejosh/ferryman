@@ -1425,6 +1425,7 @@ fn opening(
                     (open + 1, running)
                 }
                 ferryman_channel::TaskState::Claimed { .. }
+                | ferryman_channel::TaskState::Stale { .. }
                 | ferryman_channel::TaskState::ChangesRequested { .. } => (open, running + 1),
                 _ => (open, running),
             }),

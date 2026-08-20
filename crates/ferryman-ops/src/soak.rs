@@ -127,6 +127,7 @@ fn state_name(state: &TaskState) -> &'static str {
         // report can show `claimed` for work that has not started. Worth knowing when
         // reading these numbers, and worth fixing before the count is trusted.
         TaskState::Claimed { .. } => "claimed",
+        TaskState::Stale { .. } => "stale",
         TaskState::AwaitingReview { .. } => "awaiting_review",
         TaskState::ChangesRequested { .. } => "changes_requested",
         TaskState::Accepted => "accepted",
