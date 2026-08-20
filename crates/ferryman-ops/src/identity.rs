@@ -85,6 +85,74 @@ pub fn resolve(explicit: Option<String>, attachment: &Path) -> Result<String> {
     machine_name()
 }
 
+/// The name an unattended worker takes: `ichabod-<machine>-<engine>`.
+///
+/// # Three actors, not two
+///
+/// The operator is a person: they say what they want, and they sign with a key sealed
+/// under their password because they are present to type it.
+///
+/// `grouchly` is an agent - an engine on that machine, with a human in the conversation.
+/// It writes the orders, not the operator; what the operator supplied was intent. It is
+/// not the person, and it is not unattended either.
+///
+/// `ichabod-grouchly-deepseek` is the same machine's agent running alone, on a schedule,
+/// at three in the morning. Same hardware, same engine, nobody watching.
+///
+/// The middle one is easy to collapse into either neighbour and both collapses are wrong.
+/// Called a person, it inherits an identity that cannot be signed with unattended. Called
+/// the same as the unattended worker, a signature stops being able to say whether anyone
+/// was there - and "was a human in the loop for this" is a question a ledger has to be
+/// able to answer. So: `ichabod` marks the one that ran alone, and `grouchly` keeps its
+/// key and its rosters, meaning what it already meant.
+///
+/// Supervision is the axis, not humanity. Both are machine identities with machine keys;
+/// only the operator's is sealed. It is the same distinction [`crate::governor::presence`]
+/// already acts on - a headless worker holds off when someone is at the keyboard - said
+/// in the one place it can also be signed.
+///
+/// # Why the engine is in the name, and what that costs
+///
+/// It is there because two headless workers on one box are told apart by what they run,
+/// and a name that cannot tell them apart is a name that needs a suffix invented later.
+///
+/// The cost is real and worth saying once: a worker that changes engine changes name, and
+/// a changed name is a new identity to every roster. Its ledger history stays under the
+/// old one. That is honest - it *was* a different worker - but it is not free, and nothing
+/// should rewrite the old attributions to pretend otherwise.
+///
+/// # The short form is not this
+///
+/// `ichabodgd` is what a person says. It is never what gets signed, written to a roster,
+/// or passed to `--agent`: a name that varies by context is a different identity every
+/// time it varies, which is exactly what the roster's name-to-key pinning exists to catch.
+/// Only the full form is ever written down, and only this function writes it.
+#[must_use]
+pub fn headless_name(machine: &str, engine: &str) -> String {
+    let machine = slug(machine);
+    let engine = slug(engine);
+    match (machine.is_empty(), engine.is_empty()) {
+        (true, true) => "ichabod".to_string(),
+        (false, true) => format!("ichabod-{machine}"),
+        (true, false) => format!("ichabod-{engine}"),
+        (false, false) => format!("ichabod-{machine}-{engine}"),
+    }
+}
+
+/// What to call the engine in a headless worker's name, given the CLI it runs.
+///
+/// A guess, and a deliberately shallow one: `ferryman-cline` is a runner, not a model, and
+/// what it drives is a choice made elsewhere. So the default names the runner honestly
+/// rather than inventing a model it might not be pointed at - and `--engine` is there for
+/// the operator to say what is actually running, which is usually what they want in the
+/// name.
+#[must_use]
+pub fn engine_label(command: &str) -> String {
+    let command = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let command = command.strip_suffix(".exe").unwrap_or(command);
+    slug(command.strip_prefix("ferryman-").unwrap_or(command))
+}
+
 /// Make an arbitrary name usable as a path component.
 ///
 /// A project directory can be called anything at all, and an unattended caller has no
@@ -109,6 +177,55 @@ pub fn slug(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unattended_worker_is_named_for_its_machine_and_engine() {
+        assert_eq!(
+            headless_name("grouchly", "deepseek"),
+            "ichabod-grouchly-deepseek"
+        );
+        assert_eq!(
+            headless_name("beastlywsl", "claude"),
+            "ichabod-beastlywsl-claude"
+        );
+    }
+
+    #[test]
+    fn the_generated_name_is_always_a_usable_path_component() {
+        // It becomes a key filename, a roster filename and a lock filename. A name that
+        // is not path-safe fails at the first of those, after the others were written.
+        let name = headless_name("Beastly WSL", "DeepSeek v4/pro");
+        assert!(ferryman_channel::is_safe_component(&name), "{name}");
+        assert_eq!(name, ferryman_channel::canonical_agent_name(&name));
+    }
+
+    #[test]
+    fn a_missing_part_does_not_produce_a_name_with_a_hole_in_it() {
+        // "ichabod--deepseek" and "ichabod-grouchly-" are different identities to a
+        // roster than the ones intended, and neither reads as anything.
+        assert_eq!(headless_name("", "deepseek"), "ichabod-deepseek");
+        assert_eq!(headless_name("grouchly", ""), "ichabod-grouchly");
+        assert_eq!(headless_name("", ""), "ichabod");
+    }
+
+    #[test]
+    fn the_engine_label_names_the_runner_not_a_model_it_guesses_at() {
+        // ferryman-cline drives whatever it is pointed at. Naming it "deepseek" here
+        // would be inventing a fact; --engine is where the operator states it.
+        assert_eq!(engine_label("ferryman-cline"), "cline");
+        assert_eq!(engine_label("claude"), "claude");
+        assert_eq!(engine_label("/usr/local/bin/claude"), "claude");
+        assert_eq!(engine_label("C:\\bin\\claude.exe"), "claude");
+    }
+
+    #[test]
+    fn one_machine_can_run_two_engines_without_them_being_one_identity() {
+        // The reason the engine is in the name at all.
+        assert_ne!(
+            headless_name("grouchly", "deepseek"),
+            headless_name("grouchly", "claude")
+        );
+    }
 
     #[test]
     fn slug_maps_rather_than_rejects() {

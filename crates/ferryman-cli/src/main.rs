@@ -116,6 +116,24 @@ enum Command {
         /// This agent's name. Defaults to this machine's name.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
+        /// Name this as an unattended worker: `ichabod-<machine>-<engine>`.
+        ///
+        /// An agent with a human in the conversation and the same machine's agent running
+        /// alone at three in the morning are two actors. Both are machines and both sign
+        /// with machine keys - the difference is whether anyone was there, which is a
+        /// question a ledger has to be able to answer. So the unattended one takes its
+        /// own name, and the machine's plain name keeps meaning the supervised one.
+        ///
+        /// Generated rather than typed, because typing it is how a convention drifts.
+        #[arg(long, conflicts_with = "agent")]
+        headless: bool,
+        /// What to call the engine in a headless name. Defaults to the CLI being run.
+        ///
+        /// Worth setting to what is actually running - `deepseek` rather than `cline` -
+        /// because that is what the name is for. Changing it later changes the worker's
+        /// identity, and its past work stays attributed to the old one.
+        #[arg(long, requires = "headless")]
+        engine: Option<String>,
         /// Contact email for this deployment. Required: free production use is
         /// conditioned on registering one (LICENSE section 3). Nothing about your
         /// code or your work is ever sent - see PRIVACY.md.
@@ -1450,6 +1468,8 @@ async fn run(cli: Cli) -> Result<()> {
             workspace,
             project,
             agent: agent_name,
+            headless,
+            engine,
             role,
             email,
             command,
@@ -1470,6 +1490,16 @@ async fn run(cli: Cli) -> Result<()> {
                     .unwrap_or(std::env::current_dir().context("read the current directory")?);
                 refuse_person_as_machine(&start.join(".ferryman"), name)?;
             }
+            let agent_name = if headless {
+                let machine = ferryman_ops::identity::machine_name()?;
+                let engine =
+                    engine.unwrap_or_else(|| ferryman_ops::identity::engine_label(&command));
+                let name = ferryman_ops::identity::headless_name(&machine, &engine);
+                println!("unattended worker, joining as '{name}'");
+                Some(name)
+            } else {
+                agent_name
+            };
             let outcome = enable::perform(enable::Request {
                 workspace,
                 project,
