@@ -1088,14 +1088,26 @@ async fn handle(chat: &Chat, desk: &Desk, approver: i64, message: &TgMessage) {
             // An unaddressed order goes to whichever machine claims it first, which is the
             // wrong default when machines are not interchangeable: they differ in what they
             // cost to run, and the fastest poller wins rather than the cheapest engine. So a
-            // configured default decides, and `/to` still overrides it per message.
-            let target = to.clone().or_else(|| default_to.map(str::to_string));
+            // configured default decides - but only among machines that work on this
+            // project. See `route_order`.
+            let workers: Vec<String> = ferryman_channel::read_agent_roster(&route.communications)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|agent| agent.name)
+                .filter(|name| name != issuer)
+                .collect();
+            let (target, caveat) = route_order(to.as_deref(), default_to, &workers);
             match issue(route, issuer, message.message_id, target.clone(), &task) {
-                Ok(id) => match (target, to.is_some()) {
-                    (Some(who), true) => format!("issued {id} to {who}"),
-                    (Some(who), false) => format!("issued {id} to {who} (default)"),
-                    (None, _) => format!("issued {id}, open to whoever claims it first"),
-                },
+                Ok(id) => {
+                    let where_to = match &target {
+                        Some(who) => format!("issued {id} in {} to {who}", route.project_id),
+                        None => format!("issued {id} in {}", route.project_id),
+                    };
+                    match caveat {
+                        Some(caveat) => format!("{where_to}\n\n{caveat}"),
+                        None => where_to,
+                    }
+                }
                 Err(error) => format!("could not issue that: {error}"),
             }
         }
@@ -1126,6 +1138,59 @@ fn help_text(default_to: Option<&str>) -> String {
          \n\
          Do not send credentials here. This chat is not end-to-end encrypted."
     )
+}
+
+/// Who an order should go to, and what to tell the operator will happen to it.
+///
+/// # What "issued tg-69 to grouchly (default)" left out
+///
+/// That receipt was true and useless. The order had been addressed to a machine that has
+/// never joined that project - grouchly works on `ferryman`, and the message was sent in
+/// the Bullship topic - so nothing would ever pick it up. The operator was told the order
+/// existed, which they could see, and not the one thing that mattered: that it was already
+/// dead.
+///
+/// A fleet-wide `--default-to` is a statement about which machine is cheapest to run, and
+/// that is only meaningful among machines that work on the project in hand. Applied to a
+/// project the target has not joined, it does not route the work - it addresses it to
+/// nobody and hides it from everybody, because an addressed order is offered to its
+/// assignee alone.
+///
+/// So the default only applies where the target is actually on the roster. Everywhere else
+/// the order stays open, and the reply says who could take it.
+///
+/// An explicit `/to` is honoured either way. The operator naming a machine outranks this
+/// rule - they may be about to bring it online - but they are told it is not there yet,
+/// rather than finding out through silence.
+fn route_order(
+    asked: Option<&str>,
+    default_to: Option<&str>,
+    roster: &[String],
+) -> (Option<String>, Option<String>) {
+    let known = |name: &str| roster.iter().any(|agent| agent.eq_ignore_ascii_case(name));
+    let who_could = || match roster {
+        [] => "nobody has joined this channel yet, so nothing will pick it up".to_string(),
+        [one] => format!("{one} can pick it up"),
+        many => format!("{} can pick it up", many.join(", ")),
+    };
+    match (asked, default_to) {
+        (Some(who), _) if known(who) => (Some(who.to_string()), None),
+        (Some(who), _) => (
+            Some(who.to_string()),
+            Some(format!(
+                "{who} has not joined this channel, so nothing will pick it up until it does"
+            )),
+        ),
+        (None, Some(who)) if known(who) => (Some(who.to_string()), None),
+        (None, Some(who)) => (
+            None,
+            Some(format!(
+                "{who} does not work on this one, so it is open - {}",
+                who_could()
+            )),
+        ),
+        (None, None) => (None, Some(who_could())),
+    }
 }
 
 /// What to say on first contact.
@@ -1421,6 +1486,63 @@ mod tests {
         // sharing a cursor file would fight over it.
         let path = state_path(Path::new("/w/.ferryman"), "beastlywsl");
         assert!(path.ends_with("telegram-beastlywsl.json"));
+    }
+
+    #[test]
+    fn a_default_target_that_does_not_work_here_leaves_the_order_open() {
+        // The failure: --default-to grouchly addressed a Bullship order to a machine that
+        // has never joined Bullship. An addressed order is offered to its assignee alone,
+        // so it was invisible to the two machines that could have done it.
+        let roster = vec!["beastlywsl".to_string(), "beastly".to_string()];
+        let (target, caveat) = route_order(None, Some("grouchly"), &roster);
+        assert_eq!(target, None);
+        let caveat = caveat.unwrap();
+        assert!(
+            caveat.contains("grouchly does not work on this one"),
+            "{caveat}"
+        );
+        assert!(caveat.contains("beastlywsl, beastly"), "{caveat}");
+    }
+
+    #[test]
+    fn a_default_target_that_does_work_here_still_gets_the_order() {
+        // The default exists because machines are not interchangeable in what they cost.
+        // Where it applies, it must still apply.
+        let roster = vec!["grouchly".to_string(), "beastlywsl".to_string()];
+        assert_eq!(
+            route_order(None, Some("grouchly"), &roster),
+            (Some("grouchly".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn naming_a_machine_outranks_the_rule_but_is_not_silent_about_it() {
+        // The operator may be about to bring that machine online. Honour it - and say it
+        // is not there yet, rather than letting them find out through silence.
+        let roster = vec!["beastlywsl".to_string()];
+        let (target, caveat) = route_order(Some("grouchly"), None, &roster);
+        assert_eq!(target, Some("grouchly".to_string()));
+        assert!(caveat.unwrap().contains("has not joined this channel"));
+    }
+
+    #[test]
+    fn an_empty_channel_says_so_rather_than_promising_a_result() {
+        let (target, caveat) = route_order(None, None, &[]);
+        assert_eq!(target, None);
+        assert!(
+            caveat
+                .unwrap()
+                .contains("nobody has joined this channel yet")
+        );
+    }
+
+    #[test]
+    fn an_open_order_names_who_could_take_it() {
+        // "open to whoever claims it first" is true and tells the operator nothing. Who
+        // is actually listening is the thing they cannot see from a phone.
+        let roster = vec!["beastlywsl".to_string()];
+        let (_, caveat) = route_order(None, None, &roster);
+        assert_eq!(caveat.unwrap(), "beastlywsl can pick it up");
     }
 
     #[test]
