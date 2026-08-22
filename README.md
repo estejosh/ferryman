@@ -190,6 +190,7 @@ so this one is on you.
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
 | [Writing a worker (server mode)](docs/WRITING_A_WORKER.md) | the lease-based worker protocol behind `ferryman-server` |
 | [Engine setup](docs/ENGINE_SETUP.md) | pointing the worker at Claude Code, OpenCode, Codex or anything else — including API keys via `credentials.json` |
+| [Dashboard team and agent access](docs/DASHBOARD_TEAM_ACCESS_MODEL.md) | how the dashboard models human teammates vs agents; what is enforced today vs previewed |
 | [Getting started](docs/GETTING_STARTED.md) | install → first task walkthrough |
 
 ## Keeping a fleet on the same build

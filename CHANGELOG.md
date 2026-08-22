@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added - dashboard team model and invitation prototype (`codex/novice-dashboard-ux`)
+
+- **Dashboard redesigned around human teams and agents.** A new home and
+  install experience separates human teammates from AI agents throughout,
+  backed by a real `GET /api/team` endpoint that reads the roster and master
+  declaration and never invents ownership. Install and access controls are an
+  honest policy preview: without enforcement behind them they save drafts and
+  say so rather than claiming authority changed.
+- **Teammate invitation onboarding, prototyped.** Owner-side invite composition
+  and a recipient flow, both non-mutating pending signed invitation
+  enforcement. The product model and remaining backend contract are in
+  `docs/DASHBOARD_TEAM_ACCESS_MODEL.md` and
+  `docs/TEAM_INVITATION_ONBOARDING_PROPOSAL.md`; design QA is filed under
+  `docs/reviews/`.
+- Demo state is client-side only (`?demo=team`) and never touches live APIs.
+
 ### Added - the setup knows before the first task does
 
 - **`ferry doctor`.** One read-only command that answers "will this machine

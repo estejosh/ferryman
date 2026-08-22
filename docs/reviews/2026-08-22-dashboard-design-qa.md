@@ -1,5 +1,9 @@
 # Ferryman dashboard design QA
 
+> QA record for the `codex/novice-dashboard-ux` redesign and invitation
+> prototype, filed here per the reviews convention. Screenshot paths are on the
+> reviewing machine and are kept as provenance, not as links that resolve.
+
 Final result: **passed** — no open P0, P1, or P2 findings.
 
 ## Evidence

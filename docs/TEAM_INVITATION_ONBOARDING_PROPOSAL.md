@@ -82,12 +82,19 @@ after verification completes.
 ferry team invite create --email alex@example.com --role reviewer --project ferryman --expires 7d
 ferry team invite inspect <code-or-url> --json
 ferry team invite accept <code-or-url>
-ferry setup doctor --project ferryman --json
+ferry doctor --workspace /path/to/ferryman --json
 ferry team invite revoke <invitation-id>
 ```
 
 Every command should support structured JSON output so the dashboard can show
 progress without parsing prose.
+
+> **Shipped since this proposal was drafted:** the readiness check exists as
+> `ferry doctor` (not `ferry setup doctor --project`). It verifies channel,
+> agent config, engine on PATH, signing key, roster, credentials-file presence,
+> and Syncthing, supports `--json`, and exits non-zero when not ready. The
+> invitation flow should call it rather than propose a second readiness
+> command; per-project selection can reuse `--workspace`.
 
 ## Proposed dashboard API
 
@@ -106,8 +113,9 @@ email directory, tokens, or secrets.
 
 1. Persist signed invitation records and implement create, inspect, revoke, and
    atomic acceptance.
-2. Add `ferry setup doctor --json` with OS, CLI, Syncthing, folder, roster, and
-   dashboard checks.
+2. Wire the invitation preflight to the shipped `ferry doctor --json` (channel,
+   CLI, Syncthing, folder, and roster checks are already covered by it) and add
+   whatever invitation-specific checks remain.
 3. Connect the existing dashboard proposal to the invitation endpoints.
 4. Add platform installers that always preview commands and require consent.
 5. Add verification, audit events, expiry cleanup, resend, and recovery states.
