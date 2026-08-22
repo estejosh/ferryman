@@ -51,14 +51,18 @@ Install Ferryman on this project and join it to my fleet.
      - license.over_limit — if true, tell me what it says under "exceeded".
 
 4. Start the worker:
-     ferry agent run
+      ferry agent run
    It runs until stopped. If a task appears it will run my agent CLI on it. If the
    configured command is missing, edit .ferryman/agent.toml and point "command" at an
-   agent CLI that exists on this machine, then start it again.
+   agent CLI that exists on this machine, then start it again. Before that first
+   run, check readiness with:
+      ferry doctor
+   Every required check passing means the machine can claim and run work; each
+   failing check states its own fix.
 
 5. Confirm it is healthy and stop:
-     ferry channel status
-     ferry channel tasks
+      ferry channel status
+      ferry channel tasks
 
 Rules:
 - Do not commit anything to my repository. Ferryman writes only inside .ferryman/.

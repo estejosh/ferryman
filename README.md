@@ -188,8 +188,9 @@ so this one is on you.
 | [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
 | [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
-| [Writing a worker](docs/WRITING_A_WORKER.md) | the worker protocol |
-| [Getting started](docs/GETTING_STARTED.md) | the guided walkthrough |
+| [Writing a worker (server mode)](docs/WRITING_A_WORKER.md) | the lease-based worker protocol behind `ferryman-server` |
+| [Engine setup](docs/ENGINE_SETUP.md) | pointing the worker at Claude Code, OpenCode, Codex or anything else — including API keys via `credentials.json` |
+| [Getting started](docs/GETTING_STARTED.md) | install → first task walkthrough |
 
 ## Keeping a fleet on the same build
 

@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod console;
+pub mod doctor;
 pub mod enable;
 pub mod eval;
 pub mod governor;

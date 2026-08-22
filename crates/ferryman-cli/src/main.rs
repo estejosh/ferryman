@@ -185,6 +185,21 @@ enum Command {
         #[arg(long)]
         dashboard_operator: Option<String>,
     },
+    /// Check whether this machine is ready to run a task, before one fails.
+    ///
+    /// Reads only: the channel, `agent.toml`, the signing key's presence, the
+    /// roster, whether the engine resolves on PATH, and whether Syncthing
+    /// answers. Never prints credential contents. Every failing check states
+    /// its remedy, because the CLI knows the answer and should not make you
+    /// discover it. Exit code 0 when every required check passes.
+    Doctor {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Emit one JSON object instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop this machine taking on new work, until you resume it.
     ///
     /// Affects every project on this computer, not just this one, because "stop working
@@ -1553,6 +1568,40 @@ async fn run(cli: Cli) -> Result<()> {
                 report_enable_human(&outcome, dashboard.as_ref());
             }
         }
+        Command::Doctor { workspace, json } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let report = ferryman_ops::doctor::examine(&start);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                for check in &report.checks {
+                    // Informational checks are marked as such rather than as
+                    // failures: a machine without Syncthing still works locally.
+                    let mark = match (check.ok, check.required) {
+                        (true, _) => "ok",
+                        (false, true) => "FIX",
+                        (false, false) => "note",
+                    };
+                    println!("  {mark:<4} {:<17} {}", check.name, check.detail);
+                }
+                if report.ready {
+                    println!("\nready: this machine can claim and run tasks");
+                    println!("  next: ferry agent run        # does work");
+                    println!("        ferry agent review     # judges results");
+                } else {
+                    println!(
+                        "\nnot ready: fix the checks marked FIX above, then run \
+                         'ferry doctor' again"
+                    );
+                }
+            }
+            if !report.ready {
+                bail!("readiness checks failed");
+            }
+        }
         Command::Pause { reason } => {
             let Some(path) = ferryman_ops::governor::pause_marker() else {
                 bail!("this machine has no per-user directory, so a pause cannot be recorded")
@@ -2340,6 +2389,10 @@ fn report_enable_json(
             "channel": outcome.route.communications.display().to_string(),
             "syncthing": outcome.syncthing,
             "agent_command": outcome.config.command,
+            "agent_args": outcome.config.args,
+            // Checked now rather than discovered at first-task time: a missing
+            // engine is the most common reason a fresh setup does nothing.
+            "command_found": outcome.command_found,
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
             "already_configured": outcome.steps.iter().all(|s| !s.created),
@@ -2391,7 +2444,19 @@ fn report_enable_human(outcome: &enable::Outcome, dashboard: Option<&DashboardOu
     }
     println!();
     println!("  agent      {}", outcome.agent);
-    println!("  runs       {}", outcome.config.command);
+    println!(
+        "  runs       {} {}",
+        outcome.config.command,
+        outcome.config.args.join(" ")
+    );
+    if !outcome.command_found {
+        println!(
+            "  WARNING    '{}' is not on this machine's PATH - tasks would fail to \
+             start. Install it, or edit command/args in .ferryman/agent.toml \
+             (see docs/ENGINE_SETUP.md). Run 'ferry doctor' after fixing.",
+            outcome.config.command
+        );
+    }
     println!("  review     {}", outcome.config.review.as_str());
     println!("  public key {}", outcome.public_key);
     match dashboard {

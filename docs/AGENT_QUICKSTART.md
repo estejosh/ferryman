@@ -103,7 +103,7 @@ Useful flags, all optional:
 | `--project` | the directory name | The directory is named something unhelpful |
 | `--agent` | this machine's name | Several agents on one machine |
 | `--role` | `worker` | This one hands out and reviews work: use `orchestrator` |
-| `--command` | `claude` | You run a different agent CLI |
+| `--command` | `claude` | You run a different agent CLI; known engines (`opencode`, `codex`, …) get their correct non-interactive args written automatically — see [ENGINE_SETUP.md](ENGINE_SETUP.md) |
 | `--email` | *(required)* | No default is possible; ask your human |
 | `--review` | `confirm` | See the risk section below |
 | `--dashboard` | off | Mark that the human wants the web dashboard (`ferry dashboard`) to approve work from a browser |
@@ -111,6 +111,18 @@ Useful flags, all optional:
 
 Exit code is 0 on success, non-zero with a message on stderr otherwise. It never
 prompts, never opens an editor, and never waits on a terminal.
+
+Right after enabling, run:
+
+```sh
+ferry doctor
+```
+
+It checks what the first task would otherwise discover the hard way: the config
+parses, the engine resolves on PATH, the signing key and roster entry exist,
+Syncthing answers. Every failing check states its remedy. A missing engine is
+the single most common failed first task — enable warns about it in its output,
+and doctor confirms the fix worked.
 
 The dashboard operator's password is **never handled by an agent**. `enable` does
 not accept one, and you must not type one into a flag, an environment variable, or a
@@ -294,5 +306,7 @@ usually a missing `--agent`.
 | `run 'ferry enable' in this project first` | Channel exists, agent config does not | `ferry enable` again; it is idempotent |
 | `order UnknownSigner` | Signed by a name not in the roster | Pass `--agent <your enabled name>` |
 | reviewer does nothing | It is the same agent that did the work | Run the reviewer under a different name |
-| `'claude' ... is it installed and on PATH?` | The configured agent CLI is missing | Install it, or change `command` in `.ferryman/agent.toml` |
+| `'claude' ... is it installed and on PATH?` | The configured agent CLI is missing | Install it, or change `command` in `.ferryman/agent.toml`; `ferry doctor` confirms |
+| engine killed as frozen, or "Execution error" | It is waiting for a permission prompt nobody can answer | Use the engine's non-interactive/auto-approve contract — [ENGINE_SETUP.md](ENGINE_SETUP.md) |
+| authentication errors on every task | The API key was scrubbed from the worker's environment | List it in `.ferryman/credentials.json` — [ENGINE_SETUP.md](ENGINE_SETUP.md) |
 | work sits in `AwaitingReview` forever | `review = "confirm"` and nobody settled it | `ferry agent pending`, then `ferry channel review` |
