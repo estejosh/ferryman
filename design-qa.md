@@ -65,3 +65,36 @@ Final result: **passed** — no open P0, P1, or P2 findings.
 ## Residual product boundary
 
 The interface is an honest policy preview. Signed ownership grants, business-agent installation, and runtime authorization enforcement are not implemented by this branch; production controls save or explain drafts instead of claiming authority changed. That backend contract is documented in `docs/DASHBOARD_TEAM_ACCESS_MODEL.md` and must be implemented before these controls become authoritative.
+
+## Recipient-bound Vault extension
+
+final result: passed
+
+- Design-system source: `ferryman-dashboard-build-home-final2.png` (1425 x
+  1013 captured content).
+- Vault overview: `ferryman-vault-overview-final.png` (1440 x 1024).
+- Owner grant review: `ferryman-vault-grant-review-final.png` (1440 x 1024).
+- Recipient acceptance: `ferryman-vault-recipient-final.png` (1440 x 1024).
+- Narrow recipient state: `ferryman-vault-mobile-final.png` (685 x 881 captured
+  viewport content at a 700 x 900 browser viewport).
+- Combined source/implementation inspection:
+  `qa-vault-dashboard-side-by-side.png` (2865 x 1024). All files are in
+  `C:\Users\oshha\.codex\visualizations\2026\08\22\01a029f0-296f-7843-96c6-716bdea2f3f5`.
+- The Vault preserves the selected dashboard shell, navy surfaces, compact
+  navigation, border density, blue primary hierarchy, yellow proposal warning,
+  green verified boundary, typography, spacing, and right-hand review pattern.
+- The overview makes the novice mental model explicit: three encrypted key
+  records, active-grant count, one-recipient rule, value-hidden metadata, and a
+  direct Assign key action.
+- The full interaction was exercised: choose recipient, switch duration,
+  prepare, send, preview recipient, accept, list the active grant, revoke, and
+  verify send/accept/revoke audit entries. The delivery entry remained singular
+  after the duplicate-event guard was added.
+- At 700 x 900, document `scrollWidth`, `clientWidth`, and `bodyScrollWidth`
+  were all 685 pixels. Navigation, recipient checks, policy cells, transport
+  route, review details, and action buttons stack without horizontal overflow.
+- Browser warning and error logs were empty at desktop and after the full
+  interaction sequence.
+- No actual secret is requested or stored. All displayed key suffixes, grant
+  identifiers, delivery receipts, and people are synthetic demo metadata.
+- No open P0, P1, or P2 findings remain.

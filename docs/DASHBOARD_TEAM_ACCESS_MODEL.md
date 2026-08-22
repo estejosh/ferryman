@@ -73,6 +73,10 @@ auditable.
   state and request/approval controls.
 - **Install agent**: ownership, lifecycle, audience, permissions, placement, and
   review summary before installation.
+- **Vault**: owner-controlled encrypted-key metadata, one-human assignment,
+  repository and purpose scope, recipient acceptance, use-only status,
+  revocation, and secret audit history. The cryptographic and broker contract is
+  in `docs/RECIPIENT_BOUND_SECRET_TRANSPORT_PROPOSAL.md`.
 - **Inbox**: human mentions, access requests, reviews, and agent blockers.
 - **Audit**: requester, approver, scopes, duration, expiry, revocation, and agent
   use.
@@ -84,3 +88,9 @@ that a visual badge is enforcement. The channel/runtime must verify an active
 grant before accepting a message, task assignment, or handoff to an agent owned
 by another human. Business-wide access must resolve from a signed business
 policy. Unknown, expired, revoked, or unverifiable grants fail closed.
+
+Secret grants are a separate authority type from agent grants. The runtime must
+verify the human recipient, encryption key id, repository, approved agent,
+purpose, grant version, expiry, replay state, and current revocation before each
+use-only broker operation. Possessing or being allowed to use an agent never
+implies access to its owner's keys.
