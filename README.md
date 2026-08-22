@@ -190,6 +190,8 @@ so this one is on you.
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
 | [Writing a worker](docs/WRITING_A_WORKER.md) | the worker protocol |
 | [Getting started](docs/GETTING_STARTED.md) | the guided walkthrough |
+| [A+++++ implementation plan](docs/A_PLUS_PLUS_PLUS_PLUS_IMPLEMENTATION_PLAN.md) | sequenced trust, reliability, and release gates |
+| [Fleet trust and readiness proposal](docs/FLEET_TRUST_AND_READINESS_PROPOSAL.md) | Health Center, proof, repair, and offboarding contracts |
 
 ## Keeping a fleet on the same build
 
