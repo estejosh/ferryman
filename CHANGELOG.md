@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+### Added - the setup knows before the first task does
+
+- **`ferry doctor`.** One read-only command that answers "will this machine
+  actually run a task?" before one fails trying: channel discovered, `agent.toml`
+  parses, the engine resolves on PATH, signing key and roster entry exist,
+  Syncthing reachable, credentials file present (never its contents). Every
+  failing check states its remedy. `--json` for a calling program; exit 1 when
+  not ready.
+- **Engine-aware worker args.** `ferry enable --command opencode` now writes
+  OpenCode's real non-interactive contract (`run --auto {prompt}`) instead of
+  Claude Code's `-p`, which failed on every task for every OpenCode operator;
+  `codex` gets `exec --full-auto` as its config already documented. Claude and
+  unknown engines keep the historical args, and Claude's permission grant is
+  still yours to add — never written in uninvited.
+- **Enable reports engine presence.** Human output warns when the configured
+  engine is missing from PATH; `--json` gains `agent_args` and `command_found`,
+  so an agent caller can react without parsing prose.
+
+### Fixed
+
+- `settle_worktree` tripped `clippy::too_many_arguments` under
+  `-D warnings` with the pinned toolchain, failing `cargo clippy --workspace`
+  locally on an unchanged tree. Allowed explicitly, with the reasoning inline.
+
 ## 0.4.1
 
 A fleet is a mixed fleet. Everything here was found by running 0.4.0 across Windows,

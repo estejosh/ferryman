@@ -71,6 +71,15 @@ pub struct Outcome {
     pub route: ProjectRoute,
     pub public_key: String,
     pub config: AgentConfig,
+    /// Whether the configured engine resolves on this machine's PATH right now.
+    ///
+    /// Checked at enable time because a missing engine is the most common
+    /// first-task failure and the current failure mode - the loop claiming a
+    /// task, failing to start the command, and reporting it only then - wastes
+    /// the operator's time in exactly the way setup exists to prevent. Not an
+    /// error: the engine may legitimately be installed after enabling, on
+    /// another machine of the fleet, or inside the sandbox image.
+    pub command_found: bool,
     pub steps: Vec<Step>,
 }
 
@@ -259,7 +268,10 @@ pub fn perform(request: Request) -> Result<Outcome> {
                 &agent_name,
                 &request.role,
                 &request.command,
-                &["-p".to_string(), "{prompt}".to_string()],
+                // Chosen from the engine named, not one shape for everyone: a
+                // worker pointed at OpenCode must be started as `opencode run`
+                // or it fails on every task. See [`AgentConfig::default_args`].
+                &AgentConfig::default_args(&request.command),
                 review,
                 request.sandbox.as_deref(),
                 request.worktree,
@@ -397,8 +409,68 @@ pub fn perform(request: Request) -> Result<Outcome> {
         route,
         public_key: identity.public_key_hex(),
         config: loaded,
+        command_found: crate::doctor::find_on_path(&request.command).is_some(),
         steps,
     })
+}
+
+/// Keep this test binary's machine state out of the developer's home.
+///
+/// `cfg(test)` is per crate, so a dependent crate's tests link ferryman-channel
+/// compiled without it - which is how the suite came to write real signing keys into
+/// ~/.local/state. First call wins, so every test here shares one temporary machine.
+#[cfg(test)]
+fn hermetic_machine() {
+    let dir = std::env::temp_dir().join(format!(
+        "ferryman-test-machine-{}-{}",
+        env!("CARGO_CRATE_NAME"),
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    ferryman_channel::licensing::use_machine_state_dir_per_thread(dir);
+}
+
+/// A real enabled project for other test modules in this crate.
+///
+/// Doctor's checks need something enabled to examine, and its own module should
+/// not have to restate the request shape. Uses the same hermetic machine state
+/// as the tests above; first call wins, which is fine because every caller wants
+/// the same isolation.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    /// Enable a project in a fresh temporary directory whose engine is
+    /// `command`, and return the workspace path.
+    pub(crate) fn enabled_project(command: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ferryman-enable-support-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        hermetic_machine();
+        perform(Request {
+            workspace: Some(dir.clone()),
+            project: Some("demo".into()),
+            agent: Some("tester".into()),
+            role: "worker".into(),
+            email: "tester@example.com".into(),
+            no_syncthing: true,
+            share_with: vec![],
+            command: command.into(),
+            review: "confirm".into(),
+            as_json: false,
+            master: false,
+            sandbox: None,
+            worktree: false,
+        })
+        .unwrap();
+        dir
+    }
 }
 
 #[cfg(test)]
@@ -590,6 +662,60 @@ mod tests {
         // An unattended caller cannot rename someone's project directory.
         assert_eq!(slug("My Project (v2)!"), "my-project--v2");
         assert_eq!(slug("  trailing--  "), "trailing");
+    }
+
+    /// Enable must write the arg contract of the engine it was pointed at, not
+    /// Claude's args with a different command name in front of them.
+    #[test]
+    fn the_written_args_match_the_engine_named() {
+        let dir = tempdir();
+        perform(Request {
+            workspace: Some(dir.clone()),
+            project: Some("demo".into()),
+            agent: Some("tester".into()),
+            role: "worker".into(),
+            email: "tester@example.com".into(),
+            no_syncthing: true,
+            share_with: vec![],
+            command: "opencode".into(),
+            review: "confirm".into(),
+            as_json: false,
+            master: false,
+            sandbox: None,
+            worktree: false,
+        })
+        .unwrap();
+        let config = fs::read_to_string(AgentConfig::path(&dir.join(".ferryman"))).unwrap();
+        assert!(
+            config.contains(r#"args = ["run","--auto","{prompt}"]"#),
+            "an opencode worker must be started as 'opencode run', got:\n{config}"
+        );
+    }
+
+    /// A missing engine is discovered at enable time, not at first-task time.
+    #[test]
+    fn a_missing_engine_is_reported_at_enable_time_not_at_first_task_time() {
+        let dir = tempdir();
+        let outcome = perform(Request {
+            workspace: Some(dir),
+            project: Some("demo".into()),
+            agent: Some("tester".into()),
+            role: "worker".into(),
+            email: "tester@example.com".into(),
+            no_syncthing: true,
+            share_with: vec![],
+            command: "definitely-not-an-engine-9x7".into(),
+            review: "confirm".into(),
+            as_json: false,
+            master: false,
+            sandbox: None,
+            worktree: false,
+        })
+        .unwrap();
+        assert!(
+            !outcome.command_found,
+            "enable must admit when the engine is not on this machine"
+        );
     }
 
     fn tempdir() -> PathBuf {

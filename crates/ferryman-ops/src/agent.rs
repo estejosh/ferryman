@@ -259,6 +259,53 @@ impl AgentConfig {
         attachment.join("agent.toml")
     }
 
+    /// The args `ferry enable` writes for a fresh `agent.toml`, chosen from the
+    /// engine named by `--command`.
+    ///
+    /// # Why this cannot be one shape for every engine
+    ///
+    /// The default was `["-p","{prompt}"]` for every command, which is Claude Code's
+    /// non-interactive contract and nobody else's. Pointed at OpenCode it produced a
+    /// worker that failed on every task: OpenCode's non-interactive form is
+    /// `opencode run [message..]`, and `-p` is not a flag it accepts. The failure
+    /// surfaced only mid-task, on a machine that had already been told everything was
+    /// ready - the most expensive possible moment to learn the args were wrong.
+    ///
+    /// Only engines whose contract this repository can state with confidence are
+    /// listed. An unrecognised command falls back to the historical default rather
+    /// than guessing, and `ferry enable` warns when it does, so the operator learns
+    /// at setup time that the args need a look. The map is matched on the command's
+    /// file name, so `/usr/local/bin/opencode` resolves the same as `opencode`.
+    ///
+    /// Note what these args deliberately are: a *working* headless contract, which
+    /// for engines that gate tools behind approval means granting it (`--auto`,
+    /// `--full-auto`). That is a real grant of authority, made explicit by the
+    /// operator choosing the engine and explained in the generated file's comments -
+    /// never added silently for an engine the caller did not name.
+    #[must_use]
+    pub fn default_args(command: &str) -> Vec<String> {
+        let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let name = if suffix.is_empty() {
+            name
+        } else {
+            name.strip_suffix(suffix).unwrap_or(name)
+        };
+        match name.to_ascii_lowercase().as_str() {
+            // Verified against OpenCode's published CLI reference: `run` takes the
+            // prompt positionally, `--auto` approves permissions that are not
+            // explicitly denied, which a headless worker needs or nothing runs.
+            "opencode" => vec!["run".into(), "--auto".into(), "{prompt}".into()],
+            // The contract the generated config has documented all along.
+            "codex" => vec!["exec".into(), "--full-auto".into(), "{prompt}".into()],
+            // Claude Code, and anything unrecognised. The permission flag Claude
+            // needs to actually work is NOT added here: it is a large grant, the
+            // generated comment spells it out, and adding it uninvited would hand
+            // every new worker more authority than its operator chose.
+            _ => vec!["-p".into(), "{prompt}".into()],
+        }
+    }
+
     /// The file written by `ferry enable`.
     ///
     /// Parsed by hand in the same flat `key = "value"` shape as `bridge.toml`, which
@@ -434,7 +481,12 @@ role = "{role}"
 # So whichever engine you use, find its non-interactive flag and put it here:
 #
 #   claude   args = ["-p","--dangerously-skip-permissions","{{prompt}}"]
+#   opencode args = ["run","--auto","{{prompt}}"]
 #   codex    args = ["exec","--full-auto","{{prompt}}"]
+#
+# 'ferry enable' already picked the right shape for a known engine from
+# --command. Claude keeps the plain -p form above: adding its permission flag
+# is YOUR choice. If you change engines later, change these args to match.
 #
 # That is a real grant, not a formality. The engine then reads, writes and runs
 # commands in the workspace with this user's full privileges and nothing in the way -
@@ -2367,6 +2419,11 @@ async fn do_work(
 /// returns `Ok(true)` when the branch carries anything not reachable from `base`.
 /// So the push happens after the worktree is retired, which makes a kept branch
 /// always a pushed branch. A branch with no work is retired without a push.
+//
+// Nine arguments, each load-bearing: splitting them into a struct would move
+// every call site for style alone. Allowed explicitly rather than by raising
+// the global threshold.
+#[allow(clippy::too_many_arguments)]
 fn settle_worktree(
     route: &ProjectRoute,
     config: &AgentConfig,
@@ -3906,5 +3963,63 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&repo);
+    }
+}
+
+#[cfg(test)]
+mod default_args_tests {
+    use super::*;
+
+    /// The whole reason this function exists: OpenCode's non-interactive form is
+    /// `opencode run`, and the one-size `["-p","{prompt}"]` default failed on
+    /// every task for every OpenCode operator.
+    #[test]
+    fn opencode_gets_its_own_contract() {
+        assert_eq!(
+            AgentConfig::default_args("opencode"),
+            vec![
+                "run".to_string(),
+                "--auto".to_string(),
+                "{prompt}".to_string()
+            ]
+        );
+        // An absolute path or .exe spelling names the same engine.
+        assert_eq!(
+            AgentConfig::default_args("/usr/local/bin/opencode"),
+            AgentConfig::default_args("opencode")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            AgentConfig::default_args("C:\\tools\\OpenCode.EXE"),
+            AgentConfig::default_args("opencode")
+        );
+    }
+
+    #[test]
+    fn codex_gets_the_contract_the_config_already_documented() {
+        assert_eq!(
+            AgentConfig::default_args("codex"),
+            vec![
+                "exec".to_string(),
+                "--full-auto".to_string(),
+                "{prompt}".to_string()
+            ]
+        );
+    }
+
+    /// Claude keeps the historical args, and unknown engines fall back to them
+    /// rather than to a guess. In particular the permission-granting flag Claude
+    /// needs in practice must NOT appear here: enable writes it only if the
+    /// operator adds it, because that grant is theirs to make.
+    #[test]
+    fn claude_and_unknown_engines_keep_the_historical_default_without_added_grants() {
+        let historical = vec!["-p".to_string(), "{prompt}".to_string()];
+        assert_eq!(AgentConfig::default_args("claude"), historical);
+        assert_eq!(AgentConfig::default_args("./vendor/engine-x"), historical);
+        assert!(
+            !AgentConfig::default_args("claude")
+                .iter()
+                .any(|a| a.contains("skip"))
+        );
     }
 }
