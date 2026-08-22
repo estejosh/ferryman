@@ -65,6 +65,10 @@ auditable.
   concise activity feed.
 - **Teammates**: human membership, role, presence, invitations, and project
   responsibilities.
+- **Invite teammate**: owner configuration plus the recipient's consent-based
+  Ferry installation, channel connection, local identity creation, and
+  end-to-end verification walkthrough. The proposed backend contract is in
+  `docs/TEAM_INVITATION_ONBOARDING_PROPOSAL.md`.
 - **Agents**: agents grouped by human or business owner, with explicit access
   state and request/approval controls.
 - **Install agent**: ownership, lifecycle, audience, permissions, placement, and

@@ -48,6 +48,20 @@ Focused inspection covered:
 3. Post-fix comparison confirmed that the action bar is visible without weakening the review hierarchy.
 4. Interaction QA found that periodic refresh cleared an open task detail. The renderer now reopens the selected task after refresh; an 11-second browser test confirmed the review action remained available.
 
+## Human invitation proposal extension
+
+Final result: **passed** — no open P0, P1, or P2 findings.
+
+- Design-system source: `ferryman-dashboard-build-home-final2.png` (1425 x 1013 captured content).
+- Owner proposal: `ferryman-invite-owner-viewport.png` (1425 x 1013 captured content).
+- Full owner and recipient states: `ferryman-invite-owner-proposal.png` and `ferryman-invite-recipient-proposal.png`.
+- Combined comparison: `qa-invite-dashboard-side-by-side.png`, normalized to 1440 x 1024.
+- The invite flow preserves the selected dashboard shell, navigation density, typography, navy surfaces, border weight, focus state, blue primary action, yellow proposal warning, green security boundary, and right-hand summary pattern.
+- Owner inputs, role and expiry choices, project scope, permissions, recipient preview, platform switcher, readiness check, copy action, and disabled acceptance boundary were exercised.
+- At 700 x 900, document width was 685 pixels with no horizontal overflow. Cards, setup rows, controls, and status badges stack without collisions.
+- Initial QA found oversized native checkboxes caused by the general form width rule. A scoped 16-pixel checkbox rule fixed the issue before the final comparison.
+- Windows platform selection changed the proposed command to `winget install Ferryman.Ferry`; the readiness check changed the first step to `Ready on this device`; acceptance remained explicitly blocked pending signed invitation enforcement.
+
 ## Residual product boundary
 
 The interface is an honest policy preview. Signed ownership grants, business-agent installation, and runtime authorization enforcement are not implemented by this branch; production controls save or explain drafts instead of claiming authority changed. That backend contract is documented in `docs/DASHBOARD_TEAM_ACCESS_MODEL.md` and must be implemented before these controls become authoritative.
