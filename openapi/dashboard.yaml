@@ -87,6 +87,16 @@ paths:
       responses:
         '200': {description: operator name, content: {application/json: {schema: {type: object, properties: {name: {type: string}}}}}}
         '401': {description: no active session}
+  /api/team:
+    get:
+      summary: Human teammates and machine agents, returned as separate identity classes
+      description: >
+        Combines locally available operator identities with remote operator entries from
+        the signed channel roster. Agent ownership is deliberately null until a signed
+        ownership and access-policy contract exists; clients must not infer authority.
+      responses:
+        '200': {description: current operator, channel master, human teammates, and agents}
+        '401': {description: no active session}
   /api/tasks:
     get:
       summary: Summaries of every task, with signature status
