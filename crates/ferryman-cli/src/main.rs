@@ -3895,17 +3895,32 @@ fn channel(command: Channel) -> Result<()> {
             role,
             dry_run,
         } => {
-            let fleet = ferryman_ops::agent::fleet_under(&comms)?;
-            for (path, why) in &fleet.skipped {
-                println!("  skipping {}: {why}", path.display());
+            // `fleet_under` deliberately excludes a channel whose configured agent has
+            // no key there. That is exactly the state `seat` exists to repair, so using
+            // the fleet's *served* list here made the repair command skip its targets.
+            // Discover routable channels directly; a malformed channel is still named
+            // and skipped, but a valid channel with no local identity remains eligible.
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&comms)
+                .with_context(|| format!("read {}", comms.display()))?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join(".ferryman").is_dir())
+                .collect();
+            paths.sort();
+            let mut routes = Vec::new();
+            for path in paths {
+                match ferryman_channel::route_for(&path) {
+                    Ok(route) => routes.push(route),
+                    Err(error) => println!("  skipping {}: {error:#}", path.display()),
+                }
             }
-            if fleet.served.is_empty() {
+            if routes.is_empty() {
                 bail!("no Ferryman channels under {}", comms.display());
             }
             // Whose key, resolved once against a channel that has one. Resolving per
             // channel would let a machine seat two different names in one pass.
-            let name = ferryman_ops::identity::resolve(agent, &fleet.served[0].0.attachment)?;
-            let Some(identity) = fleet.served.iter().find_map(|(route, _)| {
+            let name = ferryman_ops::identity::resolve(agent, &routes[0].attachment)?;
+            let Some(identity) = routes.iter().find_map(|route| {
                 ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)
                     .ok()
                     .flatten()
@@ -3920,7 +3935,7 @@ fn channel(command: Channel) -> Result<()> {
             };
             println!("seating '{name}' ({})", identity.public_key_hex());
             let mut seated = 0;
-            for (route, _) in &fleet.served {
+            for route in &routes {
                 let held =
                     ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)?;
                 if held.is_some() {
