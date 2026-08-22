@@ -509,6 +509,7 @@ mod tests {
                 ok: true,
                 prompt_digest: crate::trajectory::digest("prompt"),
                 output: "output".into(),
+                usage: None,
             },
         )
         .unwrap();
@@ -555,6 +556,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let route = route(dir.path());
         assert!(engine_costs(&route).unwrap().is_empty());
+    }
+
+    /// The production write path: the worker records what the engine reported,
+    /// through `record_trajectory`, and the run becomes billable with no other
+    /// wiring. This is the test that fails if the two halves ever drift.
+    #[test]
+    fn a_usage_the_worker_recorded_is_billed() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        crate::trajectory::record_trajectory(
+            &route,
+            &crate::trajectory::Trajectory {
+                order_id: "t-1".into(),
+                agent: "agent".into(),
+                engine: "claude".into(),
+                revision: 1,
+                at: chrono::Utc::now(),
+                ok: true,
+                prompt_digest: crate::trajectory::digest("prompt"),
+                output: "output".into(),
+                usage: Some(crate::trajectory::TokenUsage {
+                    prompt_tokens: 1000,
+                    completion_tokens: 200,
+                }),
+            },
+        )
+        .unwrap();
+
+        let costs = engine_costs(&route).unwrap();
+        assert_eq!(costs.len(), 1);
+        assert_eq!(costs[0].engine, "claude");
+        assert_eq!(costs[0].runs, 1);
+        assert_eq!(costs[0].prompt_tokens, 1000);
+        assert_eq!(costs[0].completion_tokens, 200);
+        // claude list price applied to real recorded counts, not zeros.
+        assert!(costs[0].estimated_cost_usd > 0.0);
     }
 
     #[test]

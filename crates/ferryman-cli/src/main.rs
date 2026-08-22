@@ -1226,6 +1226,18 @@ enum Agent {
         #[arg(long)]
         json: bool,
     },
+    /// Why this machine is (or is not) working right now.
+    ///
+    /// Doctor proves the setup; this reads the loop: is the worker process
+    /// alive, what does it hold, and - when nothing is happening - the same
+    /// decision the poll makes, with the setting that causes it. Read-only.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Emit one JSON object instead of prose.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -3006,6 +3018,62 @@ async fn agent_command(command: Agent) -> Result<()> {
                     println!("      {}", r.reasoning);
                 }
                 println!("settle with: ferry channel review --accept <id>   (or --notes \"...\")");
+            }
+        }
+        Agent::Status { workspace, json } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let status = ferryman_ops::status::examine(&start)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            println!(
+                "project {} · agent {} · runs '{}'",
+                status.project, status.agent, status.engine
+            );
+            println!(
+                "  worker     {}",
+                if status.worker_alive {
+                    "running".to_string()
+                } else {
+                    "not running - start with 'ferry agent run'".to_string()
+                }
+            );
+            match &status.current_task {
+                Some(task) => {
+                    let beat = match task.heartbeat_age_secs {
+                        Some(secs) => format!("heartbeat {secs}s ago"),
+                        None => "no heartbeat yet".to_string(),
+                    };
+                    println!("  working    {} ({beat})", task.order_id);
+                }
+                None => println!("  working    nothing held right now"),
+            }
+            if let Some(reason) = &status.claim_blocked_reason {
+                println!("  new work   waiting: {reason}");
+            } else {
+                println!("  new work   ready to claim");
+            }
+            if let Some(window) = &status.claim_window {
+                println!("  hours      {window}");
+            }
+            println!(
+                "  memory     {} MB available / keeps {} MB free",
+                status
+                    .memory_available_mb
+                    .map(|mb| mb.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                status.min_free_ram_mb
+            );
+            if !status.engine_on_path {
+                println!(
+                    "  WARNING    '{}' is not on PATH - tasks would fail to start; \
+                     run 'ferry doctor' for the fix",
+                    status.engine
+                );
             }
         }
     }

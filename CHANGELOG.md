@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Added - the loop and the bill become observable
+
+- **`ferry agent status`.** The one command for "why is nothing happening":
+  whether the worker process is alive, which task it holds with heartbeat age,
+  and the exact claim-gate decision the poll acts on - paused, outside working
+  hours, someone typing, memory floor - naming the `agent.toml` setting that
+  causes it. `--json` for callers.
+- **Recorded engine usage makes cost real where engines report it.** Workers
+  now parse the token counts an engine prints (Claude Code's JSON result, JSONL
+  streams restating cumulative totals), record them in the trajectory and the
+  signed result, and `ferry cost project` bills from recorded numbers instead
+  of reading structurally zero. Engines that print nothing stay an honest zero.
+- **ADR 0013: agent access grants are renewable leases.** The semantics behind
+  the dashboard team-access and secret-transport proposals: authority is a
+  short-lived signed lease renewed by its owner, so revocation means "stop
+  renewing" and an offline machine expires out of authority at a known horizon
+  instead of holding a durable capability until a revocation file arrives.
+  THREAT_MODEL states the same rule.
+
 ### Added - the setup knows before the first task does
 
 - **`ferry doctor`.** One read-only command that answers "will this machine
