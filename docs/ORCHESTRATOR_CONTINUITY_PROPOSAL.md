@@ -49,6 +49,30 @@ For every accepted user request, the dashboard and channel must eventually show 
 
 “Claimed forever with no next action” is not an allowed continuity state.
 
+Continuity also means continuity of understanding, not merely moving the task ID. Before a
+substitute can act, Ferryman must give it the relevant, verified project and task memory and record
+which memory it actually loaded. A substitute that starts from only the original prompt is not a
+successful failover.
+
+## Current memory boundary
+
+Ferryman already retains useful recovery material, but the channel worker does not yet assemble it
+into a guaranteed handoff:
+
+- the synced project memory bank can be reviewed manually with `ferry loadmem`;
+- each agent's signed specialization profile is automatically injected into that same agent's
+  prompts, and verified peer summaries are supplied as attributed routing hints;
+- Telegram supplies recent signed conversation turns to the orchestrator brief;
+- task results and review notes are replayed when a revision is requested;
+- trajectories retain a prompt digest and bounded engine output for review; and
+- server mode has append-only project memory and encrypted recovery packs, but recovery produces a
+  briefing and deliberately does not resume or dispatch channel work.
+
+These are strong storage primitives, not yet an automatic “replacement actor knows what the
+primary knew” contract. In particular, the normal channel worker does not automatically load the
+shared project memory files for every task. Agent-specific memory also must not be relabelled as the
+substitute's own memory.
+
 ## Permission model
 
 Failover changes who may be selected; it does not broaden what that identity may do.
@@ -174,7 +198,36 @@ the unexpired fenced lease.
 - **Primary returns:** it takes only new work after healthy-check hysteresis. The substitute finishes
   work already leased to it.
 
-### 5. Telegram and request routing
+### 5. Verified continuity context
+
+Every failover lease references a signed `ContinuityContextManifest`. It is a provenance manifest,
+not a copy of credentials and not an agent's private chain of thought. It contains hashes and bounded,
+permission-filtered excerpts or summaries of:
+
+1. the immutable order and relevant signed conversation turns;
+2. the current task state, results, reviews, steering, failure evidence, and remaining work;
+3. accepted shared project memory selected for this task;
+4. verified agent profiles, kept attributed to their authors rather than inherited as the
+   substitute's identity;
+5. the last safe branch, commit, artifact, or worktree checkpoint;
+6. applicable project decisions, policies, approvals, grants, and expiry times; and
+7. unresolved assumptions, risks, side effects, and human decisions.
+
+Ferryman retrieves this context before either proposal or execution mode, injects it with source and
+trust labels, and records its manifest digest in the substitute's proposal/result. The substitute
+must acknowledge the manifest and state which items it used. Missing, stale, unverifiable, or
+permission-inaccessible required context blocks automatic execution and falls back to an explicitly
+incomplete proposal.
+
+Memory is updated after the work as well as read before it. Accepted decisions and durable project
+facts become signed, provenance-bearing memory candidates; they enter shared project memory only
+under the project's existing approval policy. Raw model chatter, hidden reasoning, credentials,
+unaccepted guesses, and unrelated repository content do not become durable memory.
+
+The primary loads the resulting context manifest and accepted memory updates when it returns. This
+makes failback another verified handoff rather than a reset to the primary's pre-outage view.
+
+### 6. Telegram and request routing
 
 Replace the single effective `[orchestrator]` destination with a continuity service resolved from
 the signed policy. Telegram still files one immutable request, but the current lease holder receives
@@ -185,7 +238,7 @@ it. The sender sees an immediate status update such as:
 
 The request origin remains attached so the final result returns to the correct topic.
 
-### 6. Dashboard
+### 7. Dashboard
 
 Add a **Continuity** panel to Team/Health:
 
@@ -194,6 +247,7 @@ Add a **Continuity** panel to Team/Health:
 - eligible agents grouped as execution, proposal-only, awaiting permission, unavailable;
 - human owner, business/shared status, engine/model, cost policy, and lease expiry per agent;
 - active failover term, selected agent, work phase, and why it was selected;
+- memory readiness, context-manifest digest, sources loaded, and any missing or rejected source;
 - immediate failover/failback notifications and an immutable event timeline;
 - controls to opt an agent in, prefer a business agent, pause continuity, or require approval for a
   work class;
@@ -209,14 +263,17 @@ The design must land in protocol and runtime code, with the dashboard as a view/
 
 1. `ferryman-channel`
    - add signed `ContinuityPolicy`, `AgentAvailability`, `AttemptFailure`,
-     `ContinuityLease`, and `ContinuityProposal` records;
+     `ContinuityLease`, `ContinuityContextManifest`, and `ContinuityProposal` records;
    - calculate effective availability, eligibility, election, lease term, and task state;
+   - retrieve permission-filtered task/project memory with source hashes and trust labels;
    - make proposal records non-terminal and dependency-neutral;
    - validate signatures, expiry, owner consent, grants, and fencing terms.
 2. `ferryman-ops`
    - replace the in-memory, untyped terminal retry outcome with persisted attempt evidence;
    - let a worker release its own claim only for a failover-eligible, pre-execution failure;
    - run elected proposal mode in a restricted prompt/tool envelope;
+   - require and acknowledge the continuity context before a substitute acts;
+   - submit accepted durable facts as provenance-bearing memory candidates after the task;
    - check grants, secrets, cost, lease term, and task phase again at point of use.
 3. `ferryman-cli`
    - add `ferry continuity status`, `policy`, `opt-in`, `pause`, and `test` commands;
@@ -240,6 +297,13 @@ The feature is not complete until automated tests prove:
 - unknown failure produces at most one proposal and no second executor;
 - proposal-only work cannot finish a task, satisfy a dependency, use an ungranted secret, or mutate
   a repository;
+- a substitute receives the relevant shared memory, signed conversation, task/review history, and
+  safe checkpoint, and its output records the exact context-manifest digest;
+- agent-specific memory stays attributed to its original agent and is never silently inherited;
+- inaccessible, stale, or invalid required memory blocks execution rather than being omitted;
+- secrets, hidden reasoning, unrelated project memory, and unaccepted guesses never enter a
+  continuity context or durable shared memory;
+- accepted substitute decisions are available to the primary on failback;
 - a cross-human agent is ineligible without its owner's active consent lease;
 - permanent business agents work only within their published project/tool/secret scope;
 - engine, repository, tool, secret, and spend checks fail closed at point of use;
@@ -263,28 +327,33 @@ Recommended defaults are included so the implementation can proceed with short a
    repo/tool/secret/spend grant; otherwise create a proposal. Accept?
 4. **Proposal boundary:** A proposal may use only already-readable context, cannot mutate or mark the
    task done, and needs later adoption by an authorized actor. Accept?
-5. **Concurrency:** Select one proposal agent at a time; ask a second only if the first declines,
+5. **Memory:** Require every substitute to load a signed, permission-filtered context manifest and
+   record its digest; block execution if required context is missing. Accept?
+6. **Memory writes:** Put accepted decisions and durable facts into shared memory as signed
+   candidates, while excluding raw reasoning, secrets, and unaccepted guesses. Accept?
+7. **Concurrency:** Select one proposal agent at a time; ask a second only if the first declines,
    times out, or returns blocked. Or should Ferryman ask several agents in parallel?
-6. **Spend:** Failover never increases an agent's existing budget. Should projects also have a hard
+8. **Spend:** Failover never increases an agent's existing budget. Should projects also have a hard
    continuity ceiling per incident and per day; if yes, what amounts?
-7. **Failback:** Require two healthy readiness checks; give the primary new work only and let the
+9. **Failback:** Require two healthy readiness checks; give the primary new work only and let the
    substitute finish its current lease. Accept?
-8. **Notifications:** Notify immediately on failover, permission blockage, and failback, but do not
+10. **Notifications:** Notify immediately on failover, permission blockage, and failback, but do not
    wait for approval when the signed policy already permits the safe action. Accept?
-9. **Scope:** Use a fleet-wide default with a separately signed effective policy per repo/channel;
+11. **Scope:** Use a fleet-wide default with a separately signed effective policy per repo/channel;
    never expose one repo's raw task to an agent that is not seated there. Accept?
 
 ## Recommended delivery order
 
 1. Approve the failure taxonomy, permission boundary, and answers above.
 2. Land renewable/fenced lease semantics and point-of-use authorization prerequisites.
-3. Add persisted availability/failure evidence and proposal records.
-4. Implement proposal-only election first; it is useful and has the smallest authority surface.
-5. Add execution failover for confirmed pre-execution failures.
-6. Move Telegram to the continuity service and add dashboard controls/status.
-7. Run the cross-platform and outage drill before enabling execution failover by default.
+3. Add persisted availability/failure evidence, verified context manifests, and proposal records.
+4. Wire project/task memory retrieval and provenance acknowledgements into every failover prompt.
+5. Implement proposal-only election first; it is useful and has the smallest authority surface.
+6. Add execution failover for confirmed pre-execution failures.
+7. Move Telegram to the continuity service and add dashboard controls/status.
+8. Run the cross-platform, memory-loss, and outage drill before enabling execution failover by
+   default.
 
 Proposal-only continuity can default on for opted-in project agents after its safety tests pass.
 Automatic execution failover should remain opt-in until fenced leases and point-of-use grant checks
 are proven end to end.
-
