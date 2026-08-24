@@ -259,6 +259,53 @@ impl AgentConfig {
         attachment.join("agent.toml")
     }
 
+    /// The args `ferry enable` writes for a fresh `agent.toml`, chosen from the
+    /// engine named by `--command`.
+    ///
+    /// # Why this cannot be one shape for every engine
+    ///
+    /// The default was `["-p","{prompt}"]` for every command, which is Claude Code's
+    /// non-interactive contract and nobody else's. Pointed at OpenCode it produced a
+    /// worker that failed on every task: OpenCode's non-interactive form is
+    /// `opencode run [message..]`, and `-p` is not a flag it accepts. The failure
+    /// surfaced only mid-task, on a machine that had already been told everything was
+    /// ready - the most expensive possible moment to learn the args were wrong.
+    ///
+    /// Only engines whose contract this repository can state with confidence are
+    /// listed. An unrecognised command falls back to the historical default rather
+    /// than guessing, and `ferry enable` warns when it does, so the operator learns
+    /// at setup time that the args need a look. The map is matched on the command's
+    /// file name, so `/usr/local/bin/opencode` resolves the same as `opencode`.
+    ///
+    /// Note what these args deliberately are: a *working* headless contract, which
+    /// for engines that gate tools behind approval means granting it (`--auto`,
+    /// `--full-auto`). That is a real grant of authority, made explicit by the
+    /// operator choosing the engine and explained in the generated file's comments -
+    /// never added silently for an engine the caller did not name.
+    #[must_use]
+    pub fn default_args(command: &str) -> Vec<String> {
+        let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
+        let suffix = std::env::consts::EXE_SUFFIX;
+        let name = if suffix.is_empty() {
+            name
+        } else {
+            name.strip_suffix(suffix).unwrap_or(name)
+        };
+        match name.to_ascii_lowercase().as_str() {
+            // Verified against OpenCode's published CLI reference: `run` takes the
+            // prompt positionally, `--auto` approves permissions that are not
+            // explicitly denied, which a headless worker needs or nothing runs.
+            "opencode" => vec!["run".into(), "--auto".into(), "{prompt}".into()],
+            // The contract the generated config has documented all along.
+            "codex" => vec!["exec".into(), "--full-auto".into(), "{prompt}".into()],
+            // Claude Code, and anything unrecognised. The permission flag Claude
+            // needs to actually work is NOT added here: it is a large grant, the
+            // generated comment spells it out, and adding it uninvited would hand
+            // every new worker more authority than its operator chose.
+            _ => vec!["-p".into(), "{prompt}".into()],
+        }
+    }
+
     /// The file written by `ferry enable`.
     ///
     /// Parsed by hand in the same flat `key = "value"` shape as `bridge.toml`, which
@@ -434,7 +481,12 @@ role = "{role}"
 # So whichever engine you use, find its non-interactive flag and put it here:
 #
 #   claude   args = ["-p","--dangerously-skip-permissions","{{prompt}}"]
+#   opencode args = ["run","--auto","{{prompt}}"]
 #   codex    args = ["exec","--full-auto","{{prompt}}"]
+#
+# 'ferry enable' already picked the right shape for a known engine from
+# --command. Claude keeps the plain -p form above: adding its permission flag
+# is YOUR choice. If you change engines later, change these args to match.
 #
 # That is a real grant, not a formality. The engine then reads, writes and runs
 # commands in the workspace with this user's full privileges and nothing in the way -
@@ -662,6 +714,58 @@ fn engine_failure_detail(run: &AgentRun) -> String {
         (None, Some(out)) => format!("nothing on stderr; on stdout: {out}"),
         (None, None) => "exited without printing anything on stdout or stderr".to_string(),
     }
+}
+
+/// What the engine said it spent, dug out of its output when it says anything.
+///
+/// # Why parse rather than ask
+///
+/// Ferryman runs an arbitrary CLI through a config file, so there is no flag it
+/// could pass to request accounting. Most engines that account tokens print
+/// them anyway, as JSON on stdout - Claude Code's JSON result carries
+/// `usage.input_tokens` / `usage.output_tokens`, and engines with JSONL event
+/// streams restate running totals per event. Those printed numbers are real
+/// usage from the only source that knows it, and they were being thrown away:
+/// `ferry cost project` read structurally zero while the evidence sat in every
+/// captured trajectory.
+///
+/// Scans JSON lines for the last `usage` object carrying token counts. The last,
+/// because a stream restates *cumulative* totals, so the final one is the run's.
+/// Accepts both common namings (`input_tokens`/`prompt_tokens`,
+/// `output_tokens`/`completion_tokens`). Anything else - prose output, no usage
+/// key, unparseable lines - is `None`: an engine that does not account stays an
+/// honest zero in cost aggregates instead of a wrong number.
+fn engine_usage(stdout: &str) -> Option<ferryman_channel::trajectory::TokenUsage> {
+    let count = |usage: &Value, names: &[&str]| -> Option<u64> {
+        names
+            .iter()
+            .find_map(|name| usage.get(*name))
+            .and_then(Value::as_u64)
+    };
+    let mut found: Option<ferryman_channel::trajectory::TokenUsage> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(usage) = value.get("usage") else {
+            continue;
+        };
+        let Some(prompt) = count(usage, &["input_tokens", "prompt_tokens"]) else {
+            continue;
+        };
+        let Some(completion) = count(usage, &["output_tokens", "completion_tokens"]) else {
+            continue;
+        };
+        found = Some(ferryman_channel::trajectory::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+        });
+    }
+    found
 }
 
 /// The engine's answer, dug out of a machine-readable event stream if that is what it
@@ -2258,6 +2362,11 @@ async fn do_work(
         pid: 0,
     };
     let run = run_agent(config, &workdir, &prompt, &credentials, Some(heartbeat)).await?;
+    // What the engine says it spent, when it says anything. Recorded twice on
+    // purpose: into the trajectory (what the cost aggregator reads) and into
+    // the signed result payload (what reviewers and the fleet can read without
+    // access to this machine's trajectories).
+    let usage = engine_usage(&run.stdout);
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
     // never fail the run itself.
@@ -2272,6 +2381,7 @@ async fn do_work(
             ok: run.ok,
             prompt_digest: ferryman_channel::trajectory::digest(&prompt),
             output: ferryman_channel::trajectory::truncate(&run.stdout),
+            usage,
         },
     );
 
@@ -2280,6 +2390,12 @@ async fn do_work(
         "produced_by": config.command,
         "worktree_branch": branch,
     });
+    if let Some(usage) = usage {
+        payload["usage"] = json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+        });
+    }
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
     }
@@ -2367,6 +2483,11 @@ async fn do_work(
 /// returns `Ok(true)` when the branch carries anything not reachable from `base`.
 /// So the push happens after the worktree is retired, which makes a kept branch
 /// always a pushed branch. A branch with no work is retired without a push.
+//
+// Nine arguments, each load-bearing: splitting them into a struct would move
+// every call site for style alone. Allowed explicitly rather than by raising
+// the global threshold.
+#[allow(clippy::too_many_arguments)]
 fn settle_worktree(
     route: &ProjectRoute,
     config: &AgentConfig,
@@ -3906,5 +4027,109 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&repo);
+    }
+}
+
+#[cfg(test)]
+mod default_args_tests {
+    use super::*;
+
+    /// The whole reason this function exists: OpenCode's non-interactive form is
+    /// `opencode run`, and the one-size `["-p","{prompt}"]` default failed on
+    /// every task for every OpenCode operator.
+    #[test]
+    fn opencode_gets_its_own_contract() {
+        assert_eq!(
+            AgentConfig::default_args("opencode"),
+            vec![
+                "run".to_string(),
+                "--auto".to_string(),
+                "{prompt}".to_string()
+            ]
+        );
+        // An absolute path or .exe spelling names the same engine.
+        assert_eq!(
+            AgentConfig::default_args("/usr/local/bin/opencode"),
+            AgentConfig::default_args("opencode")
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            AgentConfig::default_args("C:\\tools\\OpenCode.EXE"),
+            AgentConfig::default_args("opencode")
+        );
+    }
+
+    #[test]
+    fn codex_gets_the_contract_the_config_already_documented() {
+        assert_eq!(
+            AgentConfig::default_args("codex"),
+            vec![
+                "exec".to_string(),
+                "--full-auto".to_string(),
+                "{prompt}".to_string()
+            ]
+        );
+    }
+
+    /// Claude keeps the historical args, and unknown engines fall back to them
+    /// rather than to a guess. In particular the permission-granting flag Claude
+    /// needs in practice must NOT appear here: enable writes it only if the
+    /// operator adds it, because that grant is theirs to make.
+    #[test]
+    fn claude_and_unknown_engines_keep_the_historical_default_without_added_grants() {
+        let historical = vec!["-p".to_string(), "{prompt}".to_string()];
+        assert_eq!(AgentConfig::default_args("claude"), historical);
+        assert_eq!(AgentConfig::default_args("./vendor/engine-x"), historical);
+        assert!(
+            !AgentConfig::default_args("claude")
+                .iter()
+                .any(|a| a.contains("skip"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod engine_usage_tests {
+    fn usage(stdout: &str) -> Option<(u64, u64)> {
+        super::engine_usage(stdout).map(|u| (u.prompt_tokens, u.completion_tokens))
+    }
+
+    #[test]
+    fn a_claude_style_json_result_reports_its_counts() {
+        let stdout = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false"#,
+            r#","usage":{"input_tokens":25,"output_tokens":150}}"#,
+        );
+        assert_eq!(usage(stdout), Some((25, 150)));
+    }
+
+    #[test]
+    fn a_stream_restating_cumulative_totals_ends_on_the_final_one() {
+        // JSONL event streams restate running totals per event; the last line is
+        // the run's total, so an early smaller number must not win.
+        let stdout = concat!(
+            "{\"event\":{\"type\":\"progress\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}\n",
+            "{\"event\":{\"type\":\"done\",\"text\":\"done\"},\"usage\":{\"input_tokens\":400,\"output_tokens\":90}}\n",
+        );
+        assert_eq!(usage(stdout), Some((400, 90)));
+    }
+
+    #[test]
+    fn the_other_common_naming_is_accepted() {
+        let stdout = r#"{"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
+        assert_eq!(usage(stdout), Some((7, 3)));
+    }
+
+    #[test]
+    fn prose_output_records_nothing() {
+        // Most engines print prose. An honest zero beats an invented number.
+        assert_eq!(usage("the answer is 4\n"), None);
+        assert_eq!(usage(""), None);
+    }
+
+    #[test]
+    fn an_incomplete_usage_object_is_not_a_guessable_total() {
+        let stdout = r#"{"usage":{"input_tokens":25}}"#;
+        assert_eq!(usage(stdout), None);
     }
 }

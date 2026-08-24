@@ -17,6 +17,7 @@
 
 pub mod agent;
 pub mod console;
+pub mod doctor;
 pub mod enable;
 pub mod eval;
 pub mod governor;
@@ -24,6 +25,7 @@ pub mod identity;
 pub mod priority;
 pub mod runlog;
 pub mod soak;
+pub mod status;
 pub mod telemetry;
 
 /// Where a long-running operation reports what it is doing.

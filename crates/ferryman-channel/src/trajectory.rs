@@ -19,6 +19,17 @@ use crate::ProjectRoute;
 /// always of the full prompt.
 const OUTPUT_CAP: usize = 64 * 1024;
 
+/// Token counts an engine reported for one run, when it reported any.
+///
+/// Key names match what the cost aggregator reads (`/usage/prompt_tokens`,
+/// `/usage/completion_tokens`), so a recorded run is billable the moment it is
+/// written - no second format to keep in step.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Trajectory {
     pub order_id: String,
@@ -31,6 +42,11 @@ pub struct Trajectory {
     pub prompt_digest: String,
     /// The captured stdout, truncated to a sane cap.
     pub output: String,
+    /// What the engine said it spent, when it says anything. `None` for engines
+    /// that print no usage, which must stay an ordinary zero in aggregates
+    /// rather than block them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsage>,
 }
 
 /// SHA-256 hex of a prompt, for replay without storing the full text.

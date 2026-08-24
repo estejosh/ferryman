@@ -1,5 +1,12 @@
 # Writing a Worker
 
+> **Server mode.** This describes the lease-based worker protocol of the
+> optional HTTP server (`ferryman-server`). The intended setup needs no server
+> at all: `ferry agent run` runs your agent CLI against the synced channel
+> directly — see [GETTING_STARTED.md](GETTING_STARTED.md) and
+> [ENGINE_SETUP.md](ENGINE_SETUP.md). Come back here only if you are embedding
+> Ferryman behind its HTTP API.
+
 A worker registers with the bridge, leases jobs, streams progress, uploads artifacts, and
 completes idempotently. The bridge orchestrates and gates; the worker runs the model. It
 deliberately does not ship a model-running worker — you bring the inference.
