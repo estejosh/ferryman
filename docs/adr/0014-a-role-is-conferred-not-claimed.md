@@ -48,6 +48,61 @@ operators and observers are all agents; a role called `agent` distinguishes
 nothing and would read, in a roster, as "we did not decide". `worker` already
 carries the meaning the floor needs.
 
+`employee`, `contractor` and `temp` were proposed for the same slot and moved to
+a different one, below. They describe how an agent is engaged rather than what
+it does - a roster line reading `alice - contractor` still leaves open whether
+she issues orders or executes them, which is the distinction `worker` and
+`orchestrator` exist to make. Both axes are worth having; neither replaces the
+other.
+
+## How an engagement is named
+
+`role` says what an agent does. It does not say how long it is trusted or how
+broadly, and those are the questions an operator actually asks when handing
+someone access.
+
+ADR 0013 already carries the second axis, unnamed: every grant is scoped "one
+task / 24 hours / 7-30 days / permanent". Durations are precise and unreadable.
+Three words carry the same thing and need no manual:
+
+| engagement   | means                                                    | expires |
+|--------------|----------------------------------------------------------|---------|
+| `temp`       | one task, or one day                                     | by itself |
+| `contractor` | scoped to one project; returns work, sees nothing else   | on its term |
+| `employee`   | standing, across projects                                | not until revoked |
+
+**`temp` is the default.** Not for tidiness: the vocabulary has to push the same
+way the policy does. `employee` carries an assumption of loyalty and continuity
+that this system deliberately does not make - people grant employees broad
+standing access because the relationship is mutual and ongoing, and nothing
+about an agent earns that. If the default were `employee`, the naming would
+argue against the rule this document exists to establish. `contractor` is the
+normal case. `employee` should be rare and deliberate.
+
+### Short forms are for typing, not for storage
+
+`emp`, `cont` and `temp` are accepted wherever an engagement is named, and
+normalized on write. The stored grant, the roster and the ledger always carry
+the full word.
+
+This is the rule already settled for headless agent names, where the full form
+is canonical and the short form exists for speech. It applies for the same
+reason: the operator types the same flag forty times, and a stranger reads the
+record once, years later, with no idea what was obvious to whoever typed it.
+
+`cont` rather than `con` deliberately. A stored trust level should not read as
+*against*, and in a public repository the shorter form invites exactly one
+joke at the expense of the thing it names.
+
+### What the words do not import
+
+A contractor in the world is accountable for their work and carries their own
+liability. An agent is not and never will be; the operator is. Ferryman borrows
+these words for their shape - how long, how broad, does it lapse - and models
+none of the obligations that surround them. Nothing here is a statement about
+employment, and no part of the system changes behaviour based on which word was
+chosen beyond scope and expiry.
+
 ## Migration, which is the hard part
 
 Flipping the default stops every existing fleet on its next poll — politely,
