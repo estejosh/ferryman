@@ -17,6 +17,7 @@
   `docs/TEAM_INVITATION_ONBOARDING_PROPOSAL.md`; design QA is filed under
   `docs/reviews/`.
 - Demo state is client-side only (`?demo=team`) and never touches live APIs.
+## 0.5.0 - 2026-08-24
 
 ### Added - grants as leases: the lifetime primitive behind the team model
 
