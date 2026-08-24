@@ -49,6 +49,19 @@ fn digest_bytes(data: &[u8]) -> String {
     format!("sha256:{}", hex::encode(h.finalize()))
 }
 
+/// Commitment for a successor configured with a name but no key. Weaker than
+/// [`fingerprint_successor`] — it proves nothing beyond the label chosen at
+/// arm time, which is exactly what the config promised.
+pub fn fingerprint_name(name: &str) -> Result<String> {
+    let t = name.trim();
+    if t.is_empty() {
+        return Err(Error::BadInput(
+            "successor needs a name and/or a key".into(),
+        ));
+    }
+    Ok(digest_bytes(format!("name:{t}").as_bytes()))
+}
+
 /// Short display form: first 16 chars after the prefix.
 pub fn short(fp: &str) -> String {
     fp.chars().take(7 + 16).collect()
@@ -57,6 +70,20 @@ pub fn short(fp: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_only_commitments() {
+        let a = fingerprint_name("ada").unwrap();
+        assert!(a.starts_with("sha256:"));
+        assert_eq!(a, fingerprint_name(" ada ").unwrap());
+        assert_ne!(a, fingerprint_name("grace").unwrap());
+        assert_ne!(
+            a,
+            fingerprint_successor("aabbccddeeff00112233445566778899").unwrap()
+        );
+        assert!(fingerprint_name("").is_err());
+        assert!(fingerprint_name("  ").is_err());
+    }
 
     #[test]
     fn fingerprints_inline_hex() {

@@ -32,9 +32,14 @@ pub struct ArtifactHeader {
     pub period_secs: u64,
     pub genesis_unix: i64,
     pub created_unix: i64,
+    /// Identity commitment of the successor this copy is sealed for.
     pub successor_fingerprint: String,
-    /// sha256 of the git bundle inside the archive.
-    pub bundle_sha256: String,
+    #[serde(default)]
+    pub successor_name: Option<String>,
+    /// sha256 of the git bundle inside the archive (None when a custom
+    /// archiver produced a payload without one).
+    #[serde(default)]
+    pub bundle_sha256: Option<String>,
     /// sha256 of the tar.gz payload (before encryption).
     pub archive_sha256: String,
     /// HEAD commit at seal time, when the repo had one.
@@ -189,7 +194,8 @@ mod tests {
             genesis_unix: 1_000,
             created_unix: 2_000,
             successor_fingerprint: "sha256:deadbeef".into(),
-            bundle_sha256: "aa".repeat(32),
+            successor_name: None,
+            bundle_sha256: Some("aa".repeat(32)),
             archive_sha256: "bb".repeat(32),
             head_sha256: None,
         }

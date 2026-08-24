@@ -9,6 +9,7 @@ pub mod archive;
 pub mod artifact;
 pub mod beacon;
 pub mod commands;
+pub mod config;
 pub mod duration;
 pub mod error;
 pub mod fingerprint;
