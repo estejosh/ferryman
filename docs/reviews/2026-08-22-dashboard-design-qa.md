@@ -9,10 +9,10 @@ Final result: **passed** — no open P0, P1, or P2 findings.
 ## Evidence
 
 - Viewport: 1440 x 1024 CSS pixels in the selected in-app browser.
-- Home source: `C:\Users\oshha\.codex\generated_images\01a029f0-296f-7843-96c6-716bdea2f3f5\exec-32e0f14a-a9b3-4eed-ac94-e977abccd6bd.png` (1487 x 1058).
-- Home implementation: `C:\Users\oshha\.codex\visualizations\2026\08\22\01a029f0-296f-7843-96c6-716bdea2f3f5\ferryman-dashboard-build-home-final2.png` (1425 x 1013 captured content).
-- Install source: `C:\Users\oshha\.codex\generated_images\01a029f0-296f-7843-96c6-716bdea2f3f5\exec-97ca860c-7b80-487d-bc96-54b04d207ad9.png` (1487 x 1058).
-- Install implementation: `C:\Users\oshha\.codex\visualizations\2026\08\22\01a029f0-296f-7843-96c6-716bdea2f3f5\ferryman-dashboard-build-install-final2.png` (1425 x 1013 captured content).
+- Home source: captured locally. The reviewer's own file path is deliberately not recorded here.
+- Home implementation: captured locally. The reviewer's own file path is deliberately not recorded here.
+- Install source: captured locally. The reviewer's own file path is deliberately not recorded here.
+- Install implementation: captured locally. The reviewer's own file path is deliberately not recorded here.
 - Normalized full-view comparisons: `qa-home-side-by-side-final.png` and `qa-install-side-by-side-final.png` in the same visualization directory. Both sides were resampled to 1440 x 1024 only for comparison; the browser itself remained at 1440 x 1024.
 - State: `?demo=team`, Home and Install permanent business agent.
 
