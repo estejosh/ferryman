@@ -276,10 +276,15 @@ Listed because you will hit some of these, and finding them written down beats
 discovering them. Every one is something we know about and intend to fix; none of
 them loses work or leaks anything.
 
-- **Costs read as `$0.00`.** `ferry cost project` and the dashboard's *est. spend*
-  tile compute from a per-run token count that nothing currently records, so they
-  are structurally zero. Treat `ferry cost plan` (an estimate, and labelled as one)
-  as the useful half and ignore the recorded totals until this is wired up.
+- **Costs read as `$0.00` for engines that don't account.** Workers now record
+  the token usage an engine prints and `ferry cost project` totals it per
+  engine; Claude Code's JSON output is accounted today, and prose-only engines
+  stay at zero rather than a guess. `ferry cost plan` remains what it was: an
+  estimate from a token heuristic, labelled as one.
+- **`ferry agent status` answers "why is nothing happening"** - worker liveness,
+  the task it holds with heartbeat age, and the exact claim-gate decision
+  (paused, outside working hours, you're typing, memory floor) with the setting
+  that causes it.
 - **Engine prices and quality scores are hand-typed constants.** `ferry cost rates`
   prints a table of list prices with no as-of date, an unrecognised engine is priced
   at a mid-range commercial rate — including a local model, which costs nothing —

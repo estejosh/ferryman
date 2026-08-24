@@ -18,6 +18,39 @@
   `docs/reviews/`.
 - Demo state is client-side only (`?demo=team`) and never touches live APIs.
 
+### Added - grants as leases: the lifetime primitive behind the team model
+
+- **`ferry channel lease grant | renew | revoke | list`.** Access grants are
+  now lease-shaped, per ADR 0013: a short-lived signed lease naming one
+  subject, scopes, and optionally one resource (a secret id, a repository).
+  Renewal extends from now by the original issuer only; a visible revocation
+  ends authority immediately where seen; expiry ends it everywhere, including
+  machines that never sync again. Every issue, renewal, and revocation lands
+  in the audit ledger. Existing worker leases are untouched - tokens without
+  grant fields sign under exactly their original payload bytes.
+- **ADR 0013** records the semantics and what is deliberately left to policy:
+  who may be trusted as an issuer is the enforcement layer's decision, not the
+  primitive's.
+
+### Added - the loop and the bill become observable
+
+- **`ferry agent status`.** The one command for "why is nothing happening":
+  whether the worker process is alive, which task it holds with heartbeat age,
+  and the exact claim-gate decision the poll acts on - paused, outside working
+  hours, someone typing, memory floor - naming the `agent.toml` setting that
+  causes it. `--json` for callers.
+- **Recorded engine usage makes cost real where engines report it.** Workers
+  now parse the token counts an engine prints (Claude Code's JSON result, JSONL
+  streams restating cumulative totals), record them in the trajectory and the
+  signed result, and `ferry cost project` bills from recorded numbers instead
+  of reading structurally zero. Engines that print nothing stay an honest zero.
+- **ADR 0013: agent access grants are renewable leases.** The semantics behind
+  the dashboard team-access and secret-transport proposals: authority is a
+  short-lived signed lease renewed by its owner, so revocation means "stop
+  renewing" and an offline machine expires out of authority at a known horizon
+  instead of holding a durable capability until a revocation file arrives.
+  THREAT_MODEL states the same rule.
+
 ### Added - the setup knows before the first task does
 
 - **`ferry doctor`.** One read-only command that answers "will this machine

@@ -22,6 +22,17 @@ Project inputs/results, artifact metadata and contents, project bearer tokens, s
 - **Recovery providers:** raw artifacts are never mirrored. Local-first continuity packs are encrypted before any configured network, Drive, MEGA, or private-Git recovery target receives them. External adapters fail closed until a target policy, credential reference, consent manifest, and remote hash verification are available.
 - **Sensitive data:** logs/events redact top-level keys containing `secret`; this is defense-in-depth, not a replacement for application-level data minimization.
 - **Destructive/external work:** project submits it with `requires_approval`; v0.1 requires a separate approve transition before dispatch.
+- **Agent access grants and invitations:** any authority a human or agent holds
+  over another principal's agents, secrets, or membership is a **renewable
+  lease**, not a durable capability - short-lived, signed by its owner,
+  expiring on its own, renewed by publication into the channel (see
+  [ADR 0013](adr/0013-agent-access-grants-are-renewable-leases.md)). This is
+  the offline story: revocation means "stop renewing", so a machine that has
+  not synced still expires out of authority at a known, deliberately small
+  horizon. Secret-use grants additionally fail closed at every use and never
+  place plaintext in any channel artifact; revealing a secret once always
+  requires rotating the upstream credential, which no Ferryman control can
+  undo.
 
 ## Non-goals and residual risks
 

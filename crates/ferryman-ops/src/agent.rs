@@ -716,6 +716,58 @@ fn engine_failure_detail(run: &AgentRun) -> String {
     }
 }
 
+/// What the engine said it spent, dug out of its output when it says anything.
+///
+/// # Why parse rather than ask
+///
+/// Ferryman runs an arbitrary CLI through a config file, so there is no flag it
+/// could pass to request accounting. Most engines that account tokens print
+/// them anyway, as JSON on stdout - Claude Code's JSON result carries
+/// `usage.input_tokens` / `usage.output_tokens`, and engines with JSONL event
+/// streams restate running totals per event. Those printed numbers are real
+/// usage from the only source that knows it, and they were being thrown away:
+/// `ferry cost project` read structurally zero while the evidence sat in every
+/// captured trajectory.
+///
+/// Scans JSON lines for the last `usage` object carrying token counts. The last,
+/// because a stream restates *cumulative* totals, so the final one is the run's.
+/// Accepts both common namings (`input_tokens`/`prompt_tokens`,
+/// `output_tokens`/`completion_tokens`). Anything else - prose output, no usage
+/// key, unparseable lines - is `None`: an engine that does not account stays an
+/// honest zero in cost aggregates instead of a wrong number.
+fn engine_usage(stdout: &str) -> Option<ferryman_channel::trajectory::TokenUsage> {
+    let count = |usage: &Value, names: &[&str]| -> Option<u64> {
+        names
+            .iter()
+            .find_map(|name| usage.get(*name))
+            .and_then(Value::as_u64)
+    };
+    let mut found: Option<ferryman_channel::trajectory::TokenUsage> = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(usage) = value.get("usage") else {
+            continue;
+        };
+        let Some(prompt) = count(usage, &["input_tokens", "prompt_tokens"]) else {
+            continue;
+        };
+        let Some(completion) = count(usage, &["output_tokens", "completion_tokens"]) else {
+            continue;
+        };
+        found = Some(ferryman_channel::trajectory::TokenUsage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+        });
+    }
+    found
+}
+
 /// The engine's answer, dug out of a machine-readable event stream if that is what it
 /// printed.
 ///
@@ -2310,6 +2362,11 @@ async fn do_work(
         pid: 0,
     };
     let run = run_agent(config, &workdir, &prompt, &credentials, Some(heartbeat)).await?;
+    // What the engine says it spent, when it says anything. Recorded twice on
+    // purpose: into the trajectory (what the cost aggregator reads) and into
+    // the signed result payload (what reviewers and the fleet can read without
+    // access to this machine's trajectories).
+    let usage = engine_usage(&run.stdout);
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
     // never fail the run itself.
@@ -2324,6 +2381,7 @@ async fn do_work(
             ok: run.ok,
             prompt_digest: ferryman_channel::trajectory::digest(&prompt),
             output: ferryman_channel::trajectory::truncate(&run.stdout),
+            usage,
         },
     );
 
@@ -2332,6 +2390,12 @@ async fn do_work(
         "produced_by": config.command,
         "worktree_branch": branch,
     });
+    if let Some(usage) = usage {
+        payload["usage"] = json!({
+            "prompt_tokens": usage.prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+        });
+    }
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
     }
@@ -4021,5 +4085,51 @@ mod default_args_tests {
                 .iter()
                 .any(|a| a.contains("skip"))
         );
+    }
+}
+
+#[cfg(test)]
+mod engine_usage_tests {
+    fn usage(stdout: &str) -> Option<(u64, u64)> {
+        super::engine_usage(stdout).map(|u| (u.prompt_tokens, u.completion_tokens))
+    }
+
+    #[test]
+    fn a_claude_style_json_result_reports_its_counts() {
+        let stdout = concat!(
+            r#"{"type":"result","subtype":"success","is_error":false"#,
+            r#","usage":{"input_tokens":25,"output_tokens":150}}"#,
+        );
+        assert_eq!(usage(stdout), Some((25, 150)));
+    }
+
+    #[test]
+    fn a_stream_restating_cumulative_totals_ends_on_the_final_one() {
+        // JSONL event streams restate running totals per event; the last line is
+        // the run's total, so an early smaller number must not win.
+        let stdout = concat!(
+            "{\"event\":{\"type\":\"progress\"},\"usage\":{\"input_tokens\":100,\"output_tokens\":10}}\n",
+            "{\"event\":{\"type\":\"done\",\"text\":\"done\"},\"usage\":{\"input_tokens\":400,\"output_tokens\":90}}\n",
+        );
+        assert_eq!(usage(stdout), Some((400, 90)));
+    }
+
+    #[test]
+    fn the_other_common_naming_is_accepted() {
+        let stdout = r#"{"usage":{"prompt_tokens":7,"completion_tokens":3}}"#;
+        assert_eq!(usage(stdout), Some((7, 3)));
+    }
+
+    #[test]
+    fn prose_output_records_nothing() {
+        // Most engines print prose. An honest zero beats an invented number.
+        assert_eq!(usage("the answer is 4\n"), None);
+        assert_eq!(usage(""), None);
+    }
+
+    #[test]
+    fn an_incomplete_usage_object_is_not_a_guessable_total() {
+        let stdout = r#"{"usage":{"input_tokens":25}}"#;
+        assert_eq!(usage(stdout), None);
     }
 }

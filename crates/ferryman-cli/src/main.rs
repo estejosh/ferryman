@@ -1180,6 +1180,71 @@ enum LeaseAction {
         /// The worker whose lease to check.
         to: String,
     },
+    /// Issue an access grant (ADR 0013): a signed lease naming one subject,
+    /// some scopes, optionally one resource - a secret id, a repository.
+    ///
+    /// Renewal is how it stays alive: the issuer rewrites the same file with a
+    /// later horizon, so revocation is stopping the renewal, and an offline
+    /// holder expires out of authority at a horizon you chose. Who may be
+    /// trusted as an issuer is policy; this proves who signed and that it is
+    /// still live.
+    Grant {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who signs the grant. Defaults to this machine's configured agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// The principal receiving the authority.
+        #[arg(long)]
+        to: String,
+        /// Comma-separated scopes, e.g. "view,message" or "use-secret".
+        #[arg(long)]
+        scope: String,
+        /// One thing the grant is about: a vault secret id, a repository name.
+        #[arg(long)]
+        resource: Option<String>,
+        /// Lifetime in minutes. Keep it small: the horizon is the bound on
+        /// exposure if you never renew or revoke in time.
+        #[arg(long, default_value_t = 240)]
+        minutes: i64,
+    },
+    /// Extend one of your grants from now. A lapse is real and is not quietly
+    /// papered over; a revoked grant refuses renewal.
+    Renew {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        to: String,
+        /// The grant id printed at issue time.
+        #[arg(long)]
+        grant: String,
+        #[arg(long, default_value_t = 240)]
+        minutes: i64,
+    },
+    /// Withdraw a grant now where this record is visible. Expiry remains what
+    /// ends it everywhere, including machines that never see this file.
+    Revoke {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        grant: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Every grant on the channel with its current state: active, expired,
+    /// revoked, or invalid (signature does not check out).
+    List {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 #[derive(Subcommand, Clone)]
 /// The agentic loop. Every one of these runs unattended and needs no terminal.
@@ -1223,6 +1288,18 @@ enum Agent {
     Pending {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Why this machine is (or is not) working right now.
+    ///
+    /// Doctor proves the setup; this reads the loop: is the worker process
+    /// alive, what does it hold, and - when nothing is happening - the same
+    /// decision the poll makes, with the setting that causes it. Read-only.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Emit one JSON object instead of prose.
         #[arg(long)]
         json: bool,
     },
@@ -3008,6 +3085,62 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("settle with: ferry channel review --accept <id>   (or --notes \"...\")");
             }
         }
+        Agent::Status { workspace, json } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let status = ferryman_ops::status::examine(&start)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status)?);
+                return Ok(());
+            }
+            println!(
+                "project {} · agent {} · runs '{}'",
+                status.project, status.agent, status.engine
+            );
+            println!(
+                "  worker     {}",
+                if status.worker_alive {
+                    "running".to_string()
+                } else {
+                    "not running - start with 'ferry agent run'".to_string()
+                }
+            );
+            match &status.current_task {
+                Some(task) => {
+                    let beat = match task.heartbeat_age_secs {
+                        Some(secs) => format!("heartbeat {secs}s ago"),
+                        None => "no heartbeat yet".to_string(),
+                    };
+                    println!("  working    {} ({beat})", task.order_id);
+                }
+                None => println!("  working    nothing held right now"),
+            }
+            if let Some(reason) = &status.claim_blocked_reason {
+                println!("  new work   waiting: {reason}");
+            } else {
+                println!("  new work   ready to claim");
+            }
+            if let Some(window) = &status.claim_window {
+                println!("  hours      {window}");
+            }
+            println!(
+                "  memory     {} MB available / keeps {} MB free",
+                status
+                    .memory_available_mb
+                    .map(|mb| mb.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                status.min_free_ram_mb
+            );
+            if !status.engine_on_path {
+                println!(
+                    "  WARNING    '{}' is not on PATH - tasks would fail to start; \
+                     run 'ferry doctor' for the fix",
+                    status.engine
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -3960,17 +4093,32 @@ fn channel(command: Channel) -> Result<()> {
             role,
             dry_run,
         } => {
-            let fleet = ferryman_ops::agent::fleet_under(&comms)?;
-            for (path, why) in &fleet.skipped {
-                println!("  skipping {}: {why}", path.display());
+            // `fleet_under` deliberately excludes a channel whose configured agent has
+            // no key there. That is exactly the state `seat` exists to repair, so using
+            // the fleet's *served* list here made the repair command skip its targets.
+            // Discover routable channels directly; a malformed channel is still named
+            // and skipped, but a valid channel with no local identity remains eligible.
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(&comms)
+                .with_context(|| format!("read {}", comms.display()))?
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join(".ferryman").is_dir())
+                .collect();
+            paths.sort();
+            let mut routes = Vec::new();
+            for path in paths {
+                match ferryman_channel::route_for(&path) {
+                    Ok(route) => routes.push(route),
+                    Err(error) => println!("  skipping {}: {error:#}", path.display()),
+                }
             }
-            if fleet.served.is_empty() {
+            if routes.is_empty() {
                 bail!("no Ferryman channels under {}", comms.display());
             }
             // Whose key, resolved once against a channel that has one. Resolving per
             // channel would let a machine seat two different names in one pass.
-            let name = ferryman_ops::identity::resolve(agent, &fleet.served[0].0.attachment)?;
-            let Some(identity) = fleet.served.iter().find_map(|(route, _)| {
+            let name = ferryman_ops::identity::resolve(agent, &routes[0].attachment)?;
+            let Some(identity) = routes.iter().find_map(|route| {
                 ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)
                     .ok()
                     .flatten()
@@ -3985,7 +4133,7 @@ fn channel(command: Channel) -> Result<()> {
             };
             println!("seating '{name}' ({})", identity.public_key_hex());
             let mut seated = 0;
-            for (route, _) in &fleet.served {
+            for route in &routes {
                 let held =
                     ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)?;
                 if held.is_some() {
@@ -5055,6 +5203,119 @@ fn channel(command: Channel) -> Result<()> {
                         );
                     } else {
                         println!("invalid or expired");
+                    }
+                }
+                LeaseAction::Grant {
+                    workspace: _,
+                    agent,
+                    to,
+                    scope,
+                    resource,
+                    minutes,
+                } => {
+                    // Grants are signed by their owner, not necessarily the
+                    // master - that is what makes them usable for personal
+                    // agents and vault secrets.
+                    let name = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    let identity = signing_identity(&route, &name)?;
+                    let scopes: Vec<String> = scope
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    if scopes.is_empty() {
+                        bail!("a grant with no scopes grants nothing; pass --scope");
+                    }
+                    let token = ferryman_channel::lease::issue_grant(
+                        &route,
+                        &identity,
+                        &to,
+                        scopes,
+                        resource.as_deref(),
+                        chrono::Duration::minutes(minutes),
+                    )?;
+                    println!(
+                        "granted [{}] on {} until {}  grant {}",
+                        token.scope.join(","),
+                        token.issued_to,
+                        token.expires_at.to_rfc3339(),
+                        token.grant_id.as_deref().unwrap_or("?")
+                    );
+                    println!(
+                        "  renew with: ferry channel lease renew --to {} --grant {} --agent {}",
+                        token.issued_to,
+                        token.grant_id.as_deref().unwrap_or("?"),
+                        identity.name()
+                    );
+                }
+                LeaseAction::Renew {
+                    workspace: _,
+                    agent,
+                    to,
+                    grant,
+                    minutes,
+                } => {
+                    let name = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    let identity = signing_identity(&route, &name)?;
+                    let token = ferryman_channel::lease::renew_grant(
+                        &route,
+                        &identity,
+                        &to,
+                        &grant,
+                        chrono::Duration::minutes(minutes),
+                    )?;
+                    println!(
+                        "renewed: {} holds [{}] until {}",
+                        token.issued_to,
+                        token.scope.join(","),
+                        token.expires_at.to_rfc3339()
+                    );
+                }
+                LeaseAction::Revoke {
+                    workspace: _,
+                    agent,
+                    to,
+                    grant,
+                    reason,
+                } => {
+                    let name = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    let identity = signing_identity(&route, &name)?;
+                    ferryman_channel::lease::revoke_grant(
+                        &route,
+                        &identity,
+                        &to,
+                        &grant,
+                        reason.as_deref(),
+                    )?;
+                    println!(
+                        "revoked {grant} on {to}. Expiry remains the bound everywhere else; \
+                         this record ends it wherever it is visible."
+                    );
+                }
+                LeaseAction::List { workspace: _, json } => {
+                    let listed = ferryman_channel::lease::list_grants(&route)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&listed)?);
+                        return Ok(());
+                    }
+                    if listed.is_empty() {
+                        println!("no access grants on this channel");
+                        return Ok(());
+                    }
+                    for g in &listed {
+                        println!(
+                            "  {:<8} {:<10} [{}] {}  by {}  until {}",
+                            format!("{:?}", g.status).to_lowercase(),
+                            g.token.issued_to,
+                            g.token.scope.join(","),
+                            g.token.resource.as_deref().unwrap_or("-"),
+                            g.token.signed_by.as_deref().unwrap_or("?"),
+                            g.token.expires_at.to_rfc3339()
+                        );
+                        if let Some(id) = &g.token.grant_id {
+                            println!("           grant {id}");
+                        }
                     }
                 }
             }
