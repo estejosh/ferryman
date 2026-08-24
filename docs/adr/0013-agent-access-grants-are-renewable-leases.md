@@ -2,11 +2,33 @@
 
 ## Status
 
-Proposed. This ADR specifies semantics only; no enforcement is wired by it. It
-exists so that the dashboard team-access work (`docs/DASHBOARD_TEAM_ACCESS_MODEL.md`)
-and the secret-transport work
-(`docs/RECIPIENT_BOUND_SECRET_TRANSPORT_PROPOSAL.md`) build their authority on
-one lifetime primitive instead of three ad-hoc ones.
+Proposed as policy; the primitive is implemented. Enforcement wiring - the
+team-access model's owners, the vault broker's use-time checks, invitation
+binding - deliberately waits on agreement between the teams building those
+layers.
+
+Implemented by this repository's `lease` module, surfaced as
+`ferry channel lease grant | renew | revoke | list`:
+
+- `LeaseToken` carries optional `grant_id` and `resource`; tokens without them
+  sign under exactly the v1 payload bytes, so every existing worker lease keeps
+  verifying unchanged.
+- `issue_grant` signs a fresh lease with its own id into
+  `grants/<subject>.<id>.json`, ledger kind `grant`.
+- `renew_grant` extends from *now* (a lapse is real), refuses any principal
+  other than the original issuer, and refuses renewal of a locally visible
+  revocation; ledger kind `grant-renew`.
+- `revoke_grant` writes a signed record beside the grant, allowed to the issuer
+  or the declared master; ledger kind `grant-revoke`.
+- Status reads in a deliberate order - visible revocation beats expiry (the
+  ledger should say why authority ended), and a broken signature reads invalid
+  regardless of everything else.
+- Every issuance, renewal, and revocation is a ledger entry, so "who could do
+  what, when" stays answerable from the audit trail.
+
+What is *not* here, on purpose: who may issue what about whom (policy for the
+layers above), automatic renewal processes, and any handling of secrets already
+revealed outside Ferryman.
 
 ## Context
 

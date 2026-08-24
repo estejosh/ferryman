@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added - grants as leases: the lifetime primitive behind the team model
+
+- **`ferry channel lease grant | renew | revoke | list`.** Access grants are
+  now lease-shaped, per ADR 0013: a short-lived signed lease naming one
+  subject, scopes, and optionally one resource (a secret id, a repository).
+  Renewal extends from now by the original issuer only; a visible revocation
+  ends authority immediately where seen; expiry ends it everywhere, including
+  machines that never sync again. Every issue, renewal, and revocation lands
+  in the audit ledger. Existing worker leases are untouched - tokens without
+  grant fields sign under exactly their original payload bytes.
+- **ADR 0013** records the semantics and what is deliberately left to policy:
+  who may be trusted as an issuer is the enforcement layer's decision, not the
+  primitive's.
+
 ### Added - the loop and the bill become observable
 
 - **`ferry agent status`.** The one command for "why is nothing happening":
