@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.5.0 - 2026-08-24
+
 ### Added - grants as leases: the lifetime primitive behind the team model
 
 - **`ferry channel lease grant | renew | revoke | list`.** Access grants are
