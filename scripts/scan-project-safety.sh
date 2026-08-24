@@ -29,7 +29,9 @@ result PASS workspace "$WORKSPACE"
 if [[ -d "$WORKSPACE/.git" ]]; then
   main_remote=$(git -C "$WORKSPACE" config --get remote.origin.url || true)
   result PASS main_remote "${main_remote:-"(none)"}"
-  if git -C "$WORKSPACE" check-ignore -q .ferryman; then
+  # Probe a child path so a directory-only rule such as /.ferryman/ is
+  # recognized even before the attachment directory exists.
+  if git -C "$WORKSPACE" check-ignore --no-index -q -- .ferryman/probe; then
     result PASS main_ignore "/.ferryman/ is ignored"
   else
     result FAIL main_ignore "/.ferryman/ is not ignored"

@@ -57,7 +57,9 @@ $mainGit = Join-Path $workspacePath '.git'
 if (Test-Path -LiteralPath $mainGit) {
   $mainRemote = Invoke-GitRead $workspacePath @('config','--get','remote.origin.url')
   Add-Result PASS main_remote $(if ($mainRemote.Output) { $mainRemote.Output } else { '(none)' })
-  $ignored = Invoke-GitRead $workspacePath @('check-ignore','-q','.ferryman')
+  # Probe a child path so a directory-only rule such as /.ferryman/ is
+  # recognized even before the attachment directory exists.
+  $ignored = Invoke-GitRead $workspacePath @('check-ignore','--no-index','-q','--','.ferryman/probe')
   if ($ignored.ExitCode -eq 0) {
     Add-Result PASS main_ignore '/.ferryman/ is ignored by the main project'
   } else {
