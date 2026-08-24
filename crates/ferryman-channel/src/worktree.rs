@@ -35,6 +35,81 @@ pub fn is_git_repo(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Where a task's branch should start.
+///
+/// # The bug this exists to stop
+///
+/// `git worktree add -b <branch> <dir>` with no start point branches from whatever
+/// the repository's HEAD happens to be. For a checkout a person uses that is
+/// usually the default branch and the omission never shows. For the checkout a
+/// worker makes task worktrees from it is whatever the last thing to touch that
+/// repo left behind - and on one machine in this fleet that was a task branch from
+/// six days earlier, so a new task's worktree began forty commits behind the work
+/// it was supposed to extend. Nothing failed. The agent worked, committed, pushed,
+/// and produced a branch that quietly reverted a week.
+///
+/// So the start point is chosen deliberately, in the order of what is most likely
+/// to be the shared truth:
+///
+/// 1. `origin/HEAD` - what the remote says its default branch is.
+/// 2. `origin/main`, then `origin/master` - when nobody ever set `origin/HEAD`,
+///    which is the common case for a clone made with older git.
+/// 3. local `main`, then `master` - a project with no remote at all, which
+///    ADR 0006 makes a first-class case.
+/// 4. `HEAD`, and only here, because a repository can legitimately have none of
+///    the above: a fresh project on its first commit, or a deliberate detached
+///    checkout. Falling back silently would restore exactly the bug above, so the
+///    caller is told this happened.
+///
+/// Deliberately does not fetch. Basing on a remote-tracking ref that is a few
+/// hours stale is a merge; reaching for the network inside worktree creation is a
+/// failure mode at the worst moment, and whether to fetch is the operator's
+/// decision to make in the layer that already knows about remotes.
+pub fn task_base(repo: &Path) -> (String, bool) {
+    let Some(dir) = repo.to_str() else {
+        return ("HEAD".to_string(), true);
+    };
+    if let Some(head) = symbolic_ref(dir, "refs/remotes/origin/HEAD") {
+        return (head, false);
+    }
+    for candidate in [
+        "refs/remotes/origin/main",
+        "refs/remotes/origin/master",
+        "refs/heads/main",
+        "refs/heads/master",
+    ] {
+        if rev_exists(dir, candidate) {
+            return (candidate.to_string(), false);
+        }
+    }
+    ("HEAD".to_string(), true)
+}
+
+/// The short name a symbolic ref points at, e.g. `origin/main`. `None` when the
+/// ref does not exist, which is normal rather than exceptional.
+fn symbolic_ref(repo_dir: &str, name: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args(["-C", repo_dir, "symbolic-ref", "--short", name])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn rev_exists(repo_dir: &str, rev: &str) -> bool {
+    Command::new("git")
+        .args(["-C", repo_dir, "rev-parse", "--verify", "--quiet", rev])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Create a worktree for an (order, agent) pair next to `repo`, returning the
 /// worktree path and the branch. Idempotent: a re-dispatched task finds its own
 /// worktree again instead of creating a second one.
@@ -72,6 +147,16 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
             .stderr(Stdio::null())
             .status();
     }
+    // The start point is explicit. Without it git branches from this repository's
+    // HEAD, which is whatever the last thing to touch the checkout left behind -
+    // see `task_base`.
+    let (base, guessed) = task_base(repo);
+    if guessed {
+        eprintln!(
+            "ferryman: {} has no origin/HEAD, main or master; branching {branch} from HEAD",
+            repo.display()
+        );
+    }
     let status = Command::new("git")
         .args([
             "-C",
@@ -81,11 +166,12 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
             "-b",
             &branch,
             dir.to_str().context("worktree path is not valid UTF-8")?,
+            &base,
         ])
         .status()
-        .with_context(|| format!("git worktree add -b {branch}"))?;
+        .with_context(|| format!("git worktree add -b {branch} {base}"))?;
     if !status.success() {
-        bail!("git worktree add -b {branch} failed");
+        bail!("git worktree add -b {branch} {base} failed");
     }
     Ok((dir, branch))
 }
@@ -397,6 +483,65 @@ mod tests {
             .args(["-C", base.to_str().unwrap(), "commit", "-q", "-m", "init"])
             .status();
         base
+    }
+
+    fn run_git(repo: &Path, args: &[&str]) {
+        let mut full = vec!["-C", repo.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let status = Command::new("git").args(&full).status().unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// The bug in the flesh. A checkout parked on some other branch used to hand
+    /// that branch's tip to the next task as its starting point, so the task began
+    /// behind the work it was meant to extend - and nothing failed while it did.
+    #[test]
+    fn a_task_branches_from_main_not_from_wherever_the_repo_was_left() {
+        let repo = temp_repo();
+        run_git(&repo, &["branch", "-M", "main"]);
+        let on_main = head_of(&repo).unwrap();
+
+        // A side branch with a commit nobody wants as a base, left checked out.
+        run_git(&repo, &["checkout", "-q", "-b", "old"]);
+        fs::write(repo.join("detour.txt"), "not this").unwrap();
+        run_git(&repo, &["add", "detour.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "a detour"]);
+
+        let (dir, branch) = create_worktree(&repo, "ENG-9", "wisp").unwrap();
+        let started_at = head_of(&dir).unwrap();
+        assert_eq!(
+            started_at, on_main,
+            "{branch} must start from main, not from the branch the repo was parked on"
+        );
+        assert!(
+            !dir.join("detour.txt").exists(),
+            "the detour must not appear in the task's tree"
+        );
+        let _ = remove_worktree(&repo, &branch);
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A project with no remote is a first-class case, not a degraded one.
+    #[test]
+    fn a_repo_with_no_remote_starts_from_its_own_main() {
+        let repo = temp_repo();
+        run_git(&repo, &["branch", "-M", "main"]);
+        let (base, guessed) = task_base(&repo);
+        assert_eq!(base, "refs/heads/main");
+        assert!(!guessed, "a local main is an answer, not a fallback");
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// And when there is genuinely nothing to point at, it says so rather than
+    /// silently reintroducing the bug.
+    #[test]
+    fn with_no_main_and_no_remote_the_fallback_is_reported_as_a_guess() {
+        let repo = temp_repo();
+        run_git(&repo, &["branch", "-M", "trunk"]);
+        let (base, guessed) = task_base(&repo);
+        assert_eq!(base, "HEAD");
+        assert!(guessed, "an unrecognisable repo is reported, not assumed");
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]
