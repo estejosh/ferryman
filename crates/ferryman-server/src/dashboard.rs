@@ -312,6 +312,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/whoami", get(whoami))
+        .route("/api/team", get(team))
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task_detail))
         .route("/api/tasks/{id}/review", post(review_task))
@@ -591,6 +592,87 @@ async fn whoami(
         Some(identity) => Ok(Json(json!({ "name": identity.name() }))),
         None => Err((StatusCode::UNAUTHORIZED, "no active session".to_string())),
     }
+}
+
+/// GET /api/team — the human operators available on this machine and the
+/// agents registered in the current project's portable roster.
+///
+/// Human identities and agent identities are deliberately returned in
+/// separate arrays. The dashboard must never infer that a model/worker is a
+/// teammate, nor that an operator owns an agent merely because both happen to
+/// be present on this machine. Agent ownership and cross-user access require a
+/// signed policy; until that contract exists, `owner` remains null and the UI
+/// presents access as unconfigured rather than inventing authority.
+async fn team(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    let current = state
+        .sessions
+        .resolve(session_token(&headers))
+        .ok_or((StatusCode::UNAUTHORIZED, "no active session".to_string()))?;
+    let mut names = state.operators.names().map_err(internal)?;
+    let roster =
+        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+    // Operators publish a public roster entry so every machine can verify their
+    // signatures. Include those remote humans even when this machine does not hold
+    // their sealed signing identity; otherwise the team view would silently collapse
+    // to "people who can sign in here" rather than the project's actual human team.
+    for operator in roster
+        .iter()
+        .filter(|entry| entry.role.eq_ignore_ascii_case("operator"))
+    {
+        if !names.iter().any(|name| name == &operator.name) {
+            names.push(operator.name.clone());
+        }
+    }
+    names.sort();
+    let master = ferryman_channel::master::read_master(&state.route)
+        .map_err(internal)?
+        .map(|declaration| declaration.master);
+    let teammates = names
+        .into_iter()
+        .map(|name| {
+            let role = if master.as_deref() == Some(name.as_str()) {
+                "owner"
+            } else {
+                "operator"
+            };
+            let is_current = name == current.name();
+            let scope = if state.operators.is_project_local(&name) {
+                "project"
+            } else if state.operators.exists(&name) {
+                "machine"
+            } else {
+                "channel"
+            };
+            json!({
+                "name": name,
+                "role": role,
+                "current": is_current,
+                "scope": scope,
+            })
+        })
+        .collect::<Vec<_>>();
+    let agents = roster
+        .into_iter()
+        .filter(|agent| !agent.role.eq_ignore_ascii_case("operator"))
+        .map(|agent| {
+            json!({
+                "name": agent.name,
+                "role": agent.role,
+                "capabilities": agent.capabilities,
+                "owner": Value::Null,
+                "access": "unconfigured",
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "current": current.name(),
+        "master": master,
+        "teammates": teammates,
+        "agents": agents,
+    })))
 }
 
 /// GET /api/tasks — a summary of every task, with signature status.
@@ -1345,6 +1427,7 @@ mod tests {
 
         for path in [
             "/api/auth/whoami",
+            "/api/team",
             "/api/tasks",
             "/api/tasks/task-1",
             "/api/stats",
@@ -1453,6 +1536,47 @@ mod tests {
             StatusCode::FORBIDDEN,
             "read-only must still refuse a write"
         );
+    }
+
+    #[tokio::test]
+    async fn api_team_separates_remote_humans_from_agents_without_inventing_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        ferryman_channel::register_expected_agent(&route, "john", "operator", &[]).unwrap();
+        ferryman_channel::register_expected_agent(&route, "builder", "worker", &[]).unwrap();
+
+        let state = state(&route, false);
+        let app = router(state.clone());
+        let token = signed_in(&app, &state).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/team")
+                    .header("x-ferryman-dashboard-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let team: Value = serde_json::from_slice(&body).unwrap();
+        let teammates = team["teammates"].as_array().unwrap();
+        let agents = team["agents"].as_array().unwrap();
+        assert!(teammates.iter().any(|person| person["name"] == "alice"));
+        assert!(
+            teammates
+                .iter()
+                .any(|person| { person["name"] == "john" && person["scope"] == "channel" })
+        );
+        assert!(!agents.iter().any(|agent| agent["name"] == "john"));
+        let builder = agents
+            .iter()
+            .find(|agent| agent["name"] == "builder")
+            .expect("worker appears as an agent");
+        assert!(builder["owner"].is_null());
+        assert_eq!(builder["access"], "unconfigured");
     }
 
     #[tokio::test]
