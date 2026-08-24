@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.5.1 - 2026-08-24
+
+### Fixed
+
+- A task's worktree starts from the default branch rather than from wherever
+  the checkout was left. 0.5.0 was tagged one commit before this landed, so the
+  release assets carried the bug while a build from main did not - the two
+  documented install paths disagreed about whether it existed.
+
+### Changed
+
+- The signing key's public half ships in `keys/estejosh.asc` with its
+  fingerprint in the release process, so a tag can be verified without a third
+  party being able to serve the key. 0.5.0 was signed and unverifiable
+  everywhere, which reads as checked from a distance and is worse than
+  unsigned.
+
 ### Added - dashboard team model and invitation prototype (`codex/novice-dashboard-ux`)
 
 - **Dashboard redesigned around human teams and agents.** A new home and
