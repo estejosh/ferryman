@@ -453,7 +453,7 @@ mod tests {
         ));
         fs::create_dir_all(&base).unwrap();
         let status = Command::new("git")
-            .args(["-C", base.to_str().unwrap(), "init", "-q"])
+            .args(["-C", base.to_str().unwrap(), "init", "-q", "--template="])
             .status()
             .unwrap();
         assert!(status.success());

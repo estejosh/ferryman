@@ -284,14 +284,19 @@ impl AgentConfig {
     /// never added silently for an engine the caller did not name.
     #[must_use]
     pub fn default_args(command: &str) -> Vec<String> {
-        let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
-        let suffix = std::env::consts::EXE_SUFFIX;
+        let file = command.rsplit(['/', '\\']).next().unwrap_or(command);
+        // Fold case FIRST, then strip the extension. Windows spells it however it
+        // likes - `OpenCode.EXE` and `opencode.exe` are one program - and stripping a
+        // lowercase ".exe" off "OpenCode.EXE" strips nothing, so the name missed the
+        // table below and every Windows OpenCode worker silently got Claude's args.
+        let file = file.to_ascii_lowercase();
+        let suffix = std::env::consts::EXE_SUFFIX.to_ascii_lowercase();
         let name = if suffix.is_empty() {
-            name
+            file.as_str()
         } else {
-            name.strip_suffix(suffix).unwrap_or(name)
+            file.strip_suffix(suffix.as_str()).unwrap_or(file.as_str())
         };
-        match name.to_ascii_lowercase().as_str() {
+        match name {
             // Verified against OpenCode's published CLI reference: `run` takes the
             // prompt positionally, `--auto` approves permissions that are not
             // explicitly denied, which a headless worker needs or nothing runs.
@@ -1643,16 +1648,43 @@ impl Drop for WorkerLock {
     }
 }
 
-/// Whether a pid belongs to a process that still exists.
+/// Whether a pid belongs to a process that still exists, on THIS machine.
 ///
-/// `/proc` on Linux, which is where this runs unattended. Anywhere else the honest answer
-/// is "cannot tell", and the safe reading of that is "assume it is alive": refusing to
-/// start twice is recoverable, and two engines writing one result is not.
+/// # Why this is not `/proc` and a shrug
+///
+/// It used to read `/proc/{pid}` on Linux and return `true` everywhere else, on the
+/// reasoning that "cannot tell" should be read as "assume alive". That reasoning is
+/// sound for the double-start it was written to prevent, and wrong for everything else
+/// built on top of it since. `true` forever means a lock left by a worker that died
+/// reads as a live worker forever: the takeover in ADR 0011 never fires, and `retire`
+/// refuses to release a worker that is already gone. The fleet could recover on Linux
+/// and nowhere else, which is exactly the shape of failure ADR 0011 exists to remove.
+/// CI on macOS and Windows had been saying so, in three failing tests.
+///
+/// `/proc` stays the Linux answer because it costs one `stat` rather than a walk of the
+/// process table. Elsewhere sysinfo - already a dependency of this crate - is asked
+/// about the one pid rather than all of them.
+///
+/// A pid can be recycled, and a zombie still has an entry. Both err towards "alive",
+/// which is the safe direction: the cost is one worker declining to start, not two
+/// engines writing one result.
 fn process_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        return Path::new(&format!("/proc/{pid}")).exists();
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
     }
-    true
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let pid = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        system.process(pid).is_some()
+    }
 }
 
 /// Whether a worker for `agent` is currently alive on this machine, by reading the
@@ -3822,7 +3854,7 @@ mod tests {
 
     fn init_bare(remote: &Path) {
         let status = std::process::Command::new("git")
-            .args(["init", "--bare", remote.to_str().unwrap()])
+            .args(["init", "--bare", "--template=", remote.to_str().unwrap()])
             .status()
             .expect("run git init --bare");
         assert!(status.success());
@@ -3887,7 +3919,7 @@ mod tests {
         let repo = unique("ferryman-agent-repo");
         let remote = unique("ferryman-agent-remote.git");
         fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["init", "-q", "--template="]);
         run_git(&repo, &["config", "user.email", "t@example.com"]);
         run_git(&repo, &["config", "user.name", "tester"]);
         fs::write(repo.join("f.txt"), "hello").unwrap();
@@ -3944,7 +3976,7 @@ mod tests {
         let repo = unique("ferryman-agent-repo");
         let remote = unique("ferryman-agent-remote.git");
         fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["init", "-q", "--template="]);
         run_git(&repo, &["config", "user.email", "t@example.com"]);
         run_git(&repo, &["config", "user.name", "tester"]);
         fs::write(repo.join("f.txt"), "hello").unwrap();
@@ -3997,7 +4029,7 @@ mod tests {
     fn a_push_failure_does_not_fail_the_task() {
         let repo = unique("ferryman-agent-repo");
         fs::create_dir_all(&repo).unwrap();
-        run_git(&repo, &["init", "-q"]);
+        run_git(&repo, &["init", "-q", "--template="]);
         run_git(&repo, &["config", "user.email", "t@example.com"]);
         run_git(&repo, &["config", "user.name", "tester"]);
         fs::write(repo.join("f.txt"), "hello").unwrap();

@@ -7102,8 +7102,11 @@ mod tests {
         let (temp, route) = fixture();
         let remote = temp.path().join("communications.git");
         fs::create_dir_all(&route.communications).unwrap();
-        test_git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
-        test_git(&route.communications, &["init", "-q"]);
+        test_git(
+            temp.path(),
+            &["init", "--bare", "--template=", remote.to_str().unwrap()],
+        );
+        test_git(&route.communications, &["init", "-q", "--template="]);
         test_git(
             &route.communications,
             &["config", "user.name", "Ferryman Test"],
@@ -7321,8 +7324,11 @@ mod tests {
         let (temp, route) = fixture();
         let remote = temp.path().join("communications.git");
         fs::create_dir_all(&route.communications).unwrap();
-        test_git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
-        test_git(&route.communications, &["init", "-q"]);
+        test_git(
+            temp.path(),
+            &["init", "--bare", "--template=", remote.to_str().unwrap()],
+        );
+        test_git(&route.communications, &["init", "-q", "--template="]);
         test_git(
             &route.communications,
             &["config", "user.name", "Ferryman Test"],

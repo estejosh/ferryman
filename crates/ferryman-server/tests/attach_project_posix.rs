@@ -80,7 +80,7 @@ fn posix_attachment_dry_run_is_framework_neutral_and_non_mutating() {
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("alpha");
     fs::create_dir_all(&workspace).unwrap();
-    assert_success(&git(&workspace, &["init", "-q"]));
+    assert_success(&git(&workspace, &["init", "-q", "--template="]));
     assert_success(&git(
         &workspace,
         &[
@@ -158,7 +158,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
         "endpoint = \"http://127.0.0.1:8796\"\nproject  = \"beta\"\n",
     )
     .unwrap();
-    assert_success(&git(&workspace, &["init", "-q"]));
+    assert_success(&git(&workspace, &["init", "-q", "--template="]));
     assert_success(&git(
         &workspace,
         &[
@@ -171,7 +171,7 @@ fn posix_attachment_apply_is_idempotent_and_pushes_only_portable_bootstrap() {
     let remote_before = git(&workspace, &["remote", "-v"]).stdout;
     assert_success(&git(
         fixture.path(),
-        &["init", "--bare", remote.to_str().unwrap()],
+        &["init", "--bare", "--template=", remote.to_str().unwrap()],
     ));
 
     let fake_gh = tools.join("gh");

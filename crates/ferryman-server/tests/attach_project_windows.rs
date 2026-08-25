@@ -42,10 +42,10 @@ fn attachment_adopts_history_is_idempotent_and_preserves_main_remote() {
     .unwrap();
     assert_success(&git(
         fixture.path(),
-        &["init", "--bare", remote.to_str().unwrap()],
+        &["init", "--bare", "--template=", remote.to_str().unwrap()],
     ));
 
-    assert_success(&git(&workspace, &["init", "-q"]));
+    assert_success(&git(&workspace, &["init", "-q", "--template="]));
     assert_success(&git(
         &workspace,
         &[
