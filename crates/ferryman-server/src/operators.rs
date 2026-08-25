@@ -280,17 +280,17 @@ impl OperatorStore {
         }
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let name = &ferryman_channel::canonical_agent_name(name);
         let identity = AgentIdentity::from_seed(name, seed);
 
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; 24];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut salt);
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut salt);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
         let cipher = XChaCha20Poly1305::new_from_slice(&derive_key(password, &salt, ITERATIONS))?;
         let sealed = cipher
-            .encrypt(XNonce::from_slice(&nonce), seed.as_ref())
+            .encrypt(&XNonce::from(nonce), seed.as_ref())
             .map_err(|_| anyhow::anyhow!("could not seal the operator key"))?;
 
         let record = OperatorRecord {
@@ -361,7 +361,8 @@ impl OperatorStore {
             XChaCha20Poly1305::new_from_slice(&derive_key(password, &salt, record.iterations))?;
         let seed = cipher
             .decrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::try_from(nonce.as_slice())
+                    .map_err(|_| anyhow::anyhow!("operator identity file is malformed"))?,
                 hex::decode(&record.sealed_seed_hex)?.as_ref(),
             )
             .map_err(|_| anyhow::anyhow!("operator name or password is incorrect"))?;

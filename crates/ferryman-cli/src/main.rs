@@ -3626,7 +3626,7 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
                      KeyChanged. Export from the machine whose key the roster already \
                      carries, or settle which key is the real one first.",
                     record.name,
-                    &record.public_key,
+                    record.public_key,
                     record.name,
                     known
                 )

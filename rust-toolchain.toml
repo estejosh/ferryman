@@ -1,9 +1,13 @@
 # Pin the toolchain so a local run and CI reach the same verdict.
 #
+# Raised 1.90 -> 1.97 on 2026-08-25, deliberately rather than as a side effect:
+# sysinfo 0.39 declares rustc 1.95 as its minimum, and a dependency bump must
+# never be the thing that silently moves the compiler under a project.
+#
 # CI used dtolnay/rust-toolchain@stable, which follows whatever stable is on the day,
 # while this machine had 1.90. Clippy gains lints between releases, so `cargo clippy`
 # passed locally and failed in CI on lints the local copy did not know about yet.
 # Pinning removes that class of surprise entirely; raise it deliberately.
 [toolchain]
-channel = "1.90"
+channel = "1.97"
 components = ["rustfmt", "clippy"]

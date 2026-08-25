@@ -444,7 +444,7 @@ pub fn list_grants(route: &ProjectRoute) -> Result<Vec<ListedGrant>> {
             token,
         });
     }
-    listed.sort_by(|a, b| a.token.issued_at.cmp(&b.token.issued_at));
+    listed.sort_by_key(|listing| listing.token.issued_at);
     Ok(listed)
 }
 

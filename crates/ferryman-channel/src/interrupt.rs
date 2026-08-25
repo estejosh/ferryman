@@ -159,7 +159,7 @@ pub fn pending_interrupts(
         }
         out.push(interrupt);
     }
-    out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    out.sort_by_key(|interrupt| interrupt.created_at);
     Ok(out)
 }
 

@@ -330,7 +330,7 @@ fn device_id_with(attachment: &Path, machine: Option<PathBuf>) -> Result<String>
     }
 
     let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     let id = hex::encode(bytes);
     if let Some(path) = &machine {
         let _ = write_local_device(path, &id);

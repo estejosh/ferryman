@@ -13,7 +13,7 @@
 # CROSS-COMPILE to $TARGETARCH. The alternative - letting the builder emulate the target
 # - once took six and a half hours for arm64 and published nothing, because emulated
 # Rust compilation is roughly 10-20x slower. Cross-compiling takes minutes.
-FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.90-bookworm AS build
+FROM --platform=$BUILDPLATFORM docker.io/library/rust:1.97-bookworm AS build
 ARG TARGETARCH
 ARG BUILDARCH
 

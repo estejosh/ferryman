@@ -1444,13 +1444,12 @@ pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
             // only to its holder. It must not make the task claimable by anyone else.
             TaskState::Claimed { .. }
             | TaskState::ChangesRequested { .. }
-            | TaskState::Stale { .. } => {
+            | TaskState::Stale { .. }
                 if task
                     .holder()
-                    .is_some_and(|held| held.eq_ignore_ascii_case(agent))
-                {
-                    out.push(task);
-                }
+                    .is_some_and(|held| held.eq_ignore_ascii_case(agent)) =>
+            {
+                out.push(task);
             }
             _ => {}
         }
@@ -1554,7 +1553,7 @@ impl AgentIdentity {
         }
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = SigningKey::from_bytes(&seed);
         if let Some(dir) = &machine_dir {
             Self::write_state_file(name, dir, &signing)?;
@@ -2278,7 +2277,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&route.attachment).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
 
         let store = TrustedSigners {
@@ -2341,7 +2340,7 @@ mod portable_auth_route_tests {
 
         // Enable enforcement by writing a trust store.
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2377,7 +2376,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&messages).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2421,7 +2420,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&messages).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2473,7 +2472,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&messages).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2568,7 +2567,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&messages).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2621,7 +2620,7 @@ mod portable_auth_route_tests {
         let route = test_route_with_agents(dir.path());
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2672,7 +2671,7 @@ mod portable_auth_route_tests {
         let route = test_route_with_agents(dir.path());
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2721,9 +2720,9 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&messages).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let orchestrator = ed25519_dalek::SigningKey::from_bytes(&seed);
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let worker = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![
@@ -2787,7 +2786,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&messages).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![SignerGrant {
@@ -2847,7 +2846,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&route.attachment).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
         let grant = SignerGrant {
             public_key: hex::encode(signing.verifying_key().as_bytes()),
@@ -2894,7 +2893,7 @@ mod portable_auth_route_tests {
         std::fs::create_dir_all(&keys).unwrap();
 
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let established = SigningKey::from_bytes(&seed);
         std::fs::write(keys.join("Fang.key"), hex::encode(established.to_bytes())).unwrap();
 
@@ -7389,9 +7388,9 @@ mod tests {
 
         // Trust store: the orchestrator issues, the builder acknowledges.
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let orchestrator = ed25519_dalek::SigningKey::from_bytes(&seed);
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let builder = ed25519_dalek::SigningKey::from_bytes(&seed);
         let store = TrustedSigners {
             signers: vec![

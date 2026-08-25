@@ -94,7 +94,7 @@ impl EncryptionIdentity {
         }
 
         let mut seed = [0_u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let secret = StaticSecret::from(seed);
         if let Some(dir) = &machine_dir {
             Self::write_state_file(&name, dir, &secret)?;
@@ -317,10 +317,10 @@ fn seal_value(
     let shared = ephemeral.diffie_hellman(recipient_public);
     let cipher = slot_cipher(&shared, &XPublicKey::from(ephemeral), recipient_public)?;
     let mut nonce = [0_u8; 24];
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
     let ciphertext = cipher
         .encrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: value.as_bytes(),
                 aad: &associated_data(name, project_id, recipient),
@@ -365,7 +365,7 @@ pub fn set_secret(
         };
         let public = XPublicKey::from(hex_decode_32(enc)?);
         let mut ephemeral_seed = [0_u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut ephemeral_seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut ephemeral_seed);
         let ephemeral = StaticSecret::from(ephemeral_seed);
         slots.push(seal_value(
             &ephemeral,
@@ -493,7 +493,7 @@ pub fn open_secret(
         hex::decode(&slot.ciphertext_hex).context("secret ciphertext is not valid hex")?;
     let plaintext = cipher
         .decrypt(
-            XNonce::from_slice(&nonce),
+            &XNonce::from(nonce),
             Payload {
                 msg: &ciphertext,
                 aad: &associated_data(&envelope.name, &envelope.project_id, &slot.recipient),
@@ -654,7 +654,7 @@ mod tests {
         assert!(
             naive
                 .decrypt(
-                    XNonce::from_slice(&nonce),
+                    &XNonce::try_from(nonce.as_slice()).unwrap(),
                     Payload {
                         msg: &ciphertext,
                         aad: &associated_data("token", "ferryman", "them"),
@@ -681,7 +681,7 @@ mod tests {
         let nonce = [7_u8; 24];
         let sealed = right
             .encrypt(
-                XNonce::from_slice(&nonce),
+                &XNonce::from(nonce),
                 Payload {
                     msg: b"x",
                     aad: b"",
@@ -691,7 +691,7 @@ mod tests {
         assert!(
             swapped
                 .decrypt(
-                    XNonce::from_slice(&nonce),
+                    &XNonce::from(nonce),
                     Payload {
                         msg: &sealed,
                         aad: b""

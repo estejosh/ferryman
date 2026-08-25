@@ -1554,7 +1554,7 @@ fn status_text(route: &ferryman_channel::ProjectRoute) -> String {
     // Newest first: the phone is for what is happening now, and the oldest task in a long
     // project is rarely the one being asked about.
     let mut tasks = tasks;
-    tasks.sort_by(|a, b| b.order.created_at.cmp(&a.order.created_at));
+    tasks.sort_by_key(|task| std::cmp::Reverse(task.order.created_at));
     for task in tasks.iter().take(12) {
         lines.push(format!(
             "{}  {}  {:?}",

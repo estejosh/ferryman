@@ -59,7 +59,7 @@ impl DashboardState {
         // at all - a standing one is a standing bypass of the thing it bootstrapped.
         let bootstrap = (!read_only && !operators.any()).then(|| {
             let mut bytes = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
             hex::encode(bytes)
         });
         Self {
@@ -173,7 +173,7 @@ impl Sessions {
     /// Start a session for an unlocked identity and return its bearer token.
     fn insert(&self, identity: AgentIdentity) -> String {
         let mut bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
         let token = hex::encode(bytes);
         self.inner.lock().unwrap().insert(
             token.clone(),

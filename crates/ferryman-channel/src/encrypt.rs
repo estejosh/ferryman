@@ -10,7 +10,7 @@ use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,
     aead::{Aead, KeyInit},
 };
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 /// Derive a 32-byte encryption key from a master secret with SHA-256.
@@ -33,7 +33,7 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<String> {
     let mut nonce = [0_u8; 12];
     rand::rng().fill_bytes(&mut nonce);
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .encrypt(&Nonce::from(nonce), plaintext)
         .map_err(|_| anyhow!("encryption failed"))?;
 
     let mut payload = Vec::with_capacity(nonce.len() + ciphertext.len());
@@ -56,7 +56,10 @@ pub fn decrypt(key: &[u8; 32], encoded: &str) -> Result<Vec<u8>> {
     let cipher =
         ChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow!("invalid encryption key"))?;
     cipher
-        .decrypt(Nonce::from_slice(nonce), ciphertext)
+        .decrypt(
+            &Nonce::try_from(nonce).map_err(|_| anyhow!("encrypted payload nonce is malformed"))?,
+            ciphertext,
+        )
         .map_err(|_| anyhow!("encrypted payload authentication failed"))
 }
 

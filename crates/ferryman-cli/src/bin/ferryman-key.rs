@@ -9,7 +9,7 @@ use chacha20poly1305::{
 };
 use clap::{Parser, Subcommand};
 use pbkdf2::pbkdf2_hmac;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{fs::OpenOptions, path::PathBuf};
@@ -120,7 +120,7 @@ fn main() -> Result<()> {
             rand::rng().fill_bytes(&mut nonce);
             let cipher = XChaCha20Poly1305::new_from_slice(&pairing_key(&passphrase, &salt))?;
             let ciphertext = cipher
-                .encrypt(XNonce::from_slice(&nonce), recovery_key.as_bytes())
+                .encrypt(&XNonce::from(nonce), recovery_key.as_bytes())
                 .map_err(|_| anyhow::anyhow!("could not encrypt recovery-key pairing file"))?;
             let pairing = PairingFile {
                 format: "ferryman-key-pairing/v1".into(),
@@ -169,7 +169,8 @@ fn main() -> Result<()> {
             let recovery_key = String::from_utf8(
                 cipher
                     .decrypt(
-                        XNonce::from_slice(&nonce),
+                        &XNonce::try_from(nonce.as_slice())
+                            .map_err(|_| anyhow::anyhow!("invalid pairing file nonce"))?,
                         hex::decode(pairing.ciphertext_hex)?.as_ref(),
                     )
                     .map_err(|_| {

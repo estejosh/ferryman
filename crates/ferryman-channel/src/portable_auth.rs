@@ -285,7 +285,7 @@ fn domain_separator(kind: &str) -> Vec<u8> {
 /// A fresh 128-bit nonce, hex-encoded.
 fn new_nonce() -> String {
     let mut bytes = [0u8; 16];
-    rand::RngCore::fill_bytes(&mut rand::rng(), &mut bytes);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
     hex::encode(bytes)
 }
 
@@ -453,7 +453,7 @@ mod tests {
 
     fn key() -> SigningKey {
         let mut seed = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rng(), &mut seed);
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         SigningKey::from_bytes(&seed)
     }
 

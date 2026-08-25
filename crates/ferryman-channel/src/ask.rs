@@ -47,7 +47,7 @@ pub fn ask(route: &ProjectRoute, question: &str) -> Result<Vec<Claim>> {
     scored.extend(ledger_claims(route, &q)?);
     scored.extend(learning_claims(route, &q)?);
     scored.extend(task_claims(route, &q)?);
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
+    scored.sort_by_key(|(_, score)| std::cmp::Reverse(*score));
     Ok(scored.into_iter().map(|(claim, _)| claim).collect())
 }
 

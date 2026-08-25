@@ -11,12 +11,13 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
+    aead::{Aead, KeyInit},
 };
 use ferryman_core::{
     Agent, Artifact, ConsentRequest, Event, Job, JobStatus, MemoryCandidate, Project,
     ProjectMemoryEntry,
 };
+use hmac::digest::KeyInit as HmacKeyInit;
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -186,7 +187,7 @@ pub async fn build_pack(state: &AppState, project_id: &str) -> Result<PackResult
     let compressed = zstd::stream::encode_all(plaintext.as_slice(), 6)?;
     let master_key = state.recovery_key()?;
     let mut data_key = [0u8; 32];
-    OsRng.fill_bytes(&mut data_key);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut data_key);
     let encrypted = encrypt(&data_key, &compressed)?;
     let wrapped = encrypt(&master_key, &data_key)?;
     let bundle = serde_json::to_vec(&encrypted)?;
@@ -451,9 +452,9 @@ fn encrypt(key: &[u8], plaintext: &[u8]) -> Result<Envelope> {
     let cipher =
         XChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow!("invalid encryption key"))?;
     let mut nonce = [0u8; 24];
-    OsRng.fill_bytes(&mut nonce);
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
     let ciphertext = cipher
-        .encrypt(XNonce::from_slice(&nonce), plaintext)
+        .encrypt(&XNonce::from(nonce), plaintext)
         .map_err(|_| anyhow!("encryption failed"))?;
     Ok(Envelope {
         nonce: nonce.to_vec(),
@@ -468,7 +469,8 @@ fn decrypt(key: &[u8], envelope: &Envelope) -> Result<Vec<u8>> {
         XChaCha20Poly1305::new_from_slice(key).map_err(|_| anyhow!("invalid encryption key"))?;
     cipher
         .decrypt(
-            XNonce::from_slice(&envelope.nonce),
+            &XNonce::try_from(envelope.nonce.as_slice())
+                .map_err(|_| anyhow!("invalid encryption nonce"))?,
             envelope.ciphertext.as_ref(),
         )
         .map_err(|_| anyhow!("encrypted pack authentication failed"))
@@ -479,8 +481,8 @@ fn unsigned_manifest(manifest: &PackManifest) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&copy)?)
 }
 fn manifest_hmac(key: &[u8], manifest: &PackManifest) -> Result<String> {
-    let mut mac =
-        <HmacSha256 as Mac>::new_from_slice(key).map_err(|_| anyhow!("invalid HMAC key"))?;
+    let mut mac = <HmacSha256 as HmacKeyInit>::new_from_slice(key)
+        .map_err(|_| anyhow!("invalid HMAC key"))?;
     mac.update(&unsigned_manifest(manifest)?);
     Ok(hex::encode(mac.finalize().into_bytes()))
 }

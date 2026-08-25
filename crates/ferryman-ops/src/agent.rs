@@ -2045,6 +2045,9 @@ pub async fn work_once(
                     acted += 1;
                 }
             }
+            // clippy would fold this `if` into a match guard. A guard cannot hold an
+            // `.await`, and this condition is the work itself.
+            #[allow(clippy::collapsible_match)]
             TaskState::Claimed { .. }
             | TaskState::ChangesRequested { .. }
             | TaskState::Stale { .. } => {

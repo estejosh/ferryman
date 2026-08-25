@@ -303,7 +303,7 @@ fn digest(value: &impl Serialize) -> Result<String> {
 mod tests {
     use super::*;
     use crate::portable_auth::{SignerGrant, TrustedSigners};
-    use rand::RngCore;
+    use rand::Rng;
     use serde_json::json;
 
     fn test_route(temp: &Path) -> ProjectRoute {
