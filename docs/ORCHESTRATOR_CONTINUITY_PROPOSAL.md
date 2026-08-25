@@ -116,7 +116,7 @@ Add a versioned, owner-signed policy to the channel rather than relying on local
 ```json
 {
   "schema": "ferryman.continuity-policy/v1",
-  "primary": "beastly",
+  "primary": "wisp",
   "candidate_pool": "project",
   "mode": "execute-when-authorized-else-propose",
   "quota_grace_secs": 0,
@@ -138,7 +138,7 @@ The worker writes a signed, secret-free availability record for its own identity
 ```json
 {
   "schema": "ferryman.agent-availability/v1",
-  "agent": "beastly",
+  "agent": "wisp",
   "state": "quota_exhausted",
   "scope": "engine",
   "failure_class": "provider_capacity",

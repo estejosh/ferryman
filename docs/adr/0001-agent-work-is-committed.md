@@ -1,0 +1,11 @@
+# ADR 0001: An agent's work is committed, kept, and offered upstream
+
+When a worker finishes a task that changed files, it commits those changes on that task's branch - `ferryman-<order>-<agent>`, derived from the signed order and the agent - keeps the branch and its checkout, and pushes the branch to the configured remote if there is one.
+
+Committing is the part that is not optional. The branch name already rides in the result and the head commit is signed into it as `worktree_head`; a reviewer verifying that a result matches a commit needs the commit to exist. Uncommitted changes sitting in a checkout are not addressable by anything the protocol carries.
+
+The branch is not merged. A merge is a judgement about whether the work is correct, and that judgement belongs to review - an accepted result, a human, or the master - not to the worker that produced it. A worker that merged its own output would be grading its own paper on the one branch everyone else builds from, and would do it before any reviewer had seen the result it had just signed. Nothing is lost by waiting: the branch is there, named after the order it came from, for whoever decides.
+
+Pushing is opt-in and fails soft. A workspace with no remote is the ordinary case - ADR 0006 has the bridge never configure one and refuse a workspace that already has one - so a push that were required would turn every private repository into a failed task. Where a remote is configured and the push fails, because the machine is offline, or has no credentials, or the remote rejects it, the failure is reported and the task still succeeds: the work is already committed locally and a push can be retried, whereas a discarded result cannot be recovered. The push is delivery, not the record.
+
+Previously the worker did the opposite. Having read the head commit into the result, it called `remove_worktree`, which force-removes the checkout and then runs `git branch -D`. Every task ended by destroying its own output. The result carried a `worktree_head` sha pointing at nothing reachable, so it could not be verified, reviewed, or built on, and the only surviving trace of the work was the prose in the result payload. Work that does not outlive the task is not work.
