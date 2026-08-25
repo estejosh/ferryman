@@ -819,6 +819,7 @@ fn seat_signer(agent: &str, desks: &[Desk]) -> Result<()> {
             role: "operator".to_string(),
             capabilities: Vec::new(),
             public_key: None,
+            encryption_key: None,
         };
         match identity
             .seat_in(&desk.route.attachment)

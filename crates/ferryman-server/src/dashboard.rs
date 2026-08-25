@@ -2057,7 +2057,8 @@ mod tests {
         let route = test_route(dir.path());
         std::fs::create_dir_all(route.communications.join("agents")).unwrap();
         // A recipient agent with a published encryption key.
-        let recipient = ferryman_channel::secrets::EncryptionIdentity::from_seed("beastly", [1_u8; 32]);
+        let recipient =
+            ferryman_channel::secrets::EncryptionIdentity::from_seed("beastly", [1_u8; 32]);
         let roster = AgentRoute {
             name: "beastly".into(),
             role: "worker".into(),
@@ -2075,10 +2076,22 @@ mod tests {
         let app = router(dashboard_state.clone());
         let token = signed_in(&app, &dashboard_state).await;
 
-        let denied = post(&app, "/api/secrets", r#"{"name":"GH_TOKEN","value":"x","recipients":["beastly"]}"#, None).await;
+        let denied = post(
+            &app,
+            "/api/secrets",
+            r#"{"name":"GH_TOKEN","value":"x","recipients":["beastly"]}"#,
+            None,
+        )
+        .await;
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
 
-        let created = post(&app, "/api/secrets", r#"{"name":"GH_TOKEN","value":"ghp_secret","recipients":["beastly"]}"#, Some(&token)).await;
+        let created = post(
+            &app,
+            "/api/secrets",
+            r#"{"name":"GH_TOKEN","value":"ghp_secret","recipients":["beastly"]}"#,
+            Some(&token),
+        )
+        .await;
         assert_eq!(created.status(), StatusCode::OK, "body: {:?}", {
             let body = created.into_body().collect().await.unwrap().to_bytes();
             String::from_utf8_lossy(&body).to_string()

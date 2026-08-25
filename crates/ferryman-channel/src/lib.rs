@@ -1801,6 +1801,7 @@ impl AgentIdentity {
         let signature = self.signing.sign(release_payload(release).as_bytes());
         release.signed_by = Some(self.name.clone());
         release.signature = Some(hex::encode(signature.to_bytes()));
+    }
 
     /// Sign arbitrary bytes and return the hex signature.
     ///
@@ -8578,7 +8579,7 @@ mod work_over_files_tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(fang.public_key_hex()),
-                encryption_key: None,
+            encryption_key: None,
         }];
         let mut r = TaskResult {
             order_id: "t-1".into(),
@@ -8607,7 +8608,7 @@ mod work_over_files_tests {
             role: "orchestrator".into(),
             capabilities: vec![],
             public_key: Some(wisp.public_key_hex()),
-                encryption_key: None,
+            encryption_key: None,
         }];
         let mut v = Review {
             order_id: "t-1".into(),

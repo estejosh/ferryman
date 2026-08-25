@@ -284,6 +284,7 @@ mod tests {
             role: "bridge".to_string(),
             capabilities: Vec::new(),
             public_key: Some(id.public_key_hex()),
+            encryption_key: None,
         }];
         assert!(matches!(
             verify_conversation(&bank, "Shop", &roster),

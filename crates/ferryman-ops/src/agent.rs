@@ -2350,8 +2350,8 @@ async fn do_work(
     // credential, and a reference this machine cannot decrypt fails loudly
     // rather than reaching the engine as an empty or literal string.
     let credentials: Vec<(String, String)> = {
-        let loaded = ferryman_channel::credentials::load_credentials(&route.attachment)
-            .unwrap_or_default();
+        let loaded =
+            ferryman_channel::credentials::load_credentials(&route.attachment).unwrap_or_default();
         let encryption = ferryman_channel::secrets::EncryptionIdentity::load_existing(
             &config.agent,
             &route.attachment,

@@ -135,6 +135,16 @@ impl EncryptionIdentity {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, hex::encode(secret.to_bytes()))?;
+        // A private key gets 0600, the same as the signing key in `lib.rs`.
+        // Without this it lands at whatever the umask allows, which on a shared
+        // machine is readable by anyone with an account - and a key that anyone
+        // can read is not a key, it is a formality.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("lock down {}", path.display()))?;
+        }
         crate::restrict_to_owner(&path)?;
         Ok(())
     }

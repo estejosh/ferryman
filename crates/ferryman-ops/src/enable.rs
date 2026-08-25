@@ -296,8 +296,10 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // The encryption key is the recipient half of sealed secrets: X25519, kept
     // beside the signing key, never synced. Generated at enable so this machine
     // is a valid recipient the moment it can do work.
-    let encryption =
-        ferryman_channel::secrets::EncryptionIdentity::load_or_create(&agent_name, &route.attachment)?;
+    let encryption = ferryman_channel::secrets::EncryptionIdentity::load_or_create(
+        &agent_name,
+        &route.attachment,
+    )?;
     let roster_entry = AgentRoute {
         name: agent_name.clone(),
         role: request.role.clone(),

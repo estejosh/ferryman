@@ -4115,8 +4115,13 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
-            let path =
-                ferryman_channel::secrets::set_secret(route, &identity, &name, &value, &recipients)?;
+            let path = ferryman_channel::secrets::set_secret(
+                route,
+                &identity,
+                &name,
+                &value,
+                &recipients,
+            )?;
             println!("sealed '{name}' for {} recipient(s)", recipients.len());
             println!("  written to {}", path.display());
             println!("  signed by '{signer_name}'");
@@ -4140,8 +4145,10 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
         }
         SecretCommand::Get { name } => {
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
-            let Some(identity) =
-                ferryman_channel::secrets::EncryptionIdentity::load_existing(&agent, &route.attachment)?
+            let Some(identity) = ferryman_channel::secrets::EncryptionIdentity::load_existing(
+                &agent,
+                &route.attachment,
+            )?
             else {
                 bail!(
                     "this machine's agent ('{agent}') has no encryption key; \
@@ -4279,6 +4286,7 @@ fn channel(command: Channel) -> Result<()> {
                     role: role.clone(),
                     capabilities: Vec::new(),
                     public_key: None,
+                    encryption_key: None,
                 };
                 match identity.seat_in(&route.attachment).and_then(|()| {
                     ferryman_channel::register_agent_key(route, &published, &identity)
