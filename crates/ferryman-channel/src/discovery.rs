@@ -97,6 +97,7 @@ mod tests {
             role: "worker".into(),
             capabilities: caps.iter().map(|c| c.to_string()).collect(),
             public_key: None,
+            encryption_key: None,
         }
     }
 

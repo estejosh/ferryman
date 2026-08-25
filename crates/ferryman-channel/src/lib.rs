@@ -30,6 +30,7 @@ pub mod master;
 pub mod memory;
 pub mod migration;
 pub mod portable_auth;
+pub mod secrets;
 pub mod skills;
 pub mod source;
 pub mod trajectory;
@@ -210,6 +211,11 @@ pub struct AgentRoute {
     /// The PRIVATE half never appears here, or anywhere else in the channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// This agent's X25519 public key for sealed secrets, hex encoded. Absent
+    /// until the agent has generated its encryption keypair (at `join`). The
+    /// private half never appears here; it stays beside the signing key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1796,6 +1802,17 @@ impl AgentIdentity {
         release.signed_by = Some(self.name.clone());
         release.signature = Some(hex::encode(signature.to_bytes()));
     }
+
+    /// Sign arbitrary bytes and return the hex signature.
+    ///
+    /// The built-in `sign_*` methods each know their own canonical payload; an
+    /// envelope that is not one of those (a sealed secret) builds its payload
+    /// string in its own module and signs it here, so it still verifies against
+    /// the roster through the same key.
+    #[must_use]
+    pub fn sign_bytes(&self, bytes: &[u8]) -> String {
+        hex::encode(self.signing.sign(bytes).to_bytes())
+    }
 }
 
 fn order_payload(order: &Order) -> String {
@@ -2248,6 +2265,7 @@ mod portable_auth_route_tests {
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: None,
+                encryption_key: None,
             }],
             ..test_route(dir)
         }
@@ -2918,6 +2936,7 @@ mod portable_auth_route_tests {
                     role: "worker".into(),
                     capabilities: Vec::new(),
                     public_key: Some(key.into()),
+                    encryption_key: None,
                 })
                 .unwrap(),
             )
@@ -2959,10 +2978,12 @@ mod portable_auth_route_tests {
             role: "worker".into(),
             capabilities: Vec::new(),
             public_key: None,
+            encryption_key: None,
         };
         let real = AgentRoute {
             name: "Fang".into(),
             public_key: Some("cc".repeat(32)),
+            encryption_key: None,
             ..reservation.clone()
         };
         for input in [
@@ -3009,12 +3030,14 @@ mod portable_auth_route_tests {
                 role: "orchestrator".into(),
                 capabilities: Vec::new(),
                 public_key: None,
+                encryption_key: None,
             },
             AgentRoute {
                 name: "Fang".into(),
                 role: "operator".into(),
                 capabilities: Vec::new(),
                 public_key: None,
+                encryption_key: None,
             },
         ];
         let error = route.validate().unwrap_err();
@@ -3061,6 +3084,7 @@ mod portable_auth_route_tests {
                 role: "worker".into(),
                 capabilities: vec!["build".into()],
                 public_key: None,
+                encryption_key: None,
             }],
             ..test_route(dir.path())
         };
@@ -3096,6 +3120,7 @@ pub fn register_agent_key(
         role: agent.role.clone(),
         capabilities: agent.capabilities.clone(),
         public_key: Some(identity.public_key_hex()),
+        encryption_key: agent.encryption_key.clone(),
     };
     if let Some(existing) = read_agent_roster(&route.communications)?
         .into_iter()
@@ -3309,6 +3334,25 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
                 let _ = std::fs::write(&pin, key);
             }
         }
+        // The same pinning applies to the encryption key, for the same reason:
+        // a peer overwriting an agent's X25519 key would otherwise redirect the
+        // next secret sealed to that agent. Trust-on-first-use, and only when a
+        // key is actually present.
+        if let Some(enc) = agent.encryption_key.as_ref().filter(|k| !k.is_empty()) {
+            let enc_pin = pin_path(attachment, &format!("{}.enc", agent.name));
+            match std::fs::read_to_string(&enc_pin) {
+                Ok(pinned) if pinned.trim() != enc.as_str() => {
+                    agent.encryption_key = Some(pinned.trim().to_string());
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    if let Some(parent) = enc_pin.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::write(&enc_pin, enc);
+                }
+            }
+        }
     }
     // An agent's public key should not depend on which repository you ask about. The
     // fleet channel is where identity belongs; the project copy stays authoritative for
@@ -3405,6 +3449,7 @@ pub fn register_expected_agent(
             role: role.to_string(),
             capabilities: capabilities.to_vec(),
             public_key: None,
+            encryption_key: None,
         },
     )
 }
@@ -6145,6 +6190,7 @@ mod tests {
                     role: "builder".into(),
                     capabilities: vec!["code".into()],
                     public_key: None,
+                    encryption_key: None,
                 }],
             },
         )
@@ -7539,6 +7585,7 @@ mod serverless_tests {
                 role: "worker".into(),
                 capabilities: vec!["messages.receive".into()],
                 public_key: None,
+                encryption_key: None,
             },
         )
         .unwrap();
@@ -7549,6 +7596,7 @@ mod serverless_tests {
                 role: "orchestrator".into(),
                 capabilities: vec!["messages.receive".into(), "review".into()],
                 public_key: None,
+                encryption_key: None,
             },
         )
         .unwrap();
@@ -7576,6 +7624,7 @@ mod serverless_tests {
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: None,
+                encryption_key: None,
             },
         )
         .unwrap();
@@ -7605,6 +7654,7 @@ mod serverless_tests {
                         role: "worker".into(),
                         capabilities: vec![],
                         public_key: None,
+                        encryption_key: None,
                     },
                 )
                 .is_err(),
@@ -7624,6 +7674,7 @@ mod serverless_tests {
                 role: "worker".into(),
                 capabilities: vec!["messages.receive".into()],
                 public_key: None,
+                encryption_key: None,
             },
         )
         .unwrap();
@@ -7705,6 +7756,7 @@ mod identity_tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }]
     }
 
@@ -7840,6 +7892,7 @@ mod identity_tests {
             role: "orchestrator".into(),
             capabilities: vec![],
             public_key: None,
+            encryption_key: None,
         };
 
         let first = AgentIdentity::load_or_create("wisp", &attachment).unwrap();
@@ -7912,6 +7965,7 @@ mod work_over_files_tests {
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: Some(identity.public_key_hex()),
+                encryption_key: None,
             });
             identities.insert(name.to_string(), identity);
         }
@@ -8475,12 +8529,14 @@ mod work_over_files_tests {
                 role: "orchestrator".into(),
                 capabilities: vec![],
                 public_key: Some(wisp.public_key_hex()),
+                encryption_key: None,
             },
             AgentRoute {
                 name: "fang".into(),
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(fang.public_key_hex()),
+                encryption_key: None,
             },
         ];
 
@@ -8523,6 +8579,7 @@ mod work_over_files_tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(fang.public_key_hex()),
+            encryption_key: None,
         }];
         let mut r = TaskResult {
             order_id: "t-1".into(),
@@ -8551,6 +8608,7 @@ mod work_over_files_tests {
             role: "orchestrator".into(),
             capabilities: vec![],
             public_key: Some(wisp.public_key_hex()),
+            encryption_key: None,
         }];
         let mut v = Review {
             order_id: "t-1".into(),

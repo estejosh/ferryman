@@ -63,6 +63,7 @@ tracing-opentelemetry = "0.32"
 serde = { version = "1.0", features = ["derive"] }
 serde_jcs = "0.2"
 serde_json = "1.0"
+hkdf = "0.12"
 sha2 = "0.10"
 system-idle-time = "1.0"
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
@@ -75,6 +76,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
 wait-timeout = "0.2"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
 zstd = "0.13"
 
 [workspace.lints.rust]

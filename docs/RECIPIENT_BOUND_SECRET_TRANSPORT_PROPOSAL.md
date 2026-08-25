@@ -19,6 +19,13 @@ Every screen states what changes, what stays local, and who remains in control.
 
 - A grant has one human recipient. Groups, wildcard recipients, and recipient
   delegation are invalid.
+- A secret may additionally be sealed to a *machine*, so unattended work can
+  open a credential with nobody present. That is not a second, independent
+  grant: every machine recipient is recorded against the person who owns it,
+  and revoking the person revokes their machines in the same act. See
+  ADR 0010, "Who a secret may be sealed to". Two independent lists would leave
+  a revoked teammate's laptop working, which is the failure this rule exists to
+  prevent.
 - Human signing keys and human encryption keys are separate key pairs. Existing
   Ed25519 identity material must not be reused as an encryption key.
 - The key value is accepted only by the owner's encrypted local vault. It is

@@ -293,11 +293,19 @@ pub fn perform(request: Request) -> Result<Outcome> {
     let key_path = attachment.join("keys").join(format!("{agent_name}.key"));
     let key_created = !key_path.exists();
     let identity = ferryman_channel::AgentIdentity::load_or_create(&agent_name, &route.attachment)?;
+    // The encryption key is the recipient half of sealed secrets: X25519, kept
+    // beside the signing key, never synced. Generated at enable so this machine
+    // is a valid recipient the moment it can do work.
+    let encryption = ferryman_channel::secrets::EncryptionIdentity::load_or_create(
+        &agent_name,
+        &route.attachment,
+    )?;
     let roster_entry = AgentRoute {
         name: agent_name.clone(),
         role: request.role.clone(),
         capabilities: vec!["messages.receive".to_string()],
         public_key: None,
+        encryption_key: Some(encryption.public_key_hex()),
     };
     // Checked before the write, not after: registering is safe to repeat, but reporting
     // "created" every time would make `already_configured` permanently false and tell a

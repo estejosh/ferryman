@@ -401,6 +401,7 @@ mod tests {
             role: "worker".into(),
             capabilities: vec![],
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         }];
         (route, identity)
     }
@@ -460,12 +461,14 @@ mod tests {
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: Some(alice.public_key_hex()),
+                encryption_key: None,
             },
             crate::AgentRoute {
                 name: "bob".into(),
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: Some(bob.public_key_hex()),
+                encryption_key: None,
             },
         ];
 
@@ -507,12 +510,14 @@ mod tests {
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: Some(alice.public_key_hex()),
+                encryption_key: None,
             },
             crate::AgentRoute {
                 name: "bob".into(),
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: Some(bob.public_key_hex()),
+                encryption_key: None,
             },
         ];
         append_ledger_entry(&route, &alice, "order", "alice", "issued t-1", Some("t-1")).unwrap();

@@ -524,12 +524,14 @@ mod tests {
                 role: "master".into(),
                 capabilities: vec![],
                 public_key: Some(master.public_key_hex()),
+                encryption_key: None,
             },
             AgentRoute {
                 name: "worker".into(),
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(worker.public_key_hex()),
+                encryption_key: None,
             },
         ];
         crate::master::initialize_master(&route, &master, "master").unwrap();
@@ -568,12 +570,14 @@ mod tests {
                 role: "master".into(),
                 capabilities: vec![],
                 public_key: Some(master.public_key_hex()),
+                encryption_key: None,
             },
             AgentRoute {
                 name: "mallory".into(),
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(mallory.public_key_hex()),
+                encryption_key: None,
             },
         ];
         crate::master::initialize_master(&route, &master, "master").unwrap();
@@ -620,12 +624,14 @@ mod grant_tests {
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(issuer.public_key_hex()),
+                encryption_key: None,
             },
             AgentRoute {
                 name: "stranger".into(),
                 role: "worker".into(),
                 capabilities: vec![],
                 public_key: Some(stranger.public_key_hex()),
+                encryption_key: None,
             },
         ];
         (route, issuer, stranger)
@@ -761,6 +767,7 @@ mod grant_tests {
             role: "master".into(),
             capabilities: vec![],
             public_key: Some(master_identity.public_key_hex()),
+            encryption_key: None,
         });
         crate::master::initialize_master(&route, &master_identity, "master").unwrap();
 

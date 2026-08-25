@@ -463,6 +463,7 @@ mod tests {
             role: "worker".to_string(),
             capabilities: Vec::new(),
             public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
         };
         (identity, route)
     }

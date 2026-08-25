@@ -248,8 +248,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
     </div>
   </nav>
 
-  <main class="main" id="main"></main>
-</div>
+  <main class="main" id="main"></main></div>
 
 <aside class="drawer" id="drawer" aria-hidden="true">
   <header>
@@ -810,7 +809,6 @@ async function boot() {
 // makes the log unreadable.
 setInterval(() => { if (state.me) refresh().catch(() => {}); }, 20000);
 
-boot().catch(() => showLogin());
-</script>
+boot().catch(() => showLogin());</script>
 </body>
 </html>

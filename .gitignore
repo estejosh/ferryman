@@ -35,3 +35,10 @@ memory-bank
 # PRIVATE SIGNING KEY. None of it belongs in the work repository - committing
 # .ferryman/keys would publish an identity every machine in your fleet trusts.
 /.ferryman/
+
+# Scratch shells from debugging sessions. They are useful on the machine that
+# wrote them and meaningless anywhere else; one of them got committed by an
+# over-broad `git add -A` during a conflict resolution.
+sandbox*.sh
+sbxresult.sh
+BEASTLYWSL_PROMPT.md
