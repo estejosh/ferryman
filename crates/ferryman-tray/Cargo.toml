@@ -23,7 +23,7 @@ description = "Ferryman in the system tray: what it is doing, and a switch to st
 anyhow = "1.0"
 ferryman-channel = { path = "../ferryman-channel" }
 ferryman-ops = { path = "../ferryman-ops" }
-tray-icon = "0.19"
+tray-icon = "0.24"
 winit = "0.30"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
