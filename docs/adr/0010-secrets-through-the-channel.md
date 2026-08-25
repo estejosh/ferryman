@@ -161,3 +161,44 @@ uses. Negative: no revocation short of rotation (once ciphertext has synced it i
 disks and in Syncthing's history), and a leaked recipient encryption key exposes
 everything ever sealed to it. The fleet folder is deliberately not used.
 
+## Who a secret may be sealed to
+
+A recipient is a name on the project roster that has published an encryption
+key. Both kinds qualify, and they do different jobs:
+
+- a **machine**, so a worker can open a credential mid-task with nobody
+  present. This is the whole point: set a key once, and stop carrying it
+  between computers.
+- a **person**, so access can be granted and taken away from someone rather
+  than from a box.
+
+They are not independent. **A machine's access hangs off its owner's.**
+
+Every recipient slot records the person the recipient belongs to. For an
+operator that is themselves; for a machine it is whoever owns the machine.
+Revoking a person revokes every machine recorded as theirs, in the same act.
+
+### Why not two independent lists
+
+Because the hole is silent. Seal a secret to a teammate *and* to their laptop as
+separate recipients, revoke the teammate, and the laptop keeps working - it
+holds its own envelope, sealed to its own key, and nothing about revoking the
+person touched it. You would have to remember which machines were theirs and
+chase each one, and the failure mode of forgetting is a credential that still
+works for someone who left.
+
+One owner, one place to revoke.
+
+### What this does not change
+
+Nothing about the cryptography. A recipient slot is still a content key wrapped
+to that recipient's X25519 public key, and only the holder of the matching
+private key can open it. The owner is recorded beside the slot as signed
+metadata, not folded into the derivation - so an envelope stays verifiable and
+openable exactly as before, and this is a statement about authority rather than
+about secrecy.
+
+And it does not make revocation retroactive. A machine that opened a secret
+before the revocation synced has the plaintext, and no signed record can reach
+back and unlearn it. The upstream credential still has to be rotated. That is a
+property of secrets, not a gap in this design.
