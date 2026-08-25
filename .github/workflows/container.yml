@@ -53,7 +53,7 @@ jobs:
       # hours and published nothing, so do not reintroduce a QEMU setup step here.
       # arm64 matters: every Mac since 2020 is Apple Silicon.
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         timeout-minutes: 45
         with:
           context: .
