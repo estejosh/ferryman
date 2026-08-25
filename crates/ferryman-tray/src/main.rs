@@ -113,7 +113,9 @@ impl Tray {
         let text = match paused {
             Some(note) => format!("Paused - {note}"),
             None => match ferryman_ops::governor::presence() {
-                ferryman_ops::governor::Presence::Active(idle) if idle < Duration::from_secs(300) => {
+                ferryman_ops::governor::Presence::Active(idle)
+                    if idle < Duration::from_secs(300) =>
+                {
                     format!("Waiting - you used this machine {}s ago", idle.as_secs())
                 }
                 _ => match ferryman_ops::governor::available_memory_mb() {
@@ -175,7 +177,11 @@ impl ApplicationHandler for Tray {
     ) {
     }
 
-    fn new_events(&mut self, loop_: &winit::event_loop::ActiveEventLoop, _: winit::event::StartCause) {
+    fn new_events(
+        &mut self,
+        loop_: &winit::event_loop::ActiveEventLoop,
+        _: winit::event::StartCause,
+    ) {
         // Also here, not only in `resumed`: whether `resumed` fires on a desktop platform
         // for an application that never opens a window is not something to bet the whole
         // feature on, and this handler runs regardless.
