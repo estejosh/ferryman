@@ -40,6 +40,22 @@ http-body-util = "0.1"
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled", "chrono"] }
+# The OpenTelemetry crates move as a set, and the set is held at 0.31 by
+# `tracing-opentelemetry`, which at 0.32.1 still depends on `opentelemetry`
+# 0.31. Bumping any of the first three to 0.32 on its own puts two versions of
+# `opentelemetry` in the graph, and then the 0.32 SDK's exporter no longer
+# satisfies a trait that came from the 0.31 API:
+#
+#   the trait `opentelemetry_sdk::trace::SpanExporter` is not implemented
+#   for `opentelemetry_otlp::SpanExporter`
+#   no method named `tracer` found for struct `SdkTracerProvider`
+#
+# Dependabot proposes exactly that bump, because from a single crate's point of
+# view it looks safe. It is not, and it was measured rather than assumed: the
+# whole family was moved to 0.32 together and it still failed, because
+# tracing-opentelemetry drags 0.31 back in regardless.
+#
+# These four move together, when tracing-opentelemetry ships against 0.32.
 opentelemetry = { version = "0.31", features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-client"] }

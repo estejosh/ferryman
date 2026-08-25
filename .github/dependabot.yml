@@ -1,0 +1,47 @@
+version: 2
+
+# Ferryman's dependencies, watched weekly.
+#
+# The OpenTelemetry crates are excluded on purpose. They only work as a set, and
+# the set is currently held at 0.31 by tracing-opentelemetry, which still
+# depends on opentelemetry 0.31 as of 0.32.1. A single-crate bump puts two
+# versions of opentelemetry in the graph and the workspace stops compiling -
+# tested, not assumed, including with the whole family moved together.
+#
+# Dependabot cannot see that constraint, so it will keep proposing the bump and
+# the bump will keep being unmergeable. Ignoring it here means the alert list
+# stays meaningful: what is left in it is worth reading.
+#
+# Remove this block when tracing-opentelemetry ships against opentelemetry 0.32.
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: opentelemetry
+      - dependency-name: opentelemetry_sdk
+      - dependency-name: opentelemetry-otlp
+      - dependency-name: tracing-opentelemetry
+
+  - package-ecosystem: cargo
+    directory: /crates/ferryman-tray
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: opentelemetry
+      - dependency-name: opentelemetry_sdk
+      - dependency-name: opentelemetry-otlp
+      - dependency-name: tracing-opentelemetry
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
