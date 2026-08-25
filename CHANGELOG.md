@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.5.2 - 2026-08-25
+
+### Fixed
+
+- A build from the v0.5.1 tag stamped itself `-dirty`, every time, forever. The
+  manifest at that tag said 0.5.1 and the lockfile still said 0.5.0 for the six
+  workspace crates, so cargo rewrote those lines before `build.rs` asked git
+  whether the tree was clean - and `--locked` refused outright. The lockfile is
+  part of the version bump now rather than a commit that follows it.
+
 ## 0.5.1 - 2026-08-24
 
 ### Fixed
