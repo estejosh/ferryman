@@ -122,6 +122,6 @@ change on an existing install.
 
 ## Still not a path for secrets
 
-Everything in the bridge's own warning applies per
+Everything in Ferryman's own warning applies per
 topic. A Telegram cloud chat is not end-to-end encrypted, and a group is a chat with more
 people in it. Orders, yes. Credentials, never.

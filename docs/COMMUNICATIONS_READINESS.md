@@ -108,8 +108,8 @@ old communications checkout.
 Windows dry run:
 
 ```powershell
-& X:\ferryman\scripts\attach-project.ps1 `
-  -Workspace X:\example `
+& C:\ferryman\scripts\attach-project.ps1 `
+  -Workspace C:\example `
   -Project example `
   -SharedRemote example-bridge `
   -GitRemote https://github.com/OWNER/example-bridge.git `

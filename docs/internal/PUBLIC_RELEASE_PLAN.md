@@ -12,7 +12,7 @@ Publish this repository as a transparent, **self-hosted, local-first team coordi
 2. Complete `openapi/openapi.yaml` for every supported v0.1 endpoint, including schemas, authentication, error responses, idempotency, pagination, SSE, agents, recovery memory, artifacts, and worker actions.
 3. Either implement or remove/mark experimental any advertised behavior that does not work end-to-end. In particular, make `tail logs` consume SSE instead of only printing its URL, and define artifact download/listing behavior.
 4. Add an API compatibility policy: `/v1` is additive-only; breaking changes require `/v2` or a major version.
-5. Add a concise `docs/OPERATING_MODEL.md` explaining that the Bridge is a control plane and recovery source—not an agent or autonomous orchestrator.
+5. Add a concise `docs/OPERATING_MODEL.md` explaining that Ferryman is a control plane and recovery source—not an agent or autonomous orchestrator.
 
 **Done when:** a fresh user can follow README examples and every command/route is either verified or explicitly marked unavailable.
 

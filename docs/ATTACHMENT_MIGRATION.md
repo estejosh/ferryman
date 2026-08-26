@@ -5,7 +5,7 @@ these commands. Run the read-only safety scanner first and show its result to
 the user:
 
 ```powershell
-& X:\ferryman\scripts\scan-project-safety.ps1 -Workspace X:\example
+& C:\ferryman\scripts\scan-project-safety.ps1 -Workspace C:\example
 ```
 
 Use `scripts/attach-project.ps1` on Windows or `scripts/attach-project.sh` on
@@ -47,8 +47,8 @@ plans to register the dedicated sync separately.
 Generic Windows dry run:
 
 ```powershell
-& X:\ferryman\scripts\attach-project.ps1 `
-  -Workspace X:\example `
+& C:\ferryman\scripts\attach-project.ps1 `
+  -Workspace C:\example `
   -Project example `
   -SharedRemote example-bridge `
   -GitRemote https://github.com/OWNER/example-bridge.git `

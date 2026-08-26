@@ -592,7 +592,7 @@ mod tests {
 
     fn recipient(dir: &Path, state: &str) -> EncryptionIdentity {
         EncryptionIdentity::load_or_create_in(
-            "beastly",
+            "harbor",
             &dir.join(state),
             Some(dir.join(format!("{state}-machine"))),
         )
@@ -609,7 +609,7 @@ mod tests {
                 encryption_key: None,
             },
             AgentRoute {
-                name: "beastly".into(),
+                name: "harbor".into(),
                 role: "worker".into(),
                 capabilities: Vec::new(),
                 public_key: None,
@@ -715,7 +715,7 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
         assert!(path.is_file());
@@ -736,7 +736,7 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
@@ -787,7 +787,7 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
@@ -825,14 +825,14 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
         // Same NAME, different key material - the signature still verifies, but
         // the AEAD seal cannot be opened by a key it was not made for.
         let wrong_key =
-            EncryptionIdentity::load_or_create_in("beastly", &dir.path().join("other"), None)
+            EncryptionIdentity::load_or_create_in("harbor", &dir.path().join("other"), None)
                 .unwrap();
         let err = open_secret(&route, "GH_TOKEN", &wrong_key)
             .unwrap_err()
@@ -852,7 +852,7 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
@@ -881,7 +881,7 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
@@ -911,7 +911,7 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
@@ -937,14 +937,14 @@ mod tests {
             &signer,
             "GH_TOKEN",
             "ghp_supersecret",
-            &["beastly".into()],
+            &["harbor".into()],
         )
         .unwrap();
 
         let summaries = list_secrets(&route).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].name, "GH_TOKEN");
-        assert_eq!(summaries[0].recipients, vec!["beastly".to_string()]);
+        assert_eq!(summaries[0].recipients, vec!["harbor".to_string()]);
         assert_eq!(summaries[0].signed_by.as_deref(), Some("op"));
         assert_eq!(summaries[0].signature, "valid");
         let json = serde_json::to_string(&summaries[0]).unwrap();

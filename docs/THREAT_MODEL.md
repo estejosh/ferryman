@@ -116,7 +116,7 @@ Project inputs/results, artifact metadata and contents, project bearer tokens, s
 ## Non-goals and residual risks
 
 Workers and communications consumers remain trusted execution environments:
-the Bridge does not sandbox their local execution or prove external effects are
+Ferryman does not sandbox their local execution or prove external effects are
 idempotent. A claim prevents duplicate Ferryman execution, but integrations
 must use their own idempotency protection for irreversible external effects. Do
 not place production secrets in job or message input or run untrusted workers.

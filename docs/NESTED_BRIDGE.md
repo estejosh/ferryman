@@ -2,7 +2,7 @@
 
 Some agents are sandboxed to the project directory they are working in. They
 cannot reach a Ferryman checkout that lives in a *sibling* folder (for example
-`X:\orchestrator-bridge` next to `X:\myproject`), so they cannot find or talk to
+`C:\orchestrator-bridge` next to `C:\myproject`), so they cannot find or talk to
 the bridge. The fix is to put a full, self-contained bridge **inside** the
 project — without polluting the project's git history.
 
@@ -54,7 +54,7 @@ It will:
 
 1. add `/.ferryman/` to the project's `.gitignore` (if the project is a git repo),
 2. create `.ferryman/` and `git init` it as its own repo,
-3. write the bridge's own `.gitignore`, `bridge.toml`, a `start` helper, and a README.
+3. write Ferryman's own `.gitignore`, `bridge.toml`, a `start` helper, and a README.
 
 ## Run it
 
@@ -62,7 +62,7 @@ The bridge needs the `ferryman-server` binary. Put it on `PATH`, or point the
 start helper at it with `FERRYMAN_BIN`:
 
 ```powershell
-$env:FERRYMAN_BIN = "X:\orchestrator-bridge\target\release\ferryman-server.exe"
+$env:FERRYMAN_BIN = "C:\orchestrator-bridge\target\release\ferryman-server.exe"
 cd C:\code\myproject\.ferryman
 powershell -File start.ps1
 ```

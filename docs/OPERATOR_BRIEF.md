@@ -26,7 +26,7 @@ change. First run the read-only directory safety scan and show the result to the
 user:
 
 ```powershell
-& X:\ferryman\scripts\scan-project-safety.ps1 -Workspace X:\example
+& C:\ferryman\scripts\scan-project-safety.ps1 -Workspace C:\example
 ```
 
 ```bash
@@ -44,7 +44,7 @@ repository.
 
 ## Determine whether Ferryman itself changed
 
-From `X:\ferryman`, preserve the working tree and inspect:
+From `C:\ferryman`, preserve the working tree and inspect:
 
 ```powershell
 git status --short --branch
@@ -68,8 +68,8 @@ Always dry-run first.
 PowerShell:
 
 ```powershell
-& X:\ferryman\scripts\attach-project.ps1 `
-  -Workspace X:\example `
+& C:\ferryman\scripts\attach-project.ps1 `
+  -Workspace C:\example `
   -Project example `
   -SharedRemote /wisp-bridges/example `
   -GitRemote https://github.com/estejosh/example-bridge.git `

@@ -2058,16 +2058,16 @@ mod tests {
         std::fs::create_dir_all(route.communications.join("agents")).unwrap();
         // A recipient agent with a published encryption key.
         let recipient =
-            ferryman_channel::secrets::EncryptionIdentity::from_seed("beastly", [1_u8; 32]);
+            ferryman_channel::secrets::EncryptionIdentity::from_seed("harbor", [1_u8; 32]);
         let roster = AgentRoute {
-            name: "beastly".into(),
+            name: "harbor".into(),
             role: "worker".into(),
             capabilities: Vec::new(),
             public_key: None,
             encryption_key: Some(recipient.public_key_hex()),
         };
         std::fs::write(
-            route.communications.join("agents").join("beastly.json"),
+            route.communications.join("agents").join("harbor.json"),
             serde_json::to_vec_pretty(&roster).unwrap(),
         )
         .unwrap();
@@ -2079,7 +2079,7 @@ mod tests {
         let denied = post(
             &app,
             "/api/secrets",
-            r#"{"name":"GH_TOKEN","value":"x","recipients":["beastly"]}"#,
+            r#"{"name":"GH_TOKEN","value":"x","recipients":["harbor"]}"#,
             None,
         )
         .await;
@@ -2088,7 +2088,7 @@ mod tests {
         let created = post(
             &app,
             "/api/secrets",
-            r#"{"name":"GH_TOKEN","value":"ghp_secret","recipients":["beastly"]}"#,
+            r#"{"name":"GH_TOKEN","value":"ghp_secret","recipients":["harbor"]}"#,
             Some(&token),
         )
         .await;

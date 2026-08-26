@@ -20,8 +20,8 @@ different channel. The pairing file alone cannot open any pack.
 On the **second** Windows machine:
 
 1. Install Git and sign in once with `gh auth login` (or configure Git Credential Manager for the private recovery repository).
-2. Clone the Bridge software repository.
-3. Run `./scripts/pair-recovery-key.ps1 -Mode Import -Path <copied pairing file>` before starting the Bridge.
+2. Clone Ferryman software repository.
+3. Run `./scripts/pair-recovery-key.ps1 -Mode Import -Path <copied pairing file>` before starting Ferryman.
 4. Run `./scripts/start-local.ps1`. It finds the paired key in Windows Credential Manager without printing it.
 
 Delete the pairing file from the USB and both machines after import. Do not put
@@ -42,7 +42,7 @@ cargo run -p ferryman-cli -- --token <project-token> consents approve --project 
 cargo run -p ferryman-cli -- --token <project-token> continuity deliver-git --project <project> <bundle-sha256> --consent <consent-id>
 ```
 
-The Bridge clones the recovery repository, commits `packs/<hash>.obpack` and
+Ferryman clones the recovery repository, commits `packs/<hash>.obpack` and
 `packs/<hash>.manifest.json` to `bridge/recovery`, pushes, downloads the same
 blob again, and verifies its SHA-256 hash.
 

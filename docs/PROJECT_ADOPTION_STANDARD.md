@@ -50,8 +50,8 @@ This is the safest starting point for projects that do not yet have an agent
 architecture. Do not invent multiple agents merely to adopt Ferryman.
 
 ```powershell
-& X:\ferryman\scripts\attach-project.ps1 `
-  -Workspace X:\example `
+& C:\ferryman\scripts\attach-project.ps1 `
+  -Workspace C:\example `
   -Project example `
   -SharedRemote example-bridge `
   -GitRemote https://github.com/OWNER/example-bridge.git `
@@ -66,8 +66,8 @@ capabilities it actually needs. The project may continue using its existing
 prompt runner, CLI, service, or CI system.
 
 ```powershell
-& X:\ferryman\scripts\attach-project.ps1 `
-  -Workspace X:\example `
+& C:\ferryman\scripts\attach-project.ps1 `
+  -Workspace C:\example `
   -Project example `
   -SharedRemote example-bridge `
   -GitRemote https://github.com/OWNER/example-bridge.git `
@@ -86,8 +86,8 @@ identities and roles into Ferryman; do not duplicate its scheduler or internal
 memory.
 
 ```powershell
-& X:\ferryman\scripts\attach-project.ps1 `
-  -Workspace X:\example `
+& C:\ferryman\scripts\attach-project.ps1 `
+  -Workspace C:\example `
   -Project example `
   -SharedRemote example-bridge `
   -GitRemote https://github.com/OWNER/example-bridge.git `

@@ -1,6 +1,6 @@
-# Bridge-owned project memory
+# Ferryman-owned project memory
 
-Project memory is the bridge's recovery record, not an agent's scratchpad. The Bridge is infrastructure: it does not become an agent or orchestrator when an actor loses context. Instead, it supplies the durable record a recovered or replacement actor loads before continuing work. It is stored in two independently maintained forms:
+Project memory is Ferryman's recovery record, not an agent's scratchpad. Ferryman is infrastructure: it does not become an agent or orchestrator when an actor loses context. Instead, it supplies the durable record a recovered or replacement actor loads before continuing work. It is stored in two independently maintained forms:
 
 1. An append-only SQLite record, available through `GET /v1/projects/{project_id}/memory`.
 2. A Markdown mirror at `<memory-root>/<project-slug>/MEMORY.md`, outside the project Git workspace.

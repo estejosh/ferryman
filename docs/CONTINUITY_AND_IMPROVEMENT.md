@@ -17,7 +17,7 @@ A recovery drill should create a fresh orchestrator/agent context, load the pack
 3. Google Drive then MEGA may be used only when the local targets are unavailable and an approved policy/consent names that encrypted target.
 4. A private Git repository is the final portability record for manifests, profiles, and recovery metadata—not an automatic destination for private artifacts.
 
-The Bridge must never silently publish, share, or push a recovery record. Any outbound submission is a pending consent with an exact manifest hash, expiry, approver identity, target, files/content hashes, reason, redactions, and proposed Git branch/Drive folder. The orchestrator approves or rejects that immutable manifest before an adapter transmits anything.
+Ferryman must never silently publish, share, or push a recovery record. Any outbound submission is a pending consent with an exact manifest hash, expiry, approver identity, target, files/content hashes, reason, redactions, and proposed Git branch/Drive folder. The orchestrator approves or rejects that immutable manifest before an adapter transmits anything.
 
 ## Improvement engine
 
@@ -30,6 +30,6 @@ The improvement engine is a proposal generator, not a self-modifying agent. It c
 - destination repository/branch or recovery drive folder;
 - required consent.
 
-After approval, a future GitHub/Drive adapter may submit the exact manifest. The Bridge records the result and never expands the submission beyond the approved manifest.
+After approval, a future GitHub/Drive adapter may submit the exact manifest. Ferryman records the result and never expands the submission beyond the approved manifest.
 
 `POST /v1/projects/{project_id}/outbound-submissions` now creates the immutable proposal/consent manifest for GitHub, Google Drive, MEGA, or private Git. It performs no delivery. GitHub delivery is constrained to a future draft-PR adapter; Drive/MEGA/private-Git delivery is constrained to opaque encrypted bundles. `POST /v1/projects/{project_id}/improvement-proposals` similarly produces only a reviewable proposal and its pending consent record—never a source-tree edit or external upload.

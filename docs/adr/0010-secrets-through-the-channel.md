@@ -116,7 +116,7 @@ ciphertext, or re-signing as a different identity, both fail open.
 The envelope lives at `<communications>/secrets/<name>.json` - one project's channel,
 reaching only devices sharing that project. Explicitly NOT the fleet folder
 (`ferryman-fleet`): that syncs to everything, the opposite of what this needs. Recipient
-scope sits on top of channel scope (`--to grouchly,beastlywsl`): two independent limits,
+scope sits on top of channel scope (`--to laptop,workstation`): two independent limits,
 neither relying on the other.
 
 A `credentials.json` value of `secret:<name>` is a reference only when `<name>` names an
