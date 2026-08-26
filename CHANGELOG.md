@@ -2,6 +2,52 @@
 
 ## Unreleased
 
+## 0.5.3 - 2026-08-25
+
+### Added
+
+- **Secrets travel the channel, sealed** (ADR 0010). A credential is encrypted
+  to each recipient with X25519 + XChaCha20-Poly1305, keyed through HKDF-SHA256
+  salted with the ephemeral and recipient public keys, and only the ciphertext
+  is ever written anywhere. The encryption identity is a separate keypair from
+  the Ed25519 signing key, so sealing and signing cannot be confused for one
+  another. A machine's access hangs off its owner's: revoking a person revokes
+  their machines in the same act. Revocation is not retroactive, and the ADR
+  says so rather than implying otherwise.
+- **Telegram is a first-class order surface** (ADR 0008), with the conversation
+  kept in the channel rather than beside the bridge, so an orchestrator reading
+  an order can see what was already asked and answered instead of asking again.
+- **Roles are conferred, not claimed** (ADR 0014).
+
+### Fixed
+
+- **A dead worker was only detectably dead on Linux.** `process_alive` read
+  `/proc/{pid}` there and returned `true` everywhere else, so on macOS and
+  Windows a lock left behind by a worker that died read as a live worker
+  forever: the takeover in ADR 0011 never fired, and `retire` refused to release
+  a worker that was already gone. A fleet that can recover on one platform and
+  not the others is the failure ADR 0011 exists to remove. sysinfo answers for
+  the one pid off Linux; no new dependency.
+- **Windows OpenCode workers silently ran Claude Code's arguments.** The `.exe`
+  suffix was stripped before the name was folded to lower case, so
+  `OpenCode.EXE` missed the engine table and fell through to `-p {prompt}` -
+  precisely the failure that table was added to prevent.
+
+### Changed
+
+- **The toolchain is pinned at 1.97** across the pin file, all five CI jobs and
+  the container build stage. sysinfo 0.39 requires 1.95, and a dependency bump
+  must never be the thing that moves the compiler under a project.
+- **The crypto dependencies move a major version**: ed25519-dalek 2.2 to 3.0,
+  chacha20poly1305 0.10 to 0.11, sha2 0.10 to 0.11, rand 0.9 to 0.10. Existing
+  signatures verify unchanged - checked against a live channel, every record
+  written by 2.2, all of them Valid under 3.0, none Unsigned, Invalid,
+  UnknownSigner or KeyChanged.
+- **CI builds the tray on every push.** It is excluded from the workspace,
+  correctly - it needs GTK, and agent machines are headless - which left it
+  compiled by nothing between releases. Its lockfile had already drifted behind
+  the crypto bump it depends on by path, and would have broken on this tag.
+
 ## 0.5.2 - 2026-08-25
 
 ### Fixed
