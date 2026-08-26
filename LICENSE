@@ -124,8 +124,8 @@ satisfies this requirement:
 This requirement does not apply to individual end users who merely interact with
 the outputs of a project that uses the Software; it applies to the party that
 deploys or redistributes the Software. It is separate from, and in addition to,
-the notice-retention requirement in Section 5. The standard Ferryman setup tooling
-writes this FERRYMAN.md automatically.
+the notice-retention requirement in Section 5. `ferry enable` writes this
+FERRYMAN.md into your project for you, and leaves an existing one untouched.
 
 7. NO AUTOMATIC CONVERSION
 This license has no Change Date and does not convert to any other license over

@@ -66,14 +66,14 @@ usage.
 
 Open an issue titled `Commercial license` on
 [github.com/estejosh/ferryman](https://github.com/estejosh/ferryman/issues), or
-contact the maintainer through the address in the repository profile. Tell us your
-total production Seat count and we'll send terms.
+email `lafamiliahale@gmail.com`. Tell us your total production Seat count and
+we'll send terms.
 
 ## Attribution
 
-Projects that deploy or redistribute Ferryman must include a root-level
-`FERRYMAN.md` stating that the project uses Ferryman (License section 5). The setup
-scripts write that file for you.
+Projects that use Ferryman must include a root-level `FERRYMAN.md` stating that
+the project uses it (License section 6). `ferry enable` writes that file into your
+work repository, and prints what it wrote.
 
 ## Questions people actually ask
 

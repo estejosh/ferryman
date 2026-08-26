@@ -16,7 +16,8 @@ entire point of the product and it is not compromised for licensing.
 
 ## Exactly what is sent
 
-One JSON object, at most once a day, to the check-in URL configured in your install:
+One JSON object, sent only when you run `ferry license checkin`, to the check-in
+URL configured in your install (unset in every downloaded release):
 
 ```json
 {
@@ -26,7 +27,7 @@ One JSON object, at most once a day, to the check-in URL configured in your inst
   "computers": 2,
   "mobile_devices": 0,
   "over_limit": false,
-  "version": "0.3.0",
+  "version": "0.5.3",
   "sent_at": "2026-08-12T09:00:00Z"
 }
 ```

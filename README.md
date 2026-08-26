@@ -108,9 +108,8 @@ Two consequences worth caring about:
   per-engine list rates (editable in a `rates.toml`, no rebuild needed) so you can
   price work before committing to it. It is an **estimate from a token heuristic**,
   not a meter reading, and the rates are hand-maintained constants — check them
-  against your provider's current pricing. `ferry cost project`, which is meant to
-  total *recorded* usage, currently reports zero because nothing yet records
-  per-run token counts; see [Known issues](#known-issues).
+  against your provider's current pricing. `ferry cost project` is the other half:
+  it totals the usage workers actually recorded, per engine.
 
 ## Two repositories, on purpose
 
@@ -360,6 +359,37 @@ task can be cut off from the network entirely. The container path is built; the
 per-platform bind-mount wrinkles (SELinux, macOS, WSL) are still being smoothed
 out. If you don't direct it to sandbox, it doesn't.
 
+## What Ferryman sends
+
+Nothing, on its own. There is no timer, no background sender, and no daemon that
+phones home. `ferry license checkin` is a command you run, and a downloaded
+release has no endpoint configured at all — it sends nothing until you set
+`FERRYMAN_CHECKIN_URL` yourself.
+
+When you do run it, this is the entire payload:
+
+```json
+{
+  "deployment_id": "a41f...",
+  "emails": ["you@example.com"],
+  "seats": 1,
+  "computers": 2,
+  "mobile_devices": 0,
+  "over_limit": false,
+  "version": "0.5.3",
+  "sent_at": "2026-08-12T09:00:00Z"
+}
+```
+
+`deployment_id` is a random number generated on your machine — not derived from
+your hardware, hostname or network. There is no field for a task, a prompt, a
+file name, or anything your agents produce, so no amount of misuse can put one
+there. `ferry license checkin --dry-run` prints the exact bytes and sends
+nothing. [PRIVACY.md](PRIVACY.md) walks the payload field by field.
+
+The same is true of `ferry soak`: it sends a report only if you set
+`FERRYMAN_SOAK_URL` **and** pass `--send`, per invocation. Never automatically.
+
 ## License
 
 Ferryman is **source-available** under the [Ferryman Source-Available
@@ -371,11 +401,20 @@ across two computers is one Seat. Beyond that it is $60 per additional seat per
 year, dropping with volume — priced per human, not per machine or agent. See
 [COMMERCIAL.md](COMMERCIAL.md).
 
-Free production use asks for a contact email, and Ferryman reports three
-integers and that address, once a day — never your code, your channel, your
-prompts, or anything your agents produce. [PRIVACY.md](PRIVACY.md) lists the
-entire payload field by field, and `ferry license checkin --dry-run` prints
-exactly what would be sent.
+**One obligation, and `ferry enable` discharges it for you.** Section 6 asks any
+project that uses Ferryman to carry a root-level `FERRYMAN.md` saying so. `ferry
+enable` writes that file into your project and tells you it did; if you already
+have one, it leaves yours alone. There is nothing else to remember, and nothing
+to strip: registration is a local file, the check-in endpoint is unset in every
+release, and failing to report is explicitly not enforced.
+
+Free production use asks for a contact email. **Ferryman never sends anything on
+its own.** There is no timer and no background sender: `ferry license checkin` is
+a command you run, and a downloaded release has no endpoint configured at all, so
+it sends nothing until you set `FERRYMAN_CHECKIN_URL` yourself. Whether you are
+inside the free tier is computed on your own machine — run `ferry license status`
+and it counts your seats, computers and phones locally and lists what it counted.
+See [What Ferryman sends](#what-ferryman-sends) for the whole payload.
 
 ## Contributing
 

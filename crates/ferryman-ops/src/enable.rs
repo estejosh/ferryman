@@ -17,9 +17,19 @@
 //!   the same code path everything else uses. Writing files that happen to be wrong is
 //!   the failure mode that would waste the most of an unattended agent's time.
 //!
-//! It deliberately does NOT touch the work repository: no commits, no hooks, no
-//! modified build. Everything it writes lives under `.ferryman/`, which is the whole
-//! separation Ferryman is built on.
+//! It writes almost nothing into the work repository: no commits, no hooks, no
+//! modified build. Everything it configures lives under `.ferryman/`, which is the
+//! whole separation Ferryman is built on.
+//!
+//! The two exceptions are both one file each, both idempotent, and both there because
+//! leaving them out costs the operator more than writing them:
+//!
+//! - `.gitignore` gains `/.ferryman/`, because committing the private signing key
+//!   inside it would publish an identity every machine in the fleet trusts.
+//! - `FERRYMAN.md` is written, because LICENSE section 6 requires it of every project
+//!   that uses Ferryman. It was documented as automatic long before it was, which put
+//!   everyone who followed the README in technical breach of a licence term they had
+//!   been told the tooling handled. Writing the file is cheaper than the trap.
 
 use anyhow::{Context, Result, bail};
 use ferryman_channel::{AgentRoute, ProjectRoute};
@@ -126,6 +136,38 @@ fn ensure_git_ignores_attachment(workspace: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Write the attribution file LICENSE section 6 requires, into the work repository.
+///
+/// Returns the path written, or `None` when it was already there. Idempotent, and
+/// deliberately non-destructive: a `FERRYMAN.md` the operator has edited - to add their
+/// own text, or because their project attributes several things in one file - is left
+/// exactly as it is. Presence is what the licence asks for, not particular bytes.
+///
+/// Unlike the `.gitignore` entry, this is written whether or not the workspace is a git
+/// repository. Section 6 applies to "any project that uses the Software", and a project
+/// that is not under git is still a project.
+fn ensure_attribution_file(workspace: &Path) -> Result<Option<PathBuf>> {
+    let path = workspace.join("FERRYMAN.md");
+    if path.exists() {
+        return Ok(None);
+    }
+    fs::write(
+        &path,
+        "This project uses Ferryman (https://github.com/estejosh/ferryman),\n\
+         licensed under the Ferryman Source-Available License.\n\
+         \n\
+         Ferryman coordinates the AI agents that work on this project. It is not part\n\
+         of what this project ships, and it reads nothing here that you do not point it\n\
+         at. This file is here because the licence asks any project using Ferryman to\n\
+         say so - see section 6 of\n\
+         https://github.com/estejosh/ferryman/blob/main/LICENSE\n\
+         \n\
+         You may edit this file freely. Ferryman writes it once and never rewrites it.\n",
+    )
+    .with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(path))
+}
+
 pub fn perform(request: Request) -> Result<Outcome> {
     let workspace = match request.workspace {
         Some(path) => path,
@@ -221,6 +263,16 @@ pub fn perform(request: Request) -> Result<Outcome> {
     if let Some(path) = gitignore_updated {
         steps.push(Step {
             what: "git exclusion",
+            path,
+            created: true,
+        });
+    }
+
+    // LICENSE section 6. Reported as a step like everything else, so a caller reading
+    // --json can see the file appear rather than discovering it in a later diff.
+    if let Some(path) = ensure_attribution_file(&workspace)? {
+        steps.push(Step {
+            what: "attribution",
             path,
             created: true,
         });
@@ -724,6 +776,56 @@ mod tests {
             !outcome.command_found,
             "enable must admit when the engine is not on this machine"
         );
+    }
+
+    #[test]
+    fn enable_writes_the_attribution_file_the_licence_asks_for() {
+        // LICENSE section 6 requires a FERRYMAN.md in any project that uses Ferryman,
+        // and two documents said the tooling wrote it long before the tooling did.
+        // Everyone who followed the README was in technical breach of a term they had
+        // been told was handled.
+        let dir = tempdir();
+        hermetic_machine();
+        perform(request_in(&dir)).unwrap();
+        let written = fs::read_to_string(dir.join("FERRYMAN.md")).unwrap();
+        assert!(written.contains("uses Ferryman"), "{written}");
+        assert!(
+            written.contains("Ferryman Source-Available License"),
+            "the licence has to be named, not merely linked: {written}"
+        );
+    }
+
+    #[test]
+    fn an_edited_attribution_file_is_left_alone() {
+        // The licence asks for presence, not for particular bytes. A project that
+        // attributes several things in one file, or that worded it themselves, must not
+        // have that overwritten by running enable again.
+        let dir = tempdir();
+        hermetic_machine();
+        let mine = "This project uses Ferryman, and three other things I wrote about.\n";
+        fs::write(dir.join("FERRYMAN.md"), mine).unwrap();
+        perform(request_in(&dir)).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("FERRYMAN.md")).unwrap(), mine);
+    }
+
+    /// The plain request the attribution tests share: no engine that exists, no
+    /// Syncthing, nothing that reaches off this machine.
+    fn request_in(dir: &Path) -> Request {
+        Request {
+            workspace: Some(dir.to_path_buf()),
+            project: Some("demo".into()),
+            agent: Some("tester".into()),
+            role: "worker".into(),
+            email: "tester@example.com".into(),
+            no_syncthing: true,
+            share_with: vec![],
+            command: "definitely-not-an-engine-9x7".into(),
+            review: "confirm".into(),
+            as_json: false,
+            master: false,
+            sandbox: None,
+            worktree: false,
+        }
     }
 
     fn tempdir() -> PathBuf {
