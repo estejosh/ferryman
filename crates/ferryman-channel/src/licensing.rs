@@ -729,7 +729,7 @@ mod tests {
             computers: counted.computers,
             mobile_devices: counted.mobile_devices,
             over_limit: counted.over_limit(),
-            version: "0.3.0".into(),
+            version: "0.5.3".into(),
             sent_at: Utc::now(),
         };
         let json = serde_json::to_value(&payload).unwrap();

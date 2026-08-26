@@ -42,3 +42,7 @@ memory-bank
 sandbox*.sh
 sbxresult.sh
 BEASTLYWSL_PROMPT.md
+
+# An NVIDIA installer drops this in whatever directory it was run from. It has
+# nothing to do with Ferryman and was one `git add -A` away from being committed.
+NVIDIA Corporation/

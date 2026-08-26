@@ -9,7 +9,7 @@ full - `oxalpha/novice-onboarding` (CLI onboarding) and
 every proposal each branch makes for follow-up work.
 
 This complements [ROADMAP.md](../ROADMAP.md) and
-[REPO_ROADMAP.md](../REPO_ROADMAP.md); it is narrower - what a person or agent
+[REPO_ROADMAP.md](../internal/REPO_ROADMAP.md); it is narrower - what a person or agent
 new to Ferryman experiences from install to first accepted task - and dated,
 because backlog priorities rot faster than architecture.
 

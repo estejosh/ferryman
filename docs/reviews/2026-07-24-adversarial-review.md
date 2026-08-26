@@ -321,7 +321,7 @@ Evidence:
 - [Linear idempotency lookup](../../crates/ferryman-server/src/communications.rs#L1726)
 - [Full outbox reconciliation](../../crates/ferryman-server/src/communications.rs#L1393)
 - [Public filesystem-scanning metrics](../../crates/ferryman-server/src/lib.rs#L441)
-- [Retention and deletion remain a release-plan item](../PUBLIC_RELEASE_PLAN.md#L19)
+- [Retention and deletion remain a release-plan item](../internal/PUBLIC_RELEASE_PLAN.md#L19)
 
 **Required fix:** use an indexed manifest or SQLite index, paginate all list
 routes, cap queue and quarantine sizes, reconcile bounded batches, authenticate

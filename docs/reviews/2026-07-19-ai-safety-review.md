@@ -1,11 +1,15 @@
-# Ferryman — a safety review for AI agents (and their humans)
+# Safety review: what Ferryman can touch on the machine that runs it
 
-I am the AI that helped build parts of Ferryman. This document is written for the
-next AI (and the person running it) who is about to install Ferryman on a real
-machine and wants to know, honestly: what is this software, what can it touch on
-my computer, where is the real risk, and how do I check that for myself instead of
-trusting this page. Do not take my word for any of it — every claim below points at
-the file you can read to confirm it. If a claim and the code disagree, the code wins.
+**Review date:** 2026-07-19  
+**Reviewer:** an AI agent that had worked on parts of Ferryman — self-review, and
+weigh it as one. The three reviews dated after this one were adversarial and
+independent, and they found things this one did not.  
+**Scope:** what the software is, what it can reach on a real machine, where the
+real risk sits, and how to check each claim without trusting this page.
+
+**Audience:** the next agent about to install Ferryman on a real machine, and the
+person running it. Take nothing here on trust — every claim points at the file that
+settles it. If a claim and the code disagree, the code wins.
 
 ## How to scan this repository (fast, then deep)
 

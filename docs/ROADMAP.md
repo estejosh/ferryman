@@ -1,6 +1,6 @@
 # Roadmap
 
-Direction, not a schedule. `REPO_ROADMAP.md` is the map of the code as it is; this is what
+Direction, not a schedule. `internal/REPO_ROADMAP.md` is the map of the code as it is; this is what
 is deliberately not built yet, and why.
 
 Each entry says what it is, what it is **not**, and what would have to be true before it

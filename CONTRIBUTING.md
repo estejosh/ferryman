@@ -1,5 +1,3 @@
-# Contributing
-
 # Contributing to Ferryman
 
 Thank you for helping. The Bridge protects private project history, so changes

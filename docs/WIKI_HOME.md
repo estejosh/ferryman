@@ -6,7 +6,7 @@ artifacts, audit events, and approval decisions without owning model execution.
 
 > v0.1 is a self-hosted, local-first team coordination system — a reference
 > implementation across machines you own, not a hosted service or a
-> production-security guarantee. See [Public Release Plan](../docs/PUBLIC_RELEASE_PLAN.md).
+> production-security guarantee. See [Public Release Plan](../docs/internal/PUBLIC_RELEASE_PLAN.md).
 
 ## Start here
 - [Getting Started](Getting-Started) — run the demo in a few minutes.

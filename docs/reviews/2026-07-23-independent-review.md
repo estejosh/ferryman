@@ -4,12 +4,12 @@
 *Date: 2026-07-23. Scope: full source clone (`ferryman-core`, `ferryman-server`, `ferryman-cli`, `ferryman-worker-sdk`, `scripts/`, `openapi/`, `docs/`).*
 
 > Remediation status for every finding below is tracked in
-> `docs/AI_SAFETY_REVIEW.md` ("Independent review & remediation"). Fixes for
+> `docs/reviews/2026-07-19-ai-safety-review.md` ("Independent review & remediation"). Fixes for
 > #1/#3/#4/#7/#8/#9 shipped and were verified.
 
 ## One-paragraph summary
 
-Ferryman is a local-first orchestration "bridge": an Axum HTTP server (loopback by default) that stores jobs/memory/artifacts in SQLite, mints scoped tokens, gates side-effectful work behind approvals/consents, and hands jobs to *workers*. The server itself is fairly disciplined — it binds loopback, spawns only `git` with argument vectors (never a shell), parameterizes every SQL query, sanitizes project IDs into safe directory slugs, encrypts recovery packs with authenticated crypto, forbids `unsafe`, and hashes stored tokens. **The real teeth are in the worker**: the reference `agent_worker` spawns an arbitrary coding agent CLI (`claude`, `codex`, …) with the job's prompt and **no sandbox**, running as the full OS user. The repo's own `docs/AI_SAFETY_REVIEW.md` is unusually honest about that central risk, and most of its specific claims check out. But the review found real issues the docs do **not** flag: a Windows `cmd.exe` argument-injection path in the worker, the shipped systemd/hub setup running in unauthenticated dev-mode with a hard-coded demo token, no Host-header/DNS-rebinding protection on the loopback service, an approval gate that shares the same credential as job submission (so an automated token holder can self-approve), and a policy envelope that is advisory-only despite being listed as a mitigation. None are unconditionally "trivially remote-root," but several materially widen the blast radius of the (accepted) core risk.
+Ferryman is a local-first orchestration "bridge": an Axum HTTP server (loopback by default) that stores jobs/memory/artifacts in SQLite, mints scoped tokens, gates side-effectful work behind approvals/consents, and hands jobs to *workers*. The server itself is fairly disciplined — it binds loopback, spawns only `git` with argument vectors (never a shell), parameterizes every SQL query, sanitizes project IDs into safe directory slugs, encrypts recovery packs with authenticated crypto, forbids `unsafe`, and hashes stored tokens. **The real teeth are in the worker**: the reference `agent_worker` spawns an arbitrary coding agent CLI (`claude`, `codex`, …) with the job's prompt and **no sandbox**, running as the full OS user. The repo's own `docs/reviews/2026-07-19-ai-safety-review.md` is unusually honest about that central risk, and most of its specific claims check out. But the review found real issues the docs do **not** flag: a Windows `cmd.exe` argument-injection path in the worker, the shipped systemd/hub setup running in unauthenticated dev-mode with a hard-coded demo token, no Host-header/DNS-rebinding protection on the loopback service, an approval gate that shares the same credential as job submission (so an automated token holder can self-approve), and a policy envelope that is advisory-only despite being listed as a mitigation. None are unconditionally "trivially remote-root," but several materially widen the blast radius of the (accepted) core risk.
 
 ## Component / data-flow map
 
@@ -79,7 +79,7 @@ Both submitting a job and approving a `requires_approval` job use the **same** p
 ### 6. [MEDIUM] Policy envelope is advisory-only but presented as a mitigation
 **File:** `crates/ferryman-core/src/lib.rs` (`PolicyEnvelope`, defaults all `Deny`); only consumer is `simulate_policy`, which merely *reports*.
 
-A job's `policy` (filesystem/network/shell = Deny by default) is stored and can be "simulated," but nothing enforces it against the agent. A job whose policy denies filesystem/network/shell still runs an agent with full access to all three. `docs/AI_SAFETY_REVIEW.md` listed "Policy envelope" under how the risk is limited, which overstates it.
+A job's `policy` (filesystem/network/shell = Deny by default) is stored and can be "simulated," but nothing enforces it against the agent. A job whose policy denies filesystem/network/shell still runs an agent with full access to all three. `docs/reviews/2026-07-19-ai-safety-review.md` listed "Policy envelope" under how the risk is limited, which overstates it.
 
 **Fix:** Either translate the policy into concrete agent sandbox flags and refuse to launch if it can't be honored, or relabel it everywhere as advisory metadata.
 

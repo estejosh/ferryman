@@ -279,9 +279,9 @@ mod tests {
     #[test]
     fn no_run_log_text_survives_into_the_report() {
         let hostile = [
-            "2026-08-17 10:00:00Z warn  holding off: /home/josh/secrets/project",
+            "2026-08-17 10:00:00Z warn  holding off: /home/me/secrets/project",
             "2026-08-17 10:00:01Z warn  pass failed: token sk-live-abcdef123 rejected",
-            "2026-08-17 10:00:02Z info  C:\\Users\\oshha\\ferryman\\private.key",
+            "2026-08-17 10:00:02Z info  C:\\Users\\me\\ferryman\\private.key",
             "2026-08-17 10:00:03Z warn  something nobody has a pattern for yet",
         ];
         let mut counts = BTreeMap::new();
@@ -291,12 +291,11 @@ mod tests {
         let rendered = counts.keys().cloned().collect::<Vec<String>>().join(" ");
 
         for leak in [
-            "/home/josh",
+            "/home/me",
             "secrets",
             "sk-live-abcdef123",
             "C:\\Users",
             "private.key",
-            "oshha",
         ] {
             assert!(
                 !rendered.contains(leak),
