@@ -17,8 +17,11 @@ cargo install --git https://github.com/estejosh/ferryman ferryman-cli
 ferry enable --json          # run in the project directory
 ```
 
-`ferry enable` never prompts, is safe to re-run, and prints a JSON object saying exactly
-what it created. If you are unsure whether you already ran it, run it again.
+`ferry enable` never prompts under `--json` or when it is not attached to a terminal —
+which is every case that matters to you — is safe to re-run, and prints a JSON object
+saying exactly what it created. If you are unsure whether you already ran it, run it
+again. (At a human's terminal without `--json` it asks one question, about the web
+dashboard. You will not see it.)
 
 ### You are working ON Ferryman itself
 

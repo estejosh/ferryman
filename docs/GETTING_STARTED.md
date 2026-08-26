@@ -22,7 +22,10 @@ irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1
 ```
 
 Both verify the release checksum and install for the current user — no Rust
-toolchain needed. Or build it yourself:
+toolchain needed. Prebuilt binaries cover x86-64 and ARM64 Linux, both Macs, and
+x86-64 Windows. Or build it yourself, which needs **Rust 1.97 or newer** —
+`rust-toolchain.toml` is not honoured for a `cargo install --git` checkout, so an
+older toolchain fails on language features rather than telling you the version:
 `cargo install --git https://github.com/estejosh/ferryman ferryman-cli`.
 Check it with `ferry --version`.
 
@@ -45,8 +48,11 @@ configuration, creates the channel folder, generates a signing key, keeps the
 key out of git and out of the synced folder, registers the machine, and shares
 the channel folder through your local Syncthing.
 
-It never prompts, never overwrites a config you edited, and is safe to re-run —
-if you are unsure whether you already ran it, run it again.
+It never overwrites a config you edited and is safe to re-run — if you are unsure
+whether you already ran it, run it again. Under `--json`, or anywhere that is not a
+terminal, it never prompts either. Run at a terminal it asks one question: whether
+to set up the web dashboard, which then wants an operator name and a password.
+Answer `n`, or pass `--json`, and it will not ask.
 
 Then confirm the machine can actually run a task:
 

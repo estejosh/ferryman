@@ -5,8 +5,13 @@
 //! This is written to be run by an agent that has just been told to put a project on
 //! Ferryman, with nobody watching. Everything that follows from that:
 //!
-//! - **It never prompts.** No terminal, no confirmation, no editor. Every decision is a
-//!   flag with a defensible default.
+//! - **It never prompts under `--json`, or when stdin is not a terminal.** Every
+//!   decision is a flag with a defensible default, so the unattended path never
+//!   blocks on a question nobody is there to answer. The CLI does ask one thing of a
+//!   human at a terminal - whether to set up the web dashboard, at
+//!   `ferryman-cli/src/main.rs` - because it leads to an operator name and a password
+//!   an agent must not choose. That prompt lives in the CLI, not here: this module
+//!   has never prompted and must not start.
 //! - **It is idempotent.** Running it twice is not an error and does not clobber an
 //!   edited config. An agent that cannot remember whether it already ran can simply run
 //!   it again, which is the normal state of affairs for an agent.

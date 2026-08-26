@@ -31,6 +31,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Built on a real ARM runner, not cross-compiled. The audience for this
+          # target is a Raspberry Pi, an Ampere VPS or an Oracle free-tier box -
+          # machines self-hosters actually run - and "we ship an ARM binary that
+          # nothing has ever executed" is not what any of them want to hear.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
           # Cross-compiled from the Apple Silicon runner rather than built on an Intel
@@ -138,6 +144,12 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          # Built on a real ARM runner, not cross-compiled. The audience for this
+          # target is a Raspberry Pi, an Ampere VPS or an Oracle free-tier box -
+          # machines self-hosters actually run - and "we ship an ARM binary that
+          # nothing has ever executed" is not what any of them want to hear.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-pc-windows-msvc

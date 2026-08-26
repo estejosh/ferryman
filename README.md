@@ -38,7 +38,10 @@ running to reach your other machines; it says so plainly if it can't find it.
 **Or don't run it yourself.** [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) is a
 block you paste into any coding agent — it installs Ferryman, enables the
 project, wires the Syncthing folder and starts working without asking anything.
-`ferry enable` never prompts, is safe to run twice, and reports in JSON.
+`ferry enable` never prompts under `--json` or when it is not attached to a
+terminal, is safe to run twice, and reports in JSON. At a terminal it does ask one
+question — whether to set up the web dashboard — because that is a decision with a
+password attached and an agent cannot make it for you.
 
 ## Why this shape
 
@@ -82,7 +85,11 @@ Two consequences worth caring about:
 
 - **Signed everything.** Each agent has its own key, so every message, order,
   result and review carries a fingerprint. On a team you can tell *which* agent
-  did what, not merely which machine.
+  did what, not merely which machine. Keys are pinned on first sight: a machine
+  that has never met an agent trusts whatever the channel shows it first, and
+  refuses any later change to that key. So the signatures prove continuity, not
+  identity, until you check a fingerprint out of band — which is worth doing once,
+  per agent, when you add a machine you did not set up yourself.
 - **Review and revision.** Accept the work, or send it back with notes. Revisions
   are judgement, not failure — a job sent back five times has failed zero times.
 - **Shared memory** the fleet agrees on — proposed by agents, approved before it
@@ -274,6 +281,14 @@ weeks by strangers, which is the only thing that finds the last problems.
 **Not built yet.** PostgreSQL, RBAC, and workflow graphs are design targets, not
 implementations.
 
+**Scope orders to a handful of tool calls.** This is the single most useful thing
+to know before your first task. "List the first three `unwrap()`s in this file"
+completes reliably; "list every place that could panic in this file" often does
+not. Bounded, specific orders are what the loop is good at, and they are also what
+a reviewer can actually judge. With Claude Code as the engine there is a known
+failure behind this rule, written up under [Known
+issues](#known-issues) with the eight causes already eliminated.
+
 ### Known issues
 
 Listed because you will hit some of these, and finding them written down beats
@@ -338,11 +353,10 @@ them loses work or leaks anything.
 - **Windows has less test coverage than Linux and macOS.** CI runs all three, but
   several suites are Unix-only, and the two most recent platform bugs were both
   Windows-only and both found by running on a real machine rather than in review.
-- **The macOS test suite is currently red.** The macOS binaries build and are published
-  on the release page, but `cargo test --workspace` fails there and the cause is not yet
-  identified — the job was previously gated to tags, so it had never run against the
-  work in this release. It now runs on every push. If you use Ferryman on a Mac, a soak
-  report is especially valuable: nobody maintaining this has one.
+- **Nobody maintaining Ferryman runs it on a Mac day to day.** CI builds and tests
+  macOS on every push and it is green, but green tests are not the same as use. If
+  you run Ferryman on a Mac, a soak report is worth more from you than from anyone
+  else.
 
 Fixed in `0.4.0` and worth knowing if you ran an earlier build: a worker could kill
 its own running task in an unrecoverable retry loop; a peer could forge another
