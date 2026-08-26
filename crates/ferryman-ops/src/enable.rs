@@ -508,9 +508,13 @@ pub(crate) mod tests_support {
     /// Enable a project in a fresh temporary directory whose engine is
     /// `command`, and return the workspace path.
     pub(crate) fn enabled_project(command: &str) -> PathBuf {
+        // See `agent.rs::unique`: the clock alone does not separate two tests that
+        // start in the same tick, and macOS ticks more coarsely than Linux.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ferryman-enable-support-{}-{}",
+            "ferryman-enable-support-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -834,9 +838,13 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
+        // See `agent.rs::unique`: the clock alone does not separate two tests that
+        // start in the same tick, and macOS ticks more coarsely than Linux.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let base = std::env::temp_dir().join(format!(
-            "ferryman-enable-{}-{}",
+            "ferryman-enable-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

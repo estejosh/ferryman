@@ -3861,10 +3861,17 @@ mod tests {
     }
 
     fn unique(name: &str) -> PathBuf {
+        // The counter is the part that actually guarantees uniqueness. The clock does
+        // not: `SystemTime` is coarser on macOS than on Linux, two tests running in
+        // parallel landed in the same tick, and two `git init` runs against one
+        // directory surfaced as "could not lock config file: File exists" - a failure
+        // that reads like a git bug and is a test-fixture bug.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::env::temp_dir().join(format!(
-            "{}-{}-{}",
+            "{}-{}-{}-{}",
             name,
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

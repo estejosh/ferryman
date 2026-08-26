@@ -4617,6 +4617,17 @@ impl<G: GitRunner> PrivateGitTransport<G> {
     }
 }
 
+/// How long to wait for another operation to finish with the Git backstop.
+///
+/// It used to be zero: `try_lock_exclusive` once, and turn "somebody else is
+/// committing right now" into a hard error. But two operations wanting the backstop
+/// at the same moment is the normal case, not a fault - a worker delivering a
+/// message while a snapshot runs is exactly what this lock is for - and the second
+/// one should wait a beat rather than fail. Ten seconds is long enough for any git
+/// commit-and-push this serialises, and short enough that a genuinely stuck holder
+/// is still reported rather than waited on forever.
+const GIT_LIVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn acquire_git_live_lock(route: &ProjectRoute) -> Result<File> {
     let path = route.attachment.join("runtime/locks/git-live.lock");
     fs::create_dir_all(path.parent().context("Git lock path has no parent")?)?;
@@ -4626,9 +4637,20 @@ fn acquire_git_live_lock(route: &ProjectRoute) -> Result<File> {
         .write(true)
         .truncate(false)
         .open(&path)?;
-    file.try_lock_exclusive()
-        .with_context(|| format!("project Git-live lock is held: {}", path.display()))?;
-    Ok(file)
+    let deadline = std::time::Instant::now() + GIT_LIVE_LOCK_WAIT;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(file),
+            Err(error) if std::time::Instant::now() >= deadline => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "project Git-live lock is still held after {}s: {}",
+                    GIT_LIVE_LOCK_WAIT.as_secs(),
+                    path.display()
+                )));
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
 }
 
 /// Commit the whole portable channel to the private-Git backstop.
