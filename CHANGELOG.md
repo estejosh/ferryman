@@ -4,6 +4,21 @@
 
 ### Added
 
+- **One seed, and every identity derives from it** (ADR 0016), in the channel
+  crate. A machine may hold an `operator.seed` beside its other machine state -
+  32 bytes, owner-only, never in a project directory and never in the channel -
+  and an identity being created for the first time is derived from it rather than
+  minted at random: `HKDF-SHA256(seed, "ferryman/v1/sign/" || name)` for signing
+  and `"ferryman/v1/encrypt/" || name` for sealed secrets, over the case-folded
+  name so `Fang` and `fang` cannot become two identities again. Distinct keys per
+  agent, so "which agent did what" survives. The derived key is then written to
+  the keystore and the keystore wins from that point on, which is what keeps
+  rotation possible: an agent that must re-key writes a new key and the roster
+  reports `KeyChanged` exactly as it does today. Nothing that already has a key
+  is re-keyed, anywhere, and a machine with no seed behaves precisely as before.
+  This also makes true the sentence ADR 0015 wrongly claimed was already true
+  about the encryption key. The first-run flow and the recovery phrase are a
+  separate change; this one is the crypto underneath them.
 - **`ferry-deadman`, a sub-product, at `crates/ferry-deadman`.** Timelocked
   succession for any git repository: seal an archive to a future drand beacon
   round, and it cannot be opened early by anyone, including whoever sealed it.

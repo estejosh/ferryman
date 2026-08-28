@@ -63,6 +63,11 @@ impl EncryptionIdentity {
     /// Mirrors [`AgentIdentity::load_or_create`]: the key is machine-wide so an
     /// agent is the same recipient in every project, and a machine that already
     /// has a key under this name keeps it.
+    ///
+    /// A key being created for the first time on a machine that holds an operator seed
+    /// is *derived* from it (ADR 0016) rather than minted at random, and then persisted
+    /// like any other. One phrase therefore restores the ability to decrypt as well as
+    /// the ability to sign.
     pub fn load_or_create(name: &str, state_dir: &Path) -> Result<Self> {
         Self::load_or_create_in(name, state_dir, crate::licensing::machine_state_dir())
     }
@@ -93,9 +98,19 @@ impl EncryptionIdentity {
             return Ok(existing);
         }
 
-        let mut seed = [0_u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
-        let secret = StaticSecret::from(seed);
+        // ADR 0016, and the same rule as the signing key: nothing has been sealed to this
+        // name on this machine yet, so the key may be derived from the operator seed when
+        // there is one, and is minted at random when there is not. ADR 0015 claimed this
+        // key already derived; it did not, and this is the change that makes the sentence
+        // true. Derive-then-persist either way, so the keystore wins from here on.
+        let secret = match crate::seed::OperatorSeed::load_from(machine_dir.as_deref())? {
+            Some(seed) => StaticSecret::from(seed.encryption_seed(&name)?),
+            None => {
+                let mut seed = [0_u8; 32];
+                rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
+                StaticSecret::from(seed)
+            }
+        };
         if let Some(dir) = &machine_dir {
             Self::write_state_file(&name, dir, &secret)?;
         }
