@@ -24,6 +24,25 @@ const EXTRA_PREFIX: &str = "extra/";
 /// Work-tree directories never walked for extra files.
 const SKIP_DIRS: &[&str] = &[".git", ".deadman", "node_modules", "target"];
 
+/// A repo-relative path spelled the way the archive and the config both mean it:
+/// `/` separated, whatever the host uses.
+///
+/// Windows hands back `docs\deep\runbook.md` from `strip_prefix`, and three things
+/// downstream assume `/`. The include globs are gitignore-style and `/` separated, so
+/// `include = ["docs/**"]` matched nothing at all on Windows and the files were left
+/// out of the archive without a word - the worst shape a bug can take in a tool whose
+/// job is to still have your files in ten years. `included_extras` is a record a
+/// successor reads on some other machine, so it must not describe the same archive
+/// two ways. And a tar entry name is POSIX by specification: a backslash in one is
+/// part of the file name, not a directory separator, so an archive sealed on Windows
+/// would restore as files with backslashes in their names.
+fn rel_slashes(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Everything needed to seal copies of an archive.
 #[derive(Debug)]
 pub struct BuiltArchive {
@@ -80,7 +99,7 @@ pub fn build_archive(repo: &Path, opts: &ArchiveOptions<'_>) -> Result<BuiltArch
             if !meta.is_file() || meta.len() > MAX_EXTRA_FILE_BYTES {
                 continue;
             }
-            let name = format!("{EXTRA_PREFIX}{}", rel.display());
+            let name = format!("{EXTRA_PREFIX}{}", rel_slashes(rel));
             append_file(&mut builder, repo, path_to_str(rel)?, &name)?;
         }
         let enc = builder
@@ -94,7 +113,7 @@ pub fn build_archive(repo: &Path, opts: &ArchiveOptions<'_>) -> Result<BuiltArch
         payload,
         bundle_sha256: Some(bundle_sha),
         head_sha256: head,
-        included_extras: extras.iter().map(|p| p.display().to_string()).collect(),
+        included_extras: extras.iter().map(|p| rel_slashes(p)).collect(),
         warnings,
     })
 }
@@ -324,7 +343,7 @@ fn walk_for_globs(
         let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let rel_str = rel.to_string_lossy();
+        let rel_str = rel_slashes(rel);
         if path.is_dir() {
             if !SKIP_DIRS.contains(&fname) {
                 walk_for_globs(repo, &path, full_set, base_set, out, total, warnings);
@@ -335,7 +354,7 @@ fn walk_for_globs(
             continue;
         }
         let matched =
-            full_set.is_match(rel_str.as_ref()) || base_set.is_match(std::path::Path::new(fname));
+            full_set.is_match(rel_str.as_str()) || base_set.is_match(std::path::Path::new(fname));
         if !matched || out.contains(rel) {
             continue;
         }
@@ -508,6 +527,18 @@ fn unpack_tar<R: Read>(
 mod tests {
     use super::*;
     use crate::testsupport;
+
+    #[test]
+    fn a_recorded_path_is_slash_separated_on_every_host() {
+        // The archive, the manifest and the include globs all speak `/`. This is the
+        // only place that is decided, and it is decided the same way on Windows as
+        // anywhere else - the alternative was `include = ["docs/**"]` matching nothing
+        // there, silently, which the CI run that caught it demonstrated.
+        let rel: PathBuf = ["docs", "deep", "runbook.md"].iter().collect();
+        assert_eq!(rel_slashes(&rel), "docs/deep/runbook.md");
+        assert_eq!(rel_slashes(Path::new(".env")), ".env");
+        assert_eq!(rel_slashes(Path::new("")), "");
+    }
 
     #[test]
     fn builds_and_recovers_roundtrip_with_secrets_and_globs() {
