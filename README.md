@@ -205,8 +205,6 @@ Ferryman's part is transport: a channel can carry the sealed artifact to your
 successors' machines, and it is ciphertext the whole way. Neither half needs the
 other. See its [README](crates/ferry-deadman/README.md).
 
-It carries the MIT licence, not the source-available one the rest of this
-repository uses.
 
 ## Documentation
 

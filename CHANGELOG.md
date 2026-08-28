@@ -7,9 +7,12 @@
 - **`ferry-deadman`, a sub-product, at `crates/ferry-deadman`.** Timelocked
   succession for any git repository: seal an archive to a future drand beacon
   round, and it cannot be opened early by anyone, including whoever sealed it.
-  Written as a standalone crate with its own MIT licence, and in this workspace so
-  it is compiled, linted and tested with everything else rather than living in a
-  directory nothing builds. Its six commits came in with their history.
+  Useful with no Ferryman anywhere - Ferryman's part is only transport, and a
+  channel can carry the sealed artifact to a successor as ciphertext. In this
+  workspace so it is compiled, linted and tested with everything else rather than
+  living in a directory nothing builds, which found two Windows defects in the
+  first hour. Its six commits came in with their history, and it was relicensed
+  from MIT to the Ferryman Source-Available License on the way in.
 
 ## 0.5.3 - 2026-08-25
 

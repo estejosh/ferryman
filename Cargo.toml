@@ -10,8 +10,8 @@ members = [
   # future drand beacon round, and works on any git repository with no Ferryman
   # anywhere. It is in this workspace so it is built, linted and tested with
   # everything else rather than rotting in a directory nobody compiles - the lesson
-  # the tray already taught. Note it carries its own MIT licence, not the
-  # source-available one the rest of this repository uses.
+  # the tray already taught. Same licence as everything here: it was written under
+  # MIT and relicensed by its author on the way in, deliberately.
   "crates/ferry-deadman",
 ]
 # ferryman-tray is excluded on purpose: it needs desktop libraries (GTK on Linux) that a

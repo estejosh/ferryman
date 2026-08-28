@@ -193,4 +193,11 @@ Requires Rust ≥ 1.90. `#![forbid(unsafe_code)]`.
 
 ## License
 
-MIT © 2026 estejosh — see [LICENSE](LICENSE).
+Source-available under the [Ferryman Source-Available License](../../LICENSE),
+the same licence as the rest of this repository: free for any non-production use,
+and free in production inside the free tier. See
+[COMMERCIAL.md](../../COMMERCIAL.md).
+
+It was written under MIT before it moved here, and relicensed deliberately by its
+author rather than inherited by accident. Anyone who took a copy under MIT keeps
+those terms for that copy; a licence change is never retroactive.

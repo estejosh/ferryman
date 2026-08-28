@@ -4,6 +4,20 @@ All notable changes to **ferry-deadman** are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 versions follow [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Changed
+- Moved into the [Ferryman](https://github.com/estejosh/ferryman) repository as a
+  sub-product, and relicensed from MIT to the Ferryman Source-Available License by
+  its author. Copies taken under MIT keep those terms; a licence change is never
+  retroactive.
+- `include` globs work on Windows. `strip_prefix` yields `\`-separated paths there,
+  the globs are `/`-separated, so `include = ["docs/**"]` matched nothing and the
+  files were left out of the seal without a warning.
+- Notify hooks run on Windows. They were spawned with `sh -c` on every platform;
+  where no `sh` exists the spawn failed, and hook failures are warnings by design,
+  so nothing fired and nothing said so. `cmd /C` there now.
+
 ## [0.1.0] — 2026-08-24
 
 ### Added
