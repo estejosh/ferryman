@@ -118,6 +118,45 @@ pub fn build_archive(repo: &Path, opts: &ArchiveOptions<'_>) -> Result<BuiltArch
     })
 }
 
+/// Build the process for a user-configured archiver.
+///
+/// A shell line gets the host's shell, and on Windows it has to go through `raw_arg`:
+/// Rust quotes arguments the way a C runtime parses them, escaping inner quotes as
+/// `\"`, and `cmd.exe` does not read that quoting - so a line containing quotes or a
+/// redirect arrives mangled and does something other than what it says. The notify
+/// hooks had the identical bug, found the same afternoon.
+///
+/// An argv vector is spawned directly and needs none of this, which is the reason to
+/// prefer it: it is the one form that means the same thing on every machine.
+fn custom_archive_command(cmd: &ArchiveCmd) -> Result<std::process::Command> {
+    match cmd {
+        ArchiveCmd::Shell(line) => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                let mut process = std::process::Command::new("cmd");
+                process.arg("/C");
+                process.raw_arg(line);
+                Ok(process)
+            }
+            #[cfg(not(windows))]
+            {
+                let mut process = std::process::Command::new("sh");
+                process.arg("-c").arg(line);
+                Ok(process)
+            }
+        }
+        ArchiveCmd::Argv(argv) => {
+            let (program, args) = argv
+                .split_first()
+                .ok_or_else(|| Error::BadInput("archive.command must not be empty".into()))?;
+            let mut process = std::process::Command::new(program);
+            process.args(args);
+            Ok(process)
+        }
+    }
+}
+
 /// Run the user's archiver. Contract (documented in README + template):
 /// cwd = repo root, `$FERRY_DEADMAN_REPO` = repo root, `$FERRY_DEADMAN_OUT`
 /// = path of the single file the command must produce.
@@ -127,19 +166,15 @@ fn run_custom_archive(repo: &Path, cmd: &ArchiveCmd, head: Option<String>) -> Re
         .tempdir_in(std::env::temp_dir())
         .map_err(|e| Error::Other(format!("cannot create temp dir: {e}")))?;
     let out_path = scratch.path().join("archive.bin");
-    let argv = cmd.argv();
-    let (program, args) = argv
-        .split_first()
-        .ok_or_else(|| Error::BadInput("archive.command must not be empty".into()))?;
-
-    let status = std::process::Command::new(program)
-        .args(args)
+    let mut process = custom_archive_command(cmd)?;
+    let shown = cmd.display();
+    let status = process
         .current_dir(repo)
         .stdin(std::process::Stdio::null())
         .env("FERRY_DEADMAN_REPO", repo)
         .env("FERRY_DEADMAN_OUT", &out_path)
         .status()
-        .map_err(|e| Error::Other(format!("cannot run archive.command {:?}: {e}", program)))?;
+        .map_err(|e| Error::Other(format!("cannot run archive.command {shown:?}: {e}")))?;
     if !status.success() {
         return Err(Error::Other(format!(
             "archive.command exited with {status}"
@@ -601,6 +636,12 @@ mod tests {
     #[test]
     fn custom_archive_produces_opaque_but_hashverifiable_payload() {
         let ctx = testsupport::repo_fixture("fdm-custom");
+        // A shell line is host-specific by nature: `cp` and `$VAR` under `sh`, `copy`
+        // and `%VAR%` under `cmd`. Asserting only the unix spelling is how a feature
+        // ends up broken on a platform nobody ran it on.
+        #[cfg(windows)]
+        let cmd = ArchiveCmd::Shell("copy hello.txt \"%FERRY_DEADMAN_OUT%\"".into());
+        #[cfg(not(windows))]
         let cmd = ArchiveCmd::Shell("cp hello.txt \"$FERRY_DEADMAN_OUT\"".into());
         let built = build_archive(
             ctx.repo(),

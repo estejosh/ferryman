@@ -287,6 +287,37 @@ fn seal_and_write_all(repo: &Path, state: &mut State, eff: &Effective) -> Result
 // notify hooks
 // ---------------------------------------------------------------------------
 
+/// The shell a hook gets, and how the line reaches it.
+///
+/// It was `sh -c` on every platform. Windows has no `sh`, so the spawn failed - and a
+/// hook failure is a warning by design, so nothing fired there and nothing said so.
+/// Telling the successors is the one thing a deadman switch owes them.
+///
+/// On Windows the line goes through `raw_arg`, not `arg`. Rust quotes arguments the
+/// way a C runtime parses them, escaping inner quotes as `\"`, and `cmd.exe` does not
+/// read `\"` that way: a hook containing quotes or a redirect arrived mangled and
+/// wrote nothing, which looked exactly like the shell being missing all over again.
+/// `cmd /C` takes the rest of the line verbatim, which is what a shell line wants.
+///
+/// What the line *says* stays the user's, and cannot be otherwise: `$VAR` under `sh`,
+/// `%VAR%` under `cmd`. The docs name the shell rather than implying there is one.
+#[cfg(windows)]
+fn notify_shell(hook: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = std::process::Command::new("cmd");
+    command.arg("/C");
+    command.raw_arg(hook);
+    command
+}
+
+/// See the Windows counterpart above.
+#[cfg(not(windows))]
+fn notify_shell(hook: &str) -> std::process::Command {
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(hook);
+    command
+}
+
 /// Run the hook configured for `event`, if any. Failures are warnings —
 /// a broken notification channel must not corrupt the succession flow.
 fn run_notify(repo: &Path, notify: &NotifyCfg, event: &str, state: &State) {
@@ -298,24 +329,8 @@ fn run_notify(repo: &Path, notify: &NotifyCfg, event: &str, state: &State) {
     };
     let Some(hook) = hook else { return };
     let unlock_at = error::from_unix(state.beacon().round_time(state.unlock_round));
-    // A hook is a shell line, so it needs a shell, and which shell depends on the host.
-    // This was `sh -c` everywhere. Windows has no `sh`, so the spawn failed, and the
-    // failure was reported as a warning and stepped over - by the same rule below that
-    // stops a broken notifier corrupting a succession. The effect was that hooks never
-    // fired on Windows at all, silently, and telling the successors is the one thing a
-    // deadman switch owes them.
-    //
-    // The hook string itself stays the user's: `$VAR` under `sh`, `%VAR%` under `cmd`.
-    // A shell line cannot be made portable by the thing that runs it, so the docs say
-    // which shell it gets rather than pretending otherwise.
-    let (shell, shell_flag) = if cfg!(windows) {
-        ("cmd", "/C")
-    } else {
-        ("sh", "-c")
-    };
-    let outcome = std::process::Command::new(shell)
-        .arg(shell_flag)
-        .arg(hook)
+    let mut command = notify_shell(hook);
+    let outcome = command
         .current_dir(repo)
         .stdin(std::process::Stdio::null())
         .env("FERRY_DEADMAN_EVENT", event)

@@ -49,8 +49,15 @@ fn full_lifecycle_recovers_identical_bundle_hash() {
     let artifact = state::artifact_path(repo, &state::State::artifact_name_for(&st.successors[0]));
     assert!(artifact.is_file(), "artifact must exist");
 
-    // Immediately after arming the round has not passed: must refuse.
-    let err = trigger(repo, Some(Duration::ZERO)).expect_err("must be locked");
+    // "Refuses while locked" and "opens after the window" are two claims, and hanging
+    // both on one two-second window makes the first depend on how fast the machine got
+    // here. On Windows, with the repository on a network drive, arming took longer than
+    // the window and this assertion failed - a true statement about the clock, not
+    // about the code. One fixture per claim.
+    let locked_fx = repo_fixture("lifecycle-locked");
+    let locked_repo = locked_fx.repo();
+    arm_sim(locked_repo, "30s");
+    let err = trigger(locked_repo, Some(Duration::ZERO)).expect_err("must be locked");
     assert!(
         matches!(err, Error::Locked { .. }),
         "expected Locked, got {err:?}"
@@ -266,15 +273,30 @@ fn malformed_inputs_are_rejected_cleanly() {
     assert!(commands::parse_successor("ada=").is_err());
     assert!(commands::parse_successor("bad name! = aabbccdd").is_err());
 
-    // non-git directory
+    // A directory that is genuinely outside any repository.
+    //
+    // `git rev-parse --git-dir` walks UPWARD, so a temp dir is only "not a repo" when
+    // no ancestor is one. On a machine whose home directory is itself a git working
+    // tree - a real configuration, and the one this was caught on - every temp dir is
+    // inside a repository, and asserting otherwise tests the machine rather than the
+    // code. So the precondition is established rather than assumed.
     let not_git = tempfile::tempdir().unwrap();
-    let err = commands::arm(&ArmArgs {
-        repo: not_git.path().into(),
-        ..base()
-    })
-    .err()
-    .unwrap();
-    assert!(matches!(err, Error::NotAGitRepo(_)));
+    let inside_some_repo = std::process::Command::new("git")
+        .arg("-C")
+        .arg(not_git.path())
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !inside_some_repo {
+        let err = commands::arm(&ArmArgs {
+            repo: not_git.path().into(),
+            ..base()
+        })
+        .err()
+        .unwrap();
+        assert!(matches!(err, Error::NotAGitRepo(_)));
+    }
 
     // nonexistent path
     let err = commands::status(&std::path::PathBuf::from("/nonexistent/fdm/xyz"))

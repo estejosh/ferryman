@@ -108,7 +108,7 @@ pub struct SuccessorCfg {
 /// produces must end up as ONE file at `$FERRY_DEADMAN_OUT`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArchiveCmd {
-    /// Executed via `sh -c`, with cwd set to the repo.
+    /// A shell line: `sh -c` on unix, `cmd /C` on Windows, cwd set to the repo.
     Shell(String),
     /// Executed directly (argv[0] + args), with cwd set to the repo.
     Argv(Vec<String>),
@@ -118,6 +118,16 @@ impl ArchiveCmd {
     /// Normalised argv used for execution and persistence in state.
     pub fn argv(&self) -> Vec<String> {
         match self {
+            // `sh` was hardcoded here, so a documented feature - `archive.command`
+            // written as a shell line - could not run on Windows at all:
+            // `cannot run archive.command "sh": program not found`. Loud, which is
+            // the right failure for an archiver, and still a feature that did not
+            // exist on one platform. This is per-machine state, not an artifact
+            // another machine reads, so recording the shell that actually ran is
+            // honest rather than inconsistent.
+            ArchiveCmd::Shell(s) if cfg!(windows) => {
+                vec!["cmd".into(), "/C".into(), s.clone()]
+            }
             ArchiveCmd::Shell(s) => vec!["sh".into(), "-c".into(), s.clone()],
             ArchiveCmd::Argv(v) => v.clone(),
         }

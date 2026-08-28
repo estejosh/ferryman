@@ -235,6 +235,23 @@ fn any_cli_source_heartbeats_on_status() {
     assert!(after.last_heartbeat_unix >= before.last_heartbeat_unix);
 }
 
+// A custom archiver is a shell line, and a shell line is not portable: `cp` and
+// `$VAR` on unix, `copy` and `%VAR%` under cmd. The product cannot fix that and does
+// not pretend to, so the test writes what each host actually understands and asserts
+// the same recorded behaviour from both.
+#[cfg(windows)]
+const SHELL: &str = "cmd";
+#[cfg(windows)]
+const SHELL_FLAG: &str = "/C";
+#[cfg(windows)]
+const ARCHIVE_LINE: &str = "copy release.bin \\\"%FERRY_DEADMAN_OUT%\\\"";
+#[cfg(not(windows))]
+const SHELL: &str = "sh";
+#[cfg(not(windows))]
+const SHELL_FLAG: &str = "-c";
+#[cfg(not(windows))]
+const ARCHIVE_LINE: &str = "cp release.bin \\\"$FERRY_DEADMAN_OUT\\\"";
+
 #[test]
 fn custom_archive_command_roundtrips_by_hash() {
     let fx = repo_fixture("custom-archive");
@@ -243,7 +260,7 @@ fn custom_archive_command_roundtrips_by_hash() {
     std::fs::write(
         repo.join("deadman.toml"),
         format!(
-            "beacon = \"simulate\"\nwindow = \"2s\"\narchive.command = \"cp release.bin \\\"$FERRY_DEADMAN_OUT\\\"\"\n[[successors]]\nname = \"ada\"\nkey = \"{SUCCESSOR_HEX}\"\n"
+            "beacon = \"simulate\"\nwindow = \"2s\"\narchive.command = \"{ARCHIVE_LINE}\"\n[[successors]]\nname = \"ada\"\nkey = \"{SUCCESSOR_HEX}\"\n"
         ),
     )
     .unwrap();
@@ -254,9 +271,9 @@ fn custom_archive_command_roundtrips_by_hash() {
     assert_eq!(
         st.archive_argv,
         Some(vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "cp release.bin \"$FERRY_DEADMAN_OUT\"".to_string()
+            SHELL.to_string(),
+            SHELL_FLAG.to_string(),
+            ARCHIVE_LINE.replace("\\\"", "\"")
         ])
     );
     let art = state::artifact_path(repo, &state::State::artifact_name_for(&st.successors[0]));
