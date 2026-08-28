@@ -1807,6 +1807,78 @@ fn reclaim_own_orphans(
 /// Run the two startup recoveries once per process per channel. A claim or heartbeat
 /// from a previous incarnation is only judged at the moment a worker starts, never on
 /// every poll.
+/// Report an order or result this machine refuses to act on, once.
+///
+/// Three things were wrong with saying this inline, and all three were found by
+/// reading two hours of a real fleet log:
+///
+/// 1. **It said "invalid" for every verdict.** The one that actually happens to people
+///    is `UnknownSigner` - a name in the roster with no key against it - and "invalid"
+///    sends an operator hunting for tampering when the answer is that a seat never
+///    registered. `bullship-bridge` declares `no-persistent-signing-key` and
+///    `public_key: null` in its own roster note: unsigned *by design*, refused
+///    correctly, and described wrongly.
+/// 2. **It never said which project.** One worker watches nineteen channels. Naming
+///    the task and not the channel cost four commands to find which.
+/// 3. **It said it every ten seconds, forever.** 481 times in two hours for one order.
+///    A refusal is a standing condition, not an event: it is true until the roster
+///    changes, and repeating it buries everything else in the log.
+///
+/// Keyed by verdict as well as task, so a condition that *changes* - a key finally
+/// registering, or a `KeyChanged` appearing - is reported again rather than swallowed.
+fn refuse_once(
+    route: &ProjectRoute,
+    id: &str,
+    what: &str,
+    check: ferryman_channel::SignatureCheck,
+) {
+    use ferryman_channel::SignatureCheck;
+    static SAID: std::sync::LazyLock<std::sync::Mutex<HashSet<(String, String, String)>>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+    let verdict = format!("{check:?}");
+    let key = (route.project_id.clone(), id.to_string(), verdict.clone());
+    // A poisoned guard must not silence a trust decision: fall through and say it
+    // every time instead. Noisy beats quiet when the subject is a signature.
+    if let Ok(mut said) = SAID.lock()
+        && !said.insert(key)
+    {
+        return;
+    }
+    let because = match &check {
+        SignatureCheck::Unsigned => "it carries no signature".to_string(),
+        SignatureCheck::Invalid => "the signature does not match the content".to_string(),
+        SignatureCheck::UnknownSigner => {
+            "the roster has no key for that name - either the agent never registered one, \
+             or the name was reserved with `ferry channel expect` and nobody joined under it"
+                .to_string()
+        }
+        // Named in full deliberately. This is the one verdict that can mean somebody is
+        // impersonating an agent, and an operator cannot judge it without both keys.
+        SignatureCheck::KeyChanged { known, presented } => format!(
+            "the key differs from the one this machine pinned the first time it saw that \
+             name. Pinned {}, presented {}. That is what impersonation looks like, and \
+             also what an honest re-key looks like - only you can tell which",
+            short_key(known),
+            short_key(presented)
+        ),
+        SignatureCheck::Valid => "it is valid, which should not reach here".to_string(),
+    };
+    tracing::warn!(
+        project = %route.project_id,
+        task = %id,
+        verdict = %verdict,
+        "refusing to act on {what}: {because}"
+    );
+}
+
+/// Enough of a public key to compare by eye, which is all a log line is for.
+fn short_key(key: &str) -> String {
+    if key.len() <= 16 {
+        return key.to_string();
+    }
+    format!("{}...{}", &key[..8], &key[key.len() - 8..])
+}
+
 fn recover_own_tasks(
     route: &ProjectRoute,
     config: &AgentConfig,
@@ -2041,10 +2113,9 @@ pub async fn work_once(
         // Trust boundary: never act on an order whose signature does not verify.
         // Any peer can write to the synced folder, so an unsigned or forged
         // order must be skipped, not executed.
-        if ferryman_channel::verify_order(&task.order, &route.agents)
-            != ferryman_channel::SignatureCheck::Valid
-        {
-            report.warn(&format!("  {id}: order signature invalid, skipping"));
+        let order_check = ferryman_channel::verify_order(&task.order, &route.agents);
+        if order_check != ferryman_channel::SignatureCheck::Valid {
+            refuse_once(route, &id, "this order", order_check);
             continue;
         }
         match task.state() {
@@ -2606,25 +2677,34 @@ pub async fn review_once(
         };
         // Trust boundary: judge only work whose order and result signatures
         // verify. A forged order or result must not be reviewed as if real.
-        if ferryman_channel::verify_order(&task.order, &route.agents)
-            != ferryman_channel::SignatureCheck::Valid
-        {
-            report.warn(&format!(
-                "  {}: order signature invalid, skipping",
-                task.order.id
-            ));
+        let order_check = ferryman_channel::verify_order(&task.order, &route.agents);
+        if order_check != ferryman_channel::SignatureCheck::Valid {
+            refuse_once(route, &task.order.id, "this order", order_check);
             continue;
         }
-        if !task.results.iter().any(|r| {
-            r.revision == revision
-                && ferryman_channel::verify_result(r, &route.agents)
-                    == ferryman_channel::SignatureCheck::Valid
-        }) {
-            report.warn(&format!(
-                "  {}: result signature invalid, skipping",
-                task.order.id
-            ));
-            continue;
+        // The verdict of the revision under review, so the refusal can name it. An
+        // absent result is not the same as a badly signed one and should not read the
+        // same either.
+        let result_check = task
+            .results
+            .iter()
+            .find(|r| r.revision == revision)
+            .map(|r| ferryman_channel::verify_result(r, &route.agents));
+        match result_check {
+            Some(ferryman_channel::SignatureCheck::Valid) => {}
+            Some(check) => {
+                refuse_once(route, &task.order.id, "this result", check);
+                continue;
+            }
+            None => {
+                tracing::warn!(
+                    project = %route.project_id,
+                    task = %task.order.id,
+                    revision,
+                    "awaiting review, but no result for that revision is present"
+                );
+                continue;
+            }
         }
         // Reviewing your own work is not review. Saying so out loud matters: a single
         // machine configured as both worker and reviewer would otherwise look like a
