@@ -47,9 +47,36 @@ signs proves the release and the repository came from the same place; it cannot
 prove that place is the one you meant. For that, compare the fingerprint with
 one you obtained some other way.
 
-### Known gap
+### The tagger address has to be a UID on the key
 
-GitHub reports `"verified": false, "reason": "bad_email"` on these tags: the
-tagger address is the `users.noreply.github.com` one used for commits, which is
-not a UID on the signing key. `git tag -v` is unaffected and reports a good
-signature. Adding that address as a UID on the key would close it.
+GitHub reported `"verified": false, "reason": "bad_email"` on v0.5.0 through
+v0.5.2 while `git tag -v` reported a good signature on all of them. Both were
+right. GitHub matches the tagger address on the tag object against the UIDs of
+the key registered on the account; the tagger address here is the
+`users.noreply.github.com` one, and it was not a UID on the key, so there was
+nothing to match.
+
+The obvious fix is the wrong one. Setting the tagger address to the address the
+key already carried made GitHub refuse the push outright:
+
+```
+! [remote rejected] v0.5.3 -> v0.5.3 (push declined due to email privacy restrictions)
+```
+
+That is the account's "block command line pushes that expose my email" setting
+doing its job. The key is the thing to change, not the privacy setting:
+
+```sh
+gpg --quick-add-uid <KEYID> "Your Name <ID+user@users.noreply.github.com>"
+gpg --batch --yes --armor --output keys/estejosh.asc --export <KEYID>
+```
+
+Export with `--output`, not by piping into a shell redirect: PowerShell's
+pipeline flattens the armor onto one line and produces a key file that looks
+present and parses as nothing.
+
+**Then re-upload the public key in GitHub → Settings → SSH and GPG keys.**
+Verification is computed against the copy GitHub holds, not the copy in this
+repository, so a UID added locally changes nothing until that copy is replaced.
+Adding a UID does not change the key or its fingerprint, and tags signed before
+the change still verify.
