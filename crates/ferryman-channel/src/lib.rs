@@ -91,10 +91,24 @@ const SENSITIVE_CHILD_ENVIRONMENT: &[&str] = &[
 
 /// Name fragments that mark an environment variable as secret, so a new
 /// provider's key is scrubbed even before it is added to the explicit list.
+/// Substrings that make a variable name look like it holds a secret.
+///
+/// `TOKEN` is here, and the compound forms it subsumes are not, because requiring the
+/// compound was a hole you could drive a fleet through. `AUTH_TOKEN` and `ACCESS_TOKEN`
+/// matched; `GITHUB_TOKEN`, `GH_TOKEN`, `TELEGRAM_BOT_TOKEN`, `NPM_TOKEN` and `HF_TOKEN`
+/// did not — which is to say the list caught the names almost nobody uses and missed the
+/// ones everybody does. Found on a live machine, where a GitHub PAT and a Telegram bot
+/// token were reaching the environment of every task the worker ran, on a box whose
+/// documentation promises an environment scrub.
+///
+/// Over-scrubbing is the safe direction here. The cost of removing a variable an engine
+/// wanted is a task that fails loudly and an operator who puts it in `credentials.json`,
+/// which is where engine credentials are supposed to live. The cost of keeping one is
+/// that every task any agent ever runs can read it.
 const SECRET_NAME_HINTS: &[&str] = &[
     "API_KEY",
-    "AUTH_TOKEN",
-    "ACCESS_TOKEN",
+    "APIKEY",
+    "TOKEN",
     "SECRET",
     "PASSWORD",
     "PASSPHRASE",
@@ -3547,15 +3561,83 @@ pub fn scrub_child_environment_names() -> Vec<String> {
         .map(|s| s.to_string())
         .collect();
     for (name, _) in std::env::vars() {
-        let upper = name.to_ascii_uppercase();
-        if SECRET_NAME_HINTS
-            .iter()
-            .any(|hint| upper.contains(hint) && !name.starts_with("GIT_"))
-        {
+        if looks_like_a_secret_name(&name) {
             names.push(name);
         }
     }
     names
+}
+
+/// Whether a variable name alone is reason enough not to hand it to a child.
+///
+/// A pure function of the name, so the policy can be tested without touching the
+/// process environment - which this crate could not do anyway, since it forbids
+/// `unsafe` and `std::env::set_var` is unsafe under edition 2024. Naming the rule also
+/// makes it reviewable, which a closure inside a loop was not.
+fn looks_like_a_secret_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    if !SECRET_NAME_HINTS.iter().any(|hint| upper.contains(hint)) {
+        return false;
+    }
+    // The `GIT_` exemption exists so git's own configuration survives - `GIT_DIR`,
+    // `GIT_TERMINAL_PROMPT` and friends, none of which look like secrets. It must not
+    // become a way to smuggle one through: `GIT_TOKEN` was exempt purely for its prefix.
+    let git_configuration = upper.starts_with("GIT_")
+        && !["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "CREDENTIAL"]
+            .iter()
+            .any(|hint| upper.contains(hint));
+    !git_configuration
+}
+
+#[cfg(test)]
+mod child_environment_scrub {
+    use super::looks_like_a_secret_name as secret;
+
+    /// The names a real machine actually uses.
+    ///
+    /// The hint list used to require a compound - `AUTH_TOKEN`, `ACCESS_TOKEN` - so it
+    /// caught the spellings almost nobody uses and missed the ones everybody does.
+    /// `TELEGRAM_BOT_TOKEN` was reaching the environment of every task a worker ran, on a
+    /// machine whose own documentation promises an environment scrub.
+    #[test]
+    fn a_name_saying_token_is_a_secret_whatever_precedes_it() {
+        for name in [
+            "TELEGRAM_BOT_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "NPM_TOKEN",
+            "SLACK_BOT_TOKEN",
+            "SOME_VENDOR_APIKEY",
+            "db_password",
+        ] {
+            assert!(secret(name), "{name} must not reach a child process");
+        }
+    }
+
+    /// The `GIT_` exemption is for git's own configuration, not a way through it.
+    #[test]
+    fn the_git_prefix_does_not_carry_a_secret_through() {
+        assert!(secret("GIT_TOKEN"), "a GIT_ prefix must not exempt a token");
+        assert!(secret("GIT_PASSWORD"));
+    }
+
+    /// Over-scrubbing is the safe direction, but not infinitely: a child that loses
+    /// `PATH` cannot run anything, and git that loses its own configuration misbehaves in
+    /// ways that look like Ferryman bugs. `PATH` also has to survive a rule about `PAT`.
+    #[test]
+    fn ordinary_configuration_is_not_a_secret() {
+        for name in [
+            "GIT_DIR",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_AUTHOR_NAME",
+            "PATH",
+            "HOME",
+            "LANG",
+            "FERRYMAN_ENV_FILE",
+        ] {
+            assert!(!secret(name), "{name} is configuration, not a credential");
+        }
+    }
 }
 
 fn system_git_command(directory: &Path, arguments: &[&str]) -> Command {
