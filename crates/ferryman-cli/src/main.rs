@@ -134,11 +134,19 @@ enum Command {
         /// identity, and its past work stays attributed to the old one.
         #[arg(long, requires = "headless")]
         engine: Option<String>,
-        /// Contact email for this deployment. Required: free production use is
-        /// conditioned on registering one (LICENSE section 3). Nothing about your
-        /// code or your work is ever sent - see PRIVACY.md.
+        /// Contact email for this deployment. Free production use is conditioned on
+        /// registering one (LICENSE section 3). Nothing about your code or your work is
+        /// ever sent - see PRIVACY.md.
+        ///
+        /// Asked for at a terminal when it is not given. It was a required argument, and
+        /// the first command in this repository's own AGENTS.md omitted it, so the first
+        /// thing a stranger following our instructions saw was `error: the following
+        /// required arguments were not provided`, exit code 2, nothing created and no
+        /// explanation. The problem was never which flag: it was that the page written
+        /// for the reader who has nobody to ask was wrong, in the first thirty seconds,
+        /// before Ferryman had shown them anything it does well.
         #[arg(long, env = "FERRYMAN_EMAIL")]
-        email: String,
+        email: Option<String>,
         /// What this agent is here to do. Shown to every other machine in the roster.
         #[arg(long, default_value = "worker")]
         role: String,
@@ -1647,6 +1655,7 @@ async fn run(cli: Cli) -> Result<()> {
             } else {
                 agent_name
             };
+            let email = resolve_contact_email(email, as_json)?;
             let outcome = enable::perform(enable::Request {
                 workspace,
                 project,
@@ -2436,6 +2445,61 @@ enum DashboardOutcome {
 /// A human at a terminal is asked and types the password privately (never
 /// echoed). An agent (`--json`, or piped stdin) never sees or supplies the
 /// password: it is told to hand the human a browser instead.
+/// The contact address, asked for rather than demanded.
+///
+/// The licence conditions free production use on registering one, so `enable` does need
+/// it. What it does not need is to be the reason a stranger's first command fails with
+/// clap's default message and nothing else. At a terminal this asks, and says in one
+/// sentence why it is asking. Anywhere else - `--json`, a pipe, an unattended agent -
+/// it fails as before, but with an error that explains the condition and names the two
+/// ways to satisfy it, because the caller there cannot answer a question.
+fn resolve_contact_email(email: Option<String>, as_json: bool) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+    if let Some(email) = email {
+        let email = email.trim().to_string();
+        if !email.is_empty() {
+            return Ok(email);
+        }
+    }
+    if as_json || !std::io::stdin().is_terminal() {
+        bail!(
+            "this deployment needs a contact address before it can be enabled.\n\
+             \n\
+             Free production use is conditioned on registering one (LICENSE section 3).\n\
+             Nothing about your code, your channel or your work is ever sent - PRIVACY.md\n\
+             lists the entire payload, and a downloaded release has no endpoint configured\n\
+             at all, so it sends nothing until you set one yourself.\n\
+             \n\
+             Pass it, or set it once:\n\
+             \n\
+             ferry enable --email you@example.com\n\
+             FERRYMAN_EMAIL=you@example.com ferry enable"
+        );
+    }
+    println!(
+        "Ferryman asks for a contact address once. Free production use is conditioned on\n\
+         registering one, and it is the only way anyone can reach you about licensing.\n\
+         Nothing about your code or your work is ever sent - see PRIVACY.md."
+    );
+    loop {
+        print!("Your email: ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer)? == 0 {
+            bail!("no address given, and no terminal left to ask on");
+        }
+        let answer = answer.trim();
+        // Deliberately the weakest check that catches a typo: an address is a thing a
+        // human reads, not a thing this program validates. Refusing a legitimate address
+        // because it does not match somebody's regex is worse than accepting a wrong one,
+        // which costs an email nobody reads.
+        if answer.contains('@') && !answer.starts_with('@') && !answer.ends_with('@') {
+            return Ok(answer.to_string());
+        }
+        println!("That does not look like an email address. Try again, or press Ctrl-C.");
+    }
+}
+
 fn resolve_dashboard_setup(
     dashboard: bool,
     operator: Option<String>,
@@ -2553,32 +2617,48 @@ fn report_enable_json(
 
 /// The same facts, for a person.
 fn report_enable_human(outcome: &enable::Outcome, dashboard: Option<&DashboardOutcome>) {
-    println!("ferryman enabled for '{}'", outcome.project);
+    // Identity first, then what changed on disk.
+    //
+    // This used to open with a list of eight files and put the agent's name and key
+    // underneath them, which is the wrong way round for the one moment that decides
+    // whether a stranger keeps going. The first thing a person wants after running
+    // setup is not an inventory of what was written - it is to know that they are now
+    // someone, with a name and a key, in a thing that has a shape. The files are still
+    // here, below, for the reader who wants them.
+    println!();
+    println!("  You are '{}' on this machine.", outcome.agent);
+    println!("  Key      {}", outcome.public_key);
+    println!(
+        "           This is how every other machine will know your work is yours.\n\
+         \x20          Nothing signs as you without it, and it never leaves this machine."
+    );
+    println!();
+    println!("  Project  {}", outcome.project);
+    println!(
+        "  Engine   {} {}",
+        outcome.config.command,
+        outcome.config.args.join(" ")
+    );
+    println!("  Review   {}", outcome.config.review.as_str());
+    if !outcome.command_found {
+        println!(
+            "  WARNING  '{}' is not on this machine's PATH - tasks would fail to \
+             start. Install it, or edit command/args in .ferryman/agent.toml \
+             (see docs/ENGINE_SETUP.md). Run 'ferry doctor' after fixing.",
+            outcome.config.command
+        );
+    }
+    println!();
+    println!("  Written:");
     for step in &outcome.steps {
         println!(
-            "  {:<16} {}  {}",
+            "    {:<16} {}  {}",
             step.what,
             if step.created { "created" } else { "present" },
             step.path.display()
         );
     }
     println!();
-    println!("  agent      {}", outcome.agent);
-    println!(
-        "  runs       {} {}",
-        outcome.config.command,
-        outcome.config.args.join(" ")
-    );
-    if !outcome.command_found {
-        println!(
-            "  WARNING    '{}' is not on this machine's PATH - tasks would fail to \
-             start. Install it, or edit command/args in .ferryman/agent.toml \
-             (see docs/ENGINE_SETUP.md). Run 'ferry doctor' after fixing.",
-            outcome.config.command
-        );
-    }
-    println!("  review     {}", outcome.config.review.as_str());
-    println!("  public key {}", outcome.public_key);
     match dashboard {
         Some(DashboardOutcome::Created { operator, .. }) => {
             println!("  dashboard  operator '{operator}' created");

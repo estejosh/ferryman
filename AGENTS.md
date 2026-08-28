@@ -13,15 +13,22 @@ instead — it is the same thing, already sequenced.
 The whole of it is two commands:
 
 ```sh
-cargo install --git https://github.com/estejosh/ferryman ferryman-cli
-ferry enable --json          # run in the project directory
+cargo install --git https://github.com/estejosh/ferryman ferryman-cli   # needs Rust 1.97+
+ferry enable --json --email you@example.com    # run in the project directory
 ```
+
+**The address is not optional under `--json`, and it is not yours to invent.** Free
+production use is conditioned on registering one (LICENSE section 3); nothing about the
+code or the work is ever sent, and PRIVACY.md lists the whole payload. Ask the human
+you are working for, or have them set `FERRYMAN_EMAIL` once. Running without it under
+`--json` fails with an error that says this — deliberately, because you cannot answer a
+question and must not answer this one by guessing.
 
 `ferry enable` never prompts under `--json` or when it is not attached to a terminal —
 which is every case that matters to you — is safe to re-run, and prints a JSON object
 saying exactly what it created. If you are unsure whether you already ran it, run it
-again. (At a human's terminal without `--json` it asks one question, about the web
-dashboard. You will not see it.)
+again. (At a human's terminal it asks for the address if it does not have one, and one
+question about the web dashboard. You will see neither.)
 
 ### You are working ON Ferryman itself
 
