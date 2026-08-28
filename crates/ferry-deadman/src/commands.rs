@@ -298,8 +298,23 @@ fn run_notify(repo: &Path, notify: &NotifyCfg, event: &str, state: &State) {
     };
     let Some(hook) = hook else { return };
     let unlock_at = error::from_unix(state.beacon().round_time(state.unlock_round));
-    let outcome = std::process::Command::new("sh")
-        .arg("-c")
+    // A hook is a shell line, so it needs a shell, and which shell depends on the host.
+    // This was `sh -c` everywhere. Windows has no `sh`, so the spawn failed, and the
+    // failure was reported as a warning and stepped over - by the same rule below that
+    // stops a broken notifier corrupting a succession. The effect was that hooks never
+    // fired on Windows at all, silently, and telling the successors is the one thing a
+    // deadman switch owes them.
+    //
+    // The hook string itself stays the user's: `$VAR` under `sh`, `%VAR%` under `cmd`.
+    // A shell line cannot be made portable by the thing that runs it, so the docs say
+    // which shell it gets rather than pretending otherwise.
+    let (shell, shell_flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("sh", "-c")
+    };
+    let outcome = std::process::Command::new(shell)
+        .arg(shell_flag)
         .arg(hook)
         .current_dir(repo)
         .stdin(std::process::Stdio::null())

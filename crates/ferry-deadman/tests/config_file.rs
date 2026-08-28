@@ -139,10 +139,32 @@ fn notify_hooks_fire_on_arm_and_rearm_and_trigger() {
     let repo = fx.repo();
     let marker = fx.root.path().join("hooklog");
     let log = marker.display().to_string().replace('\'', "");
+
+    // A hook is a shell line and the shell differs by host: `sh -c` on unix,
+    // `cmd /C` on Windows, which spells variables `%LIKE_THIS%` and does not strip
+    // single quotes. The product cannot paper over that, so neither does the test -
+    // it writes the hook each shell actually understands, and asserts the same
+    // behaviour from both.
+    #[cfg(windows)]
+    let (arm, rearm, trigger) = (
+        format!("echo %FERRY_DEADMAN_EVENT%>> \"{log}\""),
+        format!("echo %FERRY_DEADMAN_EVENT%:%FERRY_DEADMAN_ROUND%>> \"{log}\""),
+        format!("echo %FERRY_DEADMAN_EVENT%>> \"{log}\""),
+    );
+    #[cfg(not(windows))]
+    let (arm, rearm, trigger) = (
+        format!("echo $FERRY_DEADMAN_EVENT >> '{log}'"),
+        format!("echo $FERRY_DEADMAN_EVENT:$FERRY_DEADMAN_ROUND >> '{log}'"),
+        format!("echo $FERRY_DEADMAN_EVENT >> '{log}'"),
+    );
+    let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     std::fs::write(
         repo.join("deadman.toml"),
         format!(
-            "beacon = \"simulate\"\nwindow = \"1s\"\n[notify]\narm = \"echo $FERRY_DEADMAN_EVENT >> '{log}'\"\nrearm = \"echo $FERRY_DEADMAN_EVENT:$FERRY_DEADMAN_ROUND >> '{log}'\"\ntrigger = \"echo $FERRY_DEADMAN_EVENT >> '{log}'\"\n[[successors]]\nname=\"ada\"\n"
+            "beacon = \"simulate\"\nwindow = \"1s\"\n[notify]\narm = \"{}\"\nrearm = \"{}\"\ntrigger = \"{}\"\n[[successors]]\nname=\"ada\"\n",
+            escape(&arm),
+            escape(&rearm),
+            escape(&trigger)
         ),
     )
     .unwrap();

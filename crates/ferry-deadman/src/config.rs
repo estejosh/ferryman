@@ -336,9 +336,11 @@ pub const TEMPLATE: &str = r#"# deadman.toml — ferry-deadman succession settin
 ##   "any-cli"  any ferry-deadman invocation re-arms the switch
 #heartbeat.sources = ["manual"]
 
-## Arbitrary commands run on lifecycle events (via sh -c, cwd = repo).
-## Exposes $FERRY_DEADMAN_EVENT, $FERRY_DEADMAN_REPO, $FERRY_DEADMAN_ROUND,
-## $FERRY_DEADMAN_UNLOCK_AT. Hook failures are warnings, never fatal.
+## Arbitrary commands run on lifecycle events (cwd = repo), through `sh -c` on
+## unix and `cmd /C` on Windows. Exposes FERRY_DEADMAN_EVENT, FERRY_DEADMAN_REPO,
+## FERRY_DEADMAN_ROUND, FERRY_DEADMAN_UNLOCK_AT — written $VAR under sh and %VAR%
+## under cmd, so a hook is not portable between the two.
+## Hook failures are warnings, never fatal.
 #[notify]
 #arm = "say 'deadman armed'"
 #rearm = "curl -fsS -m 5 https://example.test/alive"

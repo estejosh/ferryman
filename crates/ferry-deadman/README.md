@@ -78,7 +78,7 @@ All keys optional; unknown keys warn but never error (forward compatible).
 | `[[successors]]` `name` / `key` | required ≥1 | one entry per successor; EACH gets its own sealed copy at `.deadman/sealed-<name>.tlock`. `key` = file path or inline hex (identity commitment only) |
 | `archive.command` | built-in bundle+tar.gz | replacement archiver: shell string or argv vector; must write ONE file to `$FERRY_DEADMAN_OUT` (cwd = repo, `$FERRY_DEADMAN_REPO` set). Recovery then verifies by hash instead of bundle verification |
 | `heartbeat.sources` | `["manual"]` | which events re-arm the switch: `"manual"` (explicit command, always honoured) and/or `"any-cli"` (any invocation re-arms) |
-| `notify.arm` / `notify.rearm` / `notify.trigger` | none | arbitrary shell commands run on arm / re-arm / trigger via `sh -c` (cwd = repo). Exposes `$FERRY_DEADMAN_EVENT`, `$FERRY_DEADMAN_REPO`, `$FERRY_DEADMAN_ROUND`, `$FERRY_DEADMAN_UNLOCK_AT`. Hook failures are warnings |
+| `notify.arm` / `notify.rearm` / `notify.trigger` | none | arbitrary shell commands run on arm / re-arm / trigger (cwd = repo), through `sh -c` on unix and `cmd /C` on Windows. Exposes `FERRY_DEADMAN_EVENT`, `FERRY_DEADMAN_REPO`, `FERRY_DEADMAN_ROUND`, `FERRY_DEADMAN_UNLOCK_AT` — spelled `$VAR` under `sh`, `%VAR%` under `cmd`, so a hook written for one host is not portable to the other. Hook failures are warnings and never block a succession |
 
 Example:
 
