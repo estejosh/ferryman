@@ -6,6 +6,13 @@ members = [
   "crates/ferryman-cli",
   "crates/ferryman-ops",
   "crates/ferryman-worker-sdk",
+  # A sub-product rather than a part of Ferryman: `ferry-deadman` seals a repo to a
+  # future drand beacon round, and works on any git repository with no Ferryman
+  # anywhere. It is in this workspace so it is built, linted and tested with
+  # everything else rather than rotting in a directory nobody compiles - the lesson
+  # the tray already taught. Note it carries its own MIT licence, not the
+  # source-available one the rest of this repository uses.
+  "crates/ferry-deadman",
 ]
 # ferryman-tray is excluded on purpose: it needs desktop libraries (GTK on Linux) that a
 # headless agent box does not have, and breaking the build there to compile a tray nobody

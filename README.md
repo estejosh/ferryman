@@ -191,6 +191,23 @@ Secrets themselves are meant to move — that is what sealing is for. Set them w
 machines that should receive them before they ever leave the machine that typed them. What
 must not travel is the plaintext, and the bridge is the one path that cannot carry ciphertext.
 
+## ferry-deadman — a sub-product in this repository
+
+[`crates/ferry-deadman`](crates/ferry-deadman) is its own thing, built and tested
+here but useful with no Ferryman anywhere: **timelocked succession for any git
+repository.** It seals an archive of a repo — `git bundle --all` plus any files you
+name — so that it becomes decryptable only after a future point in time, enforced by
+the [drand](https://drand.love) threshold beacon rather than by a server, a company
+or a person. While you keep running `ferry-deadman heartbeat`, the deadline keeps
+moving away from you. The day you stop, the mathematics opens the envelope.
+
+Ferryman's part is transport: a channel can carry the sealed artifact to your
+successors' machines, and it is ciphertext the whole way. Neither half needs the
+other. See its [README](crates/ferry-deadman/README.md).
+
+It carries the MIT licence, not the source-available one the rest of this
+repository uses.
+
 ## Documentation
 
 | Guide | What it covers |
