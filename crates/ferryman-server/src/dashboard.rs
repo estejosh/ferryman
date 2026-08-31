@@ -333,6 +333,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/learnings", get(learnings))
         .route("/api/roster", get(roster))
         .route("/api/fleet", get(fleet))
+        .route("/api/conversations", get(conversations))
+        .route("/api/conversations/{topic}", get(conversation).post(say))
         .route("/api/memory", get(memory))
         .route("/api/memory/suggest", post(suggest))
         .route("/api/secrets", get(secrets_list))
@@ -1438,6 +1440,137 @@ fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
         .collect())
 }
 
+/// Where the conversations live: the memory bank, which Syncthing carries - so what is
+/// said here is said in the channel, not in the dashboard.
+fn conversation_bank(state: &DashboardState) -> std::path::PathBuf {
+    state.route.communications.join("memory-bank")
+}
+
+/// One line of a conversation file, parsed back out of the shape `append_turn` writes.
+///
+/// The file is Markdown on purpose - people read it, and agents' prompts are built from
+/// it - so this parses rather than owning a format. A line it cannot read comes back
+/// whole under an empty speaker rather than being dropped: silently swallowing a line of
+/// somebody's conversation is worse than showing it plainly.
+fn parse_turn(line: &str) -> Value {
+    let rest = line.trim_start().trim_start_matches("- ");
+    if let Some((at, tail)) = rest.split_once(' ')
+        && let Some(said) = tail.strip_prefix("**")
+        && let Some((who, body)) = said.split_once("**: ")
+    {
+        return json!({ "at": at, "who": who, "said": body });
+    }
+    json!({ "at": "", "who": "", "said": rest })
+}
+
+/// GET /api/conversations - every topic, with its last line and whether it verifies.
+async fn conversations(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
+    let bank = conversation_bank(&state);
+    let dir = ferryman_channel::conversation::conversations_dir(&bank);
+    let mut topics = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(topic) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|line| line.trim_start().starts_with("- "))
+                .collect();
+            let last = lines.last().map(|line| parse_turn(line));
+            let check = ferryman_channel::conversation::verify_conversation(
+                &bank,
+                topic,
+                &state.route.agents,
+            );
+            topics.push(json!({
+                "topic": topic,
+                "turns": lines.len(),
+                "last": last,
+                "signature": sig(&check),
+            }));
+        }
+    }
+    // Most recently spoken in, first. A conversation nobody has touched for a week must
+    // not sit above the one that is happening now.
+    topics.sort_by(|a, b| {
+        let key = |v: &Value| v["last"]["at"].as_str().unwrap_or_default().to_string();
+        key(b).cmp(&key(a))
+    });
+    Ok(Json(json!({ "conversations": topics })))
+}
+
+/// GET /api/conversations/{topic} - the thread.
+async fn conversation(
+    State(state): State<DashboardState>,
+    Path(topic): Path<String>,
+) -> Result<Json<Value>, DashboardError> {
+    let bank = conversation_bank(&state);
+    let check =
+        ferryman_channel::conversation::verify_conversation(&bank, &topic, &state.route.agents);
+    let text = ferryman_channel::conversation::load_conversation(&bank, &topic).unwrap_or_default();
+    let turns: Vec<Value> = text
+        .lines()
+        .filter(|line| line.trim_start().starts_with("- "))
+        .map(parse_turn)
+        .collect();
+    Ok(Json(json!({
+        "topic": topic,
+        "turns": turns,
+        "signature": sig(&check),
+    })))
+}
+
+#[derive(Deserialize)]
+struct SaidBody {
+    said: String,
+}
+
+/// POST /api/conversations/{topic} - say something, signed by whoever is signed in.
+///
+/// # Why this writes to the channel rather than to the dashboard
+///
+/// The dashboard is a view over the synced channel, never a second channel. What the
+/// operator types here and what they type into Telegram land in the same signed file and
+/// are indistinguishable afterwards, which is the whole point. A message that existed
+/// only in the dashboard would be invisible to every agent and would vanish when this
+/// process stopped - and the project's claim is that there is no server in the middle.
+async fn say(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Json(body): Json<SaidBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let said = body.said.trim();
+    if said.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "nothing to say".to_string()));
+    }
+    // A browser will happily post a megabyte, and this file is carried to every machine
+    // in the fleet and read into agents' prompts.
+    if said.len() > 8_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "that is too long for one turn; say it in a few".to_string(),
+        ));
+    }
+    let bank = conversation_bank(&state);
+    ferryman_channel::conversation::append_turn(&bank, &topic, identity.name(), said, &identity)
+        .map_err(|e| internal(e.into()))?;
+    Ok(Json(json!({ "topic": topic, "who": identity.name() })))
+}
+
 /// GET /api/memory — the project's shared memory bank, plus the knowledge graph
 /// if graphify has exported one. Best-effort: an unreadable file is skipped, and
 /// a missing graph simply returns `graph: null`.
@@ -1682,6 +1815,23 @@ mod tests {
             read_only,
             Duration::from_secs(900),
         )
+    }
+
+    /// A session-carrying GET, decoded. Every read endpoint is behind the session guard,
+    /// so a test that forgets the header gets a 401 and an unhelpful panic.
+    async fn get_json(app: &Router, uri: &str, token: Option<&str>) -> Value {
+        let mut builder = Request::builder().uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("x-ferryman-dashboard-token", token);
+        }
+        let response = app
+            .clone()
+            .oneshot(builder.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
     }
 
     async fn post(
@@ -2475,6 +2625,91 @@ mod tests {
 
     /// Setting a secret from the dashboard is signed by the operator, not the
     /// machine, and lands in the project's channel as ciphertext.
+    /// The property the whole chat surface rests on: the dashboard is a VIEW over the
+    /// channel, not a second place to talk. What is typed in the browser must land in the
+    /// same signed file the Telegram bridge appends to, and be indistinguishable from it
+    /// afterwards - otherwise a message exists only here, no agent can see it, and it
+    /// dies with the process.
+    #[tokio::test]
+    async fn saying_something_in_the_browser_writes_the_channel_the_bridge_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        // Nobody signed in gets nowhere: what the fleet is saying is not public just
+        // because the port is reachable.
+        let denied = post(
+            &app,
+            "/api/conversations/launch",
+            r#"{"said":"hello"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        let said = post(
+            &app,
+            "/api/conversations/launch",
+            r#"{"said":"cutting the release now"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(said.status(), StatusCode::OK);
+
+        // It is in the channel, in the file the bridge and every agent prompt read.
+        let bank = route.communications.join("memory-bank");
+        let on_disk = ferryman_channel::conversation::load_conversation(&bank, "launch").unwrap();
+        assert!(on_disk.contains("cutting the release now"), "{on_disk}");
+
+        // And it is signed, so `recent_turns` will hand it to a prompt rather than
+        // refusing it.
+        let (turns, check) =
+            ferryman_channel::conversation::recent_turns(&bank, "launch", 10, &route.agents);
+        assert!(turns.contains("cutting the release now"));
+        assert_ne!(check, SignatureCheck::Unsigned);
+
+        // The API reads back what was written, parsed into turns.
+        let body = get_json(&app, "/api/conversations/launch", Some(&token)).await;
+        assert_eq!(body["turns"][0]["said"], "cutting the release now");
+        assert!(
+            body["turns"][0]["who"]
+                .as_str()
+                .is_some_and(|w| !w.is_empty()),
+            "a turn with no speaker is not attributable: {body}"
+        );
+
+        // And the topic shows up in the list, with its last line.
+        let list = get_json(&app, "/api/conversations", Some(&token)).await;
+        assert_eq!(list["conversations"][0]["topic"], "launch");
+        assert_eq!(list["conversations"][0]["turns"], 1);
+    }
+
+    /// An empty turn is not a message, and a megabyte is not one either. The file is
+    /// carried to every machine in the fleet and read into agents' prompts.
+    #[tokio::test]
+    async fn an_empty_or_enormous_turn_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let empty = post(
+            &app,
+            "/api/conversations/launch",
+            r#"{"said":"   "}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        let huge = format!(r#"{{"said":"{}"}}"#, "x".repeat(9_000));
+        let refused = post(&app, "/api/conversations/launch", &huge, Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn secret_set_is_signed_by_the_operator_and_written_to_the_channel() {
         let dir = tempfile::tempdir().unwrap();

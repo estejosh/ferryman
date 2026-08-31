@@ -62,6 +62,25 @@ a{color:var(--accent);text-decoration:none}
 
 .side{background:var(--panel);border-right:1px solid var(--line);padding:14px 10px;overflow-y:auto}
 .side .grp{padding:16px 10px 6px;font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint)}
+.chat{display:grid;grid-template-columns:minmax(180px,260px) 1fr;gap:12px;align-items:start}
+.chat-list{padding:6px;max-height:70vh;overflow:auto}
+.chat-pick{
+  display:block;width:100%;text-align:left;background:none;border:1px solid transparent;
+  border-radius:8px;padding:8px 10px;color:var(--text);cursor:pointer
+}
+.chat-pick:hover{background:var(--panel-2)}
+.chat-pick.on{background:var(--panel-2);border-color:var(--line-2)}
+.chat-pick .s{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chat-thread{display:flex;flex-direction:column;max-height:70vh}
+.chat-top{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
+.turns{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
+.turn{max-width:80%;padding:8px 10px;border-radius:10px;background:var(--panel-2);border:1px solid var(--line)}
+.turn.mine{align-self:flex-end;border-color:var(--line-2)}
+.turn-head{display:flex;gap:8px;align-items:baseline;margin-bottom:2px}
+.turn-body{white-space:pre-wrap;word-break:break-word}
+.chat-say{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line)}
+.chat-say input{flex:1}
+@media (max-width:760px){.chat{grid-template-columns:1fr}}
 .nav{display:flex;flex-direction:column;gap:2px}
 .nav button{
   display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;
@@ -175,6 +194,11 @@ textarea.notes:focus{border-color:var(--accent-dim)}
   border-radius:12px;padding:28px}
 #login h1{margin:0 0 6px;font-size:21px;letter-spacing:-.02em}
 #login p{margin:0 0 20px;color:var(--dim);font-size:13.5px}
+/* `display` beats the user agent's [hidden] rule, so any element given an explicit
+   display must opt back out of it - otherwise `el.hidden = true` silently does nothing.
+   This bit the first-run form: the recovery-phrase LABEL stayed on screen above a hidden
+   field, so the very first screen a stranger sees asked for something that was not there. */
+[hidden]{display:none!important}
 #login label{display:block;font-size:12px;color:var(--faint);margin:12px 0 5px;
   letter-spacing:.08em;text-transform:uppercase}
 #login input{width:100%;background:var(--panel-2);border:1px solid var(--line);
@@ -296,6 +320,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <button data-page="tasks">Tasks <span class="pill num" id="count-tasks">0</span></button>
       <button data-page="review">Needs review <span class="pill num" id="count-review">0</span></button>
       <button data-page="agents">Agents <span class="pill num" id="count-agents">0</span></button>
+      <button data-page="chat">Conversation</button>
       <button data-page="teammates">Teammates</button>
     </div>
     <div class="grp">System</div>
@@ -945,6 +970,127 @@ pages.identity = async () => {
     </div>`;
 };
 
+/* ---------- conversation ----------
+
+   The dashboard is a view over the synced channel, never a second channel. What is typed
+   here lands in the same signed file the Telegram bridge writes to, and is
+   indistinguishable from it afterwards. That is the whole point: a message that existed
+   only in the dashboard would be invisible to every agent and would vanish when the
+   process stopped. */
+
+let chatTopic = null;
+let chatTimer = null;
+
+function chatTurn(turn, me) {
+  const who = turn.who || "";
+  const mine = me && who.toLowerCase() === String(me).toLowerCase();
+  // Every value here was written by another machine. `esc` is not decoration: an
+  // injection in this page steals a session that can approve agent work.
+  return `<div class="turn${mine ? " mine" : ""}">
+    <div class="turn-head"><b>${esc(who || "—")}</b><span class="s">${esc(turn.at || "")}</span></div>
+    <div class="turn-body">${esc(turn.said || "")}</div>
+  </div>`;
+}
+
+pages.chat = async () => {
+  const list = (await api("/api/conversations")).conversations || [];
+  if (!chatTopic && list.length) chatTopic = list[0].topic;
+
+  let thread = { turns: [], signature: null };
+  if (chatTopic) {
+    try { thread = await api(`/api/conversations/${encodeURIComponent(chatTopic)}`); }
+    catch (_) { thread = { turns: [], signature: null }; }
+  }
+  const me = state.me;  // a plain string: whoami returns { name }, and login stores the name
+
+  return `
+    <div class="head">
+      <div><h1>Conversation</h1><p>What was actually said. The same file the fleet reads and the bridge writes to &mdash; not a second place to talk.</p></div>
+    </div>
+    <div class="chat">
+      <div class="panel chat-list">
+        ${list.length ? list.map((c) => `
+          <button class="chat-pick${c.topic === chatTopic ? " on" : ""}" data-topic="${esc(c.topic)}">
+            <div class="lead">${esc(c.topic)}</div>
+            <div class="s">${esc((c.last && c.last.who) || "—")}: ${esc(((c.last && c.last.said) || "").slice(0, 60))}</div>
+          </button>`).join("") : `<div class="empty">No conversations yet.</div>`}
+      </div>
+      <div class="panel chat-thread">
+        ${chatTopic ? `
+          <div class="chat-top">
+            <b>${esc(chatTopic)}</b>
+            ${thread.signature && thread.signature !== "Valid" ? sigBadge(thread.signature) : ""}
+          </div>
+          <div class="turns" id="turns">
+            ${thread.turns.length
+              ? thread.turns.map((t) => chatTurn(t, me)).join("")
+              : `<div class="empty">Nothing said here yet.</div>`}
+          </div>
+          <form class="chat-say" id="chat-say">
+            <input id="chat-input" placeholder="Say something to the fleet&hellip;" autocomplete="off" maxlength="8000">
+            <button class="btn" type="submit">Send</button>
+          </form>
+          <div class="s" id="chat-msg"></div>`
+        : `<div class="empty">Pick a conversation.</div>`}
+      </div>
+    </div>`;
+};
+
+/* Wire the chat after each render. Event delegation would survive re-rendering, but the
+   page is rebuilt wholesale by `render()` and being explicit here keeps it obvious that
+   the handlers belong to the markup that was just written. */
+function wireChat() {
+  $$(".chat-pick").forEach((b) => {
+    b.addEventListener("click", async () => {
+      chatTopic = b.dataset.topic;
+      await render();
+    });
+  });
+
+  const form = $("#chat-say");
+  if (form) {
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const input = $("#chat-input");
+      const said = input.value.trim();
+      if (!said) return;
+      const msg = $("#chat-msg");
+      msg.textContent = "";
+      input.disabled = true;
+      try {
+        await api(`/api/conversations/${encodeURIComponent(chatTopic)}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ said }),
+        });
+        input.value = "";
+        await render();
+      } catch (err) {
+        // Say what went wrong. A message the operator believes was sent, and was not, is
+        // the worst outcome here.
+        msg.textContent = String(err.message || err).slice(0, 200);
+      } finally {
+        input.disabled = false;
+        const back = $("#chat-input");
+        if (back) back.focus();
+      }
+    });
+  }
+
+  const turns = $("#turns");
+  if (turns) turns.scrollTop = turns.scrollHeight;
+
+  // Poll while the page is open. Honest answer for a localhost dashboard reading files
+  // off disk: a websocket would need a second channel of its own, and Syncthing's own
+  // latency is seconds anyway. Cleared whenever the page changes so it cannot pile up.
+  clearInterval(chatTimer);
+  if (current === "chat") {
+    chatTimer = setInterval(() => {
+      if (current === "chat" && state.me && !document.hidden) render().catch(() => {});
+    }, 5000);
+  }
+}
+
 /* ---------- routing and refresh ---------- */
 
 let current = "home";
@@ -958,6 +1104,7 @@ async function render() {
       <div class="notice"><b>Could not load</b><div>${esc(err.message)}</div></div>`;
   }
   wireRows();
+  wireChat();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {
