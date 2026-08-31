@@ -78,6 +78,8 @@ a{color:var(--accent);text-decoration:none}
 .turn.mine{align-self:flex-end;border-color:var(--line-2)}
 .turn-head{display:flex;gap:8px;align-items:baseline;margin-bottom:2px}
 .turn-body{white-space:pre-wrap;word-break:break-word}
+.chat-new{display:flex;gap:6px;padding:6px 6px 10px;border-bottom:1px solid var(--line);margin-bottom:6px}
+.chat-new input{flex:1;min-width:0}
 .chat-say{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line)}
 .chat-say input{flex:1}
 @media (max-width:760px){.chat{grid-template-columns:1fr}}
@@ -1001,6 +1003,8 @@ pages.chat = async () => {
     try { thread = await api(`/api/conversations/${encodeURIComponent(chatTopic)}`); }
     catch (_) { thread = { turns: [], signature: null }; }
   }
+  // A topic the operator has just named is not in the list until it has a turn in it.
+  const known = list.some((c) => c.topic === chatTopic);
   const me = state.me;  // a plain string: whoami returns { name }, and login stores the name
 
   return `
@@ -1009,11 +1013,15 @@ pages.chat = async () => {
     </div>
     <div class="chat">
       <div class="panel chat-list">
+        <form class="chat-new" id="chat-new">
+          <input id="chat-new-topic" placeholder="New conversation&hellip;" autocomplete="off" maxlength="60">
+          <button class="btn ghost" type="submit" title="Start it">+</button>
+        </form>
         ${list.length ? list.map((c) => `
           <button class="chat-pick${c.topic === chatTopic ? " on" : ""}" data-topic="${esc(c.topic)}">
             <div class="lead">${esc(c.topic)}</div>
             <div class="s">${esc((c.last && c.last.who) || "—")}: ${esc(((c.last && c.last.said) || "").slice(0, 60))}</div>
-          </button>`).join("") : `<div class="empty">No conversations yet.</div>`}
+          </button>`).join("") : `<div class="empty">No conversations yet. Name one above and say something.</div>`}
       </div>
       <div class="panel chat-thread">
         ${chatTopic ? `
@@ -1024,7 +1032,7 @@ pages.chat = async () => {
           <div class="turns" id="turns">
             ${thread.turns.length
               ? thread.turns.map((t) => chatTurn(t, me)).join("")
-              : `<div class="empty">Nothing said here yet.</div>`}
+              : `<div class="empty">${known ? "Nothing said here yet." : "New conversation. It exists once you say something in it."}</div>`}
           </div>
           <form class="chat-say" id="chat-say">
             <input id="chat-input" placeholder="Say something to the fleet&hellip;" autocomplete="off" maxlength="8000">
@@ -1046,6 +1054,22 @@ function wireChat() {
       await render();
     });
   });
+
+  const starter = $("#chat-new");
+  if (starter) {
+    starter.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const name = $("#chat-new-topic").value.trim();
+      if (!name) return;
+      // Nothing is written yet. A topic becomes a file when somebody says something in
+      // it, so naming one and walking away leaves no empty conversation behind for the
+      // next person to wonder about.
+      chatTopic = name;
+      await render();
+      const box = $("#chat-input");
+      if (box) box.focus();
+    });
+  }
 
   const form = $("#chat-say");
   if (form) {

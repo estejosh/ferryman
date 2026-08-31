@@ -4,6 +4,7 @@ mod mcp;
 mod mcp_client;
 mod telegram;
 mod tgmap;
+mod update;
 
 use ferryman_ops::Progress;
 use ferryman_ops::agent;
@@ -418,6 +419,16 @@ enum Command {
         /// an agent that gets better at a task keeps that sharpened memory.
         #[arg(long)]
         record: Option<String>,
+    },
+    /// Bring this install up to the latest published release.
+    ///
+    /// Replaces the binary on disk and never a running process: a worker in the
+    /// middle of a task is not interrupted, and the new version takes effect the
+    /// next time it starts.
+    Update {
+        /// Say what would change and install nothing.
+        #[arg(long)]
+        check: bool,
     },
     /// Marvin: the orchestrator's memory, which outlives the machine holding it.
     ///
@@ -2046,7 +2057,13 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Operator { command } => operator_command(command)?,
         Command::Identity { command } => identity_command(command)?,
-        Command::Agent { command } => agent_command(command).await?,
+        Command::Agent { command } => {
+            // A worker is the thing most likely to be left running for weeks, and so the
+            // thing most likely to drift. Best-effort, rate-limited, and it only touches
+            // the binary on disk - this process carries on with the code it has.
+            update::keep_current().await;
+            agent_command(command).await?
+        }
         Command::Bench {
             workspace,
             timeout_secs,
@@ -2126,6 +2143,7 @@ async fn run(cli: Cli) -> Result<()> {
             timeout,
             read_only,
         } => {
+            update::keep_current().await;
             let start = match workspace {
                 Some(path) => path,
                 None => std::env::current_dir().context("read the current directory")?,
@@ -2159,6 +2177,7 @@ async fn run(cli: Cli) -> Result<()> {
             list_agents,
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
+        Command::Update { check } => update_command(check).await?,
         Command::Marvin { command } => marvin_command(command)?,
         Command::Mcp { command } => match command {
             McpCommand::Serve { workspace } => mcp::serve(workspace)?,
@@ -6472,6 +6491,36 @@ fn print_brief(brief: &ferryman_channel::marvin::Brief, route: &ferryman_channel
             println!("    {line}");
         }
     }
+}
+
+/// `ferry update` - say what is available, and install it unless only asked to look.
+async fn update_command(check: bool) -> Result<()> {
+    let running = update::running_version();
+    let latest = update::latest_release().await?;
+
+    if !update::differs(&latest) {
+        println!("ferry {running} is the latest release.");
+        return Ok(());
+    }
+
+    println!("  running   {running}");
+    println!("  available {latest}");
+    if check {
+        println!();
+        println!("  Install it with:  ferry update");
+        return Ok(());
+    }
+
+    println!();
+    let installed = update::apply(&latest).await?;
+    println!("installed {installed}.");
+    println!(
+        "  Verified against the checksum published beside it - that catches a damaged \
+         download, not a compromised release. Release tags are GPG-signed; `git tag -v \
+         {installed}` checks the one thing a signature can actually prove."
+    );
+    println!("  Anything already running keeps the old version until it restarts.");
+    Ok(())
 }
 
 fn marvin_command(command: MarvinCommand) -> Result<()> {
