@@ -10,6 +10,7 @@ use ferryman_ops::agent;
 use ferryman_ops::enable;
 
 use anyhow::{Context, Result, bail};
+use bip39::{Language, Mnemonic};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,26 @@ enum Operator {
     List {
         #[arg(long)]
         workspace: Option<PathBuf>,
+    },
+}
+
+/// One machine's operator identity, derived from its seed (ADR 0016).
+///
+/// The seed is created by `ferry enable` on first run and shown once as a recovery
+/// phrase. These two commands are the rest of that story: `show` prints the one
+/// fingerprint a person verifies out of band, and `recover` brings the seed back from
+/// the phrase onto a new machine.
+#[derive(Subcommand, Clone)]
+enum Identity {
+    /// Print this machine's operator fingerprint and which agent identities derive
+    /// from the seed.
+    Show,
+    /// Restore this machine's operator seed from its recovery phrase.
+    Recover {
+        /// Replace an existing seed after confirmation. Without this, `recover`
+        /// refuses when a seed is already present.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -261,6 +282,12 @@ enum Command {
     Operator {
         #[command(subcommand)]
         command: Operator,
+    },
+    /// Your machine's operator identity: the one fingerprint, and recovery from the
+    /// phrase (ADR 0016).
+    Identity {
+        #[command(subcommand)]
+        command: Identity,
     },
     /// Run the agentic loop: pick work up, do it, and judge what comes back.
     Agent {
@@ -1741,7 +1768,19 @@ async fn run(cli: Cli) -> Result<()> {
                 agent_name
             };
             let email = resolve_contact_email(email, as_json)?;
-            let outcome = enable::perform(enable::Request {
+            // The operator seed is the one secret that has to survive, and its
+            // recovery phrase must reach a human's terminal exactly once. It is
+            // created here, before any project file is written, so the agent
+            // identity `perform` is about to create derives from it (ADR 0016).
+            // Under `--json` - or any run where nobody is at a terminal - it is
+            // deliberately NOT created: there would be no one to write the phrase
+            // down, and a seed whose phrase was never seen is worse than no seed.
+            let interactive = !as_json && std::io::stdin().is_terminal();
+            let (seed_report, phrase) = match ferryman_channel::licensing::machine_state_dir() {
+                Some(dir) => ensure_operator_seed(&dir, interactive)?,
+                None => (SeedReport::absent(), None),
+            };
+            let outcome = match enable::perform(enable::Request {
                 workspace,
                 project,
                 agent: agent_name,
@@ -1755,7 +1794,25 @@ async fn run(cli: Cli) -> Result<()> {
                 master,
                 sandbox,
                 worktree,
-            })?;
+            }) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    // The seed may have been created a moment ago. Its phrase is the
+                    // only copy that will ever exist, so make sure it reaches the
+                    // operator even though the rest of enable failed below.
+                    if let Some(phrase) = &phrase {
+                        println!();
+                        println!(
+                            "  Your operator identity was created, and its recovery phrase is"
+                        );
+                        println!("  the only copy. Write it down before fixing the problem below:");
+                        println!();
+                        println!("    {phrase}");
+                        println!();
+                    }
+                    return Err(err);
+                }
+            };
             // A human at a terminal types the operator password here, privately.
             // An agent never sees or supplies it: it is told to hand the human a
             // browser, where the operator identity is created out of the agent's
@@ -1777,9 +1834,14 @@ async fn run(cli: Cli) -> Result<()> {
                 None => None,
             };
             if as_json {
-                report_enable_json(&outcome, dashboard.as_ref())?;
+                report_enable_json(&outcome, dashboard.as_ref(), &seed_report)?;
             } else {
-                report_enable_human(&outcome, dashboard.as_ref());
+                report_enable_human(
+                    &outcome,
+                    dashboard.as_ref(),
+                    &seed_report,
+                    phrase.as_deref(),
+                );
             }
         }
         Command::Doctor { workspace, json } => {
@@ -1937,6 +1999,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Operator { command } => operator_command(command)?,
+        Command::Identity { command } => identity_command(command)?,
         Command::Agent { command } => agent_command(command).await?,
         Command::Bench {
             workspace,
@@ -2648,6 +2711,7 @@ fn resolve_dashboard_setup(
 fn report_enable_json(
     outcome: &enable::Outcome,
     dashboard: Option<&DashboardOutcome>,
+    seed: &SeedReport,
 ) -> Result<()> {
     println!(
         "{}",
@@ -2666,6 +2730,19 @@ fn report_enable_json(
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
             "already_configured": outcome.steps.iter().all(|s| !s.created),
+            // The operator seed, without its phrase. The phrase is the one secret
+            // that has to survive and must never reach a result payload: an agent
+            // running `--json` is told here that the seed was created or found, and
+            // never given the words. "absent" means the machine has no seed yet -
+            // a human should run `ferry enable` at a terminal (or restore a phrase).
+            "operator": {
+                "seed": seed.state,
+                "fingerprint": seed.fingerprint,
+                "note": (seed.state == "absent").then_some(
+                    "no operator identity yet - run 'ferry enable' at a terminal to create one, \
+                     or 'ferry identity recover' to restore one"
+                ),
+            },
             "dashboard": dashboard.map(|d| match d {
                 DashboardOutcome::Created { operator, public_key } => json!({
                     "operator": operator,
@@ -2702,7 +2779,12 @@ fn report_enable_json(
 }
 
 /// The same facts, for a person.
-fn report_enable_human(outcome: &enable::Outcome, dashboard: Option<&DashboardOutcome>) {
+fn report_enable_human(
+    outcome: &enable::Outcome,
+    dashboard: Option<&DashboardOutcome>,
+    seed: &SeedReport,
+    phrase: Option<&str>,
+) {
     // Identity first, then what changed on disk.
     //
     // This used to open with a list of eight files and put the agent's name and key
@@ -2713,6 +2795,37 @@ fn report_enable_human(outcome: &enable::Outcome, dashboard: Option<&DashboardOu
     // here, below, for the reader who wants them.
     println!();
     println!("  You are '{}' on this machine.", outcome.agent);
+
+    // The first run of all, in the same breath as the identity it belongs to: the
+    // recovery phrase is the only copy that will ever exist, so it is printed once,
+    // here, and never again. An existing seed is used silently - never re-displayed.
+    if let Some(phrase) = phrase {
+        println!();
+        println!("  Your recovery phrase - the only copy, shown once:");
+        println!();
+        println!("    {phrase}");
+        println!();
+        println!("  It is the only secret that has to survive: this one phrase restores");
+        println!("  every identity on this machine. Write it down and keep it safe.");
+        println!("  Ferryman will not show it again.");
+    }
+
+    // The one fingerprint a person reads aloud to verify out of band, versus the
+    // O(agents) fingerprints verification used to demand. Shown whenever a seed
+    // exists - it is a public key, not a secret.
+    if let Some(fingerprint) = &seed.fingerprint {
+        println!();
+        println!("  Operator fingerprint");
+        println!("  {fingerprint}");
+        println!("  This is how a colleague verifies, out of band, that they are talking");
+        println!("  to you and not someone else.");
+    } else if seed.state == "absent" {
+        println!();
+        println!("  No operator identity yet - run 'ferry enable' at a terminal to create");
+        println!("  one, or 'ferry identity recover' to restore one.");
+    }
+
+    println!();
     println!("  Key      {}", outcome.public_key);
     println!(
         "           This is how every other machine will know your work is yours.\n\
@@ -3835,6 +3948,287 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// What `ferry enable` found or did about the operator seed, ready to report.
+///
+/// Carries the fingerprint - a public key, safe to print anywhere - but never the
+/// phrase: the phrase is returned separately and only ever printed by the human
+/// report, exactly once.
+struct SeedReport {
+    /// "created", "present", or "absent".
+    state: &'static str,
+    /// The operator fingerprint when a seed exists.
+    fingerprint: Option<String>,
+}
+
+impl SeedReport {
+    fn absent() -> Self {
+        Self {
+            state: "absent",
+            fingerprint: None,
+        }
+    }
+}
+
+/// Make sure this machine has an operator seed, creating it when a person is at a
+/// terminal and there is none yet (ADR 0016).
+///
+/// Returns a report for `ferry enable`'s output, and - only when a seed was created
+/// just now, which implies interactive - the recovery phrase to show once. An existing
+/// seed is used and never replaced, and its phrase is never re-displayed. A
+/// non-interactive run never creates a seed: there would be no one to write the phrase
+/// down, and a seed whose phrase was never seen is worse than no seed.
+fn ensure_operator_seed(
+    machine_dir: &std::path::Path,
+    interactive: bool,
+) -> Result<(SeedReport, Option<String>)> {
+    use ferryman_channel::seed::OperatorSeed;
+    if let Some(seed) = OperatorSeed::load(machine_dir)? {
+        let report = SeedReport {
+            state: "present",
+            fingerprint: Some(seed.operator_fingerprint()?),
+        };
+        return Ok((report, None));
+    }
+    if !interactive {
+        return Ok((SeedReport::absent(), None));
+    }
+    let seed = OperatorSeed::create_in(machine_dir)?;
+    let report = SeedReport {
+        state: "created",
+        fingerprint: Some(seed.operator_fingerprint()?),
+    };
+    let phrase = seed_to_phrase(seed.expose_bytes())?;
+    Ok((report, Some(phrase)))
+}
+
+/// 32 seed bytes as a BIP-39 English recovery phrase (24 words).
+fn seed_to_phrase(bytes: [u8; 32]) -> Result<String> {
+    let mnemonic = Mnemonic::from_entropy(&bytes, Language::English)
+        .map_err(|_| anyhow::anyhow!("could not turn the operator seed into a recovery phrase"))?;
+    Ok(mnemonic.phrase().to_string())
+}
+
+/// A BIP-39 English recovery phrase back into 32 seed bytes, validating its checksum.
+///
+/// The phrase itself is never echoed: an invalid phrase fails with a message that names
+/// the problem but not the words.
+fn phrase_to_seed(phrase: &str) -> Result<[u8; 32]> {
+    let mnemonic = Mnemonic::from_phrase(phrase, Language::English).map_err(|_| {
+        anyhow::anyhow!(
+            "that did not read as a 24-word BIP-39 English recovery phrase - \
+             check the words and the order, then try again"
+        )
+    })?;
+    let entropy = mnemonic.entropy();
+    entropy
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("the phrase did not hold a 32-byte operator seed"))
+}
+
+/// The `ferry identity` subcommands: the one fingerprint, and recovery from the phrase.
+fn identity_command(command: Identity) -> Result<()> {
+    match command {
+        Identity::Show => identity_show(),
+        Identity::Recover { force } => identity_recover(force),
+    }
+}
+
+fn identity_show() -> Result<()> {
+    use ferryman_channel::seed::OperatorSeed;
+    let Some(dir) = ferryman_channel::licensing::machine_state_dir() else {
+        bail!("this machine has no per-user state directory, so it cannot hold an operator seed");
+    };
+    match OperatorSeed::load(&dir)? {
+        None => {
+            println!("This machine has no operator identity yet.");
+            println!();
+            println!(
+                "  To create one:  ferry enable           # at a terminal; write down the phrase"
+            );
+            println!("  To restore one: ferry identity recover  # from a phrase you already have");
+        }
+        Some(seed) => {
+            println!("  Operator fingerprint");
+            println!("  {}", seed.operator_fingerprint()?);
+            println!();
+            println!("  This is how a colleague verifies, out of band, that they are talking");
+            println!("  to you and not someone else. One fingerprint covers every identity");
+            println!("  this machine derives from its seed.");
+            println!();
+            println!("  Agent identities on this machine:");
+            let identities = machine_identities(&dir, &seed)?;
+            if identities.is_empty() {
+                println!("    (none yet)");
+            } else {
+                for (name, derives) in identities {
+                    let how = if derives {
+                        "derives from the seed"
+                    } else {
+                        "does not derive - rotated, or minted before the seed existed"
+                    };
+                    println!("    {name:<20} {how}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every signing identity in this machine's keystore, and whether it derives from the
+/// seed. Returns (name, derives) sorted by name.
+fn machine_identities(
+    machine_dir: &std::path::Path,
+    seed: &ferryman_channel::seed::OperatorSeed,
+) -> Result<Vec<(String, bool)>> {
+    let keys = machine_dir.join("keys");
+    let Ok(entries) = std::fs::read_dir(&keys) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Signing keys are `name.key`; encryption keys are `name.enc.key` and are not
+        // identities, so they are skipped here.
+        if !file_name.ends_with(".key") || file_name.ends_with(".enc.key") {
+            continue;
+        }
+        let name = file_name.trim_end_matches(".key").to_owned();
+        let Ok(encoded) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(bytes) = hex::decode(encoded.trim()) else {
+            continue;
+        };
+        let Ok(bytes) = <[u8; 32]>::try_from(bytes) else {
+            continue;
+        };
+        let actual = ferryman_channel::AgentIdentity::from_seed(&name, bytes).public_key_hex();
+        let derives = match seed.signing_identity(&name) {
+            Ok(derived) => derived.public_key_hex() == actual,
+            Err(_) => false,
+        };
+        out.push((name, derives));
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn identity_recover(force: bool) -> Result<()> {
+    use ferryman_channel::seed::OperatorSeed;
+    let Some(dir) = ferryman_channel::licensing::machine_state_dir() else {
+        bail!("this machine has no per-user state directory, so it cannot hold an operator seed");
+    };
+    let existing = OperatorSeed::load(&dir)?;
+    if existing.is_some() && !force {
+        confirm_replacing_seed(&dir)?;
+    }
+    // Read and validate the phrase BEFORE touching the existing seed, so a typo can
+    // never cost a machine its current identity.
+    let mut bytes = None;
+    for _ in 0..3 {
+        let phrase = read_recovery_phrase()?;
+        match phrase_to_seed(&phrase) {
+            Ok(valid) => {
+                bytes = Some(valid);
+                break;
+            }
+            Err(err) => eprintln!("{err:#}\n"),
+        }
+    }
+    let Some(bytes) = bytes else {
+        bail!("could not read a valid recovery phrase; nothing was changed");
+    };
+    let seed = OperatorSeed::from_bytes(bytes);
+    // A confirmed replacement moves the old seed aside rather than deleting it, so the
+    // operator can change their mind. `restore_in` then finds no file and writes fresh.
+    if existing.is_some() {
+        move_seed_aside(&dir)?;
+    }
+    seed.restore_in(&dir)?;
+    println!("Restored the operator identity from your recovery phrase.");
+    println!();
+    println!("  Operator fingerprint");
+    println!("  {}", seed.operator_fingerprint()?);
+    println!();
+    println!("  If this matches the fingerprint you wrote down, you are yourself again.");
+    println!("  If it does not, you typed a different phrase - run `ferry identity recover`");
+    println!("  again.");
+    Ok(())
+}
+
+/// Confirm, at a terminal, that the operator means to replace an existing seed.
+///
+/// Refusing is the default: replacing a seed does not re-key anything already on disk,
+/// but it changes what every FUTURE identity derives to, so the old phrase would restore
+/// strangers. The refusal names the remedy rather than just saying no.
+fn confirm_replacing_seed(dir: &std::path::Path) -> Result<()> {
+    let path = ferryman_channel::seed::OperatorSeed::path_in(dir);
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "an operator seed already exists at {} - refusing to replace it.\n\
+             \n\
+             Replacing a seed changes what every future identity on this machine derives\n\
+             to, and the old phrase would then restore strangers. If you are restoring this\n\
+             machine from its recovery phrase and mean to replace the existing seed, run:\n\
+             \n\
+             ferry identity recover --force\n\
+             \n\
+             That moves the existing seed aside first (it is not deleted).",
+            path.display()
+        );
+    }
+    use std::io::Write;
+    print!(
+        "An operator seed already exists at {}.\n\
+         Replacing it changes what every future identity derives to. Replace it? [y/N] ",
+        path.display()
+    );
+    std::io::stdout().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        bail!("nothing changed; the existing seed is still in place");
+    }
+    Ok(())
+}
+
+/// Read the recovery phrase from the operator's terminal, hidden.
+///
+/// Hidden for the same reason the operator password is: a phrase echoed into a pipe or a
+/// scrollback is the one secret that forges every identity, and `rpassword` reads the
+/// terminal directly rather than stdin.
+fn read_recovery_phrase() -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "restoring needs the recovery phrase typed at a terminal, and there is none \
+             here - run `ferry identity recover` yourself"
+        );
+    }
+    let phrase = rpassword::prompt_password("Recovery phrase (24 words): ")?;
+    let phrase = phrase.trim().to_string();
+    if phrase.is_empty() {
+        bail!("no phrase given");
+    }
+    Ok(phrase)
+}
+
+/// Move an existing seed aside, preserving it, before a confirmed replacement writes a
+/// new one. `restore_in` refuses to clobber, so this is the deliberate gap-closing step.
+fn move_seed_aside(dir: &std::path::Path) -> Result<()> {
+    let path = ferryman_channel::seed::OperatorSeed::path_in(dir);
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let aside = dir.join(format!("operator.seed.before-{unix}.bak"));
+    std::fs::rename(&path, &aside)
+        .with_context(|| format!("move {} to {}", path.display(), aside.display()))?;
     Ok(())
 }
 
@@ -6302,5 +6696,78 @@ mod tests {
         );
         assert_eq!(slug_of(Path::new("/tmp/foo--bar--")), "foo-bar");
         assert_eq!(slug_of(Path::new("/")), "");
+    }
+
+    /// The recovery phrase is the one secret that has to survive: whatever it holds
+    /// must round-trip exactly, or a machine restored from its phrase comes back a
+    /// stranger to every roster that knew it.
+    #[test]
+    fn the_recovery_phrase_round_trips_the_seed_bytes() {
+        let bytes = [0x5a; 32];
+        let phrase = super::seed_to_phrase(bytes).unwrap();
+        assert_eq!(phrase.split_whitespace().count(), 24, "got: {phrase}");
+        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), bytes);
+    }
+
+    /// The standard BIP-39 test vector for 256 zero bits: 23 `abandon` words and then
+    /// `art`. Pins that we are using the real BIP-39 word list and checksum, not some
+    /// near-cousin that a phrase from another wallet would not recover.
+    #[test]
+    fn the_bip39_zero_entropy_vector_is_correct() {
+        let phrase = super::seed_to_phrase([0u8; 32]).unwrap();
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        assert_eq!(words.len(), 24);
+        assert!(words[..23].iter().all(|w| *w == "abandon"), "got: {phrase}");
+        assert_eq!(words[23], "art", "got: {phrase}");
+        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), [0u8; 32]);
+    }
+
+    /// A seed is created once, used silently after that, and never created unattended.
+    #[test]
+    fn enable_creates_a_seed_once_and_never_unattended() {
+        let machine = tempfile::tempdir().unwrap();
+
+        let (report, phrase) = super::ensure_operator_seed(machine.path(), true).unwrap();
+        assert_eq!(report.state, "created");
+        assert!(report.fingerprint.is_some());
+        let phrase = phrase.expect("a created seed carries its phrase once");
+        assert_eq!(phrase.split_whitespace().count(), 24);
+
+        // Re-running uses the seed and never re-displays the phrase.
+        let (report, phrase) = super::ensure_operator_seed(machine.path(), true).unwrap();
+        assert_eq!(report.state, "present");
+        assert!(phrase.is_none());
+
+        // Unattended runs never create a seed.
+        let fresh = tempfile::tempdir().unwrap();
+        let (report, phrase) = super::ensure_operator_seed(fresh.path(), false).unwrap();
+        assert_eq!(report.state, "absent");
+        assert!(phrase.is_none());
+        assert!(!ferryman_channel::seed::OperatorSeed::path_in(fresh.path()).exists());
+    }
+
+    /// `identity show` reports which keys derive from the seed, and it skips the
+    /// encryption keys that live beside them.
+    #[test]
+    fn machine_identities_separates_derived_from_rotated() {
+        use ferryman_channel::seed::OperatorSeed;
+        let machine = tempfile::tempdir().unwrap();
+        let seed = OperatorSeed::create_in(machine.path()).unwrap();
+
+        // A key derived from the seed, exactly as `load_or_create` would persist it.
+        let derived = seed.signing_identity("fang").unwrap();
+        let keys = machine.path().join("keys");
+        std::fs::create_dir_all(&keys).unwrap();
+        std::fs::write(keys.join("fang.key"), hex::encode(derived.seed_bytes())).unwrap();
+        // A rotated key that predates the seed, and an encryption key that is not an
+        // identity at all.
+        std::fs::write(keys.join("rotated.key"), hex::encode([0x77u8; 32])).unwrap();
+        std::fs::write(keys.join("fang.enc.key"), hex::encode([0x33u8; 32])).unwrap();
+
+        let identities = super::machine_identities(machine.path(), &seed).unwrap();
+        assert_eq!(
+            identities,
+            vec![("fang".to_string(), true), ("rotated".to_string(), false),]
+        );
     }
 }

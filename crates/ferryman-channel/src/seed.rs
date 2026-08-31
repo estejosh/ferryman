@@ -59,6 +59,14 @@ const SIGNING_INFO: &str = "ferryman/v1/sign/";
 /// HKDF `info` prefix for an encryption key. See [`SIGNING_INFO`].
 const ENCRYPTION_INFO: &str = "ferryman/v1/encrypt/";
 
+/// HKDF `info` for the operator's own signing identity - the one fingerprint a person
+/// reads aloud to verify, out of band, that they are talking to the right machine.
+///
+/// A purpose string of its own, with no agent name after it, so it can never collide
+/// with a real agent's key even on a machine that happens to run an agent named
+/// "operator".
+const OPERATOR_INFO: &str = "ferryman/v1/operator";
+
 /// A machine's operator seed: 32 random bytes, created once, from which every
 /// identity on that machine can be derived.
 pub struct OperatorSeed {
@@ -227,6 +235,32 @@ impl OperatorSeed {
             agent,
             self.encryption_seed(agent)?,
         ))
+    }
+
+    /// The operator's own signing identity, derived from the seed.
+    ///
+    /// The seed derives a *distinct* key for every agent, so that a breakage at 3am
+    /// can be traced to one agent. The operator is the one thing that is not an agent:
+    /// its public key is the single fingerprint a person reads aloud to a colleague to
+    /// verify, out of band, that they are talking to the right machine (ADR 0016).
+    ///
+    /// Like [`Self::signing_identity`], this derives and does not consult the keystore:
+    /// it is the derivation of the operator's identity, not a lookup of what is on disk.
+    pub fn operator_identity(&self) -> Result<AgentIdentity> {
+        let mut derived = [0_u8; 32];
+        Hkdf::<Sha256>::new(None, &self.bytes)
+            .expand(OPERATOR_INFO.as_bytes(), &mut derived)
+            .map_err(|_| anyhow!("could not derive the operator identity from the seed"))?;
+        Ok(AgentIdentity::from_seed("operator", derived))
+    }
+
+    /// The operator fingerprint: the public key of [`Self::operator_identity`], as hex.
+    ///
+    /// Safe to print and safe to publish - it is a public key, not secret material -
+    /// and it is the one value a person checks out of band rather than the O(agents)
+    /// fingerprints the fleet used to ask for.
+    pub fn operator_fingerprint(&self) -> Result<String> {
+        Ok(self.operator_identity()?.public_key_hex())
     }
 
     /// The 32 bytes an agent's ed25519 signing key is built from.
@@ -825,6 +859,23 @@ mod tests {
             hex::encode(seed.encryption_seed("fang").unwrap()),
             "dd527bbe58d217722789dd3854dae7180d3ef0e8be8766f8c3290f9ab3e82282",
             "the encryption derivation changed: sealed secrets become unopenable"
+        );
+    }
+
+    /// The operator fingerprint is a wire format too, and this pins it.
+    ///
+    /// It is the one fingerprint a person reads aloud to verify a machine out of band
+    /// (ADR 0016), so two machines that disagree on it would disagree on who they are
+    /// talking to. The value was computed independently - HKDF-SHA256 with a
+    /// zero-filled salt over the `info` string, then ed25519 - rather than copied from
+    /// this implementation's own output.
+    #[test]
+    fn the_operator_fingerprint_is_pinned() {
+        let seed = OperatorSeed::from_bytes([0x2a; 32]);
+        assert_eq!(
+            seed.operator_fingerprint().unwrap(),
+            "88f62b90e0e514a6aa278bc4d5cfd1874321ae191487edfe9abf23ab8049645c",
+            "the operator fingerprint changed: two machines would disagree on who they are"
         );
     }
 }
