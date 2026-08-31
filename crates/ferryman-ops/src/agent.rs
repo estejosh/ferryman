@@ -112,6 +112,18 @@ impl Runner {
         !matches!(self, Self::Bare)
     }
 
+    /// The image the agent runs in, if any. `None` when bare.
+    ///
+    /// Named out loud wherever a check cannot see inside it, so an operator is told
+    /// which image to go and look in rather than being told nothing.
+    #[must_use]
+    pub fn image(&self) -> Option<&str> {
+        match self {
+            Self::Bare => None,
+            Self::Podman(image) | Self::Docker(image) => Some(image),
+        }
+    }
+
     /// The container runtime binary, if any. Empty when bare.
     #[must_use]
     pub fn runtime(&self) -> &'static str {

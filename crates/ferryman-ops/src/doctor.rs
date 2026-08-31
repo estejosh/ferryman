@@ -203,7 +203,53 @@ pub fn examine(start: &Path) -> Report {
     // The single most common first-task failure: the engine is not installed,
     // or is named differently on this machine (on WSL, `claude` on PATH is
     // often the Windows install, which a Linux worker cannot use).
-    if find_on_path(&config.command).is_some() {
+    //
+    // # Why a sandboxed agent gets a different answer
+    //
+    // This check resolves `command` on the HOST's PATH. For a bare runner that is the
+    // right question, because the host is where the engine will run. For a container
+    // runner it is the wrong question entirely: the engine has to exist inside the
+    // IMAGE, and the host PATH says nothing about that.
+    //
+    // Answering it anyway is worse than not checking. A sandboxed worker whose image
+    // lacks the engine printed `ok engine_on_path` while every single task failed to
+    // start - the operator's first diagnostic confidently confirming the thing that was
+    // broken. `doctor` is the first command a new operator runs, and a check that can be
+    // confidently wrong costs more than a check that admits what it cannot see.
+    //
+    // So under a container runner this reports the runtime instead, which is the part
+    // this machine genuinely can answer, and says plainly that the engine is the image's
+    // business.
+    if config.runner.is_sandboxed() {
+        let runtime = config.runner.runtime();
+        let image = config.runner.image().unwrap_or("");
+        if find_on_path(runtime).is_some() {
+            checks.push(check(
+                "engine_on_path",
+                true,
+                true,
+                format!(
+                    "'{}' runs inside {runtime} ({image}), so the engine has to be in that \
+                     image - this machine's PATH cannot tell you whether it is. \
+                     '{runtime}' itself resolves here.",
+                    config.command
+                ),
+            ));
+        } else {
+            checks.push(check(
+                "engine_on_path",
+                false,
+                true,
+                format!(
+                    "'{runtime}' is NOT on this machine's PATH, and '{}' is configured to \
+                     run inside {runtime} ({image}) - every task would fail to start. \
+                     Install {runtime}, or clear 'sandbox' in {}",
+                    config.command,
+                    AgentConfig::path(&route.attachment).display()
+                ),
+            ));
+        }
+    } else if find_on_path(&config.command).is_some() {
         checks.push(check(
             "engine_on_path",
             true,
@@ -405,6 +451,43 @@ mod tests {
         assert_eq!(report.checks.len(), 1);
         assert!(!report.ready);
         assert_eq!(report.checks[0].name, "channel");
+    }
+
+    /// The check that used to be confidently wrong.
+    ///
+    /// A container-run agent's engine lives in the IMAGE, so the host PATH cannot answer
+    /// the question. It used to answer anyway, and a sandboxed worker whose image lacked
+    /// the engine got a green `engine_on_path` while every task failed to start.
+    #[test]
+    fn a_sandboxed_agent_is_not_told_its_engine_is_fine_because_the_host_has_one() {
+        let dir = crate::enable::tests_support::enabled_project("ferryman-no-such-engine-8b2");
+        let config = dir.join(".ferryman").join("agent.toml");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replace("sandbox = \"\"", "sandbox = \"podman:example/image\""),
+        )
+        .unwrap();
+
+        let engine = examine(&dir)
+            .checks
+            .into_iter()
+            .find(|c| c.name == "engine_on_path")
+            .unwrap();
+
+        // Whichever way it lands - podman present or absent on the machine running the
+        // tests - it must never claim the engine itself is fine, and it must name the
+        // image so the operator knows where to look.
+        assert!(
+            engine.detail.contains("example/image"),
+            "{:?}",
+            engine.detail
+        );
+        assert!(
+            !engine.detail.contains("resolves on this machine"),
+            "the host PATH cannot vouch for an engine inside a container: {:?}",
+            engine.detail
+        );
     }
 
     #[test]
