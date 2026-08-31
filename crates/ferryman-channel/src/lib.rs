@@ -32,6 +32,7 @@ pub mod migration;
 pub mod orchestrator;
 pub mod portable_auth;
 pub mod secrets;
+pub mod seed;
 pub mod skills;
 pub mod source;
 pub mod trajectory;
@@ -1538,6 +1539,16 @@ impl AgentIdentity {
     /// A machine already signing under a project key **keeps it**. Rotating on upgrade
     /// would invalidate every signature that machine has already published, which is the
     /// one thing this must not do.
+    ///
+    /// # Where a *new* key comes from
+    ///
+    /// On a machine with an operator seed, a key being created for the first time is
+    /// **derived** from it - `HKDF-SHA256(seed, "ferryman/v1/sign/" || name)`, ADR 0016 -
+    /// and then written to the keystore exactly as a random one would be. On a machine
+    /// with no seed, it is minted from the RNG, as it always was. Nothing about the
+    /// resulting identity differs to a reader either way, and no established key is
+    /// touched by either path: this decision is only reached when no store holds a key
+    /// under this name.
     pub fn load_or_create(name: &str, state_dir: &Path) -> Result<Self> {
         Self::load_or_create_in(name, state_dir, licensing::machine_state_dir())
     }
@@ -1581,9 +1592,26 @@ impl AgentIdentity {
             return Ok(existing);
         }
 
-        let mut seed = [0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
-        let signing = SigningKey::from_bytes(&seed);
+        // Nothing has signed under this name on this machine, so it is safe to decide
+        // where the key comes from. ADR 0016: if the machine has an operator seed, derive
+        // it; otherwise mint at random exactly as before. Both branches then persist
+        // identically - derive-then-persist, so the keystore wins from the next run on and
+        // an agent that must re-key can simply write a new one, which is the property a
+        // pure-derivation model does not have.
+        //
+        // The seed is looked for in `machine_dir` and nowhere else, because the seed IS
+        // machine state: it is never in the attachment, never in the channel, and never in
+        // anything Syncthing carries. A caller with no machine directory therefore has no
+        // seed and gets the old behaviour, which is also what keeps a machine with no home
+        // directory working.
+        let signing = match seed::OperatorSeed::load_from(machine_dir.as_deref())? {
+            Some(seed) => SigningKey::from_bytes(&seed.signing_seed(name)?),
+            None => {
+                let mut seed = [0u8; 32];
+                rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
+                SigningKey::from_bytes(&seed)
+            }
+        };
         if let Some(dir) = &machine_dir {
             Self::write_state_file(name, dir, &signing)?;
         }

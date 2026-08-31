@@ -4,6 +4,16 @@
 
 Proposed.
 
+> **Implementation note, 2026-08-28.** The derivation itself is implemented in
+> `crates/ferryman-channel/src/seed.rs`: `OperatorSeed`, the two HKDF-SHA256
+> derivations over the case-folded agent name, and the derive-then-persist branch in
+> `AgentIdentity::load_or_create` and `EncryptionIdentity::load_or_create`. A machine
+> with no seed is unchanged, and no identity that already holds a key is re-keyed. What
+> is *not* yet built is everything above the crypto: `ferry enable` does not create a
+> seed, nothing shows a recovery phrase, and nothing restores from one. Until that
+> lands, a seed exists only if something puts one there, so the behaviour every current
+> installation sees is the old one.
+
 ## Context
 
 A person installing Ferryman today gets no identity. They get a binary. An identity
