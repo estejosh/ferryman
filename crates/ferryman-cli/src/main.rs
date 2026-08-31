@@ -3403,6 +3403,25 @@ async fn agent_command(command: Agent) -> Result<()> {
                 .map(|(_, config)| config.poll)
                 .min()
                 .unwrap_or(std::time::Duration::from_secs(300));
+            // A fleet that has been running since before there were roots has nothing to
+            // file into, so nothing gets filed and the picker stays empty forever. Make
+            // one beside the channels this worker already watches - which is where a
+            // person would have put it - and every project files itself on the next pass.
+            //
+            // Best-effort, and it creates a directory and nothing else: ADR 0019 is that
+            // nothing of the operator's ever moves into it.
+            if ferryman_channel::ferry::find_root().is_none()
+                && let Some(beside) = comms.parent()
+            {
+                match ferryman_channel::ferry::Root::create(&beside.join("ferry")) {
+                    Ok(root) => report.info(&format!(
+                        "filing projects in {} as they are used",
+                        root.path.display()
+                    )),
+                    Err(error) => report.warn(&format!("could not make a ferry root: {error:#}")),
+                }
+            }
+
             let mut fleet = fleet;
             loop {
                 // Keeping a long-running worker current.
