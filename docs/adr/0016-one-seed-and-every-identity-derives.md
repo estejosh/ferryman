@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed.
+Accepted.
 
 > **Implementation note, 2026-08-28.** The derivation itself is implemented in
 > `crates/ferryman-channel/src/seed.rs`: `OperatorSeed`, the two HKDF-SHA256

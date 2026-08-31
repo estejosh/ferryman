@@ -101,11 +101,23 @@ impl OperatorSeed {
         // The hex error is deliberately dropped rather than chained: `hex::FromHexError`
         // names the offending character, and the offending character is seed material.
         // The path is all an operator needs in order to act on this.
-        let bytes = hex::decode(encoded.trim())
-            .map_err(|_| anyhow!("{} is not a valid operator seed", path.display()))?;
-        let bytes: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow!("{} is not a 32-byte operator seed", path.display()))?;
+        // Both errors name the remedy, because a corrupt seed is otherwise a wedge: this
+        // refuses, and so do `create_in` and `restore_in`, so nothing on the machine can
+        // mint a new identity again until a person moves the file.
+        let bytes = hex::decode(encoded.trim()).map_err(|_| {
+            anyhow!(
+                "{} is not a valid operator seed. Move it aside and restore from the \
+                 recovery phrase, or let this machine mint fresh keys without it.",
+                path.display()
+            )
+        })?;
+        let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
+            anyhow!(
+                "{} is not a 32-byte operator seed. Move it aside and restore from the \
+                 recovery phrase, or let this machine mint fresh keys without it.",
+                path.display()
+            )
+        })?;
         Ok(Some(Self { bytes }))
     }
 
@@ -196,11 +208,20 @@ impl OperatorSeed {
     ///
     /// Indistinguishable from a minted one to every reader: an ed25519 keypair whose
     /// private half happens to have come from HKDF rather than from the RNG.
+    ///
+    /// # Warning
+    ///
+    /// This derives and **does not consult the keystore**. Reaching for it instead of
+    /// [`AgentIdentity::load_or_create`] re-keys an agent that already has a key on
+    /// disk, and every signature that agent has already published then reads as an
+    /// impostor to every other machine. Derivation is a bootstrap, not a binding: for
+    /// "give me this agent's identity", the answer is always `load_or_create`.
     pub fn signing_identity(&self, agent: &str) -> Result<AgentIdentity> {
         Ok(AgentIdentity::from_seed(agent, self.signing_seed(agent)?))
     }
 
-    /// This agent's encryption identity, derived. See [`Self::signing_identity`].
+    /// This agent's encryption identity, derived. Carries the same warning as
+    /// [`Self::signing_identity`]: it does not consult the keystore.
     pub fn encryption_identity(&self, agent: &str) -> Result<EncryptionIdentity> {
         Ok(EncryptionIdentity::from_seed(
             agent,
@@ -274,6 +295,11 @@ fn write_new(path: &Path, bytes: &[u8; 32]) -> Result<()> {
     file.write_all(hex::encode(bytes).as_bytes())
         .with_context(|| format!("write {}", path.display()))?;
     file.flush()?;
+    // The one file in this crate where a torn write is not self-healing: a half-written
+    // key file can be re-minted, a half-written seed wedges every future mint and takes
+    // the recovery phrase with it.
+    file.sync_all()
+        .with_context(|| format!("flush {} to disk", path.display()))?;
     // Windows has no `mode`, and the state directory there is already per-user. Going
     // through the one resolver for "owner only" keeps this from becoming a second
     // implementation of it that drifts from the first.
