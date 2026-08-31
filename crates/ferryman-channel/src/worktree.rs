@@ -193,6 +193,53 @@ pub fn worktree_head(repo: &Path, branch: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Refuse a directory that is not itself the root of a git worktree.
+///
+/// # Why this is not paranoia
+///
+/// `git -C <dir> status` walks *upwards* until it finds a repository. Ask it about a
+/// directory that is not a repo and it will happily answer about some ancestor - and on
+/// a machine where the home directory is itself a repo (which happens, and did), every
+/// scratch directory under it reads as a clean-or-dirty checkout of that repo.
+///
+/// That is not a cosmetic error. [`commit_all`] runs `git add -A` and commits whatever
+/// git says is there. Pointed at a directory whose only repository is an ancestor, it
+/// would stage that ancestor's entire tree - the operator's home directory, credentials
+/// and all - and commit it to an agent branch that then gets pushed.
+///
+/// Every worktree this module makes is created by `git worktree add`, so its path *is*
+/// the top level. Requiring that exactly closes the hole, and turns "some ancestor is a
+/// repo" from a silent data leak into a refusal that names the directory it found.
+fn is_a_worktree_root(worktree: &Path, dir: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["-C", dir, "rev-parse", "--show-toplevel"])
+        .output()
+        .with_context(|| format!("git rev-parse in {dir}"))?;
+    if !output.status.success() {
+        bail!(
+            "{dir} is not a git worktree: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let toplevel = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+
+    // Canonicalise both sides before comparing. `--show-toplevel` prints forward slashes
+    // on Windows and either side may reach the same directory through a symlink or a
+    // short name, and a false mismatch here would refuse a perfectly good worktree.
+    let same = match (toplevel.canonicalize(), worktree.canonicalize()) {
+        (Ok(found), Ok(asked)) => found == asked,
+        _ => toplevel == worktree,
+    };
+    if !same {
+        bail!(
+            "{dir} is not a git worktree of its own; git resolved to {}. Refusing rather \
+             than reporting on a repository this directory merely sits inside.",
+            toplevel.display()
+        );
+    }
+    Ok(())
+}
+
 /// What git thinks has changed in the worktree: modified, added and untracked
 /// files, in `--porcelain` form. Empty means the agent changed nothing.
 ///
@@ -203,6 +250,7 @@ pub fn status_of(worktree: &Path) -> Result<String> {
     let dir = worktree
         .to_str()
         .context("worktree path is not valid UTF-8")?;
+    is_a_worktree_root(worktree, dir)?;
     let output = Command::new("git")
         .args(["-C", dir, "status", "--porcelain"])
         .output()
@@ -676,6 +724,28 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&repo);
         let _ = fs::remove_dir_all(&again);
+    }
+
+    /// The bug this exists to stop: a scratch directory *inside* somebody's repository
+    /// is not a worktree, and must never be reported on - let alone committed - as if it
+    /// were that repository. Found on a machine whose home directory was a git repo,
+    /// where every temp directory under it read as a clean checkout.
+    #[test]
+    fn a_directory_inside_someone_elses_repo_is_refused_not_reported_on() {
+        let repo = temp_repo();
+        let inside = repo.join("scratch").join("deep");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("agent-output.txt"), "work").unwrap();
+
+        let error = status_of(&inside).unwrap_err().to_string();
+        assert!(
+            error.contains("not a git worktree of its own"),
+            "expected a refusal naming the resolved repository, got: {error}"
+        );
+        // The committing path refuses too, which is the half that would otherwise have
+        // staged the whole surrounding repository under an agent's name.
+        assert!(commit_all(&inside, "nebra", "x").is_err());
+        let _ = fs::remove_dir_all(&repo);
     }
 
     /// The distinction that matters: "clean" and "I cannot tell" are different answers,

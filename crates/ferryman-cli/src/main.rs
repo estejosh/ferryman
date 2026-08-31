@@ -391,6 +391,18 @@ enum Command {
         #[arg(long)]
         record: Option<String>,
     },
+    /// The orchestrator's own continuity. `brief` records what only the
+    /// orchestrator knows — the objective, what is in flight and why, the
+    /// standing constraints, what is waiting on you — and `resume` prints it
+    /// back in the order a replacement needs it. ADR 0017.
+    ///
+    /// Written continuously, not at handoff: running out of context is never a
+    /// graceful event, so there is no moment at which a dying orchestrator
+    /// reliably gets to summarise itself.
+    Orchestrator {
+        #[command(subcommand)]
+        command: OrchestratorCommand,
+    },
     /// Talk MCP. `serve` exposes this project's read-only query surface as tools
     /// for an MCP client; `list` and `call` connect to an external MCP server
     /// and use its tools instead.
@@ -412,6 +424,66 @@ enum Command {
         json: bool,
     },
 }
+#[derive(Subcommand, Clone)]
+enum OrchestratorCommand {
+    /// Record or update this orchestrator's brief. Only the sections you pass are
+    /// touched, so a running orchestrator can update one thing after a decision
+    /// without restating everything it already knows.
+    ///
+    /// With no sections given, it prints the brief as it stands.
+    Brief {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Whose brief. Defaults to the only agent this machine holds a key for.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// One line: what this is all for right now.
+        #[arg(long)]
+        objective: Option<String>,
+        /// When it has to be true by, if that is real rather than a wish.
+        #[arg(long)]
+        deadline: Option<String>,
+        /// What the human has said that still binds.
+        #[arg(long)]
+        constraints: Option<String>,
+        /// What is moving, and why each thing sits where it does.
+        #[arg(long)]
+        in_flight: Option<String>,
+        /// Load-bearing decisions that never became ADRs, with the reason.
+        #[arg(long)]
+        decided: Option<String>,
+        /// Tried, and not taken — so a successor does not rediscover it.
+        #[arg(long)]
+        rejected: Option<String>,
+        /// Waiting on the human, not on a machine.
+        #[arg(long)]
+        waiting_on_human: Option<String>,
+        /// What to do next, in the order to do it.
+        #[arg(long)]
+        next: Option<String>,
+    },
+    /// Print everything a replacement orchestrator needs, in the order it needs
+    /// it. Meant to be pasted whole into a fresh orchestrator as its opening
+    /// context.
+    Resume {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Whose brief to resume from. Defaults to the most recently updated.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
+    /// Every brief in the channel, newest first, with its age and whether it
+    /// verifies. More than one is normal: an orchestrator that has handed over
+    /// leaves its brief behind.
+    List {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Clone)]
 enum McpCommand {
     /// Serve this project over MCP (Model Context Protocol) on stdio, exposing
@@ -1965,6 +2037,7 @@ async fn run(cli: Cli) -> Result<()> {
             list_agents,
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
+        Command::Orchestrator { command } => orchestrator_command(command)?,
         Command::Mcp { command } => match command {
             McpCommand::Serve { workspace } => mcp::serve(workspace)?,
             McpCommand::List { server } => mcp_client::list(&server)?,
@@ -5819,6 +5892,331 @@ fn note_unclassified_shares(
         println!("  is this a device you own, or a different person?");
         println!("  record it with:  ferry channel syncthing mark --with {id} --owner self|other");
     }
+}
+
+/// The one agent this machine holds a signing key for.
+///
+/// A machine that has joined a project has exactly one identity in the normal case, and
+/// making the operator type it every time is the sort of friction that stops a brief from
+/// being updated - which is the only way this feature fails. When there is more than one,
+/// refuse and list them: guessing would sign a brief under a name this machine is not.
+fn only_local_agent(route: &ferryman_channel::ProjectRoute) -> Result<String> {
+    let keys = route.attachment.join("keys");
+    let mut names: Vec<String> = std::fs::read_dir(&keys)
+        .with_context(|| {
+            format!(
+                "no identities on this machine; looked in {}",
+                keys.display()
+            )
+        })?
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension()? != "key" {
+                return None;
+            }
+            Some(ferryman_channel::canonical_agent_name(
+                path.file_stem()?.to_str()?,
+            ))
+        })
+        .collect();
+    names.sort();
+    names.dedup();
+    match names.len() {
+        0 => bail!("no signing key on this machine; run `ferry enable` first"),
+        1 => Ok(names.remove(0)),
+        _ => bail!(
+            "this machine holds keys for {}; say which one with --agent",
+            names.join(", ")
+        ),
+    }
+}
+
+/// How a signature reads to a human who has to decide whether to trust the brief.
+fn signature_line(check: &ferryman_channel::SignatureCheck) -> &'static str {
+    match check {
+        ferryman_channel::SignatureCheck::Valid => "signature verifies against the roster",
+        ferryman_channel::SignatureCheck::Unsigned => "UNSIGNED - anyone could have written this",
+        ferryman_channel::SignatureCheck::Invalid => {
+            "SIGNATURE DOES NOT VERIFY - do not act on this brief"
+        }
+        ferryman_channel::SignatureCheck::UnknownSigner => {
+            "signer has no published key, so nothing can be concluded"
+        }
+        ferryman_channel::SignatureCheck::KeyChanged { .. } => {
+            "A DIFFERENT KEY is claiming this name - treat as hostile until explained"
+        }
+    }
+}
+
+/// Age in words. A successor reasoning about a four-hour-old brief must behave
+/// differently from one trusting it as current, so the age is never buried.
+fn age_phrase(minutes: i64) -> String {
+    match minutes {
+        0 => "just now".to_string(),
+        1 => "1 minute ago".to_string(),
+        m if m < 60 => format!("{m} minutes ago"),
+        m if m < 120 => format!("1 hour {} minutes ago", m % 60),
+        m if m < 2880 => format!("{} hours ago", m / 60),
+        m => format!("{} days ago", m / 1440),
+    }
+}
+
+fn print_brief(
+    brief: &ferryman_channel::orchestrator::Brief,
+    route: &ferryman_channel::ProjectRoute,
+) {
+    let age = brief.age_minutes(chrono::Utc::now());
+    println!("  {} — updated {}", brief.agent, age_phrase(age));
+    println!(
+        "  {}",
+        signature_line(&ferryman_channel::orchestrator::verify_brief(
+            brief,
+            &route.agents
+        ))
+    );
+    if age > 240 {
+        println!("  This brief is stale. Whatever it says was true four hours ago at best.");
+    }
+    println!();
+    println!("  Objective");
+    println!("    {}", brief.objective);
+    if let Some(deadline) = &brief.deadline {
+        println!("    by {deadline}");
+    }
+    for (heading, body) in [
+        ("Standing constraints", &brief.constraints),
+        ("In flight", &brief.in_flight),
+        ("Decided (and why)", &brief.decided),
+        ("Tried and rejected", &brief.rejected),
+        ("Waiting on the human", &brief.waiting_on_human),
+        ("Next, in order", &brief.next),
+    ] {
+        if body.trim().is_empty() {
+            continue;
+        }
+        println!();
+        println!("  {heading}");
+        for line in body.lines() {
+            println!("    {line}");
+        }
+    }
+}
+
+fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+
+    match command {
+        OrchestratorCommand::Brief {
+            workspace,
+            agent,
+            objective,
+            deadline,
+            constraints,
+            in_flight,
+            decided,
+            rejected,
+            waiting_on_human,
+            next,
+        } => {
+            let route = here(workspace)?;
+            let name = match agent {
+                Some(name) => name,
+                None => only_local_agent(&route)?,
+            };
+
+            let sections = [
+                &objective,
+                &deadline,
+                &constraints,
+                &in_flight,
+                &decided,
+                &rejected,
+                &waiting_on_human,
+                &next,
+            ];
+            let nothing_to_write = sections.iter().all(|section| section.is_none());
+
+            let existing = ferryman_channel::orchestrator::read_brief(&route, &name)?;
+
+            if nothing_to_write {
+                let Some(brief) = existing else {
+                    println!("no brief for '{name}' yet.");
+                    println!();
+                    println!(
+                        "  Start one:  ferry orchestrator brief --objective \"what this is all for\""
+                    );
+                    return Ok(());
+                };
+                print_brief(&brief, &route);
+                return Ok(());
+            }
+
+            // Only the sections given are touched. An orchestrator recording one decision
+            // mid-flight must not have to restate the other five, because the version that
+            // costs six paragraphs is the version that stops being written.
+            let mut brief = existing.unwrap_or_else(|| {
+                ferryman_channel::orchestrator::Brief::new(
+                    &name,
+                    objective.as_deref().unwrap_or(""),
+                )
+            });
+            if let Some(value) = objective {
+                brief.objective = value;
+            }
+            if let Some(value) = deadline {
+                brief.deadline = Some(value).filter(|v| !v.trim().is_empty());
+            }
+            if let Some(value) = constraints {
+                brief.constraints = value;
+            }
+            if let Some(value) = in_flight {
+                brief.in_flight = value;
+            }
+            if let Some(value) = decided {
+                brief.decided = value;
+            }
+            if let Some(value) = rejected {
+                brief.rejected = value;
+            }
+            if let Some(value) = waiting_on_human {
+                brief.waiting_on_human = value;
+            }
+            if let Some(value) = next {
+                brief.next = value;
+            }
+
+            // `load_existing`, never `load_or_create`: minting a second key under a name the
+            // roster already knows would make every signature it produces read as an impostor.
+            let identity =
+                ferryman_channel::AgentIdentity::load_existing(&name, &route.attachment)?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no signing key for '{name}' on this machine, so a brief cannot be \
+                             signed here. Write it on {name}'s own machine, or use --agent with \
+                             a name this machine holds a key for."
+                        )
+                    })?;
+
+            let path = ferryman_channel::orchestrator::write_brief(&route, &brief, &identity)?;
+            println!("brief recorded at {}", path.display());
+            println!("  A replacement reads it with: ferry orchestrator resume");
+        }
+
+        OrchestratorCommand::List { workspace } => {
+            let route = here(workspace)?;
+            let briefs = ferryman_channel::orchestrator::list_briefs(&route)?;
+            if briefs.is_empty() {
+                println!("no orchestrator briefs in this channel yet.");
+                return Ok(());
+            }
+            let now = chrono::Utc::now();
+            for brief in briefs {
+                println!(
+                    "  {:<14} {:<18} {}",
+                    brief.agent,
+                    age_phrase(brief.age_minutes(now)),
+                    brief.objective
+                );
+                println!(
+                    "                 {}",
+                    signature_line(&ferryman_channel::orchestrator::verify_brief(
+                        &brief,
+                        &route.agents
+                    ))
+                );
+            }
+        }
+
+        OrchestratorCommand::Resume { workspace, agent } => {
+            let route = here(workspace)?;
+            let brief = match &agent {
+                Some(name) => ferryman_channel::orchestrator::read_brief(&route, name)?,
+                // No name given: the newest brief, because that is the one the fleet was
+                // most recently being run from.
+                None => ferryman_channel::orchestrator::list_briefs(&route)?
+                    .into_iter()
+                    .next(),
+            };
+
+            println!(
+                "Ferryman — orchestrator handover for '{}'",
+                route.project_id
+            );
+            println!();
+
+            match &brief {
+                Some(brief) => print_brief(brief, &route),
+                None => {
+                    println!("  No brief was left behind.");
+                    println!(
+                        "  Everything below is what the channel knows. What the last \
+                         orchestrator knew is gone."
+                    );
+                }
+            }
+
+            // The roster, so a successor knows who it can address work to at all.
+            println!();
+            println!("  Who is in this fleet");
+            if route.agents.is_empty() {
+                println!("    nobody on the roster yet");
+            }
+            for agent in &route.agents {
+                let signing = if agent.public_key.is_some() {
+                    "signs"
+                } else {
+                    "unsigned"
+                };
+                println!("    {:<14} {:<14} {}", agent.name, agent.role, signing);
+            }
+
+            // Work in flight, from the channel rather than from the brief, so a stale brief
+            // cannot hide a task. The two disagreeing is itself information.
+            println!();
+            println!("  Work the channel is carrying");
+            let tasks = ferryman_channel::list_tasks(&route)?;
+            let mut open = 0;
+            for task in &tasks {
+                if matches!(
+                    task.state(),
+                    ferryman_channel::TaskState::Accepted | ferryman_channel::TaskState::Done
+                ) {
+                    continue;
+                }
+                open += 1;
+                println!(
+                    "    {:<14} {:<12} {:?}",
+                    task.order.id,
+                    task.holder().unwrap_or("-"),
+                    task.state()
+                );
+            }
+            if open == 0 {
+                println!("    nothing open");
+            }
+
+            if let Some(brief) = &brief
+                && !brief.waiting_on_human.trim().is_empty()
+            {
+                println!();
+                println!("  Before anything else, these need the human");
+                for line in brief.waiting_on_human.lines() {
+                    println!("    {line}");
+                }
+            }
+
+            println!();
+            println!("  Keep this current as you work:  ferry orchestrator brief --next \"...\"");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

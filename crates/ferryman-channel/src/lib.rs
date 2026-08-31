@@ -29,6 +29,7 @@ pub mod licensing;
 pub mod master;
 pub mod memory;
 pub mod migration;
+pub mod orchestrator;
 pub mod portable_auth;
 pub mod secrets;
 pub mod skills;
