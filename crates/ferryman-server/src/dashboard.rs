@@ -326,6 +326,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/secrets", get(secrets_list))
         .route("/api/secrets", post(secret_set))
         .route("/api/secrets/{name}", delete(secret_remove))
+        .route("/api/releases", get(releases))
+        .route("/api/releases/{id}/decision", post(release_decision))
         .route("/api/cost/rates", get(cost_rates))
         .route("/api/cost/plan", post(cost_plan))
         // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
@@ -1348,6 +1350,114 @@ async fn review_task(
         "revision": revision,
         "accepted": body.accept,
         "reviewer": verdict.reviewer,
+        "path": path.display().to_string(),
+    })))
+}
+
+/// GET /api/releases — the release requests in the channel, with their decisions,
+/// the verification status of each, and (when a decision exists) whether it would
+/// currently authorise. This is the page the operator reads before approving, so it
+/// returns the reasoning — version, commit, CI, changelog — not a bare yes/no. Text
+/// is returned raw; the page escapes every field before rendering it.
+async fn releases(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let roster = ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
+    let requests = ferryman_channel::release::list_requests(&route).map_err(internal)?;
+    let decisions = ferryman_channel::release::list_decisions(&route).map_err(internal)?;
+
+    let items = requests
+        .iter()
+        .map(|request| {
+            let mut decisions_json = Vec::new();
+            for decision in decisions.iter().filter(|d| d.request_id == request.id) {
+                let check = ferryman_channel::release::verify_decision(decision, &roster);
+                // The reason a decision would not authorise right now, so the page can
+                // show it rather than a bare state word. Only computed for a valid
+                // signature, because a record that does not verify has no opinion.
+                let refusal = (check == SignatureCheck::Valid)
+                    .then(|| {
+                        ferryman_channel::release::authorize_release(
+                            request,
+                            decision,
+                            &roster,
+                            chrono::Utc::now(),
+                        )
+                        .err()
+                        .map(|refusal| refusal.to_string())
+                    })
+                    .flatten();
+                decisions_json.push(json!({
+                    "operator": decision.operator,
+                    "decision": decision.decision,
+                    "reason": decision.reason,
+                    "decided_at": decision.decided_at.to_rfc3339(),
+                    "sig": sig(&check),
+                    "refusal": refusal,
+                }));
+            }
+            json!({
+                "id": request.id,
+                "version": request.version,
+                "commit": request.commit,
+                "ci": request.ci,
+                "changelog": request.changelog,
+                "requester": request.requester,
+                "created_at": request.created_at.to_rfc3339(),
+                "sig": sig(&ferryman_channel::release::verify_request(request, &roster)),
+                "decisions": decisions_json,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!(items)))
+}
+
+/// The body of a release decision: approve or deny, with optional reasoning.
+#[derive(Deserialize)]
+struct ReleaseDecisionBody {
+    approve: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+/// POST /api/releases/{id}/decision — approve or deny a release, signed by the
+/// session's operator identity and written to the channel. Telegram has no part in
+/// this: the signature comes from the key the operator unsealed by signing in, so an
+/// approval is the operator acting, not the bridge.
+async fn release_decision(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ReleaseDecisionBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+
+    let request = ferryman_channel::release::read_request(&state.route, &id)
+        .map_err(internal)?
+        .ok_or((StatusCode::NOT_FOUND, "no such release request".to_string()))?;
+
+    let decision = if body.approve { "approve" } else { "deny" };
+    let verdict = ferryman_channel::release::ReleaseDecision::new(
+        &request,
+        decision,
+        &body.reason,
+        identity.name(),
+    );
+    let path = ferryman_channel::release::decide_release(&state.route, &verdict, &identity)
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+
+    Ok(Json(json!({
+        "id": request.id,
+        "decision": decision,
+        "operator": verdict.operator,
         "path": path.display().to_string(),
     })))
 }

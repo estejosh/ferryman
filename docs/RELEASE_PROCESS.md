@@ -8,7 +8,50 @@ Third-party commits never update Ferryman installations directly.
 4. The release is tested, checksummed, and (for a production release) signed.
 5. A Ferryman operator runs the opt-in updater against that approved release.
 
-Until a signing key is configured, releases are **preview** releases and must not be treated as production security attestations. The updater must refuse dirty installations and never adds a remote.
+## The approval gate (ADR 0018)
+
+The maintainer's judgement in step 3 is now exercised through a gate, not a
+`git push`. A machine proposes a release; a person approves it; the signing
+machine lands it. Telegram is not part of the authority — it only announces that
+a release is waiting.
+
+1. A machine writes a signed release request into the channel:
+   `ferry release propose --version 0.5.4 --commit <full-sha> --ci green --changelog "…"`.
+2. The bridge tells Telegram that a release is waiting, and links to the
+   dashboard. Telegram cannot approve anything.
+3. The operator opens the dashboard (loopback by default; a tunnel they already
+   run puts the same page on their phone), signs in with their password, and
+   approves or denies. Approving signs with the operator key that signing in
+   unsealed — the fleet cannot sign as the operator, because it never has the
+   password.
+4. The signing machine applies the approval:
+   `ferry release land`. This refuses — loudly — an approval that does not
+   verify, names nobody on the roster, points at a different version or commit,
+   is older than 24 hours, or whose CI is not green. It then tags, signs and
+   pushes.
+
+### The release key
+
+Releases are signed with a key that is separate from any operator's personal GPG
+identity. Generate it once per machine with:
+
+```sh
+ferry release key
+```
+
+It prints a public half. Publish that public half in this repository and in the
+section below; keep the private half where it is (`.ferryman/keys/release.key`,
+owner-only, never in the channel, never committed).
+
+The release signing public key for this repository is:
+
+```
+__RELEASE_KEY_PLACEHOLDER__ — run `ferry release key` and paste the public half
+```
+
+Until a release key is generated, releases are **preview** releases and must not
+be treated as production security attestations. The updater must refuse dirty
+installations and never adds a remote.
 
 For this private repository, invite trusted collaborators in GitHub to submit PRs. If the repository becomes public, contributors can fork it and follow the same PR process.
 

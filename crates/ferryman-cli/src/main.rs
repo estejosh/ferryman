@@ -403,6 +403,13 @@ enum Command {
         #[command(subcommand)]
         command: OrchestratorCommand,
     },
+    /// Propose and land a release through the channel. A machine proposes
+    /// (`propose`), a person approves in the dashboard, and the signing machine
+    /// applies (`land`) only once a verifiable approval exists. ADR 0018.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
     /// Talk MCP. `serve` exposes this project's read-only query surface as tools
     /// for an MCP client; `list` and `call` connect to an external MCP server
     /// and use its tools instead.
@@ -478,6 +485,61 @@ enum OrchestratorCommand {
     /// verifies. More than one is normal: an orchestrator that has handed over
     /// leaves its brief behind.
     List {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum ReleaseCommand {
+    /// Write a signed release request into the channel: version, exact commit, CI
+    /// conclusion and a changelog summary. Does nothing else. Telegram is told a
+    /// release is waiting by the bridge, and the approval happens in the dashboard,
+    /// where the operator's password unseals the key that signs it.
+    Propose {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is proposing. Defaults to the only agent this machine holds a key for.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// The version, e.g. 0.5.4.
+        #[arg(long)]
+        version: String,
+        /// The exact commit (full hash) this release is built from.
+        #[arg(long)]
+        commit: String,
+        /// CI conclusion: green, failed or pending. Only green can be approved.
+        #[arg(long, default_value = "green")]
+        ci: String,
+        /// A changelog summary, one or two paragraphs.
+        #[arg(long)]
+        changelog: Option<String>,
+        /// Read the changelog summary from a file instead of a flag.
+        #[arg(long, conflicts_with = "changelog")]
+        changelog_file: Option<PathBuf>,
+    },
+    /// Apply an approved release. This is the only path that moves a tag, and it
+    /// refuses to act on an approval that does not verify, names nobody on the
+    /// roster, points at a different version or commit, is stale, or whose CI is
+    /// not green.
+    Land {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The request id, e.g. v0.5.4. Defaults to the newest request.
+        #[arg(long)]
+        id: Option<String>,
+        /// Print what would be tagged and pushed, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate the release signing key — a key separate from any operator's
+    /// personal GPG identity. Prints the public half to publish in the repo and in
+    /// docs/RELEASE_PROCESS.md, and keeps the private half owner-only and out of
+    /// the channel.
+    Key {
         /// The project directory. Defaults to where you are.
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -2051,6 +2113,7 @@ async fn run(cli: Cli) -> Result<()> {
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
         Command::Orchestrator { command } => orchestrator_command(command)?,
+        Command::Release { command } => release_command(command)?,
         Command::Mcp { command } => match command {
             McpCommand::Serve { workspace } => mcp::serve(workspace)?,
             McpCommand::List { server } => mcp_client::list(&server)?,
@@ -5961,6 +6024,223 @@ fn only_local_agent(route: &ferryman_channel::ProjectRoute) -> Result<String> {
             names.join(", ")
         ),
     }
+}
+
+/// The release flow, ADR 0018. A machine proposes, a person approves in the
+/// dashboard, and this machine lands — but only after the approval verifies against
+/// the roster and pins exactly this version and commit.
+fn release_command(command: ReleaseCommand) -> Result<()> {
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+
+    match command {
+        ReleaseCommand::Propose {
+            workspace,
+            agent,
+            version,
+            commit,
+            ci,
+            changelog,
+            changelog_file,
+        } => {
+            let route = here(workspace)?;
+            let agent = match agent {
+                Some(name) => name,
+                None => only_local_agent(&route)?,
+            };
+            let identity = signing_identity(&route, &agent)?;
+            let changelog = match (changelog, changelog_file) {
+                (Some(text), _) => text,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read changelog {}", path.display()))?,
+                (None, None) => bail!("give --changelog or --changelog-file"),
+            };
+            let request = ferryman_channel::release::ReleaseRequest::new(
+                &version, &commit, &ci, &changelog, &agent,
+            );
+            let path = ferryman_channel::release::propose_release(&route, &request, &identity)?;
+            println!("proposed {} (commit {})", request.id, request.commit);
+            println!("  record  {}", path.display());
+            println!(
+                "  next    an operator approves it in the dashboard, then `ferry release land`"
+            );
+        }
+        ReleaseCommand::Land {
+            workspace,
+            id,
+            dry_run,
+        } => {
+            let route = here(workspace)?;
+            let request = match id {
+                Some(id) => ferryman_channel::release::read_request(&route, &id)?
+                    .with_context(|| format!("no release request named {id}")),
+                None => ferryman_channel::release::list_requests(&route)?
+                    .into_iter()
+                    .next()
+                    .with_context(|| "no release request in the channel"),
+            }?;
+            let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+            let approval = ferryman_channel::release::list_decisions(&route)?
+                .into_iter()
+                .find(|decision| decision.request_id == request.id && decision.approves())
+                .with_context(|| format!("no approval for {} yet", request.id))?;
+            // The gate. Every refusal below is a message, never a silent skip.
+            ferryman_channel::release::authorize_release(
+                &request,
+                &approval,
+                &roster,
+                chrono::Utc::now(),
+            )
+            .map_err(|refusal| anyhow::anyhow!("refusing to land {}: {refusal}", request.id))?;
+
+            let head = git_in(&route.workspace, &["rev-parse", "HEAD"])?;
+            if head != request.commit {
+                bail!(
+                    "HEAD is {head}, the approval is for {}; refusing to tag a different commit",
+                    request.commit
+                );
+            }
+
+            let tag = format!("v{}", request.version);
+            if dry_run {
+                println!("would tag {tag} at {}", request.commit);
+                println!(
+                    "  approved by {} at {}",
+                    approval.operator, approval.decided_at
+                );
+                return Ok(());
+            }
+            land_release(&route, &request, &tag)?;
+        }
+        ReleaseCommand::Key { workspace } => {
+            let route = here(workspace)?;
+            generate_release_key(&route)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run git in a directory, returning trimmed stdout, or the stderr on failure.
+fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Where the release signing key lives: machine-local, owner-only, never in the
+/// channel. Separate from any operator identity and from any personal GPG key.
+fn release_key_path(route: &ferryman_channel::ProjectRoute) -> std::path::PathBuf {
+    route.attachment.join("keys").join("release.key")
+}
+
+/// Generate (once) the release signing key and print its public half to publish.
+fn generate_release_key(route: &ferryman_channel::ProjectRoute) -> Result<()> {
+    let path = release_key_path(route);
+    if path.exists() {
+        let key = load_release_signing_key(route)?;
+        println!("a release key already exists at {}", path.display());
+        println!(
+            "public half: {}",
+            hex::encode(key.verifying_key().to_bytes())
+        );
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().context("release key dir")?)?;
+    let mut seed = [0u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
+    let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+    std::fs::write(&path, hex::encode(seed))?;
+    ferryman_channel::restrict_to_owner(&path)?;
+    println!("generated a release key at {}", path.display());
+    println!(
+        "public half: {}",
+        hex::encode(key.verifying_key().to_bytes())
+    );
+    println!("publish that public half in keys/release.pub and docs/RELEASE_PROCESS.md.");
+    println!("the private half never enters the channel and is never committed.");
+    Ok(())
+}
+
+/// Load the release signing key, refusing with a pointer to `ferry release key`.
+fn load_release_signing_key(
+    route: &ferryman_channel::ProjectRoute,
+) -> Result<ed25519_dalek::SigningKey> {
+    let path = release_key_path(route);
+    let encoded = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "no release key at {}; run `ferry release key` first",
+            path.display()
+        )
+    })?;
+    let bytes: [u8; 32] = hex::decode(encoded.trim())
+        .with_context(|| format!("{} is not a readable release key", path.display()))?
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("{} is not a 32-byte key", path.display()))?;
+    Ok(ed25519_dalek::SigningKey::from_bytes(&bytes))
+}
+
+/// Tag, sign a manifest with the release key, and push. Everything before this is
+/// the security boundary; these git steps are mechanical and must never run unless
+/// `authorize_release` has already passed.
+fn land_release(
+    route: &ferryman_channel::ProjectRoute,
+    request: &ferryman_channel::release::ReleaseRequest,
+    tag: &str,
+) -> Result<()> {
+    use ed25519_dalek::Signer;
+
+    let message = format!("Release {} ({})", request.version, request.commit);
+    git_in(&route.workspace, &["tag", "-a", tag, "-m", &message])?;
+
+    let key = load_release_signing_key(route)?;
+    let payload = format!(
+        "ferryman-release-manifest/v1\n{}\n{}\n{}",
+        request.version, request.commit, tag
+    );
+    let signature = key.sign(payload.as_bytes());
+    let manifest = json!({
+        "format": "ferryman-release-manifest/v1",
+        "version": request.version,
+        "commit": request.commit,
+        "tag": tag,
+        "signature": hex::encode(signature.to_bytes()),
+    });
+    let dir = route.workspace.join("release-signatures");
+    std::fs::create_dir_all(&dir)?;
+    let manifest_path = dir.join(format!("{tag}.json"));
+    std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    let commit_message = format!("release: sign {tag}");
+    git_in(
+        &route.workspace,
+        &[
+            "add",
+            manifest_path
+                .to_str()
+                .context("manifest path is not UTF-8")?,
+        ],
+    )?;
+    git_in(&route.workspace, &["commit", "-m", &commit_message])?;
+    git_in(&route.workspace, &["push", "origin", "HEAD"])?;
+    git_in(&route.workspace, &["push", "origin", tag])?;
+    println!("tagged and pushed {tag}");
+    println!("  manifest {}", manifest_path.display());
+    Ok(())
 }
 
 /// How a signature reads to a human who has to decide whether to trust the brief.

@@ -1235,6 +1235,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "ferryman-channel",
  "ferryman-ops",
  "ferryman-server",

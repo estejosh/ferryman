@@ -235,6 +235,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <button data-page="home" aria-current="page">Home</button>
       <button data-page="tasks">Tasks <span class="pill num" id="count-tasks">0</span></button>
       <button data-page="review">Needs review <span class="pill num" id="count-review">0</span></button>
+      <button data-page="releases">Releases <span class="pill num" id="count-releases">0</span></button>
       <button data-page="agents">Agents <span class="pill num" id="count-agents">0</span></button>
       <button data-page="teammates">Teammates</button>
     </div>
@@ -267,7 +268,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-const state = { me: null, project: "—", tasks: [], roster: [], team: null, filter: "" };
+const state = { me: null, project: "—", tasks: [], roster: [], releases: [], team: null, filter: "" };
 
 async function api(path, opts) {
   const res = await fetch(path, { credentials: "same-origin", ...opts });
@@ -489,6 +490,30 @@ function wireRows() {
   });
 }
 
+function wireReleases() {
+  $$("[data-release]").forEach((el) => {
+    el.addEventListener("click", async () => {
+      const id = el.dataset.release;
+      const approve = el.dataset.decision === "approve";
+      const reasonEl = document.getElementById("reason-" + id);
+      const reason = reasonEl ? reasonEl.value.trim() : "";
+      const msg = document.getElementById("relmsg-" + id);
+      el.disabled = true;
+      try {
+        await api(`/api/releases/${encodeURIComponent(id)}/decision`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ approve, reason }),
+        });
+        await refresh();
+      } catch (err) {
+        if (msg) msg.textContent = String(err.message || err).slice(0, 200);
+        el.disabled = false;
+      }
+    });
+  });
+}
+
 pages.home = async () => {
   const tasks = state.tasks;
   const counts = tasks.reduce((acc, t) => {
@@ -619,6 +644,57 @@ pages.ledger = async () => {
     </div>`;
 };
 
+pages.releases = async () => {
+  const d = await api("/api/releases");
+  const items = Array.isArray(d) ? d : (d.releases || []);
+  const tone = (sig) => (sig === "valid" ? "good" : (sig === "unsigned" ? "warn" : "bad"));
+  const ciTone = (c) => (c === "green" ? "good" : "bad");
+  return `
+    <div class="head">
+      <div><h1>Releases</h1><p>A machine proposes a release. Only a person approves it — and
+      approving signs with the identity you unsealed by signing in. Telegram only points here;
+      it cannot approve anything.</p></div>
+    </div>
+    ${items.length ? items.map((r) => `
+      <div class="card" style="margin-bottom:14px;text-align:left">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">
+          <div style="font-size:16px;font-weight:600">Version <span class="mono">${esc(r.version)}</span></div>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <span class="badge ${ciTone(r.ci)}">CI ${esc(r.ci)}</span>
+            <span class="badge ${tone(r.sig)}">request ${esc(r.sig)}</span>
+          </div>
+        </div>
+        <dl class="kv" style="margin:12px 0">
+          <dt>Commit</dt><dd class="mono">${esc(r.commit)}</dd>
+          <dt>Proposed by</dt><dd>${esc(r.requester)}</dd>
+          <dt>When</dt><dd>${esc(r.created_at)} <span style="color:var(--faint)">${ago(r.created_at)}</span></dd>
+        </dl>
+        <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:0 0 6px">What is in it</div>
+        <pre class="out">${esc(r.changelog || "")}</pre>
+        ${(r.decisions || []).length ? `
+          <div style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:14px 0 6px">Decisions</div>
+          ${r.decisions.map((x) => `
+            <div style="padding:8px 10px;border:1px solid var(--line);border-radius:var(--radius);margin-bottom:8px">
+              <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+                <span class="badge">${esc(x.operator)}</span>
+                <span class="badge ${x.decision === "approve" ? "good" : "bad"}">${esc(x.decision)}</span>
+                <span class="badge ${tone(x.sig)}">${esc(x.sig)}</span>
+              </div>
+              ${x.reason ? `<div style="margin-top:6px">${esc(x.reason)}</div>` : ""}
+              ${x.refusal ? `<div class="notice" style="margin-top:8px"><b>Would not authorise</b><div>${esc(x.refusal)}</div></div>` : ""}
+            </div>`).join("")}
+        ` : `<div style="color:var(--faint);margin-top:10px">No decision yet.</div>`}
+        <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="reason-${esc(r.id)}" type="text" placeholder="Reason (optional)" autocomplete="off"
+            style="flex:1;min-width:180px;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);padding:7px 12px">
+          <button class="btn" data-release="${esc(r.id)}" data-decision="deny" type="button">Deny</button>
+          <button class="btn primary" data-release="${esc(r.id)}" data-decision="approve" type="button">Approve</button>
+        </div>
+        <div class="msg" id="relmsg-${esc(r.id)}" role="status" style="margin-top:8px"></div>
+      </div>`).join("") : `<div class="empty">No release has been proposed.</div>`}
+  `;
+};
+
 pages.learnings = async () => {
   const d = await api("/api/learnings");
   const items = Array.isArray(d) ? d : (d.entries || d.learnings || []);
@@ -741,6 +817,7 @@ async function render() {
       <div class="notice"><b>Could not load</b><div>${esc(err.message)}</div></div>`;
   }
   wireRows();
+  wireReleases();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {
@@ -767,7 +844,9 @@ function setSync(tone, text) {
 }
 
 async function refresh() {
-  const [tasks, roster] = await Promise.allSettled([api("/api/tasks"), api("/api/roster")]);
+  const [tasks, roster, releases] = await Promise.allSettled([
+    api("/api/tasks"), api("/api/roster"), api("/api/releases"),
+  ]);
 
   if (tasks.status === "fulfilled") {
     const d = tasks.value;
@@ -778,11 +857,17 @@ async function refresh() {
     const d = roster.value;
     state.roster = Array.isArray(d) ? d : (d.agents || d.roster || []);
   }
+  if (releases.status === "fulfilled") {
+    const d = releases.value;
+    state.releases = Array.isArray(d) ? d : (d.releases || []);
+  }
 
   $("#count-tasks").textContent = state.tasks.length;
   $("#count-review").textContent = state.tasks.filter(
     (t) => stateOf(t).word === "AwaitingReview").length;
   $("#count-agents").textContent = state.roster.length;
+  $("#count-releases").textContent = state.releases.filter(
+    (r) => !(r.decisions || []).length).length;
   $("#project").textContent = state.project;
 
   // The indicator reports what this page can see, not what Syncthing thinks.
