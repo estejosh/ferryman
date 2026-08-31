@@ -6498,7 +6498,14 @@ async fn update_command(check: bool) -> Result<()> {
     let running = update::running_version();
     let latest = update::latest_release().await?;
 
-    if !update::differs(&latest) {
+    if update::is_ahead(&latest) {
+        // A build from source, which is not something to "fix". Offering to install an
+        // older release here would be offering a downgrade dressed as an update.
+        println!("ferry {running} is ahead of the latest release ({latest}).");
+        println!("  Built from source. Nothing to install.");
+        return Ok(());
+    }
+    if !update::is_newer(&latest) {
         println!("ferry {running} is the latest release.");
         return Ok(());
     }
@@ -6708,7 +6715,7 @@ fn marvin_command(command: MarvinCommand) -> Result<()> {
             match ferryman_channel::marvin::current_holder(&route)? {
                 Some(holding) if holding.has_gone_quiet(now) => {
                     println!(
-                        "  '{}' held Marvin and has not been heard from for {}.",
+                        "  '{}' held Marvin and was last heard from {}.",
                         holding.agent,
                         age_phrase(holding.quiet_minutes(now))
                     );

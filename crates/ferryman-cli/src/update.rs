@@ -89,15 +89,41 @@ pub fn running_version() -> String {
     format!("v{}", env!("CARGO_PKG_VERSION"))
 }
 
-/// Whether `latest` is a different release from the one running.
+/// A version as numbers, for comparing. Anything after a `-` is a pre-release suffix and
+/// is ignored: `0.5.5-rc1` and `0.5.5` are the same release for this purpose.
+fn parts(version: &str) -> Vec<u64> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('-')
+        .next()
+        .unwrap_or_default()
+        .split('.')
+        .map(|piece| piece.parse().unwrap_or(0))
+        .collect()
+}
+
+/// Whether `latest` is NEWER than what is running.
 ///
-/// Deliberately an inequality rather than a version comparison. A machine running
-/// something NEWER than the latest release is a developer build, and telling them they
-/// are current would be wrong in the other direction - `check` reports the difference and
-/// lets a person decide.
+/// # Why this is a comparison and not an inequality
+///
+/// It was an inequality first, and running it caught the bug in one sentence: a build of
+/// main reported "available v0.5.4" against its own v0.5.5 and offered to install it.
+/// Harmless as a message, and not harmless at all in [`keep_current`], which would have
+/// silently DOWNGRADED every developer build and every machine running ahead of a tag -
+/// including, at that moment, the entire fleet.
+///
+/// Newer only. A machine ahead of the latest release is told so and left alone.
 #[must_use]
-pub fn differs(latest: &str) -> bool {
-    latest.trim_start_matches('v') != env!("CARGO_PKG_VERSION")
+pub fn is_newer(latest: &str) -> bool {
+    parts(latest) > parts(env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether the running build is ahead of the newest published release, which is what a
+/// build from source looks like.
+#[must_use]
+pub fn is_ahead(latest: &str) -> bool {
+    parts(env!("CARGO_PKG_VERSION")) > parts(latest)
 }
 
 async fn fetch(url: &str) -> Result<Vec<u8>> {
@@ -302,7 +328,7 @@ pub async fn keep_current() {
     let Ok(latest) = latest_release().await else {
         return;
     };
-    if !differs(&latest) {
+    if !is_newer(&latest) {
         return;
     }
     match apply(&latest).await {
@@ -345,10 +371,33 @@ mod tests {
         let running = running_version();
         assert!(running.starts_with('v'));
         assert!(
-            !differs(&running),
+            !is_newer(&running),
             "a build must not think itself out of date"
         );
-        assert!(differs("v0.0.1-not-this"));
+    }
+
+    /// The bug that replacing an inequality with a comparison fixes. A build of main is
+    /// AHEAD of the latest tag, and an inequality read that as "different, so update" -
+    /// which in the unattended path would have quietly DOWNGRADED every machine running
+    /// ahead of a release, the whole fleet included.
+    #[test]
+    fn a_build_ahead_of_the_latest_release_is_never_downgraded() {
+        assert!(!is_newer("v0.0.1"), "an older release is not an update");
+        assert!(is_ahead("v0.0.1"));
+
+        assert!(is_newer("v999.0.0"), "a newer release is an update");
+        assert!(!is_ahead("v999.0.0"));
+    }
+
+    #[test]
+    fn versions_compare_by_number_and_not_by_text() {
+        // Why this cannot be string comparison: "0.5.10" sorts before "0.5.9".
+        assert!(parts("v0.5.10") > parts("0.5.9"));
+        assert!(parts("v1.0.0") > parts("v0.99.99"));
+        // A pre-release suffix is not part of the ordering here.
+        assert_eq!(parts("v0.5.5-rc1"), parts("0.5.5"));
+        // Nonsense sorts low rather than panicking.
+        assert!(parts("v0.5.5") > parts("not-a-version"));
     }
 
     /// The whole point of the swap: the old binary is moved rather than deleted, because
