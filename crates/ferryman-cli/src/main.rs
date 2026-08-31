@@ -396,6 +396,13 @@ enum Command {
         /// Serve views only; disable sign-in and the approve/send-back action.
         #[arg(long)]
         read_only: bool,
+        /// The folder holding your channels, so the project picker can see the whole
+        /// fleet. Same folder `ferry agent run --comms` takes.
+        ///
+        /// Without it, projects are looked for beside the directory you launched in,
+        /// which finds nothing when the fleet lives one level down.
+        #[arg(long)]
+        comms: Option<PathBuf>,
         /// A hostname a tunnel in front of this dashboard will send, e.g. your
         /// Tailscale name or a Cloudflare hostname. Repeatable.
         ///
@@ -2195,11 +2202,15 @@ async fn run(cli: Cli) -> Result<()> {
             port,
             timeout,
             read_only,
+            comms,
             allow_host,
         } => {
             update::keep_current().await;
             if !allow_host.is_empty() {
                 ferryman_server::dashboard::allow_hosts(allow_host.clone());
+            }
+            if let Some(root) = comms.clone() {
+                ferryman_server::dashboard::discover_projects_in(root);
             }
             let start = match workspace {
                 Some(path) => path,

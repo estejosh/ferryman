@@ -22,6 +22,7 @@ pub mod encrypt;
 pub mod events;
 pub mod interrupt;
 pub mod keys;
+pub mod known;
 pub mod learning;
 pub mod lease;
 pub mod ledger;
@@ -3552,7 +3553,14 @@ pub fn route_for(start: &Path) -> Result<ProjectRoute> {
             start.display()
         )
     })?;
-    load_route(&attachment)
+    let route = load_route(&attachment)?;
+    // Note where this project was, so the fleet can be found later without guessing from
+    // whichever directory a command happened to be run in. Best-effort and rate-limited;
+    // see `known`. Hooked here because this is the one funnel every command already goes
+    // through - a discovery feature that depends on each caller remembering to record is
+    // one that will be incomplete exactly when it matters.
+    known::remember(&route);
+    Ok(route)
 }
 
 pub fn is_acknowledged(route: &ProjectRoute, message_id: &str) -> bool {

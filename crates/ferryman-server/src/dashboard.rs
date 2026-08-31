@@ -5,6 +5,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -129,7 +130,22 @@ struct ProjectParam {
 /// same discovery the Fleet tab uses, so a clickable project resolves to the
 /// same channel `route_for` would find.
 fn find_project_route(current: &ProjectRoute, id: &str) -> Option<ProjectRoute> {
-    let parent = current.workspace.parent()?;
+    // The index knows where projects actually are; the scan below only knows what sits
+    // next to this one.
+    if let Some(project) = ferryman_channel::known::known()
+        .into_iter()
+        .find(|project| project.project_id == id)
+        && let Ok(route) = ferryman_channel::route_for(&project.workspace)
+    {
+        return Some(route);
+    }
+    // The same root discovery uses. Listing a project the reads cannot then resolve would
+    // give a picker that silently falls back to the current project - which looks like
+    // the switch did nothing, and is worse than not offering it.
+    let parent = COMMS_ROOT
+        .get()
+        .map(PathBuf::as_path)
+        .or_else(|| current.workspace.parent())?;
     if !parent.is_dir() {
         return None;
     }
@@ -1452,15 +1468,57 @@ async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, Dashb
     ))
 }
 
-/// Every project whose channel directory sits beside this workspace. A sibling
-/// directory is a project exactly when it has a `.ferryman/bridge.toml`; there
-/// is no registry to keep in sync, so a project appears the moment its channel
-/// is on disk.
+/// Where sibling projects are looked for, when it is not simply the parent directory.
+///
+/// A fleet is usually kept as one folder of channels, and `ferry agent run --comms`
+/// already takes that folder. The dashboard did not: launched from inside one channel it
+/// scanned that channel's parent and found its siblings, and launched from a project
+/// checkout elsewhere it found nothing at all and silently showed one project. Set by
+/// `ferry dashboard --comms`.
+static COMMS_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Point project discovery at a folder of channels. Call before `serve`.
+pub fn discover_projects_in(root: PathBuf) {
+    let _ = COMMS_ROOT.set(root);
+}
+
+/// Every project whose channel directory sits beside this workspace, or inside the
+/// `--comms` folder when one was given. A directory is a project exactly when it has a
+/// channel on disk; there is no registry to keep in sync, so a project appears the moment
+/// its channel is there.
 fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
-    let Some(parent) = route.workspace.parent() else {
+    let Some(parent) = COMMS_ROOT
+        .get()
+        .map(PathBuf::as_path)
+        .or_else(|| route.workspace.parent())
+    else {
         return Ok(Vec::new());
     };
     let mut projects: Vec<(String, String, usize, usize, usize)> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    // What this machine has actually used, wherever it lives. This is the half that finds
+    // a fleet the scan below cannot reach - channels on another drive, or one level down
+    // from wherever the dashboard was launched.
+    for project in ferryman_channel::known::known() {
+        let Ok(child) = ferryman_channel::route_for(&project.workspace) else {
+            continue;
+        };
+        let tasks = ferryman_channel::list_tasks(&child).unwrap_or_default();
+        let open = tasks
+            .iter()
+            .filter(|task| !matches!(task.state(), TaskState::Accepted | TaskState::Done))
+            .count();
+        seen.push(child.project_id.clone());
+        projects.push((
+            child.project_id,
+            child.workspace.display().to_string(),
+            tasks.len(),
+            open,
+            tasks.len() - open,
+        ));
+    }
+
     if parent.is_dir() {
         for entry in std::fs::read_dir(parent)? {
             let entry = entry?;
@@ -1477,6 +1535,9 @@ fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
             let Ok(child) = ferryman_channel::route_for(&path) else {
                 continue;
             };
+            if seen.contains(&child.project_id) {
+                continue;
+            }
             let tasks = ferryman_channel::list_tasks(&child).unwrap_or_default();
             let open = tasks
                 .iter()

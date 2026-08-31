@@ -45,7 +45,11 @@ a{color:var(--accent);text-decoration:none}
   background:linear-gradient(150deg,var(--accent),#7C5CFF);
   display:grid;place-items:center;font-size:13px;color:#fff;font-weight:700
 }
-.proj{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:13px;flex:none}
+.proj{display:flex;align-items:center;gap:6px;color:var(--dim);font-size:13px;flex:none;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);
+  padding:6px 10px;cursor:pointer;max-width:220px}
+.proj:hover{border-color:var(--line-2);color:var(--text)}
+.proj:focus{outline:none;border-color:var(--accent-dim)}
 .search{flex:1;max-width:520px}
 .search input{
   width:100%;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);
@@ -64,27 +68,56 @@ a{color:var(--accent);text-decoration:none}
 
 .side{background:var(--panel);border-right:1px solid var(--line);padding:14px 10px;overflow-y:auto}
 .side .grp{padding:16px 10px 6px;font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint)}
-.chat{display:grid;grid-template-columns:minmax(180px,260px) 1fr;gap:12px;align-items:start}
-.chat-list{padding:6px;max-height:70vh;overflow:auto}
+.chat{display:grid;grid-template-columns:minmax(200px,268px) minmax(0,1fr);gap:16px;
+  align-items:stretch;height:calc(100vh - 176px);min-height:420px}
+.chat-list{display:flex;flex-direction:column;padding:0;overflow:hidden}
+.chat-list-scroll{flex:1;overflow-y:auto;padding:6px}
 .chat-pick{
-  display:block;width:100%;text-align:left;background:none;border:1px solid transparent;
-  border-radius:8px;padding:8px 10px;color:var(--text);cursor:pointer
+  display:block;width:100%;text-align:left;background:none;border:0;
+  border-left:2px solid transparent;border-radius:0 6px 6px 0;padding:10px 12px;
+  color:var(--text);cursor:pointer
 }
 .chat-pick:hover{background:var(--panel-2)}
-.chat-pick.on{background:var(--panel-2);border-color:var(--line-2)}
-.chat-pick .s{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.chat-thread{display:flex;flex-direction:column;max-height:70vh}
-.chat-top{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;gap:8px;align-items:center}
-.turns{flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:10px}
-.turn{max-width:80%;padding:8px 10px;border-radius:10px;background:var(--panel-2);border:1px solid var(--line)}
-.turn.mine{align-self:flex-end;border-color:var(--line-2)}
-.turn-head{display:flex;gap:8px;align-items:baseline;margin-bottom:2px}
-.turn-body{white-space:pre-wrap;word-break:break-word}
-.chat-new{display:flex;gap:6px;padding:6px 6px 10px;border-bottom:1px solid var(--line);margin-bottom:6px}
-.chat-new input{flex:1;min-width:0}
-.chat-say{display:flex;gap:8px;padding:10px 12px;border-top:1px solid var(--line)}
-.chat-say input{flex:1}
-@media (max-width:760px){.chat{grid-template-columns:1fr}}
+.chat-pick.on{background:var(--panel-2);border-left-color:var(--accent)}
+.chat-pick .n{font-weight:500;letter-spacing:-.01em;display:flex;align-items:center;gap:7px}
+.chat-pick .s{color:var(--dim);font-size:12.5px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;margin-top:2px}
+.chat-thread{display:flex;flex-direction:column;min-height:0}
+.chat-top{padding:13px 18px;border-bottom:1px solid var(--line);display:flex;gap:10px;
+  align-items:center;flex:none}
+.chat-top .t{font-weight:600;letter-spacing:-.01em}
+.turns{flex:1;overflow-y:auto;padding:4px 0;min-height:0}
+.turn{display:grid;grid-template-columns:34px minmax(0,1fr);gap:12px;padding:14px 18px}
+.turn+.turn{border-top:1px solid var(--line)}
+.turn:hover{background:color-mix(in srgb,var(--panel-2) 55%,transparent)}
+.turn.mine .who{background:var(--accent-dim);border-color:var(--accent-dim);color:#fff}
+.who{width:34px;height:34px;border-radius:50%;background:var(--panel-2);
+  border:1px solid var(--line-2);color:var(--text);display:grid;place-items:center;
+  font-size:12px;font-weight:600;flex:none}
+.turn-head{display:flex;align-items:baseline;gap:9px;margin-bottom:3px}
+.turn-head .at{color:var(--faint);font-size:12px}
+.said{white-space:pre-wrap;word-break:break-word;line-height:1.65;max-width:78ch}
+.said.gist{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.more{background:none;border:0;color:var(--accent);cursor:pointer;padding:5px 0 0;
+  font-size:12.5px;display:inline-flex;align-items:center;gap:5px}
+.more:hover{text-decoration:underline}
+.more svg{transition:transform .15s ease}
+.turn.open .more svg{transform:rotate(180deg)}
+.chat-say{display:flex;gap:10px;padding:12px 18px;border-top:1px solid var(--line);
+  flex:none;align-items:flex-end}
+.chat-say textarea{flex:1;min-height:44px;max-height:160px;resize:none;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);
+  padding:11px 14px;outline:none;font:inherit;color:var(--text);line-height:1.5}
+.chat-say textarea:focus{border-color:var(--accent-dim)}
+.chat-new{display:flex;gap:6px;padding:10px;border-bottom:1px solid var(--line);flex:none}
+.chat-new input{flex:1;min-width:0;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:var(--radius);padding:8px 11px;color:var(--text);outline:none}
+.chat-new input:focus{border-color:var(--accent-dim)}
+@media (max-width:760px){
+  .chat{grid-template-columns:1fr;height:auto}
+  .chat-list{max-height:210px}
+  .chat-thread{height:62vh}
+}
 .nav{display:flex;flex-direction:column;gap:2px}
 .nav button{
   display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;
@@ -344,7 +377,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
         <path d="M26.6,23.2 H37.6 V27.3 H30.7 V30.24 H35 V34.34 H30.7 V40.8 H26.6 Z" stroke="none" fill="currentColor"/>
       </g>
     </svg><span>Ferryman</span></div>
-    <div class="proj mono" id="project">—</div>
+    <select class="proj mono" id="project" aria-label="Project"></select>
     <div class="search"><input id="search" type="search" placeholder="Filter tasks, agents and activity" aria-label="Filter"></div>
     <div class="spacer"></div>
     <div class="sync"><span class="dot" id="sync-dot"></span><span id="sync-text">Checking</span></div>
@@ -395,7 +428,8 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-const state = { me: null, project: "—", tasks: [], roster: [], team: null, filter: "" };
+const state = { me: null, project: null, homeProject: null, projects: [], tasks: [],
+  roster: [], team: null, filter: "" };
 
 // The session token lives in memory and in sessionStorage (per-tab, gone on close), never
 // in localStorage: a session is meant to be short-lived and idle-expiring, not a standing
@@ -408,6 +442,13 @@ async function api(path, opts) {
   opts = opts || {};
   const headers = Object.assign({}, opts.headers || {});
   if (sessionToken) headers["x-ferryman-dashboard-token"] = sessionToken;
+  // Scope the read to the chosen project. Only on GETs: the write endpoints act on the
+  // channel this dashboard was launched in, and quietly retargeting a write at whichever
+  // project a dropdown happened to be showing is not something to add by accident.
+  const method = (opts.method || "GET").toUpperCase();
+  if (method === "GET" && state.project && state.project !== state.homeProject) {
+    path += `${path.includes("?") ? "&" : "?"}project=${encodeURIComponent(state.project)}`;
+  }
   const res = await fetch(path, { credentials: "same-origin", ...opts, headers });
   if (res.status === 401) { showLogin(); throw new Error("not signed in"); }
   if (!res.ok) throw new Error((await res.text()) || `${res.status} on ${path}`);
@@ -919,26 +960,41 @@ pages.learnings = async () => {
 pages.engines = async () => {
   const d = await api("/api/stats");
   const rows = d.engines || d.rows || (Array.isArray(d) ? d : []);
-  const money = (v) => (v == null ? "—" : `$${Number(v).toFixed(2)}`);
+
+  // An engine that reported nothing has NOT cost nothing.
+  //
+  // The worker records an honest zero when an engine's output carries no usage - the
+  // right call, and the aggregate is correct. Rendering that zero as "0 tokens, $0.00"
+  // turns a correct silence into a false claim: this table said 49 real runs were free.
+  // A number nobody measured has to look different from a number that is zero.
+  const reported = (r) => (r.prompt_tokens ?? 0) > 0 || (r.completion_tokens ?? 0) > 0;
+  const silent = rows.filter((r) => !reported(r) && (r.runs ?? 0) > 0).length;
+  const num = (v) => Number(v ?? 0).toLocaleString();
+
   return `
     <div class="head">
-      <div><h1>Engines</h1><p>How each engine is doing on this project. Costs are list prices, computed offline — an estimate, not a bill.</p></div>
+      <div><h1>Engines</h1><p>How each engine is doing on this project. Where an engine reports its token use, the cost is a list-price estimate &mdash; never a bill.</p></div>
     </div>
+    ${silent ? `<div class="notice"><b>${esc(String(silent))} engine${silent === 1 ? "" : "s"} not reporting usage</b><div>
+      Those runs happened and cost real money; Ferryman has no count for them, because
+      nothing in their output said so. Blank below means unmeasured, not free.</div></div>` : ""}
     <div class="panel scroll">
       <table class="grid">
         <thead><tr><th>Engine</th><th>Family</th><th>Runs</th><th>Accepted</th><th>Prompt tokens</th><th>Completion</th><th>Est. cost</th></tr></thead>
         <tbody>${rows.length ? rows.map((r) => {
-          const rate = r.runs ? Math.round((100 * (r.accepted || 0)) / r.runs) : null;
+          const runs = r.runs ?? 0;
+          const rate = runs ? Math.round((100 * (r.accepted || 0)) / runs) : null;
+          const has = reported(r);
           return `
           <tr>
             <td class="lead">${esc(r.engine || r.key || "—")}</td>
             <td>${esc(r.family || "—")}</td>
-            <td class="num">${esc(r.runs ?? 0)}</td>
-            <td class="num">${esc(r.accepted ?? 0)}${rate == null ? "" :
+            <td class="num">${esc(String(runs))}</td>
+            <td class="num">${esc(String(r.accepted ?? 0))}${rate == null ? "" :
               ` <span class="badge ${rate >= 80 ? "good" : rate >= 50 ? "warn" : "bad"}">${rate}%</span>`}</td>
-            <td class="num">${esc((r.prompt_tokens ?? 0).toLocaleString())}</td>
-            <td class="num">${esc((r.completion_tokens ?? 0).toLocaleString())}</td>
-            <td class="num">${money(r.estimated_cost_usd)}</td>
+            <td class="num">${has ? esc(num(r.prompt_tokens)) : `<span class="badge">not reported</span>`}</td>
+            <td class="num">${has ? esc(num(r.completion_tokens)) : "&mdash;"}</td>
+            <td class="num">${has ? esc(`$${Number(r.estimated_cost_usd ?? 0).toFixed(2)}`) : "&mdash;"}</td>
           </tr>`; }).join("")
           : `<tr><td colspan="7"><div class="empty">No runs recorded yet.</div></td></tr>`}
         </tbody>
@@ -1136,25 +1192,58 @@ function wireRelease() {
   if (later) later.addEventListener("click", () => { current = "home"; render(); });
 }
 
-/* ---------- conversation ----------
+/* The conversation view.
 
-   The dashboard is a view over the synced channel, never a second channel. What is typed
+   The dashboard is a view over the synced channel, never a second channel: what is typed
    here lands in the same signed file the Telegram bridge writes to, and is
-   indistinguishable from it afterwards. That is the whole point: a message that existed
-   only in the dashboard would be invisible to every agent and would vanish when the
-   process stopped. */
+   indistinguishable from it afterwards.
+
+   It reads as a transcript rather than as chat bubbles. Agents write paragraphs, and a
+   bubble column turns a considered answer into a ransom note. */
 
 let chatTopic = null;
 let chatTimer = null;
+const chatOpen = new Set();   // turns the reader has expanded, by index
 
-function chatTurn(turn, me) {
+function initials(who) {
+  const parts = String(who || "?").split(/[-_\s]+/).filter(Boolean);
+  const letters = parts.length > 1 ? parts[0][0] + parts[1][0] : String(who || "?").slice(0, 2);
+  return letters.toUpperCase();
+}
+
+/* The gist of a turn is the agent's OWN first sentence, never a summary this page
+   invented. A generated one-liner would be a claim about what somebody said, sitting
+   above what they actually said, with nothing marking which is which - and on a channel
+   where every other line is signed and attributable, that is the one thing this view must
+   not do. So: their words, truncated, with the rest a click away. */
+function gistOf(said) {
+  const text = String(said || "").trim();
+  const stop = text.search(/[.!?](\s|$)/);
+  const first = stop > 0 ? text.slice(0, stop + 1) : text;
+  return first.length > 180 ? `${first.slice(0, 177)}…` : first;
+}
+
+function chatTurn(turn, index, me) {
   const who = turn.who || "";
   const mine = me && who.toLowerCase() === String(me).toLowerCase();
+  const said = String(turn.said || "");
+  const gist = gistOf(said);
+  // Only worth folding when there is meaningfully more behind it.
+  const long = said.length > gist.length + 40 || said.includes("\n");
+  const open = chatOpen.has(index);
+
   // Every value here was written by another machine. `esc` is not decoration: an
-  // injection in this page steals a session that can approve agent work.
-  return `<div class="turn${mine ? " mine" : ""}">
-    <div class="turn-head"><b>${esc(who || "—")}</b><span class="s">${esc(turn.at || "")}</span></div>
-    <div class="turn-body">${esc(turn.said || "")}</div>
+  // injection in this page steals a session that can approve releases.
+  return `<div class="turn${mine ? " mine" : ""}${open ? " open" : ""}" data-turn="${index}" title="${long ? esc(gist) : ""}">
+    <div class="who">${esc(initials(who))}</div>
+    <div>
+      <div class="turn-head"><b>${esc(who || "—")}</b><span class="at">${esc(turn.at || "")}</span></div>
+      <div class="said${long && !open ? " gist" : ""}">${esc(said)}</div>
+      ${long ? `<button class="more" data-more="${index}">
+        ${open ? "Show less" : "Show the rest"}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"></path></svg>
+      </button>` : ""}
+    </div>
   </div>`;
 }
 
@@ -1167,9 +1256,8 @@ pages.chat = async () => {
     try { thread = await api(`/api/conversations/${encodeURIComponent(chatTopic)}`); }
     catch (_) { thread = { turns: [], signature: null }; }
   }
-  // A topic the operator has just named is not in the list until it has a turn in it.
   const known = list.some((c) => c.topic === chatTopic);
-  const me = state.me;  // a plain string: whoami returns { name }, and login stores the name
+  const me = state.me;
 
   return `
     <div class="head">
@@ -1179,43 +1267,68 @@ pages.chat = async () => {
       <div class="panel chat-list">
         <form class="chat-new" id="chat-new">
           <input id="chat-new-topic" placeholder="New conversation&hellip;" autocomplete="off" maxlength="60">
-          <button class="btn ghost" type="submit" title="Start it">+</button>
+          <button class="btn small" type="submit" title="Start it">Add</button>
         </form>
-        ${list.length ? list.map((c) => `
-          <button class="chat-pick${c.topic === chatTopic ? " on" : ""}" data-topic="${esc(c.topic)}">
-            <div class="lead">${esc(c.topic)}</div>
-            <div class="s">${esc((c.last && c.last.who) || "—")}: ${esc(((c.last && c.last.said) || "").slice(0, 60))}</div>
-          </button>`).join("") : `<div class="empty">No conversations yet. Name one above and say something.</div>`}
+        <div class="chat-list-scroll">
+          ${list.length ? list.map((c) => `
+            <button class="chat-pick${c.topic === chatTopic ? " on" : ""}" data-topic="${esc(c.topic)}">
+              <div class="n">${esc(c.topic)}${c.signature && c.signature !== "Valid" ? ` ${sigBadge(c.signature)}` : ""}</div>
+              <div class="s">${esc((c.last && c.last.who) || "—")}: ${esc(gistOf((c.last && c.last.said) || ""))}</div>
+            </button>`).join("")
+            : `<div class="empty">No conversations yet.<br>Name one above.</div>`}
+        </div>
       </div>
+
       <div class="panel chat-thread">
         ${chatTopic ? `
           <div class="chat-top">
-            <b>${esc(chatTopic)}</b>
+            <div class="t">${esc(chatTopic)}</div>
+            <div class="spacer" style="flex:1"></div>
+            <span class="badge">${esc(String(thread.turns.length))} turn${thread.turns.length === 1 ? "" : "s"}</span>
             ${thread.signature && thread.signature !== "Valid" ? sigBadge(thread.signature) : ""}
           </div>
           <div class="turns" id="turns">
             ${thread.turns.length
-              ? thread.turns.map((t) => chatTurn(t, me)).join("")
+              ? thread.turns.map((t, i) => chatTurn(t, i, me)).join("")
               : `<div class="empty">${known ? "Nothing said here yet." : "New conversation. It exists once you say something in it."}</div>`}
           </div>
           <form class="chat-say" id="chat-say">
-            <input id="chat-input" placeholder="Say something to the fleet&hellip;" autocomplete="off" maxlength="8000">
-            <button class="btn" type="submit">Send</button>
+            <textarea id="chat-input" rows="1" placeholder="Say something to the fleet&hellip;" maxlength="8000"></textarea>
+            <button class="btn primary" type="submit">Send</button>
           </form>
-          <div class="s" id="chat-msg"></div>`
-        : `<div class="empty">Pick a conversation.</div>`}
+          <div class="s" id="chat-msg" style="padding:0 18px 10px;color:var(--bad)"></div>`
+        : `<div class="empty">Pick a conversation, or start one.</div>`}
       </div>
     </div>`;
 };
 
-/* Wire the chat after each render. Event delegation would survive re-rendering, but the
-   page is rebuilt wholesale by `render()` and being explicit here keeps it obvious that
-   the handlers belong to the markup that was just written. */
 function wireChat() {
   $$(".chat-pick").forEach((b) => {
     b.addEventListener("click", async () => {
+      if (b.dataset.topic !== chatTopic) chatOpen.clear();
       chatTopic = b.dataset.topic;
       await render();
+    });
+  });
+
+  // Expanding is a local reading choice, so it does not go through render(): a re-render
+  // would scroll the thread back and lose the reader's place mid-paragraph.
+  $$("[data-more]").forEach((b) => {
+    b.addEventListener("click", () => {
+      const index = Number(b.dataset.more);
+      const turn = b.closest(".turn");
+      const said = turn.querySelector(".said");
+      if (chatOpen.has(index)) {
+        chatOpen.delete(index);
+        said.classList.add("gist");
+        turn.classList.remove("open");
+        b.childNodes[0].nodeValue = "Show the rest ";
+      } else {
+        chatOpen.add(index);
+        said.classList.remove("gist");
+        turn.classList.add("open");
+        b.childNodes[0].nodeValue = "Show less ";
+      }
     });
   });
 
@@ -1225,13 +1338,24 @@ function wireChat() {
       ev.preventDefault();
       const name = $("#chat-new-topic").value.trim();
       if (!name) return;
-      // Nothing is written yet. A topic becomes a file when somebody says something in
-      // it, so naming one and walking away leaves no empty conversation behind for the
-      // next person to wonder about.
+      // Nothing is written yet: a topic becomes a file when somebody says something in
+      // it, so naming one and walking away leaves no empty conversation behind.
       chatTopic = name;
+      chatOpen.clear();
       await render();
       const box = $("#chat-input");
       if (box) box.focus();
+    });
+  }
+
+  const input = $("#chat-input");
+  if (input) {
+    // Grow with the message. A one-line box for a paragraph is how people end up sending
+    // three fragments instead of one thought.
+    const grow = () => { input.style.height = "auto"; input.style.height = `${Math.min(input.scrollHeight, 160)}px`; };
+    input.addEventListener("input", grow);
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("#chat-say").requestSubmit(); }
     });
   }
 
@@ -1239,28 +1363,27 @@ function wireChat() {
   if (form) {
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
-      const input = $("#chat-input");
-      const said = input.value.trim();
+      const box = $("#chat-input");
+      const said = box.value.trim();
       if (!said) return;
       const msg = $("#chat-msg");
       msg.textContent = "";
-      input.disabled = true;
+      box.disabled = true;
       try {
         await api(`/api/conversations/${encodeURIComponent(chatTopic)}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ said }),
         });
-        input.value = "";
+        box.value = "";
         await render();
       } catch (err) {
         // Say what went wrong. A message the operator believes was sent, and was not, is
         // the worst outcome here.
         msg.textContent = String(err.message || err).slice(0, 200);
       } finally {
-        input.disabled = false;
         const back = $("#chat-input");
-        if (back) back.focus();
+        if (back) { back.disabled = false; back.focus(); }
       }
     });
   }
@@ -1268,9 +1391,6 @@ function wireChat() {
   const turns = $("#turns");
   if (turns) turns.scrollTop = turns.scrollHeight;
 
-  // Poll while the page is open. Honest answer for a localhost dashboard reading files
-  // off disk: a websocket would need a second channel of its own, and Syncthing's own
-  // latency is seconds anyway. Cleared whenever the page changes so it cannot pile up.
   clearInterval(chatTimer);
   if (current === "chat") {
     chatTimer = setInterval(() => {
@@ -1306,12 +1426,58 @@ $$("#nav-main button, #nav-system button").forEach((b) => {
   });
 });
 
+$("#project").addEventListener("change", async (ev) => {
+  state.project = ev.target.value;
+  // Everything on screen belongs to the old project, so refetch rather than re-render.
+  state.tasks = [];
+  state.roster = [];
+  chatTopic = null;
+  await refresh();
+});
+
 let searchTimer;
 $("#search").addEventListener("input", (e) => {
   state.filter = e.target.value.trim().toLowerCase();
   clearTimeout(searchTimer);
   searchTimer = setTimeout(render, 140);
 });
+
+/* The project picker.
+ *
+ * Seven read endpoints have accepted `?project=` since they were written, and the page
+ * never sent it - so a dashboard that could read the whole fleet only ever showed the one
+ * channel it happened to be launched in.
+ *
+ * The list comes from the same discovery the Fleet tab uses: a sibling directory is a
+ * project exactly when it has a channel on disk. That means it finds what sits BESIDE the
+ * launch directory, which is why a fleet kept one level down needs `ferry dashboard
+ * --comms <dir>` to be seen at all. */
+function renderProjects() {
+  const select = $("#project");
+  if (!select) return;
+  const options = state.projects.length ? state.projects : (state.project ? [state.project] : []);
+  const current = state.project || state.homeProject || "";
+  select.innerHTML = options
+    .map((id) => `<option value="${esc(id)}"${id === current ? " selected" : ""}>${esc(id)}</option>`)
+    .join("");
+  // One project is not a choice; showing a dropdown implies there is somewhere else to go.
+  select.disabled = options.length < 2;
+}
+
+async function loadProjects() {
+  try {
+    const fleet = await api("/api/fleet");
+    const ids = (fleet.projects || [])
+      .map((p) => p.project_id)
+      .filter(Boolean);
+    if (state.homeProject && !ids.includes(state.homeProject)) ids.push(state.homeProject);
+    ids.sort();
+    state.projects = ids;
+  } catch (_) {
+    state.projects = state.homeProject ? [state.homeProject] : [];
+  }
+  renderProjects();
+}
 
 function setSync(tone, text) {
   const dot = $("#sync-dot");
@@ -1325,7 +1491,9 @@ async function refresh() {
   if (tasks.status === "fulfilled") {
     const d = tasks.value;
     state.tasks = Array.isArray(d) ? d : (d.tasks || []);
-    state.project = (Array.isArray(d) ? null : d.project) || state.project;
+    const reported = (Array.isArray(d) ? null : d.project) || null;
+    if (reported && !state.homeProject) state.homeProject = reported;
+    if (!state.project) state.project = reported;
   }
   if (roster.status === "fulfilled") {
     const d = roster.value;
@@ -1336,7 +1504,7 @@ async function refresh() {
   $("#count-review").textContent = state.tasks.filter(
     (t) => stateOf(t).word === "AwaitingReview").length;
   $("#count-agents").textContent = state.roster.length;
-  $("#project").textContent = state.project;
+  renderProjects();
 
   // The indicator reports what this page can see, not what Syncthing thinks.
   // A dashboard that says "healthy" while its own reads are failing is worse
@@ -1367,6 +1535,7 @@ async function boot() {
       $("#me-avatar").textContent = state.me.slice(0, 2).toUpperCase();
       showApp();
       await refresh();
+      await loadProjects();
       return;
     } catch (_) {
       sessionToken = null;
