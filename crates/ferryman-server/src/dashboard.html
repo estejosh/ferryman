@@ -185,6 +185,69 @@ textarea.notes:focus{border-color:var(--accent-dim)}
 #login .alt{margin-top:14px;text-align:center;font-size:13px;color:var(--dim)}
 #login .alt button{background:none;border:0;color:var(--accent);cursor:pointer;padding:0}
 
+/* ---------- chat ---------- */
+.main.chat-active{padding:0;overflow:hidden}
+.chat{display:grid;grid-template-columns:236px 1fr;height:100%;min-height:0}
+.chat-side{
+  border-right:1px solid var(--line);background:var(--panel);display:flex;flex-direction:column;min-width:0
+}
+.chat-side-head{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:12px 14px;border-bottom:1px solid var(--line);font-weight:600;font-size:13px
+}
+.chat-new-box{padding:8px 12px;border-bottom:1px solid var(--line)}
+.chat-new-box input{
+  width:100%;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);
+  padding:6px 10px;color:var(--text);outline:none;font-size:13px
+}
+.chat-new-box input:focus{border-color:var(--accent-dim)}
+.chat-list{flex:1;overflow-y:auto;padding:8px}
+.chat-row{
+  display:flex;flex-direction:column;gap:2px;width:100%;text-align:left;
+  background:none;border:1px solid transparent;border-radius:var(--radius);
+  padding:8px 10px;cursor:pointer;color:var(--dim)
+}
+.chat-row:hover{background:var(--panel-2);color:var(--text)}
+.chat-row.active{background:var(--panel-2);border-color:var(--line-2);color:var(--text)}
+.chat-row-name{font-weight:500;letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-row-meta{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--faint)}
+.chat-sigdot{width:7px;height:7px;border-radius:50%;background:var(--line-2);flex:none}
+.chat-sigdot.good{background:var(--good)}
+.chat-sigdot.warn{background:var(--warn)}
+.chat-sigdot.bad{background:var(--bad)}
+.chat-main{display:flex;flex-direction:column;min-width:0;min-height:0}
+.chat-head{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel)
+}
+.chat-title{font-weight:600;letter-spacing:-.01em;font-size:15px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-thread{flex:1;overflow-y:auto;padding:18px}
+.msg{display:flex;gap:11px;margin-bottom:14px;max-width:72ch}
+.msg.mine{background:color-mix(in srgb,var(--accent) 7%,transparent);border-radius:var(--radius);padding:10px 12px}
+.msg-avatar{
+  width:30px;height:30px;border-radius:50%;color:#fff;flex:none;
+  display:grid;place-items:center;font-size:12px;font-weight:600
+}
+.msg-body{min-width:0}
+.msg-meta{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+.msg-who{font-weight:600;font-size:13px}
+.msg-time{color:var(--faint);font-size:11.5px;white-space:nowrap}
+.msg-said{color:var(--text);white-space:pre-wrap;word-break:break-word;font-size:14px}
+.chat-compose{
+  display:flex;align-items:flex-end;gap:10px;padding:12px 18px;
+  border-top:1px solid var(--line);background:var(--panel)
+}
+.chat-compose textarea{
+  flex:1;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--radius);
+  padding:9px 12px;color:var(--text);outline:none;resize:none;min-height:40px;max-height:160px
+}
+.chat-compose textarea:focus{border-color:var(--accent-dim)}
+.chat-err{align-self:center;color:var(--bad);font-size:12.5px;max-width:40%}
+@media (max-width:860px){
+  .chat{grid-template-columns:1fr}
+  .chat-side{display:none}
+}
+
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 @media (max-width:860px){
@@ -233,6 +296,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
   <nav class="side">
     <div class="nav" id="nav-main">
       <button data-page="home" aria-current="page">Home</button>
+      <button data-page="chat">Chat</button>
       <button data-page="tasks">Tasks <span class="pill num" id="count-tasks">0</span></button>
       <button data-page="review">Needs review <span class="pill num" id="count-review">0</span></button>
       <button data-page="agents">Agents <span class="pill num" id="count-agents">0</span></button>
@@ -267,10 +331,15 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
-const state = { me: null, project: "—", tasks: [], roster: [], team: null, filter: "" };
+const state = { me: null, token: null, project: "—", tasks: [], roster: [], team: null, filter: "" };
 
 async function api(path, opts) {
-  const res = await fetch(path, { credentials: "same-origin", ...opts });
+  // The session token lives only in this tab's memory, never on disk and never in a
+  // cookie. Every authenticated read and write sends it as a header; without this the
+  // dashboard could not even read the fleet after signing in.
+  const headers = { ...(opts?.headers || {}) };
+  if (state.token) headers["x-ferryman-dashboard-token"] = state.token;
+  const res = await fetch(path, { credentials: "same-origin", ...opts, headers });
   if (res.status === 401) { showLogin(); throw new Error("not signed in"); }
   if (!res.ok) throw new Error((await res.text()) || `${res.status} on ${path}`);
   return res.status === 204 ? null : res.json();
@@ -290,12 +359,20 @@ function stateOf(task) {
   return { word, raw, tone };
 }
 
-// A signature is the one thing on this page that must never be softened: a
-// result that does not verify is reported as such, not quietly styled as fine.
-function sigBadge(sig) {
+// A signature tone shared by every surface, so "valid" is always quiet-green and
+// "invalid"/"key_changed" is always loud-red. A signature is the one thing on this page
+// that must never be softened: a result that does not verify is reported as such, never
+// quietly styled as fine. The channel reports these lowercase; this maps them to a look.
+function sigTone(sig) {
   if (!sig) return "";
-  const ok = sig === "Valid";
-  const tone = ok ? "good" : (sig === "Unsigned" ? "warn" : "bad");
+  if (sig === "valid") return "good";
+  if (sig === "unsigned") return "warn";
+  return "bad";
+}
+
+function sigBadge(sig) {
+  const tone = sigTone(sig);
+  if (!tone) return "";
   return `<span class="badge ${tone}">${esc(sig)}</span>`;
 }
 
@@ -346,14 +423,29 @@ $("#auth-form").addEventListener("submit", async (ev) => {
   msg.textContent = "";
   $("#auth-submit").disabled = true;
   try {
-    await api(creating ? "/api/auth/create" : "/api/auth/login", {
+    const res = await api(creating ? "/api/auth/create" : "/api/auth/login", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ name, password }),
     });
-    $("#auth-password").value = "";
-    showApp();
-    await boot();
+    if (creating) {
+      // Creating an identity mints the key but does not start a session. Flip back to
+      // sign-in and say so, rather than showing the app and bouncing on the first
+      // authenticated read.
+      creating = false;
+      $("#auth-title").textContent = "Sign in";
+      $("#auth-submit").textContent = "Sign in";
+      $("#auth-alt-text").textContent = "No identity on this machine yet?";
+      $("#auth-toggle").textContent = "Create one";
+      $("#auth-password").setAttribute("autocomplete", "current-password");
+      $("#auth-password").value = "";
+      msg.textContent = "Identity created. Sign in to continue.";
+    } else {
+      state.token = res.token;
+      $("#auth-password").value = "";
+      showApp();
+      await boot();
+    }
   } catch (err) {
     // Say what went wrong. "Something went wrong" teaches the operator nothing
     // and makes a wrong password indistinguishable from a broken server.
@@ -366,6 +458,7 @@ $("#auth-form").addEventListener("submit", async (ev) => {
 $("#signout").addEventListener("click", async () => {
   try { await api("/api/auth/logout", { method: "POST" }); } catch (_) {}
   state.me = null;
+  state.token = null;
   showLogin();
 });
 
@@ -494,7 +587,7 @@ pages.home = async () => {
   const counts = tasks.reduce((acc, t) => {
     acc[stateOf(t).word] = (acc[stateOf(t).word] || 0) + 1; return acc;
   }, {});
-  const unverified = tasks.filter((t) => t.sig && t.sig !== "Valid").length;
+  const unverified = tasks.filter((t) => t.sig && t.sig !== "valid").length;
   const working = (counts.Claimed || 0);
   const waiting = (counts.AwaitingReview || 0) + (counts.ChangesRequested || 0);
   const open = (counts.Open || 0) + (counts.Offered || 0);
@@ -728,6 +821,202 @@ pages.vault = async () => `
     credential has to be rotated too. That limit is part of the design rather than a gap in it.
   </p>`;
 
+/* ---------- chat ---------- */
+
+const chat = { topic: null, conversations: [], stick: true };
+
+function chatActive() { return current === "chat" && !!state.me; }
+
+pages.chat = async () => `
+  <div class="chat" id="chat-root">
+    <aside class="chat-side">
+      <div class="chat-side-head">
+        <span>Conversations</span>
+        <button class="linkbtn" id="chat-new" type="button">+ New</button>
+      </div>
+      <div class="chat-new-box" id="chat-new-box" hidden>
+        <input id="chat-new-name" placeholder="Conversation name" aria-label="Conversation name">
+      </div>
+      <div class="chat-list" id="chat-list"></div>
+    </aside>
+    <section class="chat-main">
+      <header class="chat-head">
+        <div class="chat-title" id="chat-title">No conversation selected</div>
+        <div id="chat-sig"></div>
+      </header>
+      <div class="chat-thread" id="chat-thread"></div>
+      <form class="chat-compose" id="chat-compose">
+        <textarea id="chat-input" rows="1" placeholder="Message the fleet…" aria-label="Message"></textarea>
+        <button class="btn primary" type="submit">Send</button>
+        <span class="chat-err" id="chat-err" role="status"></span>
+      </form>
+    </section>
+  </div>`;
+
+function avatarHue(name) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  return h;
+}
+
+// A conversation's signature is one signature over the whole file, not one per turn. So
+// the indicator lives on the topic and the thread header, not on every message.
+function chatSigHtml(sig, turnCount) {
+  if (sig === "invalid" || sig === "key_changed") {
+    return `<span class="badge bad">${esc(sig)}</span>`;
+  }
+  if (sig === "unknown") return `<span class="badge bad">unknown signer</span>`;
+  if (sig === "unsigned") return turnCount ? `<span class="badge warn">unsigned</span>` : "";
+  if (sig === "valid") {
+    return `<span class="badge" style="color:var(--faint);border-color:var(--line-2)">signed</span>`;
+  }
+  return "";
+}
+
+function turnHtml(t) {
+  const mine = t.who === state.me;
+  const hue = avatarHue(t.who);
+  return `
+    <div class="msg${mine ? " mine" : ""}">
+      <span class="msg-avatar" style="background:hsl(${hue} 42% 38%)">${esc((t.who || "?").slice(0, 1).toUpperCase())}</span>
+      <div class="msg-body">
+        <div class="msg-meta">
+          <span class="msg-who">${esc(t.who)}</span>
+          <span class="msg-time">${esc(t.at || "")}</span>
+        </div>
+        <div class="msg-said">${esc(t.said)}</div>
+      </div>
+    </div>`;
+}
+
+function chatListRow(c) {
+  const tone = sigTone(c.sig);
+  const dot = tone ? `<span class="chat-sigdot ${tone}" title="${esc(c.sig)}"></span>` : "";
+  const active = c.topic === chat.topic ? " active" : "";
+  return `
+    <button class="chat-row${active}" data-topic="${esc(c.topic)}" type="button">
+      <span class="chat-row-name">${esc(c.topic)}</span>
+      <span class="chat-row-meta">${esc(c.last_at ? ago(c.last_at) : "")}${dot}</span>
+    </button>`;
+}
+
+
+function renderThread(d) {
+  const sig = d.sig || "";
+  const turns = d.turns || [];
+  $("#chat-title").textContent = d.topic ? d.topic : "No conversation selected";
+  $("#chat-sig").innerHTML = chatSigHtml(sig, turns.length);
+  const loud = (sig === "invalid" || sig === "key_changed")
+    ? `<div class="notice"><b>Signature does not verify</b><div>This conversation cannot be trusted as signed. Shown as it is.</div></div>`
+    : "";
+  const empty = d.topic
+    ? `<div class="empty">Nothing here yet. Say something.</div>`
+    : `<div class="empty">Pick a conversation on the left, or start one with + New.</div>`;
+  $("#chat-thread").innerHTML = loud + (turns.length ? turns.map(turnHtml).join("") : empty);
+  if (chat.stick) {
+    const el = $("#chat-thread");
+    el.scrollTop = el.scrollHeight;
+  }
+}
+
+async function chatTick() {
+  if (!chatActive()) return;
+  try {
+    chat.conversations = await api("/api/conversations");
+  } catch (_) {
+    chat.conversations = [];
+  }
+  const list = $("#chat-list");
+  if (list) {
+    list.innerHTML = chat.conversations.length
+      ? chat.conversations.map(chatListRow).join("")
+      : `<div class="empty" style="padding:24px 12px">No conversations yet. Use + New to start one.</div>`;
+  }
+  // Default to the most recent conversation, which the server already sorts first.
+  if (!chat.topic && chat.conversations.length) chat.topic = chat.conversations[0].topic;
+  if (chat.topic) {
+    try {
+      const d = await api(`/api/conversations/${encodeURIComponent(chat.topic)}`);
+      renderThread(d);
+    } catch (err) {
+      $("#chat-sig").innerHTML = `<span class="badge bad">unreadable</span>`;
+      $("#chat-thread").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+    }
+  } else {
+    renderThread({ topic: null, sig: "", turns: [] });
+  }
+}
+
+async function chatSend() {
+  const input = $("#chat-input");
+  const text = input.value.trim();
+  const err = $("#chat-err");
+  err.textContent = "";
+  if (!text) return;
+  if (!chat.topic) {
+    err.textContent = "Choose or create a conversation first.";
+    return;
+  }
+  const btn = $("#chat-compose button[type=submit]");
+  btn.disabled = true;
+  try {
+    const d = await api(`/api/conversations/${encodeURIComponent(chat.topic)}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    input.value = "";
+    chat.topic = d.topic; // adopt the slug the channel actually filed it under
+    await chatTick();
+  } catch (e) {
+    err.textContent = String(e.message || e).slice(0, 160);
+  } finally {
+    btn.disabled = false;
+    input.focus();
+  }
+}
+
+async function chatMount() {
+  $("#main").innerHTML = await pages.chat();
+  const thread = $("#chat-thread");
+  thread.addEventListener("scroll", () => {
+    chat.stick = thread.scrollHeight - thread.scrollTop - thread.clientHeight < 120;
+  });
+
+  const form = $("#chat-compose");
+  form.addEventListener("submit", (ev) => { ev.preventDefault(); chatSend(); });
+  const input = $("#chat-input");
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); chatSend(); }
+  });
+
+  $("#chat-new").addEventListener("click", () => {
+    const box = $("#chat-new-box");
+    box.hidden = !box.hidden;
+    if (!box.hidden) $("#chat-new-name").focus();
+  });
+  $("#chat-new-name").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      const name = $("#chat-new-name").value.trim();
+      if (!name) return;
+      chat.topic = name; // slugged by the server on first send
+      $("#chat-new-box").hidden = true;
+      $("#chat-new-name").value = "";
+      $("#chat-input").focus();
+      chatTick();
+    }
+  });
+
+  $("#chat-list").addEventListener("click", (ev) => {
+    const row = ev.target.closest("[data-topic]");
+    if (row) { chat.topic = row.dataset.topic; chat.stick = true; chatTick(); }
+  });
+
+  await chatTick();
+}
+
+
 /* ---------- routing and refresh ---------- */
 
 let current = "home";
@@ -735,8 +1024,18 @@ let current = "home";
 async function render() {
   const main = $("#main");
   try {
-    main.innerHTML = await pages[current]();
+    if (current === "chat") {
+      // The chat page manages its own DOM in place, so a periodic refresh does not
+      // rebuild it and lose the composer text or scroll position.
+      main.classList.add("chat-active");
+      if ($("#chat-root")) await chatTick();
+      else await chatMount();
+    } else {
+      main.classList.remove("chat-active");
+      main.innerHTML = await pages[current]();
+    }
   } catch (err) {
+    main.classList.remove("chat-active");
     main.innerHTML = `<div class="head"><div><h1>${esc(current)}</h1></div></div>
       <div class="notice"><b>Could not load</b><div>${esc(err.message)}</div></div>`;
   }
@@ -808,6 +1107,12 @@ async function boot() {
 // Poll gently. The channel is files on disk; hammering it buys nothing and
 // makes the log unreadable.
 setInterval(() => { if (state.me) refresh().catch(() => {}); }, 20000);
+
+// Chat polls faster than the rest of the dashboard because a message that has just
+// arrived should show up while the tab is open, and three seconds is still a gentle read
+// of a handful of files on loopback. WebSockets would be the wrong answer here: there is
+// no server holding state to push from, only files on disk.
+setInterval(() => { if (chatActive()) chatTick().catch(() => {}); }, 3000);
 
 boot().catch(() => showLogin());</script>
 </body>

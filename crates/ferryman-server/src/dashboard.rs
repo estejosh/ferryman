@@ -323,6 +323,11 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/fleet", get(fleet))
         .route("/api/memory", get(memory))
         .route("/api/memory/suggest", post(suggest))
+        .route("/api/conversations", get(conversations))
+        .route(
+            "/api/conversations/{topic}",
+            get(conversation).post(conversation_append),
+        )
         .route("/api/secrets", get(secrets_list))
         .route("/api/secrets", post(secret_set))
         .route("/api/secrets/{name}", delete(secret_remove))
@@ -1004,6 +1009,143 @@ async fn suggest(
     Ok(StatusCode::CREATED)
 }
 
+/// Normalise a topic to the slug the channel files conversations under.
+///
+/// [`ferryman_channel::conversation::conversation_path`] already slugs whatever it is given,
+/// so a traversal-shaped topic can never escape the conversations directory - the slug is
+/// alphanumerics and dashes only. Slugging here first makes the handler speak the same name
+/// the files use: a request for "My Project" and the file `my-project.md` resolve to one
+/// conversation rather than two.
+fn conversation_topic(topic: &str) -> Result<String, DashboardError> {
+    let slug = ferryman_channel::memory::slugify(topic);
+    if slug.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "conversation name is empty".to_string(),
+        ));
+    }
+    Ok(slug)
+}
+
+/// GET /api/conversations — the topics that have a conversation, newest activity first,
+/// with the signature status of each whole file.
+async fn conversations(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Vec<Value>>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let bank = ferryman_channel::memory::memory_bank_dir(&route);
+    let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+    let mut items = ferryman_channel::conversation::list_conversations(&bank)
+        .into_iter()
+        .map(|topic| {
+            let check = ferryman_channel::conversation::verify_conversation(&bank, &topic, &roster);
+            let text = ferryman_channel::conversation::load_conversation(&bank, &topic)
+                .unwrap_or_default();
+            let turns = ferryman_channel::conversation::parse_turns(&text);
+            let last_at = turns.last().map(|turn| turn.at.clone());
+            json!({
+                "topic": topic,
+                "sig": sig(&check),
+                "turns": turns.len(),
+                "last_at": last_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    // The topic a person just spoke in goes to the top, not the oldest.
+    items.sort_by(|a, b| {
+        let a = a["last_at"].as_str().unwrap_or("");
+        let b = b["last_at"].as_str().unwrap_or("");
+        b.cmp(a)
+    });
+    Ok(Json(items))
+}
+
+/// GET /api/conversations/{topic} — one conversation's turns, with the whole file's
+/// signature status. Returns an empty thread for a topic that has no file yet.
+async fn conversation(
+    State(state): State<DashboardState>,
+    Path(topic): Path<String>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let topic = conversation_topic(&topic)?;
+    let route = state.route_for(params.project.as_deref());
+    let bank = ferryman_channel::memory::memory_bank_dir(&route);
+    let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+    let check = ferryman_channel::conversation::verify_conversation(&bank, &topic, &roster);
+    let text = ferryman_channel::conversation::load_conversation(&bank, &topic).unwrap_or_default();
+    let turns = ferryman_channel::conversation::parse_turns(&text)
+        .into_iter()
+        .map(|turn| {
+            json!({
+                "at": turn.at,
+                "who": turn.who,
+                "said": turn.said,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "topic": topic,
+        "sig": sig(&check),
+        "turns": turns,
+    })))
+}
+
+/// POST /api/conversations/{topic} — append a turn, signed by the session's operator.
+///
+/// This is the dashboard half of "the dashboard is a view of the channel, not a second
+/// channel": what is typed here goes through the exact same [`append_turn`] the Telegram
+/// bridge calls, into the same file, under the same operator identity, so afterwards the
+/// two surfaces are indistinguishable.
+#[derive(Deserialize)]
+struct ConversationBody {
+    text: String,
+}
+
+async fn conversation_append(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(topic): Path<String>,
+    Json(body): Json<ConversationBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    // Signed by the human who signed in - the same identity the bridge signs with, and the
+    // same one this dashboard uses for reviews and secrets - never unsigned, never a
+    // machine's key.
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let topic = conversation_topic(&topic)?;
+    let text = body.text.trim().to_string();
+    if text.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "message is empty".to_string()));
+    }
+    // Bounded for the same reason a suggestion is: this file replicates to every machine
+    // in the fleet, so one message must stay small and the whole conversation stays
+    // readable in a prompt.
+    const MAX_TURN: usize = 4096;
+    if text.len() > MAX_TURN {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("a message is at most {MAX_TURN} characters"),
+        ));
+    }
+    let bank = ferryman_channel::memory::memory_bank_dir(&state.route);
+    let who = identity.name().to_string();
+    ferryman_channel::conversation::append_turn(&bank, &topic, &who, &text, &identity)
+        .map_err(|e| internal(e.into()))?;
+    let roster =
+        ferryman_channel::read_agent_roster(&state.route.communications).unwrap_or_default();
+    let check = ferryman_channel::conversation::verify_conversation(&bank, &topic, &roster);
+    Ok(Json(json!({
+        "topic": topic,
+        "sig": sig(&check),
+    })))
+}
+
 /// GET /api/secrets — the stored secrets, never their values. Enough for the
 /// form to list what exists and what setting a name again would overwrite.
 async fn secrets_list(
@@ -1532,6 +1674,8 @@ mod tests {
             "/api/roster",
             "/api/fleet",
             "/api/memory",
+            "/api/conversations",
+            "/api/conversations/shop",
             "/api/cost/rates",
         ] {
             let response = app
@@ -1552,6 +1696,7 @@ mod tests {
         for (path, body) in [
             ("/api/tasks/task-1/review", r#"{"accept":true}"#),
             ("/api/memory/suggest", r#"{"text":"anonymous"}"#),
+            ("/api/conversations/shop", r#"{"text":"anonymous"}"#),
             ("/api/cost/plan", r#"{"goal":"x"}"#),
         ] {
             let response = post(&app, path, body, None).await;
@@ -1706,6 +1851,56 @@ mod tests {
         assert_eq!(tasks[0]["result_count"], 0);
         assert_eq!(tasks[0]["state"]["status"], "claimed");
         assert_eq!(tasks[0]["state"]["by"], "alice");
+    }
+
+    /// A turn typed in the dashboard lands in the same signed conversation file the
+    /// Telegram bridge writes, under the operator's identity, and reads back as valid.
+    #[tokio::test]
+    async fn a_typed_turn_lands_in_the_signed_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let state = state(&route, false);
+        // Publish the operator's key to the roster so the conversation verifies, exactly
+        // as `ferry enable --dashboard` does on a real setup.
+        let identity = crate::operators::create_operator_identity_in(
+            &route,
+            &state.operators,
+            "alice",
+            "hunter2-secret",
+        )
+        .unwrap();
+        let token = state.sessions.insert(identity);
+        let app = router(state);
+
+        let written = post(
+            &app,
+            "/api/conversations/Shop",
+            r#"{"text":"get the shop ready for daily players"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(written.status(), StatusCode::OK);
+
+        let read = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/conversations/shop")
+                    .header("x-ferryman-dashboard-token", &token)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.status(), StatusCode::OK);
+        let body = read.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["topic"], "shop");
+        assert_eq!(value["sig"], "valid");
+        let turns = value["turns"].as_array().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0]["who"], "alice");
+        assert_eq!(turns[0]["said"], "get the shop ready for daily players");
     }
 
     /// The cases a prefix test gets wrong.

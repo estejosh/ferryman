@@ -29,6 +29,7 @@
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use fs2::FileExt;
 use sha2::{Digest, Sha256};
 
 use crate::memory::{ProfileAttestation, slugify};
@@ -72,6 +73,35 @@ fn one_line(said: &str) -> String {
     said.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Serialize appends to one conversation on the local filesystem.
+///
+/// Two surfaces write this file through the same [`append_turn`] - the Telegram bridge and
+/// the dashboard - and they can run as two processes on one machine. `append` itself is
+/// one atomic write, but the read-back-and-resign that follows it is not: two writers can
+/// each read a different snapshot of the file and write a sidecar that no longer matches
+/// what is on disk. The bridge never met this because it is a single-threaded loop; the
+/// dashboard is a multi-threaded server, so the lock is load-bearing now.
+///
+/// The lock lives beside the conversations, not in the non-synced attachment: [`append_turn`]
+/// is given a bank, not a route, and a lock file is an empty, never-written marker that is
+/// invisible to every reader that lists `*.md`. It serialises writers on one filesystem,
+/// which is all a lock can do - it does not (and cannot) coordinate two machines that each
+/// hold their own copy of a Syncthing folder. The cross-machine rule is the one the whole
+/// channel already relies on: one writer per path, which here means the operator writes a
+/// conversation from one machine at a time.
+fn conversation_lock(bank: &Path) -> std::io::Result<std::fs::File> {
+    let dir = conversations_dir(bank);
+    std::fs::create_dir_all(&dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".append.lock"))?;
+    file.lock_exclusive()?;
+    Ok(file)
+}
+
 /// Add a turn and re-sign, in that order.
 ///
 /// The identity is required rather than optional, for the reason `append_agent_profile`
@@ -84,6 +114,7 @@ pub fn append_turn(
     said: &str,
     identity: &AgentIdentity,
 ) -> std::io::Result<()> {
+    let _lock = conversation_lock(bank)?;
     let path = conversation_path(bank, topic);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -194,6 +225,61 @@ pub fn recent_turns(
     (tail, check)
 }
 
+/// The topics that have a conversation, as their slugs.
+///
+/// The channel keeps a topic's name only as the slug it files under, because
+/// [`conversation_path`] derives the filename from the topic and nothing stores the
+/// original spelling. A dashboard listing conversations therefore shows slugs - the only
+/// name the channel preserves - which are still the names a person gave their topics,
+/// lowercased and dashed.
+#[must_use]
+pub fn list_conversations(bank: &Path) -> Vec<String> {
+    let dir = conversations_dir(bank);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut topics = entries
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("md"))
+        .filter_map(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_string)
+        })
+        .collect::<Vec<_>>();
+    topics.sort();
+    topics
+}
+
+/// One turn, parsed back out of the file it is stored in. Kept public so the dashboard
+/// renders turns without knowing the line format; [`append_turn`] owns that format and the
+/// dashboard should not have a second copy of it to drift out of step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurn {
+    pub at: String,
+    pub who: String,
+    pub said: String,
+}
+
+/// Parse the turn lines out of a conversation file's text. Lines that do not look like a
+/// turn are skipped, so an empty or foreign file yields no turns rather than a failure.
+#[must_use]
+pub fn parse_turns(text: &str) -> Vec<ConversationTurn> {
+    text.lines().filter_map(parse_turn).collect()
+}
+
+fn parse_turn(line: &str) -> Option<ConversationTurn> {
+    let rest = line.trim_start().strip_prefix("- ")?;
+    let (at, rest) = rest.split_once(" **")?;
+    let (who, said) = rest.split_once("**: ")?;
+    Some(ConversationTurn {
+        at: at.to_string(),
+        who: who.to_string(),
+        said: said.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,5 +376,38 @@ mod tests {
             verify_conversation(&bank, "Shop", &roster),
             SignatureCheck::Invalid
         ));
+    }
+
+    #[test]
+    fn turns_parse_back_out_of_a_written_file() {
+        let text = "- 2026-08-20T21:30Z **the operator**: get the shop ready\n\
+                    - 2026-08-20T21:35Z **you**: which machine holds the shop?\n\
+                    - 2026-08-20T21:40Z **the operator**: the shop is on the other machine\n";
+        let turns = parse_turns(text);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].who, "the operator");
+        assert_eq!(turns[0].said, "get the shop ready");
+        assert_eq!(turns[1].who, "you");
+        assert_eq!(turns[1].at, "2026-08-20T21:35Z");
+        assert_eq!(turns[2].said, "the shop is on the other machine");
+    }
+
+    #[test]
+    fn a_turn_can_contain_a_colon_without_breaking_the_parse() {
+        let text = "- 2026-08-20T21:40Z **the operator**: run: the tests, all of them\n";
+        let turns = parse_turns(text);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].said, "run: the tests, all of them");
+    }
+
+    #[test]
+    fn listing_conversations_returns_slugs_and_ignores_sidecars() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let bank = tmp.path().join("memory-bank");
+        let id = identity(tmp.path(), "telegram");
+        append_turn(&bank, "Shop", "the operator", "hello", &id).expect("append");
+        append_turn(&bank, "My Project", "the operator", "hi", &id).expect("append");
+        let topics = list_conversations(&bank);
+        assert_eq!(topics, vec!["my-project", "shop"]);
     }
 }
