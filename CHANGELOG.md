@@ -19,6 +19,17 @@
   This also makes true the sentence ADR 0015 wrongly claimed was already true
   about the encryption key. The first-run flow and the recovery phrase are a
   separate change; this one is the crypto underneath them.
+- **The first thirty seconds: an identity and a recovery phrase.** `ferry enable`
+  at a terminal now creates the operator seed on first run, shows it once as a
+  BIP-39 English recovery phrase (24 words), and prints one operator fingerprint
+  to verify out of band - one value per person instead of one per agent per
+  project. An existing seed is used silently and never re-displayed. `ferry
+  identity show` prints that fingerprint and which agent identities on the
+  machine derive from the seed; `ferry identity recover` restores the seed from
+  the phrase onto a new machine, and with `--force` onto one that already holds a
+  seed, moving the old seed aside rather than deleting it. The seed bytes and the
+  phrase never reach a log line, a result payload, or the channel, and
+  `*.seed`/`operator.seed` are excluded from the channel's `.stignore`.
 - **`ferry-deadman`, a sub-product, at `crates/ferry-deadman`.** Timelocked
   succession for any git repository: seal an archive to a future drand beacon
   round, and it cannot be opened early by anyone, including whoever sealed it.

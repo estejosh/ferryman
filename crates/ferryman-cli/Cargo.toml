@@ -27,6 +27,14 @@ rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# BIP-39 English recovery phrases, 24 words for 32 seed bytes. Chosen over the
+# heavier `bip39` (rust-bitcoin) crate because Ferryman only needs the
+# entropy<->phrase round-trip and never the PBKDF2-to-HD-seed step; `tiny-bip39`
+# is the small, maintained fork of the vetted `bip39` 0.6 with the same word
+# list and the same validation, default-features off so it compiles English
+# only and skips the RNG helpers we do not use. Its library target is named
+# `bip39`, hence the `package = "tiny-bip39"` rename below.
+bip39 = { package = "tiny-bip39", version = "2.0.0", default-features = false }
 tokio.workspace = true
 toml.workspace = true
 uuid.workspace = true

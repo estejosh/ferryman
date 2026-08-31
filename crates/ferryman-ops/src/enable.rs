@@ -297,6 +297,8 @@ pub fn perform(request: Request) -> Result<Outcome> {
             "keys\n\
              *.tmp\n\
              *.key\n\
+             *.seed\n\
+             operator.seed\n\
              *.exe\n\
              *.dll\n\
              *.so\n\
@@ -619,6 +621,10 @@ mod tests {
         enable_in(&dir).unwrap();
         let ignore = fs::read_to_string(dir.join(".ferryman/ferryman/.stignore")).unwrap();
         assert!(ignore.lines().any(|line| line.trim() == "keys"));
+        // The seed never lands in the channel in the first place, but the one secret
+        // that has to survive gets belt-and-braces exclusions all the same.
+        assert!(ignore.lines().any(|line| line.trim() == "*.seed"));
+        assert!(ignore.lines().any(|line| line.trim() == "operator.seed"));
     }
 
     /// Enabling inside a git repository must put `.ferryman/` beyond git's reach.
