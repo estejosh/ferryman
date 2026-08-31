@@ -6168,13 +6168,31 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
             if route.agents.is_empty() {
                 println!("    nobody on the roster yet");
             }
+            // Widths from the data, not from a guess. A fleet with one long agent name
+            // otherwise turns the whole roster into ragged columns, and this text is
+            // meant to be pasted into a successor as its opening context.
+            let name_width = route
+                .agents
+                .iter()
+                .map(|agent| agent.name.chars().count())
+                .max()
+                .unwrap_or(0);
+            let role_width = route
+                .agents
+                .iter()
+                .map(|agent| agent.role.chars().count())
+                .max()
+                .unwrap_or(0);
             for agent in &route.agents {
                 let signing = if agent.public_key.is_some() {
                     "signs"
                 } else {
                     "unsigned"
                 };
-                println!("    {:<14} {:<14} {}", agent.name, agent.role, signing);
+                println!(
+                    "    {:name_width$} {:role_width$} {}",
+                    agent.name, agent.role, signing
+                );
             }
 
             // Work in flight, from the channel rather than from the brief, so a stale brief
@@ -6182,6 +6200,25 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
             println!();
             println!("  Work the channel is carrying");
             let tasks = ferryman_channel::list_tasks(&route)?;
+            let unfinished: Vec<_> = tasks
+                .iter()
+                .filter(|task| {
+                    !matches!(
+                        task.state(),
+                        ferryman_channel::TaskState::Accepted | ferryman_channel::TaskState::Done
+                    )
+                })
+                .collect();
+            let id_width = unfinished
+                .iter()
+                .map(|task| task.order.id.chars().count())
+                .max()
+                .unwrap_or(0);
+            let holder_width = unfinished
+                .iter()
+                .map(|task| task.holder().unwrap_or("-").chars().count())
+                .max()
+                .unwrap_or(0);
             let mut open = 0;
             for task in &tasks {
                 if matches!(
@@ -6192,7 +6229,7 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
                 }
                 open += 1;
                 println!(
-                    "    {:<14} {:<12} {:?}",
+                    "    {:id_width$} {:holder_width$} {:?}",
                     task.order.id,
                     task.holder().unwrap_or("-"),
                     task.state()
