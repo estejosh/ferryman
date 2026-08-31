@@ -31,6 +31,7 @@ pub mod master;
 pub mod memory;
 pub mod migration;
 pub mod portable_auth;
+pub mod release;
 pub mod secrets;
 pub mod seed;
 pub mod skills;

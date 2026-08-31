@@ -333,6 +333,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/learnings", get(learnings))
         .route("/api/roster", get(roster))
         .route("/api/fleet", get(fleet))
+        .route("/api/release", get(release))
+        .route("/api/release/{version}/approve", post(approve_release))
         .route("/api/conversations", get(conversations))
         .route("/api/conversations/{topic}", get(conversation).post(say))
         .route("/api/memory", get(memory))
@@ -377,12 +379,53 @@ fn is_loopback_host(host: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
-/// Reject requests whose `Host` header is not a loopback name/IP.
+/// Hostnames this dashboard will answer to besides loopback.
+///
+/// # Why this exists, and why it is a list rather than a switch
+///
+/// The bind stays loopback forever - that part is not negotiable and is not what this
+/// changes. What this admits is a proxy running ON THIS MACHINE that terminates a private
+/// tunnel and forwards to 127.0.0.1: `tailscale serve`, `cloudflared`, an SSH forward.
+/// Those all reach the dashboard over loopback exactly as a local browser does; the only
+/// thing that differs is the `Host` header they carry, which the guard was refusing.
+///
+/// So the operator names the hostname they set up. A blanket "allow any host" switch
+/// would re-open DNS rebinding - the entire attack this guard exists to stop - because
+/// rebinding works precisely by sending an attacker-controlled `Host` to a loopback
+/// listener. A name the operator typed cannot be one an attacker registered.
+///
+/// Set with `--allow-host`, repeatable, and empty by default.
+static ALLOWED_HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Name the hostnames a fronting proxy will send. Call before `serve`.
+pub fn allow_hosts(hosts: Vec<String>) {
+    let _ = ALLOWED_HOSTS.set(
+        hosts
+            .into_iter()
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect(),
+    );
+}
+
+fn host_is_allowed(host: &str) -> bool {
+    if is_loopback_host(host) {
+        return true;
+    }
+    ALLOWED_HOSTS.get().is_some_and(|allowed| {
+        allowed
+            .iter()
+            .any(|name| name == &host.to_ascii_lowercase())
+    })
+}
+
+/// Reject requests whose `Host` header is neither loopback nor a name the operator
+/// deliberately allowed.
 ///
 /// A raw loopback bind is not a defense against DNS rebinding: a browser can
 /// resolve `attacker.example` to 127.0.0.1 and reach the dashboard as
 /// "same-origin", reading the fleet and driving the write endpoints. Requiring
-/// a loopback `Host` blocks that. Requests with no `Host` at all (non-browser
+/// a known `Host` blocks that. Requests with no `Host` at all (non-browser
 /// clients such as `curl`) are allowed. Mirrors the bridge server's guard.
 async fn loopback_host_guard(
     request: axum::extract::Request,
@@ -398,7 +441,7 @@ async fn loopback_host_guard(
                 _ => raw,
             };
             let host = host.trim_start_matches('[').trim_end_matches(']');
-            is_loopback_host(host)
+            host_is_allowed(host)
         })
         .unwrap_or(true);
     if host_ok {
@@ -407,7 +450,8 @@ async fn loopback_host_guard(
         use axum::response::IntoResponse;
         (
             StatusCode::FORBIDDEN,
-            "host not allowed on loopback dashboard",
+            "this dashboard does not answer to that hostname. If you put a tunnel in \
+             front of it, name the hostname with --allow-host.",
         )
             .into_response()
     }
@@ -457,6 +501,28 @@ type DashboardError = (StatusCode, String);
 
 fn internal(error: Error) -> DashboardError {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
+/// The roster as it is on disk right now, not as it was when this process started.
+///
+/// # Why this is not a cache
+///
+/// `state.route` is a snapshot taken at boot. Verifying against it was fine until
+/// identities began being created *through* the dashboard: an operator who signed up two
+/// minutes ago is not in that snapshot, so their perfectly good signature came back
+/// `UnknownSigner` and the page told them their own approval was from an unknown signer.
+///
+/// That is the worst possible direction for this particular error. A badge that cries
+/// wolf about a valid signature does not make anyone safer - it teaches them the badge is
+/// noise, and the one time it means something they will click past it.
+///
+/// The roster is a handful of small files in a synced folder, and it changes while this
+/// process runs whether or not the process notices. So it is read when the question is
+/// asked. Falls back to the boot snapshot if the read fails, which is no worse than what
+/// it did before.
+fn roster_now(state: &DashboardState) -> Vec<ferryman_channel::AgentRoute> {
+    ferryman_channel::read_agent_roster(&state.route.communications)
+        .unwrap_or_else(|_| state.route.agents.clone())
 }
 
 fn sig(signature: &SignatureCheck) -> &'static str {
@@ -1440,6 +1506,133 @@ fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
         .collect())
 }
 
+/// GET /api/release — the release waiting for a person, if there is one.
+async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
+    let Some(request) = ferryman_channel::release::pending(&state.route) else {
+        return Ok(Json(json!({ "pending": null })));
+    };
+    let approved = ferryman_channel::release::list_approvals(&state.route)
+        .into_iter()
+        .find(|a| a.version == request.version);
+    let roster = roster_now(&state);
+    let now = chrono::Utc::now();
+    Ok(Json(json!({
+        "pending": {
+            "version": request.version,
+            "commit": request.commit,
+            "prepared_by": request.prepared_by,
+            "prepared_at": request.prepared_at.to_rfc3339(),
+            "age_minutes": request.age_minutes(now),
+            "stale": request.is_stale(now),
+            "ci_green": request.ci_green,
+            "ci_summary": request.ci_summary,
+            "notes": request.notes,
+            "signature": sig(&ferryman_channel::release::verify_request(&request, &roster)),
+        },
+        "approval": approved.map(|a| json!({
+            "version": a.version,
+            "commit": a.commit,
+            "approved_by": a.approved_by,
+            "approved_at": a.approved_at.to_rfc3339(),
+            "via": a.via,
+            "signature": sig(&ferryman_channel::release::verify_approval(&a, &roster)),
+        })),
+    })))
+}
+
+#[derive(Deserialize)]
+struct ApproveBody {
+    /// Repeated back by the page deliberately. If what the operator was looking at is
+    /// not what the channel now holds, the approval must not silently attach to the
+    /// newer thing - that is the substitution the whole design exists to refuse.
+    commit: String,
+}
+
+/// POST /api/release/{version}/approve — a person says yes to one commit.
+///
+/// # Why the session is the whole gate
+///
+/// The operator's signing key is sealed at rest with their password and is not in this
+/// process until they sign in (see `operators.rs`). So the fleet cannot reach this: an
+/// orchestrator, a worker, or a compromised bridge has no session and therefore no key.
+/// What authorises a release is a person having typed their password, which is exactly
+/// the property the old "type a passphrase at the machine" arrangement had.
+async fn approve_release(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(version): Path<String>,
+    Json(body): Json<ApproveBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+
+    let request = ferryman_channel::release::pending(&state.route).ok_or((
+        StatusCode::CONFLICT,
+        "there is no release waiting to be approved".to_string(),
+    ))?;
+    if request.version != version {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "the release waiting is {}, not {version}. Reload and look at what is \
+                 actually on the table.",
+                request.version
+            ),
+        ));
+    }
+    // The page tells us which commit the person was looking at. If the channel has moved
+    // under them, their yes was about something else.
+    if request.commit != body.commit {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "this release is now at {} and you were shown {}. Reload and look again \
+                 before approving.",
+                request.commit, body.commit
+            ),
+        ));
+    }
+    if !request.ci_green {
+        return Err((
+            StatusCode::CONFLICT,
+            "the tests did not pass; this gate is for judgement, not for overriding the \
+             machine"
+                .to_string(),
+        ));
+    }
+    if request.is_stale(chrono::Utc::now()) {
+        return Err((
+            StatusCode::CONFLICT,
+            "this request has gone stale; have it prepared again so you are approving \
+             what is actually there"
+                .to_string(),
+        ));
+    }
+
+    let approval = ferryman_channel::release::ReleaseApproval {
+        version: request.version.clone(),
+        commit: request.commit.clone(),
+        approved_by: identity.name().to_string(),
+        approved_at: chrono::Utc::now(),
+        via: "dashboard".to_string(),
+        signed_by: None,
+        signature: None,
+    };
+    let path = ferryman_channel::release::write_approval(&state.route, &approval, &identity)
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "version": approval.version,
+        "commit": approval.commit,
+        "approved_by": approval.approved_by,
+        "path": path.display().to_string(),
+    })))
+}
+
 /// Where the conversations live: the memory bank, which Syncthing carries - so what is
 /// said here is said in the channel, not in the dashboard.
 fn conversation_bank(state: &DashboardState) -> std::path::PathBuf {
@@ -1467,6 +1660,7 @@ fn parse_turn(line: &str) -> Value {
 async fn conversations(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
     let bank = conversation_bank(&state);
     let dir = ferryman_channel::conversation::conversations_dir(&bank);
+    let roster = roster_now(&state);
     let mut topics = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -1483,11 +1677,7 @@ async fn conversations(State(state): State<DashboardState>) -> Result<Json<Value
                 .filter(|line| line.trim_start().starts_with("- "))
                 .collect();
             let last = lines.last().map(|line| parse_turn(line));
-            let check = ferryman_channel::conversation::verify_conversation(
-                &bank,
-                topic,
-                &state.route.agents,
-            );
+            let check = ferryman_channel::conversation::verify_conversation(&bank, topic, &roster);
             topics.push(json!({
                 "topic": topic,
                 "turns": lines.len(),
@@ -1512,7 +1702,7 @@ async fn conversation(
 ) -> Result<Json<Value>, DashboardError> {
     let bank = conversation_bank(&state);
     let check =
-        ferryman_channel::conversation::verify_conversation(&bank, &topic, &state.route.agents);
+        ferryman_channel::conversation::verify_conversation(&bank, &topic, &roster_now(&state));
     let text = ferryman_channel::conversation::load_conversation(&bank, &topic).unwrap_or_default();
     let turns: Vec<Value> = text
         .lines()
@@ -2092,6 +2282,34 @@ mod tests {
         assert_eq!(tasks[0]["result_count"], 0);
         assert_eq!(tasks[0]["state"]["status"], "claimed");
         assert_eq!(tasks[0]["state"]["by"], "alice");
+    }
+
+    /// A named host gets in; everything else still does not.
+    ///
+    /// The point of naming them rather than switching the guard off: a rebinding attacker
+    /// controls the `Host` header, so "allow any host" would hand them the fleet. They
+    /// cannot make the operator type their domain into `--allow-host`.
+    #[test]
+    fn only_hosts_the_operator_named_are_admitted_beyond_loopback() {
+        allow_hosts(vec![
+            "beastly.tail1234.ts.net".into(),
+            "  FLEET.example  ".into(),
+        ]);
+
+        // Loopback, always.
+        assert!(host_is_allowed("127.0.0.1"));
+        assert!(host_is_allowed("localhost"));
+
+        // The names the operator gave, case- and space-insensitively.
+        assert!(host_is_allowed("beastly.tail1234.ts.net"));
+        assert!(host_is_allowed("BEASTLY.tail1234.TS.NET"));
+        assert!(host_is_allowed("fleet.example"));
+
+        // And nothing else - including the rebinding shapes.
+        assert!(!host_is_allowed("attacker.example"));
+        assert!(!host_is_allowed("127.0.0.1.evil.com"));
+        assert!(!host_is_allowed("beastly.tail1234.ts.net.evil.com"));
+        assert!(!host_is_allowed("evil.beastly.tail1234.ts.net"));
     }
 
     /// The cases a prefix test gets wrong.

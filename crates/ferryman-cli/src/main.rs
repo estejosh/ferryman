@@ -396,6 +396,15 @@ enum Command {
         /// Serve views only; disable sign-in and the approve/send-back action.
         #[arg(long)]
         read_only: bool,
+        /// A hostname a tunnel in front of this dashboard will send, e.g. your
+        /// Tailscale name or a Cloudflare hostname. Repeatable.
+        ///
+        /// The dashboard still binds loopback only; this admits a proxy running on
+        /// this machine that forwards to it. Name the host you set up — a blanket
+        /// "any host" would re-open DNS rebinding, which is the attack the check
+        /// exists to stop.
+        #[arg(long = "allow-host")]
+        allow_host: Vec<String>,
     },
     /// Print this project's persistent memory — the synced memory bank and the
     /// durable append-only log — so an agent that has lost its context (or a
@@ -419,6 +428,15 @@ enum Command {
         /// an agent that gets better at a task keeps that sharpened memory.
         #[arg(long)]
         record: Option<String>,
+    },
+    /// Prepare a release for a person to approve, and sign it once they have.
+    ///
+    /// The fleet can prepare and check; it cannot approve. Approving needs the
+    /// operator key, which is sealed with a password this machine does not
+    /// have. ADR 0018.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
     },
     /// Bring this install up to the latest published release.
     ///
@@ -465,6 +483,41 @@ enum Command {
         json: bool,
     },
 }
+#[derive(Subcommand, Clone)]
+enum ReleaseCommand {
+    /// Put a release in front of a person: version, commit, what the tests said,
+    /// and what ships. Writes a signed request into the channel and nothing else.
+    Prepare {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is preparing it. Defaults to the only agent this machine holds a key for.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// The version, as the tag will spell it.
+        #[arg(long)]
+        version: String,
+        /// The exact commit. Defaults to HEAD.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Say the tests passed. Without it the release is prepared as failing and
+        /// cannot be approved - which is the point.
+        #[arg(long)]
+        ci_green: bool,
+        /// What the tests said, in a line.
+        #[arg(long, default_value = "")]
+        ci_summary: String,
+        /// What ships. Read from a file, verbatim; `-` reads standard input.
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
+    },
+    /// What is waiting, whether anybody has approved it, and whether it could be
+    /// signed right now.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Clone)]
 enum MarvinCommand {
     /// Record or update this orchestrator's brief. Only the sections you pass are
@@ -2142,8 +2195,12 @@ async fn run(cli: Cli) -> Result<()> {
             port,
             timeout,
             read_only,
+            allow_host,
         } => {
             update::keep_current().await;
+            if !allow_host.is_empty() {
+                ferryman_server::dashboard::allow_hosts(allow_host.clone());
+            }
             let start = match workspace {
                 Some(path) => path,
                 None => std::env::current_dir().context("read the current directory")?,
@@ -2178,6 +2235,7 @@ async fn run(cli: Cli) -> Result<()> {
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
         Command::Update { check } => update_command(check).await?,
+        Command::Release { command } => release_command(command)?,
         Command::Marvin { command } => marvin_command(command)?,
         Command::Mcp { command } => match command {
             McpCommand::Serve { workspace } => mcp::serve(workspace)?,
@@ -6528,6 +6586,144 @@ async fn update_command(check: bool) -> Result<()> {
     );
     println!("  Anything already running keeps the old version until it restarts.");
     Ok(())
+}
+
+/// `ferry release` - prepare one, and see where it stands.
+fn release_command(command: ReleaseCommand) -> Result<()> {
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+
+    match command {
+        ReleaseCommand::Prepare {
+            workspace,
+            agent,
+            version,
+            commit,
+            ci_green,
+            ci_summary,
+            notes_file,
+        } => {
+            let route = here(workspace)?;
+            let name = match agent {
+                Some(name) => name,
+                None => only_local_agent(&route)?,
+            };
+            let identity = signing_identity(&route, &name)?;
+
+            let commit = match commit {
+                Some(commit) => commit,
+                None => head_commit(&route.workspace)?,
+            };
+            let notes = match notes_file {
+                None => String::new(),
+                Some(path) if path.as_os_str() == "-" => {
+                    let mut buffer = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                        .context("read the release notes from standard input")?;
+                    buffer
+                }
+                Some(path) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read the release notes from {}", path.display()))?,
+            };
+
+            let request = ferryman_channel::release::ReleaseRequest {
+                version: version.clone(),
+                commit: commit.clone(),
+                prepared_by: name.clone(),
+                prepared_at: chrono::Utc::now(),
+                ci_green,
+                ci_summary,
+                notes,
+                signed_by: None,
+                signature: None,
+            };
+            let path = ferryman_channel::release::write_request(&route, &request, &identity)?;
+            println!("{version} is waiting for a person.");
+            println!("  commit  {commit}");
+            println!("  at      {}", path.display());
+            println!();
+            println!("  Nothing on this machine can approve it. Open the dashboard and sign in:");
+            println!("      ferry dashboard");
+        }
+
+        ReleaseCommand::Status { workspace } => {
+            let route = here(workspace)?;
+            let Some(request) = ferryman_channel::release::pending(&route) else {
+                println!("no release is waiting.");
+                return Ok(());
+            };
+            let now = chrono::Utc::now();
+            println!("  {}  {}", request.version, request.commit);
+            println!(
+                "  prepared by {} {}",
+                request.prepared_by,
+                age_phrase(request.age_minutes(now))
+            );
+            println!(
+                "  tests       {}",
+                if request.ci_green {
+                    format!("green - {}", request.ci_summary)
+                } else {
+                    "NOT GREEN".to_string()
+                }
+            );
+            println!(
+                "  request     {}",
+                signature_line(&ferryman_channel::release::verify_request(
+                    &request,
+                    &route.agents
+                ))
+            );
+            println!();
+
+            // Ask the real question rather than a proxy for it: not "is there an
+            // approval" but "would this be signed right now, at the commit that is
+            // actually here". A status that answers the easier question is how a gate
+            // gets discovered to be open.
+            let at = head_commit(&route.workspace).unwrap_or_else(|_| request.commit.clone());
+            match ferryman_channel::release::may_sign(&route, &request, &at) {
+                Ok(approval) => {
+                    println!(
+                        "  APPROVED by {} for {}",
+                        approval.approved_by, approval.commit
+                    );
+                    println!("  This may be signed.");
+                }
+                Err(refusal) => {
+                    println!("  NOT SIGNABLE");
+                    println!("  {refusal}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The commit a workspace is sitting on, short form.
+fn head_commit(workspace: &std::path::Path) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &workspace.display().to_string(),
+            "rev-parse",
+            "--short",
+            "HEAD",
+        ])
+        .output()
+        .context("ask git which commit this is")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git could not tell me the commit in {}: {}",
+            workspace.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn marvin_command(command: MarvinCommand) -> Result<()> {

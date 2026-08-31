@@ -38,6 +38,8 @@ a{color:var(--accent);text-decoration:none}
   background:var(--panel);border-bottom:1px solid var(--line);
 }
 .brand{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:-.01em;width:206px;flex:none}
+.brand .mark{color:var(--accent);flex:none}
+.loginmark{color:var(--accent);margin-bottom:14px;display:flex}
 .brand .glyph{
   width:26px;height:26px;border-radius:7px;flex:none;
   background:linear-gradient(150deg,var(--accent),#7C5CFF);
@@ -252,6 +254,24 @@ textarea.notes:focus{border-color:var(--accent-dim)}
 
 <section id="login">
   <div class="box">
+    <div class="loginmark"><svg class="mark" viewBox="0 0 64 64" width="34" height="34" fill="none" aria-hidden="true">
+      <g stroke="currentColor" fill="none" stroke-linecap="round">
+        <line x1="32" y1="13" x2="32" y2="6.6" stroke-width="3"/>
+        <line x1="48.454" y1="22.5" x2="53.997" y2="19.3" stroke-width="3"/>
+        <line x1="48.454" y1="41.5" x2="53.997" y2="44.7" stroke-width="3"/>
+        <line x1="32" y1="51" x2="32" y2="57.4" stroke-width="3"/>
+        <line x1="15.546" y1="41.5" x2="10.003" y2="44.7" stroke-width="3"/>
+        <line x1="15.546" y1="22.5" x2="10.003" y2="19.3" stroke-width="3"/>
+        <circle cx="32" cy="32" r="19" stroke-width="5"/>
+        <circle cx="32" cy="6.6" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="53.997" cy="19.3" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="53.997" cy="44.7" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="32" cy="57.4" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="10.003" cy="44.7" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="10.003" cy="19.3" r="4" stroke="none" fill="currentColor"/>
+        <path d="M26.6,23.2 H37.6 V27.3 H30.7 V30.24 H35 V34.34 H30.7 V40.8 H26.6 Z" stroke="none" fill="currentColor"/>
+      </g>
+    </svg></div>
     <h1 id="auth-title">Sign in</h1>
     <p id="auth-sub">This dashboard is bound to loopback. Your identity is held on this machine.</p>
     <!-- No `name` on the secret fields, and no `action`. A form with neither submits by
@@ -267,6 +287,8 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <textarea id="auth-phrase" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off" hidden></textarea>
       <label for="auth-password" id="auth-password-label">Password</label>
       <input id="auth-password" type="password" autocomplete="current-password" required>
+      <label for="auth-password2" id="auth-password2-label" hidden>Password again</label>
+      <input id="auth-password2" type="password" autocomplete="new-password" hidden>
       <label for="auth-setup" id="auth-setup-label" hidden>Setup token (printed in the terminal)</label>
       <input id="auth-setup" autocomplete="off" hidden>
       <button class="btn primary" id="auth-submit" type="submit">Sign in</button>
@@ -304,7 +326,24 @@ textarea.notes:focus{border-color:var(--accent-dim)}
 
 <div id="app">
   <div class="topbar">
-    <div class="brand"><span class="glyph">F</span><span>Ferryman</span></div>
+    <div class="brand"><svg class="mark" viewBox="0 0 64 64" width="26" height="26" fill="none" aria-hidden="true">
+      <g stroke="currentColor" fill="none" stroke-linecap="round">
+        <line x1="32" y1="13" x2="32" y2="6.6" stroke-width="3"/>
+        <line x1="48.454" y1="22.5" x2="53.997" y2="19.3" stroke-width="3"/>
+        <line x1="48.454" y1="41.5" x2="53.997" y2="44.7" stroke-width="3"/>
+        <line x1="32" y1="51" x2="32" y2="57.4" stroke-width="3"/>
+        <line x1="15.546" y1="41.5" x2="10.003" y2="44.7" stroke-width="3"/>
+        <line x1="15.546" y1="22.5" x2="10.003" y2="19.3" stroke-width="3"/>
+        <circle cx="32" cy="32" r="19" stroke-width="5"/>
+        <circle cx="32" cy="6.6" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="53.997" cy="19.3" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="53.997" cy="44.7" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="32" cy="57.4" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="10.003" cy="44.7" r="4" stroke="none" fill="currentColor"/>
+        <circle cx="10.003" cy="19.3" r="4" stroke="none" fill="currentColor"/>
+        <path d="M26.6,23.2 H37.6 V27.3 H30.7 V30.24 H35 V34.34 H30.7 V40.8 H26.6 Z" stroke="none" fill="currentColor"/>
+      </g>
+    </svg><span>Ferryman</span></div>
     <div class="proj mono" id="project">—</div>
     <div class="search"><input id="search" type="search" placeholder="Filter tasks, agents and activity" aria-label="Filter"></div>
     <div class="spacer"></div>
@@ -322,6 +361,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <button data-page="tasks">Tasks <span class="pill num" id="count-tasks">0</span></button>
       <button data-page="review">Needs review <span class="pill num" id="count-review">0</span></button>
       <button data-page="agents">Agents <span class="pill num" id="count-agents">0</span></button>
+      <button data-page="release">Release</button>
       <button data-page="chat">Conversation</button>
       <button data-page="teammates">Teammates</button>
     </div>
@@ -449,6 +489,15 @@ function renderAuth() {
   $("#auth-setup").hidden = !needSetup;
   $("#auth-setup").required = needSetup;
   $("#auth-password").setAttribute("autocomplete", isCreate ? "new-password" : "current-password");
+  // Typed twice wherever a password is being SET, because there is no recovering from a
+  // typo here: the password seals the key, so a mistyped one seals it under something
+  // nobody knows. The only way back would be the recovery phrase, and on a first run the
+  // person has not been shown it yet - they would be locked out of an identity that is
+  // seconds old. Signing in needs no confirmation: a wrong password there just fails.
+  const setting = isCreate || isRecover;
+  $("#auth-password2-label").hidden = !setting;
+  $("#auth-password2").hidden = !setting;
+  $("#auth-password2").required = setting;
   // Creating another operator is an authenticated action, so the create toggle is only
   // offered on a first run (no operator yet). Recovery is always reachable: it is how a
   // person gets back in on a fresh machine.
@@ -527,6 +576,11 @@ $("#auth-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const name = $("#auth-name").value.trim();
   const password = $("#auth-password").value;
+  if (mode !== "signin" && password !== $("#auth-password2").value) {
+    $("#auth-msg").textContent = "Those two passwords are not the same.";
+    $("#auth-password2").focus();
+    return;
+  }
   const msg = $("#auth-msg");
   msg.textContent = "";
   $("#auth-submit").disabled = true;
@@ -560,6 +614,7 @@ $("#auth-form").addEventListener("submit", async (ev) => {
     $("#auth-password").value = "";
     $("#auth-setup").value = "";
     $("#auth-phrase").value = "";
+    $("#auth-password2").value = "";
     if (resp && resp.token) {
       sessionToken = resp.token;
       sessionStorage.setItem("ferryman.dashboard.token", resp.token);
@@ -972,6 +1027,115 @@ pages.identity = async () => {
     </div>`;
 };
 
+/* ---------- release ----------
+
+   The fleet prepares a release and can go no further. Approving needs the operator key,
+   which is sealed at rest with the operator's password and is not in the server process
+   until they sign in - so a session IS the gate, and the fleet has no session. */
+
+pages.release = async () => {
+  const d = await api("/api/release");
+  const p = d.pending;
+
+  if (!p) {
+    return `
+      <div class="head">
+        <div><h1>Release</h1><p>Nothing is waiting. When the fleet prepares one, it shows up here and on Telegram.</p></div>
+      </div>
+      <div class="panel"><div class="empty">No release is waiting for you.</div></div>`;
+  }
+
+  const a = d.approval;
+  const ciTone = p.ci_green ? "good" : "bad";
+  const ciWord = p.ci_green ? "CI green" : "CI failed";
+
+  return `
+    <div class="head">
+      <div>
+        <h1>Release</h1>
+        <p>Prepared by the fleet. It cannot sign this &mdash; that needs your password.</p>
+      </div>
+    </div>
+
+    ${p.stale ? `<div class="notice"><b>Gone stale</b><div>This was prepared ${esc(String(Math.floor(p.age_minutes / 60)))} hours ago. Have it prepared again rather than approving what may no longer be there.</div></div>` : ""}
+
+    <div class="cards">
+      <div class="card">
+        <div class="k">Version</div>
+        <div class="v mono">${esc(p.version)}</div>
+        <div class="s">by ${esc(p.prepared_by)}, ${esc(ago(p.prepared_at))}</div>
+      </div>
+      <div class="card">
+        <div class="k">Commit</div>
+        <div class="v mono" style="font-size:22px">${esc(p.commit)}</div>
+        <div class="s">Approving signs this and nothing else</div>
+      </div>
+      <div class="card">
+        <div class="k">Tests</div>
+        <div class="v" style="font-size:20px"><span class="badge ${ciTone}">${esc(ciWord)}</span></div>
+        <div class="s">${esc(p.ci_summary || "—")}</div>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-bottom:18px">
+      <div class="chat-top"><b>What ships</b> ${sigBadge(p.signature)}</div>
+      <div style="padding:14px 16px;white-space:pre-wrap;line-height:1.6">${esc(p.notes || "No notes were written.")}</div>
+    </div>
+
+    ${a ? `
+      <div class="panel">
+        <div style="padding:16px;display:flex;gap:12px;align-items:flex-start">
+          <div class="stripe" style="background:var(--good)"></div>
+          <div>
+            <div class="t">Approved by ${esc(a.approved_by)} ${sigBadge(a.signature)}</div>
+            <div class="m">for ${esc(a.commit)} &middot; ${esc(ago(a.approved_at))} &middot; via ${esc(a.via || "—")}</div>
+            <div class="m">The signing machine can take it from here.</div>
+          </div>
+        </div>
+      </div>`
+    : `
+      <div class="panel">
+        <div style="padding:18px 16px;display:flex;flex-direction:column;gap:14px">
+          <div style="line-height:1.6">
+            You are approving <span class="mono">${esc(p.commit)}</span>. If anything lands on
+            main before the tag is cut, this approval stops applying and comes back to you.
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap">
+            <button class="btn primary" id="rel-approve" data-commit="${esc(p.commit)}" data-version="${esc(p.version)}"
+              ${p.ci_green && !p.stale ? "" : "disabled"}>Approve and sign</button>
+            <button class="btn" id="rel-later">Not yet</button>
+          </div>
+          <div class="s" id="rel-msg" style="color:var(--dim)"></div>
+        </div>
+      </div>`}`;
+};
+
+function wireRelease() {
+  const go = $("#rel-approve");
+  if (!go) return;
+  go.addEventListener("click", async () => {
+    const msg = $("#rel-msg");
+    msg.textContent = "";
+    go.disabled = true;
+    try {
+      // The commit the operator was actually shown travels with the approval. The server
+      // refuses if the channel has moved under them, so a yes can never land on work
+      // they did not see.
+      await api(`/api/release/${encodeURIComponent(go.dataset.version)}/approve`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ commit: go.dataset.commit }),
+      });
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      go.disabled = false;
+    }
+  });
+  const later = $("#rel-later");
+  if (later) later.addEventListener("click", () => { current = "home"; render(); });
+}
+
 /* ---------- conversation ----------
 
    The dashboard is a view over the synced channel, never a second channel. What is typed
@@ -1129,6 +1293,7 @@ async function render() {
   }
   wireRows();
   wireChat();
+  wireRelease();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {
