@@ -2,8 +2,33 @@
 
 ## Unreleased
 
+## v0.5.4 - 2026-08-31
+
+The release that makes a person someone before it makes them configure anything,
+and gives the orchestrator a memory that outlives the machine holding it.
+
+
 ### Added
 
+- **Marvin: the orchestrator is a memory, not a machine** (ADR 0017). What has to
+  survive when an orchestrator stops is not a machine and not a model - it is what
+  it knew. `ferry marvin brief` records the objective, what is in flight and why,
+  the standing constraints, the decisions that never became ADRs, what was tried
+  and rejected, and what is waiting on the human; `ferry marvin resume` prints it
+  back in the order a successor needs it. Written continuously rather than at
+  handoff, for the same reason `ferry-deadman` exists: running out of context is
+  never a graceful event, so the handoff cannot be an event either, and `brief`
+  therefore touches only the sections it is given. Exactly one machine holds Marvin
+  at a time - `take` refuses while the current holder is still being heard from and
+  says how long ago that was, `release` hands it straight over, and writing to the
+  memory is itself the heartbeat. Each holder writes its own file, so
+  one-writer-per-path holds; those files are pages of one memory and `resume` reads
+  them as one. Work in flight is read from the channel rather than from the memory,
+  so a stale page cannot hide a task.
+- **`ferry channel order --task-file`.** An order worth issuing is worth writing in
+  an editor. A shell splits a multi-line brief on an apostrophe and the order lands
+  signed and mangled, which is worse than a missing one because it looks like it
+  worked.
 - **One seed, and every identity derives from it** (ADR 0016), in the channel
   crate. A machine may hold an `operator.seed` beside its other machine state -
   32 bytes, owner-only, never in a project directory and never in the channel -

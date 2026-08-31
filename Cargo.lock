@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-channel"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-cli"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-core"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-ops"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1298,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-server"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-worker-sdk"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "anyhow",
  "ferryman-core",
