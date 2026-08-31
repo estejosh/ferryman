@@ -299,6 +299,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
              *.key\n\
              *.seed\n\
              operator.seed\n\
+             operator.seed.*\n\
              *.exe\n\
              *.dll\n\
              *.so\n\

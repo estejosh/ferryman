@@ -114,8 +114,10 @@ enum Identity {
     Show,
     /// Restore this machine's operator seed from its recovery phrase.
     Recover {
-        /// Replace an existing seed after confirmation. Without this, `recover`
-        /// refuses when a seed is already present.
+        /// Replace an existing seed, keeping the old one beside it as a `.bak`.
+        /// Without this, `recover` asks before replacing a seed that is already
+        /// present - and the phrase is always read and checked first either way, so
+        /// a typo can never cost this machine the identity it has.
         #[arg(long)]
         force: bool,
     },
@@ -1775,7 +1777,13 @@ async fn run(cli: Cli) -> Result<()> {
             // Under `--json` - or any run where nobody is at a terminal - it is
             // deliberately NOT created: there would be no one to write the phrase
             // down, and a seed whose phrase was never seen is worse than no seed.
-            let interactive = !as_json && std::io::stdin().is_terminal();
+            // Both ends must be a terminal, not just stdin. `ferry enable > setup.log`
+            // from an interactive shell passes the stdin check, and would then write the
+            // only copy of the phrase into a file the operator never opens while showing
+            // them nothing at all. A seed whose phrase was never seen is worse than no
+            // seed, and that is just as true when the phrase went to a pipe.
+            let interactive =
+                !as_json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
             let (seed_report, phrase) = match ferryman_channel::licensing::machine_state_dir() {
                 Some(dir) => ensure_operator_seed(&dir, interactive)?,
                 None => (SeedReport::absent(), None),
@@ -2806,7 +2814,7 @@ fn report_enable_human(
         println!("    {phrase}");
         println!();
         println!("  It is the only secret that has to survive: this one phrase restores");
-        println!("  every identity on this machine. Write it down and keep it safe.");
+        println!("  every identity derived from it. Write it down and keep it safe.");
         println!("  Ferryman will not show it again.");
     }
 
@@ -4016,7 +4024,13 @@ fn seed_to_phrase(bytes: [u8; 32]) -> Result<String> {
 /// The phrase itself is never echoed: an invalid phrase fails with a message that names
 /// the problem but not the words.
 fn phrase_to_seed(phrase: &str) -> Result<[u8; 32]> {
-    let mnemonic = Mnemonic::from_phrase(phrase, Language::English).map_err(|_| {
+    // Folded to lower case first. The BIP-39 word list is lower case and the lookup is
+    // exact, and NFKD normalisation does not case-fold - so a phrase written down with
+    // capitals, or retyped by a phone that capitalises the first word for you, would be
+    // refused as an invalid word. The person did nothing wrong and the message would not
+    // have told them that.
+    let phrase = phrase.to_lowercase();
+    let mnemonic = Mnemonic::from_phrase(&phrase, Language::English).map_err(|_| {
         anyhow::anyhow!(
             "that did not read as a 24-word BIP-39 English recovery phrase - \
              check the words and the order, then try again"
@@ -4226,9 +4240,21 @@ fn move_seed_aside(dir: &std::path::Path) -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let aside = dir.join(format!("operator.seed.before-{unix}.bak"));
+    // `rename` overwrites its destination on both platforms, so a bare timestamp is not
+    // enough: two recoveries in the same second - or two runs where the clock read failed
+    // to the same fallback - would destroy the earlier backup, which is the one thing this
+    // function exists to prevent. Walk until the name is free.
+    let mut aside = dir.join(format!("operator.seed.before-{unix}.bak"));
+    let mut attempt = 1;
+    while aside.exists() {
+        aside = dir.join(format!("operator.seed.before-{unix}-{attempt}.bak"));
+        attempt += 1;
+    }
     std::fs::rename(&path, &aside)
         .with_context(|| format!("move {} to {}", path.display(), aside.display()))?;
+    // Named out loud, because if the restore that follows fails the machine is left with
+    // no seed, and this path is the only way back to the one it had.
+    println!("  previous seed kept at {}", aside.display());
     Ok(())
 }
 
@@ -6703,10 +6729,74 @@ mod tests {
     /// stranger to every roster that knew it.
     #[test]
     fn the_recovery_phrase_round_trips_the_seed_bytes() {
+        // Deliberately NOT a byte-uniform seed. A seed of 32 identical bytes is a
+        // palindrome, so it round-trips even through code that reversed the entropy -
+        // which is exactly the bug this test is here to catch. The failure message
+        // carries no phrase: a phrase in CI output is a phrase in a log.
+        let mut bytes = [0u8; 32];
+        for (index, slot) in bytes.iter_mut().enumerate() {
+            *slot = u8::try_from(index).unwrap().wrapping_mul(7).wrapping_add(3);
+        }
+        let phrase = super::seed_to_phrase(bytes).unwrap();
+        assert_eq!(phrase.split_whitespace().count(), 24);
+        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), bytes);
+    }
+
+    /// A phrase written down in capitals, or retyped by a phone that capitalises for
+    /// you, is the same phrase. Rejecting it would blame the person for the software's
+    /// habit - and they would have no way to tell a case problem from a lost seed.
+    #[test]
+    fn a_phrase_is_recognised_whatever_case_it_was_written_in() {
         let bytes = [0x5a; 32];
         let phrase = super::seed_to_phrase(bytes).unwrap();
-        assert_eq!(phrase.split_whitespace().count(), 24, "got: {phrase}");
-        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), bytes);
+        assert_eq!(
+            super::phrase_to_seed(&phrase.to_uppercase()).unwrap(),
+            bytes
+        );
+
+        let mut titled = String::new();
+        for word in phrase.split_whitespace() {
+            let mut chars = word.chars();
+            let first = chars.next().unwrap().to_uppercase().to_string();
+            titled.push_str(&first);
+            titled.push_str(chars.as_str());
+            titled.push(' ');
+        }
+        assert_eq!(super::phrase_to_seed(titled.trim()).unwrap(), bytes);
+    }
+
+    /// The checksum is the reason a phrase is 24 words and not 23 plus luck. One wrong
+    /// word must be refused, because the alternative is silently deriving a DIFFERENT
+    /// valid seed - and the person becomes a stranger with no error to tell them why.
+    #[test]
+    fn one_wrong_word_is_refused_rather_than_quietly_becoming_someone_else() {
+        let phrase = super::seed_to_phrase([0x5a; 32]).unwrap();
+        let mut words: Vec<&str> = phrase.split_whitespace().collect();
+
+        // A real word from the list, in the wrong place: valid words, bad checksum.
+        words[0] = if words[0] == "zoo" { "abandon" } else { "zoo" };
+        assert!(super::phrase_to_seed(&words.join(" ")).is_err());
+
+        // A word that is not in the list at all.
+        let mut nonsense: Vec<&str> = phrase.split_whitespace().collect();
+        nonsense[7] = "ferryman";
+        assert!(super::phrase_to_seed(&nonsense.join(" ")).is_err());
+
+        // Too few words.
+        let short: Vec<&str> = phrase.split_whitespace().take(23).collect();
+        assert!(super::phrase_to_seed(&short.join(" ")).is_err());
+    }
+
+    /// Whitespace is how people type, not what they mean.
+    #[test]
+    fn extra_whitespace_between_words_does_not_break_a_phrase() {
+        let bytes = [0x11; 32];
+        let phrase = super::seed_to_phrase(bytes).unwrap();
+        let spaced = phrase.split_whitespace().collect::<Vec<_>>().join("   ");
+        assert_eq!(
+            super::phrase_to_seed(&format!("  {spaced}\n")).unwrap(),
+            bytes
+        );
     }
 
     /// The standard BIP-39 test vector for 256 zero bits: 23 `abandon` words and then
@@ -6717,8 +6807,10 @@ mod tests {
         let phrase = super::seed_to_phrase([0u8; 32]).unwrap();
         let words: Vec<&str> = phrase.split_whitespace().collect();
         assert_eq!(words.len(), 24);
-        assert!(words[..23].iter().all(|w| *w == "abandon"), "got: {phrase}");
-        assert_eq!(words[23], "art", "got: {phrase}");
+        // The known vector is public, but the assertion messages still do not carry the
+        // phrase: a habit of printing phrases in test output is how one escapes.
+        assert!(words[..23].iter().all(|w| *w == "abandon"));
+        assert_eq!(words[23], "art");
         assert_eq!(super::phrase_to_seed(&phrase).unwrap(), [0u8; 32]);
     }
 
