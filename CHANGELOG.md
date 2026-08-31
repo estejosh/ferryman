@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+## v0.5.5 - 2026-08-31
+
+The release that can see what people said, and the last one anybody has to
+install by hand.
+
+### Added
+
+- **The dashboard can show the conversation.** It showed team, tasks, stats,
+  ledger, learnings, roster, fleet, memory, secrets and cost - and not one word
+  anyone had said, while `conversation.rs` had been storing signed turns in the
+  channel all along with the Telegram bridge as their only writer. Conversations
+  down the side, the thread in the middle, a box to type in. Typing here appends a
+  signed turn into the same file the bridge appends to, so what is said in the
+  browser and what is said in Telegram are indistinguishable afterwards and every
+  agent reads both. The dashboard is a view over the synced channel, never a
+  second channel: a message that existed only in the dashboard would be invisible
+  to the fleet and would die with the process.
+- **`ferry update`, and installs that keep themselves current.** Fetches the
+  release for this platform, verifies it against the checksum published beside it,
+  and installs it where ferry runs from; `--check` says what would change and
+  installs nothing. `ferry agent` and `ferry dashboard` do it on the way in, at
+  most once every six hours, because a notice somebody has to act on is how an
+  install ends up four minor versions behind. It only ever replaces the binary on
+  disk - the running process keeps the code it has and every worker in flight
+  finishes its task, so the new version takes effect at the next start.
+  `FERRYMAN_NO_AUTO_UPDATE=1` turns it off.
+
+### Fixed
+
+- **A worker that died before its first heartbeat held its task forever.** The
+  staleness test read only the heartbeat, so a claim carrying none had nothing to
+  compare against and stayed `Claimed` indefinitely - the one shape of death ADR
+  0011's recovery story could not see. The claim time is the fallback now.
+- **`el.hidden` did nothing to labels on the sign-in form**, because
+  `#login label{display:block}` overrode the user agent's `[hidden]` rule: the
+  create-identity form asked for a recovery phrase above a field that was not
+  there, on the first screen a stranger sees.
+- **`ferry channel review --notes-file`**, for the same reason `--task-file`
+  exists: a shell splits a multi-line verdict on an apostrophe, and a review is a
+  signed ledger record, so a mangled one is worse than a missing one.
+
+
 ## v0.5.4 - 2026-08-31
 
 The release that makes a person someone before it makes them configure anything,
