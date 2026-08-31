@@ -10,7 +10,6 @@ use ferryman_ops::agent;
 use ferryman_ops::enable;
 
 use anyhow::{Context, Result, bail};
-use bip39::{Language, Mnemonic};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -420,17 +419,19 @@ enum Command {
         #[arg(long)]
         record: Option<String>,
     },
-    /// The orchestrator's own continuity. `brief` records what only the
-    /// orchestrator knows — the objective, what is in flight and why, the
-    /// standing constraints, what is waiting on you — and `resume` prints it
-    /// back in the order a replacement needs it. ADR 0017.
+    /// Marvin: the orchestrator's memory, which outlives the machine holding it.
+    ///
+    /// `brief` records what only the orchestrator knows — the objective, what is
+    /// in flight and why, the standing constraints, what is waiting on you — and
+    /// `resume` prints it back in the order a successor needs it. Exactly one
+    /// machine holds Marvin at a time; `take` and `release` move it. ADR 0017.
     ///
     /// Written continuously, not at handoff: running out of context is never a
     /// graceful event, so there is no moment at which a dying orchestrator
     /// reliably gets to summarise itself.
-    Orchestrator {
+    Marvin {
         #[command(subcommand)]
-        command: OrchestratorCommand,
+        command: MarvinCommand,
     },
     /// Talk MCP. `serve` exposes this project's read-only query surface as tools
     /// for an MCP client; `list` and `call` connect to an external MCP server
@@ -454,7 +455,7 @@ enum Command {
     },
 }
 #[derive(Subcommand, Clone)]
-enum OrchestratorCommand {
+enum MarvinCommand {
     /// Record or update this orchestrator's brief. Only the sections you pass are
     /// touched, so a running orchestrator can update one thing after a decision
     /// without restating everything it already knows.
@@ -503,13 +504,44 @@ enum OrchestratorCommand {
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
     },
-    /// Every brief in the channel, newest first, with its age and whether it
-    /// verifies. More than one is normal: an orchestrator that has handed over
-    /// leaves its brief behind.
+    /// Every page of Marvin's memory, newest first, with its age and whether it
+    /// verifies. More than one is the normal case: each machine that has held
+    /// Marvin leaves its page behind.
     List {
         /// The project directory. Defaults to where you are.
         #[arg(long)]
         workspace: Option<PathBuf>,
+    },
+    /// Take Marvin over. Exactly one machine holds the memory at a time, so this
+    /// refuses while somebody else is still being heard from.
+    Take {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is taking it. Defaults to the only agent this machine holds a key for.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// Why you are taking over. Worth more to whoever reads the succession
+        /// later than the timestamps are.
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Take it even though the current holder is still being heard from. For
+        /// the case the rule cannot see: a machine you KNOW is gone.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Let Marvin go, so the next machine does not have to wait out the quiet
+    /// period. Your page of the memory stays where it is.
+    Release {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is releasing. Defaults to the only agent this machine holds a key for.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// Why. Read by whoever picks it up.
+        #[arg(long, default_value = "")]
+        note: String,
     },
 }
 
@@ -2121,7 +2153,7 @@ async fn run(cli: Cli) -> Result<()> {
             list_agents,
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
-        Command::Orchestrator { command } => orchestrator_command(command)?,
+        Command::Marvin { command } => marvin_command(command)?,
         Command::Mcp { command } => match command {
             McpCommand::Serve { workspace } => mcp::serve(workspace)?,
             McpCommand::List { server } => mcp_client::list(&server)?,
@@ -4008,38 +4040,8 @@ fn ensure_operator_seed(
         state: "created",
         fingerprint: Some(seed.operator_fingerprint()?),
     };
-    let phrase = seed_to_phrase(seed.expose_bytes())?;
+    let phrase = ferryman_channel::seed::seed_to_phrase(seed.expose_bytes())?;
     Ok((report, Some(phrase)))
-}
-
-/// 32 seed bytes as a BIP-39 English recovery phrase (24 words).
-fn seed_to_phrase(bytes: [u8; 32]) -> Result<String> {
-    let mnemonic = Mnemonic::from_entropy(&bytes, Language::English)
-        .map_err(|_| anyhow::anyhow!("could not turn the operator seed into a recovery phrase"))?;
-    Ok(mnemonic.phrase().to_string())
-}
-
-/// A BIP-39 English recovery phrase back into 32 seed bytes, validating its checksum.
-///
-/// The phrase itself is never echoed: an invalid phrase fails with a message that names
-/// the problem but not the words.
-fn phrase_to_seed(phrase: &str) -> Result<[u8; 32]> {
-    // Folded to lower case first. The BIP-39 word list is lower case and the lookup is
-    // exact, and NFKD normalisation does not case-fold - so a phrase written down with
-    // capitals, or retyped by a phone that capitalises the first word for you, would be
-    // refused as an invalid word. The person did nothing wrong and the message would not
-    // have told them that.
-    let phrase = phrase.to_lowercase();
-    let mnemonic = Mnemonic::from_phrase(&phrase, Language::English).map_err(|_| {
-        anyhow::anyhow!(
-            "that did not read as a 24-word BIP-39 English recovery phrase - \
-             check the words and the order, then try again"
-        )
-    })?;
-    let entropy = mnemonic.entropy();
-    entropy
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("the phrase did not hold a 32-byte operator seed"))
 }
 
 /// The `ferry identity` subcommands: the one fingerprint, and recovery from the phrase.
@@ -4147,7 +4149,7 @@ fn identity_recover(force: bool) -> Result<()> {
     let mut bytes = None;
     for _ in 0..3 {
         let phrase = read_recovery_phrase()?;
-        match phrase_to_seed(&phrase) {
+        match ferryman_channel::seed::phrase_to_seed(&phrase) {
             Ok(valid) => {
                 bytes = Some(valid);
                 break;
@@ -6413,15 +6415,12 @@ fn age_phrase(minutes: i64) -> String {
     }
 }
 
-fn print_brief(
-    brief: &ferryman_channel::orchestrator::Brief,
-    route: &ferryman_channel::ProjectRoute,
-) {
+fn print_brief(brief: &ferryman_channel::marvin::Brief, route: &ferryman_channel::ProjectRoute) {
     let age = brief.age_minutes(chrono::Utc::now());
     println!("  {} — updated {}", brief.agent, age_phrase(age));
     println!(
         "  {}",
-        signature_line(&ferryman_channel::orchestrator::verify_brief(
+        signature_line(&ferryman_channel::marvin::verify_brief(
             brief,
             &route.agents
         ))
@@ -6454,7 +6453,7 @@ fn print_brief(
     }
 }
 
-fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
+fn marvin_command(command: MarvinCommand) -> Result<()> {
     let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
             Some(path) => path,
@@ -6464,7 +6463,7 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
     };
 
     match command {
-        OrchestratorCommand::Brief {
+        MarvinCommand::Brief {
             workspace,
             agent,
             objective,
@@ -6494,14 +6493,14 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
             ];
             let nothing_to_write = sections.iter().all(|section| section.is_none());
 
-            let existing = ferryman_channel::orchestrator::read_brief(&route, &name)?;
+            let existing = ferryman_channel::marvin::read_brief(&route, &name)?;
 
             if nothing_to_write {
                 let Some(brief) = existing else {
                     println!("no brief for '{name}' yet.");
                     println!();
                     println!(
-                        "  Start one:  ferry orchestrator brief --objective \"what this is all for\""
+                        "  Start one:  ferry marvin brief --objective \"what this is all for\""
                     );
                     return Ok(());
                 };
@@ -6513,10 +6512,7 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
             // mid-flight must not have to restate the other five, because the version that
             // costs six paragraphs is the version that stops being written.
             let mut brief = existing.unwrap_or_else(|| {
-                ferryman_channel::orchestrator::Brief::new(
-                    &name,
-                    objective.as_deref().unwrap_or(""),
-                )
+                ferryman_channel::marvin::Brief::new(&name, objective.as_deref().unwrap_or(""))
             });
             if let Some(value) = objective {
                 brief.objective = value;
@@ -6555,14 +6551,47 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
                         )
                     })?;
 
-            let path = ferryman_channel::orchestrator::write_brief(&route, &brief, &identity)?;
+            let path = ferryman_channel::marvin::write_brief(&route, &brief, &identity)?;
             println!("brief recorded at {}", path.display());
-            println!("  A replacement reads it with: ferry orchestrator resume");
+            println!("  A successor reads it with: ferry marvin resume");
         }
 
-        OrchestratorCommand::List { workspace } => {
+        MarvinCommand::Take {
+            workspace,
+            agent,
+            note,
+            force,
+        } => {
             let route = here(workspace)?;
-            let briefs = ferryman_channel::orchestrator::list_briefs(&route)?;
+            let name = match agent {
+                Some(name) => name,
+                None => only_local_agent(&route)?,
+            };
+            let identity = signing_identity(&route, &name)?;
+            let holding = ferryman_channel::marvin::take(&route, &identity, &note, force)?;
+            println!("'{}' is holding Marvin.", holding.agent);
+            println!("  Read what it knows:  ferry marvin resume");
+            println!("  Keep it current:     ferry marvin brief --next \"...\"");
+        }
+
+        MarvinCommand::Release {
+            workspace,
+            agent,
+            note,
+        } => {
+            let route = here(workspace)?;
+            let name = match agent {
+                Some(name) => name,
+                None => only_local_agent(&route)?,
+            };
+            let identity = signing_identity(&route, &name)?;
+            ferryman_channel::marvin::release(&route, &identity, &note)?;
+            println!("'{name}' has let Marvin go. Its page of the memory stays where it is.");
+        }
+
+        MarvinCommand::List { workspace } => {
+            let route = here(workspace)?;
+            let briefs = ferryman_channel::marvin::list_briefs(&route)?;
             if briefs.is_empty() {
                 println!("no orchestrator briefs in this channel yet.");
                 return Ok(());
@@ -6577,7 +6606,7 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
                 );
                 println!(
                     "                 {}",
-                    signature_line(&ferryman_channel::orchestrator::verify_brief(
+                    signature_line(&ferryman_channel::marvin::verify_brief(
                         &brief,
                         &route.agents
                     ))
@@ -6585,21 +6614,49 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
             }
         }
 
-        OrchestratorCommand::Resume { workspace, agent } => {
+        MarvinCommand::Resume { workspace, agent } => {
             let route = here(workspace)?;
             let brief = match &agent {
-                Some(name) => ferryman_channel::orchestrator::read_brief(&route, name)?,
+                Some(name) => ferryman_channel::marvin::read_brief(&route, name)?,
                 // No name given: the newest brief, because that is the one the fleet was
                 // most recently being run from.
-                None => ferryman_channel::orchestrator::list_briefs(&route)?
+                None => ferryman_channel::marvin::list_briefs(&route)?
                     .into_iter()
                     .next(),
             };
 
             println!(
-                "Ferryman — orchestrator handover for '{}'",
+                "Marvin — the orchestrator's memory for '{}'",
                 route.project_id
             );
+            println!();
+
+            // Who is holding it, and whether anybody has heard from them. A successor
+            // that does not know this either duplicates a live orchestrator or waits for
+            // one that is never coming back, and both are bad in different directions.
+            let now = chrono::Utc::now();
+            match ferryman_channel::marvin::current_holder(&route)? {
+                Some(holding) if holding.has_gone_quiet(now) => {
+                    println!(
+                        "  '{}' held Marvin and has not been heard from for {}.",
+                        holding.agent,
+                        age_phrase(holding.quiet_minutes(now))
+                    );
+                    println!("  It is yours to take:  ferry marvin take");
+                }
+                Some(holding) => {
+                    println!(
+                        "  '{}' is holding Marvin and was heard from {}.",
+                        holding.agent,
+                        age_phrase(holding.quiet_minutes(now))
+                    );
+                    println!(
+                        "  Another orchestrator is live - read on, but do not start issuing \
+                         orders alongside it."
+                    );
+                }
+                None => println!("  Nobody is holding Marvin.  Take it with:  ferry marvin take"),
+            }
             println!();
 
             match &brief {
@@ -6701,7 +6758,7 @@ fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {
             }
 
             println!();
-            println!("  Keep this current as you work:  ferry orchestrator brief --next \"...\"");
+            println!("  Keep this current as you work:  ferry marvin brief --next \"...\"");
         }
     }
     Ok(())
@@ -6722,96 +6779,6 @@ mod tests {
         );
         assert_eq!(slug_of(Path::new("/tmp/foo--bar--")), "foo-bar");
         assert_eq!(slug_of(Path::new("/")), "");
-    }
-
-    /// The recovery phrase is the one secret that has to survive: whatever it holds
-    /// must round-trip exactly, or a machine restored from its phrase comes back a
-    /// stranger to every roster that knew it.
-    #[test]
-    fn the_recovery_phrase_round_trips_the_seed_bytes() {
-        // Deliberately NOT a byte-uniform seed. A seed of 32 identical bytes is a
-        // palindrome, so it round-trips even through code that reversed the entropy -
-        // which is exactly the bug this test is here to catch. The failure message
-        // carries no phrase: a phrase in CI output is a phrase in a log.
-        let mut bytes = [0u8; 32];
-        for (index, slot) in bytes.iter_mut().enumerate() {
-            *slot = u8::try_from(index).unwrap().wrapping_mul(7).wrapping_add(3);
-        }
-        let phrase = super::seed_to_phrase(bytes).unwrap();
-        assert_eq!(phrase.split_whitespace().count(), 24);
-        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), bytes);
-    }
-
-    /// A phrase written down in capitals, or retyped by a phone that capitalises for
-    /// you, is the same phrase. Rejecting it would blame the person for the software's
-    /// habit - and they would have no way to tell a case problem from a lost seed.
-    #[test]
-    fn a_phrase_is_recognised_whatever_case_it_was_written_in() {
-        let bytes = [0x5a; 32];
-        let phrase = super::seed_to_phrase(bytes).unwrap();
-        assert_eq!(
-            super::phrase_to_seed(&phrase.to_uppercase()).unwrap(),
-            bytes
-        );
-
-        let mut titled = String::new();
-        for word in phrase.split_whitespace() {
-            let mut chars = word.chars();
-            let first = chars.next().unwrap().to_uppercase().to_string();
-            titled.push_str(&first);
-            titled.push_str(chars.as_str());
-            titled.push(' ');
-        }
-        assert_eq!(super::phrase_to_seed(titled.trim()).unwrap(), bytes);
-    }
-
-    /// The checksum is the reason a phrase is 24 words and not 23 plus luck. One wrong
-    /// word must be refused, because the alternative is silently deriving a DIFFERENT
-    /// valid seed - and the person becomes a stranger with no error to tell them why.
-    #[test]
-    fn one_wrong_word_is_refused_rather_than_quietly_becoming_someone_else() {
-        let phrase = super::seed_to_phrase([0x5a; 32]).unwrap();
-        let mut words: Vec<&str> = phrase.split_whitespace().collect();
-
-        // A real word from the list, in the wrong place: valid words, bad checksum.
-        words[0] = if words[0] == "zoo" { "abandon" } else { "zoo" };
-        assert!(super::phrase_to_seed(&words.join(" ")).is_err());
-
-        // A word that is not in the list at all.
-        let mut nonsense: Vec<&str> = phrase.split_whitespace().collect();
-        nonsense[7] = "ferryman";
-        assert!(super::phrase_to_seed(&nonsense.join(" ")).is_err());
-
-        // Too few words.
-        let short: Vec<&str> = phrase.split_whitespace().take(23).collect();
-        assert!(super::phrase_to_seed(&short.join(" ")).is_err());
-    }
-
-    /// Whitespace is how people type, not what they mean.
-    #[test]
-    fn extra_whitespace_between_words_does_not_break_a_phrase() {
-        let bytes = [0x11; 32];
-        let phrase = super::seed_to_phrase(bytes).unwrap();
-        let spaced = phrase.split_whitespace().collect::<Vec<_>>().join("   ");
-        assert_eq!(
-            super::phrase_to_seed(&format!("  {spaced}\n")).unwrap(),
-            bytes
-        );
-    }
-
-    /// The standard BIP-39 test vector for 256 zero bits: 23 `abandon` words and then
-    /// `art`. Pins that we are using the real BIP-39 word list and checksum, not some
-    /// near-cousin that a phrase from another wallet would not recover.
-    #[test]
-    fn the_bip39_zero_entropy_vector_is_correct() {
-        let phrase = super::seed_to_phrase([0u8; 32]).unwrap();
-        let words: Vec<&str> = phrase.split_whitespace().collect();
-        assert_eq!(words.len(), 24);
-        // The known vector is public, but the assertion messages still do not carry the
-        // phrase: a habit of printing phrases in test output is how one escapes.
-        assert!(words[..23].iter().all(|w| *w == "abandon"));
-        assert_eq!(words[23], "art");
-        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), [0u8; 32]);
     }
 
     /// A seed is created once, used silently after that, and never created unattended.

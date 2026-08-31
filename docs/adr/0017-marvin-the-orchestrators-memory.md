@@ -1,4 +1,4 @@
-# ADR 0017: The orchestrator writes down what only it knows
+# ADR 0017: Marvin, the orchestrator's memory
 
 ## Status
 
@@ -36,9 +36,9 @@ one component of this system with no durability story at all.
 
 ## Decision
 
-### The orchestrator keeps a brief, in the channel, signed, one per orchestrator
+### Marvin is the memory, and machines take turns holding it
 
-`<communications>/orchestrator/<agent>.json`, named after its only writer, like every
+`<communications>/marvin/brief.<holder>.json`, named after its only writer, like every
 other record here — so two orchestrators can never produce a conflicting edit and a
 successor can read the outgoing one's brief while writing its own.
 
@@ -61,7 +61,7 @@ no moment at which a dying orchestrator reliably gets to write a summary. It may
 stop mid-sentence.
 
 So the brief is updated as work happens — after a decision, after a dispatch, after the
-human says something that changes the standing constraints. `ferry orchestrator brief`
+human says something that changes the standing constraints. `ferry marvin brief`
 therefore touches only the sections it is given: an orchestrator recording one decision
 must not have to restate the other five, because the version that costs six paragraphs
 is the version that stops being written.
@@ -70,7 +70,7 @@ When updates stop, the last one is already current. The staleness of the brief i
 the signal: an orchestrator whose brief has not moved while its fleet has is an
 orchestrator that is gone.
 
-### `ferry orchestrator resume` produces the handoff, not the raw record
+### `ferry marvin resume` produces the handoff, not the raw record
 
 A successor should not have to read JSON and assemble a picture. One command prints, in
 the order a new orchestrator needs them: the brief and how old it is, who wrote it and
@@ -79,6 +79,32 @@ rather than from the brief, and what is waiting on the human.
 
 Work in flight is read from the channel on purpose, so a stale brief cannot hide a task —
 and the two disagreeing is itself information.
+
+
+### It is a memory, not a machine, and one machine holds it at a time
+
+The thing that has to survive is not a machine and not a model. It is what the
+orchestrator knows. So Marvin is the memory, and holding it is a lease rather than a
+title: taken with `ferry marvin take`, kept alive by the act of writing to it, and
+takeable by somebody else once it has gone quiet for thirty minutes.
+
+That gives the property the whole feature exists for - **the project carries on with a
+different machine, or a different model, holding the same memory and continuing the same
+thought** - without ever having two orchestrators issuing orders into one channel, which
+is the failure this replaces rather than a new one to tolerate.
+
+Each holder still writes its own file, because one-writer-per-path is the rule the entire
+channel rests on and two machines editing one file is the conflict this project
+structurally does not have. Those files are not separate briefs; they are pages of one
+memory, and `resume` reads them as one.
+
+`take` refuses while the current holder is still being heard from, and `--force` exists
+for the case the rule cannot see: a machine a person knows is gone but whose last
+heartbeat is recent. `release` pushes the heartbeat back rather than deleting the file,
+because the succession is part of the memory and a hole in it is not an improvement.
+
+Named for Douglas Adams' Marvin: a mind that carries on regardless of which body it is
+in, and remembers everything.
 
 ## Consequences
 

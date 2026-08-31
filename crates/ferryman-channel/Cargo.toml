@@ -7,6 +7,7 @@ description = "The Ferryman channel: portable agent messages and shared memory o
 
 [dependencies]
 anyhow.workspace = true
+bip39.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 fs2.workspace = true

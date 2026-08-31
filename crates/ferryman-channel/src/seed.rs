@@ -43,6 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -59,13 +60,47 @@ const SIGNING_INFO: &str = "ferryman/v1/sign/";
 /// HKDF `info` prefix for an encryption key. See [`SIGNING_INFO`].
 const ENCRYPTION_INFO: &str = "ferryman/v1/encrypt/";
 
-/// HKDF `info` for the operator's own signing identity - the one fingerprint a person
-/// reads aloud to verify, out of band, that they are talking to the right machine.
+/// HKDF `info` for the MACHINE's operator fingerprint - the one value a person reads
+/// aloud to verify, out of band, that they are talking to the right machine.
 ///
-/// A purpose string of its own, with no agent name after it, so it can never collide
-/// with a real agent's key even on a machine that happens to run an agent named
-/// "operator".
+/// A purpose string of its own, with no name after it: there is exactly one of these per
+/// seed, which is the property that makes it a *machine* fingerprint. It is never used as
+/// a signing key for a person - see [`OPERATOR_KEY_INFO`].
 const OPERATOR_INFO: &str = "ferryman/v1/operator";
+
+/// HKDF `info` prefix for one NAMED operator's signing key.
+///
+/// The name goes after the prefix, exactly as [`SIGNING_INFO`] and [`ENCRYPTION_INFO`]
+/// carry an agent's. It has to. With a bare purpose string every operator created on a
+/// machine derived the same 32 bytes, so a second operator published a byte-identical
+/// public key under a different roster name - two names sharing one key, which is the
+/// impersonation shape this project exists to prevent, and it happened silently with no
+/// error and no test failing.
+///
+/// # Why it cannot collide with any other derivation from this seed
+///
+/// Every `info` in the scheme is one of four fixed byte strings, optionally followed by a
+/// canonical name:
+///
+/// ```text
+/// "ferryman/v1/sign/"     || agent
+/// "ferryman/v1/encrypt/"  || agent
+/// "ferryman/v1/operator/" || operator
+/// "ferryman/v1/operator"                 (the machine fingerprint, nothing appended)
+/// ```
+///
+/// The three prefixes share `"ferryman/v1/"` and then differ at index 12 - `s`, `e`, `o` -
+/// so two `info` strings built from different prefixes differ at byte 12 whatever names
+/// are appended. No agent name can make an agent key equal an operator key, and no
+/// operator name can make an operator key equal an agent key.
+///
+/// Against the bare machine fingerprint the separation is by length: that string is 20
+/// bytes and a per-operator string is at least 21, because [`is_safe_component`] refuses
+/// an empty name, and its byte at index 20 is `/`.
+///
+/// Finally, [`is_safe_component`] admits only ASCII alphanumerics, `.`, `-` and `_`, so a
+/// name can never contain `/` and the boundary between prefix and name is unambiguous.
+const OPERATOR_KEY_INFO: &str = "ferryman/v1/operator/";
 
 /// A machine's operator seed: 32 random bytes, created once, from which every
 /// identity on that machine can be derived.
@@ -237,24 +272,62 @@ impl OperatorSeed {
         ))
     }
 
-    /// The operator's own signing identity, derived from the seed.
+    /// The MACHINE's operator identity, derived from the seed.
     ///
-    /// The seed derives a *distinct* key for every agent, so that a breakage at 3am
-    /// can be traced to one agent. The operator is the one thing that is not an agent:
-    /// its public key is the single fingerprint a person reads aloud to a colleague to
-    /// verify, out of band, that they are talking to the right machine (ADR 0016).
+    /// One per seed, and deliberately not bound to any name: its public key is the single
+    /// fingerprint a person reads aloud to a colleague to verify, out of band, that they
+    /// are talking to the right machine (ADR 0016).
     ///
-    /// Like [`Self::signing_identity`], this derives and does not consult the keystore:
-    /// it is the derivation of the operator's identity, not a lookup of what is on disk.
+    /// This is not the key any operator signs with. A *person* signs with
+    /// [`Self::operator_identity_for`], which binds their name.
+    ///
+    /// Like [`Self::signing_identity`], this derives and does not consult the keystore.
     pub fn operator_identity(&self) -> Result<AgentIdentity> {
+        Ok(AgentIdentity::from_seed(
+            "operator",
+            self.machine_signing_seed()?,
+        ))
+    }
+
+    /// The 32 bytes behind the machine fingerprint. Private: nothing outside this module
+    /// has any business sealing these as somebody's signing key, which is exactly the
+    /// mistake that gave every operator on a machine one shared key.
+    fn machine_signing_seed(&self) -> Result<[u8; 32]> {
         let mut derived = [0_u8; 32];
         Hkdf::<Sha256>::new(None, &self.bytes)
             .expand(OPERATOR_INFO.as_bytes(), &mut derived)
             .map_err(|_| anyhow!("could not derive the operator identity from the seed"))?;
-        Ok(AgentIdentity::from_seed("operator", derived))
+        Ok(derived)
     }
 
-    /// The operator fingerprint: the public key of [`Self::operator_identity`], as hex.
+    /// One named operator's signing identity, derived.
+    ///
+    /// Two operators on one machine are two people, so they get two keys - the same reason
+    /// two agents do. The name is canonicalised and an unsafe one is refused, exactly as in
+    /// [`Self::signing_seed`]; see [`OPERATOR_KEY_INFO`] for why this can never collide
+    /// with an agent's key or with the machine fingerprint.
+    ///
+    /// Like [`Self::signing_identity`], this derives and does not consult the keystore.
+    pub fn operator_identity_for(&self, operator: &str) -> Result<AgentIdentity> {
+        Ok(AgentIdentity::from_seed(
+            &canonical_agent_name(operator),
+            self.operator_signing_seed(operator)?,
+        ))
+    }
+
+    /// The 32 bytes a named operator's ed25519 signing key is built from.
+    ///
+    /// The third derivation alongside [`SIGNING_INFO`] and [`ENCRYPTION_INFO`], and bound
+    /// to the operator's name for the same reason those are bound to an agent's.
+    /// [`Self::operator_identity_for`] wraps these bytes in a keypair; this exists so the
+    /// dashboard can seal an operator's signing key under their password (ADR 0016)
+    /// exactly as it sealed a minted one before - the password is the local unlock, and
+    /// the seed is what it unlocks.
+    pub fn operator_signing_seed(&self, operator: &str) -> Result<[u8; 32]> {
+        self.derive(OPERATOR_KEY_INFO, operator)
+    }
+
+    /// The machine fingerprint: the public key of [`Self::operator_identity`], as hex.
     ///
     /// Safe to print and safe to publish - it is a public key, not secret material -
     /// and it is the one value a person checks out of band rather than the O(agents)
@@ -287,7 +360,7 @@ impl OperatorSeed {
     /// reads the mismatch as impersonation.
     fn derive(&self, purpose: &str, agent: &str) -> Result<[u8; 32]> {
         if !is_safe_component(agent) {
-            bail!("agent name must be a path-safe identifier")
+            bail!("name must be a path-safe identifier")
         }
         let agent = canonical_agent_name(agent);
         let mut info = Vec::with_capacity(purpose.len() + agent.len());
@@ -302,6 +375,42 @@ impl OperatorSeed {
             .map_err(|_| anyhow!("could not derive a key from the operator seed"))?;
         Ok(derived)
     }
+}
+
+/// 32 seed bytes as a BIP-39 English recovery phrase (24 words).
+///
+/// The phrase is the seed in words, and it is the one secret that has to survive. It is
+/// shown to a person exactly once - by `ferry enable` at a terminal, or by the dashboard
+/// on first run - and never stored anywhere. This function is deliberately a free function
+/// over raw bytes rather than a method, so the only place that can produce a phrase is the
+/// place that already holds the seed in the clear for the split second it exists.
+pub fn seed_to_phrase(bytes: [u8; 32]) -> Result<String> {
+    let mnemonic = Mnemonic::from_entropy(&bytes, Language::English)
+        .map_err(|_| anyhow!("could not turn the operator seed into a recovery phrase"))?;
+    Ok(mnemonic.phrase().to_string())
+}
+
+/// A BIP-39 English recovery phrase back into 32 seed bytes, validating its checksum.
+///
+/// The phrase itself is never echoed: an invalid phrase fails with a message that names the
+/// problem but not the words, so a mistyped phrase cannot be copied out of an error log.
+pub fn phrase_to_seed(phrase: &str) -> Result<[u8; 32]> {
+    // Folded to lower case first. The BIP-39 word list is lower case and the lookup is
+    // exact, and NFKD normalisation does not case-fold - so a phrase written down with
+    // capitals, or retyped by a phone that capitalises the first word for you, would be
+    // refused as an invalid word. The person did nothing wrong, and the message would
+    // not have told them that.
+    let phrase = phrase.to_lowercase();
+    let mnemonic = Mnemonic::from_phrase(&phrase, Language::English).map_err(|_| {
+        anyhow!(
+            "that did not read as a 24-word BIP-39 English recovery phrase - \
+             check the words and the order, then try again"
+        )
+    })?;
+    let entropy = mnemonic.entropy();
+    entropy
+        .try_into()
+        .map_err(|_| anyhow!("the phrase did not hold a 32-byte operator seed"))
 }
 
 /// Write a new secret file, owner-only from the moment it exists.
@@ -344,6 +453,94 @@ fn write_new(path: &Path, bytes: &[u8; 32]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The recovery phrase is the one secret that has to survive: whatever it holds must
+    /// round-trip exactly, or a machine restored from its phrase comes back a stranger to
+    /// every roster that knew it.
+    #[test]
+    fn the_recovery_phrase_round_trips_the_seed_bytes() {
+        // Deliberately NOT a byte-uniform seed. Thirty-two identical bytes are a
+        // palindrome, so such a seed round-trips even through code that reversed the
+        // entropy - which is the bug this test exists to catch. No assertion here carries
+        // a phrase: a phrase in CI output is a phrase in a log.
+        let mut bytes = [0u8; 32];
+        for (index, slot) in bytes.iter_mut().enumerate() {
+            *slot = u8::try_from(index).unwrap().wrapping_mul(7).wrapping_add(3);
+        }
+        let phrase = seed_to_phrase(bytes).unwrap();
+        assert_eq!(phrase.split_whitespace().count(), 24);
+        assert_eq!(phrase_to_seed(&phrase).unwrap(), bytes);
+    }
+
+    /// A phrase written down in capitals, or retyped by a phone that capitalises for you,
+    /// is the same phrase. Refusing it would blame the person for the software's habit,
+    /// and they would have no way to tell a case problem from a lost seed.
+    #[test]
+    fn a_phrase_is_recognised_whatever_case_it_was_written_in() {
+        let bytes = [0x5a; 32];
+        let phrase = seed_to_phrase(bytes).unwrap();
+        assert_eq!(phrase_to_seed(&phrase.to_uppercase()).unwrap(), bytes);
+
+        let mut titled = String::new();
+        for word in phrase.split_whitespace() {
+            let mut chars = word.chars();
+            let first = chars.next().unwrap().to_uppercase().to_string();
+            titled.push_str(&first);
+            titled.push_str(chars.as_str());
+            titled.push(' ');
+        }
+        assert_eq!(phrase_to_seed(titled.trim()).unwrap(), bytes);
+    }
+
+    /// The checksum is why a phrase is 24 words and not 23 plus luck. One wrong word must
+    /// be refused, because the alternative is silently deriving a DIFFERENT valid seed -
+    /// and the person becomes a stranger with no error to tell them why.
+    #[test]
+    fn one_wrong_word_is_refused_rather_than_quietly_becoming_someone_else() {
+        let phrase = seed_to_phrase([0x5a; 32]).unwrap();
+
+        // Real words from the list, wrong order: every word valid, checksum bad.
+        let mut swapped: Vec<&str> = phrase.split_whitespace().collect();
+        swapped[0] = if swapped[0] == "zoo" {
+            "abandon"
+        } else {
+            "zoo"
+        };
+        assert!(phrase_to_seed(&swapped.join(" ")).is_err());
+
+        // A word that is not in the list at all.
+        let mut nonsense: Vec<&str> = phrase.split_whitespace().collect();
+        nonsense[7] = "ferryman";
+        assert!(phrase_to_seed(&nonsense.join(" ")).is_err());
+
+        // Too few words.
+        let short: Vec<&str> = phrase.split_whitespace().take(23).collect();
+        assert!(phrase_to_seed(&short.join(" ")).is_err());
+    }
+
+    /// Whitespace is how people type, not what they mean.
+    #[test]
+    fn extra_whitespace_between_words_does_not_break_a_phrase() {
+        let bytes = [0x11; 32];
+        let phrase = seed_to_phrase(bytes).unwrap();
+        let spaced = phrase.split_whitespace().collect::<Vec<_>>().join("   ");
+        assert_eq!(phrase_to_seed(&format!("  {spaced}\n")).unwrap(), bytes);
+    }
+
+    /// The standard BIP-39 vector for 256 zero bits: 23 `abandon` and then `art`. Pins
+    /// that this is the real word list and checksum, not a near-cousin that a phrase from
+    /// another wallet would not recover.
+    #[test]
+    fn the_bip39_zero_entropy_vector_is_correct() {
+        let phrase = seed_to_phrase([0u8; 32]).unwrap();
+        let words: Vec<&str> = phrase.split_whitespace().collect();
+        assert_eq!(words.len(), 24);
+        // The vector is public, but the assertions still carry no phrase: a habit of
+        // printing phrases in test output is how one escapes.
+        assert!(words[..23].iter().all(|w| *w == "abandon"));
+        assert_eq!(words[23], "art");
+        assert_eq!(phrase_to_seed(&phrase).unwrap(), [0u8; 32]);
+    }
     use crate::{AgentRoute, Message, SignatureCheck, verify_message};
     use serde_json::json;
 
@@ -859,6 +1056,73 @@ mod tests {
             hex::encode(seed.encryption_seed("fang").unwrap()),
             "dd527bbe58d217722789dd3854dae7180d3ef0e8be8766f8c3290f9ab3e82282",
             "the encryption derivation changed: sealed secrets become unopenable"
+        );
+    }
+
+    /// Two operators on one machine are two people, and two people are two keys.
+    ///
+    /// Before the operator derivation carried a name, both of these were the same 32
+    /// bytes: a second operator published a byte-identical public key under a different
+    /// roster name, which is precisely the impersonation the roster exists to catch, and
+    /// nothing anywhere said a word about it.
+    #[test]
+    fn two_operators_on_one_machine_do_not_share_a_key() {
+        let seed = seed(7);
+        let first = seed.operator_identity_for("ada").unwrap();
+        let second = seed.operator_identity_for("grace").unwrap();
+        assert_ne!(
+            first.public_key_hex(),
+            second.public_key_hex(),
+            "two named operators on one seed must not share one signing key"
+        );
+        assert_eq!(first.name(), "ada");
+        assert_eq!(second.name(), "grace");
+    }
+
+    /// The other half of the same claim: binding the name must not cost recovery. The
+    /// same seed and the same name derive the same key, including from a seed rebuilt out
+    /// of its own bytes the way a restored phrase rebuilds one.
+    #[test]
+    fn one_operator_name_derives_the_same_key_every_time() {
+        let seed = seed(7);
+        let first = seed.operator_identity_for("ada").unwrap();
+        let again = seed.operator_identity_for("ada").unwrap();
+        assert_eq!(first.public_key_hex(), again.public_key_hex());
+
+        let restored = OperatorSeed::from_bytes(seed.expose_bytes());
+        assert_eq!(
+            restored
+                .operator_identity_for("ada")
+                .unwrap()
+                .public_key_hex(),
+            first.public_key_hex(),
+            "a restored seed must bring the same operator back, not a stranger"
+        );
+
+        // One person, however they capitalise their own name.
+        assert_eq!(
+            seed.operator_identity_for("Ada").unwrap().public_key_hex(),
+            first.public_key_hex()
+        );
+        // And an unsafe name is refused rather than quietly folded into something else.
+        assert!(seed.operator_signing_seed("../etc").is_err());
+        assert!(seed.operator_signing_seed("").is_err());
+    }
+
+    /// An operator's key, an agent's key of the same name, and the machine fingerprint are
+    /// three different keys. The `info` strings cannot collide, and this says so out loud.
+    #[test]
+    fn an_operator_key_never_collides_with_an_agent_key_or_the_fingerprint() {
+        let seed = seed(7);
+        let operator = seed.operator_signing_seed("fang").unwrap();
+        assert_ne!(operator, seed.signing_seed("fang").unwrap());
+        assert_ne!(operator, seed.encryption_seed("fang").unwrap());
+        assert_ne!(
+            seed.operator_identity_for("operator")
+                .unwrap()
+                .public_key_hex(),
+            seed.operator_fingerprint().unwrap(),
+            "an operator NAMED `operator` must not be handed the machine fingerprint key"
         );
     }
 

@@ -30,6 +30,28 @@
   seed, moving the old seed aside rather than deleting it. The seed bytes and the
   phrase never reach a log line, a result payload, or the channel, and
   `*.seed`/`operator.seed` are excluded from the channel's `.stignore`.
+- **The dashboard operator is the seed, and the password is the local unlock.**
+  The dashboard's operator identity no longer mints a random key: its signing key
+  is the third derivation from the machine seed, `HKDF-SHA256(seed,
+  "ferryman/v1/operator/" || name)` - bound to the operator's name, exactly as an
+  agent's key is bound to the agent's, so two operators on one machine are two
+  keys and not one - and the recovery phrase genuinely restores the person, not
+  just the agents. The bare `"ferryman/v1/operator"` remains what it always was:
+  the one machine fingerprint per seed, which is not anybody's signing key. The password is demoted to the local unlock - it still
+  seals the derived key at rest and is what a person types to sign in, but it is
+  no longer the root of anything. Operators that predate the seed keep their keys
+  forever. The first-run experience now lives in the browser: opening the
+  dashboard with no operator creates the identity, shows the recovery phrase once
+  (with a three-word confirmation before the page moves on), and drops the person
+  into the product; recovery pastes the 24 words on a new machine; and a new
+  Identity page shows the one fingerprint, readable aloud. The one-time setup
+  token for the first operator is unchanged, for the reason given in the previous
+  entry: the bootstrap endpoint had no authentication once, and the token is the
+  proof of console access that no browser hand-off can reproduce without making
+  the secret available over HTTP. Recovery in the browser carries the same gate as
+  creation - an existing operator's session, or that one-time token - because a
+  recovery phrase is not a credential when the machine has no seed to check it
+  against: the caller simply supplies one.
 - **`ferry-deadman`, a sub-product, at `crates/ferry-deadman`.** Timelocked
   succession for any git repository: seal an archive to a future drand beacon
   round, and it cannot be opened early by anyone, including whoever sealed it.

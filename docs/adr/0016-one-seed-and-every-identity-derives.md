@@ -4,15 +4,20 @@
 
 Accepted.
 
-> **Implementation note, 2026-08-28.** The derivation itself is implemented in
-> `crates/ferryman-channel/src/seed.rs`: `OperatorSeed`, the two HKDF-SHA256
-> derivations over the case-folded agent name, and the derive-then-persist branch in
-> `AgentIdentity::load_or_create` and `EncryptionIdentity::load_or_create`. A machine
-> with no seed is unchanged, and no identity that already holds a key is re-keyed. What
-> is *not* yet built is everything above the crypto: `ferry enable` does not create a
-> seed, nothing shows a recovery phrase, and nothing restores from one. Until that
-> lands, a seed exists only if something puts one there, so the behaviour every current
-> installation sees is the old one.
+> **Implementation note, 2026-08-31.** The derivation is implemented in
+> `crates/ferryman-channel/src/seed.rs`: `OperatorSeed`, the HKDF-SHA256 derivations
+> (signing, encryption, and the operator's own key below), and the derive-then-persist
+> branch in `AgentIdentity::load_or_create` and `EncryptionIdentity::load_or_create`. A
+> machine with no seed is unchanged, and no identity that already holds a key is re-keyed.
+>
+> The recovery phrase (BIP-39, 24 words) round-trips the seed through `seed_to_phrase`
+> and `phrase_to_seed`. `ferry identity show` and `ferry identity recover` expose it at a
+> terminal, which is the fallback for a headless box. The primary path is the web
+> dashboard: the first time it is opened with no operator on the machine, it creates the
+> identity (seed and operator together) in the browser, shows the phrase once, and offers
+> recovery from a phrase on a new machine. The dashboard operator's signing key now
+> derives from the seed — see "The operator identity" below — and its password is demoted
+> to the local unlock.
 
 ## Context
 
@@ -57,14 +62,49 @@ recovery phrase. It is the only secret that has to survive.
 ### Every identity derives from it
 
 ```
-signing key   for agent A = HKDF-SHA256(seed, info = "ferryman/v1/sign/"    || A)
-encryption key for agent A = HKDF-SHA256(seed, info = "ferryman/v1/encrypt/" || A)
+signing key   for agent A    = HKDF-SHA256(seed, info = "ferryman/v1/sign/"     || A)
+encryption key for agent A   = HKDF-SHA256(seed, info = "ferryman/v1/encrypt/"  || A)
+signing key for operator O   = HKDF-SHA256(seed, info = "ferryman/v1/operator/" || O)
+machine fingerprint          = HKDF-SHA256(seed, info = "ferryman/v1/operator")
 ```
 
 Distinct keys per agent, so the property the whole design rests on survives: when
 something breaks at 3am you can still tell *which agent* did it, not merely which
 machine. HKDF is one-way, so an agent holding its own derived key learns nothing about
 the seed or about its siblings.
+
+### The operator identity
+
+The dashboard operator is **not** a second, unrelated identity; it is the seed, wearing
+a name. Its signing key is the third derivation above, `"ferryman/v1/operator/" || O`,
+and it is bound to the operator's canonical name for exactly the reason an agent's key
+is bound to the agent's: two operators on one machine are two people. A purpose string
+with no name after it gave every operator on a machine the *same* key, so a second
+operator published a byte-identical public key under a different roster name — one key,
+two names, which is the impersonation the roster exists to catch, arriving silently.
+
+The four `info` strings cannot collide. The three prefixes share `"ferryman/v1/"` and
+then differ at byte 12 (`s`, `e`, `o`), so no name appended to one can ever equal
+another; and a per-operator string is at least one byte longer than the bare
+`"ferryman/v1/operator"`, with `/` at index 20, because an empty name is refused. Names
+are ASCII alphanumerics plus `.`, `-`, `_`, so none can contain `/`.
+
+The fourth derivation, `"ferryman/v1/operator"` with nothing after it, is **not** a
+signing key. It is one value per seed: the single machine fingerprint a person reads
+aloud to verify a machine out of band, and what `ferry identity show` prints.
+
+This closes the hole where a new user ended up with two unrelated identities — a
+dashboard password and a separate recovery phrase covering different keys, with no
+stated relationship. Now there is one: **phrase recovers, password unlocks.** The
+password no longer mints or is the root of anything; it is the *local unlock* that seals
+the derived operator key at rest (PBKDF2-SHA256 + XChaCha20-Poly1305, unchanged), and it
+is what a person types to sign in. Nobody types 24 words to log in, and nobody recovers
+the fleet with a guessed password.
+
+An operator whose key already exists keeps it forever. Derivation is a bootstrap for new
+operators, exactly as for agents: a key minted before the seed existed is never replaced
+by the seed's derivation, and `ferry identity show` (and the dashboard's Identity page)
+say plainly which identities derive and which predate the seed.
 
 ### Derivation is a bootstrap, not a permanent binding
 
