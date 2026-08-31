@@ -786,8 +786,21 @@ enum Channel {
         /// The machine to do it. Omit for "whoever picks it up first".
         #[arg(long, value_parser = agent_name)]
         to: Option<String>,
+        /// The work itself. Use --task-file instead for anything longer than a line:
+        /// a shell mangles a multi-line brief, and a mangled order is worse than a
+        /// missing one because it looks like it worked.
+        #[arg(
+            long,
+            required_unless_present = "task_file",
+            conflicts_with = "task_file"
+        )]
+        task: Option<String>,
+        /// Read the work from a file, verbatim. `-` reads standard input.
+        ///
+        /// An order worth issuing is usually worth writing in an editor, and every
+        /// quote and newline survives the trip - which is not true of a command line.
         #[arg(long)]
-        task: String,
+        task_file: Option<PathBuf>,
         /// Hold the result for review before the task counts as done.
         #[arg(long)]
         requires_review: bool,
@@ -4751,6 +4764,7 @@ fn channel(command: Channel) -> Result<()> {
             id,
             to,
             task,
+            task_file,
             requires_review,
             require,
             requires_approval,
@@ -4758,6 +4772,23 @@ fn channel(command: Channel) -> Result<()> {
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let task = match (task, task_file) {
+                (Some(task), _) => task,
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    let mut buffer = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                        .context("read the order from standard input")?;
+                    buffer
+                }
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read the order from {}", path.display()))?,
+                // clap's `required_unless_present` makes this unreachable; refusing an
+                // empty order beats issuing one nobody can act on.
+                (None, None) => bail!("give the work with --task or --task-file"),
+            };
+            if task.trim().is_empty() {
+                bail!("an order with no work in it cannot be acted on")
+            }
             let payload = if task.trim_start().starts_with('{') {
                 serde_json::from_str(&task).context("--task looked like JSON but did not parse")?
             } else {
