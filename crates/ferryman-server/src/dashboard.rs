@@ -132,6 +132,15 @@ struct ProjectParam {
 fn find_project_route(current: &ProjectRoute, id: &str) -> Option<ProjectRoute> {
     // The index knows where projects actually are; the scan below only knows what sits
     // next to this one.
+    if let Some(root) = ferryman_channel::ferry::find_root()
+        && let Some(entry) = root
+            .projects()
+            .into_iter()
+            .find(|entry| entry.project_id == id)
+        && let Ok(route) = ferryman_channel::route_for(&entry.repo.unwrap_or(entry.channel))
+    {
+        return Some(route);
+    }
     if let Some(project) = ferryman_channel::known::known()
         .into_iter()
         .find(|project| project.project_id == id)
@@ -1497,13 +1506,42 @@ fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
     let mut projects: Vec<(String, String, usize, usize, usize)> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
 
-    // What this machine has actually used, wherever it lives. This is the half that finds
-    // a fleet the scan below cannot reach - channels on another drive, or one level down
-    // from wherever the dashboard was launched.
+    // The manifest first: what a person deliberately filed, which is the most reliable
+    // answer there is.
+    if let Some(root) = ferryman_channel::ferry::find_root() {
+        for entry in root.projects() {
+            let start = entry.repo.clone().unwrap_or_else(|| entry.channel.clone());
+            let Ok(child) = ferryman_channel::route_for(&start) else {
+                continue;
+            };
+            if seen.contains(&child.project_id) {
+                continue;
+            }
+            let tasks = ferryman_channel::list_tasks(&child).unwrap_or_default();
+            let open = tasks
+                .iter()
+                .filter(|task| !matches!(task.state(), TaskState::Accepted | TaskState::Done))
+                .count();
+            seen.push(child.project_id.clone());
+            projects.push((
+                child.project_id,
+                child.workspace.display().to_string(),
+                tasks.len(),
+                open,
+                tasks.len() - open,
+            ));
+        }
+    }
+
+    // Then what this machine has actually used, wherever it lives - the half that finds
+    // a fleet the scan below cannot reach.
     for project in ferryman_channel::known::known() {
         let Ok(child) = ferryman_channel::route_for(&project.workspace) else {
             continue;
         };
+        if seen.contains(&child.project_id) {
+            continue;
+        }
         let tasks = ferryman_channel::list_tasks(&child).unwrap_or_default();
         let open = tasks
             .iter()

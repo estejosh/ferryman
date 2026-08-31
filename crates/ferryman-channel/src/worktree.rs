@@ -116,10 +116,33 @@ fn rev_exists(repo_dir: &str, rev: &str) -> bool {
 pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(PathBuf, String)> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
     let branch = branch_name(order_id, agent);
-    let parent = repo
+    // Where a worktree goes.
+    //
+    // It used to be `repo.parent()` - beside the user's repository. That litters a
+    // directory that is not ours, and it is also why scanning that directory finds
+    // things which are not projects: a task worktree looks exactly like a sibling
+    // checkout. Transient, Ferryman-owned scratch belongs in the ferry root's `work/`.
+    //
+    // The old location is still honoured when a worktree is already sitting there, so an
+    // install that has been running for weeks does not suddenly abandon work in
+    // progress - and a machine with no ferry root behaves exactly as it always did.
+    let beside = repo
         .parent()
-        .context("repo has no parent to hold a worktree")?;
-    let dir = parent.join(&branch);
+        .context("repo has no parent to hold a worktree")?
+        .join(&branch);
+    let dir = if beside.exists() {
+        beside
+    } else {
+        match crate::ferry::find_root_from(repo).or_else(crate::ferry::find_root) {
+            Some(root) => {
+                let work = root.work();
+                std::fs::create_dir_all(&work)
+                    .with_context(|| format!("create {}", work.display()))?;
+                work.join(&branch)
+            }
+            None => beside,
+        }
+    };
     if dir.exists() {
         // Reuse is deliberate - a re-dispatched task should land in its own worktree
         // rather than a fresh one - but only if this is still a working tree of this

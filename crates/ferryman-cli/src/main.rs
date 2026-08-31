@@ -445,6 +445,11 @@ enum Command {
         #[command(subcommand)]
         command: ReleaseCommand,
     },
+    /// The one place your Ferryman lives, and what is in it. ADR 0019.
+    Root {
+        #[command(subcommand)]
+        command: RootCommand,
+    },
     /// Bring this install up to the latest published release.
     ///
     /// Replaces the binary on disk and never a running process: a worker in the
@@ -490,6 +495,23 @@ enum Command {
         json: bool,
     },
 }
+#[derive(Subcommand, Clone)]
+enum RootCommand {
+    /// Make the layout: comms/, repos/, work/ and a .ferry manifest.
+    Init {
+        /// Where to put it. Defaults to `ferry` in the current directory.
+        path: Option<PathBuf>,
+    },
+    /// What the manifest knows: every project, its channel, and where its repository is.
+    Show,
+    /// Record a project here. Nothing is moved: a repository is noted where it stands,
+    /// and `repos/` gets a link to it.
+    Adopt {
+        /// The project directory or channel to adopt. Defaults to where you are.
+        workspace: Option<PathBuf>,
+    },
+}
+
 #[derive(Subcommand, Clone)]
 enum ReleaseCommand {
     /// Put a release in front of a person: version, commit, what the tests said,
@@ -2246,6 +2268,7 @@ async fn run(cli: Cli) -> Result<()> {
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
         Command::Update { check } => update_command(check).await?,
+        Command::Root { command } => root_command(command)?,
         Command::Release { command } => release_command(command)?,
         Command::Marvin { command } => marvin_command(command)?,
         Command::Mcp { command } => match command {
@@ -6596,6 +6619,97 @@ async fn update_command(check: bool) -> Result<()> {
          {installed}` checks the one thing a signature can actually prove."
     );
     println!("  Anything already running keeps the old version until it restarts.");
+    Ok(())
+}
+
+/// `ferry root` - the one place, and what is filed in it.
+fn root_command(command: RootCommand) -> Result<()> {
+    use ferryman_channel::ferry;
+    match command {
+        RootCommand::Init { path } => {
+            let path = match path {
+                Some(path) => path,
+                None => std::env::current_dir()
+                    .context("read the current directory")?
+                    .join("ferry"),
+            };
+            let root = ferry::Root::create(&path)?;
+            println!("your Ferryman lives in {}", root.path.display());
+            println!("  comms/   every channel");
+            println!("  repos/   what Ferryman clones, and links to what it adopts");
+            println!("  work/    task worktrees, which come and go");
+            println!();
+            println!("  Nothing you already have is moved into it.");
+            println!("  Add a project you already have:  ferry root adopt <path>");
+        }
+
+        RootCommand::Show => {
+            let Some(root) = ferry::find_root() else {
+                println!("no ferry root yet.");
+                println!();
+                println!("  Make one:  ferry root init");
+                return Ok(());
+            };
+            println!("{}", root.path.display());
+            let projects = root.projects();
+            if projects.is_empty() {
+                println!("  nothing filed yet.  ferry root adopt <path>");
+                return Ok(());
+            }
+            let width = projects
+                .iter()
+                .map(|entry| entry.project_id.chars().count())
+                .max()
+                .unwrap_or(0);
+            for entry in projects {
+                println!("  {:width$}  {}", entry.project_id, entry.channel.display());
+                match entry.repo {
+                    // Said out loud, because it is the promise this layout makes: an
+                    // adopted repository was never moved and never will be.
+                    Some(repo) if entry.adopted => {
+                        println!(
+                            "  {:width$}  {} (adopted where it stands)",
+                            "",
+                            repo.display()
+                        );
+                    }
+                    Some(repo) => println!("  {:width$}  {}", "", repo.display()),
+                    None => println!("  {:width$}  channel only on this machine", ""),
+                }
+            }
+        }
+
+        RootCommand::Adopt { workspace } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = ferryman_channel::route_for(&start)?;
+            // The workspace is the repository only when it actually looks like one. A
+            // channel synced onto a machine that does not do the work has no repo here,
+            // and inventing a path for it would be a lie the picker acts on.
+            let repo = route
+                .workspace
+                .join(".git")
+                .exists()
+                .then(|| route.workspace.clone());
+            root.adopt(&route.project_id, &route.communications, repo.as_deref())?;
+            println!("filed {} in {}", route.project_id, root.path.display());
+            println!("  channel  {}", route.communications.display());
+            match &repo {
+                Some(repo) => {
+                    println!("  repo     {} (left where it is)", repo.display());
+                    if let Ok(Some(link)) = root.link_repo(&route.project_id, repo) {
+                        println!("  link     {}", link.display());
+                    }
+                }
+                None => println!("  repo     none on this machine - channel only"),
+            }
+        }
+    }
     Ok(())
 }
 

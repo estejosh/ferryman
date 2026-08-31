@@ -20,6 +20,7 @@ pub mod credentials;
 pub mod discovery;
 pub mod encrypt;
 pub mod events;
+pub mod ferry;
 pub mod interrupt;
 pub mod keys;
 pub mod known;
