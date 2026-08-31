@@ -914,6 +914,16 @@ impl Task {
             .any(|claim| claim.agent.eq_ignore_ascii_case(holder))
     }
 
+    /// When the holder took the task, from its own unreleased claim.
+    ///
+    /// The last resort for "when was this worker last known to exist", used when no
+    /// heartbeat was ever written.
+    fn claimed_at(&self, agent: &str) -> Option<DateTime<Utc>> {
+        self.active_claims()
+            .find(|claim| claim.agent.eq_ignore_ascii_case(agent))
+            .map(|claim| claim.claimed_at)
+    }
+
     /// The holder's heartbeat, if one was written under the holder's own name.
     fn heartbeat_for(&self, agent: &str) -> Option<&Heartbeat> {
         self.heartbeats
@@ -1006,12 +1016,26 @@ impl Task {
             // must not make the task claimable by anyone. The threshold is a generous
             // multiple of the interval so that a wrong clock does not start lying about
             // a task that is merely slow to sync.
-            if let Some(heartbeat) = self.heartbeat_for(holder)
-                && heartbeat_lapsed(heartbeat, now)
+            //
+            // The claim time is the fallback, and it is not a detail. A worker writes its
+            // first heartbeat within one interval of claiming, so a claim carrying NO
+            // heartbeat at all means the worker died between taking the task and drawing
+            // its first breath. Reading only the heartbeat made that case invisible: with
+            // nothing to compare against, the task stayed `Claimed` forever and the
+            // operator saw a healthy claim on work nobody was doing. It happened here, to
+            // a launch feature, for eighty minutes.
+            //
+            // ADR 0011 says a dead worker is recoverable. It should not quietly mean "a
+            // dead worker that lived long enough to say hello once".
+            let last_sign_of_life = self
+                .heartbeat_for(holder)
+                .map_or_else(|| self.claimed_at(holder), |beat| Some(beat.at));
+            if let Some(since) = last_sign_of_life
+                && lapsed(since, now)
             {
                 return TaskState::Stale {
                     by: holder.to_string(),
-                    since: heartbeat.at,
+                    since,
                 };
             }
             return TaskState::Claimed {
@@ -1033,10 +1057,15 @@ impl Task {
     }
 }
 
-/// Whether a heartbeat is old enough to report its task as stale.
-fn heartbeat_lapsed(heartbeat: &Heartbeat, now: DateTime<Utc>) -> bool {
+/// Whether the last sign of life from a worker is old enough to report its task as
+/// stale.
+///
+/// Takes the instant rather than the heartbeat record, because the instant is sometimes
+/// the claim: a worker that died before its first heartbeat has no record to hand over,
+/// and that case must not be exempt from the question.
+fn lapsed(since: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     let threshold = chrono::Duration::seconds(HEARTBEAT_INTERVAL_SECS * HEARTBEAT_STALE_MULTIPLE);
-    now.signed_duration_since(heartbeat.at) > threshold
+    now.signed_duration_since(since) > threshold
 }
 
 fn tasks_root(route: &ProjectRoute) -> PathBuf {
@@ -8292,6 +8321,44 @@ mod work_over_files_tests {
             "oldest claim wins, and every machine computes that identically from the same files"
         );
     }
+    /// The case that hid a dead worker for eighty minutes.
+    ///
+    /// A worker writes its first heartbeat within one interval of claiming, so a claim
+    /// carrying no heartbeat at all means it died between taking the task and drawing
+    /// breath. That used to read as a healthy `Claimed` forever, because the staleness
+    /// test had nothing to compare against - the one shape of death the recovery story
+    /// could not see, and the one that actually happened.
+    #[test]
+    fn a_worker_that_died_before_its_first_heartbeat_does_not_look_healthy_forever() {
+        let (_t, route, ids) = signed_channel();
+        issue_order(&route, &signed(&ids, order("t-dead", None, false))).unwrap();
+        claim_order(&route, "t-dead", "fang").unwrap();
+
+        // Just after claiming nothing is wrong: it is simply early.
+        assert!(matches!(
+            read_task(&route, "t-dead").unwrap().state(),
+            TaskState::Claimed { .. }
+        ));
+
+        // Age the claim past the lapse window, and never write a heartbeat at all.
+        let path = task_dir(&route, "t-dead").join("claim.fang.json");
+        let mut held: Claim = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        held.claimed_at = Utc::now()
+            - chrono::Duration::seconds(HEARTBEAT_INTERVAL_SECS * HEARTBEAT_STALE_MULTIPLE + 60);
+        atomic_json(&path, &held).unwrap();
+
+        let task = read_task(&route, "t-dead").unwrap();
+        assert!(
+            matches!(task.state(), TaskState::Stale { ref by, .. } if by == "fang"),
+            "a claim with no heartbeat must go stale from the claim time, got {:?}",
+            task.state()
+        );
+
+        // Stale stays display-only: still held, not up for grabs.
+        assert!(work_for(&route, "wisp").unwrap().is_empty());
+        assert_eq!(work_for(&route, "fang").unwrap().len(), 1);
+    }
+
     #[test]
     fn a_claim_whose_heartbeat_has_lapsed_reads_stale_and_stays_held() {
         let (_t, route, ids) = signed_channel();
