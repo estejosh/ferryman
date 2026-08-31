@@ -342,6 +342,40 @@ pub async fn keep_current() {
     }
 }
 
+/// Check for a newer release and install it, reporting whether the caller should now
+/// stand down so the new version can take over.
+///
+/// Separate from [`keep_current`] only in what it returns: a long-running worker needs to
+/// know that the binary changed, because it is the one thing that will never notice on
+/// its own. Everything else about it - the six-hour rate limit, applying rather than
+/// nagging, never touching a running process - is the same.
+pub async fn update_and_hand_over() -> bool {
+    if std::env::var("FERRYMAN_NO_AUTO_UPDATE").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return false;
+    }
+    if checked_recently() {
+        return false;
+    }
+    remember_check();
+
+    let Ok(latest) = latest_release().await else {
+        return false;
+    };
+    if !is_newer(&latest) {
+        return false;
+    }
+    match apply(&latest).await {
+        Ok(installed) => {
+            println!("  updated ferry to {installed}");
+            true
+        }
+        Err(error) => {
+            println!("  could not update to {latest}: {error}");
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

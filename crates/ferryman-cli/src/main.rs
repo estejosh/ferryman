@@ -3405,6 +3405,29 @@ async fn agent_command(command: Agent) -> Result<()> {
                 .unwrap_or(std::time::Duration::from_secs(300));
             let mut fleet = fleet;
             loop {
+                // Keeping a long-running worker current.
+                //
+                // `keep_current` on startup was not enough, and the gap is the whole
+                // problem: these run for weeks under a supervisor and never restart, so
+                // the machines doing the most work were the last to get any fix. Checking
+                // only at start means "auto-update" that never updates anything.
+                //
+                // So it checks here too, between passes - rate-limited to once every six
+                // hours inside `keep_current`, which costs one API call.
+                //
+                // And when it does update, this process stops. It has to: the binary on
+                // disk is new and this process is still the old code, and nothing else
+                // will ever bring it forward. Stopping BETWEEN passes rather than mid-task
+                // is what makes that safe - every task in flight has already finished, and
+                // a supervisor with `Restart=always` brings it straight back on the new
+                // version. Without a supervisor it stays stopped, which is why this says
+                // so rather than exiting silently.
+                if update::update_and_hand_over().await {
+                    report.info("updated on disk; stopping so the next start runs the new version");
+                    report.info("  (a supervised worker restarts by itself)");
+                    return Ok(());
+                }
+
                 for (route, config) in &mut fleet.served {
                     match agent::work_once(route, config, &report).await {
                         Ok(0) => {}
