@@ -228,15 +228,21 @@ textarea.notes:focus{border-color:var(--accent-dim)}
   <div class="box">
     <h1 id="auth-title">Sign in</h1>
     <p id="auth-sub">This dashboard is bound to loopback. Your identity is held on this machine.</p>
+    <!-- No `name` on the secret fields, and no `action`. A form with neither submits by
+         GET to the current URL, so a submit that the script did not intercept - a stale
+         Enter before the listener attached, or any error earlier in the script - would put
+         the recovery phrase, the password and the setup token in a query string, and from
+         there into history and every access log. A control with no `name` is never
+         serialised. The script reads all of these by id. -->
     <form id="auth-form" autocomplete="off">
       <label for="auth-name">Operator name</label>
-      <input id="auth-name" name="name" autocomplete="username" required>
+      <input id="auth-name" autocomplete="username" required>
       <label for="auth-phrase" id="auth-phrase-label" hidden>Recovery phrase (24 words)</label>
-      <textarea id="auth-phrase" name="phrase" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off" hidden></textarea>
+      <textarea id="auth-phrase" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off" hidden></textarea>
       <label for="auth-password" id="auth-password-label">Password</label>
-      <input id="auth-password" name="password" type="password" autocomplete="current-password" required>
+      <input id="auth-password" type="password" autocomplete="current-password" required>
       <label for="auth-setup" id="auth-setup-label" hidden>Setup token (printed in the terminal)</label>
-      <input id="auth-setup" name="setup" autocomplete="off" hidden>
+      <input id="auth-setup" autocomplete="off" hidden>
       <button class="btn primary" id="auth-submit" type="submit">Sign in</button>
     </form>
     <div class="msg" id="auth-msg" role="status"></div>
@@ -327,7 +333,8 @@ const state = { me: null, project: "—", tasks: [], roster: [], team: null, fil
 // The session token lives in memory and in sessionStorage (per-tab, gone on close), never
 // in localStorage: a session is meant to be short-lived and idle-expiring, not a standing
 // credential on disk. The recovery phrase is deliberately NOT stored anywhere - not even
-// here - and is held only in `pendingPhrase` below for the few seconds it is on screen.
+// here - and is held only in `pendingPhrase` below, and in the grid it is rendered into,
+// for the few seconds it is on screen; `forgetPhrase()` clears both.
 let sessionToken = sessionStorage.getItem("ferryman.dashboard.token") || null;
 
 async function api(path, opts) {
@@ -386,6 +393,7 @@ let firstRun = false;     // no operator on this machine yet -> create needs the
 let pendingPhrase = null; // the one place the recovery phrase lives, for seconds only
 
 function showLogin() {
+  forgetPhrase();
   $("#app").classList.remove("on");
   $("#phrase").style.display = "none";
   $("#login").style.display = "grid";
@@ -407,7 +415,9 @@ function renderAuth() {
   $("#auth-phrase-label").hidden = !isRecover;
   $("#auth-phrase").hidden = !isRecover;
   $("#auth-phrase").required = isRecover;
-  const needSetup = isCreate && firstRun;
+  // Recovery creates an operator and hands back a session, exactly as creation does, so
+  // on a first run it needs the same one-time console token.
+  const needSetup = firstRun && (isCreate || isRecover);
   $("#auth-setup-label").hidden = !needSetup;
   $("#auth-setup").hidden = !needSetup;
   $("#auth-setup").required = needSetup;
@@ -432,8 +442,21 @@ $("#auth-recover").addEventListener("click", () => {
   renderAuth();
 });
 
-function enterApp() {
+// Take the phrase out of the page: the variable, the grid it was rendered into, and the
+// three confirmation boxes. Clearing `pendingPhrase` alone left all 24 words sitting in
+// the DOM of a hidden div for the life of the tab, where anything running on the page
+// could read them back long after the screen was gone.
+function forgetPhrase() {
   pendingPhrase = null;
+  $("#phrase-grid").textContent = "";
+  ["#phrase-c1", "#phrase-c2", "#phrase-c3"].forEach((sel) => {
+    $(sel).value = "";
+    delete $(sel).dataset.idx;
+  });
+}
+
+function enterApp() {
+  forgetPhrase();
   showApp();
   refresh().catch(() => {});
 }
@@ -470,7 +493,6 @@ $("#phrase-continue").addEventListener("click", () => {
     $("#phrase-msg").textContent = "Those do not match. Check the word and its spelling.";
     return;
   }
-  pendingPhrase = null;
   enterApp();
 });
 
@@ -484,9 +506,12 @@ $("#auth-form").addEventListener("submit", async (ev) => {
   try {
     let resp;
     if (mode === "recover") {
+      const headers = { "content-type": "application/json" };
+      const setup = $("#auth-setup").value.trim();
+      if (setup) headers["x-ferryman-dashboard-setup"] = setup;
       resp = await api("/api/auth/recover", {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers,
         body: JSON.stringify({ phrase: $("#auth-phrase").value.trim(), name, password }),
       });
     } else if (mode === "create") {

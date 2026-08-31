@@ -62,9 +62,10 @@ recovery phrase. It is the only secret that has to survive.
 ### Every identity derives from it
 
 ```
-signing key   for agent A    = HKDF-SHA256(seed, info = "ferryman/v1/sign/"    || A)
-encryption key for agent A   = HKDF-SHA256(seed, info = "ferryman/v1/encrypt/" || A)
-operator signing identity    = HKDF-SHA256(seed, info = "ferryman/v1/operator")
+signing key   for agent A    = HKDF-SHA256(seed, info = "ferryman/v1/sign/"     || A)
+encryption key for agent A   = HKDF-SHA256(seed, info = "ferryman/v1/encrypt/"  || A)
+signing key for operator O   = HKDF-SHA256(seed, info = "ferryman/v1/operator/" || O)
+machine fingerprint          = HKDF-SHA256(seed, info = "ferryman/v1/operator")
 ```
 
 Distinct keys per agent, so the property the whole design rests on survives: when
@@ -75,10 +76,22 @@ the seed or about its siblings.
 ### The operator identity
 
 The dashboard operator is **not** a second, unrelated identity; it is the seed, wearing
-a name. Its signing key is the third derivation above, `"ferryman/v1/operator"` — a
-purpose string with no agent name after it, so it can never collide with an agent's key
-even on a machine that happens to run an agent named `operator`. Its public key is the
-single fingerprint a person reads aloud to verify a machine out of band.
+a name. Its signing key is the third derivation above, `"ferryman/v1/operator/" || O`,
+and it is bound to the operator's canonical name for exactly the reason an agent's key
+is bound to the agent's: two operators on one machine are two people. A purpose string
+with no name after it gave every operator on a machine the *same* key, so a second
+operator published a byte-identical public key under a different roster name — one key,
+two names, which is the impersonation the roster exists to catch, arriving silently.
+
+The four `info` strings cannot collide. The three prefixes share `"ferryman/v1/"` and
+then differ at byte 12 (`s`, `e`, `o`), so no name appended to one can ever equal
+another; and a per-operator string is at least one byte longer than the bare
+`"ferryman/v1/operator"`, with `/` at index 20, because an empty name is refused. Names
+are ASCII alphanumerics plus `.`, `-`, `_`, so none can contain `/`.
+
+The fourth derivation, `"ferryman/v1/operator"` with nothing after it, is **not** a
+signing key. It is one value per seed: the single machine fingerprint a person reads
+aloud to verify a machine out of band, and what `ferry identity show` prints.
 
 This closes the hole where a new user ended up with two unrelated identities — a
 dashboard password and a separate recovery phrase covering different keys, with no

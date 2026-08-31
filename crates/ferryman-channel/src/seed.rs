@@ -60,13 +60,47 @@ const SIGNING_INFO: &str = "ferryman/v1/sign/";
 /// HKDF `info` prefix for an encryption key. See [`SIGNING_INFO`].
 const ENCRYPTION_INFO: &str = "ferryman/v1/encrypt/";
 
-/// HKDF `info` for the operator's own signing identity - the one fingerprint a person
-/// reads aloud to verify, out of band, that they are talking to the right machine.
+/// HKDF `info` for the MACHINE's operator fingerprint - the one value a person reads
+/// aloud to verify, out of band, that they are talking to the right machine.
 ///
-/// A purpose string of its own, with no agent name after it, so it can never collide
-/// with a real agent's key even on a machine that happens to run an agent named
-/// "operator".
+/// A purpose string of its own, with no name after it: there is exactly one of these per
+/// seed, which is the property that makes it a *machine* fingerprint. It is never used as
+/// a signing key for a person - see [`OPERATOR_KEY_INFO`].
 const OPERATOR_INFO: &str = "ferryman/v1/operator";
+
+/// HKDF `info` prefix for one NAMED operator's signing key.
+///
+/// The name goes after the prefix, exactly as [`SIGNING_INFO`] and [`ENCRYPTION_INFO`]
+/// carry an agent's. It has to. With a bare purpose string every operator created on a
+/// machine derived the same 32 bytes, so a second operator published a byte-identical
+/// public key under a different roster name - two names sharing one key, which is the
+/// impersonation shape this project exists to prevent, and it happened silently with no
+/// error and no test failing.
+///
+/// # Why it cannot collide with any other derivation from this seed
+///
+/// Every `info` in the scheme is one of four fixed byte strings, optionally followed by a
+/// canonical name:
+///
+/// ```text
+/// "ferryman/v1/sign/"     || agent
+/// "ferryman/v1/encrypt/"  || agent
+/// "ferryman/v1/operator/" || operator
+/// "ferryman/v1/operator"                 (the machine fingerprint, nothing appended)
+/// ```
+///
+/// The three prefixes share `"ferryman/v1/"` and then differ at index 12 - `s`, `e`, `o` -
+/// so two `info` strings built from different prefixes differ at byte 12 whatever names
+/// are appended. No agent name can make an agent key equal an operator key, and no
+/// operator name can make an operator key equal an agent key.
+///
+/// Against the bare machine fingerprint the separation is by length: that string is 20
+/// bytes and a per-operator string is at least 21, because [`is_safe_component`] refuses
+/// an empty name, and its byte at index 20 is `/`.
+///
+/// Finally, [`is_safe_component`] admits only ASCII alphanumerics, `.`, `-` and `_`, so a
+/// name can never contain `/` and the boundary between prefix and name is unambiguous.
+const OPERATOR_KEY_INFO: &str = "ferryman/v1/operator/";
 
 /// A machine's operator seed: 32 random bytes, created once, from which every
 /// identity on that machine can be derived.
@@ -238,30 +272,27 @@ impl OperatorSeed {
         ))
     }
 
-    /// The operator's own signing identity, derived from the seed.
+    /// The MACHINE's operator identity, derived from the seed.
     ///
-    /// The seed derives a *distinct* key for every agent, so that a breakage at 3am
-    /// can be traced to one agent. The operator is the one thing that is not an agent:
-    /// its public key is the single fingerprint a person reads aloud to a colleague to
-    /// verify, out of band, that they are talking to the right machine (ADR 0016).
+    /// One per seed, and deliberately not bound to any name: its public key is the single
+    /// fingerprint a person reads aloud to a colleague to verify, out of band, that they
+    /// are talking to the right machine (ADR 0016).
     ///
-    /// Like [`Self::signing_identity`], this derives and does not consult the keystore:
-    /// it is the derivation of the operator's identity, not a lookup of what is on disk.
+    /// This is not the key any operator signs with. A *person* signs with
+    /// [`Self::operator_identity_for`], which binds their name.
+    ///
+    /// Like [`Self::signing_identity`], this derives and does not consult the keystore.
     pub fn operator_identity(&self) -> Result<AgentIdentity> {
         Ok(AgentIdentity::from_seed(
             "operator",
-            self.operator_signing_seed()?,
+            self.machine_signing_seed()?,
         ))
     }
 
-    /// The 32 bytes the operator's ed25519 signing key is built from.
-    ///
-    /// The third derivation alongside [`SIGNING_INFO`] and [`ENCRYPTION_INFO`], with no
-    /// agent name after the `info` string. [`Self::operator_identity`] wraps these bytes in
-    /// a keypair; this exists so the dashboard can seal the operator's signing key under its
-    /// password (ADR 0016) exactly as it sealed a minted one before - the password is the
-    /// local unlock, and the seed is what it unlocks.
-    pub fn operator_signing_seed(&self) -> Result<[u8; 32]> {
+    /// The 32 bytes behind the machine fingerprint. Private: nothing outside this module
+    /// has any business sealing these as somebody's signing key, which is exactly the
+    /// mistake that gave every operator on a machine one shared key.
+    fn machine_signing_seed(&self) -> Result<[u8; 32]> {
         let mut derived = [0_u8; 32];
         Hkdf::<Sha256>::new(None, &self.bytes)
             .expand(OPERATOR_INFO.as_bytes(), &mut derived)
@@ -269,7 +300,34 @@ impl OperatorSeed {
         Ok(derived)
     }
 
-    /// The operator fingerprint: the public key of [`Self::operator_identity`], as hex.
+    /// One named operator's signing identity, derived.
+    ///
+    /// Two operators on one machine are two people, so they get two keys - the same reason
+    /// two agents do. The name is canonicalised and an unsafe one is refused, exactly as in
+    /// [`Self::signing_seed`]; see [`OPERATOR_KEY_INFO`] for why this can never collide
+    /// with an agent's key or with the machine fingerprint.
+    ///
+    /// Like [`Self::signing_identity`], this derives and does not consult the keystore.
+    pub fn operator_identity_for(&self, operator: &str) -> Result<AgentIdentity> {
+        Ok(AgentIdentity::from_seed(
+            &canonical_agent_name(operator),
+            self.operator_signing_seed(operator)?,
+        ))
+    }
+
+    /// The 32 bytes a named operator's ed25519 signing key is built from.
+    ///
+    /// The third derivation alongside [`SIGNING_INFO`] and [`ENCRYPTION_INFO`], and bound
+    /// to the operator's name for the same reason those are bound to an agent's.
+    /// [`Self::operator_identity_for`] wraps these bytes in a keypair; this exists so the
+    /// dashboard can seal an operator's signing key under their password (ADR 0016)
+    /// exactly as it sealed a minted one before - the password is the local unlock, and
+    /// the seed is what it unlocks.
+    pub fn operator_signing_seed(&self, operator: &str) -> Result<[u8; 32]> {
+        self.derive(OPERATOR_KEY_INFO, operator)
+    }
+
+    /// The machine fingerprint: the public key of [`Self::operator_identity`], as hex.
     ///
     /// Safe to print and safe to publish - it is a public key, not secret material -
     /// and it is the one value a person checks out of band rather than the O(agents)
@@ -302,7 +360,7 @@ impl OperatorSeed {
     /// reads the mismatch as impersonation.
     fn derive(&self, purpose: &str, agent: &str) -> Result<[u8; 32]> {
         if !is_safe_component(agent) {
-            bail!("agent name must be a path-safe identifier")
+            bail!("name must be a path-safe identifier")
         }
         let agent = canonical_agent_name(agent);
         let mut info = Vec::with_capacity(purpose.len() + agent.len());
@@ -904,6 +962,73 @@ mod tests {
             hex::encode(seed.encryption_seed("fang").unwrap()),
             "dd527bbe58d217722789dd3854dae7180d3ef0e8be8766f8c3290f9ab3e82282",
             "the encryption derivation changed: sealed secrets become unopenable"
+        );
+    }
+
+    /// Two operators on one machine are two people, and two people are two keys.
+    ///
+    /// Before the operator derivation carried a name, both of these were the same 32
+    /// bytes: a second operator published a byte-identical public key under a different
+    /// roster name, which is precisely the impersonation the roster exists to catch, and
+    /// nothing anywhere said a word about it.
+    #[test]
+    fn two_operators_on_one_machine_do_not_share_a_key() {
+        let seed = seed(7);
+        let first = seed.operator_identity_for("ada").unwrap();
+        let second = seed.operator_identity_for("grace").unwrap();
+        assert_ne!(
+            first.public_key_hex(),
+            second.public_key_hex(),
+            "two named operators on one seed must not share one signing key"
+        );
+        assert_eq!(first.name(), "ada");
+        assert_eq!(second.name(), "grace");
+    }
+
+    /// The other half of the same claim: binding the name must not cost recovery. The
+    /// same seed and the same name derive the same key, including from a seed rebuilt out
+    /// of its own bytes the way a restored phrase rebuilds one.
+    #[test]
+    fn one_operator_name_derives_the_same_key_every_time() {
+        let seed = seed(7);
+        let first = seed.operator_identity_for("ada").unwrap();
+        let again = seed.operator_identity_for("ada").unwrap();
+        assert_eq!(first.public_key_hex(), again.public_key_hex());
+
+        let restored = OperatorSeed::from_bytes(seed.expose_bytes());
+        assert_eq!(
+            restored
+                .operator_identity_for("ada")
+                .unwrap()
+                .public_key_hex(),
+            first.public_key_hex(),
+            "a restored seed must bring the same operator back, not a stranger"
+        );
+
+        // One person, however they capitalise their own name.
+        assert_eq!(
+            seed.operator_identity_for("Ada").unwrap().public_key_hex(),
+            first.public_key_hex()
+        );
+        // And an unsafe name is refused rather than quietly folded into something else.
+        assert!(seed.operator_signing_seed("../etc").is_err());
+        assert!(seed.operator_signing_seed("").is_err());
+    }
+
+    /// An operator's key, an agent's key of the same name, and the machine fingerprint are
+    /// three different keys. The `info` strings cannot collide, and this says so out loud.
+    #[test]
+    fn an_operator_key_never_collides_with_an_agent_key_or_the_fingerprint() {
+        let seed = seed(7);
+        let operator = seed.operator_signing_seed("fang").unwrap();
+        assert_ne!(operator, seed.signing_seed("fang").unwrap());
+        assert_ne!(operator, seed.encryption_seed("fang").unwrap());
+        assert_ne!(
+            seed.operator_identity_for("operator")
+                .unwrap()
+                .public_key_hex(),
+            seed.operator_fingerprint().unwrap(),
+            "an operator NAMED `operator` must not be handed the machine fingerprint key"
         );
     }
 

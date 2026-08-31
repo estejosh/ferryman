@@ -270,8 +270,11 @@ const PUBLIC_PATHS: &[&str] = &[
     "/api/auth/create",
     "/api/auth/login",
     // Recovery and the first-run status probe are public for the same reason the page is:
-    // they are where a person with no identity yet goes, and `create`/`recover` carry
-    // their own gates (bootstrap token, or a phrase that only its owner holds).
+    // they are where a person with no identity yet goes. `create` and `recover` are not
+    // unauthenticated - each carries the same gate of its own (an existing operator's
+    // session, or the one-time console token), which is not a session and so cannot live
+    // in this layer. A recovery PHRASE is not that gate: on a machine with no seed, the
+    // caller supplies whichever phrase they like.
     "/api/auth/recover",
     "/api/auth/status",
     // Ending a session must work even after it has expired, or a stale tab can never
@@ -544,6 +547,18 @@ async fn create_operator(
     // operator record exists and is published, so a failed creation - a bad or taken name,
     // a roster write error - can never leave behind a seed whose recovery phrase was never
     // shown.
+    //
+    // The derivation is bound to the operator's NAME, so the name is settled - folded and
+    // checked - before anything derives from it. Two operators on one machine are two
+    // people and must not share a key.
+    let name = ferryman_channel::canonical_agent_name(&credentials.name);
+    if !ferryman_channel::is_safe_component(&name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "operator name must be a path-safe identifier (letters, digits, `-`, `_`, `.`)"
+                .to_string(),
+        ));
+    }
     let (signing_seed, pending_seed) = match state.operators.machine_state_dir() {
         None => {
             let mut minted = [0u8; 32];
@@ -551,12 +566,12 @@ async fn create_operator(
             (minted, None)
         }
         Some(dir) => match OperatorSeed::load(dir).map_err(internal)? {
-            Some(seed) => (seed.operator_signing_seed().map_err(internal)?, None),
+            Some(seed) => (seed.operator_signing_seed(&name).map_err(internal)?, None),
             None => {
                 let mut bytes = [0u8; 32];
                 rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
                 let seed = OperatorSeed::from_bytes(bytes);
-                let signing_seed = seed.operator_signing_seed().map_err(internal)?;
+                let signing_seed = seed.operator_signing_seed(&name).map_err(internal)?;
                 (signing_seed, Some((dir.to_path_buf(), bytes)))
             }
         },
@@ -571,7 +586,7 @@ async fn create_operator(
     let identity = crate::operators::create_operator_identity_from_seed(
         &state.route,
         &state.operators,
-        &credentials.name,
+        &name,
         &credentials.password,
         signing_seed,
     )
@@ -589,7 +604,6 @@ async fn create_operator(
         None => None,
     };
 
-    let name = identity.name().to_string();
     let public_key = identity.public_key_hex();
     let token = state.sessions.insert(identity);
     Ok(Json(json!({
@@ -614,6 +628,7 @@ struct RecoverBody {
 
 async fn recover_operator(
     State(state): State<DashboardState>,
+    headers: HeaderMap,
     Json(body): Json<RecoverBody>,
 ) -> Result<Json<Value>, DashboardError> {
     if state.read_only {
@@ -630,6 +645,42 @@ async fn recover_operator(
     let bytes = ferryman_channel::seed::phrase_to_seed(&body.phrase)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let seed = OperatorSeed::from_bytes(bytes);
+
+    // Recovery ends in a created operator and a live session, so it is the same act as
+    // `create_operator` and it gets the same two ways in - an existing operator's session,
+    // or the one-time token printed on the console.
+    //
+    // The phrase alone is NOT a gate. On a machine with no seed yet, any valid BIP-39
+    // phrase is accepted, and the attacker supplies their own: without this check, anyone
+    // who could reach the port could seed the machine, create the first operator and get a
+    // session, which is precisely the door the setup token was added to close. A machine
+    // that already holds operators but no seed was worse still - one unauthenticated POST
+    // and the caller was an operator of a fleet they had never been let into.
+    //
+    // A person locked out of the browser is not stranded: `ferry identity recover` at the
+    // terminal restores the seed, and console access is the property this gate is testing
+    // for in the first place.
+    //
+    // Ordered AFTER the phrase check so a mistyped word does not burn the one-time token
+    // and wedge a person out of their own first run. Validating a phrase writes nothing
+    // and tells an anonymous caller only whether a BIP-39 checksum holds.
+    if state.operators.any() {
+        if state.sessions.resolve(session_token(&headers)).is_none() {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "sign in as an existing operator to recover another identity here, or run \
+                 `ferry identity recover` at a terminal on this machine"
+                    .to_string(),
+            ));
+        }
+    } else if !state.consume_bootstrap(bootstrap_token(&headers)) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "recovering onto this machine needs the setup token printed in the terminal \
+             running the dashboard; pass it as x-ferryman-dashboard-setup"
+                .to_string(),
+        ));
+    }
 
     let dir = state.operators.machine_state_dir().ok_or_else(|| {
         (
@@ -654,11 +705,19 @@ async fn recover_operator(
         None => seed.restore_in(dir).map_err(internal)?,
     }
 
-    let signing_seed = seed.operator_signing_seed().map_err(internal)?;
+    let name = ferryman_channel::canonical_agent_name(&body.name);
+    if !ferryman_channel::is_safe_component(&name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "operator name must be a path-safe identifier (letters, digits, `-`, `_`, `.`)"
+                .to_string(),
+        ));
+    }
+    let signing_seed = seed.operator_signing_seed(&name).map_err(internal)?;
     let identity = crate::operators::create_operator_identity_from_seed(
         &state.route,
         &state.operators,
-        &body.name,
+        &name,
         &body.password,
         signing_seed,
     )
@@ -703,9 +762,13 @@ async fn identity(
     let fingerprint = me.public_key_hex();
     let (derives, seed_present) = match state.operators.machine_state_dir() {
         Some(dir) => match OperatorSeed::load(dir).map_err(internal)? {
+            // Against the derivation for THIS operator's name, not the machine
+            // fingerprint: the machine fingerprint is one value per seed and is nobody's
+            // signing key, so comparing a person's key with it would answer "no" for
+            // every operator that does derive.
             Some(seed) => (
-                seed.operator_fingerprint()
-                    .map(|f| f == fingerprint)
+                seed.operator_identity_for(me.name())
+                    .map(|derived| derived.public_key_hex() == fingerprint)
                     .unwrap_or(false),
                 true,
             ),
@@ -2127,7 +2190,9 @@ mod tests {
             .expect("the first run wrote a seed");
         assert_eq!(
             value["fingerprint"].as_str().unwrap(),
-            seed.operator_fingerprint().unwrap()
+            seed.operator_identity_for("operator1")
+                .unwrap()
+                .public_key_hex()
         );
 
         // And the phrase round-trips to exactly that seed.
@@ -2144,11 +2209,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
         let route = Arc::new(test_route(dir.path()));
-        let app = router(state(&route, false));
+        let state = state(&route, false);
+        let setup = state
+            .bootstrap_token()
+            .expect("no operators -> setup token");
+        let app = router(state);
 
         let seed_bytes = [0x2a; 32];
         let phrase = ferryman_channel::seed::seed_to_phrase(seed_bytes).unwrap();
-        let recovered = post(
+
+        // A phrase is not a credential: on a machine with no seed the caller chooses it.
+        // Recovery is the same act as creation and carries the same gate.
+        let unauthorised = post(
+            &app,
+            "/api/auth/recover",
+            &serde_json::json!({
+                "phrase": phrase,
+                "name": "intruder",
+                "password": "hunter2-secret",
+            })
+            .to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(
+            unauthorised.status(),
+            StatusCode::UNAUTHORIZED,
+            "recovery without the console token must not seed the machine"
+        );
+
+        let recovered = post_with_setup(
             &app,
             "/api/auth/recover",
             &serde_json::json!({
@@ -2157,7 +2247,7 @@ mod tests {
                 "password": "hunter2-secret",
             })
             .to_string(),
-            None,
+            &setup,
         )
         .await;
         assert_eq!(recovered.status(), StatusCode::OK);
@@ -2170,10 +2260,27 @@ mod tests {
         assert_eq!(seed.expose_bytes(), seed_bytes);
         assert_eq!(
             value["fingerprint"].as_str().unwrap(),
-            seed.operator_fingerprint().unwrap()
+            seed.operator_identity_for("operator1")
+                .unwrap()
+                .public_key_hex()
         );
 
-        // A different phrase must not replace the seed that was just restored.
+        // A different phrase must not replace the seed that was just restored - checked
+        // through the authenticated path, since the bootstrap token is now spent.
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
         let other = ferryman_channel::seed::seed_to_phrase([0x33; 32]).unwrap();
         let conflict = post(
             &app,
@@ -2184,10 +2291,55 @@ mod tests {
                 "password": "hunter2-secret",
             })
             .to_string(),
-            None,
+            Some(&token),
         )
         .await;
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    }
+
+    /// Two operators created through the dashboard on one machine must not share a key.
+    ///
+    /// The end-to-end shape of the derivation regression: both were published to the
+    /// roster, under two names, carrying one public key.
+    #[tokio::test]
+    async fn two_dashboard_operators_do_not_share_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        let route = Arc::new(test_route(dir.path()));
+        let state = state(&route, false);
+        let setup = state
+            .bootstrap_token()
+            .expect("no operators -> setup token");
+        let app = router(state);
+
+        let first = post_with_setup(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"ada","password":"hunter2-secret"}"#,
+            &setup,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let body = first.into_body().collect().await.unwrap().to_bytes();
+        let first: Value = serde_json::from_slice(&body).unwrap();
+        let token = first["token"].as_str().unwrap().to_string();
+
+        let second = post(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"grace","password":"another-secret"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let body = second.into_body().collect().await.unwrap().to_bytes();
+        let second: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_ne!(
+            first["public_key"].as_str().unwrap(),
+            second["public_key"].as_str().unwrap(),
+            "two operators on one machine must not publish one key under two names"
+        );
     }
 
     #[tokio::test]

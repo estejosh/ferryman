@@ -1,8 +1,9 @@
 //! Password-sealed operator identities for the web dashboard.
 //!
 //! A human operator's ed25519 signing key derives from the machine's one operator
-//! seed (ADR 0016), exactly as every agent's key does: `HKDF-SHA256(seed,
-//! "ferryman/v1/operator")`. The password is no longer the root of the identity; it
+//! seed (ADR 0016), exactly as every agent's key does, and bound to their name the same
+//! way: `HKDF-SHA256(seed, "ferryman/v1/operator/" || name)`. The password is no longer
+//! the root of the identity; it
 //! is the LOCAL UNLOCK. It seals the derived signing key at rest with PBKDF2-SHA256
 //! and XChaCha20-Poly1305, so the dashboard process never holds the key until the
 //! person logs in, and holds it only in memory for the lifetime of a session.
@@ -323,13 +324,24 @@ impl OperatorStore {
         password: &str,
         this_project_only: bool,
     ) -> Result<AgentIdentity> {
+        // Checked here as well as inside `create_scoped_with_seed`, because the derivation
+        // below binds the name and would otherwise be the first thing to refuse an unsafe
+        // one - with a message about path components rather than about operator names.
+        if !is_safe_component(name) {
+            bail!("operator name must be a path-safe identifier (letters, digits, `-`, `_`, `.`)");
+        }
         // The signing key derives from the machine's one seed when it has one (ADR 0016);
         // otherwise it is minted at random, which is the behaviour every machine that
         // predates the seed already has and the one a seedless machine must keep. An
         // operator whose key already exists is never re-keyed: the duplicate check inside
         // `create_scoped_with_seed` refuses, exactly as it always has.
+        //
+        // The derivation is bound to the OPERATOR'S NAME. Without that, every operator
+        // created on one machine derived the same key, so a second operator published an
+        // identical public key under a different roster name - one key, two names, which
+        // is the impersonation the roster exists to catch.
         let signing_seed = match self.machine_seed()? {
-            Some(seed) => seed.operator_signing_seed()?,
+            Some(seed) => seed.operator_signing_seed(name)?,
             None => {
                 let mut minted = [0u8; 32];
                 rand::Rng::fill_bytes(&mut rand::rng(), &mut minted);
@@ -705,8 +717,8 @@ mod tests {
         let created = store.create("op", "correct horse battery").unwrap();
         assert_eq!(
             created.public_key_hex(),
-            seed.operator_fingerprint().unwrap(),
-            "a new operator must be the seed's operator identity, not a second random key"
+            seed.operator_identity_for("op").unwrap().public_key_hex(),
+            "a new operator must be the seed's identity for THIS name, not a random key"
         );
 
         // The password still unlocks it: the derived key is sealed at rest, exactly as a
@@ -729,11 +741,49 @@ mod tests {
         let seed = ferryman_channel::seed::OperatorSeed::create_in(machine.path()).unwrap();
         assert_ne!(
             created.public_key_hex(),
-            seed.operator_fingerprint().unwrap(),
+            seed.operator_identity_for("op").unwrap().public_key_hex(),
             "the pre-seed operator must not be re-keyed by the arrival of a seed"
         );
         let back = store.login("op", "correct horse battery").unwrap();
         assert_eq!(back.public_key_hex(), created.public_key_hex());
+    }
+
+    /// Two operators created on ONE seeded machine must not share a key.
+    ///
+    /// This is the regression the name binding exists for. The derivation used a bare
+    /// purpose string, so the second operator here published a public key identical to the
+    /// first under a different roster name - the fleet would have accepted either as the
+    /// other, silently, with no error and nothing to notice.
+    #[test]
+    fn two_operators_on_one_seeded_machine_get_different_keys() {
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        ferryman_channel::seed::OperatorSeed::create_in(machine.path()).unwrap();
+        let store = store_on(&machine, &project);
+
+        let ada = store.create("ada", "correct horse battery").unwrap();
+        let grace = store.create("grace", "a different password").unwrap();
+        assert_ne!(
+            ada.public_key_hex(),
+            grace.public_key_hex(),
+            "two operators on one seed must not publish the same key under two names"
+        );
+
+        // Both still derive - neither fell back to a minted key - so the phrase restores
+        // both of them.
+        let seed = ferryman_channel::seed::OperatorSeed::load(machine.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ada.public_key_hex(),
+            seed.operator_identity_for("ada").unwrap().public_key_hex()
+        );
+        assert_eq!(
+            grace.public_key_hex(),
+            seed.operator_identity_for("grace")
+                .unwrap()
+                .public_key_hex()
+        );
     }
 
     /// One import, and the person is themselves in every project on the machine.
