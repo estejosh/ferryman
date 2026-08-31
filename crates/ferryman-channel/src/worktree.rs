@@ -110,16 +110,88 @@ fn rev_exists(repo_dir: &str, rev: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Create a worktree for an (order, agent) pair next to `repo`, returning the
-/// worktree path and the branch. Idempotent: a re-dispatched task finds its own
-/// worktree again instead of creating a second one.
+/// The directory name under the root's `work/` segment for this repository, so two
+/// projects that happen to issue the same order id cannot share a worktree path.
+fn repo_namespace(repo: &Path) -> String {
+    crate::source::slug(repo.file_name().and_then(|n| n.to_str()).unwrap_or("repo"))
+}
+
+/// Where a worktree for `branch` *used* to live: beside the repository. Checked before
+/// the new location so worktrees created before ADR 0019 are adopted in place and never
+/// moved.
+fn legacy_worktree_dir(repo: &Path, branch: &str) -> Option<PathBuf> {
+    repo.parent().map(|parent| parent.join(branch))
+}
+
+/// The directory where a new worktree should be created: under the root's `work/`
+/// segment. Falls back to beside the repository when there is no root, so an install
+/// with no root keeps working exactly as before.
+fn preferred_worktree_dir(repo: &Path, branch: &str) -> Result<PathBuf> {
+    if let Some(work) = crate::root::work_dir() {
+        let dir = work.join(repo_namespace(repo)).join(branch);
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create worktree parent {}", parent.display()))?;
+        }
+        return Ok(dir);
+    }
+    repo.parent()
+        .map(|parent| parent.join(branch))
+        .context("no root work directory and the repo has no parent to hold a worktree")
+}
+
+/// Find the directory a worktree actually lives in, checking the legacy location first
+/// (adopt in place) and then the root's work directory.
+fn find_worktree_dir(repo: &Path, branch: &str) -> Option<PathBuf> {
+    if let Some(legacy) = legacy_worktree_dir(repo, branch)
+        && legacy.exists()
+    {
+        return Some(legacy);
+    }
+    let dir = crate::root::work_dir()?
+        .join(repo_namespace(repo))
+        .join(branch);
+    dir.exists().then_some(dir)
+}
+
+/// Clear a directory that is not a working tree, plus the stale git metadata it may have
+/// left behind. Best-effort tidying: "branch not found" during a successful repair reads
+/// like a failure, and output that has to be ignored teaches people to ignore output.
+fn clear_stale_worktree(repo_dir: &str, branch: &str, dir: &Path) -> Result<()> {
+    std::fs::remove_dir_all(dir)
+        .with_context(|| format!("clear the stale worktree at {}", dir.display()))?;
+    let _ = Command::new("git")
+        .args(["-C", repo_dir, "worktree", "prune"])
+        .stderr(Stdio::null())
+        .status();
+    let _ = Command::new("git")
+        .args(["-C", repo_dir, "branch", "-D", branch])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    Ok(())
+}
+
+/// Create a worktree for an (order, agent) pair under the root's `work/` directory,
+/// returning the worktree path and the branch. Idempotent: a re-dispatched task finds
+/// its own worktree again instead of creating a second one.
 pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(PathBuf, String)> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
     let branch = branch_name(order_id, agent);
-    let parent = repo
-        .parent()
-        .context("repo has no parent to hold a worktree")?;
-    let dir = parent.join(&branch);
+
+    // Adopt in place: a worktree an earlier version created beside the repository stays
+    // there and keeps working; it is never moved. Only a stale leftover beside the repo
+    // is cleared, and the replacement is built in the root.
+    if let Some(legacy) = legacy_worktree_dir(repo, &branch)
+        && legacy.exists()
+    {
+        if is_git_repo(&legacy) {
+            return Ok((legacy, branch));
+        }
+        clear_stale_worktree(repo_dir, &branch, &legacy)?;
+    }
+
+    let dir = preferred_worktree_dir(repo, &branch)?;
     if dir.exists() {
         // Reuse is deliberate - a re-dispatched task should land in its own worktree
         // rather than a fresh one - but only if this is still a working tree of this
@@ -131,21 +203,7 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
         if is_git_repo(&dir) {
             return Ok((dir, branch));
         }
-        std::fs::remove_dir_all(&dir)
-            .with_context(|| format!("clear the stale worktree at {}", dir.display()))?;
-        // Both are best-effort tidying of state that may or may not exist, so their
-        // complaints go nowhere: "branch not found" printed during a successful repair
-        // reads like a failure, and output that has to be ignored teaches people to
-        // ignore output.
-        let _ = Command::new("git")
-            .args(["-C", repo_dir, "worktree", "prune"])
-            .stderr(Stdio::null())
-            .status();
-        let _ = Command::new("git")
-            .args(["-C", repo_dir, "branch", "-D", &branch])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        clear_stale_worktree(repo_dir, &branch, &dir)?;
     }
     // The start point is explicit. Without it git branches from this repository's
     // HEAD, which is whatever the last thing to touch the checkout left behind -
@@ -386,9 +444,7 @@ pub fn push_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
 /// and wrong as an automatic step after a task; see [`retire_worktree`].
 pub fn remove_worktree(repo: &Path, branch: &str) -> Result<()> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
-    let parent = repo.parent().context("repo has no parent")?;
-    let dir = parent.join(branch);
-    if dir.exists() {
+    if let Some(dir) = find_worktree_dir(repo, branch) {
         let status = Command::new("git")
             .args([
                 "-C",
@@ -428,9 +484,7 @@ pub fn remove_worktree(repo: &Path, branch: &str) -> Result<()> {
 /// goes only when it holds nothing that was not already reachable from `base`.
 pub fn retire_worktree(repo: &Path, branch: &str, base: &str) -> Result<bool> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
-    let parent = repo.parent().context("repo has no parent")?;
-    let dir = parent.join(branch);
-    if dir.exists() {
+    if let Some(dir) = find_worktree_dir(repo, branch) {
         let status = Command::new("git")
             .args([
                 "-C",
@@ -770,6 +824,55 @@ mod tests {
         // output, a wrongly deleted one costs the work.
         let repo = temp_repo();
         assert!(has_commits_beyond(&repo, "no-such-branch", "no-such-base"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// The whole point of ADR 0019's worktree half: new worktrees belong under the
+    /// root's `work/`, not beside a repository that is not Ferryman's to litter.
+    #[test]
+    fn new_worktrees_go_under_the_root_not_beside_the_repo() {
+        let repo = temp_repo();
+        let (dir, branch) = create_worktree(&repo, "ENG-8", "nebra").unwrap();
+        let work = crate::root::work_dir().expect("a root work directory in tests");
+        assert!(
+            dir.starts_with(&work),
+            "worktree {dir:?} should be under the root's work dir {work:?}"
+        );
+        assert!(
+            !repo.parent().unwrap().join(&branch).exists(),
+            "the worktree must not be littered beside the repo"
+        );
+        remove_worktree(&repo, &branch).unwrap();
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A worktree created by a previous version sits beside its repo; its `.git` holds
+    /// an absolute path back, so it must be adopted in place and never moved.
+    #[test]
+    fn a_worktree_beside_the_repo_is_adopted_in_place_not_moved() {
+        let repo = temp_repo();
+        let branch = branch_name("ENG-9", "nebra");
+        let legacy = repo.parent().unwrap().join(&branch);
+        let status = Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().unwrap(),
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                legacy.to_str().unwrap(),
+                "HEAD",
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success(), "the legacy worktree was created");
+
+        let (dir, branch2) = create_worktree(&repo, "ENG-9", "nebra").unwrap();
+        assert_eq!(dir, legacy, "an existing worktree is adopted in place");
+        assert_eq!(branch2, branch);
+
+        remove_worktree(&repo, &branch).unwrap();
         let _ = fs::remove_dir_all(&repo);
     }
 }

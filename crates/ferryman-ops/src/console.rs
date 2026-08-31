@@ -1,12 +1,13 @@
 //! Cross-project master console: one aggregate view over every project a
 //! machine runs.
 //!
-//! Discovery is deliberately simple. [`fleet_summary`] looks at the parent of
-//! the current directory - the folder that holds one checkout per project - and
-//! asks [`ferryman_channel::route_for`] about each sibling directory. Any
-//! sibling with a `.ferryman/bridge.toml` is a project, so there is no registry
-//! to keep in sync: a project appears the moment its channel is on disk.
+//! Discovery used to read the directory beside wherever it was launched. That found a
+//! fleet kept as siblings and silently missed a checkout on another drive. It now reads
+//! the machine-local `.ferry` manifest first (see ADR 0019): every project the machine
+//! has adopted, wherever its repository actually is. The directory scan is kept, demoted
+//! to the thing that notices a channel nobody has recorded yet.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -26,26 +27,75 @@ pub struct ProjectSummary {
     pub engines: Vec<ferryman_channel::learning::EngineStats>,
 }
 
-/// Aggregate every project found beside the current workspace.
+/// Aggregate every project this machine knows about.
+///
+/// Sources, in order: the `.ferry` manifest, channels under the root's `comms/`, and
+/// finally the legacy scan of the launch directory's parent. Later sources only add
+/// projects nobody has recorded yet.
 pub fn fleet_summary() -> Result<Vec<ProjectSummary>> {
-    let current = std::env::current_dir().context("read the current directory")?;
-    let parent = current
-        .parent()
-        .with_context(|| format!("{} has no parent directory", current.display()))?;
-    fleet_summary_from(parent)
+    let known = ferryman_channel::root::known();
+    let comms = ferryman_channel::root::comms_dir();
+    let legacy_parent = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| cwd.parent().map(Path::to_path_buf));
+    discover(&known, comms.as_deref(), legacy_parent.as_deref())
 }
 
-/// Aggregate projects whose channel directories sit directly under `parent`.
-///
-/// Each child directory is offered to [`ferryman_channel::route_for`]. Children
-/// without a channel are simply not projects, so they are skipped. This accepts
-/// both a checkout named for the project and the Syncthing folder convention of
-/// naming a project's channel `<project>-ferryman`.
-fn fleet_summary_from(parent: &Path) -> Result<Vec<ProjectSummary>> {
+/// The whole of discovery, as a pure function of its inputs so it can be tested without
+/// moving the process's working directory.
+fn discover(
+    known: &[ferryman_channel::root::KnownProject],
+    comms: Option<&Path>,
+    legacy_parent: Option<&Path>,
+) -> Result<Vec<ProjectSummary>> {
+    let mut summaries = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // The manifest is the index: a project recorded there is found wherever its
+    // repository actually lives. A recorded path that no longer exists has already been
+    // dropped by `known`, and a project whose channel cannot be read is skipped rather
+    // than silencing every other project.
+    for project in known {
+        if let Ok(route) = ferryman_channel::route_for(&project.repository)
+            && seen.insert(route.project_id.clone())
+            && let Ok(summary) = summarize_project(&route)
+        {
+            summaries.push(summary);
+        }
+    }
+
+    // Channels sitting under the root's comms/ that nobody recorded yet.
+    if let Some(dir) = comms {
+        for route in channel_routes_under(dir)? {
+            if seen.insert(route.project_id.clone())
+                && let Ok(summary) = summarize_project(&route)
+            {
+                summaries.push(summary);
+            }
+        }
+    }
+
+    // The legacy scan, demoted to noticing a channel nobody has recorded yet.
+    if let Some(dir) = legacy_parent {
+        for route in channel_routes_under(dir)? {
+            if seen.insert(route.project_id.clone())
+                && let Ok(summary) = summarize_project(&route)
+            {
+                summaries.push(summary);
+            }
+        }
+    }
+
+    summaries.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+    Ok(summaries)
+}
+
+/// The project routes whose channel directories sit directly under `parent`.
+fn channel_routes_under(parent: &Path) -> Result<Vec<ProjectRoute>> {
     if !parent.is_dir() {
         return Ok(Vec::new());
     }
-    let mut summaries = Vec::new();
+    let mut routes = Vec::new();
     for entry in fs::read_dir(parent).with_context(|| format!("read {}", parent.display()))? {
         let entry = entry?;
         let path = entry.path();
@@ -58,15 +108,11 @@ fn fleet_summary_from(parent: &Path) -> Result<Vec<ProjectSummary>> {
         if name.starts_with('.') {
             continue;
         }
-        let Ok(route) = ferryman_channel::route_for(&path) else {
-            continue;
-        };
-        let summary =
-            summarize_project(&route).with_context(|| format!("summarize {}", path.display()))?;
-        summaries.push(summary);
+        if let Ok(route) = ferryman_channel::route_for(&path) {
+            routes.push(route);
+        }
     }
-    summaries.sort_by(|a, b| a.project_id.cmp(&b.project_id));
-    Ok(summaries)
+    Ok(routes)
 }
 
 fn summarize_project(route: &ProjectRoute) -> Result<ProjectSummary> {
@@ -195,7 +241,7 @@ mod tests {
         );
         write_project(&beta, "beta", &["t-3"], &[("claude", true)]);
 
-        let summaries = fleet_summary_from(&parent).unwrap();
+        let summaries = discover(&[], None, Some(&parent)).unwrap();
         assert_eq!(summaries.len(), 2);
 
         let acme_summary = summaries
@@ -225,5 +271,45 @@ mod tests {
         assert_eq!(beta_summary.engines[0].engine, "claude");
         assert_eq!(beta_summary.engines[0].total, 1);
         assert_eq!(beta_summary.engines[0].accepted, 1);
+    }
+
+    /// A project recorded in the manifest is found wherever its repository actually is,
+    /// with no sibling scan and no launch directory involved.
+    #[test]
+    fn a_known_project_is_found_wherever_its_repository_is() {
+        hermetic_machine();
+        let base = tempdir();
+        let repo = base.join("elsewhere").join("acme");
+        write_project(&repo, "acme", &["t-1"], &[("claude", true)]);
+        let known = vec![ferryman_channel::root::KnownProject {
+            project_id: "acme".into(),
+            channel: repo.join(".ferryman").join("ferryman"),
+            repository: repo,
+        }];
+        let summaries = discover(&known, None, None).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].project_id, "acme");
+        assert_eq!(summaries[0].tasks, 1);
+    }
+
+    /// The index and the scan can agree on a project; it must still appear once.
+    #[test]
+    fn a_project_is_reported_once_when_indexed_and_on_disk() {
+        hermetic_machine();
+        let base = tempdir();
+        let repo = base.join("elsewhere").join("acme");
+        write_project(&repo, "acme", &["t-1"], &[("claude", true)]);
+        let known = vec![ferryman_channel::root::KnownProject {
+            project_id: "acme".into(),
+            channel: repo.join(".ferryman").join("ferryman"),
+            repository: repo,
+        }];
+        let parent = base.join("fleet");
+        fs::create_dir_all(&parent).unwrap();
+        write_project(&parent.join("acme-ferryman"), "acme", &["t-1"], &[]);
+
+        let summaries = discover(&known, None, Some(&parent)).unwrap();
+        assert_eq!(summaries.len(), 1, "the same project must not appear twice");
+        assert_eq!(summaries[0].project_id, "acme");
     }
 }

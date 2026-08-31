@@ -4,7 +4,7 @@
 //! password-protected identity and hold a short-lived, idle-expiring session.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -124,10 +124,18 @@ struct ProjectParam {
     project: Option<String>,
 }
 
-/// Find a sibling project's route by id, scanning the workspace's parent. The
-/// same discovery the Fleet tab uses, so a clickable project resolves to the
-/// same channel `route_for` would find.
+/// Find a sibling project's route by id, checking the machine-local `.ferry` index
+/// first (where the repository may live on another drive) and then scanning the
+/// workspace's parent. The same discovery the Fleet tab uses, so a clickable project
+/// resolves to the same channel `route_for` would find.
 fn find_project_route(current: &ProjectRoute, id: &str) -> Option<ProjectRoute> {
+    for project in ferryman_channel::root::known() {
+        if project.project_id == id
+            && let Ok(route) = ferryman_channel::route_for(&project.repository)
+        {
+            return Some(route);
+        }
+    }
     let parent = current.workspace.parent()?;
     if !parent.is_dir() {
         return None;
@@ -1148,58 +1156,81 @@ async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, Dashb
     ))
 }
 
-/// Every project whose channel directory sits beside this workspace. A sibling
-/// directory is a project exactly when it has a `.ferryman/bridge.toml`; there
-/// is no registry to keep in sync, so a project appears the moment its channel
-/// is on disk.
+/// Every project this machine knows about.
+///
+/// Reads the machine-local `.ferry` manifest first (ADR 0019): each adopted project is
+/// found wherever its repository actually lives. The scan of the workspace's parent is
+/// kept, demoted to the thing that notices a channel nobody has recorded yet.
 fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
-    let Some(parent) = route.workspace.parent() else {
-        return Ok(Vec::new());
-    };
-    let mut projects: Vec<(String, String, usize, usize, usize)> = Vec::new();
-    if parent.is_dir() {
-        for entry in std::fs::read_dir(parent)? {
-            let entry = entry?;
-            let path = entry.path();
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if name.starts_with('.') {
-                continue;
-            }
-            let Ok(child) = ferryman_channel::route_for(&path) else {
-                continue;
-            };
-            let tasks = ferryman_channel::list_tasks(&child).unwrap_or_default();
-            let open = tasks
-                .iter()
-                .filter(|task| !matches!(task.state(), TaskState::Accepted | TaskState::Done))
-                .count();
-            projects.push((
-                child.project_id,
-                child.workspace.display().to_string(),
-                tasks.len(),
-                open,
-                tasks.len() - open,
-            ));
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut entries: Vec<Value> = Vec::new();
+
+    for project in ferryman_channel::root::known() {
+        if let Ok(child) = ferryman_channel::route_for(&project.repository)
+            && seen.insert(child.project_id.clone())
+        {
+            entries.push(project_entry(&child));
         }
     }
-    projects.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(projects
-        .into_iter()
-        .map(|(project_id, path, tasks, open, done)| {
-            json!({
-                "project_id": project_id,
-                "path": path,
-                "tasks": tasks,
-                "open": open,
-                "done": done,
-            })
-        })
-        .collect())
+
+    if let Some(comms) = ferryman_channel::root::comms_dir() {
+        collect_routes_under(&comms, &mut seen, &mut entries);
+    }
+
+    if let Some(parent) = route.workspace.parent() {
+        collect_routes_under(parent, &mut seen, &mut entries);
+    }
+
+    entries.sort_by(|a, b| a["project_id"].as_str().cmp(&b["project_id"].as_str()));
+    Ok(entries)
+}
+
+/// Add every project route under `parent` that has not already been seen.
+fn collect_routes_under(
+    parent: &std::path::Path,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<Value>,
+) {
+    if !parent.is_dir() {
+        return;
+    }
+    let Ok(dir) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in dir.flatten() {
+        let path = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        let Ok(child) = ferryman_channel::route_for(&path) else {
+            continue;
+        };
+        if seen.insert(child.project_id.clone()) {
+            entries.push(project_entry(&child));
+        }
+    }
+}
+
+/// The Fleet tab's row for one project.
+fn project_entry(child: &ProjectRoute) -> Value {
+    let tasks = ferryman_channel::list_tasks(child).unwrap_or_default();
+    let open = tasks
+        .iter()
+        .filter(|task| !matches!(task.state(), TaskState::Accepted | TaskState::Done))
+        .count();
+    json!({
+        "project_id": child.project_id,
+        "path": child.workspace.display().to_string(),
+        "tasks": tasks.len(),
+        "open": open,
+        "done": tasks.len() - open,
+    })
 }
 
 /// GET /api/memory — the project's shared memory bank, plus the knowledge graph

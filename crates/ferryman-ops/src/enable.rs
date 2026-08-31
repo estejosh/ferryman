@@ -465,6 +465,23 @@ pub fn perform(request: Request) -> Result<Outcome> {
         Some(ferryman_channel::syncthing_register_folder(&route, &share)?)
     };
 
+    // Adopt the project into the machine-local root (ADR 0019): write down where its
+    // channel and repository already are. Never a move, never required - an install
+    // with no root still works, and a failure to index costs nothing but convenience.
+    if let Some(manifest_path) = ferryman_channel::root::manifest_path() {
+        let created = ferryman_channel::root::record(
+            &route.project_id,
+            &route.communications,
+            &route.workspace,
+        )
+        .unwrap_or(false);
+        steps.push(Step {
+            what: "root manifest",
+            path: manifest_path,
+            created,
+        });
+    }
+
     Ok(Outcome {
         project,
         syncthing,
@@ -492,7 +509,8 @@ fn hermetic_machine() {
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&dir);
-    ferryman_channel::licensing::use_machine_state_dir_per_thread(dir);
+    ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.clone());
+    ferryman_channel::root::use_root_dir_per_thread(dir);
 }
 
 /// A real enabled project for other test modules in this crate.
