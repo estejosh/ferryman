@@ -971,11 +971,17 @@ enum Channel {
         /// any other machine's, which defeats the point of signing it.
         #[arg(long, value_parser = agent_name)]
         reviewer: Option<String>,
-        /// Keep it. Without this, the work is sent back and --notes is required.
+        /// Keep it. Without this, the work is sent back and notes are required.
         #[arg(long)]
         accept: bool,
-        #[arg(long)]
+        /// The verdict in your own words. Use --notes-file for anything longer than
+        /// a line: a shell mangles a multi-line note, and a review is a signed
+        /// record, so a mangled one is worse than a missing one.
+        #[arg(long, conflicts_with = "notes_file")]
         notes: Option<String>,
+        /// Read the verdict from a file, verbatim. `-` reads standard input.
+        #[arg(long)]
+        notes_file: Option<PathBuf>,
         id: String,
     },
     /// Every task and where it has got to.
@@ -5507,8 +5513,23 @@ fn channel(command: Channel) -> Result<()> {
             reviewer,
             accept,
             notes,
+            notes_file,
             id,
         } => {
+            let notes = match (notes, notes_file) {
+                (Some(notes), _) => Some(notes),
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    let mut buffer = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                        .context("read the review from standard input")?;
+                    Some(buffer)
+                }
+                (None, Some(path)) => Some(
+                    std::fs::read_to_string(&path)
+                        .with_context(|| format!("read the review from {}", path.display()))?,
+                ),
+                (None, None) => None,
+            };
             let route = here(workspace)?;
             let reviewer = ferryman_ops::identity::resolve(reviewer, &route.attachment)?;
             let task = ferryman_channel::read_task(&route, &id)?;
