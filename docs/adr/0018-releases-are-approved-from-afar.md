@@ -25,81 +25,74 @@ So the passphrase cannot move. Something else has to.
 
 ## Decision
 
-**Telegram carries the doorbell. The channel carries the authorisation. Neither carries
-the secret.**
+**Approving a release is a dashboard action, authenticated by the operator's password.
+Telegram is the doorbell. No new key, no new device, no command line.**
 
-### The mistake this avoids
+### Two mistakes this avoids
 
-The obvious design is: leave the key usable on the signing machine, and let a Telegram
-`/release approve` trigger it. It is wrong, and the reason is a fact about this fleet
-rather than a hypothetical.
+The first draft said: leave the release key usable on the signing machine and let a
+Telegram `/release approve` trigger it. Wrong, for a reason about this fleet rather than a
+hypothetical. `phone.key` is not on a phone — the `phone` identity signs on whichever
+machine runs the bridge, and ADR 0008 says so outright: the bot "shells out to the local
+CLI that already owns the key". An approval signed as `phone` proves the *bridge machine*
+acted, not that the operator did. A gate whose key lives on the machine being gated is not
+a gate; it looks like two parties and is one.
 
-`phone.key` is not on a phone. The `phone` identity signs on whichever machine runs the
-bridge — beastly holds no such key, and ADR 0008 says so outright: the bot "shells out to
-the local CLI that already owns the key". So a Telegram approval signed as `phone` proves
-**the bridge machine acted**. It does not prove the operator did.
+The second draft fixed the cryptography and broke the product: it had the operator run
+`ferry` on a phone to sign the approval. Ferryman is for people who are not going to
+install a terminal emulator on their phone, and a design that assumes otherwise has
+quietly changed who the product is for. Correct and unusable is not correct.
 
-An approval gate whose key lives on the machine being gated is not a gate. It would look
-like two parties and be one, and the bot token would be the whole of the security. That is
-worse than having no gate at all, because it reads as safe.
+### What was already here
 
-So the authorisation has to be signed by a key on a device the operator actually holds.
+The operator identity is **already** the right primitive, and it was built two ADRs ago
+without anyone noticing it solved this.
 
-### The design
+An operator's signing key derives from the machine seed (ADR 0016) and is **sealed at rest
+with their password** — PBKDF2-SHA256 at 600k iterations and XChaCha20-Poly1305. The
+dashboard process does not hold that key until the person signs in, and holds it only in
+memory for the life of the session.
 
-The release key stays **encrypted at rest** on the signing machine. What unlocks it does
-not live there.
+Which means the property this ADR needs already exists: **the fleet cannot sign as the
+operator, because the fleet does not have the password.** No new key, no second device, no
+new secret to lose. The thing that authorises is a password in the operator's head, and the
+thing being authorised is a key on the machine that is useless without it.
+
+### The flow
 
 1. The fleet prepares the release — version bumped, changelog written, CI green, commit
    pushed — and raises a signed **release request** in the channel naming the version, the
-   exact commit, the CI conclusion, and the changelog summary.
-2. Telegram shows the operator what is being approved. This is a notification and a human
-   decision surface, nothing more. It holds no authority.
-3. The operator approves **from a device that holds a key** — anything that can run
-   `ferry`: a phone with Termux, a tablet, whichever laptop they are near. That device
-   writes a signed approval naming the version and the commit, and **seals the unlock for
-   the release key to the signing machine's X25519 key**.
-4. The signing machine opens the seal — which only it can — verifies the approval against
-   the roster, tags, signs, and pushes. The unlock exists in its memory for one operation
-   and is never written down.
+   exact commit, the CI conclusion, and the changelog summary. Nothing is tagged.
+2. Telegram says a release is waiting and links to it. That is all Telegram does: it holds
+   no authority and must not be able to cause a signature.
+3. The operator opens the dashboard — on a phone, on a laptop, on whatever is to hand —
+   and signs in. Signing in unseals their operator key with their password.
+4. They see what is being approved: version, commit, CI, changelog. Then they approve, and
+   the dashboard signs the approval with the operator key that is now in memory.
+5. The signing machine verifies the approval against the roster, tags, signs, and pushes.
 
-### Why this is the product's own thesis
+Step 3 is the entire security model and it is also just "log in". That is the point.
 
-Every primitive here already exists and is already the documented rule. Secrets are set up
-once on one device and travel encrypted through the channel. Plaintext credentials never go
-into Telegram; **sealed ciphertext travels the channel freely**. One writer per path.
-Records signed and verified against the roster.
+### Reaching it from afar
 
-This is that machinery pointed at Ferryman's own release process — which is also the
-honest test of whether the machinery is any good. A secrets layer nobody trusts with their
-own signing key is a secrets layer that has not been used for anything yet.
+The dashboard binds to loopback, which is right and should stay right. Reaching it from
+outside is a **transport** problem, not a trust problem: a tunnel the operator already runs
+(cloudflared, Tailscale) puts the same loopback page on their phone without weakening
+anything. Whatever fronts it must not be allowed to become an authority — it carries bytes
+to a page that still demands a password.
 
-### What it buys
-
-**The fleet alone can never produce a release.** Not the orchestrator, not a worker, not a
-compromised bridge, not the bot token. The signing machine holds a key it cannot open; the
-operator's device holds what opens it; a release needs both. That is the property the
-current passphrase arrangement has, kept — and the operator stops having to be at a
-particular desk to exercise it.
+The Host guard must therefore be relaxed deliberately and narrowly, if at all, and the
+default stays loopback-only. An operator who has not set up a tunnel is not locked out;
+they approve the next time they are on the network, exactly as today they approve the next
+time they are at the machine.
 
 ### A release identity, not a personal one
 
-The key that signs releases is **not** the operator's personal GPG identity, and its public
-half is published in the repo and in `docs/RELEASE_PROCESS.md` exactly as the current one
-is.
-
-Even sealed at rest, a personal key on a machine that runs autonomous agents puts every
-commit that key has ever meant behind the weakest process on that box. A release key
-forfeits releases and nothing else, and it rotates without touching who he is.
-
-### The weaker tier, named so it is chosen and not drifted into
-
-If the operator has only Telegram and no device running `ferry`, a Telegram-only approval
-can still trigger a release — but then the gate really is "bot token plus bridge machine",
-and that must be stated in `docs/RELEASE_PROCESS.md` rather than implied away. It is a
-reasonable trade for a preview build and a poor one for anything a stranger installs.
-Whichever tier produced a release is recorded in the tag message, because a person reading
-`git tag -v` a year from now should be able to tell which arrangement they are trusting.
+The key that finally signs the tag is **not** the operator's personal GPG identity. Its
+public half is published in the repo and in `docs/RELEASE_PROCESS.md` exactly as the
+current one is. Even sealed, a personal key on a box running autonomous agents puts every
+commit that key has ever meant behind the weakest process on that machine. A release key
+forfeits releases and nothing else, and rotates without touching who he is.
 
 ### What refuses
 
