@@ -468,6 +468,19 @@ pub fn perform(request: Request) -> Result<Outcome> {
         Some(ferryman_channel::syncthing_register_folder(&route, &share)?)
     };
 
+    // The first `enable` on a machine makes the one place everything lives, beside the
+    // project being enabled. After this nobody runs a filing command again: using a
+    // project is what files it (see `known::remember`).
+    //
+    // Only when there is no root already, and best-effort: a filing convenience must
+    // never be the reason enabling a project fails. Nothing of the user's is moved into
+    // it - see ADR 0019 - so creating it costs them nothing but a directory.
+    if ferryman_channel::ferry::find_root().is_none()
+        && let Some(beside) = workspace.parent()
+    {
+        let _ = ferryman_channel::ferry::Root::create(&beside.join("ferry"));
+    }
+
     Ok(Outcome {
         project,
         syncthing,

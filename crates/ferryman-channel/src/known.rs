@@ -81,6 +81,13 @@ pub fn known() -> Vec<KnownProject> {
 /// remember to do it - a discovery feature that depends on being called correctly is one
 /// that will be wrong exactly when it matters.
 pub fn remember(route: &ProjectRoute) {
+    // First, always. This used to run at the end, after the index's hourly rate limit had
+    // already returned - so a project seen in the last hour was never filed, which meant
+    // the projects this machine uses MOST were the ones missing from the manifest. It is
+    // idempotent and writes only when something actually differs, so calling it every
+    // time costs a small read.
+    file_in_root(route);
+
     let Some(path) = index_path() else {
         return;
     };
@@ -114,6 +121,48 @@ pub fn remember(route: &ProjectRoute) {
 
     index.sort_by(|a, b| a.project_id.cmp(&b.project_id));
     let _ = write_index(&path, &index);
+}
+
+/// File this project in the ferry root, if there is one.
+///
+/// # Why this is not a command the person runs
+///
+/// `ferry root adopt` exists and works, and asking somebody to run it once per project
+/// is asking them to keep a filing system by hand. They will do it for the first three
+/// and then have a fleet that is half-recorded, which is worse than none - a picker
+/// showing four of nineteen projects looks like the software is broken, and they will
+/// never know which four are missing.
+///
+/// So it happens as a side effect of use, in the same funnel that already records the
+/// usage index. Use a project once and it is filed. Nobody is asked anything.
+///
+/// It only ever RECORDS. Nothing is moved, created or linked here: filing is not the
+/// place to start touching a person's directories, and adoption already refuses to move
+/// a repository at all.
+fn file_in_root(route: &ProjectRoute) {
+    let Some(root) = crate::ferry::find_root() else {
+        return;
+    };
+    // A workspace is the repository only when it actually is one. A channel synced onto a
+    // machine that does not do the work has no repo here, and inventing a path for it
+    // would be a lie the project picker then acts on.
+    let repo = route
+        .workspace
+        .join(".git")
+        .exists()
+        .then(|| route.workspace.clone());
+
+    // Only write when something is actually new or different. Every command resolves a
+    // route, so an unconditional write would mean a file rewrite per command for nothing.
+    let already = root.read().projects.into_iter().find(|entry| {
+        entry.project_id == route.project_id
+            && entry.channel == route.communications
+            && (repo.is_none() || entry.repo == repo)
+    });
+    if already.is_some() {
+        return;
+    }
+    let _ = root.adopt(&route.project_id, &route.communications, repo.as_deref());
 }
 
 fn write_index(path: &Path, index: &[KnownProject]) -> std::io::Result<()> {
@@ -192,6 +241,67 @@ mod tests {
         let found = known();
         assert_eq!(found.len(), 1, "one project, not two entries for it");
         assert_eq!(found[0].workspace, moved.workspace);
+    }
+
+    /// Using a project files it. No command, no prompt, nothing for a person to keep up
+    /// with - which is the whole point, because a filing system maintained by hand ends
+    /// up half-filled and a picker showing four of nineteen projects reads as broken.
+    #[test]
+    fn using_a_project_files_it_in_the_ferry_root_without_being_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+
+        // Somebody just uses a project. They run no filing command.
+        let route = route(dir.path(), "alpha");
+        remember(&route);
+
+        let filed = root.projects();
+        assert_eq!(filed.len(), 1, "using it was enough");
+        assert_eq!(filed[0].project_id, "alpha");
+        assert_eq!(filed[0].channel, route.communications);
+    }
+
+    /// The bug this had: filing sat behind the index's hourly rate limit, so a project
+    /// used in the last hour short-circuited before it was ever filed - meaning the
+    /// projects a machine uses most were exactly the ones missing from the manifest.
+    #[test]
+    fn a_project_already_in_the_index_still_gets_filed() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+
+        // Used once before any root existed - so it is in the index and not in a manifest.
+        let route = route(dir.path(), "alpha");
+        remember(&route);
+        assert_eq!(known().len(), 1);
+
+        // The root appears afterwards, and the project is simply used again.
+        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        assert!(root.projects().is_empty());
+        remember(&route);
+
+        assert_eq!(
+            root.projects().len(),
+            1,
+            "using it filed it, rate limit or not"
+        );
+    }
+
+    /// Filing records; it never touches anything.
+    #[test]
+    fn filing_moves_nothing_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+
+        let route = route(dir.path(), "alpha");
+        std::fs::write(route.workspace.join("mine.txt"), "untouched").unwrap();
+        remember(&route);
+
+        assert!(route.workspace.join("mine.txt").is_file());
+        assert!(route.communications.is_dir());
+        // repos/ stays empty: a link is a deliberate act, not something filing does.
+        assert_eq!(std::fs::read_dir(root.repos()).unwrap().count(), 0);
     }
 
     /// The index is a convenience, never authority: losing it must cost nothing but the
