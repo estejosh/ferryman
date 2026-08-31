@@ -5077,6 +5077,33 @@ fn channel(command: Channel) -> Result<()> {
                     "               order {:?}",
                     ferryman_channel::verify_order(&task.order, &route.agents)
                 );
+                // Why it is not being picked up, when the state alone does not say.
+                //
+                // `Offered` means "addressed to that machine", not "ready". An order
+                // held back by `--depends-on` reads exactly like one a worker is
+                // ignoring, and an operator watching a queue cannot tell the difference
+                // - I could not, and I wrote the order. The state is the truth about
+                // the claim; this line is the truth about whether anything will happen.
+                if matches!(
+                    task.state(),
+                    ferryman_channel::TaskState::Open | ferryman_channel::TaskState::Offered { .. }
+                ) && !ferryman_channel::dependencies_satisfied(&route, &task.order)?
+                {
+                    let waiting: Vec<&str> = task
+                        .order
+                        .depends_on
+                        .iter()
+                        .filter(|id| {
+                            !matches!(
+                                ferryman_channel::read_task(&route, id).map(|t| t.state()),
+                                Ok(ferryman_channel::TaskState::Accepted
+                                    | ferryman_channel::TaskState::Done)
+                            )
+                        })
+                        .map(String::as_str)
+                        .collect();
+                    println!("               waiting on {}", waiting.join(", "));
+                }
                 if let Some(missing) = task.contract_violations() {
                     if missing.is_empty() {
                         println!("               contract satisfied");

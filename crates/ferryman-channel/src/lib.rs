@@ -1439,6 +1439,20 @@ pub fn dependencies_satisfied(route: &ProjectRoute, order: &Order) -> Result<boo
 pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
     let mut out = Vec::new();
     for task in list_tasks(route)? {
+        // The same trust boundary the loop enforces before it acts. This was missing
+        // here, and the gap had a name: `ferry agent run --dry-run` printed
+        // `postpurge-20260827  claim it, then run the agent` for an order the real loop
+        // refuses on every pass, and had done for a day. A dry run that advertises work
+        // the wet run will not do is the one failure mode a dry run must not have -
+        // it is consulted precisely by someone asking "what is this machine going to
+        // do?", and it answered wrongly.
+        //
+        // Verifying here rather than only in the loop also fixes `ferry channel work`
+        // and anything else that asks what can be picked up: there is now one answer to
+        // that question rather than an optimistic one and a real one.
+        if verify_order(&task.order, &route.agents) != SignatureCheck::Valid {
+            continue;
+        }
         // An order whose dependencies are not yet done must not be offered.
         if !dependencies_satisfied(route, &task.order)? {
             continue;
@@ -8082,6 +8096,20 @@ mod work_over_files_tests {
         (temp, route, identities)
     }
 
+    /// The same order, signed by whoever issued it.
+    ///
+    /// `work_for` verifies signatures now, the way the loop always did, so a test that
+    /// issues an unsigned order and expects to see it offered is testing a state no
+    /// worker will ever act on. Signing here keeps these tests about what they are
+    /// named for.
+    fn signed(identities: &HashMap<String, AgentIdentity>, mut order: Order) -> Order {
+        identities
+            .get(&order.issued_by)
+            .expect("the issuer must be in the roster")
+            .sign_order(&mut order);
+        order
+    }
+
     fn order(id: &str, assigned_to: Option<&str>, requires_review: bool) -> Order {
         Order {
             id: id.into(),
@@ -8167,11 +8195,36 @@ mod work_over_files_tests {
     }
 
     #[test]
+    fn work_on_offer_is_work_the_loop_would_actually_do() {
+        // `--dry-run` printed `postpurge-20260827  claim it, then run the agent` every
+        // pass for an order the loop refused every pass, and had for a day. A dry run is
+        // consulted by someone asking "what is this machine about to do?"; answering
+        // with work that will never be done is the one way it must not be wrong.
+        let (_t, route, ids) = signed_channel();
+        issue_order(&route, &signed(&ids, order("t-signed", None, false))).unwrap();
+        // Unsigned, and from a name the roster does know - exactly the shape of a seat
+        // that declares it has no durable key.
+        issue_order(&route, &order("t-unsigned", None, false)).unwrap();
+
+        let offered: Vec<String> = work_for(&route, "fang")
+            .unwrap()
+            .into_iter()
+            .map(|task| task.order.id)
+            .collect();
+        assert!(offered.contains(&"t-signed".to_string()));
+        assert!(
+            !offered.contains(&"t-unsigned".to_string()),
+            "an order the loop refuses must not be offered as work: {offered:?}"
+        );
+    }
+
+    #[test]
     fn an_order_waits_for_its_dependencies() {
-        let (_t, route) = channel();
-        issue_order(&route, &order("t-1", None, false)).unwrap();
+        let (_t, route, ids) = signed_channel();
+        issue_order(&route, &signed(&ids, order("t-1", None, false))).unwrap();
         let mut dependent = order("t-2", None, false);
         dependent.depends_on = vec!["t-1".into()];
+        let dependent = signed(&ids, dependent);
         issue_order(&route, &dependent).unwrap();
         // t-1 is still open, so t-2 must not be offered for work.
         assert!(
@@ -8212,8 +8265,8 @@ mod work_over_files_tests {
     }
     #[test]
     fn a_claim_whose_heartbeat_has_lapsed_reads_stale_and_stays_held() {
-        let (_t, route) = channel();
-        issue_order(&route, &order("t-1", None, false)).unwrap();
+        let (_t, route, ids) = signed_channel();
+        issue_order(&route, &signed(&ids, order("t-1", None, false))).unwrap();
         claim_order(&route, "t-1", "fang").unwrap();
         write_heartbeat(
             &route,
@@ -8457,8 +8510,8 @@ mod work_over_files_tests {
     fn an_offered_order_is_still_work_its_machine_can_see() {
         // Offered must not become a state that hides work from the machine it was
         // addressed to, or an addressed order would never be done at all.
-        let (_t, route, _identities) = signed_channel();
-        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
+        let (_t, route, ids) = signed_channel();
+        issue_order(&route, &signed(&ids, order("t-1", Some("fang"), false))).unwrap();
         assert_eq!(work_for(&route, "fang").unwrap().len(), 1);
         assert_eq!(work_for(&route, "wisp").unwrap().len(), 0);
     }
@@ -8589,10 +8642,14 @@ mod work_over_files_tests {
 
     #[test]
     fn an_agent_only_sees_work_that_is_actually_its_own() {
-        let (_t, route) = channel();
-        issue_order(&route, &order("t-open", None, false)).unwrap();
-        issue_order(&route, &order("t-mine", Some("fang"), false)).unwrap();
-        issue_order(&route, &order("t-theirs", Some("nebra"), false)).unwrap();
+        let (_t, route, ids) = signed_channel();
+        issue_order(&route, &signed(&ids, order("t-open", None, false))).unwrap();
+        issue_order(&route, &signed(&ids, order("t-mine", Some("fang"), false))).unwrap();
+        issue_order(
+            &route,
+            &signed(&ids, order("t-theirs", Some("nebra"), false)),
+        )
+        .unwrap();
 
         let mine: Vec<_> = work_for(&route, "fang")
             .unwrap()
