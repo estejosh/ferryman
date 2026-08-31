@@ -43,6 +43,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bip39::{Language, Mnemonic};
 use hkdf::Hkdf;
 use sha2::Sha256;
 
@@ -247,11 +248,25 @@ impl OperatorSeed {
     /// Like [`Self::signing_identity`], this derives and does not consult the keystore:
     /// it is the derivation of the operator's identity, not a lookup of what is on disk.
     pub fn operator_identity(&self) -> Result<AgentIdentity> {
+        Ok(AgentIdentity::from_seed(
+            "operator",
+            self.operator_signing_seed()?,
+        ))
+    }
+
+    /// The 32 bytes the operator's ed25519 signing key is built from.
+    ///
+    /// The third derivation alongside [`SIGNING_INFO`] and [`ENCRYPTION_INFO`], with no
+    /// agent name after the `info` string. [`Self::operator_identity`] wraps these bytes in
+    /// a keypair; this exists so the dashboard can seal the operator's signing key under its
+    /// password (ADR 0016) exactly as it sealed a minted one before - the password is the
+    /// local unlock, and the seed is what it unlocks.
+    pub fn operator_signing_seed(&self) -> Result<[u8; 32]> {
         let mut derived = [0_u8; 32];
         Hkdf::<Sha256>::new(None, &self.bytes)
             .expand(OPERATOR_INFO.as_bytes(), &mut derived)
             .map_err(|_| anyhow!("could not derive the operator identity from the seed"))?;
-        Ok(AgentIdentity::from_seed("operator", derived))
+        Ok(derived)
     }
 
     /// The operator fingerprint: the public key of [`Self::operator_identity`], as hex.
@@ -302,6 +317,36 @@ impl OperatorSeed {
             .map_err(|_| anyhow!("could not derive a key from the operator seed"))?;
         Ok(derived)
     }
+}
+
+/// 32 seed bytes as a BIP-39 English recovery phrase (24 words).
+///
+/// The phrase is the seed in words, and it is the one secret that has to survive. It is
+/// shown to a person exactly once - by `ferry enable` at a terminal, or by the dashboard
+/// on first run - and never stored anywhere. This function is deliberately a free function
+/// over raw bytes rather than a method, so the only place that can produce a phrase is the
+/// place that already holds the seed in the clear for the split second it exists.
+pub fn seed_to_phrase(bytes: [u8; 32]) -> Result<String> {
+    let mnemonic = Mnemonic::from_entropy(&bytes, Language::English)
+        .map_err(|_| anyhow!("could not turn the operator seed into a recovery phrase"))?;
+    Ok(mnemonic.phrase().to_string())
+}
+
+/// A BIP-39 English recovery phrase back into 32 seed bytes, validating its checksum.
+///
+/// The phrase itself is never echoed: an invalid phrase fails with a message that names the
+/// problem but not the words, so a mistyped phrase cannot be copied out of an error log.
+pub fn phrase_to_seed(phrase: &str) -> Result<[u8; 32]> {
+    let mnemonic = Mnemonic::from_phrase(phrase, Language::English).map_err(|_| {
+        anyhow!(
+            "that did not read as a 24-word BIP-39 English recovery phrase - \
+             check the words and the order, then try again"
+        )
+    })?;
+    let entropy = mnemonic.entropy();
+    entropy
+        .try_into()
+        .map_err(|_| anyhow!("the phrase did not hold a 32-byte operator seed"))
 }
 
 /// Write a new secret file, owner-only from the moment it exists.

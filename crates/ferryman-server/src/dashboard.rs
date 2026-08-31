@@ -17,6 +17,7 @@ use axum::{
     response::Html,
     routing::{delete, get, post},
 };
+use ferryman_channel::seed::OperatorSeed;
 use ferryman_channel::{AgentIdentity, ProjectRoute, SignatureCheck, TaskState};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -268,6 +269,11 @@ const PUBLIC_PATHS: &[&str] = &[
     // (see `create_operator`), which is not a session and so cannot live in this layer.
     "/api/auth/create",
     "/api/auth/login",
+    // Recovery and the first-run status probe are public for the same reason the page is:
+    // they are where a person with no identity yet goes, and `create`/`recover` carry
+    // their own gates (bootstrap token, or a phrase that only its owner holds).
+    "/api/auth/recover",
+    "/api/auth/status",
     // Ending a session must work even after it has expired, or a stale tab can never
     // clear itself. Revoking an unknown token is already a no-op.
     "/api/auth/logout",
@@ -312,6 +318,9 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/whoami", get(whoami))
+        .route("/api/auth/recover", post(recover_operator))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/identity", get(identity))
         .route("/api/team", get(team))
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task_detail))
@@ -480,8 +489,10 @@ struct Credentials {
     password: String,
 }
 
-/// POST /api/auth/create — mint a password-sealed operator identity and publish
-/// its public key to the roster, so the fleet can verify what this human signs.
+/// POST /api/auth/create — mint a password-sealed operator identity whose signing key
+/// derives from the machine's operator seed (ADR 0016), and publish its public key to the
+/// roster so the fleet can verify what this human signs. On the very first run - no seed,
+/// no operator - it also creates the seed and returns the recovery phrase, once.
 async fn create_operator(
     State(state): State<DashboardState>,
     headers: HeaderMap,
@@ -528,6 +539,28 @@ async fn create_operator(
                 .to_string(),
         ));
     }
+    // The operator's signing key derives from the machine's one seed. Determine the
+    // signing seed WITHOUT persisting anything yet: the seed is committed only after the
+    // operator record exists and is published, so a failed creation - a bad or taken name,
+    // a roster write error - can never leave behind a seed whose recovery phrase was never
+    // shown.
+    let (signing_seed, pending_seed) = match state.operators.machine_state_dir() {
+        None => {
+            let mut minted = [0u8; 32];
+            rand::Rng::fill_bytes(&mut rand::rng(), &mut minted);
+            (minted, None)
+        }
+        Some(dir) => match OperatorSeed::load(dir).map_err(internal)? {
+            Some(seed) => (seed.operator_signing_seed().map_err(internal)?, None),
+            None => {
+                let mut bytes = [0u8; 32];
+                rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+                let seed = OperatorSeed::from_bytes(bytes);
+                let signing_seed = seed.operator_signing_seed().map_err(internal)?;
+                (signing_seed, Some((dir.to_path_buf(), bytes)))
+            }
+        },
+    };
     // Through `state.operators`, not a store this function builds for itself.
     //
     // It used to construct its own, which was invisible while every store resolved to the
@@ -535,16 +568,156 @@ async fn create_operator(
     // endpoint wrote an operator into one store while `login`, three functions down, read
     // from `state.operators` and answered 401 for the account that had just been created
     // successfully. One dashboard, one store.
-    let identity = crate::operators::create_operator_identity_in(
+    let identity = crate::operators::create_operator_identity_from_seed(
         &state.route,
         &state.operators,
         &credentials.name,
         &credentials.password,
+        signing_seed,
     )
     .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+
+    // The operator is on disk and published. Only now commit the seed, and - when it was
+    // minted here - build its phrase for the one response that carries it.
+    let phrase = match pending_seed {
+        Some((dir, bytes)) => {
+            OperatorSeed::from_bytes(bytes)
+                .restore_in(&dir)
+                .map_err(internal)?;
+            Some(ferryman_channel::seed::seed_to_phrase(bytes).map_err(internal)?)
+        }
+        None => None,
+    };
+
+    let name = identity.name().to_string();
+    let public_key = identity.public_key_hex();
+    let token = state.sessions.insert(identity);
     Ok(Json(json!({
-        "name": identity.name(),
-        "public_key": identity.public_key_hex(),
+        "token": token,
+        "name": &name,
+        "public_key": &public_key,
+        "fingerprint": &public_key,
+        "phrase": phrase,
+    })))
+}
+
+/// POST /api/auth/recover — restore a machine's operator seed from its recovery phrase and
+/// create the operator identity that derives from it, so a person on a new machine is
+/// themselves again. The phrase is validated first and never echoed, and it is refused
+/// rather than silently honoured when a different seed is already present.
+#[derive(Deserialize)]
+struct RecoverBody {
+    phrase: String,
+    name: String,
+    password: String,
+}
+
+async fn recover_operator(
+    State(state): State<DashboardState>,
+    Json(body): Json<RecoverBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    if !state.create_rate.allow(&body.name) {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many recovery attempts; slow down".to_string(),
+        ));
+    }
+    // Validate the phrase before touching anything, and never echo it. A phrase that does
+    // not parse says so without repeating a word of it.
+    let bytes = ferryman_channel::seed::phrase_to_seed(&body.phrase)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let seed = OperatorSeed::from_bytes(bytes);
+
+    let dir = state.operators.machine_state_dir().ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "this machine has no state directory, so it cannot hold an operator seed".to_string(),
+        )
+    })?;
+    match OperatorSeed::load(dir).map_err(internal)? {
+        Some(existing) if existing.expose_bytes() != bytes => {
+            return Err((
+                StatusCode::CONFLICT,
+                "this machine already has an operator seed, and the phrase you entered \
+                 restores a different one. Replacing it would change what every future \
+                 identity derives to; use `ferry identity recover --force` at a terminal if \
+                 you mean to do that deliberately."
+                    .to_string(),
+            ));
+        }
+        Some(_) => {
+            // The same seed is already here; fall through to (re)creating the operator.
+        }
+        None => seed.restore_in(dir).map_err(internal)?,
+    }
+
+    let signing_seed = seed.operator_signing_seed().map_err(internal)?;
+    let identity = crate::operators::create_operator_identity_from_seed(
+        &state.route,
+        &state.operators,
+        &body.name,
+        &body.password,
+        signing_seed,
+    )
+    .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    let name = identity.name().to_string();
+    let public_key = identity.public_key_hex();
+    let token = state.sessions.insert(identity);
+    Ok(Json(json!({
+        "token": token,
+        "name": &name,
+        "public_key": &public_key,
+        "fingerprint": &public_key,
+    })))
+}
+
+/// GET /api/auth/status — the two facts the first-run page needs before it chooses which
+/// form to show: whether an operator already exists here, and whether a seed does. Reveals
+/// only existence, never which operators or what the seed is.
+async fn auth_status(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
+    let seed_present = match state.operators.machine_state_dir() {
+        Some(dir) => OperatorSeed::load(dir).map_err(internal)?.is_some(),
+        None => false,
+    };
+    Ok(Json(json!({
+        "any_operators": state.operators.any(),
+        "seed_present": seed_present,
+        "read_only": state.read_only,
+    })))
+}
+
+/// GET /api/identity — the operator's one fingerprint, readable aloud, and whether it
+/// derives from the machine's seed. The fingerprint is a public key, safe to display and
+/// to publish; it is the value a colleague checks out of band.
+async fn identity(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    let me = state
+        .sessions
+        .resolve(session_token(&headers))
+        .ok_or((StatusCode::UNAUTHORIZED, "sign in first".to_string()))?;
+    let fingerprint = me.public_key_hex();
+    let (derives, seed_present) = match state.operators.machine_state_dir() {
+        Some(dir) => match OperatorSeed::load(dir).map_err(internal)? {
+            Some(seed) => (
+                seed.operator_fingerprint()
+                    .map(|f| f == fingerprint)
+                    .unwrap_or(false),
+                true,
+            ),
+            None => (false, false),
+        },
+        None => (false, false),
+    };
+    Ok(Json(json!({
+        "name": me.name(),
+        "fingerprint": fingerprint,
+        "derives": derives,
+        "seed_present": seed_present,
     })))
 }
 
@@ -1916,6 +2089,105 @@ mod tests {
         )
         .await;
         assert_eq!(dup.status(), StatusCode::CONFLICT);
+    }
+
+    /// The first-run create path creates the machine seed, returns its phrase exactly once,
+    /// and the operator it mints is the seed's operator identity (ADR 0016).
+    #[tokio::test]
+    async fn first_run_create_returns_a_phrase_and_derives_from_the_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        let route = Arc::new(test_route(dir.path()));
+        let state = state(&route, false);
+        let setup = state
+            .bootstrap_token()
+            .expect("no operators -> setup token");
+        let app = router(state);
+
+        let created = post_with_setup(
+            &app,
+            "/api/auth/create",
+            r#"{"name":"operator1","password":"hunter2-secret"}"#,
+            &setup,
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let body = created.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        // The phrase is returned once, on the request that created the seed.
+        let phrase = value["phrase"]
+            .as_str()
+            .expect("the first operator creation returns the recovery phrase");
+        assert_eq!(phrase.split_whitespace().count(), 24);
+
+        // The operator's key is the seed's operator fingerprint - not a second random key.
+        let seed = ferryman_channel::seed::OperatorSeed::load(&route.attachment.join("machine"))
+            .unwrap()
+            .expect("the first run wrote a seed");
+        assert_eq!(
+            value["fingerprint"].as_str().unwrap(),
+            seed.operator_fingerprint().unwrap()
+        );
+
+        // And the phrase round-trips to exactly that seed.
+        assert_eq!(
+            ferryman_channel::seed::phrase_to_seed(phrase).unwrap(),
+            seed.expose_bytes()
+        );
+    }
+
+    /// Recovery pastes the 24 words on a new machine and restores the same identity, and a
+    /// second, different phrase is refused rather than silently re-keying the machine.
+    #[tokio::test]
+    async fn recovery_restores_the_identity_from_the_phrase() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        let route = Arc::new(test_route(dir.path()));
+        let app = router(state(&route, false));
+
+        let seed_bytes = [0x2a; 32];
+        let phrase = ferryman_channel::seed::seed_to_phrase(seed_bytes).unwrap();
+        let recovered = post(
+            &app,
+            "/api/auth/recover",
+            &serde_json::json!({
+                "phrase": phrase,
+                "name": "operator1",
+                "password": "hunter2-secret",
+            })
+            .to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let body = recovered.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        let seed = ferryman_channel::seed::OperatorSeed::load(&route.attachment.join("machine"))
+            .unwrap()
+            .expect("recovery wrote the seed");
+        assert_eq!(seed.expose_bytes(), seed_bytes);
+        assert_eq!(
+            value["fingerprint"].as_str().unwrap(),
+            seed.operator_fingerprint().unwrap()
+        );
+
+        // A different phrase must not replace the seed that was just restored.
+        let other = ferryman_channel::seed::seed_to_phrase([0x33; 32]).unwrap();
+        let conflict = post(
+            &app,
+            "/api/auth/recover",
+            &serde_json::json!({
+                "phrase": other,
+                "name": "operator2",
+                "password": "hunter2-secret",
+            })
+            .to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

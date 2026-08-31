@@ -1,10 +1,15 @@
 //! Password-sealed operator identities for the web dashboard.
 //!
-//! A human operator is a separate principal from the machine identity a worker
-//! signs under. Their ed25519 signing seed is sealed at rest with a key derived
-//! from their password (PBKDF2-SHA256 + XChaCha20-Poly1305), so the dashboard
-//! process never holds the key until they log in - and holds it only in memory
-//! for the lifetime of a session.
+//! A human operator's ed25519 signing key derives from the machine's one operator
+//! seed (ADR 0016), exactly as every agent's key does: `HKDF-SHA256(seed,
+//! "ferryman/v1/operator")`. The password is no longer the root of the identity; it
+//! is the LOCAL UNLOCK. It seals the derived signing key at rest with PBKDF2-SHA256
+//! and XChaCha20-Poly1305, so the dashboard process never holds the key until the
+//! person logs in, and holds it only in memory for the lifetime of a session.
+//!
+//! The recovery phrase restores the seed, and therefore the identity. An operator
+//! whose key predates the seed keeps its key forever, exactly as an agent's does:
+//! derivation is a bootstrap for new identities, never a re-key of an old one.
 //!
 //! The files live under the project's *private* attachment directory, never in
 //! the synced channel. Only the public key is ever published (to the roster, by
@@ -20,6 +25,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit},
 };
+use ferryman_channel::seed::OperatorSeed;
 use ferryman_channel::{
     AgentIdentity, AgentRoute, ProjectRoute, is_safe_component, register_agent_key,
 };
@@ -93,6 +99,33 @@ pub fn create_operator_identity_scoped(
     this_project_only: bool,
 ) -> Result<AgentIdentity> {
     let identity = store.create_scoped(name, password, this_project_only)?;
+    publish_operator(route, store, identity)
+}
+
+/// Create an operator from an already-derived signing seed, then publish it.
+///
+/// The dashboard's first-run path calls this after deriving the operator key from the
+/// machine seed itself, so it can create the seed, show the recovery phrase, and seal the
+/// derived key under the password in one breath. `create_operator_identity` above derives
+/// the seed itself; this exists for the one caller that must also *show* the seed's phrase.
+pub fn create_operator_identity_from_seed(
+    route: &ProjectRoute,
+    store: &OperatorStore,
+    name: &str,
+    password: &str,
+    signing_seed: [u8; 32],
+) -> Result<AgentIdentity> {
+    let identity = store.create_scoped_with_seed(name, password, false, signing_seed)?;
+    publish_operator(route, store, identity)
+}
+
+/// Publish an operator's public key to the roster, unwinding the just-written file on
+/// failure so a name is never left occupied by an identity nothing can verify.
+fn publish_operator(
+    route: &ProjectRoute,
+    store: &OperatorStore,
+    identity: AgentIdentity,
+) -> Result<AgentIdentity> {
     let published = AgentRoute {
         name: identity.name().to_string(),
         role: "operator".to_string(),
@@ -110,7 +143,7 @@ pub fn create_operator_identity_scoped(
     // heard of, and the name would then be "taken" while nothing can verify
     // anything it signs - a lockout the human cannot see or fix.
     if let Err(error) = register_agent_key(route, &published, &identity) {
-        let _ = store.remove(name);
+        let _ = store.remove(identity.name());
         return Err(error);
     }
     Ok(identity)
@@ -177,6 +210,10 @@ pub struct OperatorStore {
     /// directory at all, which is the same condition under which a machine key has
     /// nowhere to live either.
     machine: Option<PathBuf>,
+    /// The machine state directory itself, where the operator seed lives. `None` under
+    /// the same condition as `machine`; distinct from `machine` because the seed is not an
+    /// operator record - it is the root the operator's key derives from (ADR 0016).
+    machine_state: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -216,7 +253,8 @@ impl OperatorStore {
     pub fn with_machine_dir(attachment: &Path, machine_dir: Option<PathBuf>) -> Self {
         Self {
             project: attachment.join("operators"),
-            machine: machine_dir.map(|dir| dir.join("operators")),
+            machine: machine_dir.as_ref().map(|dir| dir.join("operators")),
+            machine_state: machine_dir,
         }
     }
 
@@ -244,6 +282,25 @@ impl OperatorStore {
         self.machine.as_deref().unwrap_or(self.project.as_path())
     }
 
+    /// The machine's operator seed, if this machine has a state directory and a seed in
+    /// it. `None` is an ordinary answer - a machine that predates ADR 0016 has no seed -
+    /// and an unreadable seed is a loud error, exactly as `OperatorSeed::load` promises.
+    fn machine_seed(&self) -> Result<Option<OperatorSeed>> {
+        match self.machine_state.as_deref() {
+            Some(dir) => OperatorSeed::load(dir),
+            None => Ok(None),
+        }
+    }
+
+    /// The machine state directory this store reads the seed from and writes records to,
+    /// if any. The dashboard needs this to create and read the seed in the *same* place the
+    /// store reads operator records from, so the two can never disagree about which machine
+    /// they are on.
+    #[must_use]
+    pub fn machine_state_dir(&self) -> Option<&Path> {
+        self.machine_state.as_deref()
+    }
+
     /// Create a new operator identity, sealing its signing seed under the
     /// password. Refuses to replace an existing name: an operator is an
     /// identity, and quietly overwriting its key would lock it out.
@@ -266,6 +323,32 @@ impl OperatorStore {
         password: &str,
         this_project_only: bool,
     ) -> Result<AgentIdentity> {
+        // The signing key derives from the machine's one seed when it has one (ADR 0016);
+        // otherwise it is minted at random, which is the behaviour every machine that
+        // predates the seed already has and the one a seedless machine must keep. An
+        // operator whose key already exists is never re-keyed: the duplicate check inside
+        // `create_scoped_with_seed` refuses, exactly as it always has.
+        let signing_seed = match self.machine_seed()? {
+            Some(seed) => seed.operator_signing_seed()?,
+            None => {
+                let mut minted = [0u8; 32];
+                rand::Rng::fill_bytes(&mut rand::rng(), &mut minted);
+                minted
+            }
+        };
+        self.create_scoped_with_seed(name, password, this_project_only, signing_seed)
+    }
+
+    /// The same, sealing a signing seed the caller already holds rather than deriving or
+    /// minting one. The dashboard's first-run path uses this after deriving the key from
+    /// the seed it just created, so it can show the recovery phrase in the same request.
+    pub fn create_scoped_with_seed(
+        &self,
+        name: &str,
+        password: &str,
+        this_project_only: bool,
+        signing_seed: [u8; 32],
+    ) -> Result<AgentIdentity> {
         if !is_safe_component(name) {
             bail!("operator name must be a path-safe identifier (letters, digits, `-`, `_`, `.`)");
         }
@@ -279,10 +362,8 @@ impl OperatorStore {
             bail!("an operator named '{name}' already exists on this machine");
         }
 
-        let mut seed = [0u8; 32];
-        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
         let name = &ferryman_channel::canonical_agent_name(name);
-        let identity = AgentIdentity::from_seed(name, seed);
+        let identity = AgentIdentity::from_seed(name, signing_seed);
 
         let mut salt = [0u8; 16];
         let mut nonce = [0u8; 24];
@@ -290,7 +371,7 @@ impl OperatorStore {
         rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
         let cipher = XChaCha20Poly1305::new_from_slice(&derive_key(password, &salt, ITERATIONS))?;
         let sealed = cipher
-            .encrypt(&XNonce::from(nonce), seed.as_ref())
+            .encrypt(&XNonce::from(nonce), signing_seed.as_ref())
             .map_err(|_| anyhow::anyhow!("could not seal the operator key"))?;
 
         let record = OperatorRecord {
@@ -609,6 +690,50 @@ mod tests {
     /// first was noticed.
     fn store_on(machine: &tempfile::TempDir, project: &tempfile::TempDir) -> OperatorStore {
         OperatorStore::with_machine_dir(project.path(), Some(machine.path().to_path_buf()))
+    }
+
+    /// The dashboard operator derives from the machine seed, and its password is only the
+    /// local unlock (ADR 0016). Creating an operator on a machine that holds a seed must
+    /// yield the seed's operator fingerprint, not a fresh random key.
+    #[test]
+    fn a_new_operator_derives_from_the_machine_seed() {
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let seed = ferryman_channel::seed::OperatorSeed::create_in(machine.path()).unwrap();
+        let store = store_on(&machine, &project);
+
+        let created = store.create("op", "correct horse battery").unwrap();
+        assert_eq!(
+            created.public_key_hex(),
+            seed.operator_fingerprint().unwrap(),
+            "a new operator must be the seed's operator identity, not a second random key"
+        );
+
+        // The password still unlocks it: the derived key is sealed at rest, exactly as a
+        // minted one was.
+        let back = store.login("op", "correct horse battery").unwrap();
+        assert_eq!(back.public_key_hex(), created.public_key_hex());
+    }
+
+    /// An operator created before the machine had a seed is never re-keyed. Minting a seed
+    /// afterwards must not change the operator's published key.
+    #[test]
+    fn an_operator_that_predates_the_seed_keeps_its_key() {
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = store_on(&machine, &project);
+        let created = store.create("op", "correct horse battery").unwrap();
+
+        // A seed appears later (e.g. a future `ferry enable`), and it does not touch the
+        // existing operator.
+        let seed = ferryman_channel::seed::OperatorSeed::create_in(machine.path()).unwrap();
+        assert_ne!(
+            created.public_key_hex(),
+            seed.operator_fingerprint().unwrap(),
+            "the pre-seed operator must not be re-keyed by the arrival of a seed"
+        );
+        let back = store.login("op", "correct horse battery").unwrap();
+        assert_eq!(back.public_key_hex(), created.public_key_hex());
     }
 
     /// One import, and the person is themselves in every project on the machine.

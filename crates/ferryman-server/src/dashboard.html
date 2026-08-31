@@ -184,6 +184,33 @@ textarea.notes:focus{border-color:var(--accent-dim)}
 #login .msg{margin-top:12px;font-size:13px;min-height:19px;color:var(--bad)}
 #login .alt{margin-top:14px;text-align:center;font-size:13px;color:var(--dim)}
 #login .alt button{background:none;border:0;color:var(--accent);cursor:pointer;padding:0}
+#login textarea{width:100%;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:var(--radius);padding:9px 12px;outline:none;resize:vertical;min-height:74px}
+#login textarea:focus{border-color:var(--accent-dim)}
+
+/* ---------- recovery phrase (shown once) ---------- */
+#phrase{display:none;place-items:center;height:100vh;padding:20px}
+#phrase .box{width:min(560px,100%);background:var(--panel);border:1px solid var(--line);
+  border-radius:12px;padding:28px}
+#phrase h1{margin:0 0 6px;font-size:21px;letter-spacing:-.02em}
+#phrase p{margin:0 0 20px;color:var(--dim);font-size:13.5px}
+.phrase-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:18px}
+.phrase-grid .w{background:var(--panel-2);border:1px solid var(--line);border-radius:6px;
+  padding:8px 6px;font-size:12.5px;text-align:center}
+.phrase-grid .w b{color:var(--faint);font-weight:500;margin-right:5px}
+#phrase-confirm p{color:var(--dim);font-size:13px;margin:0 0 4px}
+#phrase-confirm label{display:block;font-size:12px;color:var(--faint);margin:10px 0 4px;
+  letter-spacing:.08em;text-transform:uppercase}
+#phrase-confirm input{width:100%;background:var(--panel-2);border:1px solid var(--line);
+  border-radius:var(--radius);padding:9px 12px;outline:none}
+#phrase-confirm input:focus{border-color:var(--accent-dim)}
+#phrase .btn{width:100%;margin-top:18px;justify-content:center}
+#phrase .msg{margin-top:12px;font-size:13px;min-height:19px;color:var(--bad)}
+
+/* ---------- fingerprint, readable aloud ---------- */
+.fp{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  font-size:15px;letter-spacing:.06em;word-break:break-all;background:var(--bg);
+  border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
 
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
@@ -204,15 +231,42 @@ textarea.notes:focus{border-color:var(--accent-dim)}
     <form id="auth-form" autocomplete="off">
       <label for="auth-name">Operator name</label>
       <input id="auth-name" name="name" autocomplete="username" required>
-      <label for="auth-password">Password</label>
+      <label for="auth-phrase" id="auth-phrase-label" hidden>Recovery phrase (24 words)</label>
+      <textarea id="auth-phrase" name="phrase" rows="3" spellcheck="false" autocapitalize="off" autocomplete="off" hidden></textarea>
+      <label for="auth-password" id="auth-password-label">Password</label>
       <input id="auth-password" name="password" type="password" autocomplete="current-password" required>
+      <label for="auth-setup" id="auth-setup-label" hidden>Setup token (printed in the terminal)</label>
+      <input id="auth-setup" name="setup" autocomplete="off" hidden>
       <button class="btn primary" id="auth-submit" type="submit">Sign in</button>
     </form>
     <div class="msg" id="auth-msg" role="status"></div>
-    <div class="alt">
+    <div class="alt" id="auth-alt">
       <span id="auth-alt-text">No identity on this machine yet?</span>
       <button type="button" id="auth-toggle">Create one</button>
     </div>
+    <div class="alt" id="recover-alt">
+      <span>New machine, but you kept your phrase?</span>
+      <button type="button" id="auth-recover">Recover it</button>
+    </div>
+  </div>
+</section>
+
+<section id="phrase">
+  <div class="box">
+    <h1>Your recovery phrase</h1>
+    <p>These 24 words are the only way back into your identity. Write them down in order, on paper. They are shown once, now, and never again — not on this page, not in any file, not in any email.</p>
+    <div id="phrase-grid" class="phrase-grid mono"></div>
+    <div id="phrase-confirm">
+      <p>Confirm you have it: type the three words asked for.</p>
+      <label for="phrase-c1" id="phrase-l1">Word 1</label>
+      <input id="phrase-c1" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="phrase-c2" id="phrase-l2">Word 2</label>
+      <input id="phrase-c2" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <label for="phrase-c3" id="phrase-l3">Word 3</label>
+      <input id="phrase-c3" autocomplete="off" autocapitalize="off" spellcheck="false">
+    </div>
+    <div class="msg" id="phrase-msg" role="status"></div>
+    <button class="btn primary" id="phrase-continue" type="button">Continue</button>
   </div>
 </section>
 
@@ -245,6 +299,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <button data-page="engines">Engines</button>
       <button data-page="fleet">Fleet</button>
       <button data-page="vault">Vault</button>
+      <button data-page="identity">Identity</button>
     </div>
   </nav>
 
@@ -269,8 +324,17 @@ const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) =>
 
 const state = { me: null, project: "—", tasks: [], roster: [], team: null, filter: "" };
 
+// The session token lives in memory and in sessionStorage (per-tab, gone on close), never
+// in localStorage: a session is meant to be short-lived and idle-expiring, not a standing
+// credential on disk. The recovery phrase is deliberately NOT stored anywhere - not even
+// here - and is held only in `pendingPhrase` below for the few seconds it is on screen.
+let sessionToken = sessionStorage.getItem("ferryman.dashboard.token") || null;
+
 async function api(path, opts) {
-  const res = await fetch(path, { credentials: "same-origin", ...opts });
+  opts = opts || {};
+  const headers = Object.assign({}, opts.headers || {});
+  if (sessionToken) headers["x-ferryman-dashboard-token"] = sessionToken;
+  const res = await fetch(path, { credentials: "same-origin", ...opts, headers });
   if (res.status === 401) { showLogin(); throw new Error("not signed in"); }
   if (!res.ok) throw new Error((await res.text()) || `${res.status} on ${path}`);
   return res.status === 204 ? null : res.json();
@@ -317,25 +381,97 @@ function matches(hay) {
 
 /* ---------- auth ---------- */
 
-let creating = false;
+let mode = "signin";      // "signin" | "create" | "recover"
+let firstRun = false;     // no operator on this machine yet -> create needs the setup token
+let pendingPhrase = null; // the one place the recovery phrase lives, for seconds only
 
 function showLogin() {
   $("#app").classList.remove("on");
+  $("#phrase").style.display = "none";
   $("#login").style.display = "grid";
 }
 function showApp() {
   $("#login").style.display = "none";
+  $("#phrase").style.display = "none";
   $("#app").classList.add("on");
 }
 
-$("#auth-toggle").addEventListener("click", () => {
-  creating = !creating;
-  $("#auth-title").textContent = creating ? "Create an identity" : "Sign in";
-  $("#auth-submit").textContent = creating ? "Create identity" : "Sign in";
-  $("#auth-alt-text").textContent = creating ? "Already have one?" : "No identity on this machine yet?";
-  $("#auth-toggle").textContent = creating ? "Sign in" : "Create one";
-  $("#auth-password").setAttribute("autocomplete", creating ? "new-password" : "current-password");
+function renderAuth() {
+  const isCreate = mode === "create";
+  const isRecover = mode === "recover";
+  $("#auth-title").textContent = isRecover ? "Recover your identity" : (isCreate ? "Create your identity" : "Sign in");
+  $("#auth-sub").textContent = isRecover
+    ? "Paste your 24-word recovery phrase. It restores the seed this machine's identity derives from."
+    : "This dashboard is bound to loopback. Your identity is held on this machine.";
+  $("#auth-submit").textContent = isRecover ? "Recover" : (isCreate ? "Create identity" : "Sign in");
+  $("#auth-phrase-label").hidden = !isRecover;
+  $("#auth-phrase").hidden = !isRecover;
+  $("#auth-phrase").required = isRecover;
+  const needSetup = isCreate && firstRun;
+  $("#auth-setup-label").hidden = !needSetup;
+  $("#auth-setup").hidden = !needSetup;
+  $("#auth-setup").required = needSetup;
+  $("#auth-password").setAttribute("autocomplete", isCreate ? "new-password" : "current-password");
+  // Creating another operator is an authenticated action, so the create toggle is only
+  // offered on a first run (no operator yet). Recovery is always reachable: it is how a
+  // person gets back in on a fresh machine.
+  $("#auth-alt").style.display = (isRecover || !firstRun) ? "none" : "";
+  $("#recover-alt").style.display = isRecover ? "none" : "";
+  $("#auth-alt-text").textContent = isCreate ? "Already have one?" : "No identity on this machine yet?";
+  $("#auth-toggle").textContent = isCreate ? "Sign in" : "Create one";
   $("#auth-msg").textContent = "";
+}
+
+$("#auth-toggle").addEventListener("click", () => {
+  mode = mode === "create" ? "signin" : "create";
+  renderAuth();
+});
+
+$("#auth-recover").addEventListener("click", () => {
+  mode = "recover";
+  renderAuth();
+});
+
+function enterApp() {
+  pendingPhrase = null;
+  showApp();
+  refresh().catch(() => {});
+}
+
+function showPhrase(phrase) {
+  pendingPhrase = phrase.trim().split(/\s+/);
+  $("#phrase-grid").innerHTML = pendingPhrase
+    .map((w, i) => `<div class="w"><b>${i + 1}</b>${esc(w)}</div>`)
+    .join("");
+  const idx = [];
+  while (idx.length < 3) {
+    const n = Math.floor(Math.random() * pendingPhrase.length);
+    if (!idx.includes(n)) idx.push(n);
+  }
+  idx.sort((a, b) => a - b);
+  [["#phrase-l1", "#phrase-c1"], ["#phrase-l2", "#phrase-c2"], ["#phrase-l3", "#phrase-c3"]]
+    .forEach(([label, input], i) => {
+      $(label).textContent = `Word ${idx[i] + 1}`;
+      $(input).value = "";
+      $(input).dataset.idx = idx[i];
+    });
+  $("#phrase-msg").textContent = "";
+  $("#login").style.display = "none";
+  $("#phrase").style.display = "grid";
+}
+
+$("#phrase-continue").addEventListener("click", () => {
+  if (!pendingPhrase) { enterApp(); return; }
+  const ok = ["#phrase-c1", "#phrase-c2", "#phrase-c3"].every((sel) => {
+    const el = $(sel);
+    return pendingPhrase[Number(el.dataset.idx)] === el.value.trim().toLowerCase();
+  });
+  if (!ok) {
+    $("#phrase-msg").textContent = "Those do not match. Check the word and its spelling.";
+    return;
+  }
+  pendingPhrase = null;
+  enterApp();
 });
 
 $("#auth-form").addEventListener("submit", async (ev) => {
@@ -346,18 +482,48 @@ $("#auth-form").addEventListener("submit", async (ev) => {
   msg.textContent = "";
   $("#auth-submit").disabled = true;
   try {
-    await api(creating ? "/api/auth/create" : "/api/auth/login", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ name, password }),
-    });
+    let resp;
+    if (mode === "recover") {
+      resp = await api("/api/auth/recover", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ phrase: $("#auth-phrase").value.trim(), name, password }),
+      });
+    } else if (mode === "create") {
+      const headers = { "content-type": "application/json" };
+      const setup = $("#auth-setup").value.trim();
+      if (setup) headers["x-ferryman-dashboard-setup"] = setup;
+      resp = await api("/api/auth/create", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name, password }),
+      });
+    } else {
+      resp = await api("/api/auth/login", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name, password }),
+      });
+    }
     $("#auth-password").value = "";
-    showApp();
-    await boot();
+    $("#auth-setup").value = "";
+    $("#auth-phrase").value = "";
+    if (resp && resp.token) {
+      sessionToken = resp.token;
+      sessionStorage.setItem("ferryman.dashboard.token", resp.token);
+    }
+    state.me = (resp && resp.name) || name;
+    $("#me").textContent = state.me;
+    $("#me-avatar").textContent = state.me.slice(0, 2).toUpperCase();
+    if (resp && resp.phrase) {
+      showPhrase(resp.phrase);
+    } else {
+      enterApp();
+    }
   } catch (err) {
     // Say what went wrong. "Something went wrong" teaches the operator nothing
     // and makes a wrong password indistinguishable from a broken server.
-    msg.textContent = String(err.message || err).slice(0, 200);
+    msg.textContent = String(err.message || err).slice(0, 300);
   } finally {
     $("#auth-submit").disabled = false;
   }
@@ -365,6 +531,8 @@ $("#auth-form").addEventListener("submit", async (ev) => {
 
 $("#signout").addEventListener("click", async () => {
   try { await api("/api/auth/logout", { method: "POST" }); } catch (_) {}
+  sessionToken = null;
+  sessionStorage.removeItem("ferryman.dashboard.token");
   state.me = null;
   showLogin();
 });
@@ -728,6 +896,30 @@ pages.vault = async () => `
     credential has to be rotated too. That limit is part of the design rather than a gap in it.
   </p>`;
 
+pages.identity = async () => {
+  let d;
+  try {
+    d = await api("/api/identity");
+  } catch (err) {
+    return `<div class="head"><div><h1>Identity</h1></div></div>
+      <div class="notice"><b>Could not load</b><div>${esc(err.message)}</div></div>`;
+  }
+  const groups = (d.fingerprint || "").match(/.{1,4}/g)?.join(" ") || d.fingerprint || "";
+  return `
+    <div class="head">
+      <div><h1>Identity</h1><p>Your one fingerprint, read aloud to a colleague to prove — out of band — that they are talking to you and not someone else.</p></div>
+    </div>
+    <div class="panel" style="padding:18px">
+      <div class="k" style="font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;color:var(--faint)">Operator fingerprint</div>
+      <div class="fp" style="margin:8px 0 6px">${esc(groups)}</div>
+      <p style="color:var(--dim);font-size:13px;margin:6px 0 0">
+        ${d.derives
+          ? "This identity derives from your seed, so the recovery phrase restores exactly this fingerprint."
+          : "This identity predates the machine's seed, so its key is kept forever and the recovery phrase restores the seed-derived identity instead."}
+      </p>
+    </div>`;
+};
+
 /* ---------- routing and refresh ---------- */
 
 let current = "home";
@@ -797,12 +989,33 @@ async function refresh() {
 }
 
 async function boot() {
-  const me = await api("/api/auth/whoami");
-  state.me = me?.name || "operator";
-  $("#me").textContent = state.me;
-  $("#me-avatar").textContent = state.me.slice(0, 2).toUpperCase();
-  showApp();
-  await refresh();
+  // Decide the first screen from /api/auth/status: whether an operator already exists on
+  // this machine. The page itself is a shell, so the decision is made here rather than
+  // server-rendered, the same way every other fact on this page is fetched.
+  let status = { any_operators: false, seed_present: false, read_only: false };
+  try { status = await api("/api/auth/status"); } catch (_) {}
+  firstRun = !status.any_operators;
+
+  // A token already in hand (this tab created or recovered an identity, or survived a
+  // refresh via sessionStorage) means the session may still be live.
+  if (sessionToken) {
+    try {
+      const me = await api("/api/auth/whoami");
+      state.me = me?.name || "operator";
+      $("#me").textContent = state.me;
+      $("#me-avatar").textContent = state.me.slice(0, 2).toUpperCase();
+      showApp();
+      await refresh();
+      return;
+    } catch (_) {
+      sessionToken = null;
+      sessionStorage.removeItem("ferryman.dashboard.token");
+    }
+  }
+
+  mode = status.any_operators ? "signin" : "create";
+  renderAuth();
+  showLogin();
 }
 
 // Poll gently. The channel is files on disk; hammering it buys nothing and

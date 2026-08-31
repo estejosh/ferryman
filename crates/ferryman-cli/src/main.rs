@@ -10,7 +10,6 @@ use ferryman_ops::agent;
 use ferryman_ops::enable;
 
 use anyhow::{Context, Result, bail};
-use bip39::{Language, Mnemonic};
 use clap::{Parser, Subcommand};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -4000,32 +3999,8 @@ fn ensure_operator_seed(
         state: "created",
         fingerprint: Some(seed.operator_fingerprint()?),
     };
-    let phrase = seed_to_phrase(seed.expose_bytes())?;
+    let phrase = ferryman_channel::seed::seed_to_phrase(seed.expose_bytes())?;
     Ok((report, Some(phrase)))
-}
-
-/// 32 seed bytes as a BIP-39 English recovery phrase (24 words).
-fn seed_to_phrase(bytes: [u8; 32]) -> Result<String> {
-    let mnemonic = Mnemonic::from_entropy(&bytes, Language::English)
-        .map_err(|_| anyhow::anyhow!("could not turn the operator seed into a recovery phrase"))?;
-    Ok(mnemonic.phrase().to_string())
-}
-
-/// A BIP-39 English recovery phrase back into 32 seed bytes, validating its checksum.
-///
-/// The phrase itself is never echoed: an invalid phrase fails with a message that names
-/// the problem but not the words.
-fn phrase_to_seed(phrase: &str) -> Result<[u8; 32]> {
-    let mnemonic = Mnemonic::from_phrase(phrase, Language::English).map_err(|_| {
-        anyhow::anyhow!(
-            "that did not read as a 24-word BIP-39 English recovery phrase - \
-             check the words and the order, then try again"
-        )
-    })?;
-    let entropy = mnemonic.entropy();
-    entropy
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("the phrase did not hold a 32-byte operator seed"))
 }
 
 /// The `ferry identity` subcommands: the one fingerprint, and recovery from the phrase.
@@ -4133,7 +4108,7 @@ fn identity_recover(force: bool) -> Result<()> {
     let mut bytes = None;
     for _ in 0..3 {
         let phrase = read_recovery_phrase()?;
-        match phrase_to_seed(&phrase) {
+        match ferryman_channel::seed::phrase_to_seed(&phrase) {
             Ok(valid) => {
                 bytes = Some(valid);
                 break;
@@ -6704,9 +6679,12 @@ mod tests {
     #[test]
     fn the_recovery_phrase_round_trips_the_seed_bytes() {
         let bytes = [0x5a; 32];
-        let phrase = super::seed_to_phrase(bytes).unwrap();
+        let phrase = ferryman_channel::seed::seed_to_phrase(bytes).unwrap();
         assert_eq!(phrase.split_whitespace().count(), 24, "got: {phrase}");
-        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), bytes);
+        assert_eq!(
+            ferryman_channel::seed::phrase_to_seed(&phrase).unwrap(),
+            bytes
+        );
     }
 
     /// The standard BIP-39 test vector for 256 zero bits: 23 `abandon` words and then
@@ -6714,12 +6692,15 @@ mod tests {
     /// near-cousin that a phrase from another wallet would not recover.
     #[test]
     fn the_bip39_zero_entropy_vector_is_correct() {
-        let phrase = super::seed_to_phrase([0u8; 32]).unwrap();
+        let phrase = ferryman_channel::seed::seed_to_phrase([0u8; 32]).unwrap();
         let words: Vec<&str> = phrase.split_whitespace().collect();
         assert_eq!(words.len(), 24);
         assert!(words[..23].iter().all(|w| *w == "abandon"), "got: {phrase}");
         assert_eq!(words[23], "art", "got: {phrase}");
-        assert_eq!(super::phrase_to_seed(&phrase).unwrap(), [0u8; 32]);
+        assert_eq!(
+            ferryman_channel::seed::phrase_to_seed(&phrase).unwrap(),
+            [0u8; 32]
+        );
     }
 
     /// A seed is created once, used silently after that, and never created unattended.

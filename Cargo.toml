@@ -30,6 +30,11 @@ repository = "https://github.com/estejosh/ferryman"
 anyhow = "1.0"
 async-stream = "0.3"
 async-trait = "0.1"
+# BIP-39 English recovery phrases (24 words for 32 seed bytes). `tiny-bip39` is the
+# small, maintained fork of the vetted `bip39` 0.6 with the same word list and the same
+# validation, default-features off so it compiles English only and skips the RNG helpers
+# Ferryman does not use. Renamed to `bip39` so call sites read as the standard.
+bip39 = { package = "tiny-bip39", version = "2.0.0", default-features = false }
 chacha20poly1305 = "0.11"
 axum = { version = "0.8", features = ["macros", "json"] }
 chrono = { version = "0.4", features = ["serde"] }
