@@ -61,6 +61,14 @@ that keeps itself current without being asked.
   because a worker that hands over cleanly after an update exits successfully.
 - **The dashboard reported a valid approval as coming from an unknown signer**,
   having verified it against the roster as it was at boot rather than as it is.
+- **CI's test job had been red on all three platforms since before v0.5.4**, and
+  v0.5.4 and v0.5.5 were both tagged, signed and published over it. Four dashboard
+  tests each asked for their own machine state directory through a first-call-wins
+  `OnceLock`, so three of them silently got the first one's - already holding an
+  operator - and the test that needs a virgin machine passed or failed depending on
+  which test the scheduler started first. It won that race on the maintainer's
+  machine and lost it on every runner, which is how local and CI disagreed for weeks
+  with neither of them lying.
 
 ## v0.5.5 - 2026-08-31
 
