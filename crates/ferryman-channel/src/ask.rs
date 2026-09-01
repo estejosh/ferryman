@@ -286,6 +286,7 @@ fn state_name(state: &TaskState) -> &'static str {
         TaskState::ChangesRequested { .. } => "changes requested",
         TaskState::Accepted => "accepted",
         TaskState::Done => "done",
+        TaskState::Killed { .. } => "killed",
     }
 }
 

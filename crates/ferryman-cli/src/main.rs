@@ -5573,6 +5573,9 @@ fn channel(command: Channel) -> Result<()> {
                             ferryman_channel::TaskState::Done => {
                                 "finished, no review asked for".to_string()
                             }
+                            ferryman_channel::TaskState::Killed { by, .. } => {
+                                format!("killed by {by}; nobody may claim it again")
+                            }
                             ferryman_channel::TaskState::Claimed { by } => {
                                 format!("held by {by}")
                             }

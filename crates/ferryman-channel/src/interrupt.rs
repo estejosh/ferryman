@@ -450,4 +450,172 @@ mod tests {
             payload(&interrupt).starts_with("ferryman-interrupt-v1\nt-1\nkill\nwrong branch\n")
         );
     }
+
+    /// Set up a route with one signing operator and one order on disk.
+    fn route_with_order(dir: &std::path::Path, order_id: &str) -> (ProjectRoute, crate::AgentIdentity) {
+        let mut route = route(dir);
+        let identity =
+            crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
+        route.agents = vec![crate::AgentRoute {
+            name: "orchestrator".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
+        }];
+        let task = crate::task_dir(&route, order_id);
+        std::fs::create_dir_all(&task).unwrap();
+        let mut order = crate::Order {
+            id: order_id.into(),
+            project_id: "ferryman".into(),
+            issued_by: "orchestrator".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: serde_json::json!({ "task": "do the thing" }),
+            requires_review: false,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            result_contract: None,
+            signed_by: None,
+            signature: None,
+        };
+        identity.sign_order(&mut order);
+        crate::write_task_file(&task.join("order.json"), &order).unwrap();
+        (route, identity)
+    }
+
+    fn kill(route: &ProjectRoute, identity: &crate::AgentIdentity, order_id: &str) {
+        let mut interrupt = Interrupt {
+            order_id: order_id.into(),
+            action: InterruptAction::Kill,
+            note: "superseded".into(),
+            issued_by: "orchestrator".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        identity.sign_interrupt(&mut interrupt);
+        write_interrupt(route, &interrupt).unwrap();
+    }
+
+    /// The bug this exists to prevent, exactly as it happened.
+    ///
+    /// An order killed at 20:11 was acknowledged at 23:13 and re-claimed by the same
+    /// worker at 23:45, because the ack made the interrupt stop being pending and the
+    /// order read as plainly open. It ran work the operator had stopped, and starved
+    /// live work queued behind it.
+    #[test]
+    fn acknowledging_a_kill_does_not_bring_the_order_back_to_life() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, identity) = route_with_order(dir.path(), "t-dead");
+        kill(&route, &identity, "t-dead");
+
+        // The worker sees the kill once and acknowledges it, as it always did.
+        assert_eq!(pending_interrupts(&route, "t-dead", "claw").unwrap().len(), 1);
+        acknowledge(&route, "t-dead", "orchestrator", "claw").unwrap();
+        assert!(
+            pending_interrupts(&route, "t-dead", "claw")
+                .unwrap()
+                .is_empty(),
+            "an acknowledged interrupt is no longer pending - that part was always right"
+        );
+
+        // What must not happen: the order reading as claimable again.
+        let task = crate::read_task(&route, "t-dead").unwrap();
+        assert!(
+            matches!(task.state(), crate::TaskState::Killed { .. }),
+            "an acknowledged kill still leaves the order dead, not open"
+        );
+        assert!(
+            crate::work_for(&route, "claw").unwrap().is_empty(),
+            "no machine may be offered a killed order it does not hold"
+        );
+    }
+
+    /// A kill that lands before anyone claims is just as final as one that interrupts a run.
+    #[test]
+    fn a_kill_on_an_unclaimed_order_is_final_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, identity) = route_with_order(dir.path(), "t-open");
+        assert_eq!(
+            crate::work_for(&route, "claw").unwrap().len(),
+            1,
+            "before the kill it is ordinary open work"
+        );
+        kill(&route, &identity, "t-open");
+        assert!(crate::work_for(&route, "claw").unwrap().is_empty());
+    }
+
+    /// Killing is destructive and irreversible, so it takes a valid signature. Any peer
+    /// can write into the synced folder; an unsigned kill is a forged one.
+    #[test]
+    fn an_unsigned_kill_does_not_end_an_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _identity) = route_with_order(dir.path(), "t-live");
+        let forged = Interrupt {
+            order_id: "t-live".into(),
+            action: InterruptAction::Kill,
+            note: "stop".into(),
+            issued_by: "orchestrator".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        write_interrupt(&route, &forged).unwrap();
+        let task = crate::read_task(&route, "t-live").unwrap();
+        assert!(
+            !matches!(task.state(), crate::TaskState::Killed { .. }),
+            "an unsigned kill must not end an order"
+        );
+    }
+
+    /// Pause and kill are different promises. Pause says come back to this; kill says
+    /// never. They used to do the same thing, which meant kill was only ever a pause.
+    #[test]
+    fn a_pause_leaves_the_order_claimable_and_a_kill_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, identity) = route_with_order(dir.path(), "t-paused");
+        let mut interrupt = Interrupt {
+            order_id: "t-paused".into(),
+            action: InterruptAction::Pause,
+            note: "later".into(),
+            issued_by: "orchestrator".into(),
+            created_at: Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        identity.sign_interrupt(&mut interrupt);
+        write_interrupt(&route, &interrupt).unwrap();
+        assert_eq!(
+            crate::work_for(&route, "claw").unwrap().len(),
+            1,
+            "a paused order is meant to be picked up again"
+        );
+    }
+
+    /// The one machine still holding a killed order is offered it once, so that it can
+    /// let go. Nobody else sees it, and it sees nothing after the claim is gone.
+    #[test]
+    fn the_holder_of_a_killed_order_is_offered_it_only_to_release_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, identity) = route_with_order(dir.path(), "t-held");
+        crate::claim_order(&route, "t-held", "claw").unwrap();
+        kill(&route, &identity, "t-held");
+
+        assert_eq!(
+            crate::work_for(&route, "claw").unwrap().len(),
+            1,
+            "the holder must be told, or its claim sits on the order forever"
+        );
+        assert!(
+            crate::work_for(&route, "someone-else").unwrap().is_empty(),
+            "nobody else is offered a killed order"
+        );
+
+        abandon_claim(&route, "t-held", "claw").unwrap();
+        assert!(
+            crate::work_for(&route, "claw").unwrap().is_empty(),
+            "once it has let go, the killed order is gone for everyone"
+        );
+    }
 }

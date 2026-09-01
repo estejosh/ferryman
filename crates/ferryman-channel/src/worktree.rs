@@ -110,6 +110,50 @@ fn rev_exists(repo_dir: &str, rev: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the worktree at `dir` is a checkout of `repo` and not of some other
+/// repository that happened to want the same directory name.
+///
+/// Compares the common git directory, which every worktree of a repo shares and no two
+/// repos do. A failure to ask - git missing, a directory that is no longer a checkout -
+/// answers no, because the cost of a wrong yes is running a task in the wrong project.
+fn belongs_to(dir: &Path, repo: &Path) -> bool {
+    fn common_git_dir(path: &Path) -> Option<PathBuf> {
+        let path = path.to_str()?;
+        let output = Command::new("git")
+            .args(["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let found = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        Some(found.canonicalize().unwrap_or(found))
+    }
+    match (common_git_dir(dir), common_git_dir(repo)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The `work/` subdirectory that holds one repository's worktrees.
+///
+/// Readable half so a person can see whose scratch this is; digest half so two repos
+/// with the same folder name in different places never share it.
+#[must_use]
+fn worktree_holder(repo: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let name = repo
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(crate::source::slug)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "repo".to_string());
+    // The path as written is what distinguishes two checkouts, so that is what is
+    // hashed. Case is folded because Windows would otherwise give one repo two homes.
+    let digest = Sha256::digest(repo.to_string_lossy().to_lowercase().as_bytes());
+    format!("{name}-{:06x}", u32::from_be_bytes([0, digest[0], digest[1], digest[2]]))
+}
+
 /// Create a worktree for an (order, agent) pair next to `repo`, returning the
 /// worktree path and the branch. Idempotent: a re-dispatched task finds its own
 /// worktree again instead of creating a second one.
@@ -126,16 +170,37 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
     // The old location is still honoured when a worktree is already sitting there, so an
     // install that has been running for weeks does not suddenly abandon work in
     // progress - and a machine with no ferry root behaves exactly as it always did.
-    let beside = repo
-        .parent()
-        .context("repo has no parent to hold a worktree")?
-        .join(&branch);
+    let parent = repo.parent().context("repo has no parent to hold a worktree")?;
+    let plain = parent.join(&branch);
+    // The legacy location is stepped around in exactly one case: a LIVE worktree of
+    // another repository is sitting in it. Two repos side by side, given the same order
+    // id and the same agent, both want this exact path - and the second must neither be
+    // handed the first one's checkout nor delete it as stale. A broken leftover is a
+    // different thing and is still reclaimed below; only somebody's working checkout is
+    // sacred.
+    let occupied_by_another = plain.exists() && is_git_repo(&plain) && !belongs_to(&plain, repo);
+    let beside = if occupied_by_another {
+        parent.join(format!("{branch}-{}", worktree_holder(repo)))
+    } else {
+        plain
+    };
     let dir = if beside.exists() {
         beside
     } else {
         match crate::ferry::find_root_from(repo).or_else(crate::ferry::find_root) {
             Some(root) => {
-                let work = root.work();
+                // One subdirectory per repository, not one flat pile of branches.
+                //
+                // The branch name is (order, agent). That was unambiguous while worktrees
+                // lived beside their own repo, because the repo's own path did the
+                // disambiguating. Under one shared ferry root it stops being: order ids
+                // are short human names like `update-0828`, and two projects in the same
+                // root can easily both have one. Both would resolve to the same
+                // directory, the second would find a valid checkout sitting there and
+                // reuse it, and an agent would run a whole task - and commit - in the
+                // wrong repository. Centralising `work/` is what introduced that, so
+                // centralising `work/` is what has to pay for it.
+                let work = root.work().join(worktree_holder(repo));
                 std::fs::create_dir_all(&work)
                     .with_context(|| format!("create {}", work.display()))?;
                 work.join(&branch)
@@ -151,7 +216,13 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
         // refuses to operate in it, `git status` fails, and an agent runs a whole task
         // in a directory whose changes cannot be committed. Silently doing nothing with
         // an hour of work is worse than starting over.
-        if is_git_repo(&dir) {
+        // ...and only if it is a checkout of THIS repository. `is_git_repo` answers
+        // "is there a git worktree here", which is not the question. The directory name
+        // is (order, agent); two repositories that share a parent - or share one ferry
+        // root - can both produce it, and the loser used to be handed a perfectly valid
+        // checkout of somebody else's project. It would run the task there, commit
+        // there, and report success.
+        if is_git_repo(&dir) && belongs_to(&dir, repo) {
             return Ok((dir, branch));
         }
         std::fs::remove_dir_all(&dir)
@@ -639,6 +710,45 @@ mod tests {
         remove_worktree(&repo, &branch).unwrap();
         assert!(!dir.exists(), "the worktree is gone after cleanup");
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Two repositories, one order id, one agent - which is an ordinary Tuesday under
+    /// ADR 0019, because a ferry root holds many projects and order ids are short human
+    /// names like `update-0828` that nobody coordinates across projects.
+    ///
+    /// They used to resolve to the same directory. The second task would find a valid
+    /// git checkout sitting there, reuse it, and run - and commit - in the wrong
+    /// repository, reporting success the whole way.
+    #[test]
+    fn two_repos_sharing_an_order_id_do_not_share_a_worktree() {
+        let one = temp_repo();
+        let two = temp_repo();
+
+        let (dir_one, _) = create_worktree(&one, "update-0828", "nebra").unwrap();
+        let (dir_two, _) = create_worktree(&two, "update-0828", "nebra").unwrap();
+        assert_ne!(
+            dir_one, dir_two,
+            "the same order id in two projects must not name the same directory"
+        );
+
+        // And each is a checkout of its own repository, which is the thing that actually
+        // matters: a distinct path holding the wrong repo would be no better.
+        fs::write(dir_one.join("mine.txt"), "one").unwrap();
+        assert!(
+            one.join("f.txt").exists() && dir_one.join("f.txt").exists(),
+            "the first worktree tracks the first repo"
+        );
+        assert!(
+            !dir_two.join("mine.txt").exists(),
+            "work in one project must not appear in the other"
+        );
+
+        // Asking again finds each its own again, rather than a fresh one or the neighbour's.
+        assert_eq!(create_worktree(&one, "update-0828", "nebra").unwrap().0, dir_one);
+        assert_eq!(create_worktree(&two, "update-0828", "nebra").unwrap().0, dir_two);
+
+        let _ = fs::remove_dir_all(&one);
+        let _ = fs::remove_dir_all(&two);
     }
 
     /// The defect this whole module was quietly built around: a finished task's work

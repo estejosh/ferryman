@@ -213,6 +213,7 @@ mod tests {
             reviews: vec![],
             recommendations: vec![],
             releases: vec![],
+            kills: vec![],
             heartbeats: vec![ferryman_channel::Heartbeat {
                 order_id: "t-hold".into(),
                 agent: "tester".into(),
@@ -238,6 +239,7 @@ mod tests {
             reviews: vec![],
             recommendations: vec![],
             releases: vec![],
+            kills: vec![],
             heartbeats: vec![],
         };
         assert!(current_task(std::slice::from_ref(&idle), "tester", now).is_none());

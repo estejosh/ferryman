@@ -2050,6 +2050,9 @@ fn state_value(state: &TaskState) -> Value {
         }
         TaskState::Accepted => json!({ "status": "accepted" }),
         TaskState::Done => json!({ "status": "done" }),
+        TaskState::Killed { by, at } => {
+            json!({ "status": "killed", "by": by, "at": at.to_rfc3339() })
+        }
     }
 }
 

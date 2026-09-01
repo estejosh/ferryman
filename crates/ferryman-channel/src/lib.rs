@@ -872,6 +872,23 @@ pub enum TaskState {
     Accepted,
     /// Finished, with no review asked for.
     Done,
+    /// An operator killed it. Terminal, and terminal for everyone: no machine may
+    /// claim it again.
+    ///
+    /// # Why acknowledging a kill was not enough
+    ///
+    /// The worker used to handle a kill by acknowledging the interrupt, dropping its
+    /// claim and returning. That is correct for the running process and wrong for the
+    /// order. On the next poll `pending_interrupts` skipped the interrupt - the ack
+    /// file was there - so the order read as plainly `Open`, and the same worker
+    /// claimed it and ran the work the operator had just stopped. It looped, and
+    /// everything queued behind it starved. Observed here: an order killed at 20:11
+    /// was acknowledged at 23:13 and re-claimed at 23:45, ahead of live work.
+    ///
+    /// The ack records that a worker saw the interrupt. It was never a statement that
+    /// the order should live again. Death belongs to the order, so it is read from the
+    /// order's own files by every machine, not remembered by one.
+    Killed { by: String, at: DateTime<Utc> },
 }
 
 /// Everything known about one task.
@@ -892,6 +909,10 @@ pub struct Task {
     /// Signed releases of claims. A released claim is no longer held, so the task
     /// returns to `Open` or `Offered`.
     pub releases: Vec<Release>,
+    /// Signed `kill` interrupts. Any one of them ends the order permanently - see
+    /// [`TaskState::Killed`]. Acknowledgements are deliberately not consulted: an ack
+    /// says a worker saw the kill, not that the order may run again.
+    pub kills: Vec<crate::interrupt::Interrupt>,
 }
 
 impl Task {
@@ -1004,6 +1025,15 @@ impl Task {
     /// reasoned about without sleeping in a test.
     #[must_use]
     pub fn state_at(&self, now: DateTime<Utc>) -> TaskState {
+        // Death first, and before the holder is even resolved: a kill that landed while
+        // the order sat unclaimed must be just as final as one that interrupted a run.
+        // The oldest kill is the one reported, so every machine names the same instant.
+        if let Some(kill) = self.kills.iter().min_by_key(|k| (k.created_at, k.issued_by.clone())) {
+            return TaskState::Killed {
+                by: kill.issued_by.clone(),
+                at: kill.created_at,
+            };
+        }
         let Some(holder) = self.holder() else {
             return TaskState::Open;
         };
@@ -1373,6 +1403,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let mut recommendations = Vec::new();
     let mut heartbeats = Vec::new();
     let mut releases = Vec::new();
+    let mut kills = Vec::new();
     for entry in fs::read_dir(&directory)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1413,6 +1444,17 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             && verify_release(&value, &route.agents) == SignatureCheck::Valid
         {
             releases.push(value);
+        } else if name.starts_with("interrupt.")
+            // Acknowledgements share the prefix and are not interrupts.
+            && !name.ends_with(".acked.json")
+            && let Ok(value) = serde_json::from_str::<crate::interrupt::Interrupt>(&text)
+            && value.action == crate::interrupt::InterruptAction::Kill
+            // Trust boundary: any peer can write into the synced folder, so an
+            // unsigned kill is a forged one. Killing an order is destructive - it
+            // ends work nobody else can restart - so it takes a valid signature.
+            && verify_interrupt(&value, &route.agents) == SignatureCheck::Valid
+        {
+            kills.push(value);
         }
     }
     results.sort_by_key(|r: &TaskResult| r.revision);
@@ -1426,6 +1468,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         recommendations,
         heartbeats,
         releases,
+        kills,
     })
 }
 
@@ -1510,6 +1553,19 @@ pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
                 if task
                     .holder()
                     .is_some_and(|held| held.eq_ignore_ascii_case(agent)) =>
+            {
+                out.push(task);
+            }
+            // A killed order is returned to exactly one machine: the one still holding a
+            // claim on it, and only so that it can let go. There is no work here. Every
+            // other machine, and this one once the claim is gone, sees nothing - which
+            // is the whole point of the state.
+            TaskState::Killed { .. }
+                if task
+                    .claims
+                    .iter()
+                    .any(|claim| claim.agent.eq_ignore_ascii_case(agent))
+                    && !task.released(agent) =>
             {
                 out.push(task);
             }

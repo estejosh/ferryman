@@ -2062,6 +2062,10 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
                     id,
                     format!("revision {revision} was rejected; run the agent again"),
                 )),
+                TaskState::Killed { by, .. } => Some((
+                    id,
+                    format!("killed by {by}; let go of the claim and run nothing"),
+                )),
                 _ => None,
             }
         })
@@ -2169,6 +2173,21 @@ pub async fn work_once(
                 if attempt(route, config, &identity, &task, report).await {
                     acted += 1;
                 }
+            }
+            // The operator ended this one. The only thing left to do is stop holding it,
+            // so the channel does not show a claim on work nobody will ever finish. No
+            // agent is started, no revision is owed, and the order is not seen again.
+            TaskState::Killed { by, .. } => {
+                ferryman_channel::interrupt::abandon_claim(route, &id, &config.agent)?;
+                ferryman_channel::ledger::append_ledger_entry(
+                    route,
+                    &identity,
+                    "interrupt",
+                    &config.agent,
+                    &format!("let go of {id}: killed by {by}"),
+                    Some(&id),
+                )?;
+                report.warn(&format!("  {id}: killed by {by}; dropped the claim"));
             }
             _ => {}
         }
@@ -3544,6 +3563,7 @@ mod tests {
             recommendations: Vec::new(),
             heartbeats: Vec::new(),
             releases: Vec::new(),
+            kills: Vec::new(),
         }
     }
 
@@ -4006,6 +4026,7 @@ mod tests {
             recommendations: Vec::new(),
             heartbeats: Vec::new(),
             releases: Vec::new(),
+            kills: Vec::new(),
         }
     }
 
