@@ -403,6 +403,14 @@ enum Command {
         #[command(subcommand)]
         command: OrchestratorCommand,
     },
+    /// Propose and land a release through the channel. A machine proposes
+    /// (`propose`), a human approves or denies it from Telegram (`/release approve`,
+    /// `/release deny`), and the signing machine applies (`land`) only once a
+    /// verifiable approval exists. ADR 0018.
+    Release {
+        #[command(subcommand)]
+        command: ReleaseCommand,
+    },
     /// Talk MCP. `serve` exposes this project's read-only query surface as tools
     /// for an MCP client; `list` and `call` connect to an external MCP server
     /// and use its tools instead.
@@ -477,6 +485,66 @@ enum OrchestratorCommand {
     /// Every brief in the channel, newest first, with its age and whether it
     /// verifies. More than one is normal: an orchestrator that has handed over
     /// leaves its brief behind.
+    List {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum ReleaseCommand {
+    /// Write a signed release request into the channel: version, exact commit, CI
+    /// conclusion and a changelog summary. Does nothing else. The bridge tells
+    /// Telegram a release is waiting, and the approver says yes or no from there.
+    Propose {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is proposing. Defaults to the only agent this machine holds a key for.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// The version, e.g. 0.5.4.
+        #[arg(long)]
+        version: String,
+        /// The exact commit (full hash) this release is built from.
+        #[arg(long)]
+        commit: String,
+        /// CI conclusion: green, failed or pending. Only green can be approved.
+        #[arg(long, default_value = "green")]
+        ci: String,
+        /// A changelog summary, one or two paragraphs.
+        #[arg(long)]
+        changelog: Option<String>,
+        /// Read the changelog summary from a file instead of a flag.
+        #[arg(long, conflicts_with = "changelog")]
+        changelog_file: Option<PathBuf>,
+    },
+    /// Apply an approved release. This is the only path that moves a tag, and it
+    /// refuses to act on an approval that does not verify, names nobody on the
+    /// roster, points at a different version or commit, is stale, or whose CI is
+    /// not green.
+    Land {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The request id, e.g. v0.5.4. Defaults to the newest request.
+        #[arg(long)]
+        id: Option<String>,
+        /// Print what would be tagged and pushed, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Generate the release signing key — a GPG key separate from any operator's
+    /// personal identity. Exports the public half to `keys/release.asc` and prints
+    /// the fingerprint to publish in docs/RELEASE_PROCESS.md. The private half stays
+    /// in this machine's GPG keyring, passphrase-less, and never enters the channel.
+    Key {
+        /// The project directory. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Print every request and decision in the channel, newest first.
     List {
         /// The project directory. Defaults to where you are.
         #[arg(long)]
@@ -2051,6 +2119,7 @@ async fn run(cli: Cli) -> Result<()> {
             record,
         } => loadmem(workspace, project, agent, list_agents, record)?,
         Command::Orchestrator { command } => orchestrator_command(command)?,
+        Command::Release { command } => release_command(command)?,
         Command::Mcp { command } => match command {
             McpCommand::Serve { workspace } => mcp::serve(workspace)?,
             McpCommand::List { server } => mcp_client::list(&server)?,
@@ -6032,6 +6101,316 @@ fn print_brief(
             println!("    {line}");
         }
     }
+}
+
+/// The release flow, ADR 0018. A machine proposes, a human approves or denies it from
+/// Telegram, and this machine lands — but only after the approval verifies against the
+/// roster and pins exactly this version and commit.
+fn release_command(command: ReleaseCommand) -> Result<()> {
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+
+    match command {
+        ReleaseCommand::Propose {
+            workspace,
+            agent,
+            version,
+            commit,
+            ci,
+            changelog,
+            changelog_file,
+        } => {
+            let route = here(workspace)?;
+            let agent = match agent {
+                Some(name) => name,
+                None => only_local_agent(&route)?,
+            };
+            let identity = signing_identity(&route, &agent)?;
+            let changelog = match (changelog, changelog_file) {
+                (Some(text), _) => text,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read changelog {}", path.display()))?,
+                (None, None) => bail!("give --changelog or --changelog-file"),
+            };
+            let request = ferryman_channel::release::ReleaseRequest::new(
+                &version, &commit, &ci, &changelog, &agent,
+            );
+            let path = ferryman_channel::release::propose_release(&route, &request, &identity)?;
+            println!("proposed {} (commit {})", request.id, request.commit);
+            println!("  record  {}", path.display());
+            println!("  next    the bridge announces it on Telegram; the approver replies");
+            Ok(())
+        }
+        ReleaseCommand::Land {
+            workspace,
+            id,
+            dry_run,
+        } => {
+            let route = here(workspace)?;
+            let request = match id {
+                Some(id) => ferryman_channel::release::read_request(&route, &id)?
+                    .with_context(|| format!("no release request named {id}")),
+                None => ferryman_channel::release::list_requests(&route)?
+                    .into_iter()
+                    .next()
+                    .with_context(|| "no release request in the channel"),
+            }?;
+            let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+            let approval = ferryman_channel::release::list_decisions(&route)?
+                .into_iter()
+                .find(|decision| decision.request_id == request.id && decision.approves())
+                .with_context(|| format!("no approval for {} yet", request.id))?;
+            authorize_and_check_head(&route, &request, &approval, &roster)?;
+            let tag = format!("v{}", request.version);
+            if dry_run {
+                println!("would tag {tag} at {}", request.commit);
+                println!(
+                    "  approved by {} at {}",
+                    approval.operator, approval.decided_at
+                );
+                return Ok(());
+            }
+            land_release(&route, &request, &approval, &tag)?;
+            Ok(())
+        }
+        ReleaseCommand::Key { workspace } => {
+            let route = here(workspace)?;
+            generate_release_key(&route)?;
+            Ok(())
+        }
+        ReleaseCommand::List { workspace } => {
+            let route = here(workspace)?;
+            print_releases(&route)?;
+            Ok(())
+        }
+    }
+}
+
+/// The gate, shared by `ferry release land` and the bridge's `/release approve`: the
+/// approval must verify against the roster, pin exactly this version and commit, be
+/// within the horizon and carry green CI — and the workspace's HEAD must still be the
+/// commit the request named. Approving this release must never authorise a different
+/// one, even after the approval was written.
+pub(crate) fn authorize_and_check_head(
+    route: &ferryman_channel::ProjectRoute,
+    request: &ferryman_channel::release::ReleaseRequest,
+    approval: &ferryman_channel::release::ReleaseDecision,
+    roster: &[ferryman_channel::AgentRoute],
+) -> Result<()> {
+    ferryman_channel::release::authorize_release(request, approval, roster, chrono::Utc::now())
+        .map_err(|refusal| anyhow::anyhow!("refusing to land {}: {refusal}", request.id))?;
+    let head = git_in(&route.workspace, &["rev-parse", "HEAD"])?;
+    if head != request.commit {
+        bail!(
+            "HEAD is {head}, the approval is for {}; refusing to tag a different commit",
+            request.commit
+        );
+    }
+    Ok(())
+}
+
+/// Tag, sign and push. Everything before this is the security boundary; these git steps
+/// are mechanical and must never run unless [`authorize_and_check_head`] has passed.
+pub(crate) fn land_release(
+    route: &ferryman_channel::ProjectRoute,
+    request: &ferryman_channel::release::ReleaseRequest,
+    approval: &ferryman_channel::release::ReleaseDecision,
+    tag: &str,
+) -> Result<()> {
+    let fingerprint = release_key_fingerprint(route)?;
+    let message = tag_message(request, approval);
+    git_in(
+        &route.workspace,
+        &["tag", "-s", "-u", &fingerprint, "-m", &message, tag],
+    )?;
+    git_in(&route.workspace, &["push", "origin", tag])?;
+    println!("tagged and pushed {tag}");
+    Ok(())
+}
+
+/// The tag message, read back by `git tag -v`. It must say how the release was
+/// authorised — remotely, by whom, and over what surface — so someone verifying the tag
+/// a year later can tell which arrangement produced it.
+fn tag_message(
+    request: &ferryman_channel::release::ReleaseRequest,
+    approval: &ferryman_channel::release::ReleaseDecision,
+) -> String {
+    format!(
+        "release {} (commit {})\napproved remotely by {} via {}\napprover telegram id {}",
+        request.version, request.commit, approval.operator, approval.via, approval.approved_by
+    )
+}
+
+/// Where the release signing key's fingerprint is recorded, machine-local and out of the
+/// channel. The key itself lives in this machine's GPG keyring; only its fingerprint and
+/// public half are ever written to disk here.
+fn release_fingerprint_path(route: &ferryman_channel::ProjectRoute) -> PathBuf {
+    route.attachment.join("keys").join("release.fingerprint")
+}
+
+/// The fingerprint of this project's release key, or a pointer to how to make one.
+pub(crate) fn release_key_fingerprint(route: &ferryman_channel::ProjectRoute) -> Result<String> {
+    let path = release_fingerprint_path(route);
+    let no_key = || {
+        format!(
+            "no release key for this project; run `ferry release key` first \
+             (looked in {})",
+            path.display()
+        )
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                bail!("{}", no_key());
+            }
+            Ok(text)
+        }
+        Err(_) => bail!("{}", no_key()),
+    }
+}
+
+/// Run `gpg` and return its stdout, refusing loudly on failure.
+fn gpg_out(args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("gpg")
+        .args(args)
+        .output()
+        .with_context(|| format!("run gpg {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "gpg {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Run `git` in a directory and return its trimmed stdout, refusing loudly on failure.
+fn git_in(dir: &std::path::Path, args: &[&str]) -> Result<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .with_context(|| format!("run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Generate (once) the release signing key and print its public half to publish. The key
+/// is a passphrase-less GPG key, separate from any operator's personal identity, so an
+/// unattended machine can sign releases while forfeiting nothing but releases.
+fn generate_release_key(route: &ferryman_channel::ProjectRoute) -> Result<()> {
+    let keys_dir = route.attachment.join("keys");
+    std::fs::create_dir_all(&keys_dir).context("release key dir")?;
+    let fingerprint_path = release_fingerprint_path(route);
+    if fingerprint_path.exists() {
+        let existing = std::fs::read_to_string(&fingerprint_path)?
+            .trim()
+            .to_string();
+        println!("a release key already exists for this project (fingerprint {existing})");
+        return Ok(());
+    }
+
+    let uid = "Ferryman Release <release@ferryman.invalid>";
+    // Passphrase-less on purpose: the key must be usable unattended, and it forfeits
+    // releases and nothing else. The operator's personal key and passphrase never come
+    // near this machine's release path.
+    gpg_out(&[
+        "--batch",
+        "--passphrase",
+        "",
+        "--quick-generate-key",
+        uid,
+        "ed25519",
+        "sign",
+        "never",
+    ])?;
+    let listing = gpg_out(&["--batch", "--with-colons", "--list-keys", uid])?;
+    let fingerprint = listing
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("fpr:").map(|rest| {
+                rest.split(':')
+                    .find(|field| !field.is_empty())
+                    .unwrap_or("")
+                    .to_string()
+            })
+        })
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .context("gpg did not report a fingerprint for the new key")?;
+    std::fs::write(&fingerprint_path, &fingerprint)?;
+    ferryman_channel::restrict_to_owner(&fingerprint_path)?;
+
+    let public_path = keys_dir.join("release.asc");
+    gpg_out(&[
+        "--batch",
+        "--yes",
+        "--armor",
+        "--output",
+        public_path
+            .to_str()
+            .context("release key path is not UTF-8")?,
+        "--export",
+        &fingerprint,
+    ])?;
+    println!("generated a release signing key (fingerprint {fingerprint})");
+    println!("  public half  {}", public_path.display());
+    println!("  publish that public half in the repository and in docs/RELEASE_PROCESS.md.");
+    println!(
+        "  the private half stays in this machine's GPG keyring and never enters the channel."
+    );
+    Ok(())
+}
+
+/// Print every request and decision in the channel, newest first, with verification.
+fn print_releases(route: &ferryman_channel::ProjectRoute) -> Result<()> {
+    let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+    let requests = ferryman_channel::release::list_requests(route)?;
+    if requests.is_empty() {
+        println!("no release requests in the channel");
+        return Ok(());
+    }
+    for request in requests {
+        println!(
+            "{}  {}  commit {}  ci {}  {}",
+            request.id,
+            request.version,
+            request.commit,
+            request.ci,
+            signature_line(&ferryman_channel::release::verify_request(
+                &request, &roster
+            )),
+        );
+        println!("    {}", request.changelog.replace('\n', "\n    "));
+        for decision in ferryman_channel::release::list_decisions(route)? {
+            if decision.request_id != request.id {
+                continue;
+            }
+            println!(
+                "    {} {} via {} (from {}) — {}",
+                decision.decision,
+                decision.operator,
+                decision.via,
+                decision.approved_by,
+                signature_line(&ferryman_channel::release::verify_decision(
+                    &decision, &roster
+                )),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn orchestrator_command(command: OrchestratorCommand) -> Result<()> {

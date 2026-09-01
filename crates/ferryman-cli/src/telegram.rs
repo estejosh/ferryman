@@ -73,6 +73,21 @@ pub enum Instruction {
         to: Option<String>,
         task: String,
     },
+    /// A release decision, carried as a command rather than a bare line. Structured only:
+    /// ADR 0008 — free text must never be silently promoted to a signed action, and this
+    /// is the most dangerous place that rule could be broken.
+    Release {
+        action: ReleaseAction,
+        version: String,
+        reason: String,
+    },
+}
+
+/// What a `/release` command asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseAction {
+    Approve,
+    Deny,
 }
 
 /// Read one chat message as an instruction.
@@ -107,6 +122,30 @@ pub fn parse_instruction(text: &str) -> Option<Instruction> {
                 to: Some(who),
                 task: task.to_string(),
             })
+        }
+        "/release" => {
+            let (action, rest) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+            let rest = rest.trim();
+            match action.to_ascii_lowercase().as_str() {
+                "approve" => (!rest.is_empty()).then(|| Instruction::Release {
+                    action: ReleaseAction::Approve,
+                    version: rest.to_string(),
+                    reason: String::new(),
+                }),
+                "deny" => {
+                    let (version, why) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+                    let version = version.trim();
+                    let why = why.trim();
+                    // A deny without a reason is refused: the gate is for judgement, and
+                    // a bare "no" is not a judgement.
+                    (!version.is_empty() && !why.is_empty()).then_some(Instruction::Release {
+                        action: ReleaseAction::Deny,
+                        version: version.to_string(),
+                        reason: why.to_string(),
+                    })
+                }
+                _ => None,
+            }
         }
         // An unrecognised slash command is a typo, not a task. Turning `/stauts` into an
         // order for the fleet to carry out is the kind of helpfulness nobody wants.
@@ -1014,6 +1053,10 @@ fn load_state(path: &Path, route: &ferryman_channel::ProjectRoute) -> Result<(Br
                 state.remember(result_key(&task.order.id, &result.agent, result.revision));
             }
         }
+        // Requests already in the channel are history, not news, exactly like results.
+        for request in ferryman_channel::release::list_requests(route)? {
+            state.remember(format!("release:{}", request.id));
+        }
         save(path, &state)?;
     }
     Ok((state, first_run))
@@ -1070,6 +1113,12 @@ async fn serve(
         for desk in desks.iter_mut() {
             if let Err(error) = announce(chat, desk, Some(origins), &rooms).await {
                 eprintln!("telegram: could not report {} results: {error}", desk.name);
+            }
+            if let Err(error) = announce_releases(chat, desk).await {
+                eprintln!(
+                    "telegram: could not announce releases for {}: {error}",
+                    desk.name
+                );
             }
         }
     }
@@ -1320,6 +1369,17 @@ async fn handle(
                 Err(error) => format!("could not issue that: {error}"),
             }
         }
+        Some(Instruction::Release {
+            action,
+            version,
+            reason,
+        }) => {
+            let name = operator_name(
+                seat.and_then(|seat| seat.operator.as_deref()),
+                message.from.as_ref(),
+            );
+            release_reply(route, issuer, from, &name, &action, &version, &reason)
+        }
     };
     // Answer in the chat and topic the message came from, falling back to the configured
     // chat only when Telegram did not tell us where it was.
@@ -1329,6 +1389,78 @@ async fn handle(
         .await
     {
         eprintln!("telegram: could not reply: {error}");
+    }
+}
+
+/// Carry out a `/release approve` or `/release deny`. The authorization already happened —
+/// `from == approver` — before this runs. The bridge writes a signed decision into the
+/// channel; approve also runs the signing step (verify, tag, sign, push).
+fn release_reply(
+    route: &ferryman_channel::ProjectRoute,
+    issuer: &str,
+    from: i64,
+    approver_name: &str,
+    action: &ReleaseAction,
+    version: &str,
+    reason: &str,
+) -> String {
+    let id = format!("v{}", version.trim_start_matches('v'));
+    let request = match ferryman_channel::release::read_request(route, &id) {
+        Ok(Some(request)) => request,
+        Ok(None) => return format!("no release request named {id}; nothing to decide"),
+        Err(error) => return format!("could not read release request {id}: {error}"),
+    };
+
+    let identity = match crate::sign_as(route, issuer) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => {
+            return "this machine holds no signing key, so the decision cannot be signed"
+                .to_string();
+        }
+        Err(error) => return format!("cannot sign the decision: {error}"),
+    };
+
+    let word = match action {
+        ReleaseAction::Approve => "approve",
+        ReleaseAction::Deny => "deny",
+    };
+    let decision = ferryman_channel::release::ReleaseDecision::new(
+        &request,
+        word,
+        reason,
+        approver_name,
+        "telegram",
+        from,
+    );
+    if let Err(error) = ferryman_channel::release::decide_release(route, &decision, &identity) {
+        return format!("could not record the decision: {error}");
+    }
+
+    let decision = match ferryman_channel::release::read_decision(route, &id, issuer) {
+        Ok(Some(decision)) => decision,
+        _ => return "recorded the decision but could not read it back".to_string(),
+    };
+
+    match action {
+        ReleaseAction::Deny => format!("denied {} ({}): {}", request.id, request.version, reason),
+        ReleaseAction::Approve => {
+            let roster =
+                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+            if let Err(error) = crate::authorize_and_check_head(route, &request, &decision, &roster)
+            {
+                return format!("approval recorded, but I will not land it: {error}");
+            }
+            let tag = format!("v{}", request.version);
+            match crate::land_release(route, &request, &decision, &tag) {
+                Ok(()) => format!(
+                    "approved {} and tagged {tag}\n  {}\n  {}",
+                    request.id,
+                    request.version,
+                    excerpt(&request.changelog, EXCERPT_CHARS)
+                ),
+                Err(error) => format!("approval recorded, but tagging failed: {error}"),
+            }
+        }
     }
 }
 
@@ -1344,6 +1476,8 @@ fn help_text(default_to: Option<&str>) -> String {
          /order <task>       the same as sending the line alone\n\
          /status             every task and where it has got to\n\
          /agents             who is in this channel\n\
+         /release approve <version>   approve the waiting release\n\
+         /release deny <version> <why>  refuse it, with the reason\n\
          \n\
          Do not send credentials here. This chat is not end-to-end encrypted."
     )
@@ -1734,6 +1868,47 @@ async fn announce(
     Ok(())
 }
 
+/// The message the bridge posts when a release request appears. This is the judgement
+/// surface: it shows *what* is being approved — version, commit, CI, changelog, who
+/// proposed — rather than asking a bare yes/no, because a gate nobody can exercise
+/// judgement at is a rubber stamp with extra steps.
+fn release_notice(request: &ferryman_channel::release::ReleaseRequest) -> String {
+    format!(
+        "A release is waiting for your decision:\n\n\
+         version  {}\n\
+         commit   {}\n\
+         ci       {}\n\
+         by       {}\n\n\
+         {}\n\n\
+         /release approve {}\n\
+         /release deny {} <why>",
+        request.version,
+        request.commit,
+        request.ci,
+        request.requester,
+        request.changelog,
+        request.version,
+        request.version,
+    )
+}
+
+/// Announce release requests that have not been announced yet. Mirrors [`announce`]: a
+/// request raised by a machine has no Telegram origin, so it goes to its project's topic,
+/// and it is remembered before it is spoken so a restart does not repeat it.
+async fn announce_releases(chat: &Chat, desk: &mut Desk) -> Result<()> {
+    for request in ferryman_channel::release::list_requests(&desk.route)? {
+        let key = format!("release:{}", request.id);
+        if desk.state.knows(&key) {
+            continue;
+        }
+        desk.state.remember(key);
+        save(&desk.state_path, &desk.state)?;
+        chat.send_to(desk.chat_id, desk.thread, &release_notice(&request))
+            .await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1812,6 +1987,56 @@ mod tests {
     fn an_order_verb_with_nothing_after_it_is_not_an_order() {
         assert_eq!(parse_instruction("/order   "), None);
         assert_eq!(parse_instruction("/to wisp"), None);
+    }
+
+    #[test]
+    fn a_release_approve_is_structured_and_needs_a_version() {
+        assert_eq!(
+            parse_instruction("/release approve 0.5.4"),
+            Some(Instruction::Release {
+                action: ReleaseAction::Approve,
+                version: "0.5.4".to_string(),
+                reason: String::new(),
+            })
+        );
+        assert_eq!(parse_instruction("/release approve"), None);
+    }
+
+    #[test]
+    fn a_release_deny_needs_a_version_and_a_reason() {
+        assert_eq!(
+            parse_instruction("/release deny 0.5.4 not ready yet"),
+            Some(Instruction::Release {
+                action: ReleaseAction::Deny,
+                version: "0.5.4".to_string(),
+                reason: "not ready yet".to_string(),
+            })
+        );
+        // A bare "no" is not a judgement; the gate is for reasoning, not rubber-stamping.
+        assert_eq!(parse_instruction("/release deny 0.5.4"), None);
+    }
+
+    #[test]
+    fn an_unknown_release_subcommand_is_not_silently_a_decision() {
+        assert_eq!(parse_instruction("/release ship 0.5.4"), None);
+    }
+
+    #[test]
+    fn a_release_notice_shows_what_is_being_approved() {
+        let request = ferryman_channel::release::ReleaseRequest::new(
+            "0.5.4",
+            "0123456789abcdef0123456789abcdef01234567",
+            "green",
+            "A release worth shipping.",
+            "grouchly",
+        );
+        let notice = release_notice(&request);
+        assert!(notice.contains("version  0.5.4"));
+        assert!(notice.contains("commit   0123456789abcdef0123456789abcdef01234567"));
+        assert!(notice.contains("ci       green"));
+        assert!(notice.contains("A release worth shipping."));
+        assert!(notice.contains("/release approve 0.5.4"));
+        assert!(notice.contains("/release deny 0.5.4 <why>"));
     }
 
     /// The default recipient is the difference between "the fleet does this" and "whichever
