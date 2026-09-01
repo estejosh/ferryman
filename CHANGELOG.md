@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+## v0.5.6 - 2026-09-01
+
+One place to put things, an operator whose "stop" means stop, and a fleet
+that keeps itself current without being asked.
+
+### Added
+
+- **One root called `ferry`.** `ferry/comms/`, `ferry/repos/`, `ferry/work/`
+  and a `.ferry` manifest that tells an engine where everything is. Finding
+  things used to be guesswork - the dashboard read the directory beside wherever
+  it happened to be launched, which finds a fleet kept as siblings, finds nothing
+  on another drive, and fails *silently* by showing one project as though one is
+  all there is. Nothing of yours is moved into the root: repositories are linked
+  and recorded, never relocated. See ADR 0019.
+- **The manifest fills itself in by being used.** Every time a route is
+  resolved, that project and its repository are filed. There is no command to
+  run and nothing to keep in sync by hand; a fleet that has been running for
+  weeks acquires a complete manifest by carrying on working. Nineteen channels
+  filed themselves on the first pass here.
+- **A project picker in the dashboard**, backed by discovery that reads the
+  manifest first, then the learned index, then the directory scan - so the answer
+  improves as the install is used rather than depending on where it was started.
+- **Workers keep themselves current.** A long-running `ferry agent` checks for a
+  newer release at most every six hours, installs it, and hands over at the next
+  natural boundary. Ferryman is getting better daily and an install that needs a
+  person to notice is an install that falls behind.
+
+### Fixed
+
+- **A killed order came back.** The worker acknowledged a signed `kill`, dropped
+  its claim and returned - correct for the running process, never made true of the
+  order. Next poll, the acknowledgement made the interrupt stop being pending, the
+  order read as plainly `Open`, and the same worker claimed it and ran the work the
+  operator had just stopped. Because `list_tasks` is a correct FIFO, a killed order
+  sat permanently at the *head* of the queue and re-ran itself ahead of everything
+  issued after it: one killed at 20:11 was acknowledged at 23:13, re-claimed at
+  23:45, and held a worker for thirty-one minutes while live work sat last in a
+  line it could never reach. Death now belongs to the order, is read from the
+  order's own signed files by every machine, and needs a valid signature to
+  declare. `Kill` and `Pause` also did byte-identical work; kill was only ever a
+  pause that sounded final. See ADR 0020.
+- **Two projects could share one worktree, and one committed to the other.**
+  Moving worktrees into a shared `ferry/work/` keyed them on `(order id, agent)`,
+  which was unambiguous only while they lived beside their own repository. Order
+  ids are short human names nobody coordinates across projects, and a ferry root
+  exists to hold many projects - so the second task found a valid checkout sitting
+  there, reused it, and ran and committed in the wrong repository, reporting
+  success. Worktrees are now keyed on the repository as well, and reuse verifies
+  the directory is a checkout of *this* repo rather than merely a checkout.
+- **The ledger recorded claims that never happened.** The entry was written the
+  instant the claim file was, before the re-read that decides whether the claim
+  held, so every lost race went into the tamper-evident chain as "claimed order X".
+  A machine losing the same race every ten seconds - which had been happening for
+  six hours - writes thousands of signed entries for claims it never had. The
+  ledger's whole value is recording what happened.
+- **`Restart=on-failure` would have permanently killed a self-updating worker**,
+  because a worker that hands over cleanly after an update exits successfully.
+- **The dashboard reported a valid approval as coming from an unknown signer**,
+  having verified it against the roster as it was at boot rather than as it is.
+
 ## v0.5.5 - 2026-08-31
 
 The release that can see what people said, and the last one anybody has to
