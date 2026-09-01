@@ -29,8 +29,29 @@ that keeps itself current without being asked.
   natural boundary. Ferryman is getting better daily and an install that needs a
   person to notice is an install that falls behind.
 
+- **A person can say no to a release.** The channel could only hold approvals, so
+  declining had nowhere to go and silence was indistinguishable from refusal - which
+  meant "did anybody look at this" could not be answered. `Decline` writes a signed
+  denial with a reason. It is a separate record rather than a field on the approval,
+  because adding a field would have changed the bytes every existing approval was signed
+  over and retroactively turned real consent into an unreadable signature. An unsigned
+  denial is ignored: a forged refusal blocking every release is a denial of service any
+  peer could mount, and refusing to ship is not the safe direction when the block itself
+  is unattributable. Declining is never disabled by red tests or staleness - those refuse
+  a release, and must not refuse a person's refusal.
+- **Teammates can be invited, and what each may do is on the screen.** Inviting reserves
+  the *name*, and says so: an operator key is sealed under that person's own password, so
+  a key minted here would be a key this machine has seen, which is the thing operator
+  identities exist to prevent. Access levels are `MasterGrant`, which has carried
+  projects, roles and capabilities since ADR 0014 - authority that was in the channel and
+  on no screen, so who could do what was answerable only by reading JSON.
+
 ### Fixed
 
+- **The release page could offer to approve what the gate would refuse.** `may_sign` had
+  one caller, `ferry release status`, at a terminal; the dashboard never consulted it. Two
+  answers to one question, with the reassuring one in front of the person. The page now
+  renders the verdict from the same function the signing path calls.
 - **A killed order came back.** The worker acknowledged a signed `kill`, dropped
   its claim and returned - correct for the running process, never made true of the
   order. Next poll, the acknowledgement made the interrupt stop being pending, the
