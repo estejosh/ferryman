@@ -887,27 +887,171 @@ pages.agents = async () => {
     </div>`;
 };
 
+/* The access levels, in the order a person thinks about them rather than
+   alphabetically. `roles: []` on a grant means every role, which reads as "full" here -
+   the empty list is not an accident and must not be shown as "none". */
+const ACCESS_LEVELS = [
+  { id: "",        label: "Full",   roles: [],                      hint: "Everything, on the projects listed" },
+  { id: "operator",label: "Approve",roles: ["operator", "reviewer"],hint: "Review and approve work" },
+  { id: "reviewer",label: "Review", roles: ["reviewer"],            hint: "Accept or send back, but not approve releases" },
+  { id: "worker",  label: "Work",   roles: ["worker"],              hint: "Claim and do tasks" },
+  { id: "reader",  label: "Read",   roles: ["reader"],              hint: "Look, and nothing else" },
+];
+
+function accessLabel(grant) {
+  if (!grant) return "";
+  const roles = grant.roles || [];
+  if (!roles.length) return "Full";
+  const found = ACCESS_LEVELS.find((l) => l.roles.length && l.roles.join(",") === roles.join(","));
+  return found ? found.label : roles.join(", ");
+}
+
+function scopeLabel(grant) {
+  if (!grant) return "";
+  const p = grant.projects || [];
+  return p.length ? p.join(", ") : "every project";
+}
+
 pages.teammates = async () => {
   let d = state.team;
   if (!d) { try { d = state.team = await api("/api/team"); } catch (_) { d = null; } }
   if (!d) return `<div class="head"><div><h1>Teammates</h1></div></div><div class="empty">Could not read the team.</div>`;
+
+  const grants = {};
+  for (const g of (d.grants || [])) grants[g.grantee] = g;
+  const projects = d.projects || [];
+
   return `
     <div class="head">
       <div><h1>Teammates</h1><p>People with an identity in this project. The master is whoever the channel says it is.</p></div>
     </div>
+
+    ${d.may_grant ? `
+    <div class="panel" style="margin-bottom:18px">
+      <div class="chat-top"><b>Invite someone</b></div>
+      <div style="padding:16px;display:flex;flex-direction:column;gap:12px">
+        <div style="line-height:1.6;color:var(--dim)">
+          This reserves the name. It does not create their identity and it cannot &mdash;
+          an operator key is sealed under that person&rsquo;s own password, and this machine
+          must never know it. When they set themselves up, their key binds to the name
+          you reserve here.
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <input id="tm-name" placeholder="their name, e.g. priya" style="min-width:200px" />
+          <button class="btn primary" id="tm-invite">Reserve the name</button>
+        </div>
+        <div class="s" id="tm-msg" style="color:var(--dim)"></div>
+      </div>
+    </div>` : ""}
+
     <div class="panel scroll">
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Identity lives</th></tr></thead>
-        <tbody>${(d.teammates || []).map((t) => `
+        <thead><tr><th>Person</th><th>Role</th><th>Identity lives</th><th>Can do</th><th>Where</th>${d.may_grant ? "<th></th>" : ""}</tr></thead>
+        <tbody>${(d.teammates || []).map((t) => {
+          const g = grants[t.name];
+          return `
           <tr>
             <td class="lead">${esc(t.name)} ${t.current ? `<span class="badge accent">you</span>` : ""}</td>
             <td>${t.role === "owner" ? `<span class="badge good">owner</span>` : esc(t.role)}</td>
-            <td>${esc(t.scope)}</td>
-          </tr>`).join("")}
+            <td>${esc(t.scope)}${t.scope === "channel" ? ` <span class="badge">not on this machine</span>` : ""}</td>
+            <td>${g ? `${esc(accessLabel(g))} ${sigBadge(g.signature)}` : `<span class="badge warn">no grant</span>`}</td>
+            <td>${g ? esc(scopeLabel(g)) : "&mdash;"}</td>
+            ${d.may_grant ? `<td><button class="btn" data-grant="${esc(t.name)}">Access</button></td>` : ""}
+          </tr>`;
+        }).join("")}
         </tbody>
       </table>
-    </div>`;
+    </div>
+
+    ${d.may_grant ? `
+    <div class="panel" id="tm-editor" hidden style="margin-top:18px">
+      <div class="chat-top"><b>Access for <span id="tm-who"></span></b></div>
+      <div style="padding:16px;display:flex;flex-direction:column;gap:14px">
+        <div>
+          <div class="k" style="margin-bottom:6px">Can do</div>
+          <select id="tm-level">
+            ${ACCESS_LEVELS.map((l) => `<option value="${esc(l.id)}">${esc(l.label)} &mdash; ${esc(l.hint)}</option>`).join("")}
+          </select>
+        </div>
+        <div>
+          <div class="k" style="margin-bottom:6px">On which projects</div>
+          ${projects.length
+            ? projects.map((p) => `<label style="display:inline-flex;gap:6px;align-items:center;margin:0 14px 8px 0">
+                 <input type="checkbox" class="tm-project" value="${esc(p)}" /> <span class="mono">${esc(p)}</span>
+               </label>`).join("")
+            : `<div class="s" style="color:var(--dim)">No other projects are known to this machine yet.</div>`}
+          <div class="s" style="color:var(--dim)">None ticked means every project, now and later.</div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn primary" id="tm-save">Sign this grant</button>
+          <button class="btn" id="tm-cancel">Cancel</button>
+        </div>
+        <div class="s" id="tm-editor-msg" style="color:var(--dim)"></div>
+      </div>
+    </div>` : ""}`;
 };
+
+function wireTeammates() {
+  const invite = $("#tm-invite");
+  if (invite) invite.addEventListener("click", async () => {
+    const msg = $("#tm-msg");
+    msg.textContent = "";
+    invite.disabled = true;
+    try {
+      await api("/api/team/invite", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: ($("#tm-name") || {}).value || "" }),
+      });
+      state.team = null;
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      invite.disabled = false;
+    }
+  });
+
+  const editor = $("#tm-editor");
+  let editing = null;
+  document.querySelectorAll("[data-grant]").forEach((b) => {
+    b.addEventListener("click", () => {
+      editing = b.dataset.grant;
+      $("#tm-who").textContent = editing;
+      const g = ((state.team || {}).grants || []).find((x) => x.grantee === editing);
+      // Pre-fill from what is actually in the channel, so opening this and saving
+      // without touching anything cannot silently narrow somebody's access.
+      $("#tm-level").value = g && (g.roles || []).length ? (g.roles[0] || "") : "";
+      const on = new Set(g ? (g.projects || []) : []);
+      document.querySelectorAll(".tm-project").forEach((c) => { c.checked = on.has(c.value); });
+      editor.hidden = false;
+      editor.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    });
+  });
+  const cancel = $("#tm-cancel");
+  if (cancel) cancel.addEventListener("click", () => { editor.hidden = true; });
+
+  const save = $("#tm-save");
+  if (save) save.addEventListener("click", async () => {
+    if (!editing) return;
+    const msg = $("#tm-editor-msg");
+    msg.textContent = "";
+    save.disabled = true;
+    try {
+      const level = ACCESS_LEVELS.find((l) => l.id === $("#tm-level").value) || ACCESS_LEVELS[0];
+      const projects = [...document.querySelectorAll(".tm-project")].filter((c) => c.checked).map((c) => c.value);
+      await api(`/api/team/${encodeURIComponent(editing)}/access`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projects, roles: level.roles, capabilities: [] }),
+      });
+      state.team = null;
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      save.disabled = false;
+    }
+  });
+}
 
 pages.ledger = async () => {
   const d = await api("/api/ledger");
@@ -1464,6 +1608,7 @@ async function render() {
   wireRows();
   wireChat();
   wireRelease();
+  wireTeammates();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {

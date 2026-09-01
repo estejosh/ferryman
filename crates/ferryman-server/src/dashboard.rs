@@ -361,6 +361,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/release", get(release))
         .route("/api/release/{version}/approve", post(approve_release))
         .route("/api/release/{version}/deny", post(deny_release))
+        .route("/api/team/invite", post(invite_teammate))
+        .route("/api/team/{name}/access", post(set_access))
         .route("/api/conversations", get(conversations))
         .route("/api/conversations/{topic}", get(conversation).post(say))
         .route("/api/memory", get(memory))
@@ -1000,11 +1002,200 @@ async fn team(
             })
         })
         .collect::<Vec<_>>();
+    // What each person may do, and where. This is not new authority - `MasterGrant` has
+    // carried projects, roles and capabilities since ADR 0014 - it is authority that
+    // existed in the channel and was not on any screen, so nobody could see who could do
+    // what without reading JSON.
+    let grants = ferryman_channel::master::member_grants(&state.route)
+        .map_err(internal)?
+        .into_iter()
+        .map(|(grant, check)| {
+            json!({
+                "grantee": grant.grantee,
+                "projects": grant.projects,
+                "roles": grant.roles,
+                "capabilities": grant.capabilities,
+                "granted_at": grant.granted_at.to_rfc3339(),
+                "signature": sig(&check),
+            })
+        })
+        .collect::<Vec<_>>();
     Ok(Json(json!({
         "current": current.name(),
         "master": master,
+        // Only the master's signature makes a grant, so the page must not offer the
+        // controls to anybody else and then fail at the server. Same answer, one place.
+        "may_grant": master.as_deref() == Some(current.name()),
         "teammates": teammates,
         "agents": agents,
+        "grants": grants,
+        // The projects a grant can name, so the page offers what exists rather than
+        // asking a person to type an id correctly from memory.
+        "projects": ferryman_channel::known::known()
+            .into_iter()
+            .map(|project| project.project_id)
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct InviteBody {
+    name: String,
+}
+
+/// POST /api/team/invite - reserve a name for a person who has not joined yet.
+///
+/// # Why this cannot create their identity
+///
+/// An operator identity is a signing key sealed under that person's own password. This
+/// machine must never know that password, so it cannot mint a teammate: a key created
+/// here and handed over would be a key this machine had seen, which is the whole thing
+/// operator identities exist to prevent. Anyone offering "add a teammate" that produces
+/// a working login for someone else has quietly built a master key.
+///
+/// So an invitation reserves the NAME. No key is published. When that person's own
+/// machine registers, their key binds to the reserved name under first-key-wins - a name
+/// reservation, not an impersonation.
+async fn invite_teammate(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<InviteBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let name = body.name.trim().to_string();
+    if !ferryman_channel::is_safe_component(&name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a teammate name must be a plain identifier: letters, digits, dashes and \
+             underscores"
+                .to_string(),
+        ));
+    }
+    let roster =
+        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+    // First-key-wins is the rule that makes reservation safe, and it is also the rule
+    // that makes overwriting an existing entry dangerous: a name that already carries a
+    // published key belongs to whoever holds that key, and re-registering it would be
+    // the impersonation this is careful not to be.
+    if let Some(existing) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+        return Err((
+            StatusCode::CONFLICT,
+            if existing.public_key.is_some() {
+                format!("{name} is already in this channel and has published a key")
+            } else {
+                format!("{name} has already been invited and is waiting to come online")
+            },
+        ));
+    }
+    ferryman_channel::register_expected_agent(
+        &state.route,
+        &name,
+        "operator",
+        &["messages.receive".to_string()],
+    )
+    .map_err(internal)?;
+    ferryman_channel::ledger::append_ledger_entry(
+        &state.route,
+        &current,
+        "invite",
+        current.name(),
+        &format!("reserved {name} for a teammate who has not joined yet"),
+        None,
+    )
+    .map_err(internal)?;
+    Ok(Json(json!({ "name": name, "state": "invited" })))
+}
+
+#[derive(Deserialize)]
+struct AccessBody {
+    #[serde(default)]
+    projects: Vec<String>,
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+/// POST /api/team/{name}/access - what this person may do, and on which projects.
+///
+/// Writes a `MasterGrant`, which has carried projects/roles/capabilities since ADR 0014.
+/// The authority is not new; what is new is that it can be read and written by a person
+/// rather than only by editing JSON in the channel.
+async fn set_access(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<AccessBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    // A grant is only worth anything because the master signed it, so a grant this
+    // person cannot sign must be refused here rather than written unsigned.
+    let roster =
+        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+    let Some(person) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("{name} is not in this channel; invite them first"),
+        ));
+    };
+    // A reserved name has no key yet, and a grant names the key it is about - otherwise
+    // it would attach to whoever claimed the name later, which is the substitution every
+    // other gate here refuses.
+    let Some(public_key) = person.public_key.clone() else {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{name} has been invited but has not come online yet, so there is no key \
+                 to grant access to. A grant names the key, not the name."
+            ),
+        ));
+    };
+    let grant = ferryman_channel::master::grant_member(
+        &state.route,
+        &current,
+        &person.name,
+        &public_key,
+        body.projects.clone(),
+        body.roles.clone(),
+        body.capabilities.clone(),
+    )
+    // grant_member refuses anyone who is not the master, and says so in words.
+    .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+    ferryman_channel::ledger::append_ledger_entry(
+        &state.route,
+        &current,
+        "grant",
+        current.name(),
+        &format!(
+            "granted {} roles [{}] on projects [{}]",
+            grant.grantee,
+            grant.roles.join(", "),
+            if grant.projects.is_empty() {
+                "every project".to_string()
+            } else {
+                grant.projects.join(", ")
+            }
+        ),
+        None,
+    )
+    .map_err(internal)?;
+    Ok(Json(json!({
+        "grantee": grant.grantee,
+        "projects": grant.projects,
+        "roles": grant.roles,
+        "capabilities": grant.capabilities,
     })))
 }
 
