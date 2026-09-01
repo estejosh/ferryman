@@ -2522,7 +2522,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Keep the machine-wide fleet roster inside the tempdir, so this test
         // does not publish a random key into the real operator's fleet dir.
-        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        // Per-thread, not the plain override: the plain one is FIRST CALL WINS, so with
+        // four tests each asking for their own directory, three of them silently got the
+        // first one's - already populated, with an operator in it. Whether a test that
+        // needs a virgin machine passed came down to which test the scheduler started
+        // first. It won that race on one maintainer's machine and lost it on CI, and the
+        // suite was red on every platform for weeks while passing locally.
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
         let route = Arc::new(test_route(dir.path()));
         let state = state(&route, false);
         let setup = state
@@ -2629,7 +2637,15 @@ mod tests {
     #[tokio::test]
     async fn first_run_create_returns_a_phrase_and_derives_from_the_seed() {
         let dir = tempfile::tempdir().unwrap();
-        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        // Per-thread, not the plain override: the plain one is FIRST CALL WINS, so with
+        // four tests each asking for their own directory, three of them silently got the
+        // first one's - already populated, with an operator in it. Whether a test that
+        // needs a virgin machine passed came down to which test the scheduler started
+        // first. It won that race on one maintainer's machine and lost it on CI, and the
+        // suite was red on every platform for weeks while passing locally.
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
         let route = Arc::new(test_route(dir.path()));
         let state = state(&route, false);
         let setup = state
@@ -2677,7 +2693,15 @@ mod tests {
     #[tokio::test]
     async fn recovery_restores_the_identity_from_the_phrase() {
         let dir = tempfile::tempdir().unwrap();
-        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        // Per-thread, not the plain override: the plain one is FIRST CALL WINS, so with
+        // four tests each asking for their own directory, three of them silently got the
+        // first one's - already populated, with an operator in it. Whether a test that
+        // needs a virgin machine passed came down to which test the scheduler started
+        // first. It won that race on one maintainer's machine and lost it on CI, and the
+        // suite was red on every platform for weeks while passing locally.
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
         let route = Arc::new(test_route(dir.path()));
         let state = state(&route, false);
         let setup = state
@@ -2774,7 +2798,15 @@ mod tests {
     #[tokio::test]
     async fn two_dashboard_operators_do_not_share_a_key() {
         let dir = tempfile::tempdir().unwrap();
-        ferryman_channel::licensing::use_machine_state_dir(dir.path().join("machine-state"));
+        // Per-thread, not the plain override: the plain one is FIRST CALL WINS, so with
+        // four tests each asking for their own directory, three of them silently got the
+        // first one's - already populated, with an operator in it. Whether a test that
+        // needs a virgin machine passed came down to which test the scheduler started
+        // first. It won that race on one maintainer's machine and lost it on CI, and the
+        // suite was red on every platform for weeks while passing locally.
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
         let route = Arc::new(test_route(dir.path()));
         let state = state(&route, false);
         let setup = state

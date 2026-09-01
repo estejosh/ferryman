@@ -205,6 +205,20 @@ fn thread_scoped(base: &Path) -> PathBuf {
 ///
 /// First call wins, so a suite can set it once and every later call agrees. Also useful
 /// to anything embedding Ferryman that keeps state somewhere of its own choosing.
+///
+/// # A test that calls this is probably calling the wrong one
+///
+/// First-call-wins means the second caller is silently ignored - it does not get the
+/// directory it asked for, it gets the first caller's, and nothing says so. Four
+/// dashboard tests each passed their own tempdir here; three of them ran against a
+/// machine state directory another test had already put an operator into, and the one
+/// that needed a virgin machine passed or failed depending on which test the scheduler
+/// happened to start first. It won that race on one maintainer's machine and lost it on
+/// every CI runner, so the suite was red on three platforms for weeks while passing
+/// locally - and releases went out over it.
+///
+/// Tests want [`use_machine_state_dir_per_thread`], which gives each thread its own
+/// directory underneath whichever base won, and so cannot be quietly shared.
 pub fn use_machine_state_dir(dir: PathBuf) {
     let _ = MACHINE_STATE_DIR.set(dir);
 }
