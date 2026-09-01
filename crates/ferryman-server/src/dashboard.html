@@ -497,6 +497,12 @@ function matches(hay) {
 /* ---------- auth ---------- */
 
 let mode = "signin";      // "signin" | "create" | "recover"
+// Operators this channel knows whose sealed key is missing from THIS machine. Not the
+// same as "nobody has set up", and the two call for opposite actions.
+let orphaned = [];
+// Whether this MACHINE holds any operator at all. Kept beside `orphaned` because the
+// interesting case is the pair: none here, but some in the channel.
+let status_any = false;
 let firstRun = false;     // no operator on this machine yet -> create needs the setup token
 let pendingPhrase = null; // the one place the recovery phrase lives, for seconds only
 
@@ -516,16 +522,32 @@ function renderAuth() {
   const isCreate = mode === "create";
   const isRecover = mode === "recover";
   $("#auth-title").textContent = isRecover ? "Recover your identity" : (isCreate ? "Create your identity" : "Sign in");
-  $("#auth-sub").textContent = isRecover
-    ? "Paste your 24-word recovery phrase. It restores the seed this machine's identity derives from."
-    : "This dashboard is bound to loopback. Your identity is held on this machine.";
+  // The honest sentence when the channel knows an operator this machine does not.
+  //
+  // This screen used to say "No identity on this machine yet?" and offer "Create one",
+  // which reads as "you have never set up" - and that is a different situation with a
+  // different fix. A cleaner deleted a sealed operator key from %LOCALAPPDATA% here; the
+  // dashboard said first-run, and the next hour went on hunting a bug that did not exist
+  // while the roster held the answer all along.
+  const lost = !status_any && orphaned.length
+    ? `${orphaned.join(", ")} ${orphaned.length > 1 ? "are" : "is"} published in this channel and still verifying, but the sealed key is not on this machine. Recover it with your phrase, or import it from a machine that has it. Do not create a new one under the same name - first key wins, and re-keying makes every past signature read as forged.`
+    : null;
+  $("#auth-sub").textContent = lost
+    ? lost
+    : (isRecover
+      ? "Paste your 24-word recovery phrase. It restores the seed this machine's identity derives from."
+      : "This dashboard is bound to loopback. Your identity is held on this machine.");
   $("#auth-submit").textContent = isRecover ? "Recover" : (isCreate ? "Create identity" : "Sign in");
   $("#auth-phrase-label").hidden = !isRecover;
   $("#auth-phrase").hidden = !isRecover;
   $("#auth-phrase").required = isRecover;
   // Recovery creates an operator and hands back a session, exactly as creation does, so
-  // on a first run it needs the same one-time console token.
-  const needSetup = firstRun && (isCreate || isRecover);
+  // on a first run it needs the same one-time console token - EXCEPT when it is restoring
+  // a name this channel already publishes. There the phrase has to derive the published
+  // key, which only its owner can do, and that is a stronger claim than a token printed
+  // on a console the person may never have seen. The server decides; this only stops the
+  // page demanding something that is not needed.
+  const needSetup = firstRun && (isCreate || (isRecover && orphaned.length === 0));
   $("#auth-setup-label").hidden = !needSetup;
   $("#auth-setup").hidden = !needSetup;
   $("#auth-setup").required = needSetup;
@@ -1716,9 +1738,11 @@ async function boot() {
   // Decide the first screen from /api/auth/status: whether an operator already exists on
   // this machine. The page itself is a shell, so the decision is made here rather than
   // server-rendered, the same way every other fact on this page is fetched.
-  let status = { any_operators: false, seed_present: false, read_only: false };
+  let status = { any_operators: false, seed_present: false, read_only: false, orphaned_operators: [] };
   try { status = await api("/api/auth/status"); } catch (_) {}
   firstRun = !status.any_operators;
+  status_any = !!status.any_operators;
+  orphaned = status.orphaned_operators || [];
 
   // A token already in hand (this tab created or recovered an identity, or survived a
   // refresh via sessionStorage) means the session may still be live.
@@ -1738,7 +1762,11 @@ async function boot() {
     }
   }
 
-  mode = status.any_operators ? "signin" : "create";
+  // An identity this channel knows, whose key is not on this machine, is NOT a first
+  // run - and offering "Create one" there sends a person to build a second key under
+  // their own name, which first-key-wins will refuse after they have typed a password
+  // and believed they fixed it. Recovery is the answer, so recovery is the default.
+  mode = status.any_operators ? "signin" : (orphaned.length ? "recover" : "create");
   renderAuth();
   showLogin();
 }

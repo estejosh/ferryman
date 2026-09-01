@@ -82,6 +82,41 @@ impl DashboardState {
         self.bootstrap.lock().unwrap().clone()
     }
 
+    /// Operators this CHANNEL knows, whose sealed key this MACHINE does not have.
+    ///
+    /// # Why this is worth its own question
+    ///
+    /// "No operator exists" was answered by looking at one machine's disk, and the answer
+    /// was printed as though it settled the matter: a first-run setup token and a sign-up
+    /// form. But a published roster entry is evidence that somebody DID set an operator
+    /// up - they signed it, and their signature is still verifying on work in the
+    /// channel. A machine holding the public half and not the private half has lost
+    /// something, which is a different situation from never having had it.
+    ///
+    /// This happened here. An operator's sealed record was deleted from `%LOCALAPPDATA%`
+    /// by a disk cleaner. The dashboard said "No operator exists for this project yet"
+    /// and offered a setup token, so the obvious reading was that setup had never
+    /// happened - and the hour that followed went on looking for a bug in identity
+    /// resolution rather than for a missing file. The roster had the answer the whole
+    /// time and nothing asked it.
+    ///
+    /// Names only. A public key is safe to display, but there is nothing to be gained
+    /// from putting one on a sign-in screen.
+    #[must_use]
+    pub fn orphaned_operators(&self) -> Vec<String> {
+        let Ok(roster) = ferryman_channel::read_agent_roster(&self.route.communications) else {
+            return Vec::new();
+        };
+        roster
+            .into_iter()
+            .filter(|entry| entry.role.eq_ignore_ascii_case("operator"))
+            // A reserved name carries no key. Nobody has lost anything yet.
+            .filter(|entry| entry.public_key.as_ref().is_some_and(|k| !k.is_empty()))
+            .map(|entry| entry.name)
+            .filter(|name| !self.operators.exists(name))
+            .collect()
+    }
+
     /// Accept and consume the bootstrap token, or refuse.
     ///
     /// Single-use: taken out of the state on success, so a token that leaks after the first
@@ -507,8 +542,26 @@ pub async fn serve(state: DashboardState, addr: std::net::SocketAddr) -> anyhow:
     // terminal, and it must survive `--quiet`, a log level, or logs going to a file. It
     // appears only when there is no operator yet, and stops working the moment one exists.
     if let Some(token) = state.bootstrap_token() {
-        println!("\nNo operator exists for this project yet.");
-        println!("To create the first one, the dashboard needs this single-use setup token:");
+        // Two very different situations share this branch, and announcing the wrong one
+        // costs hours. Ask the channel before saying nobody has ever set up.
+        let orphaned = state.orphaned_operators();
+        if orphaned.is_empty() {
+            println!("\nNo operator exists for this project yet.");
+            println!("To create the first one, the dashboard needs this single-use setup token:");
+        } else {
+            println!(
+                "\nThis machine holds no operator key, but this channel already knows: {}.",
+                orphaned.join(", ")
+            );
+            println!("Their signatures still verify here, so the identity is intact - the");
+            println!("sealed key is simply not on this machine. Get it back with either:");
+            println!("    - the 24-word recovery phrase ('Recover it' on the sign-in screen)");
+            println!("    - 'ferry operator import --file <file>' from a machine that has it");
+            println!();
+            println!("Creating a NEW identity under an existing name will be refused: first");
+            println!("key wins, and re-keying would make every past signature read as forged.");
+            println!("\nIf you are a new person joining this channel, the setup token is:");
+        }
         println!("\n    {token}\n");
         println!("Paste it into the sign-up form. It is not stored, is never sent to you");
         println!("over HTTP, and stops working as soon as one operator exists.\n");
@@ -722,6 +775,49 @@ struct RecoverBody {
     password: String,
 }
 
+/// Whether this phrase reconstructs the identity the channel ALREADY publishes under
+/// this name.
+///
+/// # Why this is allowed to stand in for the setup token
+///
+/// The token exists because a phrase, by itself, proves nothing: on a machine with no
+/// seed any valid BIP-39 phrase is accepted, and an attacker simply supplies their own.
+/// That reasoning is exactly right for creating a NEW name out of nothing.
+///
+/// It stops being right when the name is already in the roster with a published key. Then
+/// the phrase is not free input - it has to derive that exact key, which only the person
+/// who owns it can do. Requiring a console token on top of that adds friction without
+/// adding security, and it adds it on the worst day somebody will ever have with this
+/// tool: the day they have lost their identity and are holding the one thing that gets it
+/// back. If the dashboard is running as a service, or in a window they never saw, a
+/// person with a valid recovery phrase is simply stuck.
+///
+/// Checked here, before anything is written, rather than left to fail later at
+/// `register_agent_key`: a gate that works by letting the wrong thing happen and then
+/// refusing to publish it is not a gate, it is a cleanup.
+fn phrase_proves_a_published_identity(
+    state: &DashboardState,
+    name: &str,
+    seed: &OperatorSeed,
+) -> bool {
+    let name = ferryman_channel::canonical_agent_name(name);
+    let Ok(roster) = ferryman_channel::read_agent_roster(&state.route.communications) else {
+        return false;
+    };
+    let Some(published) = roster
+        .iter()
+        .find(|entry| ferryman_channel::canonical_agent_name(&entry.name) == name)
+        .and_then(|entry| entry.public_key.clone())
+        .filter(|key| !key.is_empty())
+    else {
+        return false;
+    };
+    // Both sides are public keys, so an ordinary comparison is fine - there is no secret
+    // here to leak through timing.
+    seed.operator_identity_for(&name)
+        .is_ok_and(|identity| identity.public_key_hex() == published)
+}
+
 async fn recover_operator(
     State(state): State<DashboardState>,
     headers: HeaderMap,
@@ -760,7 +856,16 @@ async fn recover_operator(
     // Ordered AFTER the phrase check so a mistyped word does not burn the one-time token
     // and wedge a person out of their own first run. Validating a phrase writes nothing
     // and tells an anonymous caller only whether a BIP-39 checksum holds.
-    if state.operators.any() {
+    //
+    // ...unless the phrase itself is the proof. See
+    // `phrase_proves_a_published_identity`: deriving the key this channel already
+    // publishes under this name is something only its owner can do, and it is a stronger
+    // claim than holding a token printed on a console.
+    let proven = phrase_proves_a_published_identity(&state, &body.name, &seed);
+    if proven {
+        // Nothing else to ask for. Deliberately does NOT consume the bootstrap token: a
+        // recovery that never needed it must not burn it for whoever does.
+    } else if state.operators.any() {
         if state.sessions.resolve(session_token(&headers)).is_none() {
             return Err((
                 StatusCode::UNAUTHORIZED,
@@ -772,8 +877,10 @@ async fn recover_operator(
     } else if !state.consume_bootstrap(bootstrap_token(&headers)) {
         return Err((
             StatusCode::UNAUTHORIZED,
-            "recovering onto this machine needs the setup token printed in the terminal \
-             running the dashboard; pass it as x-ferryman-dashboard-setup"
+            "that phrase does not reconstruct any identity this channel publishes, so it \
+             is being treated as creating a new one - which needs the setup token printed \
+             in the terminal running the dashboard. Check the name is spelled as the \
+             channel has it, and that the phrase is the right one."
                 .to_string(),
         ));
     }
@@ -841,6 +948,9 @@ async fn auth_status(State(state): State<DashboardState>) -> Result<Json<Value>,
         "any_operators": state.operators.any(),
         "seed_present": seed_present,
         "read_only": state.read_only,
+        // So the sign-in screen can tell "you have never set up" from "your identity is
+        // missing from this machine". They look identical and call for opposite actions.
+        "orphaned_operators": state.orphaned_operators(),
     })))
 }
 
@@ -2986,6 +3096,135 @@ mod tests {
             ferryman_channel::seed::phrase_to_seed(phrase).unwrap(),
             seed.expose_bytes()
         );
+    }
+
+    /// Recovering a name the CHANNEL already publishes needs no console token, because
+    /// the phrase has to derive that exact published key - which only its owner can do.
+    ///
+    /// The token still guards creating a new name out of nothing, and the test below this
+    /// one holds that line. This is the day somebody has lost their identity and is
+    /// holding the one thing that restores it; if the dashboard runs as a service, or in
+    /// a window they never saw, demanding a console secret strands them for no gain.
+    #[tokio::test]
+    async fn a_published_identity_is_recovered_by_its_phrase_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
+        let route = Arc::new(test_route(dir.path()));
+
+        // The channel knows this operator: their public key is in the roster, exactly as
+        // it would be after they set themselves up on a machine that has since lost the
+        // sealed half.
+        let seed_bytes = [0x5b; 32];
+        let seed = ferryman_channel::seed::OperatorSeed::from_bytes(seed_bytes);
+        let published = seed.operator_identity_for("josh").unwrap();
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "josh".into(),
+                role: "operator".into(),
+                capabilities: vec!["messages.receive".into()],
+                public_key: Some(published.public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+
+        let state = state(&route, false);
+        assert_eq!(
+            state.orphaned_operators(),
+            vec!["josh".to_string()],
+            "the channel knows josh and this machine does not - that is the whole situation"
+        );
+        let app = router(state);
+
+        let phrase = ferryman_channel::seed::seed_to_phrase(seed_bytes).unwrap();
+        let recovered = post(
+            &app,
+            "/api/auth/recover",
+            &serde_json::json!({
+                "phrase": phrase,
+                "name": "josh",
+                "password": "hunter2-secret",
+            })
+            .to_string(),
+            None, // no session, and deliberately no setup token
+        )
+        .await;
+        assert_eq!(
+            recovered.status(),
+            StatusCode::OK,
+            "the phrase derives the published key, which is proof enough"
+        );
+        let body = recovered.into_body().collect().await.unwrap().to_bytes();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            value["fingerprint"].as_str().unwrap(),
+            published.public_key_hex(),
+            "recovery must reconstruct the SAME key, or every past signature reads as forged"
+        );
+    }
+
+    /// The other half: a phrase that reconstructs nothing this channel publishes is
+    /// creating a new identity, whatever it is called, and still needs the token.
+    ///
+    /// Without this the gate would be gone entirely - anyone reaching the port could pick
+    /// their own phrase, seed the machine, and be an operator of a fleet they were never
+    /// let into.
+    #[tokio::test]
+    async fn a_phrase_for_an_unknown_name_still_needs_the_setup_token() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
+        let route = Arc::new(test_route(dir.path()));
+        let seed_bytes = [0x5b; 32];
+        let seed = ferryman_channel::seed::OperatorSeed::from_bytes(seed_bytes);
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "josh".into(),
+                role: "operator".into(),
+                capabilities: vec!["messages.receive".into()],
+                public_key: Some(seed.operator_identity_for("josh").unwrap().public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        let app = router(state(&route, false));
+
+        // An attacker's own phrase, under a name nobody has published.
+        let mine = ferryman_channel::seed::seed_to_phrase([0x11; 32]).unwrap();
+        let refused = post(
+            &app,
+            "/api/auth/recover",
+            &serde_json::json!({
+                "phrase": mine,
+                "name": "intruder",
+                "password": "hunter2-secret",
+            })
+            .to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        // And the right phrase under the WRONG name is not a shortcut either: the name is
+        // part of the derivation, so it derives a different key and proves nothing.
+        let right_phrase_wrong_name = post(
+            &app,
+            "/api/auth/recover",
+            &serde_json::json!({
+                "phrase": ferryman_channel::seed::seed_to_phrase(seed_bytes).unwrap(),
+                "name": "someone-else",
+                "password": "hunter2-secret",
+            })
+            .to_string(),
+            None,
+        )
+        .await;
+        assert_eq!(right_phrase_wrong_name.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Recovery pastes the 24 words on a new machine and restores the same identity, and a
