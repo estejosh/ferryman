@@ -360,6 +360,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/fleet", get(fleet))
         .route("/api/release", get(release))
         .route("/api/release/{version}/approve", post(approve_release))
+        .route("/api/release/{version}/deny", post(deny_release))
         .route("/api/conversations", get(conversations))
         .route("/api/conversations/{topic}", get(conversation).post(say))
         .route("/api/memory", get(memory))
@@ -1613,8 +1614,14 @@ async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, Das
     let approved = ferryman_channel::release::list_approvals(&state.route)
         .into_iter()
         .find(|a| a.version == request.version);
+    let denied = ferryman_channel::release::list_denials(&state.route)
+        .into_iter()
+        .find(|d| d.version == request.version);
     let roster = roster_now(&state);
     let now = chrono::Utc::now();
+    // Asked at the commit the request itself names, which is what a person on this page
+    // is being asked about.
+    let verdict = ferryman_channel::release::may_sign(&state.route, &request, &request.commit);
     Ok(Json(json!({
         "pending": {
             "version": request.version,
@@ -1636,6 +1643,26 @@ async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, Das
             "via": a.via,
             "signature": sig(&ferryman_channel::release::verify_approval(&a, &roster)),
         })),
+        "denial": denied.map(|d| json!({
+            "version": d.version,
+            "commit": d.commit,
+            "denied_by": d.denied_by,
+            "denied_at": d.denied_at.to_rfc3339(),
+            "reason": d.reason,
+            "via": d.via,
+            "signature": sig(&ferryman_channel::release::verify_denial(&d, &roster)),
+        })),
+        // The same verdict the signing path computes, from the same function.
+        //
+        // It used to be absent, and `may_sign` had exactly one caller: `ferry release
+        // status`, at a terminal. So this page could offer an Approve button for a
+        // request the gate would refuse, and the person found out later, elsewhere, if
+        // they went looking. Two answers to one question, with the reassuring one in
+        // front of the human. One gate, both callers.
+        "would_authorise": match &verdict {
+            Ok(_) => json!({ "ok": true }),
+            Err(refusal) => json!({ "ok": false, "because": refusal.to_string() }),
+        },
     })))
 }
 
@@ -1728,6 +1755,88 @@ async fn approve_release(
         "version": approval.version,
         "commit": approval.commit,
         "approved_by": approval.approved_by,
+        "path": path.display().to_string(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct DenyBody {
+    commit: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// POST /api/release/{version}/deny - a person says no to one commit, and why.
+///
+/// # Why saying no needs a signature too
+///
+/// Before this existed the store could only hold approvals, so a person who read a
+/// request and decided against it had nowhere to put that: silence and refusal were
+/// recorded identically, and "did anybody actually look at this" - the one question a
+/// judgement surface exists to answer - could not be answered from the channel.
+///
+/// A denial is signed by the same key an approval is, unsealed by the same password. An
+/// unsigned refusal would be a denial of service any peer could write into the synced
+/// folder, and `may_sign` ignores one for that reason.
+async fn deny_release(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(version): Path<String>,
+    Json(body): Json<DenyBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let request = ferryman_channel::release::pending(&state.route).ok_or((
+        StatusCode::CONFLICT,
+        "there is no release waiting to be decided".to_string(),
+    ))?;
+    if request.version != version {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "the release waiting is {}, not {version}. Reload and look at what is \
+                 actually on the table.",
+                request.version
+            ),
+        ));
+    }
+    // The same substitution check approving does. A no about one commit is not a no
+    // about whatever has replaced it since the page was drawn.
+    if request.commit != body.commit {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "this release is now at {} and you were shown {}. Reload and look again \
+                 before deciding.",
+                request.commit, body.commit
+            ),
+        ));
+    }
+    // Deliberately no CI or staleness gate here. Those refuse a *release*; they must not
+    // refuse a person's refusal. Being unable to record "no" on a stale request would be
+    // the original hole in a smaller shape.
+    let denial = ferryman_channel::release::ReleaseDenial {
+        version: request.version.clone(),
+        commit: request.commit.clone(),
+        denied_by: identity.name().to_string(),
+        denied_at: chrono::Utc::now(),
+        reason: body.reason.clone(),
+        via: "dashboard".to_string(),
+        signed_by: None,
+        signature: None,
+    };
+    let path = ferryman_channel::release::write_denial(&state.route, &denial, &identity)
+        .map_err(internal)?;
+    Ok(Json(json!({
+        "version": denial.version,
+        "commit": denial.commit,
+        "denied_by": denial.denied_by,
+        "reason": denial.reason,
         "path": path.display().to_string(),
     })))
 }

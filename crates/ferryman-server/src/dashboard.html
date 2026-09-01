@@ -1102,6 +1102,12 @@ pages.release = async () => {
   }
 
   const a = d.approval;
+  const n = d.denial;
+  // The verdict comes from the server, computed by the same function the signing path
+  // calls. This page must never work it out for itself: a second opinion rendered next
+  // to an Approve button is how a person ends up approving something that will be
+  // refused elsewhere, later, without them.
+  const w = d.would_authorise || {};
   const ciTone = p.ci_green ? "good" : "bad";
   const ciWord = p.ci_green ? "CI green" : "CI failed";
 
@@ -1138,14 +1144,28 @@ pages.release = async () => {
       <div style="padding:14px 16px;white-space:pre-wrap;line-height:1.6">${esc(p.notes || "No notes were written.")}</div>
     </div>
 
+    ${n ? `
+      <div class="panel" style="margin-bottom:18px">
+        <div style="padding:16px;display:flex;gap:12px;align-items:flex-start">
+          <div class="stripe" style="background:var(--bad)"></div>
+          <div>
+            <div class="t">Declined by ${esc(n.denied_by)} ${sigBadge(n.signature)}</div>
+            <div class="m">for ${esc(n.commit)} &middot; ${esc(ago(n.denied_at))} &middot; via ${esc(n.via || "—")}</div>
+            <div class="m">${esc(n.reason || "No reason was given.")}</div>
+          </div>
+        </div>
+      </div>` : ""}
+
     ${a ? `
       <div class="panel">
         <div style="padding:16px;display:flex;gap:12px;align-items:flex-start">
-          <div class="stripe" style="background:var(--good)"></div>
+          <div class="stripe" style="background:${w.ok ? "var(--good)" : "var(--warn)"}"></div>
           <div>
             <div class="t">Approved by ${esc(a.approved_by)} ${sigBadge(a.signature)}</div>
             <div class="m">for ${esc(a.commit)} &middot; ${esc(ago(a.approved_at))} &middot; via ${esc(a.via || "—")}</div>
-            <div class="m">The signing machine can take it from here.</div>
+            <div class="m">${w.ok
+              ? "The signing machine can take it from here."
+              : `<b>Would not authorise.</b> ${esc(w.because || "")}`}</div>
           </div>
         </div>
       </div>`
@@ -1156,10 +1176,18 @@ pages.release = async () => {
             You are approving <span class="mono">${esc(p.commit)}</span>. If anything lands on
             main before the tag is cut, this approval stops applying and comes back to you.
           </div>
+          <input id="rel-reason" placeholder="Reason (only needed to decline)" style="min-width:180px" />
           <div style="display:flex;gap:10px;flex-wrap:wrap">
             <button class="btn primary" id="rel-approve" data-commit="${esc(p.commit)}" data-version="${esc(p.version)}"
               ${p.ci_green && !p.stale ? "" : "disabled"}>Approve and sign</button>
+            <!-- Declining is deliberately never disabled. CI and staleness refuse a
+                 release; they must not refuse a person's refusal. -->
+            <button class="btn" id="rel-deny" data-commit="${esc(p.commit)}" data-version="${esc(p.version)}">Decline</button>
             <button class="btn" id="rel-later">Not yet</button>
+          </div>
+          <div class="s" style="color:var(--dim)">
+            &ldquo;Not yet&rdquo; leaves it waiting and says nothing. &ldquo;Decline&rdquo; is a signed no,
+            and it stays in the channel.
           </div>
           <div class="s" id="rel-msg" style="color:var(--dim)"></div>
         </div>
@@ -1186,6 +1214,28 @@ function wireRelease() {
     } catch (err) {
       msg.textContent = String(err.message || err).slice(0, 300);
       go.disabled = false;
+    }
+  });
+  const no = $("#rel-deny");
+  if (no) no.addEventListener("click", async () => {
+    const msg = $("#rel-msg");
+    msg.textContent = "";
+    no.disabled = true;
+    try {
+      // Same commit pin as approving. A no about one commit is not a no about whatever
+      // replaced it while the page was open.
+      await api(`/api/release/${encodeURIComponent(no.dataset.version)}/deny`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          commit: no.dataset.commit,
+          reason: ($("#rel-reason") || {}).value || "",
+        }),
+      });
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      no.disabled = false;
     }
   });
   const later = $("#rel-later");
