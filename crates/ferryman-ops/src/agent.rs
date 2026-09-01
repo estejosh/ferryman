@@ -2141,14 +2141,6 @@ pub async fn work_once(
             // one being worked on.
             TaskState::Open | TaskState::Offered { .. } => {
                 ferryman_channel::claim_order(route, &id, &config.agent)?;
-                ferryman_channel::ledger::append_ledger_entry(
-                    route,
-                    &identity,
-                    "claim",
-                    &config.agent,
-                    &format!("claimed order {id}"),
-                    Some(&id),
-                )?;
                 // Re-read: another machine's claim may have arrived while this one was
                 // being written, and the older claim wins. Acting on a stale read is
                 // how two agents end up doing the same task.
@@ -2160,6 +2152,23 @@ pub async fn work_once(
                     ));
                     continue;
                 }
+                // The ledger entry comes AFTER the claim is confirmed, not before.
+                //
+                // It used to be written the instant the claim file was, which meant every
+                // lost race still went into the tamper-evident chain as "claimed order X".
+                // A machine that loses the same race every ten seconds - which happens,
+                // and had been happening here for six hours - writes thousands of signed
+                // entries for claims it never held. A log that records what a machine
+                // attempted, in a chain whose whole value is recording what happened, is
+                // worse than no entry: it is evidence for something untrue.
+                ferryman_channel::ledger::append_ledger_entry(
+                    route,
+                    &identity,
+                    "claim",
+                    &config.agent,
+                    &format!("claimed order {id}"),
+                    Some(&id),
+                )?;
                 if attempt(route, config, &identity, &task, report).await {
                     acted += 1;
                 }
