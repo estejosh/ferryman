@@ -452,7 +452,10 @@ mod tests {
     }
 
     /// Set up a route with one signing operator and one order on disk.
-    fn route_with_order(dir: &std::path::Path, order_id: &str) -> (ProjectRoute, crate::AgentIdentity) {
+    fn route_with_order(
+        dir: &std::path::Path,
+        order_id: &str,
+    ) -> (ProjectRoute, crate::AgentIdentity) {
         let mut route = route(dir);
         let identity =
             crate::AgentIdentity::load_or_create("orchestrator", &route.attachment).unwrap();
@@ -511,7 +514,10 @@ mod tests {
         kill(&route, &identity, "t-dead");
 
         // The worker sees the kill once and acknowledges it, as it always did.
-        assert_eq!(pending_interrupts(&route, "t-dead", "claw").unwrap().len(), 1);
+        assert_eq!(
+            pending_interrupts(&route, "t-dead", "claw").unwrap().len(),
+            1
+        );
         acknowledge(&route, "t-dead", "orchestrator", "claw").unwrap();
         assert!(
             pending_interrupts(&route, "t-dead", "claw")

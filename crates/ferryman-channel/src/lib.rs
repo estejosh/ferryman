@@ -1028,7 +1028,11 @@ impl Task {
         // Death first, and before the holder is even resolved: a kill that landed while
         // the order sat unclaimed must be just as final as one that interrupted a run.
         // The oldest kill is the one reported, so every machine names the same instant.
-        if let Some(kill) = self.kills.iter().min_by_key(|k| (k.created_at, k.issued_by.clone())) {
+        if let Some(kill) = self
+            .kills
+            .iter()
+            .min_by_key(|k| (k.created_at, k.issued_by.clone()))
+        {
             return TaskState::Killed {
                 by: kill.issued_by.clone(),
                 at: kill.created_at,

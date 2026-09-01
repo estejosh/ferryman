@@ -120,7 +120,13 @@ fn belongs_to(dir: &Path, repo: &Path) -> bool {
     fn common_git_dir(path: &Path) -> Option<PathBuf> {
         let path = path.to_str()?;
         let output = Command::new("git")
-            .args(["-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .args([
+                "-C",
+                path,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ])
             .output()
             .ok()?;
         if !output.status.success() {
@@ -151,7 +157,10 @@ fn worktree_holder(repo: &Path) -> String {
     // The path as written is what distinguishes two checkouts, so that is what is
     // hashed. Case is folded because Windows would otherwise give one repo two homes.
     let digest = Sha256::digest(repo.to_string_lossy().to_lowercase().as_bytes());
-    format!("{name}-{:06x}", u32::from_be_bytes([0, digest[0], digest[1], digest[2]]))
+    format!(
+        "{name}-{:06x}",
+        u32::from_be_bytes([0, digest[0], digest[1], digest[2]])
+    )
 }
 
 /// Create a worktree for an (order, agent) pair next to `repo`, returning the
@@ -170,7 +179,9 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
     // The old location is still honoured when a worktree is already sitting there, so an
     // install that has been running for weeks does not suddenly abandon work in
     // progress - and a machine with no ferry root behaves exactly as it always did.
-    let parent = repo.parent().context("repo has no parent to hold a worktree")?;
+    let parent = repo
+        .parent()
+        .context("repo has no parent to hold a worktree")?;
     let plain = parent.join(&branch);
     // The legacy location is stepped around in exactly one case: a LIVE worktree of
     // another repository is sitting in it. Two repos side by side, given the same order
@@ -744,8 +755,14 @@ mod tests {
         );
 
         // Asking again finds each its own again, rather than a fresh one or the neighbour's.
-        assert_eq!(create_worktree(&one, "update-0828", "nebra").unwrap().0, dir_one);
-        assert_eq!(create_worktree(&two, "update-0828", "nebra").unwrap().0, dir_two);
+        assert_eq!(
+            create_worktree(&one, "update-0828", "nebra").unwrap().0,
+            dir_one
+        );
+        assert_eq!(
+            create_worktree(&two, "update-0828", "nebra").unwrap().0,
+            dir_two
+        );
 
         let _ = fs::remove_dir_all(&one);
         let _ = fs::remove_dir_all(&two);
