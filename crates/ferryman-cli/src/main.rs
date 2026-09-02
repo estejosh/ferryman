@@ -412,6 +412,10 @@ enum Command {
         /// exists to stop.
         #[arg(long = "allow-host")]
         allow_host: Vec<String>,
+        /// Do not open a browser. For headless machines, and for anyone who would
+        /// rather a window did not appear on its own.
+        #[arg(long = "no-open")]
+        no_open: bool,
     },
     /// Print this project's persistent memory — the synced memory bank and the
     /// durable append-only log — so an agent that has lost its context (or a
@@ -2269,6 +2273,7 @@ async fn run(cli: Cli) -> Result<()> {
             read_only,
             comms,
             allow_host,
+            no_open,
         } => {
             update::keep_current().await;
             if !allow_host.is_empty() {
@@ -2300,6 +2305,31 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("read-only; ctrl-c to stop");
             } else {
                 println!("sign in (or create an operator identity) in the browser; ctrl-c to stop");
+            }
+            // Open it, rather than printing an address and hoping.
+            //
+            // The product is the page; the terminal is the one command a person should
+            // have to type. Printing "http://127.0.0.1:8788" and leaving them to copy it
+            // is a small tax on someone comfortable with terminals and a wall for
+            // everyone else - and "no command line bullshit" is the stated bar.
+            //
+            // Best-effort and silent on failure: a headless box has no browser and must
+            // not have the dashboard fail to start because nothing could be opened.
+            // `--no-open` for anyone who does not want a window appearing.
+            if !no_open && !read_only {
+                let url = format!("http://{addr}");
+                let opened = if cfg!(windows) {
+                    std::process::Command::new("cmd")
+                        .args(["/C", "start", "", &url])
+                        .spawn()
+                } else if cfg!(target_os = "macos") {
+                    std::process::Command::new("open").arg(&url).spawn()
+                } else {
+                    std::process::Command::new("xdg-open").arg(&url).spawn()
+                };
+                if opened.is_err() {
+                    println!("  (could not open a browser here - visit the address above)");
+                }
             }
             ferryman_server::dashboard::serve(state, addr).await?;
         }
@@ -3122,7 +3152,20 @@ fn report_enable_human(
         None => println!("  syncthing  skipped (--no-syncthing)"),
     }
     println!();
-    println!("Then, on each machine:");
+    // What to do next, told to the person who is actually standing here.
+    //
+    // This used to end with two more commands to type, which assumes the reader is
+    // comfortable at a terminal. The stated goal is the opposite: setup is a form in a
+    // browser, and "no command line bullshit" for the end user. So the last thing setup
+    // says is how to stop using the command line - and `ferry dashboard` is one command,
+    // once, after which everything happens in a page.
+    //
+    // The worker commands stay, below, because a headless machine has no browser and
+    // that is exactly how every machine in this fleet but the operator's runs.
+    println!("Next, open the dashboard - everything else happens there:");
+    println!("  ferry dashboard        # then open the address it prints");
+    println!();
+    println!("On a headless machine, with no browser:");
     println!("  ferry agent run        # does work");
     println!("  ferry agent review     # judges results");
     if outcome.counted.over_limit() {

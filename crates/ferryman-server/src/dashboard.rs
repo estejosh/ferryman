@@ -3116,6 +3116,44 @@ mod tests {
         );
     }
 
+    /// Every route the router serves is in the published OpenAPI spec.
+    ///
+    /// The spec had eleven paths while the router had thirty-one. Twenty endpoints -
+    /// including everything that approves a release, grants a teammate access, or writes
+    /// a secret - existed and were undocumented, and nothing anywhere would ever have
+    /// said so. A spec that drifts silently is worse than no spec: it is consulted, and
+    /// it is wrong.
+    ///
+    /// Reading the source rather than the router because axum's `Router` does not expose
+    /// its paths. Crude, and it holds: a route added without a line in the spec fails
+    /// here, which is the whole job.
+    #[test]
+    fn every_route_is_in_the_openapi_spec() {
+        const SOURCE: &str = include_str!("dashboard.rs");
+        const SPEC: &str = include_str!("../../../openapi/dashboard.yaml");
+
+        let mut missing = Vec::new();
+        for line in SOURCE.lines() {
+            let Some(rest) = line.trim().strip_prefix(".route(\"") else {
+                continue;
+            };
+            let Some(path) = rest.split('"').next() else {
+                continue;
+            };
+            // The dashboard page itself is not an API endpoint.
+            if path == "/" {
+                continue;
+            }
+            if !SPEC.contains(&format!("\n  {path}:")) {
+                missing.push(path.to_string());
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these routes are served but absent from openapi/dashboard.yaml: {missing:#?}"
+        );
+    }
+
     /// Recovering a name the CHANNEL already publishes needs no console token, because
     /// the phrase has to derive that exact published key - which only its owner can do.
     ///

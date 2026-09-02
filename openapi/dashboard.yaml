@@ -87,6 +87,151 @@ paths:
       responses:
         '200': {description: operator name, content: {application/json: {schema: {type: object, properties: {name: {type: string}}}}}}
         '401': {description: no active session}
+  /api/auth/recover:
+    post:
+      summary: Restore an operator from its 24-word recovery phrase
+      description: >
+        Recovering a name the channel already publishes needs no setup token: the phrase
+        must derive that published key, which only its owner can do. Creating a NEW name
+        this way still needs the one-time token printed on the console.
+      responses:
+        '200': {description: session token and fingerprint}
+        '400': {description: the phrase is not a valid 24-word BIP-39 phrase}
+        '401': {description: an unpublished name, and no setup token or session}
+        '409': {description: this machine already holds a different seed}
+  /api/auth/status:
+    get:
+      summary: Whether this machine holds an operator, and which published ones it is missing
+      description: >
+        `orphaned_operators` names operators the CHANNEL publishes whose sealed key is not
+        on this machine. It distinguishes "never set up" from "identity lost", which look
+        identical otherwise and call for opposite actions.
+      responses:
+        '200': {description: any_operators, seed_present, read_only, orphaned_operators}
+  /api/identity:
+    get:
+      summary: The operator's fingerprint, and whether it derives from the machine seed
+      responses:
+        '200': {description: fingerprint and derivation}
+        '401': {description: no active session}
+  /api/team/invite:
+    post:
+      summary: Reserve a name for a teammate who has not joined yet
+      description: >
+        Reserves the NAME only. It cannot create their identity: an operator key is sealed
+        under that person's own password, and a key minted here would be a key this machine
+        has seen. Their key binds to the reserved name when their own machine registers.
+      responses:
+        '200': {description: the reserved name}
+        '400': {description: not a path-safe identifier}
+        '409': {description: already in the channel}
+  /api/team/{name}/access:
+    post:
+      summary: Sign a master grant saying what this person may do, and on which projects
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: the grant}
+        '403': {description: only the channel master may grant}
+        '404': {description: not in this channel}
+        '409': {description: invited but not yet online, so there is no key to grant to}
+  /api/release:
+    get:
+      summary: The release waiting for a person, with the gate's own verdict
+      description: >
+        `would_authorise` is computed by the same function the signing path calls, so the
+        page can never offer to approve something the gate would refuse.
+      responses:
+        '200': {description: pending request, approval, denial, superseded approval, verdict}
+        '401': {description: no active session}
+  /api/release/{version}/approve:
+    post:
+      summary: A person says yes to one exact commit
+      parameters:
+        - {name: version, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: the signed approval}
+        '401': {description: no active session}
+        '409': {description: the commit moved, CI is not green, or the request is stale}
+  /api/release/{version}/deny:
+    post:
+      summary: A person says no to one exact commit, with a reason
+      description: >
+        Never gated on CI or staleness. Those refuse a release; they must not refuse a
+        person's refusal.
+      parameters:
+        - {name: version, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: the signed denial}
+        '401': {description: no active session}
+        '409': {description: the commit moved under the page}
+  /api/conversations:
+    get:
+      summary: Every conversation topic, with its last line and signature status
+      responses:
+        '200': {description: topics}
+        '401': {description: no active session}
+  /api/conversations/{topic}:
+    get:
+      summary: One conversation, as a transcript
+      parameters:
+        - {name: topic, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: turns}
+        '401': {description: no active session}
+  /api/roster:
+    get:
+      summary: The channel roster, as signed
+      responses:
+        '200': {description: roster entries}
+        '401': {description: no active session}
+  /api/fleet:
+    get:
+      summary: Machines in the fleet and what they are doing
+      responses:
+        '200': {description: fleet status}
+        '401': {description: no active session}
+  /api/memory:
+    get:
+      summary: The shared memory bank
+      responses:
+        '200': {description: memory}
+        '401': {description: no active session}
+  /api/memory/suggest:
+    post:
+      summary: Propose an addition to the shared memory bank
+      responses:
+        '200': {description: the proposal}
+        '401': {description: no active session}
+  /api/secrets:
+    get:
+      summary: Secret names held in the channel. Never their values
+      responses:
+        '200': {description: names only}
+        '401': {description: no active session}
+    post:
+      summary: Set a secret, sealed and signed by the operator
+      responses:
+        '200': {description: written}
+        '401': {description: no active session}
+  /api/secrets/{name}:
+    delete:
+      summary: Remove a secret from the channel
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: removed}
+        '401': {description: no active session}
+  /api/cost/rates:
+    get:
+      summary: Published per-engine list prices, computed offline
+      responses:
+        '200': {description: rates}
+  /api/cost/plan:
+    post:
+      summary: Estimate what one prompt would cost on each engine
+      responses:
+        '200': {description: estimate}
   /api/team:
     get:
       summary: Human teammates and machine agents, returned as separate identity classes
