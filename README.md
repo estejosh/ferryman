@@ -17,12 +17,27 @@ server in the middle, no port to forward, no cloud account — and the
 coordination lives in its own private repository, kept separate from the work
 itself.
 
+### Nothing to type
+
+Download one file from [the latest release](https://github.com/estejosh/ferryman/releases/latest)
+and double-click it:
+
+| | |
+|---|---|
+| Windows | **Ferryman-Setup.cmd** |
+| macOS, Linux | **Ferryman-Setup.command** |
+
+It installs Ferryman, asks which folder to coordinate, and opens the dashboard. From
+there it is a web page — there is no second step and no command to remember.
+
+### Or from a terminal
+
 ```sh
 # macOS and Linux
 curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh
 
 cd your-project && ferry enable --email you@example.com    # setup, all of it
-ferry agent run                                            # this machine now does work
+ferry dashboard                                            # everything else is here
 ```
 
 Windows, in PowerShell:
