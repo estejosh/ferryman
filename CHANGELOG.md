@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+## v0.5.7 - 2026-09-02
+
+Setup you double-click, an API spec that cannot drift, and the first release
+signed with SSH.
+
+### Added
+
+- **Setup is a file you double-click.** `Ferryman-Setup.cmd` and
+  `Ferryman-Setup.command`, attached to every release. They install Ferryman, ask for
+  an email and a folder, enable the project and open the dashboard — after which it is
+  a web page. The install instructions were `curl … | sh` and `irm … | iex`, and both
+  are command lines, which is the one thing this tool tells its users they will not
+  need. A `.ps1` cannot even be double-clicked; Windows opens it in Notepad.
+- **`ferry dashboard` opens the browser** rather than printing an address and hoping,
+  and `ferry enable` now ends by pointing at it instead of asking for two more
+  commands. `--no-open` for headless machines.
+- **A person can decline a release**, signed, with a reason — and declining is never
+  disabled by red tests or staleness, because those refuse a release and must not
+  refuse a person's refusal.
+- **Teammates can be invited, with per-project access levels.** Inviting reserves the
+  *name*: an operator key is sealed under that person's own password, so a key minted
+  here would be a key this machine has seen.
+- **Engine cost is measured.** `Learning` now carries token counts read from the result
+  in whatever shape the engine reported (OpenAI's, Anthropic's, or flat). Optional
+  rather than zero — silence is not a free run.
+- **`ferry channel submit --result-file`**, for the same reason `--task-file` exists.
+  It carries the largest payload in the channel and was the one command without it.
+- **`scripts/uninstall.sh` and `.ps1`.** They keep your operator identity unless you
+  pass `--identity`, never touch channels, and support `--dry-run`.
+- **The whole API is documented**, and a test fails if a route is added without a spec
+  entry. It described 11 of 31 endpoints.
+
+### Fixed
+
+- **A lost identity no longer reads as a first run.** The dashboard answered "does an
+  operator exist" from one machine's disk and offered a setup token — so an operator
+  whose sealed key had been deleted was told they had never set one up, while their
+  signatures were still verifying in the channel. It asks the channel now, names who is
+  missing, and defaults to recovery.
+- **Recovering a published name needs no console token.** The phrase must derive that
+  exact published key, which only its owner can do — a stronger claim than a secret
+  printed in a terminal window the person may never have seen.
+- **An old approval hid the button for approving the new one.** The release page matched
+  approvals by version alone, so an approval of one commit made it render as settled for
+  a different commit the gate was refusing. Page and gate now both come from `may_sign`.
+- **Your operator key is kept in two places.** It lived only in `%LOCALAPPDATA%` (or
+  `~/.local/state`), where every disk cleaner points; one deleted the whole directory
+  overnight. A second sealed copy lives in `~/.ferryman/operators`, and signing in puts
+  the primary back if it has gone.
+- **Two machines sharing a hostname got a frightening error.** The refusal named
+  impersonation first; it now names the ordinary cause — two VMs from one image — and
+  gives the fix.
+- **Errors print a sentence, not a stack trace.** `FERRYMAN_BACKTRACE=1` brings it back
+  for whoever is fixing ferry rather than using it.
+
+### Notes
+
+Releases are signed with SSH from this version on. v0.5.6 and earlier are GPG-signed.
+
+
 ## v0.5.6 - 2026-09-01
 
 One place to put things, an operator whose "stop" means stop, and a fleet

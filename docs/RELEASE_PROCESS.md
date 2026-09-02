@@ -28,6 +28,42 @@ gpg --import keys/estejosh.asc
 git tag -v v0.5.1
 ```
 
+## Releases are signed with SSH from v0.5.7
+
+GPG is no longer used for signing here. It was replaced rather than repaired, and the
+reason is the section below: the GPG key's UID does not match the tagger address GitHub
+requires, every release since carried a `bad_email` badge, and the documented fix -
+re-uploading the key - is refused by GitHub with "Key already exists" unless the existing
+key is deleted first. Deleting it would invalidate the verification status of every tag
+already signed with it, so it stays.
+
+SSH signing sidesteps all of that: a separate key, added to GitHub as a **signing** key
+(not an authentication key - that dropdown is the easy thing to get wrong), with nothing
+deleted and no UID to reconcile.
+
+```sh
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/ferryman_signing.pub
+git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
+git config --global tag.gpgsign true
+```
+
+Set globally on purpose: per-repository configuration is how this silently reverts, and a
+release signed with the old key would put the badge straight back.
+
+`allowed_signers` is one line - `<tagger-email> <contents of the .pub>` - and is what
+makes `git tag -v` verify locally rather than only on GitHub.
+
+To check a tag signed this way, nothing needs importing:
+
+```sh
+git tag -v v0.5.7
+```
+
+Tags up to and including v0.5.6 are GPG-signed and verify with the key above. They are
+left exactly as they are: re-tagging a published release invalidates it and can break the
+auto-update path for anyone who already has it.
+
 ### Why the key is in the repository
 
 It was not, and the first signed release nobody could verify made the case.
