@@ -521,7 +521,9 @@ function showApp() {
 function renderAuth() {
   const isCreate = mode === "create";
   const isRecover = mode === "recover";
-  $("#auth-title").textContent = isRecover ? "Recover your identity" : (isCreate ? "Create your identity" : "Sign in");
+  $("#auth-title").textContent = isRecover
+    ? (!status_any && orphaned.length ? "Get your identity back" : "Recover your identity")
+    : (isCreate ? "Create your identity" : "Sign in");
   // The honest sentence when the channel knows an operator this machine does not.
   //
   // This screen used to say "No identity on this machine yet?" and offer "Create one",
@@ -529,14 +531,19 @@ function renderAuth() {
   // different fix. A cleaner deleted a sealed operator key from %LOCALAPPDATA% here; the
   // dashboard said first-run, and the next hour went on hunting a bug that did not exist
   // while the roster held the answer all along.
-  const lost = !status_any && orphaned.length
-    ? `${orphaned.join(", ")} ${orphaned.length > 1 ? "are" : "is"} published in this channel and still verifying, but the sealed key is not on this machine. Recover it with your phrase, or import it from a machine that has it. Do not create a new one under the same name - first key wins, and re-keying makes every past signature read as forged.`
-    : null;
-  $("#auth-sub").textContent = lost
-    ? lost
+  // The words a person reads on the worst day they will have with this tool. Say what
+  // happened, say what to do, and stop. The first draft of this put the whole
+  // explanation - first-key-wins, re-keying, importing from another machine - into one
+  // paragraph above an empty form, and the operator it was written for could not get
+  // through it. Explanation is not instruction.
+  const lost = !status_any && orphaned.length;
+  $("#auth-sub").textContent = lost && isRecover
+    ? `${orphaned.join(" and ")} ${orphaned.length > 1 ? "are" : "is"} in this channel, but the key is not on this machine. Paste your 24 words below to get it back.`
     : (isRecover
       ? "Paste your 24-word recovery phrase. It restores the seed this machine's identity derives from."
-      : "This dashboard is bound to loopback. Your identity is held on this machine.");
+      : (lost
+        ? `${orphaned.join(", ")} ${orphaned.length > 1 ? "are" : "is"} in this channel, but the key is not on this machine.`
+        : "This dashboard is bound to loopback. Your identity is held on this machine."));
   $("#auth-submit").textContent = isRecover ? "Recover" : (isCreate ? "Create identity" : "Sign in");
   $("#auth-phrase-label").hidden = !isRecover;
   $("#auth-phrase").hidden = !isRecover;
@@ -564,10 +571,21 @@ function renderAuth() {
   // Creating another operator is an authenticated action, so the create toggle is only
   // offered on a first run (no operator yet). Recovery is always reachable: it is how a
   // person gets back in on a fresh machine.
-  $("#auth-alt").style.display = (isRecover || !firstRun) ? "none" : "";
+  // Never a dead end. Recovery used to hide BOTH of these, so a person who landed here -
+  // and after the fix above they land here by default - had no way back to signing in or
+  // creating anything. A screen you can only leave by reloading is a broken screen.
+  $("#auth-alt").style.display = (!firstRun && !isRecover) ? "none" : "";
   $("#recover-alt").style.display = isRecover ? "none" : "";
-  $("#auth-alt-text").textContent = isCreate ? "Already have one?" : "No identity on this machine yet?";
+  $("#auth-alt-text").textContent = isRecover
+    ? "Not recovering an existing identity?"
+    : (isCreate ? "Already have one?" : "No identity on this machine yet?");
   $("#auth-toggle").textContent = isCreate ? "Sign in" : "Create one";
+
+  // Fill in the name we already know. It is the one fact on this screen the person
+  // should not have to supply from memory - it is written in the channel, this page has
+  // just read it, and getting it wrong derives a different key and fails.
+  const nameField = $("#auth-name");
+  if (isRecover && lost && !nameField.value) nameField.value = orphaned[0];
   $("#auth-msg").textContent = "";
 }
 
