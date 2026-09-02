@@ -1912,9 +1912,22 @@ async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, Das
     let Some(request) = ferryman_channel::release::pending(&state.route) else {
         return Ok(Json(json!({ "pending": null })));
     };
+    // Matched on version AND commit, because that is what an approval means.
+    //
+    // Matching on version alone was a dead end with no way out: an approval of v0.5.6 at
+    // one commit made the page report v0.5.6 as approved, render the "approved by" panel,
+    // and hide the buttons - for a request at a DIFFERENT commit that `may_sign` was
+    // correctly refusing. The gate and the page disagreed, and the half that disagreed was
+    // the half with the controls on it. The operator could not approve the release and
+    // could not see why.
     let approved = ferryman_channel::release::list_approvals(&state.route)
         .into_iter()
-        .find(|a| a.version == request.version);
+        .find(|a| a.version == request.version && a.commit == request.commit);
+    // An approval of this version at an older commit is worth showing - it is why the
+    // commit pin exists and it explains the state - but it is not consent to this one.
+    let superseded = ferryman_channel::release::list_approvals(&state.route)
+        .into_iter()
+        .find(|a| a.version == request.version && a.commit != request.commit);
     let denied = ferryman_channel::release::list_denials(&state.route)
         .into_iter()
         .find(|d| d.version == request.version);
@@ -1943,6 +1956,11 @@ async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, Das
             "approved_at": a.approved_at.to_rfc3339(),
             "via": a.via,
             "signature": sig(&ferryman_channel::release::verify_approval(&a, &roster)),
+        })),
+        "superseded_approval": superseded.map(|a| json!({
+            "commit": a.commit,
+            "approved_by": a.approved_by,
+            "approved_at": a.approved_at.to_rfc3339(),
         })),
         "denial": denied.map(|d| json!({
             "version": d.version,

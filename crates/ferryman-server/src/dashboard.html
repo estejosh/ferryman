@@ -1328,6 +1328,12 @@ pages.release = async () => {
       <div style="padding:14px 16px;white-space:pre-wrap;line-height:1.6">${esc(p.notes || "No notes were written.")}</div>
     </div>
 
+    ${d.superseded_approval ? `
+      <div class="notice" style="margin-bottom:18px">
+        <b>Your earlier approval no longer applies</b>
+        <div>${esc(d.superseded_approval.approved_by)} approved ${esc(d.superseded_approval.commit)} ${esc(ago(d.superseded_approval.approved_at))}, and the release has moved to ${esc(p.commit)} since. Approving one commit does not approve another, so this one needs a fresh yes.</div>
+      </div>` : ""}
+
     ${n ? `
       <div class="panel" style="margin-bottom:18px">
         <div style="padding:16px;display:flex;gap:12px;align-items:flex-start">
