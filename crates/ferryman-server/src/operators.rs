@@ -215,6 +215,22 @@ pub struct OperatorStore {
     /// the same condition as `machine`; distinct from `machine` because the seed is not an
     /// operator record - it is the root the operator's key derives from (ADR 0016).
     machine_state: Option<PathBuf>,
+    /// A second home for the same sealed records, outside the directories disk cleaners
+    /// sweep. Written alongside the primary and read only when the primary has gone.
+    ///
+    /// # Why one copy was not enough
+    ///
+    /// The machine tier lives under `%LOCALAPPDATA%` on Windows and `~/.local/state`
+    /// elsewhere, which is exactly where every disk cleaner points. One of them deleted an
+    /// operator's `operators/` directory overnight - not the file, the whole directory -
+    /// and with it the only copy of a sealed key that nothing else on any machine holds.
+    /// The channel still had the public half, the signatures still verified, and the
+    /// person was locked out of their own identity by a tidy-up utility.
+    ///
+    /// A sealed record is safe to duplicate: it is useless without the password, which is
+    /// the same reason it can be carried between machines at all. Losing it is
+    /// catastrophic and copying it is nearly free, so it is copied.
+    refuge: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -228,13 +244,30 @@ struct OperatorRecord {
     public_key_hex: String,
 }
 
+/// Where the spare copy of a sealed operator record lives.
+///
+/// `~/.ferryman/operators` - the profile root rather than any application-data directory,
+/// because application data is precisely what cleaners are pointed at. It sits beside
+/// `.ssh` and `.gnupg`, which is company that reflects what it holds and which cleaners
+/// have long since learned to leave alone.
+#[must_use]
+fn refuge_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .filter(|home| !home.is_empty())?;
+    Some(PathBuf::from(home).join(".ferryman").join("operators"))
+}
+
 impl OperatorStore {
     /// Operator identities live out of the synced folder: beside the machine key for the
     /// ones that belong to this person wherever they work, and beside the attachment for
     /// any this project overrides.
     #[must_use]
     pub fn new(attachment: &Path) -> Self {
-        Self::with_machine_dir(attachment, ferryman_channel::licensing::machine_state_dir())
+        let mut store =
+            Self::with_machine_dir(attachment, ferryman_channel::licensing::machine_state_dir());
+        store.refuge = refuge_dir();
+        store
     }
 
     /// The same, with the machine directory given rather than discovered.
@@ -256,7 +289,19 @@ impl OperatorStore {
             project: attachment.join("operators"),
             machine: machine_dir.as_ref().map(|dir| dir.join("operators")),
             machine_state: machine_dir,
+            // Deliberately none by default: a test asking for a temporary machine must not
+            // start writing sealed records into the developer's real home directory as a
+            // side effect. Only `new` reaches for the real one.
+            refuge: None,
         }
+    }
+
+    /// The same, with the refuge given rather than discovered. For tests that want to
+    /// exercise the copy without touching a real home directory.
+    #[must_use]
+    pub fn with_refuge(mut self, refuge: Option<PathBuf>) -> Self {
+        self.refuge = refuge;
+        self
     }
 
     /// Both directories, most specific first. The single place the precedence rule is
@@ -264,7 +309,46 @@ impl OperatorStore {
     fn search_path(&self) -> Vec<&Path> {
         let mut dirs: Vec<&Path> = vec![self.project.as_path()];
         dirs.extend(self.machine.as_deref());
+        // Last, because it is a fallback and not a location anybody manages by hand. It is
+        // consulted only when both real homes have lost the record - which is the case
+        // this exists for.
+        dirs.extend(self.refuge.as_deref());
         dirs
+    }
+
+    /// Write the same sealed bytes into the refuge, and put them back where they belong if
+    /// the primary has lost them.
+    ///
+    /// Best-effort throughout: a machine with a read-only home, or no home, must still be
+    /// able to create and use an operator. A failure to keep a spare copy is not a reason
+    /// to refuse the thing being copied.
+    fn keep_a_spare(&self, name: &str) {
+        let Some(refuge) = self.refuge.as_deref() else {
+            return;
+        };
+        let primary = self.machine.as_deref().unwrap_or(self.project.as_path());
+        let (from, to) = match (
+            Self::path_in(primary, name).is_file(),
+            Self::path_in(refuge, name).is_file(),
+        ) {
+            // Normal: the record is where it belongs, so mirror it.
+            (true, _) => (Self::path_in(primary, name), Self::path_in(refuge, name)),
+            // The reason this module exists: the primary is gone and the spare is not.
+            // Put it back, so the machine heals itself rather than waiting to be noticed.
+            (false, true) => (Self::path_in(refuge, name), Self::path_in(primary, name)),
+            (false, false) => return,
+        };
+        let Some(parent) = to.parent() else { return };
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let _ = restrict_dir_to_owner(parent);
+        if std::fs::copy(&from, &to).is_ok() {
+            // Same reasoning as the original: salt, nonce, iteration count and sealed seed
+            // are a password-cracking kit, so the copy is owner-only too. A spare that is
+            // world-readable would be a downgrade dressed as a safety net.
+            let _ = ferryman_channel::restrict_to_owner(&to);
+        }
     }
 
     /// Where a record for `name` already is, if it is anywhere.
@@ -423,6 +507,7 @@ impl OperatorStore {
         // someone compares two files that should have matched.
         ferryman_channel::restrict_to_owner(&path)
             .with_context(|| format!("restrict {} to its owner", path.display()))?;
+        self.keep_a_spare(name);
         Ok(identity)
     }
 
@@ -434,6 +519,12 @@ impl OperatorStore {
         if !is_safe_component(name) {
             return Err(anyhow::anyhow!("operator name or password is incorrect"));
         }
+        // Signing in is the moment to notice the primary copy has gone and put it back,
+        // because it is the moment somebody is here to be affected by it. Cheap - a couple
+        // of `stat` calls when nothing is wrong - and silent: a person whose disk cleaner
+        // ate their identity overnight should simply sign in as usual and never learn it
+        // happened.
+        self.keep_a_spare(name);
         let path = self
             .existing_path(name)
             .ok_or_else(|| anyhow::anyhow!("operator name or password is incorrect"))?;
@@ -1157,6 +1248,60 @@ mod tests {
         }
         // The honest path still works.
         assert!(store.login("alice", "hunter2-secret").is_ok());
+    }
+
+    /// The incident this exists for: a disk cleaner deleted the whole `operators/`
+    /// directory overnight, taking the only copy of a sealed key nothing else holds.
+    #[test]
+    fn a_deleted_operator_record_comes_back_from_the_refuge() {
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let refuge = tempfile::tempdir().unwrap();
+        let store = store_on(&machine, &project).with_refuge(Some(refuge.path().to_path_buf()));
+
+        let made = store.create("josh", "hunter2-secret").unwrap();
+        assert!(
+            refuge.path().join("josh.json").is_file(),
+            "creating an operator keeps a spare somewhere a cleaner does not sweep"
+        );
+
+        // Exactly what happened: not the file, the whole directory.
+        std::fs::remove_dir_all(machine.path().join("operators")).unwrap();
+        assert!(!machine.path().join("operators").exists());
+
+        // The person simply signs in, as they would on any other morning.
+        let back = store.login("josh", "hunter2-secret").unwrap();
+        assert_eq!(
+            back.public_key_hex(),
+            made.public_key_hex(),
+            "the SAME key, or every signature they ever made reads as forged"
+        );
+        assert!(
+            machine.path().join("operators").join("josh.json").is_file(),
+            "and it is put back where it belongs, so the next sign-in needs no rescue"
+        );
+    }
+
+    /// A store with no refuge configured must behave exactly as it always did - including
+    /// in every test above this one, which is why the default is None.
+    #[test]
+    fn without_a_refuge_nothing_extra_is_written() {
+        let machine = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = store_on(&machine, &project);
+        store.create("alice", "hunter2-secret").unwrap();
+        assert!(
+            machine
+                .path()
+                .join("operators")
+                .join("alice.json")
+                .is_file()
+        );
+        std::fs::remove_dir_all(machine.path().join("operators")).unwrap();
+        assert!(
+            store.login("alice", "hunter2-secret").is_err(),
+            "with no spare there is nothing to come back from, and it must say so"
+        );
     }
 
     #[test]

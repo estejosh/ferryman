@@ -1826,7 +1826,42 @@ const COMMAND_STACK: usize = 16 * 1024 * 1024;
 /// chose, builds the runtime there, and joins it. The cost is one thread; what it buys is that
 /// the CLI's command surface can keep growing without a platform-specific cliff waiting for
 /// it.
-fn main() -> Result<()> {
+fn main() -> std::process::ExitCode {
+    match run_ferry() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            // The message, and the reasons behind it, and nothing else. `anyhow`'s own
+            // Debug printer appends a backtrace whenever RUST_BACKTRACE is set, which on
+            // a fresh Linux box it often is - so a first-time user ran `ferry operator
+            // create` and got a perfectly good sentence followed by eleven frames of
+            // `tokio::runtime::context::runtime::enter_runtime`. That reads as a crash,
+            // which makes a deliberate, correct refusal look like the tool falling over.
+            eprintln!("Error: {error}");
+            for cause in error.chain().skip(1) {
+                eprintln!("  because: {cause}");
+            }
+            if std::env::var_os("FERRYMAN_BACKTRACE").is_some() {
+                eprintln!("\n{}", error.backtrace());
+            }
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_ferry() -> Result<()> {
+    // A backtrace is for whoever is fixing ferry, not for whoever is using it.
+    //
+    // `anyhow` prints one whenever RUST_BACKTRACE is set, and on a fresh Linux box it
+    // often is - so `ferry operator create` greeted a first-time user with a perfectly
+    // good sentence followed by eleven lines of
+    // `tokio::runtime::context::runtime::enter_runtime`. Everything after the first line
+    // is noise to the person reading it, and worse than noise: it reads as a crash, so a
+    // clear, deliberate refusal looks like the tool falling over.
+    //
+    // Anyone debugging can still ask, with FERRYMAN_BACKTRACE=1. Deliberately its own
+    // variable rather than honouring RUST_BACKTRACE, because RUST_BACKTRACE is commonly
+    // exported once and forgotten, and would put the noise back for everyone on that
+    // machine forever.
     let worker = std::thread::Builder::new()
         .name("ferry".to_string())
         .stack_size(COMMAND_STACK)
@@ -1956,7 +1991,15 @@ async fn run(cli: Cli) -> Result<()> {
             // An agent never sees or supplies it: it is told to hand the human a
             // browser, where the operator identity is created out of the agent's
             // sight.
-            let setup = resolve_dashboard_setup(dashboard, dashboard_operator, &email, as_json)?;
+            let has_operator =
+                ferryman_server::operators::OperatorStore::new(&outcome.route.attachment).any();
+            let setup = resolve_dashboard_setup(
+                dashboard,
+                dashboard_operator,
+                &email,
+                as_json,
+                has_operator,
+            )?;
             let dashboard = match setup {
                 Some(DashboardSetup::Create { name, password }) => {
                     let identity = ferryman_server::operators::create_operator_identity(
@@ -2811,6 +2854,7 @@ fn resolve_dashboard_setup(
     operator: Option<String>,
     email: &str,
     as_json: bool,
+    has_operator: bool,
 ) -> Result<Option<DashboardSetup>> {
     use std::io::{IsTerminal, Write};
     let interactive = !as_json && std::io::stdin().is_terminal();
@@ -2819,12 +2863,36 @@ fn resolve_dashboard_setup(
         if !interactive {
             return Ok(None);
         }
-        print!("Set up the web dashboard (approve work from a browser)? [y/N] ");
-        std::io::stdout().flush()?;
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-            return Ok(None);
+        // Your identity is not a dashboard feature, and asking about it as one is how a
+        // person ends up without it.
+        //
+        // This used to ask only "Set up the web dashboard?" - and creating the operator
+        // identity happened to live behind a yes. Say no, quite reasonably, and setup
+        // finishes having given you an agent key but no way to approve anything, and the
+        // next screen tells you an operator is missing. The identity is what makes you a
+        // person in this fleet; the dashboard is one place to use it. So when there isn't
+        // one yet, that is the question, and it defaults to yes.
+        if !has_operator {
+            print!(
+                "Create your operator identity now? It is how you approve work, and \n                 nothing can sign as you without it. [Y/n] "
+            );
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if matches!(answer.trim().to_ascii_lowercase().as_str(), "n" | "no") {
+                println!(
+                    "  Skipped. Create one later with 'ferry operator create --name <your-name>'."
+                );
+                return Ok(None);
+            }
+        } else {
+            print!("Set up the web dashboard (approve work from a browser)? [y/N] ");
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                return Ok(None);
+            }
         }
     }
 
@@ -2896,8 +2964,8 @@ fn report_enable_json(
                 "seed": seed.state,
                 "fingerprint": seed.fingerprint,
                 "note": (seed.state == "absent").then_some(
-                    "no operator identity yet - run 'ferry enable' at a terminal to create one, \
-                     or 'ferry identity recover' to restore one"
+                    "no operator identity yet - run 'ferry operator create --name <your-name>', \
+                     or 'ferry identity recover' to restore one from its phrase"
                 ),
             },
             "dashboard": dashboard.map(|d| match d {
@@ -2978,8 +3046,18 @@ fn report_enable_human(
         println!("  to you and not someone else.");
     } else if seed.state == "absent" {
         println!();
-        println!("  No operator identity yet - run 'ferry enable' at a terminal to create");
-        println!("  one, or 'ferry identity recover' to restore one.");
+        // Names the command that actually creates one.
+        //
+        // This used to say "run 'ferry enable'" - printed BY `ferry enable`, on the first
+        // screen a new user ever sees. Running it again printed the same sentence, and
+        // `ferry operator list` offered only to *import* a file a new user does not have.
+        // A stranger following the README had no way out of that loop at all. Found by
+        // installing on a machine that had never run Ferryman, which nobody had done.
+        println!("  No operator identity yet. To create yours:");
+        println!("      ferry operator create --name <your-name>");
+        println!("  or, if you already have one elsewhere:");
+        println!("      ferry identity recover          # from your 24-word phrase");
+        println!("      ferry operator import --file <file>");
     }
 
     println!();
@@ -4141,7 +4219,10 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
             let names = store.names()?;
             if names.is_empty() {
                 println!("this machine holds no operator identity for this project");
-                println!("  carry yours here with 'ferry operator import --file <file>'");
+                println!("  create one    ferry operator create --name <your-name>");
+                println!("  or bring yours from another machine:");
+                println!("    from a phrase   ferry identity recover");
+                println!("    from a file     ferry operator import --file <file>");
             } else {
                 for name in names {
                     // Where an identity comes from is the thing a person actually needs
