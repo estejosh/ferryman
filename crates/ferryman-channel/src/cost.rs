@@ -415,6 +415,13 @@ pub fn engine_costs(route: &ProjectRoute) -> Result<Vec<EngineCost>> {
         if learning.accepted {
             entry.accepted += 1;
         }
+        // Tokens used to be summed from trajectories only, and a trajectory is written
+        // on some paths and not others - so the route every real result takes contributed
+        // nothing, and the engines page reported "not reported" for every row on a fleet
+        // that had been working for weeks. A learning is written for every accepted or
+        // rejected result there is, which makes it the one place worth counting.
+        entry.prompt_tokens += learning.prompt_tokens.unwrap_or(0);
+        entry.completion_tokens += learning.completion_tokens.unwrap_or(0);
     }
 
     let mut trajectories = Vec::new();
@@ -486,6 +493,8 @@ mod tests {
             source: "eval".into(),
             accepted,
             note: String::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
     }
 

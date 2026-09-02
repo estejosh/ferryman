@@ -1055,8 +1055,22 @@ enum Channel {
         workspace: Option<PathBuf>,
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
+        /// The result. Use --result-file for anything longer than a line.
+        #[arg(
+            long,
+            required_unless_present = "result_file",
+            conflicts_with = "result_file"
+        )]
+        result: Option<String>,
+        /// Read the result from a file, verbatim. `-` reads standard input.
+        ///
+        /// This carries the largest payload in the whole channel - an agent's report on
+        /// the work it did - and it was the one place that had no file option. `--task-file`
+        /// and `--notes-file` exist because a shell splits a multi-line brief on an
+        /// apostrophe and a mangled record looks like it worked. A result is signed, so a
+        /// mangled one is worse still: it verifies, and it is wrong.
         #[arg(long)]
-        result: String,
+        result_file: Option<PathBuf>,
         id: String,
     },
     /// Accept a result, or send it back with notes.
@@ -5762,12 +5776,26 @@ fn channel(command: Channel) -> Result<()> {
             workspace,
             agent,
             result,
+            result_file,
             id,
         } => {
             let route = here(workspace)?;
             let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             let task = ferryman_channel::read_task(&route, &id)?;
             let revision = task.latest_revision().unwrap_or(0) + 1;
+            let result = match (result, result_file) {
+                (Some(result), _) => result,
+                (None, Some(path)) if path.as_os_str() == "-" => {
+                    let mut buffer = String::new();
+                    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+                        .context("read the result from standard input")?;
+                    buffer
+                }
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .with_context(|| format!("read the result from {}", path.display()))?,
+                // clap's `required_unless_present` makes this unreachable.
+                (None, None) => bail!("give the result with --result or --result-file"),
+            };
             let payload = if result.trim_start().starts_with('{') {
                 serde_json::from_str(&result)
                     .context("--result looked like JSON but did not parse")?

@@ -201,6 +201,10 @@ pub async fn run_bench(
                         source: "eval".to_string(),
                         accepted,
                         note: note.clone(),
+                        // A benchmark run measures whether the engine does good work,
+                        // not what it spent; the harness never sees a usage report.
+                        prompt_tokens: None,
+                        completion_tokens: None,
                     },
                 )?;
             }

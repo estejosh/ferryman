@@ -3276,10 +3276,22 @@ pub fn register_agent_key(
         && let Some(known) = existing.public_key.filter(|k| !k.is_empty())
         && Some(&known) != published.public_key.as_ref()
     {
+        // Names the ordinary cause first, because it is by far the most likely and the
+        // reader is usually staring at a word like "impersonating" while setting up their
+        // second machine. Agent names default to the hostname, and two machines
+        // legitimately share one more often than anybody expects: two VMs from the same
+        // image, two containers, a laptop restored onto new hardware. Seen in the
+        // two-machine sandbox test, where both boxes named themselves `vm` and the second
+        // was refused with no hint that a name was all that was wrong.
         bail!(
-            "agent '{}' is already published with a different key. First key wins: this is \
-             either a genuine re-key, which an operator must approve by removing \
-             agents/{}.json, or something impersonating it.",
+            "agent '{}' is already published in this channel with a different key.\n\
+             \x20 If this is a SECOND MACHINE that happens to share a hostname, give it its \
+             own name:\n\
+             \x20     ferry enable --agent <a-different-name>\n\
+             \x20 If it is genuinely the same machine re-keying, an operator approves that \
+             by removing agents/{}.json from the channel.\n\
+             \x20 Otherwise something is impersonating it, and first key wins - so nothing \
+             was changed.",
             published.name,
             published.name
         )
@@ -8169,8 +8181,15 @@ mod identity_tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("already published with a different key"),
+            error.contains("already published in this channel with a different key"),
             "silent replacement is how impersonation succeeds; got: {error}"
+        );
+        // The ordinary cause is named first, because the reader is usually setting up a
+        // second machine rather than being attacked, and "impersonating" is a frightening
+        // word to meet when a hostname is all that is wrong.
+        assert!(
+            error.contains("--agent"),
+            "the refusal must say how to fix the common case; got: {error}"
         );
     }
 }

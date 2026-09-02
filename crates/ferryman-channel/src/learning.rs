@@ -45,6 +45,49 @@ pub struct Learning {
     pub accepted: bool,
     /// Reviewer notes, or the missing keys / score for an eval.
     pub note: String,
+    /// What the run cost, when the engine said. `None` means it did not say - which is
+    /// not the same as zero, and the dashboard renders it as "not reported" rather than
+    /// as a free run.
+    ///
+    /// # Why optional rather than defaulted to zero
+    ///
+    /// The engines page showed every row at $0.00 for weeks, which reads as "these are
+    /// free" rather than "nobody measured". A missing number that displays as a real one
+    /// is worse than a blank: it invites a decision - which engine to run - on evidence
+    /// that does not exist.
+    ///
+    /// `serde(default)` so every learning already written keeps parsing. This file is an
+    /// append-only log going back to the project's first run; a field that broke old
+    /// lines would throw away the whole history to add a column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+}
+
+/// Tokens an engine reported for one run, dug out of the result it submitted.
+///
+/// Engines disagree about where they put this, so the shapes that exist in the wild are
+/// all accepted rather than one being imposed on them: Ferryman does not control these
+/// CLIs and a convention they have to adopt is a convention that stays empty.
+///
+///   `{"usage": {"prompt_tokens": 1, "completion_tokens": 2}}`   OpenAI-shaped
+///   `{"usage": {"input_tokens": 1, "output_tokens": 2}}`        Anthropic-shaped
+///   `{"prompt_tokens": 1, "completion_tokens": 2}`              flat, at the top level
+///
+/// Anything else reports nothing, and nothing is displayed as "not reported".
+#[must_use]
+pub fn tokens_in(payload: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    let scope = payload.get("usage").unwrap_or(payload);
+    let read = |names: [&str; 2]| {
+        names
+            .iter()
+            .find_map(|name| scope.get(*name).and_then(serde_json::Value::as_u64))
+    };
+    (
+        read(["prompt_tokens", "input_tokens"]),
+        read(["completion_tokens", "output_tokens"]),
+    )
 }
 
 /// Per-engine totals, derived from the learnings.
@@ -192,6 +235,7 @@ pub fn record_outcome(
     let Some(result) = task.results.iter().find(|r| r.revision == revision) else {
         return Ok(());
     };
+    let tokens = tokens_in(&result.payload);
     let engine = result
         .payload
         .get("produced_by")
@@ -215,6 +259,8 @@ pub fn record_outcome(
             source: "live".to_string(),
             accepted,
             note: notes.trim().to_string(),
+            prompt_tokens: tokens.0,
+            completion_tokens: tokens.1,
         },
     )
 }
@@ -223,6 +269,49 @@ pub fn record_outcome(
 mod tests {
     use super::*;
     use crate::ProjectRoute;
+
+    /// Engines disagree about where they put usage, and Ferryman does not control any of
+    /// them. A convention they would have to adopt is a convention that stays empty, so
+    /// every shape seen in the wild is read rather than one being imposed.
+    #[test]
+    fn usage_is_read_in_whichever_shape_the_engine_used() {
+        let openai = serde_json::json!({
+            "usage": { "prompt_tokens": 120, "completion_tokens": 340 }
+        });
+        assert_eq!(tokens_in(&openai), (Some(120), Some(340)));
+
+        let anthropic = serde_json::json!({
+            "usage": { "input_tokens": 7, "output_tokens": 9 }
+        });
+        assert_eq!(tokens_in(&anthropic), (Some(7), Some(9)));
+
+        let flat = serde_json::json!({ "prompt_tokens": 1, "completion_tokens": 2 });
+        assert_eq!(tokens_in(&flat), (Some(1), Some(2)));
+    }
+
+    /// Silence is not zero. An engine that says nothing must not be reported as free -
+    /// the whole reason this column exists is to choose between engines, and a made-up
+    /// $0.00 is worse than a blank because it invites the decision anyway.
+    #[test]
+    fn an_engine_that_reports_nothing_reports_nothing() {
+        let quiet = serde_json::json!({ "output": "done" });
+        assert_eq!(tokens_in(&quiet), (None, None));
+        let wrong_type = serde_json::json!({ "usage": { "prompt_tokens": "lots" } });
+        assert_eq!(tokens_in(&wrong_type), (None, None));
+    }
+
+    /// Every learning already written must keep parsing. This log goes back to the
+    /// project's first run; a field that broke old lines would throw the history away to
+    /// add a column.
+    #[test]
+    fn learnings_written_before_tokens_existed_still_parse() {
+        let old = r#"{"at":"2026-08-01T00:00:00Z","engine":"claude","task_id":"t-1",
+                      "source":"live","accepted":true,"note":"fine"}"#;
+        let parsed: Learning = serde_json::from_str(old).expect("an old line must still read");
+        assert_eq!(parsed.engine, "claude");
+        assert_eq!(parsed.prompt_tokens, None);
+        assert_eq!(parsed.completion_tokens, None);
+    }
 
     fn route(dir: &std::path::Path) -> ProjectRoute {
         let workspace = dir.join("workspace");
@@ -249,6 +338,8 @@ mod tests {
             source: "eval".into(),
             accepted,
             note: String::new(),
+            prompt_tokens: None,
+            completion_tokens: None,
         }
     }
 
