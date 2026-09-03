@@ -460,6 +460,13 @@ inside the free tier is computed on your own machine — run `ferry license stat
 and it counts your seats, computers and phones locally and lists what it counted.
 See [What Ferryman sends](#what-ferryman-sends) for the whole payload.
 
+**You may fork it and take the reporting out.** Section 5 asks a redistributor not
+to weaken the Seat, Computer and Mobile Device limits — the commercial terms — and
+nothing more. It does not oblige anyone to keep reporting behaviour, and there is
+none to keep: a release ships with no endpoint. If you were reading §5 as "you may
+not fork out the phone-home", that is not what it means, and the wording was
+changed to stop it reading that way.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md). Agents and

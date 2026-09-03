@@ -106,9 +106,14 @@ violation of this license regardless of whether the Software continues to run.
 5. REDISTRIBUTION
 You may redistribute the Software or derivative works provided that you (a) retain
 this license text, the copyright notice, and all notices; and (b) do not remove,
-weaken, or circumvent the Seat, Computer, Mobile Device, or registration
-requirements. Any recipient receives the Software under this same license, with
-the same rights and the same limitations.
+weaken, or circumvent the Seat, Computer, or Mobile Device limits in Section 2.
+Any recipient receives the Software under this same license, with the same rights
+and the same limitations.
+
+This clause is about the commercial limits and nothing else. It does not oblige you
+to keep any reporting behaviour: registration is a local file, a downloaded release
+has no endpoint configured at all, and failure to report is explicitly not enforced.
+A fork that removes reporting entirely removes nothing this clause protects.
 
 6. ATTRIBUTION (NOTICE)
 If you deploy or redistribute the Software (including running it to coordinate or
