@@ -9,7 +9,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.120
       - name: Install Linux system deps (dbus for keyring)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
@@ -31,7 +31,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.120
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -74,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.120
       - run: cargo install cargo-audit --locked
       - run: cargo audit
   supply-chain:
@@ -123,7 +123,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@1.97
+      - uses: dtolnay/rust-toolchain@1.120
       - name: Linux desktop build dependencies
         run: |
           sudo apt-get update
