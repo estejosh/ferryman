@@ -966,6 +966,19 @@ pages.teammates = async () => {
       <div><h1>Teammates</h1><p>People with an identity in this project. The master is whoever the channel says it is.</p></div>
     </div>
 
+    ${!d.master ? `
+    <div class="notice">
+      <div>
+        <b>This project has no master.</b> Grants, invitations and the vault all hang off
+        the master&rsquo;s signature, so until someone is, nothing here can be signed. The
+        master is a person, not a machine.
+        <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn primary" id="tm-become-master">I am the master of this project</button>
+          <span class="s" id="tm-master-msg" style="color:var(--dim)"></span>
+        </div>
+      </div>
+    </div>` : ""}
+
     ${d.may_grant ? `
     <div class="panel" style="margin-bottom:18px">
       <div class="chat-top"><b>Invite someone</b></div>
@@ -1032,6 +1045,22 @@ pages.teammates = async () => {
 };
 
 function wireTeammates() {
+  const become = $("#tm-become-master");
+  if (become) become.addEventListener("click", async () => {
+    const msg = $("#tm-master-msg");
+    msg.textContent = "";
+    become.disabled = true;
+    try {
+      const r = await api("/api/master/init", { method: "POST" });
+      state.team = null;
+      msg.textContent = `${r.master} is now the master${r.grants_required ? "; grants are required from here on" : ""}`;
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      become.disabled = false;
+    }
+  });
+
   const invite = $("#tm-invite");
   if (invite) invite.addEventListener("click", async () => {
     const msg = $("#tm-msg");

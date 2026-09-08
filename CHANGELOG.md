@@ -31,6 +31,12 @@ them do by hand. The findings and their order are in `_launch/ONBOARDING_ABC_REV
   `ferry channel secret set NAME --from-env [KEY] [--env-file F]` reads the value out
   of a `.env` line without it touching argv, a pipe, or a temporary file. Sealing to a
   name that is reserved but has not joined yet says exactly that.
+- **The master is a person.** The dashboard offers *I am the master of this project*
+  whenever no master exists, signed with the session's already-unlocked operator key -
+  no password typed twice - and flips grants to required. When `ferry enable` creates
+  an operator on a machine whose agent was just declared master implicitly, the role is
+  transferred to the person, signed by the agent, so the chain reads "declared, then
+  disclaimed".
 - **A first machine is the master.** `ferry enable` declares the master implicitly when
   no declaration exists and either nobody else is on the roster or this machine is the
   only orchestrator. `--master` stays for every other case. Doctor now reports the

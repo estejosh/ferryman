@@ -2066,6 +2066,35 @@ async fn run(cli: Cli) -> Result<()> {
                         &name,
                         &password,
                     )?;
+                    // The master is a person. When enable declared this machine's agent
+                    // master implicitly (first machine, nobody else here), and a person
+                    // has just been created on the same machine in the same breath, hand
+                    // the role to the person - signed by the agent, so the chain reads
+                    // "declared, then disclaimed", never "seized".
+                    if let Ok(Some(declaration)) = ferryman_channel::master::read_master(&outcome.route)
+                        && declaration.master.eq_ignore_ascii_case(&outcome.agent)
+                        && let Ok(Some(agent)) = ferryman_channel::AgentIdentity::load_existing(
+                            &outcome.agent,
+                            &outcome.route.attachment,
+                        )
+                    {
+                        match ferryman_channel::master::transfer_master(
+                            &outcome.route,
+                            &agent,
+                            identity.name(),
+                        ) {
+                            Ok(_) => {
+                                if !as_json {
+                                    println!("  master: {} (the person, not the machine)", identity.name());
+                                }
+                            }
+                            Err(err) => {
+                                if !as_json {
+                                    println!("  master stays {}: {err}", declaration.master);
+                                }
+                            }
+                        }
+                    }
                     Some(DashboardOutcome::Created {
                         operator: identity.name().to_string(),
                         public_key: identity.public_key_hex(),

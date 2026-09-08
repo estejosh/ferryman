@@ -125,6 +125,17 @@ paths:
         '200': {description: the reserved name}
         '400': {description: not a path-safe identifier}
         '409': {description: already in the channel}
+  /api/master/init:
+    post:
+      summary: The signed-in operator becomes this project's master
+      description: >
+        The person, not the machine. Signed with the session's unlocked operator key, so no
+        password is asked for again. Flips `grants` to required. Refuses when a master
+        already exists; the master transfers the role, nobody seizes it.
+      responses:
+        '200': {description: the master's name and whether grants are now required}
+        '403': {description: dashboard is read-only}
+        '409': {description: a master already exists}
   /api/team/{name}/access:
     post:
       summary: Sign a master grant saying what this person may do, and on which projects

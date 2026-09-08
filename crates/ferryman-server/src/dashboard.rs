@@ -397,6 +397,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/release/{version}/approve", post(approve_release))
         .route("/api/release/{version}/deny", post(deny_release))
         .route("/api/team/invite", post(invite_teammate))
+        .route("/api/master/init", post(master_init))
         .route("/api/team/{name}/access", post(set_access))
         .route("/api/conversations", get(conversations))
         .route("/api/conversations/{topic}", get(conversation).post(say))
@@ -1236,6 +1237,56 @@ async fn invite_teammate(
         "name": name,
         "state": "invited",
         "grants_required": grants_flipped || state.route.requires_grants(),
+    })))
+}
+
+/// POST /api/master/init - the signed-in operator becomes this project's master.
+///
+/// The person, not the machine: a master declaration signed by an operator's key is one
+/// a human can carry between machines and one every grant can be checked against. It is
+/// the dashboard's job because the session already holds the unlocked identity - the CLI
+/// route to the same file asks for the password again. Refuses when a master exists;
+/// `transfer` is the signed way to change one.
+async fn master_init(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    if let Some(existing) = ferryman_channel::master::read_master(&state.route).map_err(internal)? {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{} is already the master of this project; the master can transfer the role",
+                existing.master
+            ),
+        ));
+    }
+    let declaration =
+        ferryman_channel::master::initialize_master(&state.route, &current, current.name())
+            .map_err(internal)?;
+    let flipped = ferryman_channel::set_grants_required(&state.route.attachment).unwrap_or(false);
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &state.route,
+        &current,
+        "master",
+        current.name(),
+        &format!(
+            "{} became the master of {}{}",
+            declaration.master,
+            state.route.project_id,
+            if flipped { "; grants are now required" } else { "" }
+        ),
+        None,
+    );
+    Ok(Json(json!({
+        "master": declaration.master,
+        "grants_required": flipped || state.route.requires_grants(),
     })))
 }
 
