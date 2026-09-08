@@ -340,22 +340,99 @@ pub fn examine(start: &Path) -> Report {
     // Best-effort and bounded: the probe has a hard timeout inside the channel
     // crate. Unavailable is normal on a first machine and never blocks local
     // work, so this is informational.
-    match ferryman_channel::syncthing_peers() {
-        Ok(peers) => checks.push(check(
+    match ferryman_channel::syncthing_health() {
+        Ok(health) => {
+            let connected = health.peers.iter().filter(|p| p.connected).count();
+            let shared = ferryman_channel::syncthing_folder_device_ids(&route)
+                .map(|ids| ids.len())
+                .unwrap_or(0);
+            checks.push(check(
+                "syncthing",
+                true,
+                false,
+                format!(
+                    "{} at {}; {} device(s) paired, {connected} connected; this folder shared with {shared}",
+                    if health.managed { "managed instance" } else { "reachable" },
+                    health.api_base,
+                    health.peers.len(),
+                ),
+            ));
+        }
+        Err(err) => checks.push(check(
             "syncthing",
-            true,
-            false,
-            format!("reachable; {} device(s) paired", peers.len()),
-        )),
-        Err(_) => checks.push(check(
-            "syncthing",
             false,
             false,
-            "not reachable - the channel still works on this machine, but nothing \
-             crosses to others until Syncthing is installed and running"
-                .to_string(),
+            format!(
+                "{err} - the channel still works on this machine, but nothing crosses to \
+                 others until Syncthing is running{}",
+                if ferryman_channel::syncthing_managed_configured() {
+                    "; ferry doctor --fix starts it"
+                } else {
+                    ""
+                }
+            ),
         )),
     }
+
+    // Open grants are fine alone. With a second person on the roster they mean
+    // "anyone who can write the folder may name their own role" (ADR 0014).
+    let operators = ferryman_channel::read_agent_roster(&route.communications)
+        .map(|roster| roster.iter().filter(|a| a.role == "operator").count())
+        .unwrap_or(0);
+    if !route.requires_grants() && operators > 1 {
+        checks.push(check(
+            "grants",
+            false,
+            false,
+            format!(
+                "open, with {operators} operators on the roster - set grants = \"required\" \
+                 in bridge.toml (inviting from the dashboard does this)"
+            ),
+        ));
+    }
+    match ferryman_channel::master::read_master(&route) {
+        Ok(Some(declaration)) => checks.push(check(
+            "master",
+            true,
+            false,
+            format!("{}", declaration.master),
+        )),
+        Ok(None) => checks.push(check(
+            "master",
+            false,
+            false,
+            "no master declared - run 'ferry enable' on the orchestrator machine, or \
+             'ferry enable --master' anywhere, to declare one"
+                .to_string(),
+        )),
+        Err(err) => checks.push(check("master", false, false, format!("{err:#}"))),
+    }
+
+    // Version skew across the fleet: the machine that is behind is the one that will
+    // misbehave first, and it is never the one you are sitting at.
+    let mine = env!("CARGO_PKG_VERSION");
+    let behind: Vec<String> = ferryman_channel::licensing::read_devices(&route)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|d| {
+            let v = d.ferry_version.as_deref()?;
+            ferryman_channel::licensing::version_is_older(v, mine)
+                .then(|| format!("{} ({v})", &d.id[..d.id.len().min(8)]))
+        })
+        .collect();
+    checks.push(check(
+        "versions",
+        behind.is_empty(),
+        false,
+        if behind.is_empty() {
+            format!("this machine {mine}; no registered machine is behind it")
+        } else {
+            format!(
+                "this machine {mine}; behind: {} - run 'ferry update' there",
+                behind.join(", ")
+            )
+        },
+    ));
 
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {

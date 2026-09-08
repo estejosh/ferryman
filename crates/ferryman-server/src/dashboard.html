@@ -1202,14 +1202,15 @@ pages.fleet = async () => {
     </div>
     <div class="panel scroll">
       <table class="grid">
-        <thead><tr><th>Machine</th><th>Kind</th><th>Device</th><th>Registered</th></tr></thead>
+        <thead><tr><th>Machine</th><th>Kind</th><th>Version</th><th>Device</th><th>Registered</th></tr></thead>
         <tbody>${machines.length ? machines.map((m) => `
           <tr>
             <td class="lead">${esc(m.name || m.id || "—")}</td>
             <td>${esc(m.kind || "—")}</td>
+            <td>${m.ferry_version ? `${esc(m.ferry_version)}${m.behind ? ` <span class="badge warn" title="behind this dashboard (${esc(d.version || "")}); run ferry update there">behind</span>` : ""}` : `<span class="badge">unknown</span>`}</td>
             <td class="mono">${esc((m.device_id || "").slice(0, 14) || "—")}</td>
             <td>${esc(m.registered_at || "—")}</td>
-          </tr>`).join("") : `<tr><td colspan="4"><div class="empty">No machines registered.</div></td></tr>`}
+          </tr>`).join("") : `<tr><td colspan="5"><div class="empty">No machines registered.</div></td></tr>`}
         </tbody>
       </table>
     </div>`;

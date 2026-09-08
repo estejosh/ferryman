@@ -1219,7 +1219,24 @@ async fn invite_teammate(
         None,
     )
     .map_err(internal)?;
-    Ok(Json(json!({ "name": name, "state": "invited" })))
+    // A second person on the channel is the moment open grants stop being safe.
+    let grants_flipped =
+        ferryman_channel::set_grants_required(&state.route.attachment).unwrap_or(false);
+    if grants_flipped {
+        let _ = ferryman_channel::ledger::append_ledger_entry(
+            &state.route,
+            &current,
+            "policy",
+            current.name(),
+            "grants are now required on this project: a second person was invited",
+            None,
+        );
+    }
+    Ok(Json(json!({
+        "name": name,
+        "state": "invited",
+        "grants_required": grants_flipped || state.route.requires_grants(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1760,23 +1777,32 @@ async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, Dashb
         .map_err(internal)?
         .iter()
         .map(|device| {
+            let behind = device
+                .ferry_version
+                .as_deref()
+                .is_some_and(|v| ferryman_channel::licensing::version_is_older(v, env!("CARGO_PKG_VERSION")));
             json!({
                 "id": device.id,
                 "kind": device.kind.as_str(),
                 "operator_email": device.operator_email,
                 "registered_at": device.registered_at.to_rfc3339(),
+                "ferry_version": device.ferry_version,
+                "behind": behind,
             })
         })
         .collect::<Vec<_>>();
     let devices = ferryman_channel::syncthing_peers()
         .unwrap_or_default()
         .iter()
-        .map(|peer| json!({ "device_id": peer.device_id, "name": peer.name }))
+        .map(|peer| json!({ "device_id": peer.device_id, "name": peer.name, "connected": peer.connected }))
         .collect::<Vec<_>>();
     let projects = discover_projects(&state.route).map_err(internal)?;
-    Ok(Json(
-        json!({ "machines": machines, "devices": devices, "projects": projects }),
-    ))
+    Ok(Json(json!({
+        "machines": machines,
+        "devices": devices,
+        "projects": projects,
+        "version": env!("CARGO_PKG_VERSION"),
+    })))
 }
 
 /// Where sibling projects are looked for, when it is not simply the parent directory.

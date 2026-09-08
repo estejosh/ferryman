@@ -3383,6 +3383,41 @@ pub fn load_route(attachment: &Path) -> Result<ProjectRoute> {
 /// Read one key from the attachment's `bridge.toml`, or an empty string when the
 /// file or key is absent. Used for fields that inform behaviour but are not part
 /// of the route's structural identity.
+/// Flip this project's `grants` to `"required"` in `bridge.toml`, if it is not already.
+///
+/// Returns whether anything changed. Called when a second person is invited: a channel
+/// with one operator can stay open, but the moment there are two, "trust whatever names
+/// itself" is the wrong rule for a folder both can write to (ADR 0014).
+pub fn set_grants_required(attachment: &Path) -> Result<bool> {
+    if bridge_field(attachment, "grants") == "required" {
+        return Ok(false);
+    }
+    let path = attachment.join("bridge.toml");
+    let text = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('#')
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(field, _)| field.trim() == "grants")
+        {
+            lines.push("grants = \"required\"".to_string());
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        lines.push("grants = \"required\"".to_string());
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    fs::write(&path, out).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
 fn bridge_field(attachment: &Path, key: &str) -> String {
     let path = attachment.join("bridge.toml");
     let Ok(text) = fs::read_to_string(&path) else {
@@ -3844,15 +3879,12 @@ impl SyncthingProbe {
     /// copying a key anywhere.
     #[must_use]
     pub fn from_env() -> Self {
-        let api_base = std::env::var("SYNCTHING_API_BASE")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| SYNCTHING_DEFAULT_API.to_string());
-        let api_key = std::env::var("SYNCTHING_API_KEY")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .or_else(syncthing_api_key_from_config)
-            .unwrap_or_default();
+        // Same resolution as every other caller: the override, then the address the
+        // config.xml Ferryman found actually declares, then the historical default.
+        // Two resolvers that disagree is how doctor said "reachable" about one
+        // Syncthing while the channel was carried by another.
+        let api_base = syncthing_api_base();
+        let api_key = syncthing_api_key().unwrap_or_default();
         Self { api_base, api_key }
     }
 }
@@ -4021,6 +4053,10 @@ fn syncthing_post(api_base: &str, path: &str, api_key: &str, body: &str) -> Resu
 pub struct SyncthingPeer {
     pub device_id: String,
     pub name: String,
+    /// Whether Syncthing reports a live connection to this device right now.
+    /// Paired is a fact about config; connected is a fact about the moment.
+    #[serde(default)]
+    pub connected: bool,
 }
 
 /// What wiring Syncthing did, or why it could not.
@@ -4058,17 +4094,104 @@ fn syncthing_api_base() -> String {
 
 /// Every device this Syncthing already knows, minus itself.
 pub fn syncthing_peers() -> Result<Vec<SyncthingPeer>> {
+    Ok(syncthing_health()?.peers)
+}
+
+/// Where the Ferryman-managed Syncthing keeps its config, per platform.
+///
+/// Ferryman can run its own Syncthing instance, separate from one the person already
+/// uses for their documents, so that a fleet's folders never mix with a household's.
+/// Windows: `%LOCALAPPDATA%\SyncthingFerry`. Elsewhere:
+/// `$XDG_STATE_HOME/ferryman/syncthing` or `~/.local/state/ferryman/syncthing`.
+#[must_use]
+pub fn syncthing_managed_home() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var("LOCALAPPDATA")
+            .ok()
+            .map(|local| PathBuf::from(local).join("SyncthingFerry"))
+    } else if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        Some(PathBuf::from(xdg).join("ferryman").join("syncthing"))
+    } else {
+        std::env::var("HOME").ok().map(|home| {
+            PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("ferryman")
+                .join("syncthing")
+        })
+    }
+}
+
+/// Whether a Ferryman-managed Syncthing has ever been set up on this machine.
+#[must_use]
+pub fn syncthing_managed_configured() -> bool {
+    syncthing_managed_home().is_some_and(|home| home.join("config.xml").is_file())
+}
+
+/// One honest reading of the local Syncthing: which config was read, whether the
+/// process answers, and every peer with its live connection state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncthingHealth {
+    /// The `config.xml` the address and key came from, when one was found.
+    pub config_path: Option<PathBuf>,
+    /// Whether that config belongs to the Ferryman-managed instance.
+    pub managed: bool,
+    pub api_base: String,
+    /// This device's own id, when Syncthing answered.
+    pub my_id: Option<String>,
+    pub peers: Vec<SyncthingPeer>,
+}
+
+/// Read the local Syncthing and say what is true, or say why nothing could be read.
+///
+/// This used to return an empty peer list for "no config found" and for "config found
+/// but the process is not answering", and callers printed "reachable; 0 device(s)
+/// paired" for both. A doctor that says a dead Syncthing is fine is worse than no
+/// doctor. Now both are errors that name the thing to fix.
+pub fn syncthing_health() -> Result<SyncthingHealth> {
+    let config_path = syncthing_config_path_found();
+    let managed = match (&config_path, syncthing_managed_home()) {
+        (Some(found), Some(home)) => found.starts_with(&home),
+        _ => false,
+    };
     let Some(key) = syncthing_api_key() else {
-        return Ok(Vec::new());
+        bail!(
+            "no Syncthing config found (looked in {}); install Syncthing or set \
+             SYNCTHING_CONFIG_DIR",
+            syncthing_config_paths()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     };
     let base = syncthing_api_base();
-    let me = syncthing_get(&base, "/rest/system/status", &key)?
-        .and_then(|v| v.get("myID").and_then(Value::as_str).map(str::to_string));
+    let Some(status) = syncthing_get(&base, "/rest/system/status", &key)? else {
+        let hint = if managed {
+            "start it: ferry syncthing start"
+        } else {
+            "start Syncthing"
+        };
+        bail!(
+            "Syncthing is configured{} but not answering at {base}; {hint}",
+            config_path
+                .as_ref()
+                .map(|p| format!(" ({})", p.display()))
+                .unwrap_or_default()
+        );
+    };
+    let me = status
+        .get("myID")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     // The devices endpoint returns an array, and syncthing_get slices out an object, so
     // this asks for the config and reads the devices out of it instead.
     let Some(config) = syncthing_get(&base, "/rest/config", &key)? else {
-        return Ok(Vec::new());
+        bail!("Syncthing answered at {base} but refused the API key; check {}", config_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "SYNCTHING_API_KEY".into()));
     };
+    let connections = syncthing_get(&base, "/rest/system/connections", &key)?
+        .and_then(|v| v.get("connections").cloned())
+        .unwrap_or(Value::Null);
     let mut peers = Vec::new();
     if let Some(devices) = config.get("devices").and_then(Value::as_array) {
         for device in devices {
@@ -4078,6 +4201,11 @@ pub fn syncthing_peers() -> Result<Vec<SyncthingPeer>> {
             if Some(id.to_string()) == me {
                 continue;
             }
+            let connected = connections
+                .get(id)
+                .and_then(|c| c.get("connected"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             peers.push(SyncthingPeer {
                 device_id: id.to_string(),
                 name: device
@@ -4085,10 +4213,31 @@ pub fn syncthing_peers() -> Result<Vec<SyncthingPeer>> {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),
+                connected,
             });
         }
     }
-    Ok(peers)
+    Ok(SyncthingHealth {
+        config_path,
+        managed,
+        api_base: base,
+        my_id: me,
+        peers,
+    })
+}
+
+/// Ask the running Syncthing to shut down. Only meaningful for the managed instance;
+/// a person's own Syncthing is theirs to stop.
+pub fn syncthing_shutdown() -> Result<()> {
+    let Some(key) = syncthing_api_key() else {
+        bail!("no Syncthing config found");
+    };
+    let base = syncthing_api_base();
+    match syncthing_post(&base, "/rest/system/shutdown", &key, "{}")? {
+        Some(200) => Ok(()),
+        Some(code) => bail!("Syncthing refused to shut down (HTTP {code})"),
+        None => bail!("Syncthing is not answering at {base}"),
+    }
 }
 
 pub fn channel_folder_id(route: &ProjectRoute) -> String {
@@ -4326,6 +4475,10 @@ pub fn peers_for_ids(device_ids: &[String]) -> Result<Vec<SyncthingPeer>> {
                 .find(|peer| &peer.device_id == id)
                 .map(|peer| peer.name.clone())
                 .unwrap_or_default(),
+            connected: known
+                .iter()
+                .find(|peer| &peer.device_id == id)
+                .is_some_and(|peer| peer.connected),
         })
         .collect())
 }
@@ -4517,6 +4670,12 @@ fn syncthing_config_paths() -> Vec<PathBuf> {
     if let Ok(explicit) = std::env::var("SYNCTHING_CONFIG_DIR") {
         candidates.push(PathBuf::from(explicit).join("config.xml"));
     }
+    // The Ferryman-managed instance beats the person's own: when both exist, the
+    // managed one is the one carrying the channel folders. Reading the other one is
+    // how doctor reported "0 devices paired" against four live peers.
+    if let Some(managed) = syncthing_managed_home() {
+        candidates.push(managed.join("config.xml"));
+    }
     if cfg!(windows) {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
             candidates.push(PathBuf::from(local).join("Syncthing").join("config.xml"));
@@ -4560,15 +4719,17 @@ fn gui_element(config: &str, tag: &str) -> Option<String> {
 }
 
 fn syncthing_config_field(tag: &str) -> Option<String> {
-    for candidate in syncthing_config_paths() {
-        let Ok(text) = fs::read_to_string(&candidate) else {
-            continue;
-        };
-        if let Some(value) = gui_element(&text, tag) {
-            return Some(value);
-        }
-    }
-    None
+    let path = syncthing_config_path_found()?;
+    let text = fs::read_to_string(path).ok()?;
+    gui_element(&text, tag)
+}
+
+/// The first `config.xml` that exists and carries a `<gui>` block - the one every
+/// field is read from, so address and key always come from the same instance.
+fn syncthing_config_path_found() -> Option<PathBuf> {
+    syncthing_config_paths().into_iter().find(|candidate| {
+        fs::read_to_string(candidate).is_ok_and(|text| gui_element(&text, "apikey").is_some())
+    })
 }
 
 fn syncthing_api_key_from_config() -> Option<String> {

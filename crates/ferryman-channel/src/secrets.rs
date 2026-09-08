@@ -373,6 +373,12 @@ pub fn set_secret(
             bail!("recipient '{recipient}' is not in this project's roster")
         };
         let Some(enc) = agent.encryption_key.as_ref().filter(|k| !k.is_empty()) else {
+            if agent.public_key.as_ref().is_none_or(|k| k.is_empty()) {
+                bail!(
+                    "'{recipient}' is reserved but has not registered a key yet; the secret \
+                     can be sealed once that machine joins"
+                )
+            }
             bail!(
                 "recipient '{recipient}' has not published an encryption key yet; \
                  run 'ferry channel join' on that machine first"

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// What `ferry --version` reports: the crate version plus the commit it was built from.
 ///
@@ -230,6 +230,19 @@ enum Command {
         /// Emit one JSON object instead of prose.
         #[arg(long)]
         json: bool,
+        /// Repair what can be repaired without asking: today, start the managed
+        /// Syncthing when it is configured but not running.
+        #[arg(long)]
+        fix: bool,
+    },
+    /// The Syncthing that Ferryman runs for itself: start it, stop it, see it.
+    ///
+    /// Separate from any Syncthing you already use for your own files. Its home is
+    /// `%LOCALAPPDATA%\SyncthingFerry` on Windows and `~/.local/state/ferryman/syncthing`
+    /// elsewhere. `stop` refuses to touch a Syncthing that is not this one.
+    Syncthing {
+        #[command(subcommand)]
+        action: ManagedSyncthingAction,
     },
     /// Stop this machine taking on new work, until you resume it.
     ///
@@ -1246,6 +1259,14 @@ enum SecretCommand {
         /// your operator name to be on the record as a person.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
+        /// Read the value from a `.env` line instead of the terminal or stdin.
+        /// Takes the key to read; with no key, uses the secret name. The value
+        /// never passes through argv, a pipe, or a temporary file.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", value_name = "KEY")]
+        from_env: Option<String>,
+        /// The `.env` file `--from-env` reads. Defaults to `.env` in the project.
+        #[arg(long, value_name = "FILE")]
+        env_file: Option<PathBuf>,
     },
     /// List secret names, recipients, who sealed each, and when - never values.
     List,
@@ -1254,12 +1275,32 @@ enum SecretCommand {
     Get {
         /// The secret name.
         name: String,
+        /// Print `NAME=value`, so `>> .env` produces a line tools can read.
+        #[arg(long)]
+        env: bool,
+        /// With `--env`, the key to print instead of the secret name.
+        #[arg(long, value_name = "KEY")]
+        key: Option<String>,
     },
     /// Remove a secret envelope. The copies already synced remain, so the real
     /// way to revoke a value is to rotate it and re-seal.
     Rm {
         /// The secret name.
         name: String,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum ManagedSyncthingAction {
+    /// Start the managed instance if it is not running, creating its home on first use.
+    Start,
+    /// Ask the managed instance to shut down cleanly.
+    Stop,
+    /// Which config is being read, whether it answers, and every device with its live
+    /// connection state.
+    Status {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -2044,11 +2085,35 @@ async fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Command::Doctor { workspace, json } => {
+        Command::Doctor {
+            workspace,
+            json,
+            fix,
+        } => {
             let start = match workspace {
                 Some(path) => path,
                 None => std::env::current_dir().context("read the current directory")?,
             };
+            if fix
+                && ferryman_channel::syncthing_managed_configured()
+                && !ferryman_ops::syncthing::managed_running()
+            {
+                match ferryman_ops::syncthing::start() {
+                    Ok(health) => {
+                        if !json {
+                            println!(
+                                "  fixed syncthing: started the managed instance at {}",
+                                health.api_base
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        if !json {
+                            println!("  could not start syncthing: {err}");
+                        }
+                    }
+                }
+            }
             let report = ferryman_ops::doctor::examine(&start);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2078,6 +2143,59 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("readiness checks failed");
             }
         }
+        Command::Syncthing { action } => match action {
+            ManagedSyncthingAction::Start => {
+                let health = ferryman_ops::syncthing::start()?;
+                println!(
+                    "syncthing running at {} ({} device(s) paired, {} connected)",
+                    health.api_base,
+                    health.peers.len(),
+                    health.peers.iter().filter(|p| p.connected).count()
+                );
+            }
+            ManagedSyncthingAction::Stop => {
+                ferryman_ops::syncthing::stop()?;
+                println!("asked the managed syncthing to shut down");
+            }
+            ManagedSyncthingAction::Status { json } => match ferryman_channel::syncthing_health() {
+                Ok(health) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&health)?);
+                    } else {
+                        println!(
+                            "config   {}{}",
+                            health
+                                .config_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "(env)".into()),
+                            if health.managed { "  (managed)" } else { "" }
+                        );
+                        println!("api      {}", health.api_base);
+                        println!("this     {}", health.my_id.as_deref().unwrap_or("?"));
+                        if health.peers.is_empty() {
+                            println!("devices  none paired");
+                        }
+                        for peer in &health.peers {
+                            println!(
+                                "device   {}  {:<20} {}",
+                                peer.device_id,
+                                peer.name,
+                                if peer.connected { "connected" } else { "not connected" }
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    if json {
+                        println!("{}", serde_json::json!({ "ok": false, "error": err.to_string() }));
+                    } else {
+                        println!("syncthing  {err}");
+                    }
+                    std::process::exit(1);
+                }
+            },
+        },
         Command::Pause { reason } => {
             let Some(path) = ferryman_ops::governor::pause_marker() else {
                 bail!("this machine has no per-user directory, so a pause cannot be recorded")
@@ -3456,6 +3574,23 @@ fn worker_progress() -> ferryman_ops::runlog::Logged<ferryman_ops::Stdout> {
     }
 }
 
+/// Start the managed Syncthing if this machine has one and it is not answering.
+/// Best-effort and quiet on success; a person's own Syncthing is never touched.
+fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
+    if !ferryman_channel::syncthing_managed_configured()
+        || ferryman_ops::syncthing::managed_running()
+    {
+        return;
+    }
+    match ferryman_ops::syncthing::start() {
+        Ok(health) => report.info(&format!(
+            "syncthing was not running; started the managed instance at {}",
+            health.api_base
+        )),
+        Err(err) => report.warn(&format!("syncthing is not running and could not be started: {err}")),
+    }
+}
+
 async fn agent_command(command: Agent) -> Result<()> {
     let route_for = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
@@ -3568,6 +3703,12 @@ async fn agent_command(command: Agent) -> Result<()> {
                 .min()
                 .unwrap_or(std::time::Duration::from_secs(300));
             let mut fleet = fleet;
+            // Stamp this machine's version on each channel it serves, so the fleet
+            // page and doctor can say which machine is behind (item 7 of the
+            // onboarding findings). Quiet, idempotent, and never a reason to stop.
+            for (route, _) in &fleet.served {
+                let _ = ferryman_channel::licensing::refresh_device_version(route, env!("CARGO_PKG_VERSION"));
+            }
             loop {
                 // Keeping a long-running worker current.
                 //
@@ -3591,6 +3732,11 @@ async fn agent_command(command: Agent) -> Result<()> {
                     report.info("  (a supervised worker restarts by itself)");
                     return Ok(());
                 }
+
+                // The transport is a process too, and one that nothing else supervises
+                // when Ferryman runs its own. A worker that keeps polling a folder its
+                // Syncthing stopped carrying is alive and useless; better to notice.
+                keep_syncthing_up(&report);
 
                 for (route, config) in &mut fleet.served {
                     match agent::work_once(route, config, &report).await {
@@ -4974,6 +5120,56 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Resul
     bail!("no prompt given; use --prompt, --prompt-file, or pipe one in on stdin")
 }
 
+/// Read `KEY=value` out of a `.env` file without the value touching anything else.
+///
+/// Accepts the shapes people actually write: an optional `export `, spaces around `=`,
+/// a value in single or double quotes, and a trailing `# comment` on an unquoted value.
+/// The last matching line wins, as dotenv loaders do.
+fn read_env_value(file: &Path, key: &str) -> Result<String> {
+    let text = std::fs::read_to_string(file)
+        .with_context(|| format!("read {}", file.display()))?;
+    let mut found = None;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() != key {
+            continue;
+        }
+        let v = v.trim();
+        let value = if let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+            inner.to_string()
+        } else if let Some(inner) = v.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
+            inner.to_string()
+        } else {
+            v.split(" #").next().unwrap_or(v).trim().to_string()
+        };
+        found = Some(value);
+    }
+    match found {
+        Some(value) if !value.is_empty() => Ok(value),
+        Some(_) => bail!("{key} in {} is empty", file.display()),
+        None => bail!("no {key}= line in {}", file.display()),
+    }
+}
+
+/// Quote a value for a `.env` line only when it needs it.
+fn env_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '+' | '='))
+    {
+        value.to_string()
+    } else {
+        format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
 fn read_secret_value(name: &str) -> Result<String> {
     if std::io::stdin().is_terminal() {
         let value = rpassword::prompt_password(format!("secret value for '{name}': "))?;
@@ -4994,7 +5190,13 @@ fn read_secret_value(name: &str) -> Result<String> {
 
 fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand) -> Result<()> {
     match command {
-        SecretCommand::Set { name, to, signer } => {
+        SecretCommand::Set {
+            name,
+            to,
+            signer,
+            from_env,
+            env_file,
+        } => {
             let signer_name = match signer {
                 Some(s) => s,
                 None => ferryman_ops::identity::resolve(None, &route.attachment)?,
@@ -5003,7 +5205,14 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
             // forged one. `signing_identity` refuses when this machine cannot
             // sign as the named identity rather than silently downgrading.
             let identity = signing_identity(route, &signer_name)?;
-            let value = read_secret_value(&name)?;
+            let value = match from_env {
+                Some(key) => {
+                    let key = if key.is_empty() { name.clone() } else { key };
+                    let file = env_file.unwrap_or_else(|| route.workspace.join(".env"));
+                    read_env_value(&file, &key)?
+                }
+                None => read_secret_value(&name)?,
+            };
             let recipients: Vec<String> = to
                 .split(',')
                 .map(str::trim)
@@ -5038,7 +5247,7 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 );
             }
         }
-        SecretCommand::Get { name } => {
+        SecretCommand::Get { name, env, key } => {
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
             let Some(identity) = ferryman_channel::secrets::EncryptionIdentity::load_existing(
                 &agent,
@@ -5051,7 +5260,12 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 );
             };
             let value = ferryman_channel::secrets::open_secret(route, &name, &identity)?;
-            println!("{value}");
+            if env {
+                let key = key.unwrap_or_else(|| name.clone());
+                println!("{key}={}", env_quote(&value));
+            } else {
+                println!("{value}");
+            }
         }
         SecretCommand::Rm { name } => {
             if ferryman_channel::secrets::remove_secret(route, &name)? {
@@ -6515,7 +6729,15 @@ fn channel(command: Channel) -> Result<()> {
                         .find(|peer| peer.device_id == id)
                         .map(|peer| peer.name.clone())
                         .unwrap_or_default();
-                    println!("shared  {id}  {name}  ({})", owner_label(&notes, &id));
+                    let live = known
+                        .iter()
+                        .find(|peer| peer.device_id == id)
+                        .is_some_and(|peer| peer.connected);
+                    println!(
+                        "shared  {id}  {name}  ({}, {})",
+                        owner_label(&notes, &id),
+                        if live { "connected" } else { "not connected" }
+                    );
                 }
             }
             SyncthingAction::Share {

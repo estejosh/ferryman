@@ -391,11 +391,35 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // asks "do you want to be master of this project?" and sets `master` from the
     // answer. The declaration is signed by this agent's key, so the choice is
     // verifiable.
-    if request.master {
+    //
+    // Two cases are not a choice, and asking would only teach people to say yes
+    // without reading: a channel nobody else is on yet (first machine, first run), and
+    // a channel whose only orchestrator is this machine. In both, "who is master" has
+    // one answer. On any other machine it stays explicit.
+    let implicit_master = !request.master
+        && ferryman_channel::master::read_master(&route)
+            .ok()
+            .flatten()
+            .is_none()
+        && {
+            let others: Vec<_> = ferryman_channel::read_agent_roster(&route.communications)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| !a.name.eq_ignore_ascii_case(&agent_name))
+                .collect();
+            others.is_empty()
+                || (request.role == "orchestrator"
+                    && !others.iter().any(|a| a.role == "orchestrator"))
+        };
+    if request.master || implicit_master {
         let declaration =
             ferryman_channel::master::initialize_master(&route, &identity, &agent_name)?;
         steps.push(Step {
-            what: "master declaration",
+            what: if implicit_master {
+                "master declaration (this machine is the first, so it is the master)"
+            } else {
+                "master declaration"
+            },
             path: route.communications.join("master.json"),
             created: true,
         });
@@ -411,6 +435,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
         kind: ferryman_channel::licensing::DeviceKind::Computer,
         operator_email: request.email.trim().to_string(),
         registered_at: chrono::Utc::now(),
+        ferry_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let device_existed = route
         .communications

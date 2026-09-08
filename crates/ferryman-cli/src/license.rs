@@ -106,6 +106,7 @@ pub fn register(route: &ProjectRoute, email: &str, kind: DeviceKind) -> Result<(
         kind,
         operator_email: email.trim().to_string(),
         registered_at: chrono::Utc::now(),
+        ferry_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     let path = licensing::register_device(route, &record)?;
     println!("registered this {} as {}", kind.as_str(), email.trim());

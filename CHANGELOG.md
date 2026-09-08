@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+From bringing one non-developer onto a channel and finding out what the tool made
+them do by hand. The findings and their order are in `_launch/ONBOARDING_ABC_REVIEW.md`
+(scratch); this is the first batch.
+
+### Fixed
+
+- **`ferry doctor` told the truth about the wrong Syncthing.** Ferryman can run its own
+  Syncthing (`%LOCALAPPDATA%\SyncthingFerry`), and nothing in the code knew that: the
+  config lookup read the person's own `Syncthing\config.xml`, the API base was
+  hard-coded to 8384, and "no key found" and "process not answering" both came back as
+  an empty peer list. Doctor said `ok syncthing reachable; 0 device(s) paired` against
+  a managed instance carrying four live devices, and said the same when it was not
+  running at all. Now the managed instance is looked for first, address and key always
+  come from the same `config.xml`, and each failure names itself.
+
+### Added
+
+- **`ferry syncthing start | stop | status`** supervises the managed instance: `start`
+  creates its home on first use and waits for the API; `stop` goes through Syncthing's
+  own shutdown and refuses to touch a Syncthing that is not Ferryman's; `status` shows
+  which config is read and every device with its live connected state. `ferry doctor
+  --fix` starts it when it is configured but down, and the worker loop does the same
+  between passes. Doctor reports paired, connected, and how many devices this folder
+  is shared with.
+- **Secrets in one line on both ends.** `ferry channel secret get NAME --env` prints
+  `NAME=value`, so `>> .env` writes a line tools can read (`--key` to rename).
+  `ferry channel secret set NAME --from-env [KEY] [--env-file F]` reads the value out
+  of a `.env` line without it touching argv, a pipe, or a temporary file. Sealing to a
+  name that is reserved but has not joined yet says exactly that.
+- **A first machine is the master.** `ferry enable` declares the master implicitly when
+  no declaration exists and either nobody else is on the roster or this machine is the
+  only orchestrator. `--master` stays for every other case. Doctor now reports the
+  master, or that there is none.
+- **Inviting a second person makes grants required.** The dashboard's invite flips
+  `grants = "required"` in `bridge.toml` and records it in the ledger. Doctor warns when
+  grants are open and more than one operator is on the roster.
+- **Version skew is visible.** Each machine's record in the channel carries the
+  Ferryman version it last ran (stamped by `ferry enable`, `ferry license register`,
+  and the worker loop on start). The Fleet page shows it with a *behind* badge, and
+  doctor lists machines older than this one with the `ferry update` line.
+
 ## v0.5.7 - 2026-09-02
 
 Setup you double-click, an API spec that cannot drift, and the first release

@@ -26,6 +26,7 @@ pub mod priority;
 pub mod runlog;
 pub mod soak;
 pub mod status;
+pub mod syncthing;
 pub mod telemetry;
 
 /// Where a long-running operation reports what it is doing.

@@ -78,6 +78,11 @@ pub struct DeviceRecord {
     /// counted: the licence counts people, and this is the only signal of a person.
     pub operator_email: String,
     pub registered_at: DateTime<Utc>,
+    /// The Ferryman version this machine last ran. Stays in the channel - the check-in
+    /// payload is built separately and pinned by a test - and exists so a fleet can see
+    /// which machine is behind before that machine misbehaves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ferry_version: Option<String>,
 }
 
 /// The fleet, counted.
@@ -385,6 +390,44 @@ fn write_device(dir: &Path, record: &DeviceRecord, body: &[u8]) -> Result<PathBu
     Ok(path)
 }
 
+/// Re-stamp this machine's own record with the version now running, if it has one.
+///
+/// Idempotent and quiet: a machine that never registered stays unregistered (that is
+/// `ferry enable`'s job), and an unchanged version is not rewritten, so a worker can
+/// call this on every start without churning the folder.
+pub fn refresh_device_version(route: &ProjectRoute, version: &str) -> Result<bool> {
+    let id = device_id(&route.attachment)?;
+    let path = devices_dir(route).join(format!("{id}.json"));
+    let Ok(text) = fs::read_to_string(&path) else {
+        return Ok(false);
+    };
+    let mut record: DeviceRecord = serde_json::from_str(&text)?;
+    if record.ferry_version.as_deref() == Some(version) {
+        return Ok(false);
+    }
+    record.ferry_version = Some(version.to_string());
+    register_device(route, &record)?;
+    Ok(true)
+}
+
+/// Whether `a` is an older release than `b`, comparing dotted numeric parts and
+/// ignoring any build suffix. Unparseable versions are never "older".
+#[must_use]
+pub fn version_is_older(a: &str, b: &str) -> bool {
+    fn parts(v: &str) -> Option<Vec<u64>> {
+        v.trim_start_matches('v')
+            .split(['-', '+', ' '])
+            .next()?
+            .split('.')
+            .map(|p| p.parse().ok())
+            .collect()
+    }
+    match (parts(a), parts(b)) {
+        (Some(a), Some(b)) => a < b,
+        _ => false,
+    }
+}
+
 /// Every machine that has registered on this channel.
 pub fn read_devices(route: &ProjectRoute) -> Result<Vec<DeviceRecord>> {
     let mut devices = read_devices_in(&devices_dir(route))?;
@@ -579,6 +622,7 @@ mod device_identity {
             kind,
             operator_email: "someone@example.com".to_string(),
             registered_at: chrono::Utc::now(),
+            ferry_version: None,
         }
     }
 
@@ -655,6 +699,7 @@ mod tests {
             kind,
             operator_email: email.into(),
             registered_at: Utc::now(),
+            ferry_version: None,
         }
     }
 
