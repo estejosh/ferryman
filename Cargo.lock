@@ -1216,6 +1216,7 @@ dependencies = [
  "fs2",
  "hex",
  "hkdf",
+ "hostname",
  "rand 0.10.2",
  "serde",
  "serde_jcs",
