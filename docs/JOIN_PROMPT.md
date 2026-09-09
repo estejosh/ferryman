@@ -1,13 +1,16 @@
-# Joining a project: the prompt a newcomer pastes into Claude
+# Joining a project: the prompt a newcomer pastes into their agent
 
 Nobody joining a Ferryman project should see a terminal. The inviter makes a code on
 the dashboard (Teammates -> *Make the code*); what comes out is not a command but a
-**prompt** - the newcomer pastes it into Claude (desktop, or Claude Code) on the
-computer they will work from, and Claude does the setup. The one thing Claude never
-does is create the person's identity: that happens in a browser tab Claude hands over,
-where the person picks their own password and sees their recovery phrase once.
+**prompt** - the newcomer pastes it into whatever AI agent they use (Claude Code,
+Claude desktop with computer access, Cursor, Codex, Copilot: anything that can run a
+command on the machine they will work from), and the agent does the setup. Someone
+with no agent runs the same numbered steps in a terminal; they are ordinary commands.
+The one thing the agent never does is create the person's identity: that happens in a
+browser tab it hands over, where the person picks their own password and sees their
+recovery phrase once.
 
-What the prompt makes Claude do:
+What the prompt makes the agent do:
 
 1. Install `ferry` with the platform's install script and confirm the version.
 2. `ferry team invite accept <code> --email <theirs>` - starts the managed Syncthing
@@ -16,7 +19,7 @@ What the prompt makes Claude do:
    registers the channel folder shared with the inviter, and writes a signed
    acceptance. With no terminal attached, identity creation is deferred to the browser.
 3. `ferry dashboard` from that folder - prints a one-time setup token and opens the tab.
-   Claude relays the token and steps back.
+   The agent relays the token and steps back.
 4. The person creates their identity in the tab: the reserved name, a password, the
    24 words. Their keys land in their copy of the channel.
 

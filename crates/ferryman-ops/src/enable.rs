@@ -177,6 +177,22 @@ fn ensure_attribution_file(workspace: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Does a person have an identity on this machine? Operator keys live in the machine
+/// state directory; one there means a human can sign, and the machine must not take a
+/// role that belongs to them.
+fn person_identity_exists() -> bool {
+    let Some(dir) = ferryman_channel::licensing::machine_state_dir() else {
+        return false;
+    };
+    std::fs::read_dir(dir.join("operators"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().is_file() && e.path().extension().is_some_and(|x| x == "json"))
+        })
+        .unwrap_or(false)
+}
+
 pub fn perform(request: Request) -> Result<Outcome> {
     let workspace = match request.workspace {
         Some(path) => path,
@@ -416,7 +432,20 @@ pub fn perform(request: Request) -> Result<Outcome> {
                 || (request.role == "orchestrator"
                     && !others.iter().any(|a| a.role == "orchestrator"))
         };
-    if request.master || implicit_master {
+    // A master is a person. This machine can only sign with its own key, so where a
+    // person already has an identity here, declaring the machine master would put the
+    // wrong kind of actor in charge - and the person cannot be signed in from a flag,
+    // because only they have their password. Leave it undeclared and say where to
+    // claim it. Found declaring `beastly` master of a project Josh was enabling.
+    let person_here = person_identity_exists();
+    if (request.master || implicit_master) && person_here {
+        steps.push(Step {
+            what: "master left undeclared: a person on this machine claims it in the \
+                   dashboard (Teammates -> I am the master)",
+            path: route.communications.join("master.json"),
+            created: false,
+        });
+    } else if request.master || implicit_master {
         let declaration =
             ferryman_channel::master::initialize_master(&route, &identity, &agent_name)?;
         steps.push(Step {
