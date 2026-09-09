@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## v0.5.10 - 2026-09-09
+
+Beta. An invitation no longer names the person; the person names themselves.
+
+### Changed
+
+- **Generic invitations.** The name field on the Teammates tab is optional. An
+  invitation made without one carries no name at all; the joiner's Claude asks them
+  what name they want, checks it against the channel (`ferry team claim <name>` says
+  free, taken, reserved, or not synced yet), and claims it. Until then the joiner is
+  `USER` in the prompt and `guest-<invite id>` on the roster; on claim the placeholder
+  is renamed `<name>-<host>` and the roster entry for the guest is removed. A named
+  invitation still reserves that name for the person it was made for.
+- **One invitation pairs one device.** When several devices knock with the same
+  handshake, `settle_pending` takes the most recent knock and leaves the others
+  pending, so a second machine cannot ride in on a code that was already used.
+- **The master's key is on the channel.** Loading Teammates as the master publishes
+  the operator's own `agents/<name>.json` to the channel if it is missing there, so
+  teammates can verify the master's grants without a manual copy.
+- **The joined device is named after the real hostname** (`hostname::get()`), not the
+  `COMPUTERNAME` variable, which sandboxed and non-Windows profiles do not set.
+
+### Prompt
+
+- The invitation prompt now tells the joiner which Claude can run it (Claude Code, or
+  Claude Desktop with a shell), that the project appears on their disk once the
+  inviter is online, and to ask for a name first and claim it before anything else.
+
 ## v0.5.9 - 2026-09-09
 
 v0.5.8 built for Windows only: the managed-Syncthing supervisor detached its child with a
