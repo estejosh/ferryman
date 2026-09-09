@@ -504,6 +504,7 @@ let mode = "signin";      // "signin" | "create" | "recover"
 // Operators this channel knows whose sealed key is missing from THIS machine. Not the
 // same as "nobody has set up", and the two call for opposite actions.
 let orphaned = [];
+let status_joining = null;
 // Whether this MACHINE holds any operator at all. Kept beside `orphaned` because the
 // interesting case is the pair: none here, but some in the channel.
 let status_any = false;
@@ -541,7 +542,11 @@ function renderAuth() {
   // paragraph above an empty form, and the operator it was written for could not get
   // through it. Explanation is not instruction.
   const lost = !status_any && orphaned.length;
-  $("#auth-sub").textContent = lost && isRecover
+  const joining = (typeof status_joining !== "undefined") && status_joining;
+  if (joining && joining.name && isCreate && !$("#auth-name").value) $("#auth-name").value = joining.name;
+  $("#auth-sub").textContent = (joining && isCreate)
+    ? `You are joining ${joining.project}. ${joining.name ? `Your name there is ${joining.name}.` : "Pick the name you want on the project - it has to be one nobody there has yet."} Choose a password; it stays on this machine.`
+    : lost && isRecover
     ? `${orphaned.join(" and ")} ${orphaned.length > 1 ? "are" : "is"} in this channel, but the key is not on this machine. Paste your 24 words below to get it back.`
     : (isRecover
       ? "Paste your 24-word recovery phrase. It restores the seed this machine's identity derives from."
@@ -993,8 +998,8 @@ pages.teammates = async () => {
           the moment it does. The code carries no secret and works once.
         </div>
         <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-          <input id="tm-name" placeholder="their name, e.g. david" style="min-width:170px" />
-          <input id="tm-agent" placeholder="their agent, e.g. david-agent (optional)" style="min-width:230px" />
+          <input id="tm-name" placeholder="reserve a name (optional - they can pick their own)" style="min-width:290px" />
+          <input id="tm-agent" placeholder="their agent's name (optional)" style="min-width:200px" />
           <select id="tm-role">
             ${ACCESS_LEVELS.map((l) => `<option value="${esc(l.id)}">${esc(l.label)} &mdash; ${esc(l.hint)}</option>`).join("")}
           </select>
@@ -1014,7 +1019,7 @@ pages.teammates = async () => {
       <div class="chat-top"><b>Invitations</b></div>
       ${(d.invites || []).map((i) => `
       <div class="row">
-        <div><div class="t">${esc(i.operator)}${i.agent ? ` <span class="badge">${esc(i.agent)}</span>` : ""}</div>
+        <div><div class="t">${esc(i.operator || "anyone (they pick their name)")}${i.agent ? ` <span class="badge">${esc(i.agent)}</span>` : ""}</div>
           <div class="m">${i.roles && i.roles.length ? esc(i.roles.join(", ")) : "full"} &middot; code ${esc(i.id)} &middot; expires ${esc((i.expires_at || "").slice(0, 10))}</div></div>
         <div class="r">${i.state === "granted" ? `<span class="badge good">joined and granted</span>` : i.state === "paired" ? `<span class="badge accent">device paired, waiting for keys</span>` : i.state === "expired" ? `<span class="badge">expired</span>` : `<span class="badge warn">waiting for them</span>`}</div>
       </div>`).join("")}
@@ -1096,37 +1101,50 @@ function wireTeammates() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          name: ($("#tm-name") || {}).value || "",
+          name: ($("#tm-name") || {}).value || null,
           agent: ($("#tm-agent") || {}).value || "",
           roles: level.roles,
         }),
       });
-      const who = r.name;
+      const who = r.name || "USER";
+      const nameLine = r.name
+        ? `name exactly "${r.name}" (it is reserved for me)`
+        : `the name I claimed in step 3`;
       const project = r.project || state.project || state.homeProject || "the project";
       const text = [
-        `Hi ${who} - to join ${project}, paste everything below this line into Claude (desktop or Claude Code) on the computer you will work from, and it does the setup for you. It will hand you a browser tab at the end; that is where you pick your password.`,
+        `Hi ${who} - to join ${project}, paste everything below this line into Claude on the computer you will work from, and it does the setup for you. It has to be a Claude that can run commands on that computer - Claude Code, or Claude desktop with computer access; a Claude that can only chat cannot do step 1. It hands you a browser tab at the end; that is where you pick your name and password. The project appears on your machine once ${state.me || "the inviter"} is online, so do not worry if it is not there the same minute.`,
         ``,
         `----------------------------------------------------------------`,
-        `Set this computer up on Ferryman and join the project "${project}" with the invite code below. Do it all yourself; only stop when a step says to hand me a browser. Never ask me for a password and never create one: my identity is made in the browser, by me.`,
+        `Set this computer up on Ferryman and join the project "${project}" with the invite code below. Do it all yourself; only stop when a step says to hand me a browser. Never ask me for a password and never create one: my identity is made in the browser, by me. If you cannot run commands on this computer, say so now and stop; do not pretend.`,
         ``,
         `Invite code: ${r.code}`,
         `My email for the licence seat count (nothing else): <MY EMAIL>`,
         ``,
+        ...(r.name ? [] : [
+          `0. Before anything else, in your reply to this message, ask me: "What name do you want to claim on Ferryman? It must be one nobody on ${project} has yet - letters, digits, dashes and underscores." Wait for my answer. You will check it in step 3 and ask again if it is taken.`,
+          ``,
+        ]),
         `1. Install Ferryman. Use a real Windows PowerShell for the Windows line (not a Linux shell):`,
         `     Windows:  irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex`,
         `     macOS / Linux:  curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh`,
-        `   Confirm with: ferry --version   (it must be 0.5.8 or newer; if older, run "ferry update").`,
+        `   Confirm with: ferry --version   (it must be 0.5.10 or newer; if older, run "ferry update").`,
         `   On Windows the binary is %LOCALAPPDATA%\\Ferryman\\bin\\ferry.exe if it is not on PATH yet.`,
         ``,
         `2. Accept the invite. This starts Syncthing (installing it if missing), pairs with the inviter, creates the project folder, and registers this machine:`,
         `     ferry team invite accept <THE CODE ABOVE> --email <MY EMAIL>`,
         `   It prints where the project folder is. If it fails, read the message - every failure says what to do - fix it and run the same line again; it is safe to repeat.`,
         ``,
-        `3. Open the dashboard from that project folder:`,
+        ...(r.name ? [] : [
+          `3. Claim the name, from that project folder:`,
+          `     ferry team claim <THE NAME I GAVE YOU>`,
+          `   "free" means it is mine and the next step will offer it. "taken" or "reserved": ask me for another name and run it again. "not yet": the project has not arrived on this machine because ${state.me || "the inviter"} is not online; wait a minute and run it again, and tell me if it stays that way for long.`,
+          ``,
+        ]),
+        `${r.name ? "3" : "4"}. Open the dashboard from that project folder:`,
         `     ferry dashboard`,
-        `   It prints a one-time setup token and opens a browser tab. Tell me the token and hand me the tab. I will create my identity there: name exactly "${who}", a password I choose, and I will write down the 24 words it shows once.`,
+        `   It prints a one-time setup token and opens a browser tab. Tell me the token and hand me the tab. I will create my identity there: ${nameLine}, a password I choose, and I will write down the 24 words it shows once.`,
         ``,
-        `4. Then tell me: "You are in. The project appears as soon as ${state.me || "the inviter"} is online; your agent ${r.agent ? `(${r.agent}) ` : ""}picks up its keys by itself. Come back to the dashboard any time with: ferry dashboard".`,
+        `${r.name ? "4" : "5"}. Then tell me, in these words: "You are in. Your device is knocking; the project appears here as soon as ${state.me || "the inviter"} has Ferryman open, and your access is signed at the same moment. Come back to the dashboard any time with: ferry dashboard". If the project has not appeared after a day, tell me to ping ${state.me || "the inviter"}; nothing on this side is wrong.`,
         ``,
         `Rules: never run gh auth switch; never put a token, key or password in a command line or a file; never paste my password anywhere. The code expires ${(r.expires_at || "").slice(0, 10)}.`,
         `----------------------------------------------------------------`,
@@ -1134,7 +1152,7 @@ function wireTeammates() {
       state.inviteText = text;
       $("#tm-code-text").textContent = text;
       $("#tm-code").hidden = false;
-      msg.textContent = `code ${r.id} made for ${who}${r.grants_required ? "; grants are required on this project from here on" : ""}`;
+      msg.textContent = `code ${r.id} made${r.name ? ` for ${r.name}` : " (they pick their name)"}${r.grants_required ? "; grants are required on this project from here on" : ""}`;
       const copy = $("#tm-copy");
       if (copy) copy.onclick = async () => {
         try { await navigator.clipboard.writeText(text); $("#tm-copied").textContent = "copied"; }
@@ -1917,6 +1935,7 @@ async function boot() {
   firstRun = !status.any_operators;
   status_any = !!status.any_operators;
   orphaned = status.orphaned_operators || [];
+  status_joining = status.joining || null;
 
   // A token already in hand (this tab created or recovered an identity, or survived a
   // refresh via sessionStorage) means the session may still be live.

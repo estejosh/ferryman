@@ -116,11 +116,12 @@ paths:
         '401': {description: no active session}
   /api/team/invite:
     post:
-      summary: Reserve a name for a teammate who has not joined yet
+      summary: Make an invitation code for a teammate who has not joined yet
       description: >
-        Reserves the NAME only. It cannot create their identity: an operator key is sealed
-        under that person's own password, and a key minted here would be a key this machine
-        has seen. Their key binds to the reserved name when their own machine registers.
+        Master only. Writes a signed invitation and returns the one-use code and the prompt
+        to send. A name may be reserved; without one the person picks any free name when
+        they create their identity, and the acceptance carries it. It cannot create their
+        identity - that happens on their machine, under their own password.
       responses:
         '200': {description: the reserved name}
         '400': {description: not a path-safe identifier}

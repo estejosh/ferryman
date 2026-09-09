@@ -755,6 +755,27 @@ async fn create_operator(
         None => None,
     };
 
+    // A joiner who arrived with a generic invite picks their name here, so this is the
+    // moment the acceptance can be written - signed by the identity just made. This
+    // machine's agent, if enable made one, rides along as theirs.
+    let mut joined = None;
+    if let Some(code) = ferryman_channel::invite::take_pending_code(&state.route)
+        && let Ok(device) = ferryman_channel::syncthing_my_id()
+    {
+        let agent = machine_agent_name(&state.route);
+        match ferryman_channel::invite::write_acceptance(
+            &state.route,
+            &identity,
+            &code,
+            &device,
+            identity.name(),
+            agent.as_deref(),
+        ) {
+            Ok(_) => joined = Some(code.project.clone()),
+            Err(err) => tracing::warn!("could not write the invitation acceptance: {err:#}"),
+        }
+    }
+
     let public_key = identity.public_key_hex();
     let token = state.sessions.insert(identity);
     Ok(Json(json!({
@@ -763,6 +784,7 @@ async fn create_operator(
         "public_key": &public_key,
         "fingerprint": &public_key,
         "phrase": phrase,
+        "joined": joined,
     })))
 }
 
@@ -953,6 +975,12 @@ async fn auth_status(State(state): State<DashboardState>) -> Result<Json<Value>,
         // So the sign-in screen can tell "you have never set up" from "your identity is
         // missing from this machine". They look identical and call for opposite actions.
         "orphaned_operators": state.orphaned_operators(),
+        // A generic invitation is waiting for the person to pick a name; the sign-up
+        // screen says so instead of talking about loopback.
+        "joining": std::fs::read_to_string(ferryman_channel::invite::pending_code_path(&state.route))
+            .ok()
+            .and_then(|t| serde_json::from_str::<ferryman_channel::invite::InviteCode>(&t).ok())
+            .map(|c| json!({ "project": c.project, "name": c.operator })),
     })))
 }
 
@@ -1129,6 +1157,12 @@ async fn team(
         .ok()
         .flatten()
         .map(|d| d.master);
+    if master_name
+        .as_deref()
+        .is_some_and(|m| m.eq_ignore_ascii_case(current.name()))
+    {
+        let _ = ensure_operator_on_roster(&route, &current);
+    }
     let mut settled_notes: Vec<String> = Vec::new();
     if let Ok(Some(name)) = ferryman_channel::invite::finish_handshake(&route) {
         settled_notes.push(format!("this device is now known as {name}"));
@@ -1146,9 +1180,9 @@ async fn team(
         {
             let roster_now =
                 ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
-            for invite in settled.ready_to_grant {
-                let mut names = vec![invite.operator.clone()];
-                names.extend(invite.agent.clone());
+            for (invite, accept) in settled.ready_to_grant {
+                let mut names = vec![accept.operator.clone()];
+                names.extend(accept.agent.clone());
                 let mut all_ok = true;
                 for who in &names {
                     let Some(entry) = roster_now.iter().find(|a| a.name.eq_ignore_ascii_case(who))
@@ -1160,7 +1194,7 @@ async fn team(
                         all_ok = false;
                         continue;
                     };
-                    let roles = if who == &invite.operator {
+                    let roles = if who == &accept.operator {
                         invite.roles.clone()
                     } else {
                         vec!["worker".to_string()]
@@ -1196,7 +1230,15 @@ async fn team(
                 }
                 if all_ok {
                     let _ = ferryman_channel::invite::mark_granted(&route, &invite.id);
-                    settled_notes.push(format!("{} has joined and is granted", invite.operator));
+                    // The placeholder a generic joiner carried until they claimed a
+                    // name has no key anyone will use again.
+                    let _ = std::fs::remove_file(
+                        route
+                            .communications
+                            .join("agents")
+                            .join(format!("guest-{}.json", invite.id)),
+                    );
+                    settled_notes.push(format!("{} has joined and is granted", accept.operator));
                 }
             }
         }
@@ -1215,9 +1257,13 @@ async fn team(
             } else {
                 "waiting"
             };
+            let accepted_as = ferryman_channel::invite::read_acceptance(&route, &invite.id)
+                .ok()
+                .flatten()
+                .map(|a| a.operator);
             json!({
                 "id": invite.id,
-                "operator": invite.operator,
+                "operator": accepted_as.or(invite.operator.clone()),
                 "agent": invite.agent,
                 "roles": invite.roles,
                 "state": state,
@@ -1263,7 +1309,9 @@ async fn team(
 
 #[derive(Deserialize)]
 struct InviteBody {
-    name: String,
+    /// Reserve this name; absent means they pick any free name themselves.
+    #[serde(default)]
+    name: Option<String>,
     /// Their agent's name; absent for a person with no agent.
     #[serde(default)]
     agent: Option<String>,
@@ -1304,8 +1352,15 @@ async fn invite_teammate(
     // The operator signs on the roster of the project acted on. A key this project
     // has never seen would sign declarations nobody there could verify.
     ensure_operator_on_roster(&route, &current).map_err(internal)?;
-    let name = body.name.trim().to_string();
-    if !ferryman_channel::is_safe_component(&name) {
+    let name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    if let Some(n) = &name
+        && !ferryman_channel::is_safe_component(n)
+    {
         return Err((
             StatusCode::BAD_REQUEST,
             "a teammate name must be a plain identifier: letters, digits, dashes and \
@@ -1338,7 +1393,7 @@ async fn invite_teammate(
     let (invite, code) = ferryman_channel::invite::create(
         &route,
         &current,
-        &name,
+        name.as_deref(),
         agent.as_deref(),
         body.roles.clone(),
         chrono::Duration::days(body.expires_days.unwrap_or(7).max(1)),
@@ -1351,7 +1406,8 @@ async fn invite_teammate(
         "invite",
         current.name(),
         &format!(
-            "invited {name}{} to {}; code {} expires {}",
+            "invited {}{} to {}; code {} expires {}",
+            name.as_deref().unwrap_or("someone (they pick their name)"),
             agent
                 .as_ref()
                 .map(|a| format!(" (agent {a})"))
@@ -1396,10 +1452,20 @@ fn ensure_operator_on_roster(
     route: &ferryman_channel::ProjectRoute,
     identity: &AgentIdentity,
 ) -> anyhow::Result<()> {
-    let roster = ferryman_channel::read_agent_roster(&route.communications)?;
-    if roster
-        .iter()
-        .any(|a| a.name.eq_ignore_ascii_case(identity.name()) && a.public_key.is_some())
+    // The CHANNEL's own agents directory, not the merged roster: the merged view folds
+    // in this machine's fleet-level operators, so an operator created at machine level
+    // reads as present here while no peer has ever seen their key. A master declaration
+    // signed by such a key verifies on this machine and nowhere else - found when the
+    // first joiner could not check who the master was.
+    let published = route
+        .communications
+        .join("agents")
+        .join(format!("{}.json", identity.name()));
+    if published.is_file()
+        && std::fs::read_to_string(&published)
+            .ok()
+            .and_then(|t| serde_json::from_str::<ferryman_channel::AgentRoute>(&t).ok())
+            .is_some_and(|a| a.public_key.as_deref().is_some_and(|k| !k.is_empty()))
     {
         return Ok(());
     }
@@ -1457,7 +1523,18 @@ async fn revoke_access(
     let mut names = vec![name.clone()];
     let mut devices: Vec<String> = Vec::new();
     for (invite, _) in ferryman_channel::invite::list(&route).unwrap_or_default() {
-        if invite.operator.eq_ignore_ascii_case(&name) {
+        let accepted_as = ferryman_channel::invite::read_acceptance(&route, &invite.id)
+            .ok()
+            .flatten()
+            .map(|a| a.operator);
+        let theirs = invite
+            .operator
+            .as_deref()
+            .is_some_and(|o| o.eq_ignore_ascii_case(&name))
+            || accepted_as
+                .as_deref()
+                .is_some_and(|o| o.eq_ignore_ascii_case(&name));
+        if theirs {
             if let Some(agent) = &invite.agent
                 && !names.iter().any(|n| n.eq_ignore_ascii_case(agent))
             {
@@ -1513,6 +1590,15 @@ async fn revoke_access(
         "invites_burned": burned,
         "rotate_secrets": sealed_to,
     })))
+}
+
+/// This machine's agent on a project, from its `agent.toml`, if there is one.
+fn machine_agent_name(route: &ProjectRoute) -> Option<String> {
+    let text = std::fs::read_to_string(route.attachment.join("agent.toml")).ok()?;
+    text.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        (key.trim() == "agent").then(|| value.trim().trim_matches('"').to_string())
+    })
 }
 
 /// POST /api/master/init - the signed-in operator becomes this project's master.
