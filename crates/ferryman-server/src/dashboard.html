@@ -1001,10 +1001,10 @@ pages.teammates = async () => {
           <button class="btn primary" id="tm-invite">Make the code</button>
         </div>
         <div class="s" id="tm-msg" style="color:var(--dim)"></div>
-        <div id="tm-code" hidden style="display:flex;flex-direction:column;gap:10px">
+        <div id="tm-code" ${state.inviteText ? "" : "hidden"} style="display:flex;flex-direction:column;gap:10px">
           <div class="k">Send them this - they paste it into their Claude</div>
-          <pre class="out" id="tm-code-text" style="max-height:none;white-space:pre-wrap"></pre>
-          <div style="display:flex;gap:8px"><button class="btn small" id="tm-copy">Copy</button><span class="s" id="tm-copied" style="color:var(--dim)"></span></div>
+          <pre class="out" id="tm-code-text" style="max-height:none;white-space:pre-wrap">${esc(state.inviteText || "")}</pre>
+          <div style="display:flex;gap:8px"><button class="btn small" id="tm-copy">Copy</button><button class="btn small" id="tm-code-close">Hide</button><span class="s" id="tm-copied" style="color:var(--dim)"></span></div>
         </div>
       </div>
     </div>
@@ -1033,7 +1033,7 @@ pages.teammates = async () => {
             <td>${esc(t.scope)}${t.scope === "channel" ? ` <span class="badge">not on this machine</span>` : ""}</td>
             <td>${g ? `${esc(accessLabel(g))} ${sigBadge(g.signature)}` : `<span class="badge warn">no grant</span>`}</td>
             <td>${g ? esc(scopeLabel(g)) : "&mdash;"}</td>
-            ${d.may_grant ? `<td><button class="btn" data-grant="${esc(t.name)}">Access</button></td>` : ""}
+            ${d.may_grant ? `<td style="white-space:nowrap">${t.revoked ? `<span class="badge bad">revoked</span> ` : ""}${t.current ? "" : `<button class="btn" data-grant="${esc(t.name)}">Access</button> <button class="btn" data-revoke="${esc(t.name)}" title="End their access">Remove</button>`}</td>` : ""}
           </tr>`;
         }).join("")}
         </tbody>
@@ -1102,7 +1102,7 @@ function wireTeammates() {
         }),
       });
       const who = r.name;
-      const project = state.project || state.homeProject || r.project || "the project";
+      const project = r.project || state.project || state.homeProject || "the project";
       const text = [
         `Hi ${who} - to join ${project}, paste everything below this line into Claude (desktop or Claude Code) on the computer you will work from, and it does the setup for you. It will hand you a browser tab at the end; that is where you pick your password.`,
         ``,
@@ -1131,6 +1131,7 @@ function wireTeammates() {
         `Rules: never run gh auth switch; never put a token, key or password in a command line or a file; never paste my password anywhere. The code expires ${(r.expires_at || "").slice(0, 10)}.`,
         `----------------------------------------------------------------`,
       ].join("\n");
+      state.inviteText = text;
       $("#tm-code-text").textContent = text;
       $("#tm-code").hidden = false;
       msg.textContent = `code ${r.id} made for ${who}${r.grants_required ? "; grants are required on this project from here on" : ""}`;
@@ -1145,6 +1146,38 @@ function wireTeammates() {
     } finally {
       invite.disabled = false;
     }
+  });
+
+  const copyBtn = $("#tm-copy");
+  if (copyBtn && state.inviteText) copyBtn.onclick = async () => {
+    try { await navigator.clipboard.writeText(state.inviteText); $("#tm-copied").textContent = "copied"; }
+    catch (_) { $("#tm-copied").textContent = "select the text and copy it"; }
+  };
+  const closeBtn = $("#tm-code-close");
+  if (closeBtn) closeBtn.onclick = () => { state.inviteText = null; $("#tm-code").hidden = true; };
+
+  document.querySelectorAll("[data-revoke]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const who = b.dataset.revoke;
+      const reason = window.prompt(`End ${who}'s access to ${state.project || state.homeProject}? Say why (kept in the ledger):`, "");
+      if (reason === null) return;
+      b.disabled = true;
+      try {
+        const r = await api(`/api/team/${encodeURIComponent(who)}/revoke`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ reason }),
+        });
+        state.team = null;
+        await render();
+        if (r.rotate_secrets && r.rotate_secrets.length) {
+          window.alert(`${who} is revoked. Rotate these secrets, which were sealed to them: ${r.rotate_secrets.join(", ")}`);
+        }
+      } catch (err) {
+        window.alert(String(err.message || err).slice(0, 300));
+        b.disabled = false;
+      }
+    });
   });
 
   const editor = $("#tm-editor");
@@ -1856,7 +1889,23 @@ async function refresh() {
   else if (stale) setSync("warn", `${stale} stale`);
   else setSync("", "Channel readable");
 
+  // A page with a form open, text selected, or a field focused is a page someone is
+  // using. Redrawing it under them throws away what they typed and hides what they
+  // were reading - an invite code, say. The counts above still update; the page
+  // itself waits for the next thing they do.
+  if (pageIsBusy()) return;
   await render();
+}
+
+function pageIsBusy() {
+  const main = $("#main");
+  if (!main) return false;
+  const active = document.activeElement;
+  if (active && main.contains(active) && /^(INPUT|TEXTAREA|SELECT)$/.test(active.tagName)) return true;
+  const sel = window.getSelection && window.getSelection();
+  if (sel && !sel.isCollapsed && main.contains(sel.anchorNode)) return true;
+  if (main.querySelector("#tm-editor:not([hidden]), #tm-code:not([hidden])")) return true;
+  return false;
 }
 
 async function boot() {

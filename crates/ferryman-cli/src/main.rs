@@ -215,6 +215,10 @@ enum Command {
         /// The dashboard operator's username. Used by the interactive prompt.
         #[arg(long)]
         dashboard_operator: Option<String>,
+        /// This machine is joining a channel that exists elsewhere; never declare a
+        /// master here. Set by `ferry team invite accept`.
+        #[arg(long, hide = true)]
+        joining: bool,
     },
     /// Check whether this machine is ready to run a task, before one fails.
     ///
@@ -1302,6 +1306,21 @@ enum TeamCommand {
         #[command(subcommand)]
         action: InviteAction,
     },
+    /// End a person's access: a master-signed revocation, the folder unshared from
+    /// their device, their open invitations burned. Master only.
+    Revoke {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The person (or agent) to revoke.
+        #[arg(long)]
+        name: String,
+        /// Why, kept in the ledger.
+        #[arg(long, default_value = "revoked by the master")]
+        reason: String,
+        /// Sign as this operator (the master). Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
     /// Trust any device knocking with a live invite's name and share the folder with it.
     /// The agent loop and the dashboard do this on their own; this runs one pass by hand.
     Pending {
@@ -2038,6 +2057,7 @@ async fn run(cli: Cli) -> Result<()> {
             json: as_json,
             dashboard,
             dashboard_operator,
+            joining,
         } => {
             // Before anything is written: a machine may not be configured to be a person.
             if let Some(name) = &agent_name {
@@ -2089,6 +2109,7 @@ async fn run(cli: Cli) -> Result<()> {
                 master,
                 sandbox,
                 worktree,
+                joining,
             }) {
                 Ok(outcome) => outcome,
                 Err(err) => {
@@ -3762,6 +3783,31 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 );
             }
         }
+        TeamCommand::Revoke {
+            workspace,
+            name,
+            reason,
+            signer,
+        } => {
+            let route = here(workspace)?;
+            let signer_name = match signer {
+                Some(s) => s,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            let identity = signing_identity(&route, &signer_name)?;
+            ferryman_channel::master::revoke_member(&route, &identity, &name, &reason)?;
+            let devices: Vec<String> = invite::list(&route)?
+                .into_iter()
+                .filter(|(i, _)| i.operator.eq_ignore_ascii_case(&name))
+                .filter_map(|(i, _)| i.accepted_device)
+                .collect();
+            if !devices.is_empty() {
+                ferryman_channel::syncthing_unshare_folder(&route, &devices)?;
+                println!("folder unshared from {} device(s)", devices.len());
+            }
+            println!("revoked {name} on {}: {reason}", route.project_id);
+            println!("note: what already synced is on their disk; rotate any secret sealed to them");
+        }
         TeamCommand::Pending { workspace } => {
             let route = here(workspace)?;
             let settled = invite::settle_pending(&route)?;
@@ -3845,7 +3891,8 @@ async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>)
         .arg(&code.device)
         .arg("--dashboard")
         .arg("--dashboard-operator")
-        .arg(&code.operator);
+        .arg(&code.operator)
+        .arg("--joining");
     if let Some(agent) = &code.agent {
         cmd.arg("--agent").arg(agent);
     }
@@ -3862,8 +3909,10 @@ async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>)
     let identity = signing_identity(&route, &agent_name)?;
     let my_device = ferryman_channel::syncthing_my_id()?;
     invite::write_acceptance(&route, &identity, &code, &my_device)?;
-    // The handshake name did its job; be a normal device from here on.
-    let _ = ferryman_channel::syncthing_set_my_name(&format!("{}-{}", code.operator, ferryman_ops::identity::machine_name().unwrap_or_default()));
+    // The device keeps the handshake name until the inviter has acted on it: the
+    // synced invite record will say so, and `invite::finish_handshake` renames then.
+    // Renaming here, before the inviter looked, is how the first test of this flow
+    // left the inviter staring at a device it did not recognise.
 
     println!();
     println!("done. {} will appear on this machine as soon as the inviter's Ferryman", code.project);
@@ -4036,6 +4085,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 // Syncthing stopped carrying is alive and useless; better to notice.
                 keep_syncthing_up(&report);
                 for (route, _) in &fleet.served {
+                    let _ = ferryman_channel::invite::finish_handshake(route);
                     match ferryman_channel::invite::settle_pending(route) {
                         Ok(settled) => {
                             for (id, device) in settled.paired {

@@ -66,6 +66,10 @@ pub struct Request {
     pub sandbox: Option<String>,
     /// Run each task in its own git worktree when the workspace is a git repo.
     pub worktree: bool,
+    /// This machine is joining a channel that already exists elsewhere (an invitation).
+    /// Its copy of the folder is empty only because nothing has synced yet, so the
+    /// "first machine" reasoning must not apply: never declare a master here.
+    pub joining: bool,
 }
 
 /// A file this run created, or found already correct.
@@ -397,6 +401,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // a channel whose only orchestrator is this machine. In both, "who is master" has
     // one answer. On any other machine it stays explicit.
     let implicit_master = !request.master
+        && !request.joining
         && ferryman_channel::master::read_master(&route)
             .ok()
             .flatten()
@@ -577,6 +582,7 @@ pub(crate) mod tests_support {
             master: false,
             sandbox: None,
             worktree: false,
+            joining: false,
         })
         .unwrap();
         dir
@@ -618,6 +624,7 @@ mod tests {
             master: false,
             sandbox: None,
             worktree: false,
+            joining: false,
         })?;
         Ok(())
     }
@@ -747,6 +754,7 @@ mod tests {
             master: false,
             sandbox: None,
             worktree: false,
+            joining: false,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome
@@ -797,6 +805,7 @@ mod tests {
             master: false,
             sandbox: None,
             worktree: false,
+            joining: false,
         })
         .unwrap();
         let config = fs::read_to_string(AgentConfig::path(&dir.join(".ferryman"))).unwrap();
@@ -824,6 +833,7 @@ mod tests {
             master: false,
             sandbox: None,
             worktree: false,
+            joining: false,
         })
         .unwrap();
         assert!(
@@ -879,6 +889,7 @@ mod tests {
             master: false,
             sandbox: None,
             worktree: false,
+            joining: false,
         }
     }
 

@@ -148,12 +148,14 @@ pub fn start() -> Result<SyncthingHealth> {
     if !home.join("config.xml").is_file() {
         std::fs::create_dir_all(&home)
             .with_context(|| format!("create {}", home.display()))?;
+        // Syncthing 2.x `generate` takes only --home and the GUI credentials; port
+        // probing (its default) picks free GUI and listen ports, which is what lets a
+        // second instance coexist with a person's own Syncthing on the same machine.
+        // The default folder it creates is removed after the first start, below.
         let generated = Command::new(&binary)
             .arg("generate")
             .arg("--home")
             .arg(&home)
-            .arg("--no-default-folder")
-            .arg("--gui-address=127.0.0.1:0")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -172,6 +174,9 @@ pub fn start() -> Result<SyncthingHealth> {
         if let Ok(health) = syncthing_health()
             && health.managed
         {
+            // A fresh `generate` seeds a "Default Folder" under the home directory. A
+            // Ferryman-managed instance carries channels and nothing else.
+            let _ = ferryman_channel::syncthing_remove_folder("default");
             return Ok(health);
         }
     }

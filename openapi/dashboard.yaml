@@ -136,6 +136,20 @@ paths:
         '200': {description: the master's name and whether grants are now required}
         '403': {description: dashboard is read-only}
         '409': {description: a master already exists}
+  /api/team/{name}/revoke:
+    post:
+      summary: End a person's access, signed by the master
+      description: >
+        Writes a master-signed revocation beside their grant and their agents' grants,
+        unshares the folder from devices this channel knows as theirs, and burns open
+        invitations in their name. Cannot unsync what already synced; the response lists
+        secrets sealed to them, which should be rotated.
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: who was revoked, which devices were unshared, which secrets to rotate}
+        '403': {description: only the master may revoke}
+        '409': {description: cannot revoke yourself}
   /api/team/{name}/access:
     post:
       summary: Sign a master grant saying what this person may do, and on which projects

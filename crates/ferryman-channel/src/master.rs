@@ -296,6 +296,9 @@ pub fn grant_member(
     let directory = grants_dir(route);
     fs::create_dir_all(&directory)?;
     crate::atomic_json(&grant_path(route, grantee), &grant)?;
+    // A fresh grant after a revocation means the master changed their mind; the
+    // revocation file must not outlive the decision it recorded.
+    let _ = fs::remove_file(revocation_path(route, grantee));
     Ok(grant)
 }
 
@@ -331,9 +334,112 @@ pub fn member_grants(route: &ProjectRoute) -> Result<Vec<(MasterGrant, Signature
     Ok(grants)
 }
 
+/// A master-signed statement that a member's access has ended.
+///
+/// Kept beside the grant rather than deleting it: the history should say who had
+/// access, who ended it, and why. A grant with a valid revocation beside it confers
+/// nothing, whatever it says.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MasterRevocation {
+    pub grantee: String,
+    pub reason: String,
+    pub revoked_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+fn revocation_path(route: &ProjectRoute, grantee: &str) -> PathBuf {
+    grants_dir(route).join(format!("{grantee}.revoked.json"))
+}
+
+fn revocation_payload(revocation: &MasterRevocation) -> String {
+    format!(
+        "ferryman-master-revoke-v1\n{}\n{}\n{}",
+        revocation.grantee,
+        revocation.reason,
+        revocation.revoked_at.to_rfc3339(),
+    )
+}
+
+/// End a member's access. Signed by the master; refuses anyone else.
+pub fn revoke_member(
+    route: &ProjectRoute,
+    master: &AgentIdentity,
+    grantee: &str,
+    reason: &str,
+) -> Result<MasterRevocation> {
+    if !crate::is_safe_component(grantee) {
+        bail!("grantee name must be a path-safe identifier");
+    }
+    let Some(declaration) = read_master(route)? else {
+        bail!("this project has no master yet");
+    };
+    if !declaration.master.eq_ignore_ascii_case(master.name()) {
+        bail!("only the master ({}) may revoke access", declaration.master);
+    }
+    let mut revocation = MasterRevocation {
+        grantee: grantee.to_owned(),
+        reason: reason.to_owned(),
+        revoked_at: Utc::now(),
+        signed_by: None,
+        signature: None,
+    };
+    let signature = master
+        .signing
+        .sign(revocation_payload(&revocation).as_bytes());
+    revocation.signed_by = Some(master.name().to_owned());
+    revocation.signature = Some(hex::encode(signature.to_bytes()));
+    fs::create_dir_all(grants_dir(route))?;
+    crate::atomic_json(&revocation_path(route, grantee), &revocation)?;
+    Ok(revocation)
+}
+
+/// Whether a valid master-signed revocation exists for `grantee`.
+pub fn is_revoked(route: &ProjectRoute, grantee: &str) -> Result<bool> {
+    let path = revocation_path(route, grantee);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let revocation: MasterRevocation = serde_json::from_str(&fs::read_to_string(&path)?)?;
+    let Some(master) = master_agent(route)? else {
+        return Ok(false);
+    };
+    Ok(check_signature(
+        revocation.signed_by.as_ref(),
+        revocation.signature.as_ref(),
+        &revocation_payload(&revocation),
+        std::slice::from_ref(&master),
+    ) == SignatureCheck::Valid)
+}
+
+/// Every valid revocation on this project, by grantee.
+pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
+    let dir = grants_dir(route);
+    if !dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let Some(grantee) = name.strip_suffix(".revoked.json") else {
+            continue;
+        };
+        if is_revoked(route, grantee)? {
+            out.push(serde_json::from_str(&fs::read_to_string(&path)?)?);
+        }
+    }
+    Ok(out)
+}
+
 /// Whether `grantee` holds a valid master-signed grant for `role` on this
 /// project. In team mode this is the gate that decides who may act.
 pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
+    if is_revoked(route, grantee)? {
+        return Ok(false);
+    }
     for (grant, check) in member_grants(route)? {
         if grant.grantee == grantee
             && check == SignatureCheck::Valid

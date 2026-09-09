@@ -398,6 +398,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/release/{version}/deny", post(deny_release))
         .route("/api/team/invite", post(invite_teammate))
         .route("/api/master/init", post(master_init))
+        .route("/api/team/{name}/revoke", post(revoke_access))
         .route("/api/team/{name}/access", post(set_access))
         .route("/api/conversations", get(conversations))
         .route("/api/conversations/{topic}", get(conversation).post(say))
@@ -1094,11 +1095,13 @@ async fn team(
             } else {
                 "channel"
             };
+            let revoked = ferryman_channel::master::is_revoked(&route, &name).unwrap_or(false);
             json!({
                 "name": name,
                 "role": role,
                 "current": is_current,
                 "scope": scope,
+                "revoked": revoked,
             })
         })
         .collect::<Vec<_>>();
@@ -1128,6 +1131,9 @@ async fn team(
         .flatten()
         .map(|d| d.master);
     let mut settled_notes: Vec<String> = Vec::new();
+    if let Ok(Some(name)) = ferryman_channel::invite::finish_handshake(&route) {
+        settled_notes.push(format!("this device is now known as {name}"));
+    }
     if let Ok(settled) = ferryman_channel::invite::settle_pending(&route) {
         for (id, device) in settled.paired {
             settled_notes.push(format!("let in a device for invite {id} ({})", &device[..device.len().min(7)]));
@@ -1364,6 +1370,7 @@ async fn invite_teammate(
     Ok(Json(json!({
         "name": name,
         "agent": agent,
+        "project": route.project_id,
         "state": "invited",
         "id": invite.id,
         "code": code,
@@ -1397,6 +1404,98 @@ fn ensure_operator_on_roster(
     };
     ferryman_channel::register_agent_key(route, &published, identity)?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct RevokeBody {
+    #[serde(default)]
+    reason: String,
+}
+
+/// POST /api/team/{name}/revoke - end a person's access: a master-signed revocation
+/// beside their grant, their agents' grants likewise, the folder unshared from any
+/// device this channel knows as theirs, and open invitations in their name burned.
+///
+/// What it cannot do: unsync what already synced. Everything in the channel up to this
+/// moment is on their disk. Secrets sealed to their agent should be rotated - the
+/// response says which ones.
+async fn revoke_access(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Path(name): Path<String>,
+    Json(body): Json<RevokeBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let route = state.route_for(params.project.as_deref());
+    if name.eq_ignore_ascii_case(current.name()) {
+        return Err((StatusCode::CONFLICT, "you cannot revoke yourself; transfer the master role first".to_string()));
+    }
+    let reason = if body.reason.trim().is_empty() {
+        "revoked by the master".to_string()
+    } else {
+        body.reason.trim().to_string()
+    };
+    // The person, and every agent whose invite named them as its human.
+    let mut names = vec![name.clone()];
+    let mut devices: Vec<String> = Vec::new();
+    for (invite, _) in ferryman_channel::invite::list(&route).unwrap_or_default() {
+        if invite.operator.eq_ignore_ascii_case(&name) {
+            if let Some(agent) = &invite.agent
+                && !names.iter().any(|n| n.eq_ignore_ascii_case(agent))
+            {
+                names.push(agent.clone());
+            }
+            if let Some(device) = &invite.accepted_device {
+                devices.push(device.clone());
+            }
+        }
+    }
+    let mut revoked = Vec::new();
+    for who in &names {
+        ferryman_channel::master::revoke_member(&route, &current, who, &reason)
+            .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        revoked.push(who.clone());
+    }
+    let mut unshared = Vec::new();
+    if !devices.is_empty()
+        && ferryman_channel::syncthing_unshare_folder(&route, &devices).is_ok()
+    {
+        unshared = devices.clone();
+    }
+    // Open invitations in their name are burned by expiring them now.
+    let burned = ferryman_channel::invite::burn_for(&route, &name).unwrap_or(0);
+    let sealed_to: Vec<String> = ferryman_channel::secrets::list_secrets(&route)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.recipients.iter().any(|r| names.iter().any(|n| n.eq_ignore_ascii_case(r))))
+        .map(|s| s.name)
+        .collect();
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &route,
+        &current,
+        "revoke",
+        current.name(),
+        &format!(
+            "revoked {} on {}: {reason}{}",
+            revoked.join(", "),
+            route.project_id,
+            if unshared.is_empty() { String::new() } else { format!("; folder unshared from {} device(s)", unshared.len()) }
+        ),
+        None,
+    );
+    Ok(Json(json!({
+        "revoked": revoked,
+        "unshared_devices": unshared,
+        "invites_burned": burned,
+        "rotate_secrets": sealed_to,
+    })))
 }
 
 /// POST /api/master/init - the signed-in operator becomes this project's master.

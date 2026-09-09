@@ -3957,7 +3957,7 @@ fn urlencode(value: &str) -> String {
 /// Returns `Ok(None)` for any non-200 answer (folder unknown, key rejected, Syncthing
 /// not running) because every one of those means the same thing to a caller: this
 /// transport is not usable right now.
-fn syncthing_get(api_base: &str, path: &str, api_key: &str) -> Result<Option<Value>> {
+pub(crate) fn syncthing_get(api_base: &str, path: &str, api_key: &str) -> Result<Option<Value>> {
     let authority = api_base
         .trim()
         .trim_end_matches('/')
@@ -4099,7 +4099,7 @@ pub fn syncthing_api_key() -> Option<String> {
         .or_else(syncthing_api_key_from_config)
 }
 
-fn syncthing_api_base() -> String {
+pub(crate) fn syncthing_api_base() -> String {
     if let Ok(explicit) = std::env::var("SYNCTHING_API_BASE")
         && !explicit.trim().is_empty()
     {
@@ -4512,6 +4512,20 @@ pub fn syncthing_add_device(device_id: &str, name: &str) -> Result<()> {
     match syncthing_post(&base, "/rest/config/devices", &key, &body)? {
         Some(code) if (200..300).contains(&code) => Ok(()),
         Some(code) => bail!("Syncthing refused the device (HTTP {code})"),
+        None => bail!("could not reach Syncthing's API"),
+    }
+}
+
+/// Remove a folder from Syncthing by id, if it exists. Used to drop the default
+/// folder a fresh instance seeds; never touches the files on disk.
+pub fn syncthing_remove_folder(folder_id: &str) -> Result<()> {
+    let Some(key) = syncthing_api_key() else {
+        bail!("Syncthing config not found");
+    };
+    let base = syncthing_api_base();
+    match syncthing_delete(&base, &format!("/rest/config/folders/{}", urlencode(folder_id)), &key)? {
+        Some(code) if (200..300).contains(&code) || code == 404 => Ok(()),
+        Some(code) => bail!("Syncthing refused to remove folder {folder_id} (HTTP {code})"),
         None => bail!("could not reach Syncthing's API"),
     }
 }

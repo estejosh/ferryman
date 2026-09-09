@@ -407,6 +407,55 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
     Ok(settled)
 }
 
+/// The joiner's side, after the folder has synced: if this device still carries a
+/// handshake name and the invite record now says the inviter accepted this device,
+/// take a normal name. Returns the new name when it renamed.
+pub fn finish_handshake(route: &ProjectRoute) -> Result<Option<String>> {
+    let Ok(health) = crate::syncthing_health() else {
+        return Ok(None);
+    };
+    let Some(me) = health.my_id else {
+        return Ok(None);
+    };
+    for (invite, _) in list(route)? {
+        if invite.accepted_device.as_deref() != Some(me.as_str()) {
+            continue;
+        }
+        // Our own announced name is in the config under our own id; the peers list
+        // excludes us, so read it straight from the config.
+        let Some(key) = crate::syncthing_api_key() else {
+            return Ok(None);
+        };
+        let mine = crate::syncthing_get(&crate::syncthing_api_base(), &format!("/rest/config/devices/{me}"), &key)?
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        if mine != handshake_name(&invite.id) {
+            return Ok(None);
+        }
+        let host = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "machine".into())
+            .to_lowercase();
+        let name = format!("{}-{host}", invite.operator);
+        crate::syncthing_set_my_name(&name)?;
+        return Ok(Some(name));
+    }
+    Ok(None)
+}
+
+/// Expire every open invitation naming `operator`, now. Returns how many.
+pub fn burn_for(route: &ProjectRoute, operator: &str) -> Result<usize> {
+    let mut burned = 0;
+    for (mut invite, _) in list(route)? {
+        if invite.operator.eq_ignore_ascii_case(operator) && invite.granted_at.is_none() {
+            invite.expires_at = Utc::now();
+            write(route, &invite)?;
+            burned += 1;
+        }
+    }
+    Ok(burned)
+}
+
 /// Mark an invite granted, after the master has signed the grants it promised.
 pub fn mark_granted(route: &ProjectRoute, id: &str) -> Result<()> {
     let Some(mut invite) = read(route, id)? else {
