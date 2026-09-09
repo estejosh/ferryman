@@ -548,8 +548,8 @@ pub fn finish_handshake(route: &ProjectRoute) -> Result<Option<String>> {
         if mine != handshake_name(&invite.id) {
             return Ok(None);
         }
-        let host = std::env::var("COMPUTERNAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
+        let host = hostname::get()
+            .map(|h| h.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "machine".into())
             .to_lowercase();
         let who = read_acceptance(route, &invite.id)
