@@ -1352,7 +1352,7 @@ enum InviteAction {
         #[arg(long)]
         agent: Option<String>,
         /// Comma-separated roles the grant will carry once their keys arrive. Empty
-        /// means every role on this project.
+        /// means "reader" (look, nothing else); "full" means every role on this project.
         #[arg(long)]
         roles: Option<String>,
         /// How long the code stays valid, in days.

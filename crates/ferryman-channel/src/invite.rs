@@ -217,7 +217,13 @@ pub fn create(
         device_id: inviter_device_id.to_string(),
         operator: operator.map(str::to_string),
         agent: agent.map(str::to_string),
-        roles,
+        // An unscoped invite is read-only, never everything: "full" is the one word
+        // that opts into the empty (= every role) grant.
+        roles: match roles.as_slice() {
+            [] => vec!["reader".to_string()],
+            [r] if r.eq_ignore_ascii_case("full") => Vec::new(),
+            _ => roles,
+        },
         created_at: now,
         expires_at: now + ttl,
         nonce_hash: hash_nonce(&nonce),

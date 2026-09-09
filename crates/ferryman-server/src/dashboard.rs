@@ -1315,7 +1315,7 @@ struct InviteBody {
     /// Their agent's name; absent for a person with no agent.
     #[serde(default)]
     agent: Option<String>,
-    /// Roles the grant will carry once their keys arrive. Empty means every role.
+    /// Roles the grant will carry once their keys arrive. Empty means reader; ["full"] means every role.
     #[serde(default)]
     roles: Vec<String>,
     #[serde(default)]

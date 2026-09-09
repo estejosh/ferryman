@@ -6,6 +6,7 @@
 <title>Ferryman</title>
 <style>
 :root{
+  color-scheme:dark;
   --bg:#0A121A; --panel:#0E1A24; --panel-2:#122334; --line:#1B2E3F; --line-2:#24405A;
   --text:#E6EEF4; --dim:#93A9BC; --faint:#63798D;
   --accent:#3B9EFF; --accent-dim:#1E5C99;
@@ -13,6 +14,7 @@
   --radius:8px;
 }
 :root[data-theme="light"]{
+  color-scheme:light;
   --bg:#F5F8FA; --panel:#FFFFFF; --panel-2:#EEF3F7; --line:#DBE4EC; --line-2:#C6D4E0;
   --text:#0E1A24; --dim:#4A6076; --faint:#7A8FA3;
   --accent:#1668C7; --accent-dim:#9CC6F0;
@@ -26,6 +28,9 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 button,input,select,textarea{font:inherit;color:inherit}
+input,select,textarea{background:var(--panel-2);border:1px solid var(--line);
+  border-radius:var(--radius);padding:8px 11px;color:var(--text)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent-dim)}
 a{color:var(--accent);text-decoration:none}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
 .num{font-variant-numeric:tabular-nums}
@@ -1001,13 +1006,13 @@ pages.teammates = async () => {
           <input id="tm-name" placeholder="reserve a name (optional - they can pick their own)" style="min-width:290px" />
           <input id="tm-agent" placeholder="their agent's name (optional)" style="min-width:200px" />
           <select id="tm-role">
-            ${ACCESS_LEVELS.map((l) => `<option value="${esc(l.id)}">${esc(l.label)} &mdash; ${esc(l.hint)}</option>`).join("")}
+            ${ACCESS_LEVELS.map((l) => `<option value="${esc(l.id)}"${l.id === "reader" ? " selected" : ""}>${esc(l.label)} &mdash; ${esc(l.hint)}</option>`).join("")}
           </select>
           <button class="btn primary" id="tm-invite">Make the code</button>
         </div>
         <div class="s" id="tm-msg" style="color:var(--dim)"></div>
         <div id="tm-code" ${state.inviteText ? "" : "hidden"} style="display:flex;flex-direction:column;gap:10px">
-          <div class="k">Send them this - they paste it into their Claude</div>
+          <div class="k">Send them this - they paste it into their AI agent, or run the steps themselves</div>
           <pre class="out" id="tm-code-text" style="max-height:none;white-space:pre-wrap">${esc(state.inviteText || "")}</pre>
           <div style="display:flex;gap:8px"><button class="btn small" id="tm-copy">Copy</button><button class="btn small" id="tm-code-close">Hide</button><span class="s" id="tm-copied" style="color:var(--dim)"></span></div>
         </div>
@@ -1096,14 +1101,14 @@ function wireTeammates() {
     msg.textContent = "";
     invite.disabled = true;
     try {
-      const level = ACCESS_LEVELS.find((l) => l.id === ($("#tm-role") || {}).value) || ACCESS_LEVELS[0];
+      const level = ACCESS_LEVELS.find((l) => l.id === ($("#tm-role") || {}).value) || ACCESS_LEVELS.find((l) => l.id === "reader");
       const r = await api("/api/team/invite", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           name: ($("#tm-name") || {}).value || null,
           agent: ($("#tm-agent") || {}).value || "",
-          roles: level.roles,
+          roles: level.roles.length ? level.roles : ["full"],
         }),
       });
       const who = r.name || "USER";
@@ -1112,7 +1117,7 @@ function wireTeammates() {
         : `the name I claimed in step 3`;
       const project = r.project || state.project || state.homeProject || "the project";
       const text = [
-        `Hi ${who} - to join ${project}, paste everything below this line into Claude on the computer you will work from, and it does the setup for you. It has to be a Claude that can run commands on that computer - Claude Code, or Claude desktop with computer access; a Claude that can only chat cannot do step 1. It hands you a browser tab at the end; that is where you pick your name and password. The project appears on your machine once ${state.me || "the inviter"} is online, so do not worry if it is not there the same minute.`,
+        `Hi ${who} - to join ${project}, paste everything below this line into your AI agent on the computer you will work from, and it does the setup for you. Any agent that can run commands on that computer works - Claude Code, Claude desktop with computer access, Cursor, Codex, Copilot, whatever you use; an agent that can only chat cannot do step 1. No agent at all is fine too: the numbered steps are commands, run them yourself in a terminal. It hands you a browser tab at the end; that is where you pick your name and password. The project appears on your machine once ${state.me || "the inviter"} is online, so do not worry if it is not there the same minute.`,
         ``,
         `----------------------------------------------------------------`,
         `Set this computer up on Ferryman and join the project "${project}" with the invite code below. Do it all yourself; only stop when a step says to hand me a browser. Never ask me for a password and never create one: my identity is made in the browser, by me. If you cannot run commands on this computer, say so now and stop; do not pretend.`,
