@@ -602,9 +602,9 @@ fn internal(error: Error) -> DashboardError {
 /// process runs whether or not the process notices. So it is read when the question is
 /// asked. Falls back to the boot snapshot if the read fails, which is no worse than what
 /// it did before.
-fn roster_now(state: &DashboardState) -> Vec<ferryman_channel::AgentRoute> {
-    ferryman_channel::read_agent_roster(&state.route.communications)
-        .unwrap_or_else(|_| state.route.agents.clone())
+fn roster_now(route: &ProjectRoute) -> Vec<ferryman_channel::AgentRoute> {
+    ferryman_channel::read_agent_roster(&route.communications)
+        .unwrap_or_else(|_| route.agents.clone())
 }
 
 fn sig(signature: &SignatureCheck) -> &'static str {
@@ -1052,14 +1052,16 @@ async fn whoami(
 async fn team(
     State(state): State<DashboardState>,
     headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     let current = state
         .sessions
         .resolve(session_token(&headers))
         .ok_or((StatusCode::UNAUTHORIZED, "no active session".to_string()))?;
     let mut names = state.operators.names().map_err(internal)?;
     let roster =
-        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+        ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
     // Operators publish a public roster entry so every machine can verify their
     // signatures. Include those remote humans even when this machine does not hold
     // their sealed signing identity; otherwise the team view would silently collapse
@@ -1073,7 +1075,7 @@ async fn team(
         }
     }
     names.sort();
-    let master = ferryman_channel::master::read_master(&state.route)
+    let master = ferryman_channel::master::read_master(&route)
         .map_err(internal)?
         .map(|declaration| declaration.master);
     let teammates = names
@@ -1117,7 +1119,7 @@ async fn team(
     // carried projects, roles and capabilities since ADR 0014 - it is authority that
     // existed in the channel and was not on any screen, so nobody could see who could do
     // what without reading JSON.
-    let grants = ferryman_channel::master::member_grants(&state.route)
+    let grants = ferryman_channel::master::member_grants(&route)
         .map_err(internal)?
         .into_iter()
         .map(|(grant, check)| {
@@ -1170,6 +1172,7 @@ struct InviteBody {
 async fn invite_teammate(
     State(state): State<DashboardState>,
     headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
     Json(body): Json<InviteBody>,
 ) -> Result<Json<Value>, DashboardError> {
     if state.read_only {
@@ -1179,6 +1182,10 @@ async fn invite_teammate(
         StatusCode::UNAUTHORIZED,
         "no active session; sign in again".to_string(),
     ))?;
+    let route = state.route_for(params.project.as_deref());
+    // The operator signs on the roster of the project acted on. A key this project
+    // has never seen would sign declarations nobody there could verify.
+    ensure_operator_on_roster(&route, &current).map_err(internal)?;
     let name = body.name.trim().to_string();
     if !ferryman_channel::is_safe_component(&name) {
         return Err((
@@ -1189,7 +1196,7 @@ async fn invite_teammate(
         ));
     }
     let roster =
-        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+        ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
     // First-key-wins is the rule that makes reservation safe, and it is also the rule
     // that makes overwriting an existing entry dangerous: a name that already carries a
     // published key belongs to whoever holds that key, and re-registering it would be
@@ -1205,14 +1212,14 @@ async fn invite_teammate(
         ));
     }
     ferryman_channel::register_expected_agent(
-        &state.route,
+        &route,
         &name,
         "operator",
         &["messages.receive".to_string()],
     )
     .map_err(internal)?;
     ferryman_channel::ledger::append_ledger_entry(
-        &state.route,
+        &route,
         &current,
         "invite",
         current.name(),
@@ -1222,10 +1229,10 @@ async fn invite_teammate(
     .map_err(internal)?;
     // A second person on the channel is the moment open grants stop being safe.
     let grants_flipped =
-        ferryman_channel::set_grants_required(&state.route.attachment).unwrap_or(false);
+        ferryman_channel::set_grants_required(&route.attachment).unwrap_or(false);
     if grants_flipped {
         let _ = ferryman_channel::ledger::append_ledger_entry(
-            &state.route,
+            &route,
             &current,
             "policy",
             current.name(),
@@ -1236,8 +1243,33 @@ async fn invite_teammate(
     Ok(Json(json!({
         "name": name,
         "state": "invited",
-        "grants_required": grants_flipped || state.route.requires_grants(),
+        "grants_required": grants_flipped || route.requires_grants(),
     })))
+}
+
+/// Publish the operator's public key to a project's roster if it is not there yet.
+/// Same entry `publish_operator` writes on creation; first-key-wins means an existing
+/// entry under this name is never overwritten.
+fn ensure_operator_on_roster(
+    route: &ferryman_channel::ProjectRoute,
+    identity: &AgentIdentity,
+) -> anyhow::Result<()> {
+    let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+    if roster
+        .iter()
+        .any(|a| a.name.eq_ignore_ascii_case(identity.name()) && a.public_key.is_some())
+    {
+        return Ok(());
+    }
+    let published = ferryman_channel::AgentRoute {
+        name: identity.name().to_string(),
+        role: "operator".to_string(),
+        capabilities: vec!["messages.receive".to_string()],
+        public_key: Some(identity.public_key_hex()),
+        encryption_key: None,
+    };
+    ferryman_channel::register_agent_key(route, &published, identity)?;
+    Ok(())
 }
 
 /// POST /api/master/init - the signed-in operator becomes this project's master.
@@ -1250,6 +1282,7 @@ async fn invite_teammate(
 async fn master_init(
     State(state): State<DashboardState>,
     headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
 ) -> Result<Json<Value>, DashboardError> {
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
@@ -1258,7 +1291,11 @@ async fn master_init(
         StatusCode::UNAUTHORIZED,
         "no active session; sign in again".to_string(),
     ))?;
-    if let Some(existing) = ferryman_channel::master::read_master(&state.route).map_err(internal)? {
+    let route = state.route_for(params.project.as_deref());
+    // The operator signs on the roster of the project acted on. A key this project
+    // has never seen would sign declarations nobody there could verify.
+    ensure_operator_on_roster(&route, &current).map_err(internal)?;
+    if let Some(existing) = ferryman_channel::master::read_master(&route).map_err(internal)? {
         return Err((
             StatusCode::CONFLICT,
             format!(
@@ -1268,25 +1305,25 @@ async fn master_init(
         ));
     }
     let declaration =
-        ferryman_channel::master::initialize_master(&state.route, &current, current.name())
+        ferryman_channel::master::initialize_master(&route, &current, current.name())
             .map_err(internal)?;
-    let flipped = ferryman_channel::set_grants_required(&state.route.attachment).unwrap_or(false);
+    let flipped = ferryman_channel::set_grants_required(&route.attachment).unwrap_or(false);
     let _ = ferryman_channel::ledger::append_ledger_entry(
-        &state.route,
+        &route,
         &current,
         "master",
         current.name(),
         &format!(
             "{} became the master of {}{}",
             declaration.master,
-            state.route.project_id,
+            route.project_id,
             if flipped { "; grants are now required" } else { "" }
         ),
         None,
     );
     Ok(Json(json!({
         "master": declaration.master,
-        "grants_required": flipped || state.route.requires_grants(),
+        "grants_required": flipped || route.requires_grants(),
     })))
 }
 
@@ -1308,6 +1345,7 @@ struct AccessBody {
 async fn set_access(
     State(state): State<DashboardState>,
     headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
     Path(name): Path<String>,
     Json(body): Json<AccessBody>,
 ) -> Result<Json<Value>, DashboardError> {
@@ -1318,10 +1356,14 @@ async fn set_access(
         StatusCode::UNAUTHORIZED,
         "no active session; sign in again".to_string(),
     ))?;
+    let route = state.route_for(params.project.as_deref());
+    // The operator signs on the roster of the project acted on. A key this project
+    // has never seen would sign declarations nobody there could verify.
+    ensure_operator_on_roster(&route, &current).map_err(internal)?;
     // A grant is only worth anything because the master signed it, so a grant this
     // person cannot sign must be refused here rather than written unsigned.
     let roster =
-        ferryman_channel::read_agent_roster(&state.route.communications).map_err(internal)?;
+        ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
     let Some(person) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1341,7 +1383,7 @@ async fn set_access(
         ));
     };
     let grant = ferryman_channel::master::grant_member(
-        &state.route,
+        &route,
         &current,
         &person.name,
         &public_key,
@@ -1352,7 +1394,7 @@ async fn set_access(
     // grant_member refuses anyone who is not the master, and says so in words.
     .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
     ferryman_channel::ledger::append_ledger_entry(
-        &state.route,
+        &route,
         &current,
         "grant",
         current.name(),
@@ -1521,11 +1563,13 @@ struct PlanBody {
 
 async fn cost_plan(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     Json(body): Json<PlanBody>,
 ) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     let (tasks, prompt_tokens, completion_tokens) =
         ferryman_channel::cost::estimate_project_tokens(&body.prompt, body.tasks);
-    let route = state.route.as_ref();
+    let route = route.as_ref();
     let rates = ferryman_channel::cost::Rates::load(route);
     let costs = ferryman_channel::cost::published_rates()
         .iter()
@@ -1652,9 +1696,11 @@ struct Suggestion {
 
 async fn suggest(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     headers: HeaderMap,
     Json(body): Json<Suggestion>,
 ) -> Result<StatusCode, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
@@ -1691,7 +1737,7 @@ async fn suggest(
         author,
         text
     );
-    let dir = state.route.communications.join("memory-bank");
+    let dir = route.communications.join("memory-bank");
     std::fs::create_dir_all(&dir).map_err(|e| internal(e.into()))?;
     let path = dir.join("suggestions.md");
     let mut file = std::fs::OpenOptions::new()
@@ -1739,9 +1785,11 @@ struct SecretBody {
 
 async fn secret_set(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     headers: HeaderMap,
     Json(body): Json<SecretBody>,
 ) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
@@ -1757,7 +1805,7 @@ async fn secret_set(
         .map(|r| ferryman_channel::canonical_agent_name(r))
         .collect();
     let path = ferryman_channel::secrets::set_secret(
-        &state.route,
+        &route,
         &identity,
         &body.name,
         &body.value,
@@ -1775,9 +1823,11 @@ async fn secret_set(
 /// DELETE /api/secrets/{name} — remove a secret envelope.
 async fn secret_remove(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Result<StatusCode, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
@@ -1788,7 +1838,7 @@ async fn secret_remove(
             "no active session; sign in again".to_string(),
         ));
     }
-    if ferryman_channel::secrets::remove_secret(&state.route, &name).map_err(internal)? {
+    if ferryman_channel::secrets::remove_secret(&route, &name).map_err(internal)? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err((StatusCode::NOT_FOUND, "no such secret".to_string()))
@@ -1823,8 +1873,12 @@ fn result_text(payload: &Value) -> Option<String> {
 /// GET /api/fleet — every machine on the network, every syncing device, and
 /// every project this machine has a channel for. The whole fleet in one view,
 /// not just the current project.
-async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
-    let machines = ferryman_channel::licensing::read_devices(&state.route)
+async fn fleet(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let machines = ferryman_channel::licensing::read_devices(&route)
         .map_err(internal)?
         .iter()
         .map(|device| {
@@ -1847,7 +1901,7 @@ async fn fleet(State(state): State<DashboardState>) -> Result<Json<Value>, Dashb
         .iter()
         .map(|peer| json!({ "device_id": peer.device_id, "name": peer.name, "connected": peer.connected }))
         .collect::<Vec<_>>();
-    let projects = discover_projects(&state.route).map_err(internal)?;
+    let projects = discover_projects(&route).map_err(internal)?;
     Ok(Json(json!({
         "machines": machines,
         "devices": devices,
@@ -1985,8 +2039,12 @@ fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
 }
 
 /// GET /api/release — the release waiting for a person, if there is one.
-async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
-    let Some(request) = ferryman_channel::release::pending(&state.route) else {
+async fn release(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let Some(request) = ferryman_channel::release::pending(&route) else {
         return Ok(Json(json!({ "pending": null })));
     };
     // Matched on version AND commit, because that is what an approval means.
@@ -1997,22 +2055,22 @@ async fn release(State(state): State<DashboardState>) -> Result<Json<Value>, Das
     // correctly refusing. The gate and the page disagreed, and the half that disagreed was
     // the half with the controls on it. The operator could not approve the release and
     // could not see why.
-    let approved = ferryman_channel::release::list_approvals(&state.route)
+    let approved = ferryman_channel::release::list_approvals(&route)
         .into_iter()
         .find(|a| a.version == request.version && a.commit == request.commit);
     // An approval of this version at an older commit is worth showing - it is why the
     // commit pin exists and it explains the state - but it is not consent to this one.
-    let superseded = ferryman_channel::release::list_approvals(&state.route)
+    let superseded = ferryman_channel::release::list_approvals(&route)
         .into_iter()
         .find(|a| a.version == request.version && a.commit != request.commit);
-    let denied = ferryman_channel::release::list_denials(&state.route)
+    let denied = ferryman_channel::release::list_denials(&route)
         .into_iter()
         .find(|d| d.version == request.version);
-    let roster = roster_now(&state);
+    let roster = roster_now(&route);
     let now = chrono::Utc::now();
     // Asked at the commit the request itself names, which is what a person on this page
     // is being asked about.
-    let verdict = ferryman_channel::release::may_sign(&state.route, &request, &request.commit);
+    let verdict = ferryman_channel::release::may_sign(&route, &request, &request.commit);
     Ok(Json(json!({
         "pending": {
             "version": request.version,
@@ -2081,10 +2139,12 @@ struct ApproveBody {
 /// the property the old "type a passphrase at the machine" arrangement had.
 async fn approve_release(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     headers: HeaderMap,
     Path(version): Path<String>,
     Json(body): Json<ApproveBody>,
 ) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
@@ -2093,7 +2153,7 @@ async fn approve_release(
         "no active session; sign in again".to_string(),
     ))?;
 
-    let request = ferryman_channel::release::pending(&state.route).ok_or((
+    let request = ferryman_channel::release::pending(&route).ok_or((
         StatusCode::CONFLICT,
         "there is no release waiting to be approved".to_string(),
     ))?;
@@ -2145,7 +2205,7 @@ async fn approve_release(
         signed_by: None,
         signature: None,
     };
-    let path = ferryman_channel::release::write_approval(&state.route, &approval, &identity)
+    let path = ferryman_channel::release::write_approval(&route, &approval, &identity)
         .map_err(internal)?;
     Ok(Json(json!({
         "version": approval.version,
@@ -2176,10 +2236,12 @@ struct DenyBody {
 /// folder, and `may_sign` ignores one for that reason.
 async fn deny_release(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     headers: HeaderMap,
     Path(version): Path<String>,
     Json(body): Json<DenyBody>,
 ) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
@@ -2187,7 +2249,7 @@ async fn deny_release(
         StatusCode::UNAUTHORIZED,
         "no active session; sign in again".to_string(),
     ))?;
-    let request = ferryman_channel::release::pending(&state.route).ok_or((
+    let request = ferryman_channel::release::pending(&route).ok_or((
         StatusCode::CONFLICT,
         "there is no release waiting to be decided".to_string(),
     ))?;
@@ -2226,7 +2288,7 @@ async fn deny_release(
         signed_by: None,
         signature: None,
     };
-    let path = ferryman_channel::release::write_denial(&state.route, &denial, &identity)
+    let path = ferryman_channel::release::write_denial(&route, &denial, &identity)
         .map_err(internal)?;
     Ok(Json(json!({
         "version": denial.version,
@@ -2239,8 +2301,8 @@ async fn deny_release(
 
 /// Where the conversations live: the memory bank, which Syncthing carries - so what is
 /// said here is said in the channel, not in the dashboard.
-fn conversation_bank(state: &DashboardState) -> std::path::PathBuf {
-    state.route.communications.join("memory-bank")
+fn conversation_bank(route: &ProjectRoute) -> std::path::PathBuf {
+    route.communications.join("memory-bank")
 }
 
 /// One line of a conversation file, parsed back out of the shape `append_turn` writes.
@@ -2261,10 +2323,14 @@ fn parse_turn(line: &str) -> Value {
 }
 
 /// GET /api/conversations - every topic, with its last line and whether it verifies.
-async fn conversations(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
-    let bank = conversation_bank(&state);
+async fn conversations(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let bank = conversation_bank(&route);
     let dir = ferryman_channel::conversation::conversations_dir(&bank);
-    let roster = roster_now(&state);
+    let roster = roster_now(&route);
     let mut topics = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
@@ -2302,11 +2368,13 @@ async fn conversations(State(state): State<DashboardState>) -> Result<Json<Value
 /// GET /api/conversations/{topic} - the thread.
 async fn conversation(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     Path(topic): Path<String>,
 ) -> Result<Json<Value>, DashboardError> {
-    let bank = conversation_bank(&state);
+    let route = state.route_for(params.project.as_deref());
+    let bank = conversation_bank(&route);
     let check =
-        ferryman_channel::conversation::verify_conversation(&bank, &topic, &roster_now(&state));
+        ferryman_channel::conversation::verify_conversation(&bank, &topic, &roster_now(&route));
     let text = ferryman_channel::conversation::load_conversation(&bank, &topic).unwrap_or_default();
     let turns: Vec<Value> = text
         .lines()
@@ -2359,7 +2427,7 @@ async fn say(
             "that is too long for one turn; say it in a few".to_string(),
         ));
     }
-    let bank = conversation_bank(&state);
+    let bank = conversation_bank(&state.route);
     ferryman_channel::conversation::append_turn(&bank, &topic, identity.name(), said, &identity)
         .map_err(|e| internal(e.into()))?;
     Ok(Json(json!({ "topic": topic, "who": identity.name() })))
@@ -2368,9 +2436,13 @@ async fn say(
 /// GET /api/memory — the project's shared memory bank, plus the knowledge graph
 /// if graphify has exported one. Best-effort: an unreadable file is skipped, and
 /// a missing graph simply returns `graph: null`.
-async fn memory(State(state): State<DashboardState>) -> Result<Json<Value>, DashboardError> {
+async fn memory(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     let mut files = Vec::new();
-    let memory_dir = state.route.communications.join("memory-bank");
+    let memory_dir = route.communications.join("memory-bank");
     if memory_dir.is_dir() {
         for entry in std::fs::read_dir(&memory_dir).map_err(|e| internal(e.into()))? {
             let entry = entry.map_err(|e| internal(e.into()))?;
@@ -2463,10 +2535,12 @@ struct ReviewBody {
 /// verdict is attributable to the human who signed in.
 async fn review_task(
     State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(body): Json<ReviewBody>,
 ) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
@@ -2475,7 +2549,7 @@ async fn review_task(
         "no active session; sign in again".to_string(),
     ))?;
 
-    let task = ferryman_channel::read_task(&state.route, &id).map_err(internal)?;
+    let task = ferryman_channel::read_task(&route, &id).map_err(internal)?;
     let revision = task.latest_revision().ok_or((
         StatusCode::CONFLICT,
         "there is no result to review yet".to_string(),
@@ -2504,7 +2578,7 @@ async fn review_task(
         signature: None,
     };
     identity.sign_review(&mut verdict);
-    let path = ferryman_channel::submit_review(&state.route, &verdict)
+    let path = ferryman_channel::submit_review(&route, &verdict)
         .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(json!({
         "order_id": id,

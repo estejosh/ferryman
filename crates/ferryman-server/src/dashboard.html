@@ -446,7 +446,11 @@ async function api(path, opts) {
   // channel this dashboard was launched in, and quietly retargeting a write at whichever
   // project a dropdown happened to be showing is not something to add by accident.
   const method = (opts.method || "GET").toUpperCase();
-  if (method === "GET" && state.project && state.project !== state.homeProject) {
+  // Every request follows the picker, reads and writes alike: the picker in the top bar
+  // IS the active project, and a dashboard where the tasks you see and the task you
+  // approve belong to different channels is the accident, not the other way round.
+  // The active project's name is always on screen, in the bar, next to what you click.
+  if (state.project && state.project !== state.homeProject) {
     path += `${path.includes("?") ? "&" : "?"}project=${encodeURIComponent(state.project)}`;
   }
   const res = await fetch(path, { credentials: "same-origin", ...opts, headers });
@@ -969,11 +973,11 @@ pages.teammates = async () => {
     ${!d.master ? `
     <div class="notice">
       <div>
-        <b>This project has no master.</b> Grants, invitations and the vault all hang off
+        <b>${esc(state.project || state.homeProject || "This project")} has no master.</b> Grants, invitations and the vault all hang off
         the master&rsquo;s signature, so until someone is, nothing here can be signed. The
         master is a person, not a machine.
         <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <button class="btn primary" id="tm-become-master">I am the master of this project</button>
+          <button class="btn primary" id="tm-become-master">I am the master of ${esc(state.project || state.homeProject || "this project")}</button>
           <span class="s" id="tm-master-msg" style="color:var(--dim)"></span>
         </div>
       </div>
@@ -1702,6 +1706,7 @@ $("#project").addEventListener("change", async (ev) => {
   // Everything on screen belongs to the old project, so refetch rather than re-render.
   state.tasks = [];
   state.roster = [];
+  state.team = null;
   chatTopic = null;
   await refresh();
 });
