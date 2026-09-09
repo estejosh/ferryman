@@ -1002,7 +1002,7 @@ pages.teammates = async () => {
         </div>
         <div class="s" id="tm-msg" style="color:var(--dim)"></div>
         <div id="tm-code" hidden style="display:flex;flex-direction:column;gap:10px">
-          <div class="k">Send them this</div>
+          <div class="k">Send them this - they paste it into their Claude</div>
           <pre class="out" id="tm-code-text" style="max-height:none;white-space:pre-wrap"></pre>
           <div style="display:flex;gap:8px"><button class="btn small" id="tm-copy">Copy</button><span class="s" id="tm-copied" style="color:var(--dim)"></span></div>
         </div>
@@ -1102,18 +1102,34 @@ function wireTeammates() {
         }),
       });
       const who = r.name;
+      const project = state.project || state.homeProject || r.project || "the project";
       const text = [
-        `Hi ${who}, three steps to join ${state.project || state.homeProject}:`,
+        `Hi ${who} - to join ${project}, paste everything below this line into Claude (desktop or Claude Code) on the computer you will work from, and it does the setup for you. It will hand you a browser tab at the end; that is where you pick your password.`,
         ``,
-        `1. Open PowerShell (Windows) or Terminal (Mac) and paste this one line:`,
-        `   Windows:  ${r.windows}`,
-        `   Mac:      ${r.unix}`,
-        `2. It asks for your email and a password. Pick a password; it is yours alone.`,
-        `3. Write down the 24 words it shows you once. That is your recovery.`,
+        `----------------------------------------------------------------`,
+        `Set this computer up on Ferryman and join the project "${project}" with the invite code below. Do it all yourself; only stop when a step says to hand me a browser. Never ask me for a password and never create one: my identity is made in the browser, by me.`,
         ``,
-        `Done. The project appears on your machine within a minute of me being online,`,
-        `and your agent${r.agent ? ` (${r.agent})` : ""} picks up what it needs by itself.`,
-        `The code expires ${(r.expires_at || "").slice(0, 10)}.`,
+        `Invite code: ${r.code}`,
+        `My email for the licence seat count (nothing else): <MY EMAIL>`,
+        ``,
+        `1. Install Ferryman. Use a real Windows PowerShell for the Windows line (not a Linux shell):`,
+        `     Windows:  irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.ps1 | iex`,
+        `     macOS / Linux:  curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/install.sh | sh`,
+        `   Confirm with: ferry --version   (it must be 0.5.8 or newer; if older, run "ferry update").`,
+        `   On Windows the binary is %LOCALAPPDATA%\\Ferryman\\bin\\ferry.exe if it is not on PATH yet.`,
+        ``,
+        `2. Accept the invite. This starts Syncthing (installing it if missing), pairs with the inviter, creates the project folder, and registers this machine:`,
+        `     ferry team invite accept <THE CODE ABOVE> --email <MY EMAIL>`,
+        `   It prints where the project folder is. If it fails, read the message - every failure says what to do - fix it and run the same line again; it is safe to repeat.`,
+        ``,
+        `3. Open the dashboard from that project folder:`,
+        `     ferry dashboard`,
+        `   It prints a one-time setup token and opens a browser tab. Tell me the token and hand me the tab. I will create my identity there: name exactly "${who}", a password I choose, and I will write down the 24 words it shows once.`,
+        ``,
+        `4. Then tell me: "You are in. The project appears as soon as ${state.me || "the inviter"} is online; your agent ${r.agent ? `(${r.agent}) ` : ""}picks up its keys by itself. Come back to the dashboard any time with: ferry dashboard".`,
+        ``,
+        `Rules: never run gh auth switch; never put a token, key or password in a command line or a file; never paste my password anywhere. The code expires ${(r.expires_at || "").slice(0, 10)}.`,
+        `----------------------------------------------------------------`,
       ].join("\n");
       $("#tm-code-text").textContent = text;
       $("#tm-code").hidden = false;
