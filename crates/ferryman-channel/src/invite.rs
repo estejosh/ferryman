@@ -44,8 +44,10 @@ pub struct Invite {
     pub folder: String,
     /// The inviter's Syncthing device id.
     pub device_id: String,
-    /// Reserved operator (human) name.
-    pub operator: String,
+    /// Reserved operator (human) name. Absent on a generic invite: the person picks any
+    /// free name when they create their identity, and the acceptance carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
     /// Reserved agent name, when the invite includes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -77,7 +79,8 @@ pub struct InviteCode {
     pub project: String,
     pub folder: String,
     pub device: String,
-    pub operator: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     pub expires: i64,
@@ -126,7 +129,7 @@ fn invite_payload(invite: &Invite) -> String {
         invite.project_id,
         invite.folder,
         invite.device_id,
-        invite.operator,
+        invite.operator.as_deref().unwrap_or(""),
         invite.agent.as_deref().unwrap_or(""),
         invite.roles.join(","),
         invite.expires_at.to_rfc3339(),
@@ -163,7 +166,7 @@ fn random_hex(bytes: usize) -> String {
 pub fn create(
     route: &ProjectRoute,
     master: &AgentIdentity,
-    operator: &str,
+    operator: Option<&str>,
     agent: Option<&str>,
     roles: Vec<String>,
     ttl: Duration,
@@ -179,7 +182,9 @@ pub fn create(
             master.name()
         );
     }
-    if !is_safe_component(operator) {
+    if let Some(operator) = operator
+        && !is_safe_component(operator)
+    {
         bail!("the operator name must be a plain identifier");
     }
     if let Some(agent) = agent
@@ -188,14 +193,16 @@ pub fn create(
         bail!("the agent name must be a plain identifier");
     }
     let roster = crate::read_agent_roster(&route.communications)?;
-    for name in std::iter::once(operator).chain(agent) {
+    for name in operator.into_iter().chain(agent) {
         if let Some(existing) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(name))
             && existing.public_key.is_some()
         {
             bail!("{name} is already in this channel and has published a key");
         }
     }
-    crate::register_expected_agent(route, operator, "operator", &["messages.receive".into()])?;
+    if let Some(operator) = operator {
+        crate::register_expected_agent(route, operator, "operator", &["messages.receive".into()])?;
+    }
     if let Some(agent) = agent {
         crate::register_expected_agent(route, agent, "worker", &["messages.receive".into()])?;
     }
@@ -208,7 +215,7 @@ pub fn create(
         project_id: route.project_id.clone(),
         folder: crate::channel_folder_id(route),
         device_id: inviter_device_id.to_string(),
-        operator: operator.to_string(),
+        operator: operator.map(str::to_string),
         agent: agent.map(str::to_string),
         roles,
         created_at: now,
@@ -231,7 +238,7 @@ pub fn create(
         project: route.project_id.clone(),
         folder: invite.folder.clone(),
         device: inviter_device_id.to_string(),
-        operator: operator.to_string(),
+        operator: operator.map(str::to_string),
         agent: agent.map(str::to_string),
         expires: invite.expires_at.timestamp(),
         nonce,
@@ -289,29 +296,109 @@ pub fn is_open(invite: &Invite, now: DateTime<Utc>) -> bool {
 /// new operator key. Syncs to the inviter once the folder does.
 pub fn write_acceptance(
     route: &ProjectRoute,
-    operator: &AgentIdentity,
+    signer: &AgentIdentity,
     code: &InviteCode,
     device_id: &str,
+    operator: &str,
+    agent: Option<&str>,
 ) -> Result<PathBuf> {
     let mut accept = Acceptance {
         invite_id: code.id.clone(),
         nonce: code.nonce.clone(),
         device_id: device_id.to_string(),
-        operator: code.operator.clone(),
-        agent: code.agent.clone(),
+        operator: operator.to_string(),
+        agent: agent.map(str::to_string),
         accepted_at: Utc::now(),
         signed_by: None,
         signature: None,
     };
-    let signature = operator
-        .signing
-        .sign(acceptance_payload(&accept).as_bytes());
-    accept.signed_by = Some(operator.name().to_string());
+    let signature = signer.signing.sign(acceptance_payload(&accept).as_bytes());
+    accept.signed_by = Some(signer.name().to_string());
     accept.signature = Some(hex::encode(signature.to_bytes()));
     fs::create_dir_all(invites_dir(route))?;
     let path = acceptance_path(route, &code.id);
     crate::atomic_json(&path, &accept)?;
     Ok(path)
+}
+
+/// Where a joiner keeps the code between `accept` and the moment they create their
+/// identity in the browser. Private to the machine: the attachment, never the channel.
+pub fn pending_code_path(route: &ProjectRoute) -> PathBuf {
+    route.attachment.join("invite-pending.json")
+}
+
+pub fn save_pending_code(route: &ProjectRoute, code: &InviteCode) -> Result<()> {
+    crate::atomic_json(&pending_code_path(route), code)
+}
+
+pub fn read_pending_code(route: &ProjectRoute) -> Option<InviteCode> {
+    serde_json::from_str(&fs::read_to_string(pending_code_path(route)).ok()?).ok()
+}
+
+/// Why a name cannot be claimed on this project right now, in words for the person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NameCheck {
+    /// Nobody has it: claim away.
+    Free,
+    /// Someone with a published key holds it.
+    Taken,
+    /// Reserved by an invitation for someone else.
+    Reserved,
+    /// The channel has not synced yet, so nothing can be said either way.
+    NotSyncedYet,
+}
+
+/// Whether `name` can be claimed on this project, judged from the synced roster.
+///
+/// Before the folder has arrived the roster is this machine's own entries only, and
+/// "free" would be a lie; that state is reported as such rather than guessed at.
+pub fn check_name(route: &ProjectRoute, name: &str) -> Result<NameCheck> {
+    if !is_safe_component(name) {
+        bail!("a name is letters, digits, dashes and underscores");
+    }
+    if crate::master::read_master(route)?.is_none() {
+        return Ok(NameCheck::NotSyncedYet);
+    }
+    let roster = crate::read_agent_roster(&route.communications)?;
+    let Some(existing) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(name)) else {
+        return Ok(NameCheck::Free);
+    };
+    if existing.public_key.as_ref().is_some_and(|k| !k.is_empty()) {
+        return Ok(NameCheck::Taken);
+    }
+    // Reserved without a key: ours if our own invite reserved it.
+    let ours = read_pending_code(route)
+        .and_then(|c| c.operator)
+        .is_some_and(|o| o.eq_ignore_ascii_case(name));
+    Ok(if ours {
+        NameCheck::Free
+    } else {
+        NameCheck::Reserved
+    })
+}
+
+/// Pin a free name to this machine's pending invitation, so the browser offers it and
+/// the acceptance carries it. Refuses a name that is not free.
+pub fn claim_name(route: &ProjectRoute, name: &str) -> Result<NameCheck> {
+    let check = check_name(route, name)?;
+    if check != NameCheck::Free {
+        return Ok(check);
+    }
+    let Some(mut code) = read_pending_code(route) else {
+        bail!(
+            "no invitation is waiting on this machine; run 'ferry team invite accept <code>' first"
+        );
+    };
+    code.operator = Some(name.to_string());
+    save_pending_code(route, &code)?;
+    Ok(NameCheck::Free)
+}
+
+pub fn take_pending_code(route: &ProjectRoute) -> Option<InviteCode> {
+    let path = pending_code_path(route);
+    let code = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+    let _ = fs::remove_file(&path);
+    Some(code)
 }
 
 pub fn read_acceptance(route: &ProjectRoute, id: &str) -> Result<Option<Acceptance>> {
@@ -327,8 +414,9 @@ pub fn read_acceptance(route: &ProjectRoute, id: &str) -> Result<Option<Acceptan
 pub struct Settled {
     /// Devices trusted and given the folder, as (invite id, device id).
     pub paired: Vec<(String, String)>,
-    /// Invites whose acceptance and keys have arrived and now need the master's grant.
-    pub ready_to_grant: Vec<Invite>,
+    /// Invites whose acceptance and keys have arrived and now need the master's grant,
+    /// with the acceptance that names who actually joined.
+    pub ready_to_grant: Vec<(Invite, Acceptance)>,
 }
 
 /// The inviter's side, without the master key: trust any knocking device whose announced
@@ -350,22 +438,36 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
         return Ok(settled);
     }
 
-    // Knocking devices first: this is the step nothing else can do.
+    // Knocking devices first: this is the step nothing else can do. One invite pairs
+    // ONE device - the most recent knock under its name - because a person whose first
+    // attempt died and who ran the code again has two devices announcing the same
+    // handshake, and only the newer one is theirs now. The first test paired both.
     if let Ok(pending) = crate::syncthing_pending_devices() {
-        for device in pending {
-            let Some(invite) = invites
+        let mut paired_this_pass: Vec<String> = Vec::new();
+        for invite in &invites {
+            if invite.accepted_device.is_some() {
+                continue;
+            }
+            let name = handshake_name(&invite.id);
+            let Some(device) = pending
                 .iter()
-                .find(|i| device.name == handshake_name(&i.id) && i.accepted_device.is_none())
+                .filter(|d| d.name == name)
+                .max_by_key(|d| d.time.clone())
             else {
                 continue;
             };
-            crate::syncthing_add_device(&device.device_id, &invite.operator)
-                .with_context(|| format!("trust {}'s device", invite.operator))?;
+            let label = invite
+                .operator
+                .clone()
+                .unwrap_or_else(|| format!("invite-{}", invite.id));
+            crate::syncthing_add_device(&device.device_id, &label)
+                .with_context(|| format!("trust {label}'s device"))?;
             crate::syncthing_share_folder(route, std::slice::from_ref(&device.device_id))
-                .with_context(|| format!("share the folder with {}", invite.operator))?;
+                .with_context(|| format!("share the folder with {label}"))?;
             let mut updated = invite.clone();
             updated.accepted_device = Some(device.device_id.clone());
             write(route, &updated)?;
+            paired_this_pass.push(invite.id.clone());
             settled
                 .paired
                 .push((invite.id.clone(), device.device_id.clone()));
@@ -384,15 +486,21 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
         if hash_nonce(&accept.nonce) != invite.nonce_hash {
             continue;
         }
+        // A named invite is for that name and no other.
+        if let Some(reserved) = &invite.operator
+            && !reserved.eq_ignore_ascii_case(&accept.operator)
+        {
+            continue;
+        }
         let has_key = |name: &str| {
             roster
                 .iter()
                 .any(|a| a.name.eq_ignore_ascii_case(name) && a.public_key.is_some())
         };
-        if !has_key(&invite.operator) {
+        if !has_key(&accept.operator) {
             continue;
         }
-        if let Some(agent) = &invite.agent
+        if let Some(agent) = &accept.agent
             && !has_key(agent)
         {
             continue;
@@ -406,7 +514,7 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
         {
             continue;
         }
-        settled.ready_to_grant.push(invite);
+        settled.ready_to_grant.push((invite, accept));
     }
     Ok(settled)
 }
@@ -444,7 +552,13 @@ pub fn finish_handshake(route: &ProjectRoute) -> Result<Option<String>> {
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "machine".into())
             .to_lowercase();
-        let name = format!("{}-{host}", invite.operator);
+        let who = read_acceptance(route, &invite.id)
+            .ok()
+            .flatten()
+            .map(|a| a.operator)
+            .or_else(|| invite.operator.clone())
+            .unwrap_or_else(|| "member".to_string());
+        let name = format!("{who}-{host}");
         crate::syncthing_set_my_name(&name)?;
         return Ok(Some(name));
     }
@@ -455,7 +569,15 @@ pub fn finish_handshake(route: &ProjectRoute) -> Result<Option<String>> {
 pub fn burn_for(route: &ProjectRoute, operator: &str) -> Result<usize> {
     let mut burned = 0;
     for (mut invite, _) in list(route)? {
-        if invite.operator.eq_ignore_ascii_case(operator) && invite.granted_at.is_none() {
+        let named = invite
+            .operator
+            .as_deref()
+            .is_some_and(|o| o.eq_ignore_ascii_case(operator));
+        let accepted_as = read_acceptance(route, &invite.id)
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.operator.eq_ignore_ascii_case(operator));
+        if (named || accepted_as) && invite.granted_at.is_none() {
             invite.expires_at = Utc::now();
             write(route, &invite)?;
             burned += 1;
@@ -554,7 +676,7 @@ mod tests {
             project: "redaktly".into(),
             folder: "redaktly-ferryman".into(),
             device: "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH".into(),
-            operator: "david".into(),
+            operator: Some("david".into()),
             agent: Some("david-agent".into()),
             expires: Utc::now().timestamp() + 3600,
             nonce: "00112233445566778899aabbccddeeff".into(),
@@ -573,7 +695,7 @@ mod tests {
             project: "p".into(),
             folder: "p-ferryman".into(),
             device: "D".into(),
-            operator: "o".into(),
+            operator: None,
             agent: None,
             expires: Utc::now().timestamp() - 1,
             nonce: "n".into(),

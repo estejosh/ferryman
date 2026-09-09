@@ -4572,6 +4572,10 @@ pub struct PendingDevice {
     pub device_id: String,
     /// The name the device announced for itself.
     pub name: String,
+    /// When Syncthing last saw it knock, as Syncthing reports it (RFC 3339, so the
+    /// string order is the time order).
+    #[serde(default)]
+    pub time: String,
 }
 
 /// Devices knocking on this Syncthing that nobody has accepted.
@@ -4590,6 +4594,11 @@ pub fn syncthing_pending_devices() -> Result<Vec<PendingDevice>> {
                 device_id: id.clone(),
                 name: info
                     .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                time: info
+                    .get("time")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string(),

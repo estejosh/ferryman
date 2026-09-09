@@ -1306,6 +1306,15 @@ enum TeamCommand {
         #[command(subcommand)]
         action: InviteAction,
     },
+    /// On a machine that accepted an invitation: check a name against the project's
+    /// roster and, if it is free, pin it so the browser offers it. Says "taken" or
+    /// "not synced yet" plainly; exits non-zero for anything but free.
+    Claim {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The name you want on the project.
+        name: String,
+    },
     /// End a person's access: a master-signed revocation, the folder unshared from
     /// their device, their open invitations burned. Master only.
     Revoke {
@@ -1335,9 +1344,10 @@ enum InviteAction {
     Create {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// The person's name on the roster, e.g. david.
+        /// Reserve this name for them, e.g. david. Omit for a generic invite: they pick
+        /// any free name when they create their identity.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         /// Their agent's name, e.g. david-agent. Omit for a person with no agent.
         #[arg(long)]
         agent: Option<String>,
@@ -3738,13 +3748,20 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             let (invite, code) = invite::create(
                 &route,
                 &identity,
-                &name,
+                name.as_deref(),
                 agent.as_deref(),
                 roles,
                 chrono::Duration::days(expires_days.max(1)),
                 &device,
             )?;
-            println!("invited {} to {}", invite.operator, route.project_id);
+            println!(
+                "invited {} to {}",
+                invite
+                    .operator
+                    .as_deref()
+                    .unwrap_or("someone (they pick their name)"),
+                route.project_id
+            );
             if let Some(agent) = &invite.agent {
                 println!("  with agent {agent}");
             }
@@ -3788,13 +3805,109 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 } else {
                     "waiting for them"
                 };
+                let who = invite::read_acceptance(&route, &invite.id)
+                    .ok()
+                    .flatten()
+                    .map(|a| a.operator)
+                    .or_else(|| invite.operator.clone())
+                    .unwrap_or_else(|| "(anyone)".to_string());
                 println!(
                     "{}  {:<14} {:<30} {}  [{check:?}]",
                     invite.id,
-                    invite.operator,
+                    who,
                     state,
                     invite.agent.as_deref().unwrap_or("-")
                 );
+            }
+        }
+        TeamCommand::Claim { workspace, name } => {
+            let route = here(workspace)?;
+            use ferryman_channel::invite::NameCheck;
+            match invite::claim_name(&route, &name)? {
+                NameCheck::Free => {
+                    // The placeholder agent becomes this person's: <name>-<machine>, a
+                    // fresh key registered under it, agent.toml pointed at it, and the
+                    // placeholder dropped from this copy before it can matter.
+                    if let Some(code) = invite::read_pending_code(&route) {
+                        let host = ferryman_ops::identity::machine_name()
+                            .unwrap_or_else(|_| "machine".into())
+                            .to_lowercase();
+                        let agent_name = format!("{name}-{host}");
+                        let placeholder = format!("guest-{}", code.id);
+                        let identity = ferryman_channel::AgentIdentity::load_or_create(
+                            &agent_name,
+                            &route.attachment,
+                        )?;
+                        ferryman_channel::register_agent_key(
+                            &route,
+                            &ferryman_channel::AgentRoute {
+                                name: agent_name.clone(),
+                                role: "worker".into(),
+                                capabilities: vec!["messages.receive".into()],
+                                public_key: None,
+                                encryption_key: None,
+                            },
+                            &identity,
+                        )?;
+                        let toml_path = route.attachment.join("agent.toml");
+                        if let Ok(text) = std::fs::read_to_string(&toml_path) {
+                            let rewritten: Vec<String> = text
+                                .lines()
+                                .map(|l| {
+                                    if l.trim_start().starts_with("agent =") {
+                                        format!("agent = \"{agent_name}\"")
+                                    } else {
+                                        l.to_string()
+                                    }
+                                })
+                                .collect();
+                            std::fs::write(&toml_path, rewritten.join("\n") + "\n")?;
+                        }
+                        let _ = std::fs::remove_file(
+                            route
+                                .communications
+                                .join("agents")
+                                .join(format!("{placeholder}.json")),
+                        );
+                        let _ = std::fs::remove_file(
+                            route
+                                .attachment
+                                .join("keys")
+                                .join(format!("{placeholder}.key")),
+                        );
+                        let mut code = code;
+                        code.agent = Some(agent_name.clone());
+                        invite::save_pending_code(&route, &code)?;
+                        println!(
+                            "free: {name} is yours on {}; your agent here is {agent_name}.",
+                            route.project_id
+                        );
+                    } else {
+                        println!("free: {name} is yours on {}.", route.project_id);
+                    }
+                    println!("It is filled in when you open the dashboard.");
+                }
+                NameCheck::Taken => {
+                    println!(
+                        "taken: someone on {} already holds {name}. Pick another.",
+                        route.project_id
+                    );
+                    std::process::exit(2);
+                }
+                NameCheck::Reserved => {
+                    println!(
+                        "reserved: {name} is held for someone else on {}. Pick another.",
+                        route.project_id
+                    );
+                    std::process::exit(2);
+                }
+                NameCheck::NotSyncedYet => {
+                    println!(
+                        "not yet: the project has not arrived on this machine, so no name can be checked. \
+                         The inviter's Ferryman has to be open to let this device in; try again in a minute."
+                    );
+                    std::process::exit(3);
+                }
             }
         }
         TeamCommand::Revoke {
@@ -3812,7 +3925,15 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             ferryman_channel::master::revoke_member(&route, &identity, &name, &reason)?;
             let devices: Vec<String> = invite::list(&route)?
                 .into_iter()
-                .filter(|(i, _)| i.operator.eq_ignore_ascii_case(&name))
+                .filter(|(i, _)| {
+                    i.operator
+                        .as_deref()
+                        .is_some_and(|o| o.eq_ignore_ascii_case(&name))
+                        || invite::read_acceptance(&route, &i.id)
+                            .ok()
+                            .flatten()
+                            .is_some_and(|a| a.operator.eq_ignore_ascii_case(&name))
+                })
                 .filter_map(|(i, _)| i.accepted_device)
                 .collect();
             if !devices.is_empty() {
@@ -3830,10 +3951,10 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             for (id, device) in &settled.paired {
                 println!("paired {device} for invite {id} and shared the folder");
             }
-            for invite in &settled.ready_to_grant {
+            for (_, accept) in &settled.ready_to_grant {
                 println!(
                     "{} has joined; open the dashboard as the master to sign their access",
-                    invite.operator
+                    accept.operator
                 );
             }
             if settled.paired.is_empty() && settled.ready_to_grant.is_empty() {
@@ -3850,7 +3971,13 @@ async fn team_command(command: TeamCommand) -> Result<()> {
 async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>) -> Result<()> {
     use ferryman_channel::invite;
     let code = invite::decode_code(code)?;
-    println!("joining {} as {}", code.project, code.operator);
+    match &code.operator {
+        Some(name) => println!("joining {} as {}", code.project, name),
+        None => println!(
+            "joining {} (you pick your name in the browser)",
+            code.project
+        ),
+    }
 
     // 1. Syncthing, running and ours.
     let health = ferryman_ops::syncthing::start().context("start Syncthing")?;
@@ -3906,29 +4033,50 @@ async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>)
         .arg("--share-with")
         .arg(&code.device)
         .arg("--dashboard")
-        .arg("--dashboard-operator")
-        .arg(&code.operator)
         .arg("--joining");
-    if let Some(agent) = &code.agent {
-        cmd.arg("--agent").arg(agent);
+    if let Some(operator) = &code.operator {
+        cmd.arg("--dashboard-operator").arg(operator);
+    }
+    match &code.agent {
+        Some(agent) => {
+            cmd.arg("--agent").arg(agent);
+        }
+        // No name yet, so no name for the agent either. A placeholder that cannot
+        // collide with anyone: the hostname would - the first test joined as "beastly",
+        // which was the inviter's own agent. `ferry team claim` replaces it.
+        None if code.operator.is_none() => {
+            cmd.arg("--agent").arg(format!("guest-{}", code.id));
+        }
+        None => {}
     }
     let status = cmd.status().context("run ferry enable")?;
     if !status.success() {
         bail!("ferry enable did not finish; fix what it reported and run this again");
     }
 
-    // 5. The acceptance, signed by this machine's agent, into our copy of the channel.
-    //    It reaches the inviter when the folder syncs, which happens once their ferry
-    //    sees our device knocking under the invite's name.
+    // 5. The acceptance. It names who joined, so it is written when that is known: now,
+    //    for a named invite (signed by this machine's agent); otherwise when the person
+    //    creates their identity in the browser and picks a name - the code waits for
+    //    them in the attachment, private to this machine.
     let route = ferryman_channel::route_for(&workspace)?;
-    let agent_name = ferryman_ops::identity::resolve(None, &route.attachment)?;
-    let identity = signing_identity(&route, &agent_name)?;
     let my_device = ferryman_channel::syncthing_my_id()?;
-    invite::write_acceptance(&route, &identity, &code, &my_device)?;
+    match &code.operator {
+        Some(operator) => {
+            let agent_name = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &agent_name)?;
+            invite::write_acceptance(
+                &route,
+                &identity,
+                &code,
+                &my_device,
+                operator,
+                code.agent.as_deref(),
+            )?;
+        }
+        None => invite::save_pending_code(&route, &code)?,
+    }
     // The device keeps the handshake name until the inviter has acted on it: the
     // synced invite record will say so, and `invite::finish_handshake` renames then.
-    // Renaming here, before the inviter looked, is how the first test of this flow
-    // left the inviter staring at a device it did not recognise.
 
     println!();
     println!(
@@ -4121,10 +4269,10 @@ async fn agent_command(command: Agent) -> Result<()> {
                                     route.project_id
                                 ));
                             }
-                            for invite in settled.ready_to_grant {
+                            for (_, accept) in settled.ready_to_grant {
                                 report.info(&format!(
                                     "{}: {} has joined and is waiting for the master's grant (open the dashboard)",
-                                    route.project_id, invite.operator
+                                    route.project_id, accept.operator
                                 ));
                             }
                         }
