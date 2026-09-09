@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## v0.5.8 - 2026-09-09
+
+Beta. Bringing a person onto a channel is one code and one prompt; the doctor tells
+the truth about Syncthing; the master is a person.
+
 From bringing one non-developer onto a channel and finding out what the tool made
 them do by hand. The findings and their order are in `_launch/ONBOARDING_ABC_REVIEW.md`
 (scratch); this is the first batch.
