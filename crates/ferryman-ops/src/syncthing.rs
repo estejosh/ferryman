@@ -116,7 +116,9 @@ fn install_binary() -> Result<PathBuf> {
         .status()
         .with_context(|| format!("run {program}"))?;
     if !status.success() {
-        bail!("{program} did not install Syncthing; install it from https://syncthing.net/downloads/ and run this again");
+        bail!(
+            "{program} did not install Syncthing; install it from https://syncthing.net/downloads/ and run this again"
+        );
     }
     find_binary().context("Syncthing was installed but its binary was not found; open a new terminal and run this again")
 }
@@ -146,8 +148,7 @@ pub fn start() -> Result<SyncthingHealth> {
         None => install_binary()?,
     };
     if !home.join("config.xml").is_file() {
-        std::fs::create_dir_all(&home)
-            .with_context(|| format!("create {}", home.display()))?;
+        std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
         // Syncthing 2.x `generate` takes only --home and the GUI credentials; port
         // probing (its default) picks free GUI and listen ports, which is what lets a
         // second instance coexist with a person's own Syncthing on the same machine.

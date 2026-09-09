@@ -1061,8 +1061,7 @@ async fn team(
         .resolve(session_token(&headers))
         .ok_or((StatusCode::UNAUTHORIZED, "no active session".to_string()))?;
     let mut names = state.operators.names().map_err(internal)?;
-    let roster =
-        ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
+    let roster = ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
     // Operators publish a public roster entry so every machine can verify their
     // signatures. Include those remote humans even when this machine does not hold
     // their sealed signing identity; otherwise the team view would silently collapse
@@ -1136,9 +1135,15 @@ async fn team(
     }
     if let Ok(settled) = ferryman_channel::invite::settle_pending(&route) {
         for (id, device) in settled.paired {
-            settled_notes.push(format!("let in a device for invite {id} ({})", &device[..device.len().min(7)]));
+            settled_notes.push(format!(
+                "let in a device for invite {id} ({})",
+                &device[..device.len().min(7)]
+            ));
         }
-        if master_name.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(current.name())) {
+        if master_name
+            .as_deref()
+            .is_some_and(|m| m.eq_ignore_ascii_case(current.name()))
+        {
             let roster_now =
                 ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
             for invite in settled.ready_to_grant {
@@ -1146,7 +1151,8 @@ async fn team(
                 names.extend(invite.agent.clone());
                 let mut all_ok = true;
                 for who in &names {
-                    let Some(entry) = roster_now.iter().find(|a| a.name.eq_ignore_ascii_case(who)) else {
+                    let Some(entry) = roster_now.iter().find(|a| a.name.eq_ignore_ascii_case(who))
+                    else {
                         all_ok = false;
                         continue;
                     };
@@ -1346,7 +1352,10 @@ async fn invite_teammate(
         current.name(),
         &format!(
             "invited {name}{} to {}; code {} expires {}",
-            agent.as_ref().map(|a| format!(" (agent {a})")).unwrap_or_default(),
+            agent
+                .as_ref()
+                .map(|a| format!(" (agent {a})"))
+                .unwrap_or_default(),
             route.project_id,
             invite.id,
             invite.expires_at.format("%Y-%m-%d")
@@ -1355,8 +1364,7 @@ async fn invite_teammate(
     )
     .map_err(internal)?;
     // A second person on the channel is the moment open grants stop being safe.
-    let grants_flipped =
-        ferryman_channel::set_grants_required(&route.attachment).unwrap_or(false);
+    let grants_flipped = ferryman_channel::set_grants_required(&route.attachment).unwrap_or(false);
     if grants_flipped {
         let _ = ferryman_channel::ledger::append_ledger_entry(
             &route,
@@ -1435,7 +1443,10 @@ async fn revoke_access(
     ))?;
     let route = state.route_for(params.project.as_deref());
     if name.eq_ignore_ascii_case(current.name()) {
-        return Err((StatusCode::CONFLICT, "you cannot revoke yourself; transfer the master role first".to_string()));
+        return Err((
+            StatusCode::CONFLICT,
+            "you cannot revoke yourself; transfer the master role first".to_string(),
+        ));
     }
     let reason = if body.reason.trim().is_empty() {
         "revoked by the master".to_string()
@@ -1464,9 +1475,7 @@ async fn revoke_access(
         revoked.push(who.clone());
     }
     let mut unshared = Vec::new();
-    if !devices.is_empty()
-        && ferryman_channel::syncthing_unshare_folder(&route, &devices).is_ok()
-    {
+    if !devices.is_empty() && ferryman_channel::syncthing_unshare_folder(&route, &devices).is_ok() {
         unshared = devices.clone();
     }
     // Open invitations in their name are burned by expiring them now.
@@ -1474,7 +1483,11 @@ async fn revoke_access(
     let sealed_to: Vec<String> = ferryman_channel::secrets::list_secrets(&route)
         .unwrap_or_default()
         .into_iter()
-        .filter(|s| s.recipients.iter().any(|r| names.iter().any(|n| n.eq_ignore_ascii_case(r))))
+        .filter(|s| {
+            s.recipients
+                .iter()
+                .any(|r| names.iter().any(|n| n.eq_ignore_ascii_case(r)))
+        })
         .map(|s| s.name)
         .collect();
     let _ = ferryman_channel::ledger::append_ledger_entry(
@@ -1486,7 +1499,11 @@ async fn revoke_access(
             "revoked {} on {}: {reason}{}",
             revoked.join(", "),
             route.project_id,
-            if unshared.is_empty() { String::new() } else { format!("; folder unshared from {} device(s)", unshared.len()) }
+            if unshared.is_empty() {
+                String::new()
+            } else {
+                format!("; folder unshared from {} device(s)", unshared.len())
+            }
         ),
         None,
     );
@@ -1530,9 +1547,8 @@ async fn master_init(
             ),
         ));
     }
-    let declaration =
-        ferryman_channel::master::initialize_master(&route, &current, current.name())
-            .map_err(internal)?;
+    let declaration = ferryman_channel::master::initialize_master(&route, &current, current.name())
+        .map_err(internal)?;
     let flipped = ferryman_channel::set_grants_required(&route.attachment).unwrap_or(false);
     let _ = ferryman_channel::ledger::append_ledger_entry(
         &route,
@@ -1543,7 +1559,11 @@ async fn master_init(
             "{} became the master of {}{}",
             declaration.master,
             route.project_id,
-            if flipped { "; grants are now required" } else { "" }
+            if flipped {
+                "; grants are now required"
+            } else {
+                ""
+            }
         ),
         None,
     );
@@ -1588,8 +1608,7 @@ async fn set_access(
     ensure_operator_on_roster(&route, &current).map_err(internal)?;
     // A grant is only worth anything because the master signed it, so a grant this
     // person cannot sign must be refused here rather than written unsigned.
-    let roster =
-        ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
+    let roster = ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
     let Some(person) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) else {
         return Err((
             StatusCode::NOT_FOUND,
@@ -2108,10 +2127,9 @@ async fn fleet(
         .map_err(internal)?
         .iter()
         .map(|device| {
-            let behind = device
-                .ferry_version
-                .as_deref()
-                .is_some_and(|v| ferryman_channel::licensing::version_is_older(v, env!("CARGO_PKG_VERSION")));
+            let behind = device.ferry_version.as_deref().is_some_and(|v| {
+                ferryman_channel::licensing::version_is_older(v, env!("CARGO_PKG_VERSION"))
+            });
             json!({
                 "id": device.id,
                 "kind": device.kind.as_str(),
@@ -2519,8 +2537,8 @@ async fn deny_release(
         signed_by: None,
         signature: None,
     };
-    let path = ferryman_channel::release::write_denial(&route, &denial, &identity)
-        .map_err(internal)?;
+    let path =
+        ferryman_channel::release::write_denial(&route, &denial, &identity).map_err(internal)?;
     Ok(Json(json!({
         "version": denial.version,
         "commit": denial.commit,

@@ -263,7 +263,7 @@ pub fn list(route: &ProjectRoute) -> Result<Vec<(Invite, SignatureCheck)>> {
         );
         out.push((invite, check));
     }
-    out.sort_by(|a, b| b.0.created_at.cmp(&a.0.created_at));
+    out.sort_by_key(|(invite, _)| std::cmp::Reverse(invite.created_at));
     Ok(out)
 }
 
@@ -303,7 +303,9 @@ pub fn write_acceptance(
         signed_by: None,
         signature: None,
     };
-    let signature = operator.signing.sign(acceptance_payload(&accept).as_bytes());
+    let signature = operator
+        .signing
+        .sign(acceptance_payload(&accept).as_bytes());
     accept.signed_by = Some(operator.name().to_string());
     accept.signature = Some(hex::encode(signature.to_bytes()));
     fs::create_dir_all(invites_dir(route))?;
@@ -359,12 +361,14 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
             };
             crate::syncthing_add_device(&device.device_id, &invite.operator)
                 .with_context(|| format!("trust {}'s device", invite.operator))?;
-            crate::syncthing_share_folder(route, &[device.device_id.clone()])
+            crate::syncthing_share_folder(route, std::slice::from_ref(&device.device_id))
                 .with_context(|| format!("share the folder with {}", invite.operator))?;
             let mut updated = invite.clone();
             updated.accepted_device = Some(device.device_id.clone());
             write(route, &updated)?;
-            settled.paired.push((invite.id.clone(), device.device_id.clone()));
+            settled
+                .paired
+                .push((invite.id.clone(), device.device_id.clone()));
         }
     }
 
@@ -426,9 +430,13 @@ pub fn finish_handshake(route: &ProjectRoute) -> Result<Option<String>> {
         let Some(key) = crate::syncthing_api_key() else {
             return Ok(None);
         };
-        let mine = crate::syncthing_get(&crate::syncthing_api_base(), &format!("/rest/config/devices/{me}"), &key)?
-            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
-            .unwrap_or_default();
+        let mine = crate::syncthing_get(
+            &crate::syncthing_api_base(),
+            &format!("/rest/config/devices/{me}"),
+            &key,
+        )?
+        .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(str::to_string))
+        .unwrap_or_default();
         if mine != handshake_name(&invite.id) {
             return Ok(None);
         }
@@ -472,7 +480,11 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         out.push(B64[(n >> 18) as usize & 63] as char);
         out.push(B64[(n >> 12) as usize & 63] as char);

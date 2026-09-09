@@ -22,6 +22,7 @@ pub mod encrypt;
 pub mod events;
 pub mod ferry;
 pub mod interrupt;
+pub mod invite;
 pub mod keys;
 pub mod known;
 pub mod learning;
@@ -29,7 +30,6 @@ pub mod lease;
 pub mod ledger;
 pub mod licensing;
 pub mod marvin;
-pub mod invite;
 pub mod master;
 pub mod memory;
 pub mod migration;
@@ -4203,7 +4203,13 @@ pub fn syncthing_health() -> Result<SyncthingHealth> {
     // The devices endpoint returns an array, and syncthing_get slices out an object, so
     // this asks for the config and reads the devices out of it instead.
     let Some(config) = syncthing_get(&base, "/rest/config", &key)? else {
-        bail!("Syncthing answered at {base} but refused the API key; check {}", config_path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "SYNCTHING_API_KEY".into()));
+        bail!(
+            "Syncthing answered at {base} but refused the API key; check {}",
+            config_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "SYNCTHING_API_KEY".into())
+        );
     };
     let connections = syncthing_get(&base, "/rest/system/connections", &key)?
         .and_then(|v| v.get("connections").cloned())
@@ -4523,7 +4529,11 @@ pub fn syncthing_remove_folder(folder_id: &str) -> Result<()> {
         bail!("Syncthing config not found");
     };
     let base = syncthing_api_base();
-    match syncthing_delete(&base, &format!("/rest/config/folders/{}", urlencode(folder_id)), &key)? {
+    match syncthing_delete(
+        &base,
+        &format!("/rest/config/folders/{}", urlencode(folder_id)),
+        &key,
+    )? {
         Some(code) if (200..300).contains(&code) || code == 404 => Ok(()),
         Some(code) => bail!("Syncthing refused to remove folder {folder_id} (HTTP {code})"),
         None => bail!("could not reach Syncthing's API"),

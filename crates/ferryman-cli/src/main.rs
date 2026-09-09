@@ -2154,7 +2154,8 @@ async fn run(cli: Cli) -> Result<()> {
                     // has just been created on the same machine in the same breath, hand
                     // the role to the person - signed by the agent, so the chain reads
                     // "declared, then disclaimed", never "seized".
-                    if let Ok(Some(declaration)) = ferryman_channel::master::read_master(&outcome.route)
+                    if let Ok(Some(declaration)) =
+                        ferryman_channel::master::read_master(&outcome.route)
                         && declaration.master.eq_ignore_ascii_case(&outcome.agent)
                         && let Ok(Some(agent)) = ferryman_channel::AgentIdentity::load_existing(
                             &outcome.agent,
@@ -2168,7 +2169,10 @@ async fn run(cli: Cli) -> Result<()> {
                         ) {
                             Ok(_) => {
                                 if !as_json {
-                                    println!("  master: {} (the person, not the machine)", identity.name());
+                                    println!(
+                                        "  master: {} (the person, not the machine)",
+                                        identity.name()
+                                    );
                                 }
                             }
                             Err(err) => {
@@ -2294,14 +2298,21 @@ async fn run(cli: Cli) -> Result<()> {
                                 "device   {}  {:<20} {}",
                                 peer.device_id,
                                 peer.name,
-                                if peer.connected { "connected" } else { "not connected" }
+                                if peer.connected {
+                                    "connected"
+                                } else {
+                                    "not connected"
+                                }
                             );
                         }
                     }
                 }
                 Err(err) => {
                     if json {
-                        println!("{}", serde_json::json!({ "ok": false, "error": err.to_string() }));
+                        println!(
+                            "{}",
+                            serde_json::json!({ "ok": false, "error": err.to_string() })
+                        );
                     } else {
                         println!("syncthing  {err}");
                     }
@@ -3737,7 +3748,10 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             if let Some(agent) = &invite.agent {
                 println!("  with agent {agent}");
             }
-            println!("  expires {}", invite.expires_at.format("%Y-%m-%d %H:%M UTC"));
+            println!(
+                "  expires {}",
+                invite.expires_at.format("%Y-%m-%d %H:%M UTC")
+            );
             println!();
             println!("Send them this. It is not a secret, but it is one-use.");
             println!();
@@ -3806,7 +3820,9 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 println!("folder unshared from {} device(s)", devices.len());
             }
             println!("revoked {name} on {}: {reason}", route.project_id);
-            println!("note: what already synced is on their disk; rotate any secret sealed to them");
+            println!(
+                "note: what already synced is on their disk; rotate any secret sealed to them"
+            );
         }
         TeamCommand::Pending { workspace } => {
             let route = here(workspace)?;
@@ -3915,9 +3931,15 @@ async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>)
     // left the inviter staring at a device it did not recognise.
 
     println!();
-    println!("done. {} will appear on this machine as soon as the inviter's Ferryman", code.project);
+    println!(
+        "done. {} will appear on this machine as soon as the inviter's Ferryman",
+        code.project
+    );
     println!("lets your device in - usually within a minute while theirs is running.");
-    println!("Open the dashboard:  ferry dashboard    (in {})", workspace.display());
+    println!(
+        "Open the dashboard:  ferry dashboard    (in {})",
+        workspace.display()
+    );
     Ok(())
 }
 
@@ -3934,7 +3956,9 @@ fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
             "syncthing was not running; started the managed instance at {}",
             health.api_base
         )),
-        Err(err) => report.warn(&format!("syncthing is not running and could not be started: {err}")),
+        Err(err) => report.warn(&format!(
+            "syncthing is not running and could not be started: {err}"
+        )),
     }
 }
 
@@ -4054,7 +4078,10 @@ async fn agent_command(command: Agent) -> Result<()> {
             // page and doctor can say which machine is behind (item 7 of the
             // onboarding findings). Quiet, idempotent, and never a reason to stop.
             for (route, _) in &fleet.served {
-                let _ = ferryman_channel::licensing::refresh_device_version(route, env!("CARGO_PKG_VERSION"));
+                let _ = ferryman_channel::licensing::refresh_device_version(
+                    route,
+                    env!("CARGO_PKG_VERSION"),
+                );
             }
             loop {
                 // Keeping a long-running worker current.
@@ -5493,8 +5520,7 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Resul
 /// a value in single or double quotes, and a trailing `# comment` on an unquoted value.
 /// The last matching line wins, as dotenv loaders do.
 fn read_env_value(file: &Path, key: &str) -> Result<String> {
-    let text = std::fs::read_to_string(file)
-        .with_context(|| format!("read {}", file.display()))?;
+    let text = std::fs::read_to_string(file).with_context(|| format!("read {}", file.display()))?;
     let mut found = None;
     for raw in text.lines() {
         let line = raw.trim();

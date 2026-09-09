@@ -391,12 +391,9 @@ pub fn examine(start: &Path) -> Report {
         ));
     }
     match ferryman_channel::master::read_master(&route) {
-        Ok(Some(declaration)) => checks.push(check(
-            "master",
-            true,
-            false,
-            format!("{}", declaration.master),
-        )),
+        Ok(Some(declaration)) => {
+            checks.push(check("master", true, false, declaration.master.clone()))
+        }
         Ok(None) => checks.push(check(
             "master",
             false,
