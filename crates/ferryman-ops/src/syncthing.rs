@@ -79,6 +79,48 @@ pub fn find_binary() -> Option<PathBuf> {
     None
 }
 
+/// Install Syncthing where a package manager makes that one command, and find it again.
+///
+/// Windows: winget, which is on every supported Windows and needs no elevation for a
+/// per-user install. macOS: Homebrew when present. Linux: too many package managers to
+/// guess at, so it says which page to visit. Never silent: the command it runs is
+/// printed, because a program installing another program should say so.
+fn install_binary() -> Result<PathBuf> {
+    let attempt: Option<(&str, Vec<&str>)> = if cfg!(windows) {
+        Some((
+            "winget",
+            vec![
+                "install",
+                "--id",
+                "Syncthing.Syncthing",
+                "-e",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+            ],
+        ))
+    } else if cfg!(target_os = "macos") && crate::doctor::find_on_path("brew").is_some() {
+        Some(("brew", vec!["install", "syncthing"]))
+    } else {
+        None
+    };
+    let Some((program, args)) = attempt else {
+        bail!(
+            "Syncthing is not installed; get it from https://syncthing.net/downloads/ and \
+             run this again"
+        );
+    };
+    eprintln!("installing Syncthing: {program} {}", args.join(" "));
+    let status = Command::new(program)
+        .args(&args)
+        .status()
+        .with_context(|| format!("run {program}"))?;
+    if !status.success() {
+        bail!("{program} did not install Syncthing; install it from https://syncthing.net/downloads/ and run this again");
+    }
+    find_binary().context("Syncthing was installed but its binary was not found; open a new terminal and run this again")
+}
+
 /// Whether the managed instance is answering right now.
 #[must_use]
 pub fn managed_running() -> bool {
@@ -99,11 +141,9 @@ pub fn start() -> Result<SyncthingHealth> {
     let Some(home) = syncthing_managed_home() else {
         bail!("cannot work out where the managed Syncthing should live on this platform");
     };
-    let Some(binary) = find_binary() else {
-        bail!(
-            "Syncthing is not installed; get it from https://syncthing.net/downloads/ \
-             (winget install Syncthing.Syncthing on Windows) and run this again"
-        );
+    let binary = match find_binary() {
+        Some(binary) => binary,
+        None => install_binary()?,
     };
     if !home.join("config.xml").is_file() {
         std::fs::create_dir_all(&home)

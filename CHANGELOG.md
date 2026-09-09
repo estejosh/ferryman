@@ -31,6 +31,17 @@ them do by hand. The findings and their order are in `_launch/ONBOARDING_ABC_REV
   `ferry channel secret set NAME --from-env [KEY] [--env-file F]` reads the value out
   of a `.env` line without it touching argv, a pipe, or a temporary file. Sealing to a
   name that is reserved but has not joined yet says exactly that.
+- **Invitations: one code from the master, one line for the newcomer.** `ferry team
+  invite create --name david --agent david-agent` (or Teammates -> *Make the code*)
+  reserves the names, writes a signed record, and prints a code plus the one line to
+  send. On the new machine `ferry team invite accept <code>` - or the `join.ps1` /
+  `join.sh` one-liner, which installs ferry first - starts the managed Syncthing
+  (installing it with winget or brew when absent), names the device after the invite,
+  trusts the inviter, enables the project under the right folder id shared with the
+  inviter's device, creates the operator, and writes a signed acceptance. The inviter's
+  ferry - the worker loop, or the dashboard while open - sees the device knocking under
+  the invite's name, trusts it and shares the folder; when the keys and acceptance sync
+  back, the dashboard signs the grant the invite promised. Nobody sees a device id.
 - **The master is a person.** The dashboard offers *I am the master of this project*
   whenever no master exists, signed with the session's already-unlocked operator key -
   no password typed twice - and flips grants to required. When `ferry enable` creates

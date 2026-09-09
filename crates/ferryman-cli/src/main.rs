@@ -235,6 +235,11 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// People on this project: invite one with a code, accept a code on a new machine.
+    Team {
+        #[command(subcommand)]
+        command: TeamCommand,
+    },
     /// The Syncthing that Ferryman runs for itself: start it, stop it, see it.
     ///
     /// Separate from any Syncthing you already use for your own files. Its home is
@@ -1291,6 +1296,63 @@ enum SecretCommand {
 }
 
 #[derive(Subcommand, Clone)]
+enum TeamCommand {
+    /// Invitations: one code from the master, one line for the newcomer.
+    Invite {
+        #[command(subcommand)]
+        action: InviteAction,
+    },
+    /// Trust any device knocking with a live invite's name and share the folder with it.
+    /// The agent loop and the dashboard do this on their own; this runs one pass by hand.
+    Pending {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum InviteAction {
+    /// Reserve a person (and their agent) and print the code to send them. Master only.
+    Create {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The person's name on the roster, e.g. david.
+        #[arg(long)]
+        name: String,
+        /// Their agent's name, e.g. david-agent. Omit for a person with no agent.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Comma-separated roles the grant will carry once their keys arrive. Empty
+        /// means every role on this project.
+        #[arg(long)]
+        roles: Option<String>,
+        /// How long the code stays valid, in days.
+        #[arg(long, default_value_t = 7)]
+        expires_days: i64,
+        /// Sign as this operator (the master). Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
+    /// On a new machine: take a code and do everything - Syncthing, the channel, your
+    /// identity - so the project appears and the inviter's machine lets you in.
+    Accept {
+        /// The code the inviter sent.
+        code: String,
+        /// Where to keep the project on this machine. Defaults to ~/Ferryman/<project>.
+        #[arg(long)]
+        into: Option<PathBuf>,
+        /// Your contact address; asked for if absent.
+        #[arg(long)]
+        email: Option<String>,
+    },
+    /// Every invitation on this project and where each one has got to.
+    List {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum ManagedSyncthingAction {
     /// Start the managed instance if it is not running, creating its home on first use.
     Start,
@@ -2172,6 +2234,7 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("readiness checks failed");
             }
         }
+        Command::Team { command } => team_command(command).await?,
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -3603,6 +3666,212 @@ fn worker_progress() -> ferryman_ops::runlog::Logged<ferryman_ops::Stdout> {
     }
 }
 
+async fn team_command(command: TeamCommand) -> Result<()> {
+    use ferryman_channel::invite;
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    match command {
+        TeamCommand::Invite {
+            action:
+                InviteAction::Create {
+                    workspace,
+                    name,
+                    agent,
+                    roles,
+                    expires_days,
+                    signer,
+                },
+        } => {
+            let route = here(workspace)?;
+            let signer_name = match signer {
+                Some(s) => s,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            let identity = signing_identity(&route, &signer_name)?;
+            let device = ferryman_channel::syncthing_my_id().context(
+                "the inviter's Syncthing must be running so the code can carry its device id",
+            )?;
+            let roles: Vec<String> = roles
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_string)
+                .collect();
+            let (invite, code) = invite::create(
+                &route,
+                &identity,
+                &name,
+                agent.as_deref(),
+                roles,
+                chrono::Duration::days(expires_days.max(1)),
+                &device,
+            )?;
+            println!("invited {} to {}", invite.operator, route.project_id);
+            if let Some(agent) = &invite.agent {
+                println!("  with agent {agent}");
+            }
+            println!("  expires {}", invite.expires_at.format("%Y-%m-%d %H:%M UTC"));
+            println!();
+            println!("Send them this. It is not a secret, but it is one-use.");
+            println!();
+            println!("  Windows (PowerShell):");
+            println!(
+                "    irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/join.ps1 | iex; ferry-join {code}"
+            );
+            println!("  macOS / Linux:");
+            println!(
+                "    curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/join.sh | sh -s -- {code}"
+            );
+            println!();
+            println!("  Or, with ferry already installed:  ferry team invite accept {code}");
+        }
+        TeamCommand::Invite {
+            action: InviteAction::Accept { code, into, email },
+        } => accept_invite(&code, into, email).await?,
+        TeamCommand::Invite {
+            action: InviteAction::List { workspace },
+        } => {
+            let route = here(workspace)?;
+            let now = chrono::Utc::now();
+            let invites = invite::list(&route)?;
+            if invites.is_empty() {
+                println!("no invitations on {}", route.project_id);
+            }
+            for (invite, check) in invites {
+                let state = if invite.granted_at.is_some() {
+                    "granted"
+                } else if invite.accepted_device.is_some() {
+                    "device paired, waiting for keys"
+                } else if !invite::is_open(&invite, now) {
+                    "expired"
+                } else {
+                    "waiting for them"
+                };
+                println!(
+                    "{}  {:<14} {:<30} {}  [{check:?}]",
+                    invite.id,
+                    invite.operator,
+                    state,
+                    invite.agent.as_deref().unwrap_or("-")
+                );
+            }
+        }
+        TeamCommand::Pending { workspace } => {
+            let route = here(workspace)?;
+            let settled = invite::settle_pending(&route)?;
+            for (id, device) in &settled.paired {
+                println!("paired {device} for invite {id} and shared the folder");
+            }
+            for invite in &settled.ready_to_grant {
+                println!(
+                    "{} has joined; open the dashboard as the master to sign their access",
+                    invite.operator
+                );
+            }
+            if settled.paired.is_empty() && settled.ready_to_grant.is_empty() {
+                println!("nothing waiting");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The newcomer's whole join, in order, stopping with a plain reason at the first thing
+/// it cannot do. Runs `ferry enable` as a child so its prompts - password, recovery
+/// phrase - reach the person exactly as they always have.
+async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>) -> Result<()> {
+    use ferryman_channel::invite;
+    let code = invite::decode_code(code)?;
+    println!("joining {} as {}", code.project, code.operator);
+
+    // 1. Syncthing, running and ours.
+    let health = ferryman_ops::syncthing::start().context("start Syncthing")?;
+    println!("  syncthing   running at {}", health.api_base);
+
+    // 2. Announce ourselves under the invite's name and trust the inviter.
+    ferryman_channel::syncthing_set_my_name(&invite::handshake_name(&code.id))?;
+    if !health.peers.iter().any(|p| p.device_id == code.device) {
+        ferryman_channel::syncthing_add_device(&code.device, "inviter")?;
+    }
+    println!("  inviter     trusted");
+
+    // 3. The project folder on this machine.
+    let workspace = match into {
+        Some(path) => path,
+        None => {
+            let home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .context("no home directory")?;
+            home.join("Ferryman").join(&code.project)
+        }
+    };
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("create {}", workspace.display()))?;
+    println!("  folder      {}", workspace.display());
+
+    // 4. Enable: channel, keys, folder registered under the invite's folder id and
+    //    shared with the inviter's device, and this person's operator identity.
+    let email = match email {
+        Some(e) => e,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                bail!("pass --email when not at a terminal");
+            }
+            print!("Your email (for the licence seat count, nothing else): ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim().to_string()
+        }
+    };
+    let exe = std::env::current_exe().context("find ferry")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("enable")
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--project")
+        .arg(&code.project)
+        .arg("--email")
+        .arg(&email)
+        .arg("--share-with")
+        .arg(&code.device)
+        .arg("--dashboard")
+        .arg("--dashboard-operator")
+        .arg(&code.operator);
+    if let Some(agent) = &code.agent {
+        cmd.arg("--agent").arg(agent);
+    }
+    let status = cmd.status().context("run ferry enable")?;
+    if !status.success() {
+        bail!("ferry enable did not finish; fix what it reported and run this again");
+    }
+
+    // 5. The acceptance, signed by this machine's agent, into our copy of the channel.
+    //    It reaches the inviter when the folder syncs, which happens once their ferry
+    //    sees our device knocking under the invite's name.
+    let route = ferryman_channel::route_for(&workspace)?;
+    let agent_name = ferryman_ops::identity::resolve(None, &route.attachment)?;
+    let identity = signing_identity(&route, &agent_name)?;
+    let my_device = ferryman_channel::syncthing_my_id()?;
+    invite::write_acceptance(&route, &identity, &code, &my_device)?;
+    // The handshake name did its job; be a normal device from here on.
+    let _ = ferryman_channel::syncthing_set_my_name(&format!("{}-{}", code.operator, ferryman_ops::identity::machine_name().unwrap_or_default()));
+
+    println!();
+    println!("done. {} will appear on this machine as soon as the inviter's Ferryman", code.project);
+    println!("lets your device in - usually within a minute while theirs is running.");
+    println!("Open the dashboard:  ferry dashboard    (in {})", workspace.display());
+    Ok(())
+}
+
 /// Start the managed Syncthing if this machine has one and it is not answering.
 /// Best-effort and quiet on success; a person's own Syncthing is never touched.
 fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
@@ -3766,6 +4035,25 @@ async fn agent_command(command: Agent) -> Result<()> {
                 // when Ferryman runs its own. A worker that keeps polling a folder its
                 // Syncthing stopped carrying is alive and useless; better to notice.
                 keep_syncthing_up(&report);
+                for (route, _) in &fleet.served {
+                    match ferryman_channel::invite::settle_pending(route) {
+                        Ok(settled) => {
+                            for (id, device) in settled.paired {
+                                report.info(&format!(
+                                    "{}: let in device {device} for invite {id}",
+                                    route.project_id
+                                ));
+                            }
+                            for invite in settled.ready_to_grant {
+                                report.info(&format!(
+                                    "{}: {} has joined and is waiting for the master's grant (open the dashboard)",
+                                    route.project_id, invite.operator
+                                ));
+                            }
+                        }
+                        Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
+                    }
+                }
 
                 for (route, config) in &mut fleet.served {
                     match agent::work_once(route, config, &report).await {

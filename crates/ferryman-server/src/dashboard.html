@@ -988,18 +988,38 @@ pages.teammates = async () => {
       <div class="chat-top"><b>Invite someone</b></div>
       <div style="padding:16px;display:flex;flex-direction:column;gap:12px">
         <div style="line-height:1.6;color:var(--dim)">
-          This reserves the name. It does not create their identity and it cannot &mdash;
-          an operator key is sealed under that person&rsquo;s own password, and this machine
-          must never know it. When they set themselves up, their key binds to the name
-          you reserve here.
+          You get one code. They run one line. Their machine installs Ferryman, pairs with
+          this one, and shows up here with its keys; the access you pick below is signed
+          the moment it does. The code carries no secret and works once.
         </div>
-        <div style="display:flex;gap:10px;flex-wrap:wrap">
-          <input id="tm-name" placeholder="their name, e.g. priya" style="min-width:200px" />
-          <button class="btn primary" id="tm-invite">Reserve the name</button>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+          <input id="tm-name" placeholder="their name, e.g. david" style="min-width:170px" />
+          <input id="tm-agent" placeholder="their agent, e.g. david-agent (optional)" style="min-width:230px" />
+          <select id="tm-role">
+            ${ACCESS_LEVELS.map((l) => `<option value="${esc(l.id)}">${esc(l.label)} &mdash; ${esc(l.hint)}</option>`).join("")}
+          </select>
+          <button class="btn primary" id="tm-invite">Make the code</button>
         </div>
         <div class="s" id="tm-msg" style="color:var(--dim)"></div>
+        <div id="tm-code" hidden style="display:flex;flex-direction:column;gap:10px">
+          <div class="k">Send them this</div>
+          <pre class="out" id="tm-code-text" style="max-height:none;white-space:pre-wrap"></pre>
+          <div style="display:flex;gap:8px"><button class="btn small" id="tm-copy">Copy</button><span class="s" id="tm-copied" style="color:var(--dim)"></span></div>
+        </div>
       </div>
+    </div>
+
+    ${(d.invites || []).length ? `
+    <div class="panel" style="margin-bottom:18px">
+      <div class="chat-top"><b>Invitations</b></div>
+      ${(d.invites || []).map((i) => `
+      <div class="row">
+        <div><div class="t">${esc(i.operator)}${i.agent ? ` <span class="badge">${esc(i.agent)}</span>` : ""}</div>
+          <div class="m">${i.roles && i.roles.length ? esc(i.roles.join(", ")) : "full"} &middot; code ${esc(i.id)} &middot; expires ${esc((i.expires_at || "").slice(0, 10))}</div></div>
+        <div class="r">${i.state === "granted" ? `<span class="badge good">joined and granted</span>` : i.state === "paired" ? `<span class="badge accent">device paired, waiting for keys</span>` : i.state === "expired" ? `<span class="badge">expired</span>` : `<span class="badge warn">waiting for them</span>`}</div>
+      </div>`).join("")}
     </div>` : ""}
+    ${(d.notes || []).length ? `<div class="notice"><div>${(d.notes || []).map(esc).join("<br>")}</div></div>` : ""}` : ""}
 
     <div class="panel scroll">
       <table class="grid">
@@ -1071,15 +1091,42 @@ function wireTeammates() {
     msg.textContent = "";
     invite.disabled = true;
     try {
-      await api("/api/team/invite", {
+      const level = ACCESS_LEVELS.find((l) => l.id === ($("#tm-role") || {}).value) || ACCESS_LEVELS[0];
+      const r = await api("/api/team/invite", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: ($("#tm-name") || {}).value || "" }),
+        body: JSON.stringify({
+          name: ($("#tm-name") || {}).value || "",
+          agent: ($("#tm-agent") || {}).value || "",
+          roles: level.roles,
+        }),
       });
+      const who = r.name;
+      const text = [
+        `Hi ${who}, three steps to join ${state.project || state.homeProject}:`,
+        ``,
+        `1. Open PowerShell (Windows) or Terminal (Mac) and paste this one line:`,
+        `   Windows:  ${r.windows}`,
+        `   Mac:      ${r.unix}`,
+        `2. It asks for your email and a password. Pick a password; it is yours alone.`,
+        `3. Write down the 24 words it shows you once. That is your recovery.`,
+        ``,
+        `Done. The project appears on your machine within a minute of me being online,`,
+        `and your agent${r.agent ? ` (${r.agent})` : ""} picks up what it needs by itself.`,
+        `The code expires ${(r.expires_at || "").slice(0, 10)}.`,
+      ].join("\n");
+      $("#tm-code-text").textContent = text;
+      $("#tm-code").hidden = false;
+      msg.textContent = `code ${r.id} made for ${who}${r.grants_required ? "; grants are required on this project from here on" : ""}`;
+      const copy = $("#tm-copy");
+      if (copy) copy.onclick = async () => {
+        try { await navigator.clipboard.writeText(text); $("#tm-copied").textContent = "copied"; }
+        catch (_) { $("#tm-copied").textContent = "select the text and copy it"; }
+      };
       state.team = null;
-      await render();
     } catch (err) {
       msg.textContent = String(err.message || err).slice(0, 300);
+    } finally {
       invite.disabled = false;
     }
   });
@@ -1736,8 +1783,9 @@ function renderProjects() {
   select.innerHTML = options
     .map((id) => `<option value="${esc(id)}"${id === current ? " selected" : ""}>${esc(id)}</option>`)
     .join("");
-  // One project is not a choice; showing a dropdown implies there is somewhere else to go.
-  select.disabled = options.length < 2;
+  // Always enabled: a disabled select on the dark theme reads as empty, and the one
+  // thing this control must always do is say which project the page is on.
+  select.disabled = false;
 }
 
 async function loadProjects() {
@@ -1746,6 +1794,8 @@ async function loadProjects() {
     const ids = (fleet.projects || [])
       .map((p) => p.project_id)
       .filter(Boolean);
+    if (fleet.home && !state.homeProject) state.homeProject = fleet.home;
+    if (fleet.current && !state.project) state.project = fleet.current;
     if (state.homeProject && !ids.includes(state.homeProject)) ids.push(state.homeProject);
     ids.sort();
     state.projects = ids;

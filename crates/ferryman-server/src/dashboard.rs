@@ -1119,6 +1119,102 @@ async fn team(
     // carried projects, roles and capabilities since ADR 0014 - it is authority that
     // existed in the channel and was not on any screen, so nobody could see who could do
     // what without reading JSON.
+    // While the dashboard is open it is the inviter's machine: let in any device
+    // knocking under a live invite's name, and - since this session holds the master's
+    // unlocked key when the master is signed in - sign the grants an invite promised
+    // once the newcomer's keys and acceptance have synced back.
+    let master_name = ferryman_channel::master::read_master(&route)
+        .ok()
+        .flatten()
+        .map(|d| d.master);
+    let mut settled_notes: Vec<String> = Vec::new();
+    if let Ok(settled) = ferryman_channel::invite::settle_pending(&route) {
+        for (id, device) in settled.paired {
+            settled_notes.push(format!("let in a device for invite {id} ({})", &device[..device.len().min(7)]));
+        }
+        if master_name.as_deref().is_some_and(|m| m.eq_ignore_ascii_case(current.name())) {
+            let roster_now =
+                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+            for invite in settled.ready_to_grant {
+                let mut names = vec![invite.operator.clone()];
+                names.extend(invite.agent.clone());
+                let mut all_ok = true;
+                for who in &names {
+                    let Some(entry) = roster_now.iter().find(|a| a.name.eq_ignore_ascii_case(who)) else {
+                        all_ok = false;
+                        continue;
+                    };
+                    let Some(key) = entry.public_key.clone() else {
+                        all_ok = false;
+                        continue;
+                    };
+                    let roles = if who == &invite.operator {
+                        invite.roles.clone()
+                    } else {
+                        vec!["worker".to_string()]
+                    };
+                    if ferryman_channel::master::grant_member(
+                        &route,
+                        &current,
+                        &entry.name,
+                        &key,
+                        vec![route.project_id.clone()],
+                        roles.clone(),
+                        Vec::new(),
+                    )
+                    .is_ok()
+                    {
+                        let _ = ferryman_channel::ledger::append_ledger_entry(
+                            &route,
+                            &current,
+                            "grant",
+                            current.name(),
+                            &format!(
+                                "granted {} roles [{}] on {} from invite {}",
+                                entry.name,
+                                roles.join(", "),
+                                route.project_id,
+                                invite.id
+                            ),
+                            None,
+                        );
+                    } else {
+                        all_ok = false;
+                    }
+                }
+                if all_ok {
+                    let _ = ferryman_channel::invite::mark_granted(&route, &invite.id);
+                    settled_notes.push(format!("{} has joined and is granted", invite.operator));
+                }
+            }
+        }
+    }
+    let invites: Vec<Value> = ferryman_channel::invite::list(&route)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(invite, check)| {
+            let now = chrono::Utc::now();
+            let state = if invite.granted_at.is_some() {
+                "granted"
+            } else if invite.accepted_device.is_some() {
+                "paired"
+            } else if !ferryman_channel::invite::is_open(&invite, now) {
+                "expired"
+            } else {
+                "waiting"
+            };
+            json!({
+                "id": invite.id,
+                "operator": invite.operator,
+                "agent": invite.agent,
+                "roles": invite.roles,
+                "state": state,
+                "expires_at": invite.expires_at.to_rfc3339(),
+                "signature": format!("{check:?}"),
+            })
+        })
+        .collect();
+
     let grants = ferryman_channel::master::member_grants(&route)
         .map_err(internal)?
         .into_iter()
@@ -1135,6 +1231,8 @@ async fn team(
         .collect::<Vec<_>>();
     Ok(Json(json!({
         "current": current.name(),
+        "invites": invites,
+        "notes": settled_notes,
         "master": master,
         // Only the master's signature makes a grant, so the page must not offer the
         // controls to anybody else and then fail at the server. Same answer, one place.
@@ -1154,6 +1252,14 @@ async fn team(
 #[derive(Deserialize)]
 struct InviteBody {
     name: String,
+    /// Their agent's name; absent for a person with no agent.
+    #[serde(default)]
+    agent: Option<String>,
+    /// Roles the grant will carry once their keys arrive. Empty means every role.
+    #[serde(default)]
+    roles: Vec<String>,
+    #[serde(default)]
+    expires_days: Option<i64>,
 }
 
 /// POST /api/team/invite - reserve a name for a person who has not joined yet.
@@ -1195,35 +1301,50 @@ async fn invite_teammate(
                 .to_string(),
         ));
     }
-    let roster =
-        ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
-    // First-key-wins is the rule that makes reservation safe, and it is also the rule
-    // that makes overwriting an existing entry dangerous: a name that already carries a
-    // published key belongs to whoever holds that key, and re-registering it would be
-    // the impersonation this is careful not to be.
-    if let Some(existing) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) {
+    let agent = body
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .map(str::to_string);
+    if let Some(agent) = &agent
+        && !ferryman_channel::is_safe_component(agent)
+    {
         return Err((
-            StatusCode::CONFLICT,
-            if existing.public_key.is_some() {
-                format!("{name} is already in this channel and has published a key")
-            } else {
-                format!("{name} has already been invited and is waiting to come online")
-            },
+            StatusCode::BAD_REQUEST,
+            "an agent name must be a plain identifier".to_string(),
         ));
     }
-    ferryman_channel::register_expected_agent(
+    // The code carries this machine's Syncthing device id so the newcomer can trust
+    // it; without a running Syncthing there is nothing to put in the code.
+    let device = ferryman_channel::syncthing_my_id().map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            format!("Syncthing must be running to invite someone: {e}"),
+        )
+    })?;
+    let (invite, code) = ferryman_channel::invite::create(
         &route,
+        &current,
         &name,
-        "operator",
-        &["messages.receive".to_string()],
+        agent.as_deref(),
+        body.roles.clone(),
+        chrono::Duration::days(body.expires_days.unwrap_or(7).max(1)),
+        &device,
     )
-    .map_err(internal)?;
+    .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     ferryman_channel::ledger::append_ledger_entry(
         &route,
         &current,
         "invite",
         current.name(),
-        &format!("reserved {name} for a teammate who has not joined yet"),
+        &format!(
+            "invited {name}{} to {}; code {} expires {}",
+            agent.as_ref().map(|a| format!(" (agent {a})")).unwrap_or_default(),
+            route.project_id,
+            invite.id,
+            invite.expires_at.format("%Y-%m-%d")
+        ),
         None,
     )
     .map_err(internal)?;
@@ -1242,7 +1363,13 @@ async fn invite_teammate(
     }
     Ok(Json(json!({
         "name": name,
+        "agent": agent,
         "state": "invited",
+        "id": invite.id,
+        "code": code,
+        "expires_at": invite.expires_at.to_rfc3339(),
+        "windows": format!("irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/join.ps1 | iex; ferry-join {code}"),
+        "unix": format!("curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/join.sh | sh -s -- {code}"),
         "grants_required": grants_flipped || route.requires_grants(),
     })))
 }
@@ -1906,6 +2033,8 @@ async fn fleet(
         "machines": machines,
         "devices": devices,
         "projects": projects,
+        "current": route.project_id,
+        "home": state.route.project_id,
         "version": env!("CARGO_PKG_VERSION"),
     })))
 }
@@ -1991,10 +2120,13 @@ fn discover_projects(route: &ProjectRoute) -> anyhow::Result<Vec<Value>> {
     }
 
     if parent.is_dir() {
-        for entry in std::fs::read_dir(parent)? {
-            let entry = entry?;
+        // One unreadable entry must not empty the whole list. The parent of a project is
+        // often a drive root, and a drive root has `System Volume Information` and
+        // `Program Files` on it - one permission error there took the picker down to
+        // nothing, on the one machine with the most projects to pick from.
+        for entry in std::fs::read_dir(parent)?.flatten() {
             let path = entry.path();
-            if !entry.file_type()?.is_dir() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {

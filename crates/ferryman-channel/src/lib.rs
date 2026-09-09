@@ -29,6 +29,7 @@ pub mod lease;
 pub mod ledger;
 pub mod licensing;
 pub mod marvin;
+pub mod invite;
 pub mod master;
 pub mod memory;
 pub mod migration;
@@ -4007,6 +4008,21 @@ fn syncthing_get(api_base: &str, path: &str, api_key: &str) -> Result<Option<Val
 /// loopback address and pulling in an HTTP client for it would add a dependency tree to
 /// a crate that deliberately has almost none.
 fn syncthing_post(api_base: &str, path: &str, api_key: &str, body: &str) -> Result<Option<u16>> {
+    syncthing_send(api_base, "POST", path, api_key, body)
+}
+
+/// PATCH to Syncthing's local API - for editing one device or folder in place.
+fn syncthing_patch(api_base: &str, path: &str, api_key: &str, body: &str) -> Result<Option<u16>> {
+    syncthing_send(api_base, "PATCH", path, api_key, body)
+}
+
+fn syncthing_send(
+    api_base: &str,
+    method: &str,
+    path: &str,
+    api_key: &str,
+    body: &str,
+) -> Result<Option<u16>> {
     let authority = api_base
         .trim()
         .trim_end_matches('/')
@@ -4026,7 +4042,7 @@ fn syncthing_post(api_base: &str, path: &str, api_key: &str, body: &str) -> Resu
     stream.set_read_timeout(Some(SYNCTHING_API_TIMEOUT))?;
     stream.set_write_timeout(Some(SYNCTHING_API_TIMEOUT))?;
     let request = format!(
-        "POST {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\n\
+        "{method} {path} HTTP/1.0\r\nHost: {authority}\r\nX-API-Key: {api_key}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -4498,6 +4514,65 @@ pub fn syncthing_add_device(device_id: &str, name: &str) -> Result<()> {
         Some(code) => bail!("Syncthing refused the device (HTTP {code})"),
         None => bail!("could not reach Syncthing's API"),
     }
+}
+
+/// This machine's own Syncthing device id.
+pub fn syncthing_my_id() -> Result<String> {
+    syncthing_health()?
+        .my_id
+        .ok_or_else(|| anyhow::anyhow!("Syncthing did not report its own device id"))
+}
+
+/// Rename this machine's own device as Syncthing announces it to peers.
+///
+/// The device name is the one field that crosses to a peer BEFORE any folder is shared:
+/// it rides the connection request. That is what makes it usable as an invitation
+/// handshake - a newcomer names itself after the invite and the inviter recognises it.
+pub fn syncthing_set_my_name(name: &str) -> Result<()> {
+    let Some(key) = syncthing_api_key() else {
+        bail!("Syncthing config not found");
+    };
+    let base = syncthing_api_base();
+    let me = syncthing_my_id()?;
+    let body = serde_json::to_string(&json!({ "name": name }))?;
+    match syncthing_patch(&base, &format!("/rest/config/devices/{me}"), &key, &body)? {
+        Some(code) if (200..300).contains(&code) => Ok(()),
+        Some(code) => bail!("Syncthing refused the rename (HTTP {code})"),
+        None => bail!("could not reach Syncthing's API"),
+    }
+}
+
+/// A device that has tried to connect but is not yet trusted, as Syncthing reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingDevice {
+    pub device_id: String,
+    /// The name the device announced for itself.
+    pub name: String,
+}
+
+/// Devices knocking on this Syncthing that nobody has accepted.
+pub fn syncthing_pending_devices() -> Result<Vec<PendingDevice>> {
+    let Some(key) = syncthing_api_key() else {
+        bail!("Syncthing config not found");
+    };
+    let base = syncthing_api_base();
+    let Some(pending) = syncthing_get(&base, "/rest/cluster/pending/devices", &key)? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    if let Some(map) = pending.as_object() {
+        for (id, info) in map {
+            out.push(PendingDevice {
+                device_id: id.clone(),
+                name: info
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Files and directories the pre-Ferryman git-backed hone bridge used. Their
