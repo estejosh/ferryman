@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## v0.5.9 - 2026-09-09
+
+v0.5.8 built for Windows only: the managed-Syncthing supervisor detached its child with a
+raw `setsid`, and `ferryman-ops` forbids unsafe code, so every Linux and macOS target
+failed at build. This release is v0.5.8 with that one block replaced by std's
+`process_group`, and the same tests, clippy and fmt run on Linux as well as Windows.
+
 ## v0.5.8 - 2026-09-09
 
 Beta. Bringing a person onto a channel is one code and one prompt; the doctor tells

@@ -223,28 +223,13 @@ fn spawn_detached(binary: &Path, home: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        // A new session so a Ctrl-C to ferry does not take Syncthing with it.
-        // SAFETY: setsid is async-signal-safe and touches no memory of the parent.
-        unsafe {
-            command.pre_exec(|| {
-                libc_setsid();
-                Ok(())
-            });
-        }
+        // Its own process group, so a Ctrl-C to ferry does not take Syncthing with it.
+        // `process_group` is the safe std API for this; this crate forbids unsafe, and a
+        // raw setsid was what broke every non-Windows build of 0.5.8's first cut.
+        command.process_group(0);
     }
     command
         .spawn()
         .with_context(|| format!("start {}", binary.display()))?;
     Ok(())
-}
-
-#[cfg(unix)]
-fn libc_setsid() {
-    unsafe extern "C" {
-        fn setsid() -> i32;
-    }
-    // SAFETY: plain libc call with no arguments.
-    unsafe {
-        setsid();
-    }
 }
