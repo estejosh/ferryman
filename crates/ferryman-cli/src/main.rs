@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 mod license;
+mod licensor;
 mod mcp;
 mod mcp_client;
 mod telegram;
@@ -1769,6 +1770,64 @@ enum Agent {
 
 #[derive(Subcommand, Clone)]
 enum License {
+    /// Mint the licensor keypair that signs every entitlement you issue.
+    ///
+    /// You almost certainly do not want this: it is for whoever SELLS Ferryman, once.
+    /// The secret half is sealed with a password you type here and never leaves this
+    /// machine unsealed; the public half is printed, to be compiled into the binaries
+    /// that will check the licences it signs.
+    Keygen {
+        /// Where to write the sealed key. Defaults to this machine's state directory.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Issue a licence. Requires the licensor key, so this is the seller's command.
+    Issue {
+        /// Who it is for: the operator fingerprint from their `ferry identity`.
+        ///
+        /// Not an email and not a machine id. An email proves nothing, and a machine id
+        /// makes every reinstall a support ticket.
+        #[arg(long)]
+        to: String,
+        /// People. Omit for unlimited.
+        #[arg(long)]
+        seats: Option<usize>,
+        /// Computers. Omit for unlimited.
+        #[arg(long)]
+        computers: Option<usize>,
+        /// Phones and tablets. Omit for unlimited.
+        #[arg(long)]
+        mobile: Option<usize>,
+        /// Builds released BEFORE this date are covered, as YYYY-MM-DD. Omit for a
+        /// lifetime licence.
+        ///
+        /// Deliberately a build window rather than a clock expiry: the customer's system
+        /// clock is never consulted, so nothing is defeated by changing it, and every
+        /// build they paid for stays licensed forever.
+        #[arg(long)]
+        until: Option<String>,
+        /// Anything worth recording on the licence itself - an order number, a chain and
+        /// transaction, the words "lifetime, founder".
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Who introduced this customer, and is owed commission on the sale.
+        ///
+        /// Signed into the licence itself, so the claim travels with the thing the
+        /// customer holds and neither side can edit it afterwards.
+        #[arg(long)]
+        referred_by: Option<String>,
+        /// The sealed licensor key. Defaults to this machine's state directory.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Where to write the licence. Defaults to `<fingerprint>.ferryman-licence`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Install a licence you were issued, on this machine.
+    Install {
+        /// The file the licensor sent you.
+        file: PathBuf,
+    },
     /// Seats, computers and phones on this channel, and whether that is within the
     /// free tier.
     Status {
@@ -3106,6 +3165,29 @@ enum DashboardOutcome {
 /// A human at a terminal is asked and types the password privately (never
 /// echoed). An agent (`--json`, or piped stdin) never sees or supplies the
 /// password: it is told to hand the human a browser instead.
+/// The address `git config user.email` holds, when it holds a plausible one.
+///
+/// `--no-includes` deliberately: an included config can pull a value from a file this
+/// repository does not control, and this ends up registered as the person's contact
+/// address. GitHub's `noreply` form is accepted - it is a real, deliverable address and
+/// plenty of people commit under nothing else.
+#[must_use]
+fn git_configured_email() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--no-includes", "--get", "user.email"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let email = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    // The shape, not the deliverability: one `@`, something either side, a dot after it.
+    let plausible = email
+        .split_once('@')
+        .is_some_and(|(user, host)| !user.is_empty() && host.contains('.') && !host.ends_with('.'));
+    plausible.then_some(email)
+}
+
 /// The contact address, asked for rather than demanded.
 ///
 /// The licence conditions free production use on registering one, so `enable` does need
@@ -3121,6 +3203,20 @@ fn resolve_contact_email(email: Option<String>, as_json: bool) -> Result<String>
         if !email.is_empty() {
             return Ok(email);
         }
+    }
+    // The address git is already committing as.
+    //
+    // Not a guess and not an invention - it is this person's own configured address,
+    // sitting in the repository the command is being run in, and it is the address their
+    // commits already carry. Asking an agent to stop and fetch a value that is on disk
+    // three feet away was the last human step in an otherwise unattended install.
+    //
+    // Only consulted when nothing was passed, so `--email` and `FERRYMAN_EMAIL` always
+    // win, and only when it looks like an address: git will happily hold nonsense there.
+    if let Some(configured) = git_configured_email() {
+        eprintln!("using the address git is configured with: {configured}");
+        eprintln!("  (pass --email or set FERRYMAN_EMAIL to register a different one)");
+        return Ok(configured);
     }
     if as_json || !std::io::stdin().is_terminal() {
         bail!(
@@ -3692,6 +3788,127 @@ async fn license_command(command: License) -> Result<()> {
         ferryman_channel::route_for(&start)
     };
     match command {
+        License::Keygen { out } => {
+            let path = match out {
+                Some(path) => path,
+                None => licensor::default_path()
+                    .context("no machine state directory to write a licensor key into")?,
+            };
+            println!("This mints the key that signs every Ferryman licence you sell.");
+            println!("Only the person selling Ferryman needs it, and only once.");
+            println!();
+            let password = rpassword::prompt_password("password for the licensor key: ")?;
+            let again = rpassword::prompt_password("again: ")?;
+            if password != again {
+                bail!("those did not match; nothing was written");
+            }
+            let record = licensor::keygen(&path, &password)?;
+            println!();
+            println!("sealed key   {}", path.display());
+            println!("public key   {}", record.public_key_hex);
+            println!();
+            println!("  The public key goes into the binary, as LICENSOR_PUBLIC_KEY in");
+            println!("  crates/ferryman-channel/src/entitlement.rs. It is public: paste it");
+            println!("  anywhere.");
+            println!();
+            println!("  The sealed key is ciphertext, so it is safe to back up and safe to");
+            println!("  send to yourself over an end-to-end encrypted messenger. Send the");
+            println!("  PASSWORD by a different route than the file - together they are");
+            println!("  simply the key. Anyone holding both can issue licences as you.");
+            println!();
+            println!("  Losing it is worse than losing a release key: minting a replacement");
+            println!("  invalidates every licence already issued, and your customers find");
+            println!("  out before you do.");
+        }
+        License::Issue {
+            to,
+            seats,
+            computers,
+            mobile,
+            until,
+            note,
+            referred_by,
+            key,
+            out,
+        } => {
+            let key_path = match key {
+                Some(path) => path,
+                None => licensor::default_path().context("no licensor key path to read")?,
+            };
+            let covers_builds_before = match until {
+                None => None,
+                Some(day) => Some(
+                    chrono::NaiveDate::parse_from_str(&day, "%Y-%m-%d")
+                        .context("--until must be a date, as YYYY-MM-DD")?
+                        .and_hms_opt(0, 0, 0)
+                        .map(|at| at.and_utc())
+                        .context("that date has no midnight")?,
+                ),
+            };
+            let password = rpassword::prompt_password("password for the licensor key: ")?;
+            let signing = licensor::open(&key_path, &password)?;
+
+            let mut entitlement = ferryman_channel::entitlement::Entitlement {
+                id: uuid::Uuid::new_v4().to_string(),
+                subject: to.trim().to_string(),
+                seats,
+                computers,
+                mobile_devices: mobile,
+                issued: chrono::Utc::now(),
+                covers_builds_before,
+                note,
+                referred_by: referred_by
+                    .map(|who| who.trim().to_string())
+                    .filter(|who| !who.is_empty()),
+                signed_by: None,
+                signature: None,
+            };
+            entitlement.sign(&signing);
+
+            let path = out.unwrap_or_else(|| {
+                PathBuf::from(format!("{}.ferryman-licence", entitlement.subject))
+            });
+            std::fs::write(&path, serde_json::to_vec_pretty(&entitlement)?)
+                .with_context(|| format!("write {}", path.display()))?;
+
+            let allowance = |value: Option<usize>| match value {
+                Some(count) => count.to_string(),
+                None => "unlimited".to_string(),
+            };
+            println!("licence     {}", path.display());
+            println!("id          {}", entitlement.id);
+            println!("subject     {}", entitlement.subject);
+            println!("seats       {}", allowance(entitlement.seats));
+            println!("computers   {}", allowance(entitlement.computers));
+            println!("phones      {}", allowance(entitlement.mobile_devices));
+            println!(
+                "covers      {}",
+                entitlement.covers_builds_before.map_or_else(
+                    || "every build, for good".to_string(),
+                    |at| format!("builds released before {}", at.format("%Y-%m-%d"))
+                )
+            );
+            if let Some(referrer) = &entitlement.referred_by {
+                println!("referred by {referrer}");
+            }
+            println!();
+            println!("  Send that file to the customer. It is signed, not secret: it grants");
+            println!("  only to the fingerprint named in it, so it is useless to anyone else.");
+            println!("  They install it with:  ferry license install <file>");
+        }
+        License::Install { file } => {
+            let entitlement = ferryman_channel::entitlement::install(&file)?;
+            println!(
+                "installed. {}",
+                ferryman_channel::entitlement::standing().describe()
+            );
+            println!("  id       {}", entitlement.id);
+            if !entitlement.note.trim().is_empty() {
+                println!("  note     {}", entitlement.note);
+            }
+            println!();
+            println!("  ferry license status shows what this machine now counts as.");
+        }
         License::Status { workspace, json } => license::status(&route_for(workspace)?, json)?,
         License::Register {
             workspace,

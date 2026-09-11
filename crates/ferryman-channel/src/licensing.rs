@@ -98,6 +98,10 @@ impl FleetCount {
     ///
     /// Each limit is checked on its own. They do not pool: three Computers and no phone
     /// is over, even though it is fewer devices than two of each.
+    ///
+    /// This is the FREE allowance specifically. Use [`Self::exceeded_under`] where an
+    /// entitlement could apply, which is everywhere a person is told anything: the free
+    /// numbers are only the right answer for someone who has not paid.
     #[must_use]
     pub fn over_limit(&self) -> bool {
         self.seats > FREE_SEATS
@@ -105,7 +109,37 @@ impl FleetCount {
             || self.mobile_devices > FREE_MOBILE_DEVICES
     }
 
-    /// Which limits are exceeded, in words a person can act on.
+    /// Which limits are exceeded, given what this deployment is entitled to.
+    ///
+    /// An allowance of `None` in an entitlement is unlimited, so an unlimited licence
+    /// returns nothing however many machines are counted. A lapsed or unverified licence
+    /// falls back to the free allowance rather than to nothing - the safe direction is
+    /// the one where an expired licence stops granting, not the one where a broken file
+    /// grants everything.
+    #[must_use]
+    pub fn exceeded_under(&self, standing: &crate::entitlement::Standing) -> Vec<String> {
+        let Some(entitlement) = standing.licensed() else {
+            return self.exceeded();
+        };
+        let mut over = Vec::new();
+        let mut check = |counted: usize, allowed: Option<usize>, noun: &str| {
+            if let Some(allowed) = allowed
+                && counted > allowed
+            {
+                over.push(format!("{counted} {noun} (this licence allows {allowed})"));
+            }
+        };
+        check(self.seats, entitlement.seats, "seats");
+        check(self.computers, entitlement.computers, "computers");
+        check(
+            self.mobile_devices,
+            entitlement.mobile_devices,
+            "phones/tablets",
+        );
+        over
+    }
+
+    /// Which limits are exceeded on the FREE allowance, in words a person can act on.
     #[must_use]
     pub fn exceeded(&self) -> Vec<String> {
         let mut over = Vec::new();

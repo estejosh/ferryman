@@ -32,6 +32,19 @@ pub fn find_binary() -> Option<PathBuf> {
     if let Some(found) = crate::doctor::find_on_path("syncthing") {
         return Some(found);
     }
+    // The copy Ferryman installed for this user, which is on no PATH by design: it
+    // belongs to Ferryman, not to the machine, and putting it on a system path would be
+    // installing software on somebody's behalf in a place they did not agree to.
+    if let Some(own) = ferryman_channel::licensing::machine_state_dir() {
+        let binary = own.join("syncthing").join(if cfg!(windows) {
+            "syncthing.exe"
+        } else {
+            "syncthing"
+        });
+        if binary.is_file() {
+            return Some(binary);
+        }
+    }
     if cfg!(windows) {
         let mut found = Vec::new();
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
@@ -101,6 +114,8 @@ fn install_binary() -> Result<PathBuf> {
         ))
     } else if cfg!(target_os = "macos") && crate::doctor::find_on_path("brew").is_some() {
         Some(("brew", vec!["install", "syncthing"]))
+    } else if cfg!(target_os = "linux") {
+        return install_linux_release();
     } else {
         None
     };
@@ -121,6 +136,75 @@ fn install_binary() -> Result<PathBuf> {
         );
     }
     find_binary().context("Syncthing was installed but its binary was not found; open a new terminal and run this again")
+}
+
+/// Install Syncthing on Linux from its own published release, not a package manager.
+///
+/// # Why not a package manager
+///
+/// This used to bail on Linux with "too many package managers to guess at", which reads
+/// as reasonable and is the wrong answer for the case that matters: an agent following
+/// the install prompt, on the platform most of this software's users are on, with nobody
+/// to hand the job to. Guessing between apt, dnf, pacman, apk and zypper is genuinely
+/// unwise - and unnecessary, because Syncthing publishes static binaries for exactly this.
+///
+/// Installed for this user, under the same directory Ferryman already uses for its own
+/// state. Nothing is elevated, nothing is put on a system path, and nothing outside this
+/// user's own directories is touched.
+fn install_linux_release() -> Result<PathBuf> {
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        other => bail!(
+            "no published Syncthing build for this architecture ({other}); install it from \
+             https://syncthing.net/downloads/ and run this again"
+        ),
+    };
+    let home = ferryman_channel::licensing::machine_state_dir()
+        .context("no per-user directory to install Syncthing into")?;
+    let into = home.join("syncthing");
+    std::fs::create_dir_all(&into)?;
+
+    // `latest` rather than a pinned version: this is somebody else's software and their
+    // release feed is the authority on which build is current. The archive is fetched
+    // over TLS from their own domain.
+    let url = format!(
+        "https://github.com/syncthing/syncthing/releases/latest/download/syncthing-linux-{arch}.tar.gz"
+    );
+    eprintln!("installing Syncthing for this user: {url}");
+    let archive = into.join("syncthing.tar.gz");
+    let fetched = Command::new("curl")
+        .args(["-fsSL", "-o"])
+        .arg(&archive)
+        .arg(&url)
+        .status();
+    if !fetched.is_ok_and(|status| status.success()) {
+        bail!(
+            "could not download Syncthing from {url}; install it from \
+             https://syncthing.net/downloads/ and run this again"
+        );
+    }
+    // --strip-components=1 because the archive holds one versioned directory, and the
+    // version changes with every release - so the path cannot be written down here.
+    let unpacked = Command::new("tar")
+        .args(["-xzf"])
+        .arg(&archive)
+        .args(["--strip-components=1", "-C"])
+        .arg(&into)
+        .status();
+    let _ = std::fs::remove_file(&archive);
+    if !unpacked.is_ok_and(|status| status.success()) {
+        bail!("could not unpack Syncthing into {}", into.display());
+    }
+    let binary = into.join("syncthing");
+    if !binary.is_file() {
+        bail!(
+            "the Syncthing archive did not contain the binary where expected ({})",
+            binary.display()
+        );
+    }
+    Ok(binary)
 }
 
 /// Whether the managed instance is answering right now.

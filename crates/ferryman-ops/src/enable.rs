@@ -504,6 +504,21 @@ pub fn perform(request: Request) -> Result<Outcome> {
     let syncthing = if request.no_syncthing {
         None
     } else {
+        // Start the managed Syncthing if it is not answering.
+        //
+        // Ferryman runs its own instance and has always known how to start it - `ferry
+        // syncthing start` - but `enable` did not, so a machine whose Syncthing was
+        // simply not running got `"available": false` and a note, and carried on. For a
+        // person that is a puzzle; for the agent this command is written for, it is a
+        // dead end, because the whole point of the one-command install is that there is
+        // nobody to hand the remaining job to.
+        //
+        // Best-effort and never fatal: a machine that cannot run Syncthing still gets a
+        // working local channel, which is exactly what the `available: false` path is
+        // for. This only removes the case where it would have worked all along.
+        if !crate::syncthing::managed_running() {
+            let _ = crate::syncthing::start();
+        }
         // Shares with every device this Syncthing already trusts by default; a
         // caller that wants one project to reach one person instead passes
         // `share_with`, which narrows the share list to exactly those devices.

@@ -26,6 +26,11 @@ fn endpoint() -> Option<String> {
 pub fn status(route: &ProjectRoute, as_json: bool) -> Result<()> {
     let devices = licensing::read_devices(route)?;
     let counted = licensing::count(&devices);
+    // What this deployment is entitled to, which is the question the counts are only
+    // half of. Without it the free-tier numbers are the only answer available, and a
+    // paying customer is told they are over a limit they bought their way past.
+    let standing = ferryman_channel::entitlement::standing();
+    let exceeded = counted.exceeded_under(&standing);
     if as_json {
         println!(
             "{}",
@@ -34,8 +39,10 @@ pub fn status(route: &ProjectRoute, as_json: bool) -> Result<()> {
                 "computers": counted.computers,
                 "mobile_devices": counted.mobile_devices,
                 "agents": "unlimited",
-                "over_limit": counted.over_limit(),
-                "exceeded": counted.exceeded(),
+                "over_limit": !exceeded.is_empty(),
+                "exceeded": exceeded,
+                "standing": standing,
+                "licence": standing.entitlement(),
                 "registered_emails": licensing::registered_emails(&devices),
                 "this_device": licensing::device_id(&route.attachment).ok(),
                 "counted": devices.iter().map(|device| serde_json::json!({
@@ -60,6 +67,7 @@ pub fn status(route: &ProjectRoute, as_json: bool) -> Result<()> {
     println!("  computers       {}", counted.computers);
     println!("  phones/tablets  {}", counted.mobile_devices);
     println!("  agents          unlimited, and never counted");
+    println!("  standing        {}", standing.describe());
     // The counts alone are unauditable: "computers 2" reads the same whether that is
     // two machines or one machine registered twice, and it is the number that decides
     // free-tier eligibility. Listing what was counted is what makes it checkable.
@@ -90,10 +98,19 @@ pub fn status(route: &ProjectRoute, as_json: bool) -> Result<()> {
         println!("\nNothing registered yet. Run 'ferry enable --email you@example.com'.");
         return Ok(());
     }
-    if counted.over_limit() {
-        print!("{}", licensing::over_limit_notice(&counted));
+    if exceeded.is_empty() {
+        match standing.licensed() {
+            Some(_) => println!("\nWithin this licence."),
+            None => println!("\nWithin the free tier."),
+        }
+    } else if standing.licensed().is_some() {
+        println!("\nOver what this licence allows:");
+        for over in &exceeded {
+            println!("  {over}");
+        }
+        println!("\nNothing stops working. Ask the licensor to widen it when you want to.");
     } else {
-        println!("\nWithin the free tier.");
+        print!("{}", licensing::over_limit_notice(&counted));
     }
     Ok(())
 }

@@ -52,6 +52,44 @@
   workspace, and never anywhere inside it, because a channel inside the workspace would
   put the work itself into the synced folder.
 
+### Added
+
+- **Licences that verify with no server.** An entitlement is a small signed document:
+  subject, seat and device allowances, an issue date, an optional build cutoff, and an
+  ed25519 signature over the payload. The licensor's public key is compiled into the
+  binary; `ferry license status` reads the installed entitlement and verifies it locally.
+  Nothing phones home, and there is nothing to phone.
+- **Expiry is measured against the build, not the clock.** `build.rs` stamps the git
+  committer date into the binary, and an entitlement that covers builds before a date
+  covers every binary built before it, forever. Setting the system clock back gains
+  nothing, because the clock is never consulted; a licence that stops at a date simply
+  stops covering newer builds, and the copy already installed keeps working.
+- **`ferry license keygen` / `issue` / `install`.** The licensor key is sealed at rest
+  with PBKDF2-SHA256 at 600,000 iterations and XChaCha20-Poly1305, and the passphrase is
+  typed at the console - it is never an argument, never an environment variable, and
+  never written anywhere. `issue` takes `--to`, `--seats`, `--computers`, `--mobile`,
+  `--until`, `--note` and `--referred-by`; omitted allowances mean unlimited. Referrals
+  are appended to the signed payload only when present, so entitlements issued before
+  referrals existed still verify byte-for-byte.
+- **A licence claim proves the machine holds the licence, not merely a copy of it.** The
+  claim is signed by the seed-derived operator key whose public half is the entitlement's
+  subject, so pasting someone else's licence into your channel proves nothing to anyone.
+- **Seat counts read the licence.** `FleetCount::exceeded_under` uses the entitlement's
+  allowances when one is installed and falls back to the free tier when none is.
+
+### Changed
+
+- **`ferry enable` starts the managed Syncthing instead of noting that it is down.**
+  Enabling on a machine whose daemon was not running registered nothing and carried on,
+  which is a bad first five minutes for someone who just pointed an agent at the repo.
+- **Syncthing installs from the project's own releases on Linux.** Rather than guessing
+  between apt, dnf, pacman and apk, the static binary for the machine's architecture is
+  downloaded and unpacked per-user under the machine state directory. Nothing is
+  elevated, and `find_binary` looks there.
+- **Setup reads the git identity before it asks for one.** `git config --get user.email`
+  is consulted first, so an agent working unattended does not stop on a question the
+  machine can already answer.
+
 ## v0.5.10 - 2026-09-09
 
 Beta. An invitation no longer names the person; the person names themselves.

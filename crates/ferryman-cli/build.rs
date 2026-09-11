@@ -47,4 +47,24 @@ fn main() {
         (None, _) => String::new(),
     };
     println!("cargo:rustc-env=FERRYMAN_BUILD={describe}");
+
+    // The date this build was made, which is what a licence window is measured against.
+    //
+    // Checking a licence against the system clock needs either a trusted clock or a
+    // server, and has neither here: moving the clock back would extend any licence
+    // indefinitely. The release date cannot be moved by the person holding the binary,
+    // so an entitlement covers every build released while it was valid and the clock is
+    // never consulted. The committer date, not "now", so the same commit built twice
+    // gives the same answer.
+    let built = Command::new("git")
+        .args(["log", "-1", "--format=%cs"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
+    if let Some(built) = built {
+        println!("cargo:rustc-env=FERRYMAN_BUILD_DATE={built}");
+    }
 }
