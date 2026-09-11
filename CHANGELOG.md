@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`ferry enable` no longer breaks sync by moving a folder in silence.** Syncthing's
+  config POST replaces a folder carrying the same id, its path included, so registering
+  blind re-pointed a `<project>-ferryman` folder that already existed at another path
+  and said nothing about it. Worse, Syncthing writes the `.stfolder` marker when it
+  *creates* a folder root and never when it updates one, so the moved folder landed on a
+  directory with no marker and Syncthing then refused to touch it in either direction -
+  "folder marker missing" - forever, silently. Registration now reads the folder id
+  first: unchanged path, it only widens the share list; different path, it moves the
+  folder deliberately and reports where it came from (`moved_from`, printed as
+  `moved from <path> - that path no longer syncs`). This is why `ferry channel syncthing
+  off` then `on` was the only thing that fixed it: the delete made the next
+  registration a genuine creation.
+- **Ferryman writes the Syncthing folder marker itself.** `.stfolder` is created
+  alongside the channel directory rather than left to Syncthing, so the missing-marker
+  failure cannot happen whichever way Syncthing treats the registration.
+- **`ferry doctor` stops reporting a dead folder as ready.** The `syncthing` check only
+  asked whether the daemon answered and counted paired devices, which is why it said
+  healthy while nothing had synced in either direction. A new `syncthing_folder` check
+  reads `/rest/db/status` for this project's folder and fails on any state that is not
+  `idle`, `scanning` or `syncing`, quoting Syncthing's own error.
+
+- **`ferry channel syncthing on` no longer unshares the folder it is repairing.** It
+  called `syncthing_register_folder(&route, &[])` - an empty share list - so the command
+  people reach for to fix a folder silently dropped every device it was reaching. It now
+  goes through `syncthing_share_folder`, which reads the current device list first and
+  adds to it. Found by causing it: repairing two folders on a live machine took them
+  from two devices to one, and nothing said so.
+- **The test suite no longer rewrites the operator's real ferry manifest.** Tests run
+  `ferry enable` in temporary workspaces; `enable` found the machine's real ferry root
+  and filed the temporary project into it. Because filing merges by project id, a
+  scratch project sharing a name with a real one overwrote the real one's channel path
+  with a directory that was deleted seconds later - four live projects on one machine
+  went that way in an afternoon. `Root::adopt` now refuses to file a channel under the
+  machine's temporary directory into a root that is not itself temporary, and returns
+  whether it filed rather than reporting success either way. A temporary root filing its
+  own temporary channels is untouched, which is what every test fixture does, so no test
+  had to opt in and none can forget to.
+- **`ferry root gather`** moves scattered channels into the root's `comms/`, one place
+  for every channel. `--dry-run` says what would move. Only the channel directory moves:
+  keys and config stay in the project, because keys must never enter the directory
+  Syncthing carries. Peers are unaffected - a Syncthing folder's path is local to each
+  machine and devices match on the folder id - and the share list is preserved.
+- **A channel may live outside its project.** `validate` required `communications` to be
+  exactly `<attachment>/ferryman`, which made a shared comms root impossible. What that
+  rule was really protecting is now what it says: the channel may be anywhere outside the
+  workspace, and never anywhere inside it, because a channel inside the workspace would
+  put the work itself into the synced folder.
+
 ## v0.5.10 - 2026-09-09
 
 Beta. An invitation no longer names the person; the person names themselves.

@@ -37,7 +37,7 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// The file that marks a ferry root and describes what is in it.
@@ -144,7 +144,13 @@ impl Root {
     ///
     /// `repo` is taken as given. If it sits outside this root it is marked adopted, which
     /// is the flag everything else reads before deciding whether it may touch it.
-    pub fn adopt(&self, project_id: &str, channel: &Path, repo: Option<&Path>) -> Result<()> {
+    ///
+    /// Returns whether it was filed. A scratch project is not, and that is not an error:
+    /// see `would_outlive_the_project` for the one case this refuses and why.
+    pub fn adopt(&self, project_id: &str, channel: &Path, repo: Option<&Path>) -> Result<bool> {
+        if self.would_outlive_the_project(channel) {
+            return Ok(false);
+        }
         let mut manifest = self.read();
         let adopted = repo.is_some_and(|repo| !repo.starts_with(&self.path));
         let entry = Entry {
@@ -175,7 +181,25 @@ impl Root {
         manifest
             .projects
             .sort_by(|a, b| a.project_id.cmp(&b.project_id));
-        self.write(&manifest)
+        self.write(&manifest)?;
+        Ok(true)
+    }
+
+    /// Whether filing this channel would leave the index pointing at a directory that
+    /// disappears while the index does not.
+    ///
+    /// A channel under the machine's temporary directory is scratch: a test fixture, or
+    /// a one-off run. Filing one into a durable root writes a path that will not exist
+    /// in a minute, and because `adopt` merges by project id, a scratch project sharing
+    /// a name with a real one OVERWRITES the real one's path. That is not hypothetical -
+    /// it is how four live projects on this machine came to point at deleted
+    /// `AppData\Local\Temp\.tmp*` directories: the test suite ran `enable` in temp
+    /// workspaces, and each one filed itself into the operator's real ferry root.
+    ///
+    /// A temporary root filing a temporary channel is fine and is what the tests here
+    /// do - both vanish together. The damage is only ever scratch into durable.
+    fn would_outlive_the_project(&self, channel: &Path) -> bool {
+        under_temp_dir(channel) && !under_temp_dir(&self.path)
     }
 
     /// Everything the manifest lists that is still on disk.
@@ -190,6 +214,83 @@ impl Root {
             .into_iter()
             .filter(|entry| entry.channel.is_dir())
             .collect()
+    }
+
+    /// Where this project's channel belongs once it lives in the root.
+    #[must_use]
+    pub fn comms_home(&self, project_id: &str) -> PathBuf {
+        self.comms().join(format!("{project_id}-ferryman"))
+    }
+
+    /// Move one project's channel into `comms/`, so every channel lives in one place.
+    ///
+    /// `adopt` deliberately moves nothing, which is right when you are recording what
+    /// already exists. It is wrong as the only option: channels then accumulate wherever
+    /// each `ferry enable` happened to run, and answering "where is everything" means
+    /// reading a manifest of scattered paths and hoping it is current.
+    ///
+    /// Only the channel directory moves. Keys, `agent.toml` and `bridge.toml` stay in the
+    /// project's `.ferryman/` where they were: the keys are the reason - they are never
+    /// synced, and moving them into the directory Syncthing carries is precisely the
+    /// mistake this software exists to make impossible.
+    ///
+    /// Safe across machines, which is the part that looks alarming and is not: a Syncthing
+    /// folder's path is local to each device and the folder id is what peers match on. A
+    /// channel gathered here keeps its id, so every other machine goes on syncing it at
+    /// its own path, and nothing re-pairs.
+    pub fn gather(&self, project_id: &str, dry_run: bool) -> Result<Gathered> {
+        let manifest = self.read();
+        let entry = manifest
+            .projects
+            .iter()
+            .find(|entry| entry.project_id == project_id)
+            .with_context(|| {
+                format!(
+                    "no project '{project_id}' in {}",
+                    self.manifest_path().display()
+                )
+            })?
+            .clone();
+        let from = entry.channel.clone();
+        let to = self.comms_home(project_id);
+
+        let mut gathered = Gathered {
+            project_id: project_id.to_string(),
+            from: from.clone(),
+            to: to.clone(),
+            moved: false,
+            note: String::new(),
+        };
+        if from == to {
+            gathered.note = "already in the root".to_string();
+            return Ok(gathered);
+        }
+        if !from.is_dir() {
+            gathered.note = format!("channel {} is not on this machine", from.display());
+            return Ok(gathered);
+        }
+        if to.exists() && std::fs::read_dir(&to).is_ok_and(|mut d| d.next().is_some()) {
+            bail!(
+                "{} already holds something; move it aside before gathering '{project_id}'",
+                to.display()
+            );
+        }
+        if dry_run {
+            gathered.note = "would move".to_string();
+            return Ok(gathered);
+        }
+
+        std::fs::create_dir_all(self.comms())?;
+        move_directory(&from, &to)
+            .with_context(|| format!("move {} to {}", from.display(), to.display()))?;
+        // The manifest and bridge.toml must agree, and bridge.toml is what the running
+        // agent reads. Rewriting the index alone would leave the worker writing into a
+        // directory that is no longer the channel.
+        repoint_bridge(&from, &to)?;
+        self.adopt(project_id, &to, entry.repo.as_deref())?;
+        gathered.moved = true;
+        gathered.note = "moved".to_string();
+        Ok(gathered)
     }
 
     /// Put a link to an adopted repository in `repos/`, so the tidy view exists without
@@ -215,6 +316,102 @@ impl Root {
         let made = false;
         Ok(made.then_some(link))
     }
+}
+
+/// What gathering one project did, or would do.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Gathered {
+    pub project_id: String,
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// False when nothing needed doing, or when this was a dry run.
+    pub moved: bool,
+    pub note: String,
+}
+
+/// Move a directory, falling back to copy-then-remove across filesystems.
+///
+/// `rename` is the whole operation on one volume and cannot half-happen, which is what
+/// you want for something an agent may be writing into. Across volumes there is no such
+/// primitive, so the copy is done first and the original removed only once every file
+/// arrived - a crash in the middle leaves both, which is recoverable, rather than
+/// neither, which is not.
+fn move_directory(from: &Path, to: &Path) -> Result<()> {
+    if std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    copy_tree(from, to)?;
+    std::fs::remove_dir_all(from).with_context(|| format!("remove {}", from.display()))
+}
+
+fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
+    for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else {
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copy {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Point `bridge.toml` at the channel's new home.
+///
+/// Rewritten a line at a time rather than through a TOML round trip. These files carry
+/// Windows paths written literally - `X:\project` - which a strict TOML writer would
+/// re-escape, changing every path in the file to fix one. Touch the one line that moved.
+fn repoint_bridge(old_channel: &Path, new_channel: &Path) -> Result<()> {
+    let Some(attachment) = old_channel.parent() else {
+        return Ok(());
+    };
+    let bridge = attachment.join("bridge.toml");
+    if !bridge.is_file() {
+        return Ok(());
+    }
+    let text =
+        std::fs::read_to_string(&bridge).with_context(|| format!("read {}", bridge.display()))?;
+    let rewritten: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("communications") && line.contains('=') {
+                format!("communications = \"{}\"", new_channel.display())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    let mut out = rewritten.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(&bridge, out).with_context(|| format!("write {}", bridge.display()))
+}
+
+/// Whether a path sits inside this machine's temporary directory.
+///
+/// Compared as folded text rather than by `canonicalize`, which would fail on a path
+/// that has already been cleaned up - and a path that no longer exists is exactly the
+/// case this is here to catch.
+fn under_temp_dir(path: &Path) -> bool {
+    let fold = |path: &Path| {
+        let text = path.display().to_string().replace('\\', "/");
+        let text = text.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    };
+    let temp = fold(&std::env::temp_dir());
+    if temp.is_empty() {
+        return false;
+    }
+    let candidate = fold(path);
+    candidate == temp || candidate.starts_with(&format!("{temp}/"))
 }
 
 fn root_pointer() -> Option<PathBuf> {
@@ -305,6 +502,160 @@ mod tests {
         assert!(root.work().is_dir());
         assert!(root.manifest_path().is_file());
         assert!(root.projects().is_empty());
+    }
+
+    /// The exact damage this rule exists to stop, reproduced.
+    ///
+    /// A scratch run in a temp workspace filed itself into the operator's durable root
+    /// and, because filing merges by project id, overwrote a live project's channel path
+    /// with a directory that was deleted seconds later. Four real projects on one machine
+    /// went that way in an afternoon.
+    #[test]
+    fn a_scratch_project_cannot_overwrite_a_real_one_in_a_durable_root() {
+        let scratch = std::env::temp_dir().join("ferryman-scratch/alpha-ferryman");
+        // Not created on disk: the rule is about where a path IS, and every other test
+        // here builds its root inside a temp directory, so this one has to name
+        // somewhere that is not.
+        let durable_root = Root {
+            path: if cfg!(windows) {
+                PathBuf::from(r"X:\ferry")
+            } else {
+                PathBuf::from("/home/josh/ferry")
+            },
+        };
+        let durable_channel = durable_root.comms().join("alpha-ferryman");
+        let temporary_root = Root {
+            path: std::env::temp_dir().join("ferryman-root"),
+        };
+
+        // The case that did the damage: scratch filed into a durable root.
+        assert!(durable_root.would_outlive_the_project(&scratch));
+        // And the three that are fine.
+        assert!(!durable_root.would_outlive_the_project(&durable_channel));
+        assert!(!temporary_root.would_outlive_the_project(&scratch));
+        assert!(!temporary_root.would_outlive_the_project(&durable_channel));
+    }
+
+    /// The rule must not fire on the ordinary case of a root that is itself temporary,
+    /// which is what every test here builds. Both vanish together, so nothing is stranded.
+    #[test]
+    fn a_temporary_root_still_files_its_own_temporary_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let channel = channel(&root.path, "alpha");
+        assert!(root.adopt("alpha", &channel, None).unwrap());
+        assert_eq!(root.projects().len(), 1);
+    }
+
+    /// Gathering brings the channel home, leaves the keys where they were, and tells the
+    /// truth in both places that record where the channel is. Getting either half wrong
+    /// leaves a worker writing into a directory that is no longer the channel.
+    #[test]
+    fn gathering_moves_the_channel_and_never_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+
+        let repo = dir.path().join("scattered/my-repo");
+        let attachment = repo.join(".ferryman");
+        let scattered = attachment.join("ferryman");
+        std::fs::create_dir_all(scattered.join("tasks")).unwrap();
+        std::fs::write(scattered.join("tasks/one.json"), "{}").unwrap();
+        std::fs::create_dir_all(attachment.join("keys")).unwrap();
+        std::fs::write(attachment.join("keys/secret"), "never synced").unwrap();
+        std::fs::write(
+            attachment.join("bridge.toml"),
+            format!(
+                "project = \"alpha\"\ncommunications = \"{}\"\ngrants = \"open\"\n",
+                scattered.display()
+            ),
+        )
+        .unwrap();
+        root.adopt("alpha", &scattered, Some(&repo)).unwrap();
+
+        let gathered = root.gather("alpha", false).unwrap();
+        assert!(gathered.moved);
+        assert_eq!(gathered.to, root.comms_home("alpha"));
+
+        // The channel and its contents came across.
+        assert!(root.comms_home("alpha").join("tasks/one.json").is_file());
+        assert!(!scattered.exists());
+
+        // The keys did NOT. They are never synced, and the directory we just moved is
+        // the one Syncthing carries.
+        assert!(attachment.join("keys/secret").is_file());
+
+        // Both records agree with each other and with the disk.
+        assert_eq!(root.projects()[0].channel, root.comms_home("alpha"));
+        let bridge = std::fs::read_to_string(attachment.join("bridge.toml")).unwrap();
+        assert!(bridge.contains(&format!(
+            "communications = \"{}\"",
+            root.comms_home("alpha").display()
+        )));
+        assert!(
+            bridge.contains("grants = \"open\""),
+            "the rest is untouched"
+        );
+    }
+
+    /// Setup runs more than once and people re-run commands. Gathering something already
+    /// gathered must be a no-op, not a move onto itself.
+    #[test]
+    fn gathering_twice_moves_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let scattered = dir.path().join("elsewhere/beta-ferryman");
+        std::fs::create_dir_all(&scattered).unwrap();
+        std::fs::write(scattered.join("keep"), "me").unwrap();
+        root.adopt("beta", &scattered, None).unwrap();
+
+        assert!(root.gather("beta", false).unwrap().moved);
+        let second = root.gather("beta", false).unwrap();
+        assert!(!second.moved);
+        assert_eq!(second.note, "already in the root");
+        assert!(root.comms_home("beta").join("keep").is_file());
+    }
+
+    /// A dry run must be readable and must not touch the disk, because the whole point
+    /// of offering one is to be believed before seventeen channels move at once.
+    #[test]
+    fn a_dry_run_says_what_would_happen_and_does_none_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let scattered = dir.path().join("elsewhere/gamma-ferryman");
+        std::fs::create_dir_all(&scattered).unwrap();
+        root.adopt("gamma", &scattered, None).unwrap();
+
+        let planned = root.gather("gamma", true).unwrap();
+        assert!(!planned.moved);
+        assert_eq!(planned.note, "would move");
+        assert_eq!(planned.to, root.comms_home("gamma"));
+        assert!(scattered.is_dir(), "still where it was");
+        assert!(!root.comms_home("gamma").exists());
+        assert_eq!(root.projects()[0].channel, scattered);
+    }
+
+    /// Refusing beats merging. Two channels landing in one directory is not something a
+    /// person can unpick afterwards.
+    #[test]
+    fn gathering_onto_an_occupied_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let scattered = dir.path().join("elsewhere/delta-ferryman");
+        std::fs::create_dir_all(&scattered).unwrap();
+        root.adopt("delta", &scattered, None).unwrap();
+
+        let occupied = root.comms_home("delta");
+        std::fs::create_dir_all(&occupied).unwrap();
+        std::fs::write(occupied.join("someone-elses"), "data").unwrap();
+
+        assert!(root.gather("delta", false).is_err());
+        assert!(scattered.is_dir(), "nothing was moved out");
+        assert!(occupied.join("someone-elses").is_file(), "nor overwritten");
     }
 
     /// The rule this whole module exists to keep: adoption records, it does not move.

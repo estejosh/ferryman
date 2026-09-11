@@ -284,7 +284,26 @@ impl ProjectRoute {
             bail!("attachment must be <workspace>/.ferryman")
         }
         if communications != format!("{attachment}/ferryman") {
-            bail!("communications must be <attachment>/ferryman")
+            // The channel does not have to sit inside the project. Keeping every channel
+            // together in one comms root is a layout people actually want, and it is how
+            // a machine answers "where is everything" without reading a manifest of
+            // scattered paths.
+            //
+            // What it may never be is anywhere else INSIDE the workspace, and that is
+            // what this check was really protecting. Point `communications` at the
+            // repository and Syncthing carries the source code to every paired machine -
+            // the one thing this software promises it will never do. Outside the
+            // workspace, a channel is just a channel.
+            if communications == workspace
+                || communications.starts_with(&format!("{workspace}/"))
+                || workspace.starts_with(&format!("{communications}/"))
+            {
+                bail!(
+                    "communications must be <attachment>/ferryman, or a directory outside \
+                     the project entirely - never another directory inside the workspace, \
+                     which would put the work itself into the synced folder"
+                )
+            }
         }
         // Visibility only matters when there is actually a remote to expose. A
         // Syncthing-only channel has no GitHub repository whose visibility could leak.
@@ -4088,6 +4107,12 @@ pub struct SyncthingSetup {
     pub device_id: Option<String>,
     /// Peers the folder is now shared with.
     pub shared_with: Vec<SyncthingPeer>,
+    /// Set when this registration moved an existing folder id off another path.
+    ///
+    /// Never silent. Re-pointing a folder id stops the old path syncing, and a caller
+    /// that cannot see it happened cannot tell the operator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub moved_from: Option<String>,
     pub note: String,
 }
 
@@ -4315,8 +4340,9 @@ fn syncthing_delete(api_base: &str, path: &str, api_key: &str) -> Result<Option<
 /// single biggest reason setting up a second machine was hard: everything else is one
 /// command, and this was a trip through a web UI. An agent cannot click a web UI.
 ///
-/// Idempotent. Syncthing's config POST replaces a folder with the same id, so running
-/// it again after adding a machine simply widens the share list.
+/// Idempotent. Running it again after adding a machine simply widens the share list.
+/// If the folder id is already registered at a different path this moves it, and says so
+/// in `moved_from` rather than leaving the operator to discover it.
 pub fn syncthing_register_folder(
     route: &ProjectRoute,
     share_with: &[SyncthingPeer],
@@ -4326,6 +4352,7 @@ pub fn syncthing_register_folder(
     } else {
         route.shared_remote.clone()
     };
+    debug_assert_eq!(folder_id, channel_folder_id(route));
     register_folder(
         &folder_id,
         &route.communications,
@@ -4384,6 +4411,7 @@ fn register_folder(
         folder_path: folder_path.clone(),
         device_id: None,
         shared_with: Vec::new(),
+        moved_from: None,
         note: note.to_string(),
     };
 
@@ -4407,6 +4435,39 @@ fn register_folder(
         .get("myID")
         .and_then(Value::as_str)
         .map(str::to_string);
+
+    // Look before writing.
+    //
+    // Syncthing's config POST replaces a folder carrying the same id, path included, so
+    // registering blind moves a folder that already lives somewhere else and says
+    // nothing about it. That alone would be bad. What made it silent breakage is that
+    // Syncthing writes the `.stfolder` marker when it CREATES a folder root and not when
+    // it updates one, so the moved folder lands on a directory with no marker and
+    // Syncthing then refuses to touch it in either direction - "folder marker missing" -
+    // while every reading Ferryman took said healthy.
+    //
+    // So: find out first. A move is done as a delete followed by a create, which is what
+    // `channel syncthing off` + `on` was doing by accident and why that pair was the
+    // only thing that fixed it.
+    let existing_path = syncthing_get(&base, &format!("/rest/config/folders/{folder_id}"), &key)?
+        .and_then(|folder| {
+            folder
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let moved_from = match existing_path {
+        Some(old) if !same_folder_path(&old, &folder_path) => {
+            syncthing_delete(&base, &format!("/rest/config/folders/{folder_id}"), &key)?;
+            Some(old)
+        }
+        _ => None,
+    };
+
+    // Ferryman writes the marker itself rather than hoping Syncthing will. Idempotent,
+    // and it makes the missing-marker failure impossible whichever way Syncthing decides
+    // to treat the registration.
+    ensure_folder_marker(path)?;
 
     let mut devices: Vec<Value> = Vec::new();
     if let Some(me) = &device_id {
@@ -4433,17 +4494,129 @@ fn register_folder(
             folder_path,
             device_id,
             shared_with: share_with.to_vec(),
-            note: if share_with.is_empty() {
-                "folder registered; no other devices are paired with this Syncthing yet".to_string()
-            } else {
-                "folder registered and shared".to_string()
+            note: match (&moved_from, share_with.is_empty()) {
+                (Some(old), _) => format!(
+                    "folder moved here from {old} and registered; that path no longer syncs"
+                ),
+                (None, true) => {
+                    "folder registered; no other devices are paired with this Syncthing yet"
+                        .to_string()
+                }
+                (None, false) => "folder registered and shared".to_string(),
             },
+            moved_from,
         }),
         Some(code) => Ok(unavailable(&format!(
             "Syncthing refused the folder (HTTP {code}); register it by hand"
         ))),
         None => Ok(unavailable("could not reach Syncthing's API")),
     }
+}
+
+/// Create the channel directory and the `.stfolder` marker Syncthing insists on.
+///
+/// Syncthing refuses to touch a folder whose marker is missing - "folder marker missing
+/// (this indicates potential data loss)" - in either direction, and reports it only on
+/// `/rest/db/status`, which nothing in Ferryman used to read. So a registration that
+/// left the marker uncreated looked completely healthy and synced nothing, forever.
+fn ensure_folder_marker(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("create channel folder {}", path.display()))?;
+    let marker = path.join(".stfolder");
+    if !marker.exists() {
+        fs::create_dir(&marker)
+            .with_context(|| format!("create Syncthing folder marker {}", marker.display()))?;
+    }
+    Ok(())
+}
+
+/// Whether two folder paths name the same directory, closely enough to decide whether a
+/// registration is a move.
+///
+/// Compared as text rather than by `canonicalize`, because the path Syncthing holds may
+/// not exist on this machine any more and canonicalising it would fail. Separators are
+/// folded and the comparison ignores case on Windows only, which is where it matters.
+fn same_folder_path(a: &str, b: &str) -> bool {
+    let normalise = |p: &str| {
+        let p = p.trim().replace('\\', "/");
+        let p = p.trim_end_matches('/').to_string();
+        if cfg!(windows) { p.to_lowercase() } else { p }
+    };
+    normalise(a) == normalise(b)
+}
+
+/// What Syncthing actually thinks of one folder right now.
+///
+/// `state` is Syncthing's own word - `idle`, `scanning`, `syncing`, `error`. Anything
+/// other than those first three means this folder is not syncing, whatever the daemon's
+/// health and device counts say.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncthingFolderState {
+    pub folder_id: String,
+    pub state: String,
+    /// Syncthing's explanation when `state` is `error`; empty otherwise.
+    pub error: String,
+    /// The path Syncthing is actually syncing under this id.
+    ///
+    /// Not the same question as the state. A folder id can be `idle` on a directory
+    /// that is not this project's channel at all, in which case this project syncs
+    /// nothing while every reading says healthy - the same silent failure as a missing
+    /// marker, one level up.
+    #[serde(default)]
+    pub registered_path: String,
+}
+
+/// Read one folder's state from Syncthing. `None` when Syncthing cannot be reached or
+/// does not know the folder.
+#[must_use]
+pub fn syncthing_folder_state(folder_id: &str) -> Option<SyncthingFolderState> {
+    let key = syncthing_api_key()?;
+    let base = syncthing_api_base();
+    let status = syncthing_get(&base, &format!("/rest/db/status?folder={folder_id}"), &key)
+        .ok()
+        .flatten()?;
+    Some(SyncthingFolderState {
+        folder_id: folder_id.to_string(),
+        state: status
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        error: status
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        registered_path: syncthing_get(&base, &format!("/rest/config/folders/{folder_id}"), &key)
+            .ok()
+            .flatten()
+            .and_then(|f| f.get("path").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default(),
+    })
+}
+
+impl SyncthingFolderState {
+    /// Whether Syncthing is moving this folder at all.
+    #[must_use]
+    pub fn is_moving(&self) -> bool {
+        matches!(self.state.as_str(), "idle" | "scanning" | "syncing")
+    }
+
+    /// Whether the directory Syncthing syncs under this id is the one given.
+    ///
+    /// Unknown paths count as matching: an older Syncthing that does not answer the
+    /// config query should not be reported as a mismatch it cannot prove.
+    #[must_use]
+    pub fn syncs(&self, channel: &Path) -> bool {
+        self.registered_path.is_empty()
+            || same_folder_path(&self.registered_path, &channel.display().to_string())
+    }
+}
+
+/// This project's channel folder state, by the same id `register_folder` uses.
+#[must_use]
+pub fn syncthing_channel_state(route: &ProjectRoute) -> Option<SyncthingFolderState> {
+    syncthing_folder_state(&channel_folder_id(route))
 }
 
 /// The device ids this project's channel folder is currently shared with
@@ -4716,6 +4889,7 @@ pub fn syncthing_unregister_folder(route: &ProjectRoute) -> Result<SyncthingSetu
         folder_path: folder_path.clone(),
         device_id: None,
         shared_with: Vec::new(),
+        moved_from: None,
         note: note.to_string(),
     };
     let Some(key) = syncthing_api_key() else {
@@ -4731,6 +4905,7 @@ pub fn syncthing_unregister_folder(route: &ProjectRoute) -> Result<SyncthingSetu
             folder_path,
             device_id: None,
             shared_with: Vec::new(),
+            moved_from: None,
             note: "folder removed from Syncthing; the channel still works locally".to_string(),
         }),
         Some(code) => Ok(unavailable(&format!(
@@ -7115,6 +7290,129 @@ mod tests {
             TransportKind::SharedFolder
         );
         assert_eq!(shared_log.lock().unwrap().as_slice(), &[message.id]);
+    }
+
+    /// A folder id that is healthy on somebody else's directory is not this project
+    /// syncing. Reading the state without reading the path is how `doctor` reported
+    /// `ferryman-ferryman is idle` while the repository's own channel synced nothing.
+    #[test]
+    fn a_folder_healthy_on_another_directory_is_not_this_project_syncing() {
+        let here = PathBuf::from("/home/josh/ferryman/.ferryman/ferryman");
+        let mut state = SyncthingFolderState {
+            folder_id: "ferryman-ferryman".to_string(),
+            state: "idle".to_string(),
+            error: String::new(),
+            registered_path: "/home/josh/ferryman-ferryman/.ferryman/ferryman".to_string(),
+        };
+        assert!(state.is_moving(), "Syncthing is happy with the folder");
+        assert!(!state.syncs(&here), "but it is not syncing this channel");
+
+        state.registered_path = here.display().to_string();
+        assert!(state.syncs(&here));
+
+        // A Syncthing that does not answer the config query cannot prove a mismatch, so
+        // it must not be reported as one.
+        state.registered_path = String::new();
+        assert!(state.syncs(&here));
+    }
+
+    /// The marker is what Syncthing refuses to sync without, and Ferryman used to leave it
+    /// to Syncthing, which only writes it when it creates a folder root - never on an
+    /// update. So a registration that moved a folder produced a live config pointing at a
+    /// directory Syncthing would not touch, and said nothing.
+    #[test]
+    fn registering_a_folder_leaves_a_syncthing_marker_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = dir.path().join("ferryman-comms");
+        ensure_folder_marker(&channel).unwrap();
+        assert!(
+            channel.join(".stfolder").exists(),
+            "Syncthing will refuse the folder without its marker"
+        );
+    }
+
+    /// Idempotent: setup runs more than once, and the second run must not fail on a marker
+    /// the first run already made.
+    #[test]
+    fn making_the_marker_twice_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        ensure_folder_marker(dir.path()).unwrap();
+        ensure_folder_marker(dir.path()).unwrap();
+        assert!(dir.path().join(".stfolder").exists());
+    }
+
+    /// Whether a registration is a move is decided by this comparison, and getting it wrong
+    /// in either direction is expensive: too strict and every re-run looks like a move, too
+    /// loose and a real move goes unreported.
+    #[test]
+    fn a_path_spelt_differently_is_still_the_same_path() {
+        assert!(same_folder_path("/home/josh/comms", "/home/josh/comms/"));
+        assert!(same_folder_path("/home/josh/comms", "  /home/josh/comms  "));
+        assert!(!same_folder_path("/home/josh/comms", "/home/josh/other"));
+        if cfg!(windows) {
+            assert!(same_folder_path(r"X:\ferry\comms", "X:/ferry/comms"));
+            assert!(same_folder_path(r"X:\Ferry\Comms", r"x:\ferry\comms"));
+        }
+    }
+
+    /// A `SyncthingSetup` written before `moved_from` existed must still parse, because
+    /// setup output gets stored and read back by things that did not ship together.
+    #[test]
+    fn a_setup_recorded_before_moves_were_reported_still_parses() {
+        let old = r#"{
+        "available": true,
+        "folder_id": "demo-ferryman",
+        "folder_path": "/home/josh/comms",
+        "device_id": null,
+        "shared_with": [],
+        "note": "folder registered and shared"
+    }"#;
+        let setup: SyncthingSetup = serde_json::from_str(old).unwrap();
+        assert!(setup.moved_from.is_none());
+    }
+
+    /// A channel may be gathered into a comms root outside the project, but nothing may
+    /// ever put the workspace itself into the synced folder. Loosening the first without
+    /// keeping the second would turn "Ferryman never touches your work" into a lie by
+    /// configuration.
+    #[test]
+    fn a_channel_may_live_outside_the_project_but_never_inside_the_work() {
+        // "Absolute" means different things per platform, and this test is about the
+        // containment rule rather than about how a path is spelt.
+        let base = if cfg!(windows) {
+            "C:/josh"
+        } else {
+            "/home/josh"
+        };
+        let project = format!("{base}/demo");
+        let route = |workspace: &str, communications: &str| ProjectRoute {
+            project_id: "demo".to_string(),
+            workspace: PathBuf::from(workspace),
+            attachment: PathBuf::from(format!("{workspace}/.ferryman")),
+            communications: PathBuf::from(communications),
+            shared_remote: "demo-ferryman".to_string(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+
+        // The classic layout, and the gathered one.
+        route(&project, &format!("{project}/.ferryman/ferryman"))
+            .validate()
+            .expect("the channel inside the attachment");
+        route(&project, &format!("{base}/ferry/comms/demo-ferryman"))
+            .validate()
+            .expect("a comms root outside the project");
+
+        // The work itself, and anywhere else inside it.
+        assert!(route(&project, &project).validate().is_err());
+        assert!(
+            route(&project, &format!("{project}/src"))
+                .validate()
+                .is_err()
+        );
+        // And a channel that would swallow the workspace from above.
+        assert!(route(&project, base).validate().is_err());
     }
 
     /// The case this whole change exists for: a channel carried entirely by Syncthing,

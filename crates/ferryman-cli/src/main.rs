@@ -536,6 +536,22 @@ enum RootCommand {
         /// The project directory or channel to adopt. Defaults to where you are.
         workspace: Option<PathBuf>,
     },
+    /// Move channels into `comms/`, so every channel lives in one place.
+    ///
+    /// `adopt` records a channel where it stands; this one brings it home. Only the
+    /// channel directory moves - keys and config stay in the project, because keys must
+    /// never enter the directory Syncthing carries.
+    ///
+    /// Safe for the rest of the fleet: a Syncthing folder's path is local to each
+    /// machine and peers match on the folder id, so nothing re-pairs.
+    Gather {
+        /// One project id. Omit to gather every project in the manifest.
+        #[arg(long)]
+        project: Option<String>,
+        /// Say what would move and move nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -7315,7 +7331,11 @@ fn channel(command: Channel) -> Result<()> {
             }
             SyncthingAction::On { workspace } => {
                 let route = here(workspace)?;
-                print_syncthing_setup(&ferryman_channel::syncthing_register_folder(&route, &[])?);
+                // Not `register_folder(&route, &[])`. That re-registers the folder
+                // shared with nobody, so the command people reach for to REPAIR a
+                // folder silently unshared it from every machine it was reaching.
+                // `share_folder` reads the current device list first and adds to it.
+                print_syncthing_setup(&ferryman_channel::syncthing_share_folder(&route, &[])?);
             }
             SyncthingAction::Off { workspace } => {
                 let route = here(workspace)?;
@@ -7369,6 +7389,9 @@ fn channel(command: Channel) -> Result<()> {
 fn print_syncthing_setup(setup: &ferryman_channel::SyncthingSetup) {
     println!("folder  {}", setup.folder_id);
     println!("path    {}", setup.folder_path);
+    if let Some(old) = &setup.moved_from {
+        println!("moved   from {old} - that path no longer syncs");
+    }
     if setup.available && !setup.shared_with.is_empty() {
         for peer in &setup.shared_with {
             println!("shared  {}  {}", peer.device_id, peer.name);
@@ -7613,6 +7636,82 @@ fn root_command(command: RootCommand) -> Result<()> {
             println!("  Add a project you already have:  ferry root adopt <path>");
         }
 
+        RootCommand::Gather { project, dry_run } => {
+            let Some(root) = ferry::find_root() else {
+                println!("no ferry root yet.");
+                println!();
+                println!("  Make one:  ferry root init");
+                return Ok(());
+            };
+            let wanted: Vec<String> = match project {
+                Some(one) => vec![one],
+                None => root
+                    .read()
+                    .projects
+                    .into_iter()
+                    .map(|entry| entry.project_id)
+                    .collect(),
+            };
+            if wanted.is_empty() {
+                println!("nothing filed in {}", root.path.display());
+                return Ok(());
+            }
+            let mut moved = 0usize;
+            for id in wanted {
+                let gathered = root.gather(&id, dry_run)?;
+                println!("{:<24} {}", gathered.project_id, gathered.note);
+                if gathered.moved || (dry_run && gathered.note == "would move") {
+                    println!("  from  {}", gathered.from.display());
+                    println!("  to    {}", gathered.to.display());
+                }
+                if !gathered.moved {
+                    continue;
+                }
+                moved += 1;
+                // Syncthing is still pointing at the old directory, which no longer
+                // exists. Re-registering is what makes the move real rather than a
+                // rename that quietly stopped the folder syncing - and it prints where
+                // the folder came from, so the move is on the record.
+                // The attachment did not move - it is the project's `.ferryman`, and
+                // `gather` has just rewritten its `bridge.toml` to the new path. Reading
+                // the route from there is what proves the rewrite landed, and it is the
+                // only place that knows this project; the gathered directory has no
+                // attachment above it to walk up to.
+                match gathered
+                    .from
+                    .parent()
+                    .context("the channel had no attachment directory")
+                    .and_then(ferryman_channel::load_route)
+                {
+                    Ok(route) => {
+                        // `share_folder` with nothing to add re-registers the folder
+                        // keeping every device it already reached. Registering with an
+                        // empty list here would gather the channel and unshare it in
+                        // the same breath.
+                        print_syncthing_setup(&ferryman_channel::syncthing_share_folder(
+                            &route,
+                            &[],
+                        )?);
+                    }
+                    Err(err) => println!(
+                        "  could not re-register with Syncthing: {err}\n  \
+                         run `ferry channel syncthing on` in the project"
+                    ),
+                }
+            }
+            if dry_run {
+                println!();
+                println!("  Nothing moved. Run it without --dry-run to do it.");
+            } else if moved > 0 {
+                println!();
+                println!(
+                    "  {moved} channel(s) now live in {}",
+                    root.comms().display()
+                );
+                println!("  Other machines are unaffected: they match on the folder id.");
+            }
+        }
+
         RootCommand::Show => {
             let Some(root) = ferry::find_root() else {
                 println!("no ferry root yet.");
@@ -7666,7 +7765,18 @@ fn root_command(command: RootCommand) -> Result<()> {
                 .join(".git")
                 .exists()
                 .then(|| route.workspace.clone());
-            root.adopt(&route.project_id, &route.communications, repo.as_deref())?;
+            if !root.adopt(&route.project_id, &route.communications, repo.as_deref())? {
+                println!(
+                    "not filed: {} is under this machine's temporary directory",
+                    route.communications.display()
+                );
+                println!(
+                    "  A scratch channel outlives nothing, and filing one would point \
+                     {} at a path that is about to disappear.",
+                    root.manifest_path().display()
+                );
+                return Ok(());
+            }
             println!("filed {} in {}", route.project_id, root.path.display());
             println!("  channel  {}", route.communications.display());
             match &repo {

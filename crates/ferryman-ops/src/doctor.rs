@@ -357,6 +357,54 @@ pub fn examine(start: &Path) -> Report {
                     health.peers.len(),
                 ),
             ));
+
+            // A reachable daemon and a paired device count say nothing about whether
+            // this folder is actually syncing. A folder whose `.stfolder` marker is
+            // missing sits in `error` and moves nothing in either direction, and the
+            // only place that shows is `/rest/db/status`. Reporting the daemon alone as
+            // `ok` is how doctor came to say ready while sync was completely dead.
+            if let Some(folder) = ferryman_channel::syncthing_channel_state(&route) {
+                let moving = folder.is_moving();
+                let ours = folder.syncs(&route.communications);
+                checks.push(check(
+                    "syncthing_folder",
+                    moving && ours,
+                    false,
+                    if !ours {
+                        // The id is registered, and may well be perfectly healthy - on
+                        // somebody else's directory. This project then syncs nothing
+                        // while the state reads idle, which is the missing-marker
+                        // failure one level up and just as quiet.
+                        format!(
+                            "folder {} is {} but Syncthing is syncing {}, not this project's \
+                             channel at {} - nothing this project writes leaves the machine; \
+                             `ferry channel syncthing on` re-points it here",
+                            folder.folder_id,
+                            folder.state,
+                            folder.registered_path,
+                            route.communications.display(),
+                        )
+                    } else if moving {
+                        format!("folder {} is {}", folder.folder_id, folder.state)
+                    } else {
+                        format!(
+                            "folder {} is {}{} - nothing syncs in either direction until this \
+                             clears; `ferry channel syncthing on` re-registers it",
+                            folder.folder_id,
+                            if folder.state.is_empty() {
+                                "in an unknown state"
+                            } else {
+                                &folder.state
+                            },
+                            if folder.error.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" ({})", folder.error)
+                            },
+                        )
+                    },
+                ));
+            }
         }
         Err(err) => checks.push(check(
             "syncthing",
