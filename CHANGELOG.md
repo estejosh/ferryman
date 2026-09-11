@@ -52,6 +52,25 @@
   workspace, and never anywhere inside it, because a channel inside the workspace would
   put the work itself into the synced folder.
 
+### Security
+
+- **CVE-2026-48504 in `opentelemetry_sdk`.** `BaggagePropagator::extract_with_context`
+  parsed an inbound W3C baggage header before applying the size limits, so an oversized
+  header bought more CPU and allocation than it should have. Moderate, availability only,
+  and not reachable from anything Ferryman does - nothing here accepts inbound
+  propagation headers, the OTLP integration only exports - but the fix is free. The whole
+  OpenTelemetry set moves to 0.32 together, which `tracing-opentelemetry` 0.33 finally
+  allows; the partial bump Dependabot proposed does not compile, and the manifest says so
+  where the next person will look. Both lockfiles, the workspace's and the tray's.
+- **`chacha20` 0.10.1 was yanked.** Moved to 0.10.2. It is the cipher under the sealed
+  licensor key, so it is not a dependency to leave on a version the registry has
+  withdrawn.
+- **`reqwest` stays at 0.12 on purpose.** 0.13 builds, but its `rustls` feature swaps
+  `ring` for `aws-lc-rs`, and `aws-lc-sys` wants cmake and a C toolchain - a hard stop on
+  exactly the unattended machine an agent is asked to install this on. The OTLP exporter
+  pulls a 0.13 of its own regardless; one duplicate crate is cheaper than a native build
+  dependency.
+
 ### Added
 
 - **Licences that verify with no server.** An entitlement is a small signed document:
