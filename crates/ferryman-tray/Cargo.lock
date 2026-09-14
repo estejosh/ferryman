@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-channel"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -946,7 +946,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-ops"
-version = "0.5.10"
+version = "0.5.11"
 dependencies = [
  "anyhow",
  "chrono",

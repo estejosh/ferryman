@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.5.11 - 2026-09-14
+
+Beta. Sync that said it was healthy while nothing moved, and licences that verify
+with nothing to phone home to.
 
 ### Fixed
 
