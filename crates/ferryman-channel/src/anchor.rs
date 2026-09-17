@@ -1181,3 +1181,130 @@ mod watching {
         .expect("nothing about a healthy anchor changes what a master can do");
     }
 }
+
+/// What a pause does to work in flight, which is the part most likely to be got
+/// wrong by someone tightening this later.
+#[cfg(test)]
+mod paused_work {
+    use super::tests::roster_entry;
+    use super::*;
+    use crate::AgentIdentity;
+    use ed25519_dalek::Signer;
+
+    fn project(dir: &std::path::Path, who: &[&AgentIdentity]) -> ProjectRoute {
+        let workspace = dir.join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(&communications).unwrap();
+        ProjectRoute {
+            project_id: "ferryman".into(),
+            workspace,
+            attachment,
+            communications,
+            shared_remote: "ferryman-ferryman".into(),
+            git_remote: "git@github.com:estejosh/ferryman.git".into(),
+            git_visibility: "private".into(),
+            agents: who.iter().map(|i| roster_entry(i)).collect(),
+        }
+    }
+
+    fn pause(route: &ProjectRoute, master: &AgentIdentity) {
+        record(route, master, master.name(), 1, Outcome::Contradicted, "gone").unwrap();
+        let path = observation_path(route, master.name());
+        let mut observation: AnchorObservation =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        observation.contradicted_since =
+            Some(Utc::now() - chrono::Duration::hours(PAUSE_AFTER_HOURS + 1));
+        let signature = master
+            .signing
+            .sign(observation_payload(&observation).as_bytes());
+        observation.signature = Some(hex::encode(signature.to_bytes()));
+        crate::atomic_json(&path, &observation).unwrap();
+        assert!(is_paused(route, master.name()).unwrap());
+    }
+
+    /// Signed, because `work_for` refuses to offer an order nobody signed - so an
+    /// unsigned one would make this test pass or fail for the wrong reason.
+    fn an_order(id: &str, from: &AgentIdentity, to: &str) -> crate::Order {
+        let mut order = unsigned_order(id, from.name(), to);
+        from.sign_order(&mut order);
+        order
+    }
+
+    fn unsigned_order(id: &str, from: &str, to: &str) -> crate::Order {
+        crate::Order {
+            id: id.into(),
+            project_id: "ferryman".into(),
+            issued_by: from.into(),
+            assigned_to: Some(to.into()),
+            created_at: Utc::now(),
+            payload: serde_json::json!({ "task": "do the thing" }),
+            requires_review: false,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        }
+    }
+
+    /// The whole point of pausing rather than stopping: work already under way
+    /// finishes. Killing a fleet mid-task leaves repositories half-done.
+    #[test]
+    fn work_already_in_flight_runs_to_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let fang = AgentIdentity::from_seed("fang", [2u8; 32]);
+        let route = project(dir.path(), &[&josh, &fang]);
+        crate::master::initialize_master(&route, &josh, "josh").unwrap();
+
+        crate::issue_order(&route, &an_order("t-1", &josh, "fang")).unwrap();
+        pause(&route, &josh);
+
+        crate::claim_order(&route, "t-1", "fang").expect("a claim is not new work");
+        assert!(
+            !crate::work_for(&route, "fang").unwrap().is_empty(),
+            "a paused master must not hide work its fleet already holds"
+        );
+    }
+
+    #[test]
+    fn a_paused_master_issues_no_new_orders() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let fang = AgentIdentity::from_seed("fang", [2u8; 32]);
+        let route = project(dir.path(), &[&josh, &fang]);
+        crate::master::initialize_master(&route, &josh, "josh").unwrap();
+        pause(&route, &josh);
+
+        let error = crate::issue_order(&route, &an_order("t-2", &josh, "fang"))
+            .expect_err("the outgoing master points the fleet at nothing new")
+            .to_string();
+        assert!(error.contains("take new orders from you"), "{error}");
+    }
+
+    /// A paused master is not a paused project. Everybody else works as before,
+    /// including issuing orders of their own under their own grant.
+    #[test]
+    fn everybody_else_carries_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let fang = AgentIdentity::from_seed("fang", [2u8; 32]);
+        let route = project(dir.path(), &[&josh, &fang]);
+        crate::master::initialize_master(&route, &josh, "josh").unwrap();
+        pause(&route, &josh);
+
+        crate::issue_order(&route, &an_order("t-3", &fang, "fang"))
+            .expect("an orchestrator's own orders are not the master's to pause");
+    }
+
+    /// A project with no master at all must not acquire one of these checks by
+    /// accident: `issue_order` is on the hot path for every fleet that exists.
+    #[test]
+    fn a_project_with_no_master_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let fang = AgentIdentity::from_seed("fang", [2u8; 32]);
+        let route = project(dir.path(), &[&fang]);
+        crate::issue_order(&route, &an_order("t-4", &fang, "fang")).unwrap();
+    }
+}

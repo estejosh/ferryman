@@ -1151,9 +1151,24 @@ pub(crate) fn write_task_file<T: Serialize>(path: &Path, value: &T) -> Result<()
 }
 
 /// Issue an order into the channel.
+///
+/// New work only. Claiming, working, returning a result and reviewing one are all
+/// untouched by anything below: an order already in flight is finished by whoever
+/// holds it, because stopping a fleet mid-task leaves repositories half-done and
+/// helps nobody.
 pub fn issue_order(route: &ProjectRoute, order: &Order) -> Result<PathBuf> {
     if !is_safe_component(&order.id) {
         bail!("order id must be a path-safe identifier")
+    }
+    // A master whose git anchor has stopped verifying directs no NEW work (ADR 0022).
+    // This is the acquisition case rather than the dramatic one: the repository has
+    // moved, the outgoing master's fleet is still running, and the thing that has to
+    // stop is them pointing it at a codebase that is no longer theirs. Everyone else
+    // carries on under their own grant - a paused master is not a paused project.
+    if let Ok(Some(declaration)) = master::read_master(route)
+        && declaration.master.eq_ignore_ascii_case(&order.issued_by)
+    {
+        anchor::refuse_if_paused(route, &declaration.master, "take new orders from you")?;
     }
     let path = task_dir(route, &order.id).join("order.json");
     if path.exists() {
