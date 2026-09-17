@@ -3803,13 +3803,25 @@ pub fn scrub_child_environment_names() -> Vec<String> {
 /// makes it reviewable, which a closure inside a loop was not.
 fn looks_like_a_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    if !SECRET_NAME_HINTS.iter().any(|hint| upper.contains(hint)) {
+    // `PAT` is what GitHub itself calls a personal access token, so it is one of the
+    // commonest names a real machine gives one - and it matched none of the hints. Found
+    // on this repository's own box: a read-all GitHub PAT named `...readallPAT` sat in
+    // `.env` and would have reached the environment of every task any agent ran.
+    //
+    // It is a suffix rule and not a substring one on purpose. `PATH` contains `PAT`, and
+    // scrubbing `PATH` from a child environment would break every task there is, which is
+    // the kind of over-scrub that gets the whole mechanism turned off.
+    let named_pat = upper.ends_with("PAT") || upper.contains("_PAT_");
+    if !named_pat && !SECRET_NAME_HINTS.iter().any(|hint| upper.contains(hint)) {
         return false;
     }
     // The `GIT_` exemption exists so git's own configuration survives - `GIT_DIR`,
     // `GIT_TERMINAL_PROMPT` and friends, none of which look like secrets. It must not
     // become a way to smuggle one through: `GIT_TOKEN` was exempt purely for its prefix.
-    let git_configuration = upper.starts_with("GIT_")
+    // `!named_pat` first, or the prefix exemption would wave `GIT_PAT` straight through -
+    // the same hole `GIT_TOKEN` was already found in, wearing the other spelling.
+    let git_configuration = !named_pat
+        && upper.starts_with("GIT_")
         && !["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "CREDENTIAL"]
             .iter()
             .any(|hint| upper.contains(hint));
@@ -3819,6 +3831,34 @@ fn looks_like_a_secret_name(name: &str) -> bool {
 #[cfg(test)]
 mod child_environment_scrub {
     use super::looks_like_a_secret_name as secret;
+
+    /// `PAT` is GitHub's own word for a personal access token, and the hint list missed
+    /// every spelling of it. Found live: a read-all PAT in this repository's `.env`,
+    /// named so that nothing here would have stopped it reaching a child process. The
+    /// same failure as the one below, three years of habit later.
+    #[test]
+    fn a_name_saying_pat_is_a_secret_too() {
+        assert!(secret("GITHUB_PAT"));
+        assert!(secret("ferrymanestejoshreadallPAT"));
+        assert!(secret("MY_PAT"));
+        assert!(secret("PAT"));
+        assert!(secret("SOME_PAT_HERE"));
+        // The prefix exemption must not wave this through the way it once did GIT_TOKEN.
+        assert!(secret("GIT_PAT"));
+    }
+
+    /// The reason this is a suffix rule and not a substring one. Scrubbing `PATH` from a
+    /// child environment breaks every task there is, and an over-scrub that breaks
+    /// everything is how the whole mechanism ends up switched off.
+    #[test]
+    fn path_is_not_a_secret_and_never_becomes_one() {
+        assert!(!secret("PATH"));
+        assert!(!secret("GOPATH"));
+        assert!(!secret("PYTHONPATH"));
+        assert!(!secret("LD_LIBRARY_PATH"));
+        assert!(!secret("PATTERN"));
+        assert!(!secret("COMPATIBILITY_MODE"));
+    }
 
     /// The names a real machine actually uses.
     ///

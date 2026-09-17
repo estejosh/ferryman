@@ -227,6 +227,16 @@ anything. Only the owner id answers the ownership question, and only that is all
 pause. The full stack failing after a sale is a true and useful thing - it is just not
 evidence, and evidence is what may pause a role.
 
+**Nor is a 404.** On a private repository GitHub returns 404 rather than 403 for anything
+the caller cannot see, so "moved", "deleted", "made private" and "your token no longer
+reaches it" arrive as the same status. Verified against this account: `repos/estejosh/
+redaktly` answers 404 to the read-only token in use, while `repos/estejosh/ferryman` answers
+in full - the difference is the token's scope, not the repositories' ownership. A 404 is
+therefore *not checked*, never *contradicted*. Only a successful fetch returning a different
+`owner.id` may pause. Reading a 404 as ownership moving would pause every private project
+the day a token expired, which is the same mistake as pausing on an auth failure wearing a
+different status code.
+
 ### The successor is already decided
 
 Tying the claim to repository ownership settles the one thing that made a vacancy dangerous.
