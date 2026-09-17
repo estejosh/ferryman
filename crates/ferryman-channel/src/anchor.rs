@@ -391,8 +391,39 @@ fn anchors_dir(route: &ProjectRoute) -> PathBuf {
     route.communications.join("anchors")
 }
 
-fn claim_path(route: &ProjectRoute, master: &str) -> PathBuf {
-    anchors_dir(route).join(format!("claim.{}.json", crate::canonical_agent_name(master)))
+/// One file per account, not per master. A person can hold more than one - the same
+/// human is `estejosh` on one project and a different login on another - and a single
+/// `claim.<master>.json` would have let the second claim silently replace the first.
+fn claim_path(route: &ProjectRoute, master: &str, provider: &str, account_id: u64) -> PathBuf {
+    anchors_dir(route).join(format!(
+        "claim.{}.{provider}-{account_id}.json",
+        crate::canonical_agent_name(master)
+    ))
+}
+
+/// The account login a git remote points at, whatever spelling the remote uses.
+///
+/// Advisory: it chooses WHICH claim to check, and the numeric id in that claim is what
+/// actually gets verified. A renamed account picks the wrong claim and fails the id
+/// comparison, which is the safe direction.
+#[must_use]
+pub fn remote_owner(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches(".git");
+    if remote.is_empty() {
+        return None;
+    }
+    let after_host = match remote.split_once("://") {
+        // https://host/owner/repo, ssh://git@host/owner/repo
+        Some((_, rest)) => rest.split_once('/').map(|(_, rest)| rest)?,
+        // git@host:owner/repo
+        None => remote.split_once(':').map(|(_, rest)| rest)?,
+    };
+    let owner = after_host.split('/').next()?;
+    if owner.is_empty() {
+        None
+    } else {
+        Some(owner.to_ascii_lowercase())
+    }
 }
 
 /// One observer's file, so two machines watching at once never write the same one.
@@ -413,14 +444,19 @@ pub fn publish(route: &ProjectRoute, anchor: &GitAnchor) -> Result<PathBuf> {
         bail!("an unsigned anchor has nobody to file it under");
     };
     fs::create_dir_all(anchors_dir(route))?;
-    let path = claim_path(route, master);
+    let path = claim_path(route, master, &anchor.provider, anchor.account_id);
     crate::atomic_json(&path, anchor)?;
     Ok(path)
 }
 
-/// The anchor `master` published here, if it is present and still verifies.
-pub fn read_claim(route: &ProjectRoute, master: &str) -> Result<Option<GitAnchor>> {
-    let path = claim_path(route, master);
+/// One published claim, if it is present and still verifies.
+pub fn read_claim(
+    route: &ProjectRoute,
+    master: &str,
+    provider: &str,
+    account_id: u64,
+) -> Result<Option<GitAnchor>> {
+    let path = claim_path(route, master, provider, account_id);
     if !path.is_file() {
         return Ok(None);
     }
@@ -432,6 +468,46 @@ pub fn read_claim(route: &ProjectRoute, master: &str) -> Result<Option<GitAnchor
     } else {
         Ok(None)
     }
+}
+
+/// Every account `master` has proven here, across providers.
+pub fn claims(route: &ProjectRoute, master: &str) -> Result<Vec<GitAnchor>> {
+    let directory = anchors_dir(route);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let prefix = format!("claim.{}.", crate::canonical_agent_name(master));
+    let mut out = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(anchor) = serde_json::from_slice::<GitAnchor>(&fs::read(&path)?) else {
+            continue;
+        };
+        if verify(&anchor, &route.agents).is_valid() {
+            out.push(anchor);
+        }
+    }
+    out.sort_by_key(|anchor| (anchor.provider.clone(), anchor.account_id));
+    Ok(out)
+}
+
+/// Which of the master's claims governs THIS project.
+///
+/// A project belongs to the account its remote points at, so a master holding several
+/// answers for the one that owns this repository and no other. Without this, a
+/// contradiction against one account would pause every project the person masters -
+/// including the ones on an account that is perfectly healthy.
+pub fn claim_for_project(route: &ProjectRoute, master: &str) -> Result<Option<GitAnchor>> {
+    let Some(owner) = remote_owner(&route.git_remote) else {
+        return Ok(None);
+    };
+    Ok(claims(route, master)?
+        .into_iter()
+        .find(|anchor| anchor.login.eq_ignore_ascii_case(&owner)))
 }
 
 /// What a check found. There is no third outcome that means anything: either the
@@ -531,7 +607,20 @@ fn read_observation(route: &ProjectRoute, observer: &str) -> Result<Option<Ancho
     Ok(serde_json::from_slice(&fs::read(&path)?).ok())
 }
 
-/// Every observation that verifies, whoever wrote it.
+/// Every observation that verifies, whoever wrote it. `account` narrows to one of the
+/// master's accounts, which is what any decision about a project should use.
+pub fn observations_for(
+    route: &ProjectRoute,
+    master: &str,
+    account: Option<u64>,
+) -> Result<Vec<AnchorObservation>> {
+    Ok(observations(route, master)?
+        .into_iter()
+        .filter(|observation| account.is_none_or(|id| observation.account_id == id))
+        .collect())
+}
+
+/// Every observation that verifies, whoever wrote it and whichever account it names.
 pub fn observations(route: &ProjectRoute, master: &str) -> Result<Vec<AnchorObservation>> {
     let directory = anchors_dir(route);
     if !directory.is_dir() {
@@ -584,7 +673,11 @@ pub enum Standing {
 /// every member checks on a jitter, so the lie is overwritten rather than argued
 /// with. A quorum would instead let one silent member hold a project open.
 pub fn standing(route: &ProjectRoute, master: &str) -> Result<Standing> {
-    let Some(latest) = observations(route, master)?.pop() else {
+    // Scoped to the account that owns THIS project. A master with several accounts has
+    // several anchors, and one of them going bad says nothing about the others: losing
+    // the account behind Hone must not pause the projects living under a different one.
+    let account = claim_for_project(route, master)?.map(|anchor| anchor.account_id);
+    let Some(latest) = observations_for(route, master, account)?.pop() else {
         return Ok(Standing::NotChecked);
     };
     if latest.outcome == Outcome::Verified {
@@ -780,12 +873,36 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
         }
     }
 
+    /// A second account under the same Ferryman identity, proven just as fully as the
+    /// first. Its own ssh key, because two accounts are two accounts.
+    pub(super) fn second_account_anchor(
+        identity: &AgentIdentity,
+        account_id: u64,
+        login: &str,
+    ) -> GitAnchor {
+        anchored_as(
+            &SigningKey::from_bytes(&[6u8; 32]),
+            identity,
+            account_id,
+            login,
+        )
+    }
+
     /// An anchor as a master would actually hold one, with both halves real.
     pub(super) fn anchored(account: &SigningKey, identity: &AgentIdentity) -> GitAnchor {
+        anchored_as(account, identity, 196_700_792, "estejosh")
+    }
+
+    pub(super) fn anchored_as(
+        account: &SigningKey,
+        identity: &AgentIdentity,
+        account_id: u64,
+        login: &str,
+    ) -> GitAnchor {
         let mut anchor = GitAnchor {
             provider: "github".into(),
-            account_id: 196_700_792,
-            login: "estejosh".into(),
+            account_id,
+            login: login.into(),
             account_type: AccountType::User,
             ferryman_key: identity.public_key_hex(),
             ssh_key: published_key(account),
@@ -936,7 +1053,7 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
 
 #[cfg(test)]
 mod watching {
-    use super::tests::{anchored, roster_entry, test_account};
+    use super::tests::{anchored, roster_entry, second_account_anchor, test_account};
     use super::*;
     use ed25519_dalek::Signer;
 
@@ -980,7 +1097,111 @@ mod watching {
         let anchor = anchored(&test_account(), &josh);
 
         publish(&route, &anchor).unwrap();
-        assert_eq!(read_claim(&route, "josh").unwrap().as_ref(), Some(&anchor));
+        assert_eq!(
+            read_claim(&route, "josh", "github", 196_700_792)
+                .unwrap()
+                .as_ref(),
+            Some(&anchor)
+        );
+    }
+
+    /// Josh is `estejosh` on some projects and a different login on others, and holds
+    /// both under one Ferryman identity. Two claims, one master, neither overwriting
+    /// the other - which a single `claim.<master>.json` would have done silently.
+    #[test]
+    fn one_master_holds_several_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+
+        publish(&route, &anchored(&test_account(), &josh)).unwrap();
+        publish(
+            &route,
+            &second_account_anchor(&josh, 555_001, "shindevlin"),
+        )
+        .unwrap();
+
+        let held = claims(&route, "josh").unwrap();
+        assert_eq!(held.len(), 2, "both accounts survive: {held:?}");
+        let logins: Vec<&str> = held.iter().map(|a| a.login.as_str()).collect();
+        assert!(logins.contains(&"estejosh") && logins.contains(&"shindevlin"));
+    }
+
+    /// The project's remote decides which claim answers for it.
+    #[test]
+    fn a_project_answers_to_the_account_that_owns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let mut route = channel(dir.path(), &josh);
+        publish(&route, &anchored(&test_account(), &josh)).unwrap();
+        publish(
+            &route,
+            &second_account_anchor(&josh, 555_001, "shindevlin"),
+        )
+        .unwrap();
+
+        // This route's remote is git@github.com:estejosh/ferryman.git
+        assert_eq!(
+            claim_for_project(&route, "josh").unwrap().unwrap().login,
+            "estejosh"
+        );
+
+        route.git_remote = "https://github.com/shindevlin/hone.git".into();
+        assert_eq!(
+            claim_for_project(&route, "josh").unwrap().unwrap().login,
+            "shindevlin"
+        );
+
+        route.git_remote = "https://github.com/somebody-else/thing.git".into();
+        assert!(claim_for_project(&route, "josh").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_owner_is_read_out_of_any_spelling_of_a_remote() {
+        for remote in [
+            "git@github.com:estejosh/ferryman.git",
+            "https://github.com/estejosh/ferryman.git",
+            "https://github.com/estejosh/ferryman",
+            "ssh://git@github.com/estejosh/ferryman.git",
+            "git@github.com:EsteJosh/ferryman.git",
+        ] {
+            assert_eq!(
+                remote_owner(remote).as_deref(),
+                Some("estejosh"),
+                "{remote}"
+            );
+        }
+        assert_eq!(remote_owner(""), None);
+        assert_eq!(remote_owner("   "), None);
+        assert_eq!(remote_owner("not-a-remote"), None);
+    }
+
+    /// The failure that made this worth doing: losing one account must not pause the
+    /// projects that live under the other.
+    #[test]
+    fn a_bad_account_does_not_pause_a_project_on_a_good_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let mut route = channel(dir.path(), &josh);
+        publish(&route, &anchored(&test_account(), &josh)).unwrap();
+        publish(
+            &route,
+            &second_account_anchor(&josh, 555_001, "shindevlin"),
+        )
+        .unwrap();
+
+        // shindevlin's anchor goes bad, and has been bad for a week.
+        record(&route, &josh, "josh", 555_001, Outcome::Contradicted, "gone").unwrap();
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 24);
+
+        // The project on shindevlin is paused...
+        route.git_remote = "https://github.com/shindevlin/hone.git".into();
+        assert!(is_paused(&route, "josh").unwrap());
+
+        // ...and the one on estejosh is not, because nothing was ever said about it.
+        route.git_remote = "git@github.com:estejosh/ferryman.git".into();
+        assert_eq!(standing(&route, "josh").unwrap(), Standing::NotChecked);
+        assert!(!is_paused(&route, "josh").unwrap());
     }
 
     #[test]
