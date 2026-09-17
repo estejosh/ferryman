@@ -196,6 +196,9 @@ pub fn create(
             master.name()
         );
     }
+    // An invitation lets a new device into the synced folder, which is exactly the
+    // kind of new thing a paused master may not do (ADR 0022).
+    crate::anchor::refuse_if_paused(route, &declaration.master, "invite anybody new")?;
     if let Some(operator) = operator
         && !is_safe_component(operator)
     {

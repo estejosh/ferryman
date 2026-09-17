@@ -27,7 +27,7 @@
 //! machine. Verifying GPG instead would mean an OpenPGP stack in the dependency
 //! tree for no cryptographic gain.
 
-use std::fmt;
+use std::{fmt, fs, path::PathBuf};
 
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
@@ -35,7 +35,15 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
-use crate::{AgentRoute, SignatureCheck, check_signature};
+use crate::{AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck, check_signature};
+
+/// How long a contradiction has to stand before it pauses anything.
+///
+/// The ADR says "several checks across days agree", and this is that in hours. A
+/// provider can be wrong for an afternoon - a bad deploy, a cache, a half-applied
+/// account change - and a role that pauses on the first disagreement would be a
+/// role that pauses on weather.
+pub const PAUSE_AFTER_HOURS: i64 = 72;
 
 /// The SSHSIG namespace. Namespaces exist so a signature made for one purpose
 /// cannot be presented as a signature for another; `ssh-keygen -Y sign -n` sets it
@@ -377,10 +385,246 @@ fn b64_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+// --- the claim in a channel, and what watching it does -------------------------
+
+fn anchors_dir(route: &ProjectRoute) -> PathBuf {
+    route.communications.join("anchors")
+}
+
+fn claim_path(route: &ProjectRoute, master: &str) -> PathBuf {
+    anchors_dir(route).join(format!("claim.{}.json", crate::canonical_agent_name(master)))
+}
+
+/// One observer's file, so two machines watching at once never write the same one.
+/// The same reason marvin keeps a page per holder rather than a shared document.
+fn observation_path(route: &ProjectRoute, observer: &str) -> PathBuf {
+    anchors_dir(route).join(format!("seen.{}.json", crate::canonical_agent_name(observer)))
+}
+
+/// Put a verified claim into a channel. Refuses to publish one that does not
+/// verify, because an anchor nobody can check is worse than none: it reads as
+/// evidence at a glance and is not.
+pub fn publish(route: &ProjectRoute, anchor: &GitAnchor) -> Result<PathBuf> {
+    let check = verify(anchor, &route.agents);
+    if !check.is_valid() {
+        bail!("this anchor does not verify ({check:?}), so it will not be published");
+    }
+    let Some(master) = anchor.signed_by.as_deref() else {
+        bail!("an unsigned anchor has nobody to file it under");
+    };
+    fs::create_dir_all(anchors_dir(route))?;
+    let path = claim_path(route, master);
+    crate::atomic_json(&path, anchor)?;
+    Ok(path)
+}
+
+/// The anchor `master` published here, if it is present and still verifies.
+pub fn read_claim(route: &ProjectRoute, master: &str) -> Result<Option<GitAnchor>> {
+    let path = claim_path(route, master);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let Ok(anchor) = serde_json::from_slice::<GitAnchor>(&fs::read(&path)?) else {
+        return Ok(None);
+    };
+    if verify(&anchor, &route.agents).is_valid() {
+        Ok(Some(anchor))
+    } else {
+        Ok(None)
+    }
+}
+
+/// What a check found. There is no third outcome that means anything: either the
+/// provider answered and agreed, or it answered and disagreed. Failing to reach it
+/// is not an observation and is never recorded as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Outcome {
+    Verified,
+    Contradicted,
+}
+
+/// One member's report of what the provider said about a master's anchor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AnchorObservation {
+    /// Whose anchor was checked.
+    pub master: String,
+    pub account_id: u64,
+    pub outcome: Outcome,
+    /// What disagreed, in words, for whoever reads the finding.
+    pub detail: String,
+    pub observed_at: DateTime<Utc>,
+    /// When this observer FIRST saw the disagreement that is still standing.
+    /// Carried forward across checks and cleared by a verify, so "it has been wrong
+    /// for three days" is answerable from one record instead of a history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradicted_since: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+fn observation_payload(observation: &AnchorObservation) -> String {
+    format!(
+        "ferryman-anchor-seen-v1\n{}\n{}\n{:?}\n{}\n{}\n{}",
+        observation.master,
+        observation.account_id,
+        observation.outcome,
+        observation.detail,
+        observation.observed_at.to_rfc3339(),
+        observation
+            .contradicted_since
+            .map(|at| at.to_rfc3339())
+            .unwrap_or_default(),
+    )
+}
+
+/// Record what this machine saw. Signed, because a report that can pause a role is
+/// worth forging.
+pub fn record(
+    route: &ProjectRoute,
+    observer: &AgentIdentity,
+    master: &str,
+    account_id: u64,
+    outcome: Outcome,
+    detail: &str,
+) -> Result<AnchorObservation> {
+    let now = Utc::now();
+    // A contradiction that was already standing keeps its original date. Restarting
+    // the clock on every check would mean the grace period never elapses and the
+    // pause never arrives.
+    let contradicted_since = match outcome {
+        Outcome::Verified => None,
+        Outcome::Contradicted => read_observation(route, observer.name())
+            .ok()
+            .flatten()
+            .filter(|previous| previous.outcome == Outcome::Contradicted)
+            .and_then(|previous| previous.contradicted_since)
+            .or(Some(now)),
+    };
+    let mut observation = AnchorObservation {
+        master: master.to_owned(),
+        account_id,
+        outcome,
+        detail: detail.to_owned(),
+        observed_at: now,
+        contradicted_since,
+        signed_by: None,
+        signature: None,
+    };
+    use ed25519_dalek::Signer;
+    let signature = observer
+        .signing
+        .sign(observation_payload(&observation).as_bytes());
+    observation.signed_by = Some(observer.name().to_owned());
+    observation.signature = Some(hex::encode(signature.to_bytes()));
+    fs::create_dir_all(anchors_dir(route))?;
+    crate::atomic_json(&observation_path(route, observer.name()), &observation)?;
+    Ok(observation)
+}
+
+fn read_observation(route: &ProjectRoute, observer: &str) -> Result<Option<AnchorObservation>> {
+    let path = observation_path(route, observer);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(serde_json::from_slice(&fs::read(&path)?).ok())
+}
+
+/// Every observation that verifies, whoever wrote it.
+pub fn observations(route: &ProjectRoute, master: &str) -> Result<Vec<AnchorObservation>> {
+    let directory = anchors_dir(route);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if !name.starts_with("seen.") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(observation) = serde_json::from_slice::<AnchorObservation>(&fs::read(&path)?) else {
+            continue;
+        };
+        if !observation.master.eq_ignore_ascii_case(master) {
+            continue;
+        }
+        if check_signature(
+            observation.signed_by.as_ref(),
+            observation.signature.as_ref(),
+            &observation_payload(&observation),
+            &route.agents,
+        ) == SignatureCheck::Valid
+        {
+            out.push(observation);
+        }
+    }
+    out.sort_by_key(|observation| observation.observed_at);
+    Ok(out)
+}
+
+/// Where a master's anchor stands on this project right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Standing {
+    /// Nobody has checked, or nobody's check could be verified. The ordinary state
+    /// for a fleet that has been offline, and it means nothing.
+    NotChecked,
+    Verified,
+    /// The provider disagreed, and has not yet disagreed for long enough to bite.
+    Contradicted { since: DateTime<Utc> },
+    /// The provider disagreed and has kept disagreeing. The role is frozen.
+    Paused { since: DateTime<Utc> },
+}
+
+/// The newest verifiable observation wins.
+///
+/// Newest rather than a quorum, and that cuts both ways on purpose. A member who
+/// lies can pause a master - but only until any honest member's check lands, and
+/// every member checks on a jitter, so the lie is overwritten rather than argued
+/// with. A quorum would instead let one silent member hold a project open.
+pub fn standing(route: &ProjectRoute, master: &str) -> Result<Standing> {
+    let Some(latest) = observations(route, master)?.pop() else {
+        return Ok(Standing::NotChecked);
+    };
+    if latest.outcome == Outcome::Verified {
+        return Ok(Standing::Verified);
+    }
+    let Some(since) = latest.contradicted_since else {
+        return Ok(Standing::NotChecked);
+    };
+    if Utc::now() - since >= chrono::Duration::hours(PAUSE_AFTER_HOURS) {
+        Ok(Standing::Paused { since })
+    } else {
+        Ok(Standing::Contradicted { since })
+    }
+}
+
+/// Whether `master`'s authority to hand out anything new is frozen.
+///
+/// Frozen, never vacated: `read_master` still names them and `initialize_master`
+/// still refuses, so a paused project cannot be walked into. What a paused master
+/// keeps is the ability to transfer the role, because that is the recovery path
+/// and blocking it would strand a project whose account is genuinely gone.
+pub fn is_paused(route: &ProjectRoute, master: &str) -> Result<bool> {
+    Ok(matches!(standing(route, master)?, Standing::Paused { .. }))
+}
+
+/// The one line to put in front of an operation a paused master may not do.
+pub fn refuse_if_paused(route: &ProjectRoute, master: &str, doing: &str) -> Result<()> {
+    if let Standing::Paused { since } = standing(route, master)? {
+        bail!(
+            "{master}'s git anchor has not verified since {}, so this project will not {doing}. \
+             Re-publish the key to the account, or transfer the role to a master who has claimed.",
+            since.format("%Y-%m-%d")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::AgentIdentity;
     use ed25519_dalek::{Signer, SigningKey};
 
     /// A signature produced by real `ssh-keygen -Y sign`, over exactly these bytes,
@@ -521,7 +765,12 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
         assert!(!verify_sshsig(&parsed, b"hello "));
     }
 
-    fn roster_entry(identity: &AgentIdentity) -> AgentRoute {
+    /// The key standing in for a github account across these tests.
+    pub(super) fn test_account() -> SigningKey {
+        SigningKey::from_bytes(&[5u8; 32])
+    }
+
+    pub(super) fn roster_entry(identity: &AgentIdentity) -> AgentRoute {
         AgentRoute {
             name: identity.name().to_owned(),
             role: "operator".into(),
@@ -532,7 +781,7 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
     }
 
     /// An anchor as a master would actually hold one, with both halves real.
-    fn anchored(account: &SigningKey, identity: &AgentIdentity) -> GitAnchor {
+    pub(super) fn anchored(account: &SigningKey, identity: &AgentIdentity) -> GitAnchor {
         let mut anchor = GitAnchor {
             provider: "github".into(),
             account_id: 196_700_792,
@@ -682,5 +931,253 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
         let back: GitAnchor = serde_json::from_str(&text).unwrap();
         assert_eq!(back, anchor);
         assert_eq!(verify(&back, &[roster_entry(&josh)]), AnchorCheck::Valid);
+    }
+}
+
+#[cfg(test)]
+mod watching {
+    use super::tests::{anchored, roster_entry, test_account};
+    use super::*;
+    use ed25519_dalek::Signer;
+
+    fn channel(dir: &std::path::Path, josh: &AgentIdentity) -> ProjectRoute {
+        let workspace = dir.join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(&communications).unwrap();
+        ProjectRoute {
+            project_id: "ferryman".into(),
+            workspace,
+            attachment,
+            communications,
+            shared_remote: "ferryman-ferryman".into(),
+            git_remote: "git@github.com:estejosh/ferryman.git".into(),
+            git_visibility: "private".into(),
+            agents: vec![roster_entry(josh)],
+        }
+    }
+
+    /// Back-date a standing contradiction, because a test cannot wait three days.
+    fn age_the_contradiction(route: &ProjectRoute, observer: &AgentIdentity, hours: i64) {
+        let path = observation_path(route, observer.name());
+        let mut observation: AnchorObservation =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        observation.contradicted_since = Some(Utc::now() - chrono::Duration::hours(hours));
+        // Re-sign, because the payload covers the date. Editing one WITHOUT signing
+        // again is the forgery a test below relies on being caught.
+        let signature = observer
+            .signing
+            .sign(observation_payload(&observation).as_bytes());
+        observation.signature = Some(hex::encode(signature.to_bytes()));
+        crate::atomic_json(&path, &observation).unwrap();
+    }
+
+    #[test]
+    fn an_anchor_is_published_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+        let anchor = anchored(&test_account(), &josh);
+
+        publish(&route, &anchor).unwrap();
+        assert_eq!(read_claim(&route, "josh").unwrap().as_ref(), Some(&anchor));
+    }
+
+    #[test]
+    fn an_anchor_that_does_not_verify_is_not_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+        let mut anchor = anchored(&test_account(), &josh);
+        anchor.account_id = 7;
+        sign_anchor(&mut anchor, &josh).unwrap();
+
+        let error = publish(&route, &anchor)
+            .expect_err("an unverifiable anchor reads as evidence and is not")
+            .to_string();
+        assert!(error.contains("does not verify"), "{error}");
+    }
+
+    #[test]
+    fn nobody_checking_is_not_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+        assert_eq!(standing(&route, "josh").unwrap(), Standing::NotChecked);
+        assert!(!is_paused(&route, "josh").unwrap());
+    }
+
+    /// The grace period is the whole difference between a pause and a tantrum.
+    #[test]
+    fn one_days_disagreement_does_not_pause_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+
+        record(
+            &route,
+            &josh,
+            "josh",
+            196_700_792,
+            Outcome::Contradicted,
+            "the key is not on the account",
+        )
+        .unwrap();
+        assert!(matches!(
+            standing(&route, "josh").unwrap(),
+            Standing::Contradicted { .. }
+        ));
+        assert!(!is_paused(&route, "josh").unwrap());
+
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS - 1);
+        assert!(!is_paused(&route, "josh").unwrap());
+
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 1);
+        assert!(is_paused(&route, "josh").unwrap());
+    }
+
+    /// Checking again must not restart the clock, or the grace period never elapses
+    /// and the pause never arrives - a bug that would look exactly like "it works".
+    #[test]
+    fn checking_again_keeps_the_date_the_disagreement_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+
+        record(&route, &josh, "josh", 1, Outcome::Contradicted, "gone").unwrap();
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 1);
+        let again = record(&route, &josh, "josh", 1, Outcome::Contradicted, "still gone").unwrap();
+
+        assert!(
+            Utc::now() - again.contradicted_since.unwrap()
+                >= chrono::Duration::hours(PAUSE_AFTER_HOURS),
+            "the second check must inherit the first check's date"
+        );
+        assert!(is_paused(&route, "josh").unwrap());
+    }
+
+    #[test]
+    fn republishing_the_key_clears_the_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+
+        record(&route, &josh, "josh", 1, Outcome::Contradicted, "gone").unwrap();
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 1);
+        assert!(is_paused(&route, "josh").unwrap());
+
+        record(&route, &josh, "josh", 1, Outcome::Verified, "back").unwrap();
+        assert_eq!(standing(&route, "josh").unwrap(), Standing::Verified);
+        assert!(!is_paused(&route, "josh").unwrap());
+    }
+
+    /// A report that can freeze a project is worth forging, so it is signed and the
+    /// signature is checked when it is read.
+    #[test]
+    fn an_unsigned_or_edited_report_freezes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+
+        record(&route, &josh, "josh", 1, Outcome::Verified, "fine").unwrap();
+        // Flip the verdict without re-signing, which is what an attacker with the
+        // folder can actually do.
+        let path = observation_path(&route, "josh");
+        let mut observation: AnchorObservation =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        observation.outcome = Outcome::Contradicted;
+        observation.contradicted_since = Some(Utc::now() - chrono::Duration::days(30));
+        crate::atomic_json(&path, &observation).unwrap();
+
+        assert_eq!(
+            standing(&route, "josh").unwrap(),
+            Standing::NotChecked,
+            "an edited report is not a report"
+        );
+        assert!(!is_paused(&route, "josh").unwrap());
+    }
+
+    /// A stranger's report counts for nothing, because they are not on the roster
+    /// and their signature resolves to no published key.
+    #[test]
+    fn somebody_not_on_the_project_cannot_freeze_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let route = channel(dir.path(), &josh);
+        let mallory = AgentIdentity::from_seed("mallory", [9u8; 32]);
+
+        record(&route, &mallory, "josh", 1, Outcome::Contradicted, "lies").unwrap();
+        assert_eq!(standing(&route, "josh").unwrap(), Standing::NotChecked);
+    }
+
+    /// The newest verifiable check wins, so an honest machine overwrites a lying
+    /// one rather than arguing with it.
+    #[test]
+    fn an_honest_check_lands_on_top_of_a_dishonest_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let grouchly = AgentIdentity::from_seed("josh-grouchly", [2u8; 32]);
+        let mut route = channel(dir.path(), &josh);
+        route.agents.push(roster_entry(&grouchly));
+
+        record(&route, &grouchly, "josh", 1, Outcome::Contradicted, "lie").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        record(&route, &josh, "josh", 1, Outcome::Verified, "checked").unwrap();
+
+        assert_eq!(standing(&route, "josh").unwrap(), Standing::Verified);
+    }
+
+    #[test]
+    fn a_paused_master_cannot_grant_but_can_still_hand_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let bob = AgentIdentity::from_seed("bob", [3u8; 32]);
+        let mut route = channel(dir.path(), &josh);
+        route.agents.push(roster_entry(&bob));
+        crate::master::initialize_master(&route, &josh, "josh").unwrap();
+
+        record(&route, &josh, "josh", 1, Outcome::Contradicted, "gone").unwrap();
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 1);
+
+        let error = crate::master::grant_member(
+            &route,
+            &josh,
+            "bob",
+            &bob.public_key_hex(),
+            vec!["ferryman".into()],
+            vec!["worker".into()],
+            Vec::new(),
+        )
+        .expect_err("a paused master hands out nothing new")
+        .to_string();
+        assert!(error.contains("will not grant new access"), "{error}");
+
+        // The recovery path has to stay open, or an account genuinely lost leaves a
+        // project frozen for good.
+        let moved = crate::master::transfer_master(&route, &josh, "bob")
+            .expect("a paused master may still give the role away");
+        assert_eq!(moved.master, "bob");
+    }
+
+    #[test]
+    fn a_verified_master_grants_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let bob = AgentIdentity::from_seed("bob", [3u8; 32]);
+        let mut route = channel(dir.path(), &josh);
+        route.agents.push(roster_entry(&bob));
+        crate::master::initialize_master(&route, &josh, "josh").unwrap();
+        record(&route, &josh, "josh", 1, Outcome::Verified, "fine").unwrap();
+
+        crate::master::grant_member(
+            &route,
+            &josh,
+            "bob",
+            &bob.public_key_hex(),
+            vec!["ferryman".into()],
+            vec!["worker".into()],
+            Vec::new(),
+        )
+        .expect("nothing about a healthy anchor changes what a master can do");
     }
 }

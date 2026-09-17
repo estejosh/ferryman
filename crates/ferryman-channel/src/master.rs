@@ -278,6 +278,10 @@ pub fn grant_member(
     if declaration.master != master.name() {
         bail!("only the master ({}) may grant roles", declaration.master);
     }
+    // A master whose git anchor has stopped verifying may not hand out anything new
+    // (ADR 0022). They keep the role and may still transfer it; what they lose is
+    // the power to widen access on a project that may no longer be theirs.
+    crate::anchor::refuse_if_paused(route, &declaration.master, "grant new access")?;
 
     let mut grant = MasterGrant {
         grantee: grantee.to_owned(),
