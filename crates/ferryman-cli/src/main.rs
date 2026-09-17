@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+mod gitanchor;
 mod license;
 mod licensor;
 mod mcp;
@@ -1351,6 +1352,16 @@ enum TeamCommand {
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
     },
+    /// Bind your Ferryman key to a git account, and check that the binding still holds.
+    ///
+    /// The account's own published SSH key signs a statement naming your Ferryman key,
+    /// and your Ferryman key signs the record naming the account. Neither signature can
+    /// be lifted off and replayed against a different key. Proven once, verified offline
+    /// ever after. See ADR 0022.
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorAction,
+    },
     /// Trust any device knocking with a live invite's name and share the folder with it.
     /// The agent loop and the dashboard do this on their own; this runs one pass by hand.
     Pending {
@@ -1360,6 +1371,46 @@ enum TeamCommand {
         /// claimed here, by the identity that invited it and nobody else.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum AnchorAction {
+    /// Claim a git account for your Ferryman identity. Asks the provider once.
+    Claim {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The account to claim, e.g. estejosh. Claim several by running this again;
+        /// a project answers to whichever one owns its repository.
+        #[arg(long)]
+        account: String,
+        /// Sign as this identity. Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+        /// The SSH key to prove the account with. Defaults to ~/.ssh/id_ed25519, and
+        /// a .pub path works when ssh-agent holds the private half - no passphrase
+        /// ever reaches Ferryman that way.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+    },
+    /// Ask the provider whether the claims still hold, and record what it said.
+    ///
+    /// Safe to run at any time and on any machine: it writes only this machine's own
+    /// observation file, and being unable to reach the provider records nothing.
+    Check {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Whose anchor to check. Defaults to the project's master.
+        #[arg(long)]
+        master: Option<String>,
+        /// Sign the observation as this identity. Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
+    /// What this project currently believes about its master's anchor.
+    Status {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -4253,6 +4304,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 "note: what already synced is on their disk; rotate any secret sealed to them"
             );
         }
+        TeamCommand::Anchor { action } => anchor_command(action).await?,
         TeamCommand::Pending { workspace, signer } => {
             let route = here(workspace)?;
             let settled = invite::settle_pending(&route)?;
@@ -4326,6 +4378,208 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             {
                 println!("nothing waiting");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Claiming a git account, checking a claim, and reporting where one stands.
+///
+/// The only place in Ferryman that asks a git provider anything about ownership. It
+/// asks unauthenticated wherever it can, because `<login>.keys` being public is what
+/// lets every member of a project watch its master rather than only the master's own
+/// machine.
+async fn anchor_command(action: AnchorAction) -> Result<()> {
+    use ferryman_channel::anchor;
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    match action {
+        AnchorAction::Claim {
+            workspace,
+            account,
+            signer,
+            ssh_key,
+        } => {
+            let route = here(workspace)?;
+            let signer_name = match signer {
+                Some(name) => name,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            let identity = signing_identity(&route, &signer_name)?;
+
+            let facts = match gitanchor::fetch_account(&account).await? {
+                Ok(facts) => facts,
+                Err(gitanchor::NotChecked(why)) => bail!("cannot claim {account}: {why}"),
+            };
+            println!("{} is account {}", facts.login, facts.account_id);
+            if facts.published_keys.is_empty() {
+                bail!(
+                    "{} publishes no SSH keys, so there is nothing to prove the account with. \
+                     Add an ed25519 key to the account and run this again.",
+                    facts.login
+                );
+            }
+
+            let key = match ssh_key.or_else(gitanchor::default_ssh_key) {
+                Some(key) => key,
+                None => bail!("no ssh key found; pass --ssh-key"),
+            };
+            let payload = anchor::ssh_payload("github", facts.account_id, &identity.public_key_hex());
+            let armoured = gitanchor::sign_with_ssh(&payload, &key, &route.attachment.join("tmp"))?;
+
+            // Which published key actually signed it. The record has to carry that one,
+            // and a key that is not on the account proves nothing about the account.
+            let signing_key = anchor::signing_key_of(&armoured)
+                .context("ssh-keygen produced a signature this cannot read")?;
+            let Some(published) = facts
+                .published_keys
+                .iter()
+                .find(|line| anchor::parse_public_key(line) == Some(signing_key))
+            else {
+                bail!(
+                    "the key at {} is not published on {}, so it proves nothing about that \
+                     account. Add it to the account, or sign with one that is already there.",
+                    key.display(),
+                    facts.login
+                );
+            };
+
+            let mut claim = anchor::GitAnchor {
+                provider: "github".into(),
+                account_id: facts.account_id,
+                login: facts.login.clone(),
+                account_type: anchor::AccountType::User,
+                ferryman_key: identity.public_key_hex(),
+                ssh_key: published.clone(),
+                ssh_signature: armoured,
+                claimed_at: chrono::Utc::now(),
+                evidence_url: format!("https://github.com/{}.keys", facts.login),
+                evidence_read_at: chrono::Utc::now(),
+                signed_by: None,
+                signature: None,
+            };
+            anchor::sign_anchor(&mut claim, &identity)?;
+            anchor::publish(&route, &claim)?;
+
+            println!("claimed by {}", identity.name());
+            println!("  account     {} ({})", facts.login, facts.account_id);
+            println!("  proven with the key already published there");
+            println!("  verifies offline from now on; nothing re-asks github to use it");
+        }
+        AnchorAction::Check {
+            workspace,
+            master,
+            signer,
+        } => {
+            let route = here(workspace)?;
+            let master = match master {
+                Some(name) => name,
+                None => match ferryman_channel::master::read_master(&route)? {
+                    Some(declaration) => declaration.master,
+                    None => bail!("this project has no master, so there is no anchor to check"),
+                },
+            };
+            let signer_name = match signer {
+                Some(name) => name,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            let observer = signing_identity(&route, &signer_name)?;
+
+            let Some(claim) = anchor::claim_for_project(&route, &master)? else {
+                println!("{master} has claimed no account that owns this project's repository");
+                return Ok(());
+            };
+            let dotenv = gitanchor::read_dotenv(&route.workspace);
+
+            // The anchor question first, because it needs no credential and anyone can
+            // corroborate it.
+            let mut verdict = None;
+            match gitanchor::fetch_account(&claim.login).await? {
+                Ok(facts) => verdict = Some(anchor::judge_account(&claim, &facts)),
+                Err(gitanchor::NotChecked(why)) => println!("not checked: {why}"),
+            }
+
+            // Then ownership, which is the one an acquisition actually trips.
+            if let Some((owner, name)) = gitanchor::remote_repository(&route.git_remote) {
+                let token = gitanchor::token_for(&claim.login, &dotenv);
+                match gitanchor::fetch_repository(&owner, &name, token.as_deref()).await? {
+                    Ok(facts) => {
+                        let owned = anchor::judge_repository(&claim, &facts);
+                        // A contradiction from either question is a contradiction.
+                        if owned.0 == anchor::Outcome::Contradicted || verdict.is_none() {
+                            verdict = Some(owned);
+                        }
+                    }
+                    Err(gitanchor::NotChecked(why)) => println!("not checked: {why}"),
+                }
+            }
+
+            match verdict {
+                Some((outcome, detail)) => {
+                    anchor::record(
+                        &route,
+                        &observer,
+                        &master,
+                        claim.account_id,
+                        outcome,
+                        &detail,
+                    )?;
+                    println!("{outcome:?}: {detail}");
+                }
+                None => println!(
+                    "nothing recorded - being unable to reach github is not evidence about anybody"
+                ),
+            }
+            print_standing(&route, &master)?;
+        }
+        AnchorAction::Status { workspace } => {
+            let route = here(workspace)?;
+            let Some(declaration) = ferryman_channel::master::read_master(&route)? else {
+                println!("this project has no master");
+                return Ok(());
+            };
+            let held = anchor::claims(&route, &declaration.master)?;
+            if held.is_empty() {
+                println!("{} has claimed no git account here", declaration.master);
+            }
+            for claim in &held {
+                println!(
+                    "{} claims {} {} ({})",
+                    declaration.master, claim.provider, claim.login, claim.account_id
+                );
+            }
+            if let Some(claim) = anchor::claim_for_project(&route, &declaration.master)? {
+                println!("this project answers to {}", claim.login);
+            }
+            print_standing(&route, &declaration.master)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_standing(route: &ferryman_channel::ProjectRoute, master: &str) -> Result<()> {
+    use ferryman_channel::anchor::Standing;
+    match ferryman_channel::anchor::standing(route, master)? {
+        Standing::NotChecked => println!("standing    not checked (which means nothing either way)"),
+        Standing::Verified => println!("standing    verified"),
+        Standing::Contradicted { since } => println!(
+            "standing    contradicted since {} - pauses in {} hours if it keeps disagreeing",
+            since.format("%Y-%m-%d %H:%M UTC"),
+            (chrono::Duration::hours(ferryman_channel::anchor::PAUSE_AFTER_HOURS)
+                - (chrono::Utc::now() - since))
+                .num_hours()
+                .max(0)
+        ),
+        Standing::Paused { since } => {
+            println!("standing    PAUSED since {}", since.format("%Y-%m-%d"));
+            println!("            {master} grants nothing new and issues no new orders here.");
+            println!("            Work already in flight finishes; everyone else is unaffected.");
+            println!("            Re-publish the key to the account, or transfer the role.");
         }
     }
     Ok(())

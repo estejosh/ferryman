@@ -277,6 +277,17 @@ pub fn parse_public_key(line: &str) -> Option<[u8; 32]> {
     reader.string()?.try_into().ok()
 }
 
+/// Which key made this signature, read out of the signature itself.
+///
+/// A signature carries its own public key, so this answers "who signed" without
+/// being told. Used when claiming an account: whichever published key `ssh-keygen`
+/// actually reached for is the one the record has to carry, and a key that is not
+/// on the account proves nothing about the account.
+#[must_use]
+pub fn signing_key_of(armoured: &str) -> Option<[u8; 32]> {
+    parse_signature(armoured).map(|parsed| parsed.public_key)
+}
+
 struct Sshsig {
     public_key: [u8; 32],
     namespace: String,
