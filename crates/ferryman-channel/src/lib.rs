@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod anchor;
 pub mod ask;
 pub mod contract;
 pub mod conversation;
