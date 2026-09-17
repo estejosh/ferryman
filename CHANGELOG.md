@@ -1,5 +1,61 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **A second machine can join as you, rather than as a stranger.**
+  `ferry team invite create --as-identity josh --machine beastly` invites one of your
+  own machines onto a project you are already on. It joins as `josh-beastly` and
+  inherits exactly what `josh` can do - no more, and nothing the master has to approve.
+  Until now every invitation needed the master's signature and produced a separate
+  member, so a person with two laptops was two people on the roster with two grants to
+  keep in step, and revoking them was two jobs, one of which was easy to forget.
+
+  The inheritance is a signed file of its own, `owners/<agent>.json`, sitting beside the
+  grants: a statement by an established identity that a named key is one of their
+  machines. It confers nothing by itself. `is_granted` resolves a machine to its owner
+  and answers with the owner's grant, so revoking the person takes every machine of
+  theirs dark in the same moment - the answer was never stored on the machine.
+
+  The claim is signed by the owner, not by the master, because it is a claim about your
+  own keys. That is worth exactly what your own access is worth: creating one of these
+  invitations refuses anyone who does not already hold a live grant here, since every
+  invitation lets a device into the synced folder and a name that was merely reserved is
+  not a member. The claim binds the machine's public key, so a name that is ever re-keyed
+  stops resolving to anybody. A machine cannot claim itself, an owner cannot be owned,
+  and the file being writable by anyone with the folder buys nothing: only a signature by
+  the identity being claimed *as* counts.
+
+  The machine finishes joining with `ferry team pending --as josh` on the machine holding
+  josh's key, or from the dashboard while signed in as josh. The agent loop reports the
+  wait rather than signing it, because it holds a machine's key and not a person's.
+
+  The `owner` field on an invitation is appended to the signed payload only when it is
+  set, so every invitation written before this release still verifies over exactly the
+  bytes it was signed over.
+
+- **A machine or an agent can be killed from any machine you own.** `ferry team revoke
+  --name josh-beastly` used to be the master's command and nobody else's. Now the master
+  still ends anyone on the project, and everybody else ends their own machines and agents
+  - signed by the owner, or by any *other* machine of the same owner. That last one is
+  the case that matters: a kill switch you can only reach from the machine you are trying
+  to kill is not a kill switch. The laptop still on your desk ends the one that left in a
+  taxi, with no master involved and without your operator key having to be on the machine
+  doing it.
+
+  A sibling can end a sibling and nothing else - it cannot grant, cannot claim, cannot
+  speak for its owner anywhere. The worst a stolen laptop does with this is switch your
+  other laptops off, which you undo by claiming them again; the alternative was a stolen
+  laptop that kept working because you were not sitting at the right desk. It cannot
+  revoke itself, so it cannot cover its tracks. Re-claiming a machine clears a revocation
+  a sibling or the owner signed, and never one the master signed.
+
+  It is a signed tombstone at `owners/<agent>.revoked.json`, not a deleted file: on a
+  synced folder a delete wins on one machine and then loses an argument with the next
+  replica that still had the file. Entitlement is checked when the revocation is read,
+  not when it is written, so writing one by hand into the folder achieves nothing.
+
 ## v0.5.11 - 2026-09-14
 
 Beta. Sync that said it was healthy while nothing moved, and licences that verify

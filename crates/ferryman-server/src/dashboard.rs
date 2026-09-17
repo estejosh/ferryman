@@ -1174,6 +1174,52 @@ async fn team(
                 &device[..device.len().min(7)]
             ));
         }
+        // A machine joining under an existing identity is claimed by that identity,
+        // whoever the master is. The session holds exactly one unlocked key, so the
+        // person signed in as the owner is the one who can finish it.
+        {
+            let roster_now =
+                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+            for (invite, accept) in settled.ready_to_attest {
+                let Some(owner) = invite.owner.as_deref() else {
+                    continue;
+                };
+                if !owner.eq_ignore_ascii_case(current.name()) {
+                    settled_notes.push(format!(
+                        "{} is waiting for {owner} to claim it",
+                        accept.operator
+                    ));
+                    continue;
+                }
+                let Some(key) = roster_now
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&accept.operator))
+                    .and_then(|a| a.public_key.clone())
+                else {
+                    continue;
+                };
+                if ferryman_channel::owner::attest_owner(&route, &current, &accept.operator, &key)
+                    .is_ok()
+                {
+                    let _ = ferryman_channel::invite::mark_granted(&route, &invite.id);
+                    let _ = ferryman_channel::ledger::append_ledger_entry(
+                        &route,
+                        &current,
+                        "own",
+                        current.name(),
+                        &format!(
+                            "{owner} claimed {} as their machine on {}; it inherits their access",
+                            accept.operator, route.project_id
+                        ),
+                        None,
+                    );
+                    settled_notes.push(format!(
+                        "{} is yours now and inherits your access",
+                        accept.operator
+                    ));
+                }
+            }
+        }
         if master_name
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(current.name()))
@@ -1545,10 +1591,21 @@ async fn revoke_access(
             }
         }
     }
+    // The master ends anyone. Everybody else ends their own machines and agents,
+    // from whichever one they happen to be signed in on.
+    let signed_in_as_master = ferryman_channel::master::read_master(&route)
+        .ok()
+        .flatten()
+        .is_some_and(|declaration| declaration.master.eq_ignore_ascii_case(current.name()));
     let mut revoked = Vec::new();
     for who in &names {
-        ferryman_channel::master::revoke_member(&route, &current, who, &reason)
-            .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        if signed_in_as_master {
+            ferryman_channel::master::revoke_member(&route, &current, who, &reason)
+                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        } else {
+            ferryman_channel::owner::revoke_machine(&route, &current, who, &reason)
+                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        }
         revoked.push(who.clone());
     }
     let mut unshared = Vec::new();

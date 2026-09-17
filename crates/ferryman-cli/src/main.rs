@@ -1332,18 +1332,22 @@ enum TeamCommand {
         /// The name you want on the project.
         name: String,
     },
-    /// End a person's access: a master-signed revocation, the folder unshared from
-    /// their device, their open invitations burned. Master only.
+    /// End access: a signed revocation, the folder unshared from their device, their
+    /// open invitations burned.
+    ///
+    /// The master may end anyone on the project. Anyone else may end their own
+    /// machines and agents, from any of them - so a laptop that walked off is killed
+    /// from the one still on your desk.
     Revoke {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// The person (or agent) to revoke.
+        /// The person, machine or agent to revoke.
         #[arg(long)]
         name: String,
         /// Why, kept in the ledger.
-        #[arg(long, default_value = "revoked by the master")]
+        #[arg(long, default_value = "revoked")]
         reason: String,
-        /// Sign as this operator (the master). Defaults to this machine's agent.
+        /// Sign as this operator. Defaults to this machine's agent.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
     },
@@ -1352,15 +1356,31 @@ enum TeamCommand {
     Pending {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Sign as this identity. A machine that joined under --as-identity is
+        /// claimed here, by the identity that invited it and nobody else.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
     },
 }
 
 #[derive(Subcommand, Clone)]
 enum InviteAction {
     /// Reserve a person (and their agent) and print the code to send them. Master only.
+    ///
+    /// With --as-identity, a second mode: invite one of your OWN machines onto a
+    /// project you are already on. It joins as <identity>-<machine> and inherits
+    /// exactly your access, so it needs no master and grants nothing new.
     Create {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Add a machine under an identity you already hold here, e.g. josh. Use with
+        /// --machine. Cannot be combined with --name, --agent or --roles.
+        #[arg(long = "as-identity", value_parser = agent_name)]
+        as_identity: Option<String>,
+        /// What to call the machine joining under --as-identity, e.g. beastly. The
+        /// name on the project becomes <identity>-<machine>.
+        #[arg(long)]
+        machine: Option<String>,
         /// Reserve this name for them, e.g. david. Omit for a generic invite: they pick
         /// any free name when they create their identity.
         #[arg(long)]
@@ -3955,6 +3975,8 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             action:
                 InviteAction::Create {
                     workspace,
+                    as_identity,
+                    machine,
                     name,
                     agent,
                     roles,
@@ -3963,14 +3985,59 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 },
         } => {
             let route = here(workspace)?;
-            let signer_name = match signer {
-                Some(s) => s,
-                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            let signer_name = match (&as_identity, signer) {
+                // --as-identity says who is signing AND who owns what joins; asking
+                // for it twice, in two flags that could disagree, helps nobody.
+                (Some(identity), _) => identity.clone(),
+                (None, Some(s)) => s,
+                (None, None) => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
             let identity = signing_identity(&route, &signer_name)?;
             let device = ferryman_channel::syncthing_my_id().context(
                 "the inviter's Syncthing must be running so the code can carry its device id",
             )?;
+
+            if let Some(owner) = as_identity {
+                if name.is_some() || agent.is_some() || roles.is_some() {
+                    bail!(
+                        "--as-identity adds a machine under your own access; it has no name, agent or roles of its own"
+                    );
+                }
+                let Some(machine) = machine else {
+                    bail!(
+                        "say which machine this is for: --machine beastly (it joins as {})",
+                        invite::machine_name(&owner, "beastly")
+                    );
+                };
+                let (invite, code) = invite::create_for_identity(
+                    &route,
+                    &identity,
+                    &machine,
+                    chrono::Duration::days(expires_days.max(1)),
+                    &device,
+                )?;
+                let joined_as = invite.operator.as_deref().unwrap_or(&machine);
+                println!("adding {joined_as} to {}", route.project_id);
+                println!("  inherits    everything {owner} can do here, and nothing else");
+                println!("  master      not needed; nothing new is granted");
+                println!(
+                    "  expires     {}",
+                    invite.expires_at.format("%Y-%m-%d %H:%M UTC")
+                );
+                println!();
+                println!("Run this on {machine}:");
+                println!();
+                println!("  ferry team invite accept {code}");
+                println!();
+                println!(
+                    "Then, back here, once it has synced:  ferry team pending --as {owner}"
+                );
+                return Ok(());
+            }
+            if machine.is_some() {
+                bail!("--machine only means something with --as-identity");
+            }
+
             let roles: Vec<String> = roles
                 .unwrap_or_default()
                 .split(',')
@@ -4155,7 +4222,15 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 None => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
             let identity = signing_identity(&route, &signer_name)?;
-            ferryman_channel::master::revoke_member(&route, &identity, &name, &reason)?;
+            // The master ends anyone on the project. Everybody else ends their own
+            // machines and agents, and can do it from any of them.
+            let signed_in_as_master = ferryman_channel::master::read_master(&route)?
+                .is_some_and(|d| d.master.eq_ignore_ascii_case(identity.name()));
+            if signed_in_as_master {
+                ferryman_channel::master::revoke_member(&route, &identity, &name, &reason)?;
+            } else {
+                ferryman_channel::owner::revoke_machine(&route, &identity, &name, &reason)?;
+            }
             let devices: Vec<String> = invite::list(&route)?
                 .into_iter()
                 .filter(|(i, _)| {
@@ -4178,7 +4253,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 "note: what already synced is on their disk; rotate any secret sealed to them"
             );
         }
-        TeamCommand::Pending { workspace } => {
+        TeamCommand::Pending { workspace, signer } => {
             let route = here(workspace)?;
             let settled = invite::settle_pending(&route)?;
             for (id, device) in &settled.paired {
@@ -4190,7 +4265,65 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     accept.operator
                 );
             }
-            if settled.paired.is_empty() && settled.ready_to_grant.is_empty() {
+            // Machines joining under an existing identity finish here rather than in
+            // the dashboard, because the key that has to sign is the owner's and this
+            // is the machine the owner is standing at.
+            for (invite, accept) in &settled.ready_to_attest {
+                let Some(owner) = invite.owner.as_deref() else {
+                    continue;
+                };
+                if signer.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case(owner)) {
+                    println!(
+                        "{} is waiting for {owner} to claim it: ferry team pending --as {owner}",
+                        accept.operator
+                    );
+                    continue;
+                }
+                let identity = match signing_identity(&route, owner) {
+                    Ok(identity) => identity,
+                    Err(err) => {
+                        println!(
+                            "{} is waiting for {owner} to claim it, and {owner}'s key is not usable here: {err:#}",
+                            accept.operator
+                        );
+                        continue;
+                    }
+                };
+                let key = ferryman_channel::read_agent_roster(&route.communications)?
+                    .into_iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&accept.operator))
+                    .and_then(|a| a.public_key);
+                let Some(key) = key else {
+                    println!("{}'s key has not synced here yet", accept.operator);
+                    continue;
+                };
+                ferryman_channel::owner::attest_owner(
+                    &route,
+                    &identity,
+                    &accept.operator,
+                    &key,
+                )?;
+                invite::mark_granted(&route, &invite.id)?;
+                let _ = ferryman_channel::ledger::append_ledger_entry(
+                    &route,
+                    &identity,
+                    "own",
+                    identity.name(),
+                    &format!(
+                        "{} claimed {} as their machine on {}; it inherits their access",
+                        owner, accept.operator, route.project_id
+                    ),
+                    None,
+                );
+                println!(
+                    "{} is yours now and inherits your access on {}",
+                    accept.operator, route.project_id
+                );
+            }
+            if settled.paired.is_empty()
+                && settled.ready_to_grant.is_empty()
+                && settled.ready_to_attest.is_empty()
+            {
                 println!("nothing waiting");
             }
         }
@@ -4505,6 +4638,15 @@ async fn agent_command(command: Agent) -> Result<()> {
                             for (_, accept) in settled.ready_to_grant {
                                 report.info(&format!(
                                     "{}: {} has joined and is waiting for the master's grant (open the dashboard)",
+                                    route.project_id, accept.operator
+                                ));
+                            }
+                            // The loop holds this machine's agent key, not a person's,
+                            // so it can say the machine arrived but not claim it.
+                            for (invite, accept) in settled.ready_to_attest {
+                                let owner = invite.owner.as_deref().unwrap_or("its owner");
+                                report.info(&format!(
+                                    "{}: {} has joined and is waiting for {owner} to claim it (ferry team pending --as {owner})",
                                     route.project_id, accept.operator
                                 ));
                             }
