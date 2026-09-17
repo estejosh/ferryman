@@ -34,6 +34,7 @@ pub mod marvin;
 pub mod master;
 pub mod memory;
 pub mod migration;
+pub mod owner;
 pub mod portable_auth;
 pub mod release;
 pub mod secrets;

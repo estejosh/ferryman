@@ -437,9 +437,51 @@ pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
 /// Whether `grantee` holds a valid master-signed grant for `role` on this
 /// project. In team mode this is the gate that decides who may act.
 pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
+    // A revocation aimed at this exact name wins over everything below it,
+    // including an owner who is still in good standing: taking one machine away
+    // from a person has to be possible without taking the person away.
     if is_revoked(route, grantee)? {
         return Ok(false);
     }
+    // The same, signed by an owner rather than the master. A person does not need
+    // the master's attention to turn off their own machine, and must be able to do
+    // it from whichever machine they are actually sitting at.
+    if crate::owner::is_revoked(route, grantee)? {
+        return Ok(false);
+    }
+    if holds_grant(route, grantee, role)? {
+        return Ok(true);
+    }
+
+    // Otherwise: a machine identity acts on behalf of the person who claimed it.
+    // The grant that was reviewed is the person's; the machine adds nothing of
+    // its own and is exactly as revoked as they are. One hop only - an owner
+    // cannot itself be owned, so a chain of claims cannot manufacture authority.
+    let Some(owner) = crate::owner::owner_of(route, grantee)? else {
+        return Ok(false);
+    };
+    if owner.eq_ignore_ascii_case(grantee) || is_revoked(route, &owner)? {
+        return Ok(false);
+    }
+    holds_grant(route, &owner, role)
+}
+
+/// Whether `grantee` has any live access here at all, whatever it covers.
+///
+/// A reserved name on the roster is not a member. This is the difference between
+/// someone who was let in and someone whose name was merely written down.
+pub fn has_any_access(route: &ProjectRoute, grantee: &str) -> Result<bool> {
+    if is_revoked(route, grantee)? {
+        return Ok(false);
+    }
+    Ok(member_grants(route)?
+        .iter()
+        .any(|(grant, check)| grant.grantee == grantee && *check == SignatureCheck::Valid))
+}
+
+/// Whether a valid grant naming `grantee` covers `role`. Ignores ownership and
+/// revocation; `is_granted` is the gate, this is the lookup behind it.
+fn holds_grant(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
     for (grant, check) in member_grants(route)? {
         if grant.grantee == grantee
             && check == SignatureCheck::Valid
@@ -653,6 +695,119 @@ mod tests {
                 vec![],
             )
             .is_err()
+        );
+    }
+
+    /// A person, their two machines, and the master who only ever reviewed the
+    /// person. This is the whole point of the owner attestation.
+    fn fleet(dir: &std::path::Path) -> (ProjectRoute, AgentIdentity, AgentIdentity) {
+        let mut route = test_route(dir);
+        std::fs::create_dir_all(&route.communications).unwrap();
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let grouchly = AgentIdentity::from_seed("josh-grouchly", [2u8; 32]);
+        let entry = |identity: &AgentIdentity| AgentRoute {
+            name: identity.name().to_owned(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
+        };
+        route.agents = vec![entry(&ada), entry(&josh), entry(&grouchly)];
+
+        initialize_master(&route, &ada, "ada").unwrap();
+        grant_member(
+            &route,
+            &ada,
+            "josh",
+            &josh.public_key_hex(),
+            vec!["hone".into()],
+            vec!["worker".into()],
+            vec!["code".into()],
+        )
+        .unwrap();
+        crate::owner::attest_owner(&route, &josh, "josh-grouchly", &grouchly.public_key_hex())
+            .unwrap();
+        (route, ada, josh)
+    }
+
+    #[test]
+    fn a_machine_inherits_the_grant_of_the_person_who_owns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _ada, _josh) = fleet(dir.path());
+
+        assert!(
+            is_granted(&route, "josh-grouchly", "worker").unwrap(),
+            "the master reviewed josh; his machine is him"
+        );
+        assert!(
+            !is_granted(&route, "josh-grouchly", "orchestrator").unwrap(),
+            "inheriting means inheriting exactly, not more"
+        );
+        assert!(
+            !is_granted(&route, "josh-beastly", "worker").unwrap(),
+            "a machine nobody has claimed is a stranger"
+        );
+    }
+
+    #[test]
+    fn revoking_the_person_takes_their_machines_with_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, ada, _josh) = fleet(dir.path());
+        assert!(is_granted(&route, "josh-grouchly", "worker").unwrap());
+
+        revoke_member(&route, &ada, "josh", "left the project").unwrap();
+
+        assert!(!is_granted(&route, "josh", "worker").unwrap());
+        assert!(
+            !is_granted(&route, "josh-grouchly", "worker").unwrap(),
+            "revocation that leaves the laptop working is not revocation"
+        );
+    }
+
+    /// The master is not in this story at all, and does not need to be.
+    #[test]
+    fn one_machine_ends_another_without_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut route, _ada, _josh) = fleet(dir.path());
+        let grouchly = AgentIdentity::from_seed("josh-grouchly", [2u8; 32]);
+        let beastly = AgentIdentity::from_seed("josh-beastly", [3u8; 32]);
+        route.agents.push(AgentRoute {
+            name: "josh-beastly".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(beastly.public_key_hex()),
+            encryption_key: None,
+        });
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        crate::owner::attest_owner(&route, &josh, "josh-beastly", &beastly.public_key_hex())
+            .unwrap();
+        assert!(is_granted(&route, "josh-beastly", "worker").unwrap());
+
+        crate::owner::revoke_machine(&route, &grouchly, "josh-beastly", "left in a taxi").unwrap();
+
+        assert!(
+            !is_granted(&route, "josh-beastly", "worker").unwrap(),
+            "the laptop on the desk has to be able to kill the one that walked off"
+        );
+        assert!(is_granted(&route, "josh-grouchly", "worker").unwrap());
+        assert!(is_granted(&route, "josh", "worker").unwrap());
+    }
+
+    #[test]
+    fn revoking_one_machine_leaves_the_person_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, ada, _josh) = fleet(dir.path());
+
+        revoke_member(&route, &ada, "josh-grouchly", "laptop stolen").unwrap();
+
+        assert!(
+            !is_granted(&route, "josh-grouchly", "worker").unwrap(),
+            "the machine-specific revocation has to outrank the owner's standing"
+        );
+        assert!(
+            is_granted(&route, "josh", "worker").unwrap(),
+            "losing a laptop is not losing your access"
         );
     }
 }
