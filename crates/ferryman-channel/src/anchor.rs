@@ -703,6 +703,95 @@ pub fn is_paused(route: &ProjectRoute, master: &str) -> Result<bool> {
     Ok(matches!(standing(route, master)?, Standing::Paused { .. }))
 }
 
+// --- judging what a provider said, without this crate ever asking it ------------
+//
+// `ferryman-channel` has no HTTP client and does not acquire one here. The fetch
+// lives in the layer that already has `reqwest`; what arrives back is plain facts,
+// and the rules that turn facts into a verdict are pure functions with tests. The
+// network stays outside the crate that decides who may act.
+
+/// What the provider said about an account.
+///
+/// Its ABSENCE is the important case and is represented by not calling this at all:
+/// a timeout, a rate limit, a 401, a 403 and a 404 all produce no facts, which is
+/// *not checked* and must never be recorded as an observation. On a private
+/// repository GitHub answers 404 for anything the caller cannot see, so "moved",
+/// "deleted" and "your token expired" are one status - reading any of them as
+/// evidence would pause every private project the day a token lapsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountFacts {
+    pub account_id: u64,
+    pub login: String,
+    /// The account's published SSH keys, exactly as `<login>.keys` served them.
+    pub published_keys: Vec<String>,
+}
+
+/// What the provider said about one repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryFacts {
+    pub owner_id: u64,
+    pub owner_login: String,
+}
+
+/// Is the claimed key still published on the claimed account?
+#[must_use]
+pub fn judge_account(anchor: &GitAnchor, facts: &AccountFacts) -> (Outcome, String) {
+    if facts.account_id != anchor.account_id {
+        return (
+            Outcome::Contradicted,
+            format!(
+                "{} now resolves to account {}, not {}",
+                facts.login, facts.account_id, anchor.account_id
+            ),
+        );
+    }
+    // Compared as KEYS, not as strings. The trailing comment on an authorized-keys
+    // line is free text the account holder edits at will, and a claim that broke
+    // because somebody retitled their laptop would be a claim nobody trusted.
+    let claimed = parse_public_key(&anchor.ssh_key);
+    let still_there = claimed.is_some_and(|key| {
+        facts
+            .published_keys
+            .iter()
+            .filter_map(|line| parse_public_key(line))
+            .any(|published| published == key)
+    });
+    if still_there {
+        (
+            Outcome::Verified,
+            format!("the claimed key is still published on {}", facts.login),
+        )
+    } else {
+        (
+            Outcome::Contradicted,
+            format!("the claimed key is no longer published on {}", facts.login),
+        )
+    }
+}
+
+/// Does the claimed account still own this repository?
+///
+/// The acquisition check. The anchor check above is blind to a sale: after one, the
+/// outgoing master's key is still on the outgoing master's account, perfectly valid,
+/// answering a question nobody asked.
+#[must_use]
+pub fn judge_repository(anchor: &GitAnchor, facts: &RepositoryFacts) -> (Outcome, String) {
+    if facts.owner_id == anchor.account_id {
+        (
+            Outcome::Verified,
+            format!("the repository still belongs to {}", facts.owner_login),
+        )
+    } else {
+        (
+            Outcome::Contradicted,
+            format!(
+                "the repository now belongs to {} ({}), not to {} ({})",
+                facts.owner_login, facts.owner_id, anchor.login, anchor.account_id
+            ),
+        )
+    }
+}
+
 /// The one line to put in front of an operation a paused master may not do.
 pub fn refuse_if_paused(route: &ProjectRoute, master: &str, doing: &str) -> Result<()> {
     if let Standing::Paused { since } = standing(route, master)? {
@@ -1527,5 +1616,110 @@ mod paused_work {
         let fang = AgentIdentity::from_seed("fang", [2u8; 32]);
         let route = project(dir.path(), &[&fang]);
         crate::issue_order(&route, &an_order("t-4", &fang, "fang")).unwrap();
+    }
+}
+
+/// Turning what a provider said into a verdict. Pure, so every case that matters
+/// can be tested without a network - including the ones a network would rarely
+/// produce on demand.
+#[cfg(test)]
+mod judging {
+    use super::tests::{anchored, test_account};
+    use super::*;
+    use crate::AgentIdentity;
+
+    fn anchor() -> GitAnchor {
+        anchored(&test_account(), &AgentIdentity::from_seed("josh", [1u8; 32]))
+    }
+
+    fn facts_with(keys: Vec<String>) -> AccountFacts {
+        AccountFacts {
+            account_id: 196_700_792,
+            login: "estejosh".into(),
+            published_keys: keys,
+        }
+    }
+
+    #[test]
+    fn a_key_still_on_the_account_verifies() {
+        let anchor = anchor();
+        let (outcome, why) = judge_account(&anchor, &facts_with(vec![anchor.ssh_key.clone()]));
+        assert_eq!(outcome, Outcome::Verified, "{why}");
+    }
+
+    /// The comment on an authorized-keys line is free text the holder edits at will.
+    /// A claim that broke when somebody retitled their laptop is a claim nobody would
+    /// leave switched on.
+    #[test]
+    fn renaming_the_key_does_not_break_the_claim() {
+        let anchor = anchor();
+        let renamed = anchor
+            .ssh_key
+            .replace("test@fixture", "josh's new thinkpad");
+        assert_ne!(renamed, anchor.ssh_key);
+        let (outcome, why) = judge_account(&anchor, &facts_with(vec![renamed]));
+        assert_eq!(outcome, Outcome::Verified, "{why}");
+    }
+
+    #[test]
+    fn a_key_taken_off_the_account_contradicts() {
+        let anchor = anchor();
+        let (outcome, why) = judge_account(&anchor, &facts_with(Vec::new()));
+        assert_eq!(outcome, Outcome::Contradicted);
+        assert!(why.contains("no longer published"), "{why}");
+
+        let somebody_elses = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFM+bIb/EF6GCFALmua7hjXIybgrxGtBRERwVm77qNLy other";
+        let (outcome, _) = judge_account(&anchor, &facts_with(vec![somebody_elses.into()]));
+        assert_eq!(
+            outcome,
+            Outcome::Contradicted,
+            "another key on the account is not this key"
+        );
+    }
+
+    /// A handle can be released and taken by somebody else. The id is what was
+    /// claimed, so the login resolving elsewhere is the account being gone.
+    #[test]
+    fn the_login_resolving_to_another_account_contradicts() {
+        let anchor = anchor();
+        let mut facts = facts_with(vec![anchor.ssh_key.clone()]);
+        facts.account_id = 999;
+        let (outcome, why) = judge_account(&anchor, &facts);
+        assert_eq!(outcome, Outcome::Contradicted);
+        assert!(why.contains("999"), "{why}");
+    }
+
+    #[test]
+    fn a_repository_still_on_the_account_verifies() {
+        let anchor = anchor();
+        let (outcome, _) = judge_repository(
+            &anchor,
+            &RepositoryFacts {
+                owner_id: 196_700_792,
+                owner_login: "estejosh".into(),
+            },
+        );
+        assert_eq!(outcome, Outcome::Verified);
+    }
+
+    /// The sale. Nothing about the account changed - the key is still published, the
+    /// id still resolves - and the project is somebody else's now.
+    #[test]
+    fn a_repository_that_moved_to_a_new_owner_contradicts() {
+        let anchor = anchor();
+        let (outcome, why) = judge_repository(
+            &anchor,
+            &RepositoryFacts {
+                owner_id: 4_242_424,
+                owner_login: "acquirer-inc".into(),
+            },
+        );
+        assert_eq!(outcome, Outcome::Contradicted);
+        assert!(why.contains("acquirer-inc"), "{why}");
+
+        // ...and the anchor check, run against a perfectly healthy account, says the
+        // opposite. This is why the ownership check cannot be advisory.
+        let (anchor_outcome, _) = judge_account(&anchor, &facts_with(vec![anchor.ssh_key.clone()]));
+        assert_eq!(anchor_outcome, Outcome::Verified);
     }
 }
