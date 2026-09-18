@@ -1407,6 +1407,15 @@ enum AnchorAction {
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
     },
+    /// Put every account you have claimed into every project here that it owns.
+    ///
+    /// Claiming already does this. Run it again after enabling a project, or on a
+    /// machine that has just synced one. Publishing the same claim twice is free.
+    Sync {
+        /// Whose claims to spread. Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
     /// What this project currently believes about its master's anchor.
     Status {
         #[arg(long)]
@@ -4470,6 +4479,29 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
             println!("  account     {} ({})", facts.login, facts.account_id);
             println!("  proven with the key already published there");
             println!("  verifies offline from now on; nothing re-asks github to use it");
+
+            // Once, not once per project. Every project on this machine whose remote
+            // this account owns learns about it now, and anything enabled later picks
+            // it up on the next sync.
+            spread_claims(&[claim]);
+        }
+        AnchorAction::Sync { signer } => {
+            let Some(root) = ferryman_channel::ferry::find_root() else {
+                bail!("no ferry root here, so there are no projects to spread a claim across");
+            };
+            let signer_name = match signer {
+                Some(name) => name,
+                None => ferryman_ops::identity::resolve(None, &root.path)?,
+            };
+            let held = anchor::held_by(&root, &signer_name);
+            if held.is_empty() {
+                println!("{signer_name} has claimed no git account on any project here");
+                return Ok(());
+            }
+            for claim in &held {
+                println!("{signer_name} holds {} {}", claim.provider, claim.login);
+            }
+            spread_claims(&held);
         }
         AnchorAction::Check {
             workspace,
@@ -4560,6 +4592,37 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Spread claims across every project in this machine's ferry root, and say what
+/// happened to each. Quiet about the ordinary cases; a project that could not verify
+/// the claim is the one worth naming.
+fn spread_claims(held: &[ferryman_channel::anchor::GitAnchor]) {
+    use ferryman_channel::anchor::Spread;
+    let Some(root) = ferryman_channel::ferry::find_root() else {
+        return;
+    };
+    let mut published = 0;
+    let mut already = 0;
+    for (project, outcome) in ferryman_channel::anchor::spread(&root, held) {
+        match outcome {
+            Spread::Published => {
+                published += 1;
+                println!("  {project}: claim published");
+            }
+            Spread::AlreadyThere => already += 1,
+            Spread::NotVerifiable => println!(
+                "  {project}: owned by a claimed account, but this identity is not on its \
+                 roster - register there first and run `ferry team anchor sync`"
+            ),
+            // Somebody else's repository, or a project with nothing to write to.
+            // Neither is a problem and neither is worth a line.
+            Spread::NotOurs { .. } | Spread::NoProject => {}
+        }
+    }
+    if published == 0 && already > 0 {
+        println!("  every project that this account owns already had it");
+    }
 }
 
 fn print_standing(route: &ferryman_channel::ProjectRoute, master: &str) -> Result<()> {

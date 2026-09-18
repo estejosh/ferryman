@@ -521,6 +521,108 @@ pub fn claim_for_project(route: &ProjectRoute, master: &str) -> Result<Option<Gi
         .find(|anchor| anchor.login.eq_ignore_ascii_case(&owner)))
 }
 
+/// What happened to one project when claims were spread across a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Spread {
+    /// The claim was written into this project's channel.
+    Published,
+    /// It was already there, byte for byte. Running this again is free.
+    AlreadyThere,
+    /// This project's repository belongs to an account nobody here has claimed.
+    /// The ordinary answer for somebody else's project, and not a problem.
+    NotOurs { owner: String },
+    /// The remote owner matches, but this identity is not published on that
+    /// project's roster, so nobody there could verify the claim. An anchor that
+    /// cannot be checked reads as evidence and is not, so it is not written.
+    NotVerifiable,
+    /// A channel-only entry, or one whose route will not load. Nothing to write to.
+    NoProject,
+}
+
+/// Every claim this identity has proven, gathered from wherever it already sits.
+///
+/// There is no machine-level store of claims and there does not need to be: a claim
+/// carries both its signatures and verifies anywhere, so a copy in any one channel
+/// is as good as a copy in a vault. This reads them back out of the projects that
+/// already have them.
+pub fn held_by(root: &crate::ferry::Root, identity: &str) -> Vec<GitAnchor> {
+    let mut held: Vec<GitAnchor> = Vec::new();
+    for entry in root.projects() {
+        let Some(repo) = entry.repo.as_ref() else {
+            continue;
+        };
+        let Ok(route) = crate::route_for(repo) else {
+            continue;
+        };
+        for claim in claims(&route, identity).unwrap_or_default() {
+            if !held
+                .iter()
+                .any(|kept| kept.provider == claim.provider && kept.account_id == claim.account_id)
+            {
+                held.push(claim);
+            }
+        }
+    }
+    held.sort_by_key(|claim| (claim.provider.clone(), claim.account_id));
+    held
+}
+
+/// Put every held claim into every project on this machine whose repository the
+/// claim's account owns.
+///
+/// This is what makes claiming a once-per-account job rather than a once-per-project
+/// one. `estejosh` owns a dozen repositories here; proving it once should mean all
+/// dozen know, and a project enabled next week should pick it up without anybody
+/// remembering. The matching is by the project's own git remote, so nothing is
+/// asserted about a repository the account does not own.
+///
+/// Safe to run on every loop: publishing the same claim twice is a no-op, and a
+/// project that cannot verify the claim is skipped rather than written to.
+pub fn spread(root: &crate::ferry::Root, held: &[GitAnchor]) -> Vec<(String, Spread)> {
+    let mut out = Vec::new();
+    for entry in root.projects() {
+        let outcome = spread_into(&entry, held);
+        out.push((entry.project_id.clone(), outcome));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn spread_into(entry: &crate::ferry::Entry, held: &[GitAnchor]) -> Spread {
+    let Some(repo) = entry.repo.as_ref() else {
+        return Spread::NoProject;
+    };
+    let Ok(route) = crate::route_for(repo) else {
+        return Spread::NoProject;
+    };
+    let Some(owner) = remote_owner(&route.git_remote) else {
+        return Spread::NoProject;
+    };
+    let Some(claim) = held
+        .iter()
+        .find(|claim| claim.login.eq_ignore_ascii_case(&owner))
+    else {
+        return Spread::NotOurs { owner };
+    };
+    let Some(signer) = claim.signed_by.as_deref() else {
+        return Spread::NotVerifiable;
+    };
+    if read_claim(&route, signer, &claim.provider, claim.account_id)
+        .ok()
+        .flatten()
+        .as_ref()
+        == Some(claim)
+    {
+        return Spread::AlreadyThere;
+    }
+    match publish(&route, claim) {
+        Ok(_) => Spread::Published,
+        // The only way this fails for a claim that verified where it came from is
+        // that this identity is not on this project's roster.
+        Err(_) => Spread::NotVerifiable,
+    }
+}
+
 /// What a check found. There is no third outcome that means anything: either the
 /// provider answered and agreed, or it answered and disagreed. Failing to reach it
 /// is not an observation and is never recorded as one.
