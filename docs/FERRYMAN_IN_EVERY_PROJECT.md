@@ -140,7 +140,7 @@ loss, which is why it goes unnoticed for months.
 | 3 | The channel never came home | `ferry root show` prints a channel path that is not under `comms\` | `ferry root gather --dry-run`, read it, then run it |
 | 4 | `repos\` has no link | `ferry root show` says *adopted where it stands* but `repos\` has no entry | `ferry root adopt` again in the repository. Adoption on an older version did not make the link |
 | 5 | Nobody is master | `ferry doctor` says *no master declared* | `ferry enable --master` on the master's own machine. Nobody else can do this for them |
-| 6 | The manifest points somewhere gone | **Nothing.** `ferry root show` omits the entry entirely. Only `ferry root gather --dry-run` names it | Re-adopt at the real path, or report it |
+| 6 | The manifest points somewhere gone | **Nothing.** `ferry root show` omits the entry entirely | `ferry root forget --gone --dry-run`, read it, then run it. Or re-adopt at the real path if the project is alive |
 
 A seventh looks like case 1 and is not: **the repository was attached the old
 way and never migrated.** `.ferryman\bridge.toml` carries `endpoint` and
@@ -177,17 +177,26 @@ or of a file under `agents\`.** Two machines wrote the same signed file. Do not
 delete either one and do not guess which is right. Tell the master and let them
 settle it — a wrong guess here re-keys an identity, which is rule 6 above.
 
-**`ferry root` can add a project to the manifest and cannot remove one, and
-`ferry root show` does not show you what it is hiding.** An entry whose channel
-and repository have both vanished stays in the manifest forever and disappears
-from `root show` — which reads exactly like a project that was never adopted.
-`ferry root gather --dry-run` is the honest inventory: it names every entry in
-the manifest, including the ones pointing at paths that are gone. Run that, not
-`root show`, when you are asking *what does this machine think it has*.
+**`ferry root show` does not show you what it is hiding.** It lists only the
+entries whose channel it can open — deliberately, because offering a project
+that cannot be opened looks like the software ignoring you. The cost is that an
+entry whose channel has gone reads exactly like a project nobody ever adopted.
 
-Until there is a `forget`, a dead entry is something to report, not something to
-edit by hand. The manifest is plain JSON with no BOM, and a PowerShell
-`Set-Content -Encoding UTF8` will add one and make the whole root read as empty.
+Two commands see past it:
+
+```sh
+ferry root forget --gone --dry-run   # names every entry whose channel is missing
+ferry root gather --dry-run          # names them too, while saying what would move
+```
+
+Run one of those, not `root show`, when the question is *what does this machine
+think it has*. `ferry root forget <project>` removes a single entry; `--gone`
+clears every dead one. Both touch the manifest and nothing else — the channel
+and the repository stay exactly where they are.
+
+Do not edit the manifest by hand. It is plain JSON with no BOM, and a PowerShell
+`Set-Content -Encoding UTF8` adds one, after which the entire root reads as
+empty and `root show` says *nothing filed yet*.
 
 ---
 
@@ -241,7 +250,7 @@ them, and they map to the table above:
 
 - **`channel only on this machine`** → case 1. Find the repository and enable it.
 - **`would move`** → case 3. Run the gather without `--dry-run`.
-- **`is not on this machine`** → case 6. A dead entry. Report it.
+- **`is not on this machine`** → case 6. A dead entry. `ferry root forget --gone`.
 - **a project in `root show` with no entry in `repos\`** → case 4. Adopt again.
 
 ### When a machine or an identity leaves
