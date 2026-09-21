@@ -140,32 +140,65 @@ pub async fn fetch_account(login: &str) -> Result<Result<AccountFacts, NotChecke
         ))));
     };
 
-    let keys = client
+    // SIGNING keys first, and they are the right ones.
+    //
+    // `<login>.keys` serves AUTHENTICATION keys - the ones that grant git push. Proving
+    // an account with one of those means the proof is only as separable as a push
+    // credential, and it means a machine that verifies has to hold something that can
+    // write to every repository on the account. A signing key grants nothing at all:
+    // stealing it forges anchor claims and cannot push a commit. That is the correct
+    // separation, and it is also the endpoint that was already right on this account
+    // while `.keys` showed nothing.
+    let mut published = Vec::new();
+    match client
+        .get(format!(
+            "https://api.github.com/users/{login}/ssh_signing_keys"
+        ))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            if let Ok(listed) = response.json::<serde_json::Value>().await
+                && let Some(entries) = listed.as_array()
+            {
+                published.extend(
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry["key"].as_str())
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(ToString::to_string),
+                );
+            }
+        }
+        // Not fatal. Authentication keys are read next, and a claim already proven with
+        // one of those must go on verifying.
+        Ok(_) | Err(_) => {}
+    }
+
+    match client
         .get(format!("https://github.com/{login}.keys"))
         .send()
-        .await;
-    let keys = match keys {
-        Ok(response) if response.status().is_success() => response,
-        Ok(response) => {
-            return Ok(Err(NotChecked(format!(
-                "github answered {} for {login}'s published keys",
-                response.status()
-            ))));
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            if let Ok(text) = response.text().await {
+                published.extend(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(ToString::to_string),
+                );
+            }
         }
-        Err(error) => {
-            return Ok(Err(NotChecked(format!(
-                "could not read {login}'s published keys: {error}"
-            ))));
-        }
-    };
-    let text = match keys.text().await {
-        Ok(text) => text,
-        Err(error) => {
-            return Ok(Err(NotChecked(format!(
-                "could not read {login}'s published keys: {error}"
-            ))));
-        }
-    };
+        Ok(_) | Err(_) => {}
+    }
+
+    if published.is_empty() {
+        return Ok(Err(NotChecked(format!(
+            "github published no signing or authentication keys for {login}"
+        ))));
+    }
 
     Ok(Ok(AccountFacts {
         account_id,
@@ -173,13 +206,59 @@ pub async fn fetch_account(login: &str) -> Result<Result<AccountFacts, NotChecke
             .as_str()
             .unwrap_or(login)
             .to_ascii_lowercase(),
-        published_keys: text
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(ToString::to_string)
-            .collect(),
+        published_keys: published,
     }))
+}
+
+/// Every private key on this machine that could prove an account, as a path.
+///
+/// `ssh-keygen -Y sign` takes the private key, so what is wanted is the file whose
+/// `.pub` sibling matches something the account publishes. Nothing here reads a
+/// private key; it only matches public halves and hands `ssh-keygen` a path.
+#[must_use]
+pub fn local_signing_keys() -> Vec<(std::path::PathBuf, String)> {
+    let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) else {
+        return Vec::new();
+    };
+    let ssh = Path::new(&home).join(".ssh");
+    let Ok(entries) = std::fs::read_dir(&ssh) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "pub") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let private = path.with_extension("");
+        if !private.is_file() {
+            continue;
+        }
+        found.push((private, text.trim().to_string()));
+    }
+    found.sort();
+    found
+}
+
+/// The local key that proves this account, if this machine holds one.
+///
+/// Compared as keys rather than as whole lines: the comment on an authorized-keys
+/// line is free text, and GitHub serves its own titling rather than whatever was in
+/// the file when it was uploaded.
+#[must_use]
+pub fn proving_key(facts: &AccountFacts) -> Option<(std::path::PathBuf, String)> {
+    let published: Vec<[u8; 32]> = facts
+        .published_keys
+        .iter()
+        .filter_map(|line| ferryman_channel::anchor::parse_public_key(line))
+        .collect();
+    local_signing_keys().into_iter().find(|(_, line)| {
+        ferryman_channel::anchor::parse_public_key(line)
+            .is_some_and(|local| published.contains(&local))
+    })
 }
 
 /// Who owns a repository now.
@@ -294,19 +373,9 @@ pub fn sign_with_ssh(payload: &str, key: &Path, scratch: &Path) -> Result<String
     Ok(armoured)
 }
 
-/// Where `ssh-keygen` looks by default, so the common case needs no flag.
-#[must_use]
-pub fn default_ssh_key() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    let ssh = Path::new(&home).join(".ssh");
-    for name in ["id_ed25519", "id_ed25519_sk"] {
-        let candidate = ssh.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
+// `default_ssh_key` lived here and guessed at `~/.ssh/id_ed25519`. Guessing was the
+// wrong idea: `proving_key` asks the account what it publishes and matches that
+// against every key on the machine, so the right key is found rather than assumed.
 
 #[cfg(test)]
 mod tests {

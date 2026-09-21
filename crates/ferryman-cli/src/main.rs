@@ -1380,10 +1380,10 @@ enum AnchorAction {
     Claim {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// The account to claim, e.g. estejosh. Claim several by running this again;
-        /// a project answers to whichever one owns its repository.
+        /// The account to claim, e.g. estejosh. Defaults to the owner of this
+        /// project's own git remote, which is almost always the right answer.
         #[arg(long)]
-        account: String,
+        account: Option<String>,
         /// Sign as this identity. Defaults to this machine's agent.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
@@ -4421,22 +4421,43 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
             };
             let identity = signing_identity(&route, &signer_name)?;
 
+            // The account this project's own remote points at. Asking for it was the
+            // wrong default: the repository already says whose it is.
+            let account = match account.or_else(|| anchor::remote_owner(&route.git_remote)) {
+                Some(account) => account,
+                None => bail!(
+                    "this project has no git remote to read an account from; pass --account"
+                ),
+            };
             let facts = match gitanchor::fetch_account(&account).await? {
                 Ok(facts) => facts,
                 Err(gitanchor::NotChecked(why)) => bail!("cannot claim {account}: {why}"),
             };
             println!("{} is account {}", facts.login, facts.account_id);
-            if facts.published_keys.is_empty() {
-                bail!(
-                    "{} publishes no SSH keys, so there is nothing to prove the account with. \
-                     Add an ed25519 key to the account and run this again.",
-                    facts.login
-                );
-            }
 
-            let key = match ssh_key.or_else(gitanchor::default_ssh_key) {
+            // Find the key ourselves. A machine that already holds a key this account
+            // publishes needs no instructions and no flag - that IS the proof, sitting
+            // there. Asking for it was the reason this felt like paperwork.
+            let key = match ssh_key {
                 Some(key) => key,
-                None => bail!("no ssh key found; pass --ssh-key"),
+                None => match gitanchor::proving_key(&facts) {
+                    Some((path, _)) => {
+                        println!("  proving key {}", path.display());
+                        path
+                    }
+                    None => bail!(
+                        "nothing on this machine matches a key {} publishes.\n\
+                         Add one at https://github.com/settings/keys as a SIGNING key - it \
+                         grants no access, it only proves the account is yours:\n  {}",
+                        facts.login,
+                        gitanchor::local_signing_keys()
+                            .first()
+                            .map_or_else(
+                                || "ssh-keygen -t ed25519 -C ferryman-anchor".to_string(),
+                                |(_, line)| line.clone()
+                            )
+                    ),
+                },
             };
             let payload = anchor::ssh_payload("github", facts.account_id, &identity.public_key_hex());
             let armoured = gitanchor::sign_with_ssh(&payload, &key, &route.attachment.join("tmp"))?;
@@ -4467,7 +4488,10 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
                 ssh_key: published.clone(),
                 ssh_signature: armoured,
                 claimed_at: chrono::Utc::now(),
-                evidence_url: format!("https://github.com/{}.keys", facts.login),
+                evidence_url: format!(
+                    "https://api.github.com/users/{}/ssh_signing_keys",
+                    facts.login
+                ),
                 evidence_read_at: chrono::Utc::now(),
                 signed_by: None,
                 signature: None,
