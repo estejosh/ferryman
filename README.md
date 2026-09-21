@@ -436,7 +436,7 @@ The same is true of `ferry soak`: it sends a report only if you set
 
 ## License
 
-Ferryman is **source-available** under the [Usufruct License (UFL) v2.0](LICENSE),
+Ferryman is **source-available** under the [Usufruct License (UFL) v2.1](LICENSE),
 Operational Scope: **Seat-Limited** (tag `UFL-S-1a`): free for any non-production
 use, and free in production for up to **2 people, on 2 computers and 2
 phones/tablets** — production use beyond that threshold requires a paid,
@@ -455,7 +455,7 @@ inside the free tier is computed on your own machine — run `ferry license stat
 and it counts your seats, computers and phones locally and lists what it counted.
 See [What Ferryman sends](#what-ferryman-sends) for the whole payload.
 
-UFL is not on the SPDX license list; cite it as `LicenseRef-UFL-2.0-S`. See the
+UFL is not on the SPDX license list; cite it as `LicenseRef-UFL-2.1-S`. See the
 canonical license text and generator at
 [estejosh/UFL-Usufruct-License](https://github.com/estejosh/UFL-Usufruct-License).
 
