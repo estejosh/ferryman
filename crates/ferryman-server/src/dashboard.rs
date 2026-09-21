@@ -1167,6 +1167,22 @@ async fn team(
     if let Ok(Some(name)) = ferryman_channel::invite::finish_handshake(&route) {
         settled_notes.push(format!("this device is now known as {name}"));
     }
+
+    // Spreading an anchor needs no key, so it happens whenever this page is opened.
+    // A project enabled or synced since the last visit picks up its master's claim
+    // here rather than waiting to be told.
+    if let Some(root) = ferryman_channel::ferry::find_root()
+        && let Some(master) = master_name.as_deref()
+    {
+        let held = ferryman_channel::anchor::held_by(&root, master);
+        if !held.is_empty() {
+            for (project, outcome) in ferryman_channel::anchor::spread(&root, &held) {
+                if outcome == ferryman_channel::anchor::Spread::Published {
+                    settled_notes.push(format!("{project} picked up the git anchor"));
+                }
+            }
+        }
+    }
     if let Ok(settled) = ferryman_channel::invite::settle_pending(&route) {
         for (id, device) in settled.paired {
             settled_notes.push(format!(

@@ -4618,6 +4618,150 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
     Ok(())
 }
 
+/// Keeping anchors current without anybody present.
+///
+/// # What a loop may and may not do here
+///
+/// The loop holds this machine's key, not a person's. A machine key sits in plaintext
+/// because nobody is there at 3am; an operator's is sealed under their password
+/// because they are a person and there IS someone there. `refuse_person_as_machine`
+/// exists because blurring those two once put a whole fleet at a password prompt all
+/// night.
+///
+/// So this does the two things that need no password, and they are most of it:
+///
+/// - **Spreading** copies claims that are already signed into projects that do not yet
+///   have them. No key is involved at all, so a project enabled or synced since the
+///   last pass picks its master's anchor up on its own.
+/// - **Checking** signs an OBSERVATION, and an observation is the machine's own - it
+///   says what this machine saw, under this machine's name, which is exactly what it
+///   is entitled to say.
+///
+/// Making the first claim is the one thing left for a person, because it binds THEIR
+/// key and only their password opens it. The dashboard does that, holding the key they
+/// already unlocked to sign in.
+async fn anchor_maintenance<Config>(
+    served: &[(ferryman_channel::ProjectRoute, Config)],
+    report: &impl ferryman_ops::Progress,
+) {
+    use ferryman_channel::anchor;
+
+    // Spreading first, and it is local and cheap. Whoever's claims are already here go
+    // to every project on this machine that the account owns.
+    if let Some(root) = ferryman_channel::ferry::find_root() {
+        let mut spread_for: Vec<String> = Vec::new();
+        for (route, _) in served {
+            if let Ok(Some(declaration)) = ferryman_channel::master::read_master(route)
+                && !spread_for.contains(&declaration.master)
+            {
+                spread_for.push(declaration.master);
+            }
+        }
+        for master in spread_for {
+            let held = anchor::held_by(&root, &master);
+            if held.is_empty() {
+                continue;
+            }
+            for (project, outcome) in anchor::spread(&root, &held) {
+                if outcome == anchor::Spread::Published {
+                    report.info(&format!("{project}: picked up {master}'s git anchor"));
+                }
+            }
+        }
+    }
+
+    for (route, _) in served {
+        let Ok(Some(declaration)) = ferryman_channel::master::read_master(route) else {
+            continue;
+        };
+        let Ok(Some(claim)) = anchor::claim_for_project(route, &declaration.master) else {
+            continue;
+        };
+        let Ok(observer_name) = ferryman_ops::identity::resolve(None, &route.attachment) else {
+            continue;
+        };
+        if !due_for_a_check(route, &declaration.master, &observer_name) {
+            continue;
+        }
+        let Ok(Some(observer)) = sign_as(route, &observer_name) else {
+            continue;
+        };
+
+        let mut verdict = None;
+        if let Ok(Ok(facts)) = gitanchor::fetch_account(&claim.login).await {
+            verdict = Some(anchor::judge_account(&claim, &facts));
+        }
+        if let Some((owner, name)) = gitanchor::remote_repository(&route.git_remote) {
+            let dotenv = gitanchor::read_dotenv(&route.workspace);
+            let token = gitanchor::token_for(&claim.login, &dotenv);
+            if let Ok(Ok(facts)) =
+                gitanchor::fetch_repository(&owner, &name, token.as_deref()).await
+            {
+                let owned = anchor::judge_repository(&claim, &facts);
+                if owned.0 == anchor::Outcome::Contradicted || verdict.is_none() {
+                    verdict = Some(owned);
+                }
+            }
+        }
+
+        // No verdict means the provider could not be reached, and that is not evidence
+        // about anybody. Nothing is written and nothing is said: a fleet that is offline
+        // would otherwise log this on every pass forever.
+        let Some((outcome, detail)) = verdict else {
+            continue;
+        };
+        if anchor::record(
+            route,
+            &observer,
+            &declaration.master,
+            claim.account_id,
+            outcome,
+            &detail,
+        )
+        .is_ok()
+            && outcome == anchor::Outcome::Contradicted
+        {
+            report.warn(&format!(
+                "{}: {}'s git anchor does not verify - {detail}",
+                route.project_id, declaration.master
+            ));
+        }
+    }
+}
+
+/// Whether this machine's last look was long enough ago to look again.
+///
+/// Days, and never the same gap twice. A fixed schedule is a window an attacker can
+/// work around, and a fleet on a fixed schedule hits the provider's rate limit all at
+/// once. The jitter is derived from the machine's own name so two machines do not
+/// drift into step with each other.
+fn due_for_a_check(
+    route: &ferryman_channel::ProjectRoute,
+    master: &str,
+    observer: &str,
+) -> bool {
+    use ferryman_channel::anchor;
+    let Ok(seen) = anchor::observations(route, master) else {
+        return true;
+    };
+    let Some(mine) = seen.iter().rfind(|observation| {
+        observation
+            .signed_by
+            .as_deref()
+            .is_some_and(|who| who.eq_ignore_ascii_case(observer))
+    }) else {
+        return true;
+    };
+    // 3 to 11 days, spread by name so a fleet does not stampede.
+    let spread = i64::from(
+        observer
+            .bytes()
+            .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(byte)))
+            % 8,
+    );
+    chrono::Utc::now() - mine.observed_at >= chrono::Duration::days(3 + spread)
+}
+
 /// Spread claims across every project in this machine's ferry root, and say what
 /// happened to each. Quiet about the ordinary cases; a project that could not verify
 /// the claim is the one worth naming.
@@ -4995,6 +5139,8 @@ async fn agent_command(command: Agent) -> Result<()> {
                         Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
                     }
                 }
+
+                anchor_maintenance(&fleet.served, &report).await;
 
                 for (route, config) in &mut fleet.served {
                     match agent::work_once(route, config, &report).await {
