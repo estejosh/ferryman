@@ -293,6 +293,43 @@ impl Root {
         Ok(gathered)
     }
 
+    /// Remove one project from the manifest. Nothing on disk is touched.
+    ///
+    /// The index could be added to and never subtracted from, and the omission was not
+    /// visible: `projects` drops an entry whose channel has gone, so a dead one vanishes
+    /// from every listing while staying in the file forever. That reads exactly like a
+    /// project that was never adopted, which is the one thing it must not be confused
+    /// with - the whole point of the index is to tell "nobody recorded this" apart from
+    /// "this was recorded and is now unreachable".
+    ///
+    /// Returns whether an entry was removed. Forgetting an unknown project is not an
+    /// error: the desired state is that it is absent, and it is.
+    pub fn forget(&self, project_id: &str) -> Result<bool> {
+        let mut manifest = self.read();
+        let before = manifest.projects.len();
+        manifest
+            .projects
+            .retain(|entry| entry.project_id != project_id);
+        if manifest.projects.len() == before {
+            return Ok(false);
+        }
+        self.write(&manifest)?;
+        Ok(true)
+    }
+
+    /// Every manifest entry whose channel is not on this machine.
+    ///
+    /// Read this rather than `projects` when the question is what the index claims, not
+    /// what it can open: these are the entries `projects` hides.
+    #[must_use]
+    pub fn unreachable(&self) -> Vec<Entry> {
+        self.read()
+            .projects
+            .into_iter()
+            .filter(|entry| !entry.channel.is_dir())
+            .collect()
+    }
+
     /// Put a link to an adopted repository in `repos/`, so the tidy view exists without
     /// anything having been moved.
     ///
@@ -502,6 +539,67 @@ mod tests {
         assert!(root.work().is_dir());
         assert!(root.manifest_path().is_file());
         assert!(root.projects().is_empty());
+    }
+
+    /// The asymmetry that let the index rot: everything filed, nothing ever removed.
+    #[test]
+    fn a_project_can_be_forgotten_and_the_rest_are_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let keep = channel(dir.path(), "keep");
+        let drop = channel(dir.path(), "drop");
+        root.adopt("keep", &keep, None).unwrap();
+        root.adopt("drop", &drop, None).unwrap();
+
+        assert!(root.forget("drop").unwrap());
+
+        let left = root.read().projects;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].project_id, "keep");
+        // The index is what changed. The channel is not the index's to delete.
+        assert!(drop.is_dir());
+    }
+
+    /// Forgetting what is not there is the desired state, not a failure.
+    #[test]
+    fn forgetting_an_unknown_project_changes_nothing_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let kept = channel(dir.path(), "kept");
+        root.adopt("kept", &kept, None).unwrap();
+
+        assert!(!root.forget("never-existed").unwrap());
+        assert_eq!(root.read().projects.len(), 1);
+    }
+
+    /// The entries `projects` hides, which is how a dead one stayed invisible.
+    #[test]
+    fn an_entry_whose_channel_is_gone_is_unreachable_rather_than_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let here = channel(dir.path(), "here");
+        let gone = channel(dir.path(), "gone");
+        root.adopt("here", &here, None).unwrap();
+        root.adopt("gone", &gone, None).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        // What every listing shows.
+        let listed = root.projects();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].project_id, "here");
+        // What the file actually claims.
+        assert_eq!(root.read().projects.len(), 2);
+        // And the difference, named.
+        let stale = root.unreachable();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].project_id, "gone");
+
+        assert!(root.forget("gone").unwrap());
+        assert!(root.unreachable().is_empty());
+        assert_eq!(root.read().projects.len(), 1);
     }
 
     /// The exact damage this rule exists to stop, reproduced.

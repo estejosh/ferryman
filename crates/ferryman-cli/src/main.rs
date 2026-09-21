@@ -554,6 +554,27 @@ enum RootCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove a project from the manifest. Nothing on disk is touched.
+    ///
+    /// The index recorded projects and never released them, and the gap did not show:
+    /// `show` hides an entry whose channel has gone, so a dead one disappears from every
+    /// listing while staying in the file - indistinguishable from a project nobody ever
+    /// adopted. This is how you say "that one is over" instead of editing the manifest
+    /// by hand, which is how a root gets truncated or written back with a byte-order
+    /// mark that makes the whole thing read as empty.
+    ///
+    /// The channel and the repository are left exactly where they are. Forgetting is an
+    /// index operation; deleting anyone's work is not Ferryman's to do.
+    Forget {
+        /// The project id to remove. Omit and pass --gone to clear every dead entry.
+        project: Option<String>,
+        /// Remove every entry whose channel is not on this machine.
+        #[arg(long)]
+        gone: bool,
+        /// Say what would be removed and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -8633,6 +8654,60 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                 }
                 None => println!("  repo     none on this machine - channel only"),
+            }
+        }
+
+        RootCommand::Forget {
+            project,
+            gone,
+            dry_run,
+        } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let targets: Vec<String> = match (&project, gone) {
+                (Some(id), _) => vec![id.clone()],
+                (None, true) => root
+                    .unreachable()
+                    .into_iter()
+                    .map(|entry| entry.project_id)
+                    .collect(),
+                (None, false) => bail!(
+                    "name a project, or pass --gone to clear every entry whose channel \
+                     is not on this machine"
+                ),
+            };
+            if targets.is_empty() {
+                println!("nothing to forget: every entry's channel is on this machine");
+                return Ok(());
+            }
+            // Say where it pointed as well as its name. An id alone does not let anyone
+            // tell a dead scratch run from a project they are about to lose track of,
+            // and this is the last moment the manifest can still answer that.
+            let claimed: std::collections::HashMap<String, PathBuf> = root
+                .read()
+                .projects
+                .into_iter()
+                .map(|entry| (entry.project_id, entry.channel))
+                .collect();
+            for id in &targets {
+                let where_it_pointed = claimed
+                    .get(id)
+                    .map_or_else(|| "not in the manifest".to_string(), |p| p.display().to_string());
+                if dry_run {
+                    println!("would forget  {id:<20}  {where_it_pointed}");
+                } else if root.forget(id)? {
+                    println!("forgot        {id:<20}  {where_it_pointed}");
+                } else {
+                    println!("not filed     {id:<20}  nothing to do");
+                }
+            }
+            if dry_run {
+                println!("\n  Nothing changed. Run it without --dry-run to do it.");
+            } else {
+                println!(
+                    "\n  The manifest only. Channels and repositories are where they were."
+                );
             }
         }
     }
