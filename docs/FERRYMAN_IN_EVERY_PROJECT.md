@@ -142,7 +142,37 @@ loss, which is why it goes unnoticed for months.
 | 5 | Nobody is master | `ferry doctor` says *no master declared* | `ferry enable --master` on the master's own machine. Nobody else can do this for them |
 | 6 | The manifest points somewhere gone | **Nothing.** `ferry root show` omits the entry entirely. Only `ferry root gather --dry-run` names it | Re-adopt at the real path, or report it |
 
-A seventh is not drift but damage: **a `.sync-conflict-` copy of `master.json`,
+A seventh looks like case 1 and is not: **the repository was attached the old
+way and never migrated.** `.ferryman\bridge.toml` carries `endpoint` and
+`project` and nothing else, there is a leftover `token` file and an inner
+`.git`, and `ferry enable` refuses with:
+
+```text
+Error: the channel was written but cannot be discovered; this is a bug
+  because: <repo>\.ferryman\bridge.toml is missing 'workspace'
+```
+
+That is a hub-era attachment. The channel under `comms\` is real and intact;
+only the config is pointing at an architecture that no longer exists. Rewrite
+`bridge.toml` in the current shape, naming the channel that already exists
+rather than letting `enable` make a second one:
+
+```toml
+project = "<id>"
+workspace = "<repo>"
+attachment = "<repo>\.ferryman"
+communications = "X:\ferry\comms\<id>-ferryman"
+shared_remote = "<id>-ferryman"
+grants = "open"
+```
+
+Then `ferry enable` again — it writes the missing signing key and nothing else,
+because the key is derived from the seed and the roster already trusts it — then
+`ferry root adopt`, then `ferry doctor`. The leftover `token` and inner `.git`
+are for `ferry channel deprecate`, which moves them aside rather than deleting
+them.
+
+An eighth is not drift but damage: **a `.sync-conflict-` copy of `master.json`,
 or of a file under `agents\`.** Two machines wrote the same signed file. Do not
 delete either one and do not guess which is right. Tell the master and let them
 settle it — a wrong guess here re-keys an identity, which is rule 6 above.
