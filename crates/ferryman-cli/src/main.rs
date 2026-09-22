@@ -4110,9 +4110,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 println!();
                 println!("  ferry team invite accept {code}");
                 println!();
-                println!(
-                    "Then, back here, once it has synced:  ferry team pending --as {owner}"
-                );
+                println!("Then, back here, once it has synced:  ferry team pending --as {owner}");
                 return Ok(());
             }
             if machine.is_some() {
@@ -4354,7 +4352,10 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 let Some(owner) = invite.owner.as_deref() else {
                     continue;
                 };
-                if signer.as_deref().is_some_and(|s| !s.eq_ignore_ascii_case(owner)) {
+                if signer
+                    .as_deref()
+                    .is_some_and(|s| !s.eq_ignore_ascii_case(owner))
+                {
                     println!(
                         "{} is waiting for {owner} to claim it: ferry team pending --as {owner}",
                         accept.operator
@@ -4379,12 +4380,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     println!("{}'s key has not synced here yet", accept.operator);
                     continue;
                 };
-                ferryman_channel::owner::attest_owner(
-                    &route,
-                    &identity,
-                    &accept.operator,
-                    &key,
-                )?;
+                ferryman_channel::owner::attest_owner(&route, &identity, &accept.operator, &key)?;
                 invite::mark_granted(&route, &invite.id)?;
                 let _ = ferryman_channel::ledger::append_ledger_entry(
                     &route,
@@ -4446,9 +4442,9 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
             // wrong default: the repository already says whose it is.
             let account = match account.or_else(|| anchor::remote_owner(&route.git_remote)) {
                 Some(account) => account,
-                None => bail!(
-                    "this project has no git remote to read an account from; pass --account"
-                ),
+                None => {
+                    bail!("this project has no git remote to read an account from; pass --account")
+                }
             };
             let facts = match gitanchor::fetch_account(&account).await? {
                 Ok(facts) => facts,
@@ -4471,16 +4467,15 @@ async fn anchor_command(action: AnchorAction) -> Result<()> {
                          Add one at https://github.com/settings/keys as a SIGNING key - it \
                          grants no access, it only proves the account is yours:\n  {}",
                         facts.login,
-                        gitanchor::local_signing_keys()
-                            .first()
-                            .map_or_else(
-                                || "ssh-keygen -t ed25519 -C ferryman-anchor".to_string(),
-                                |(_, line)| line.clone()
-                            )
+                        gitanchor::local_signing_keys().first().map_or_else(
+                            || "ssh-keygen -t ed25519 -C ferryman-anchor".to_string(),
+                            |(_, line)| line.clone()
+                        )
                     ),
                 },
             };
-            let payload = anchor::ssh_payload("github", facts.account_id, &identity.public_key_hex());
+            let payload =
+                anchor::ssh_payload("github", facts.account_id, &identity.public_key_hex());
             let armoured = gitanchor::sign_with_ssh(&payload, &key, &route.attachment.join("tmp"))?;
 
             // Which published key actually signed it. The record has to carry that one,
@@ -4756,11 +4751,7 @@ async fn anchor_maintenance<Config>(
 /// work around, and a fleet on a fixed schedule hits the provider's rate limit all at
 /// once. The jitter is derived from the machine's own name so two machines do not
 /// drift into step with each other.
-fn due_for_a_check(
-    route: &ferryman_channel::ProjectRoute,
-    master: &str,
-    observer: &str,
-) -> bool {
+fn due_for_a_check(route: &ferryman_channel::ProjectRoute, master: &str, observer: &str) -> bool {
     use ferryman_channel::anchor;
     let Ok(seen) = anchor::observations(route, master) else {
         return true;
@@ -4817,7 +4808,9 @@ fn spread_claims(held: &[ferryman_channel::anchor::GitAnchor]) {
 fn print_standing(route: &ferryman_channel::ProjectRoute, master: &str) -> Result<()> {
     use ferryman_channel::anchor::Standing;
     match ferryman_channel::anchor::standing(route, master)? {
-        Standing::NotChecked => println!("standing    not checked (which means nothing either way)"),
+        Standing::NotChecked => {
+            println!("standing    not checked (which means nothing either way)")
+        }
         Standing::Verified => println!("standing    verified"),
         Standing::Contradicted { since } => println!(
             "standing    contradicted since {} - pauses in {} hours if it keeps disagreeing",
@@ -8691,9 +8684,10 @@ fn root_command(command: RootCommand) -> Result<()> {
                 .map(|entry| (entry.project_id, entry.channel))
                 .collect();
             for id in &targets {
-                let where_it_pointed = claimed
-                    .get(id)
-                    .map_or_else(|| "not in the manifest".to_string(), |p| p.display().to_string());
+                let where_it_pointed = claimed.get(id).map_or_else(
+                    || "not in the manifest".to_string(),
+                    |p| p.display().to_string(),
+                );
                 if dry_run {
                     println!("would forget  {id:<20}  {where_it_pointed}");
                 } else if root.forget(id)? {
@@ -8705,9 +8699,7 @@ fn root_command(command: RootCommand) -> Result<()> {
             if dry_run {
                 println!("\n  Nothing changed. Run it without --dry-run to do it.");
             } else {
-                println!(
-                    "\n  The manifest only. Channels and repositories are where they were."
-                );
+                println!("\n  The manifest only. Channels and repositories are where they were.");
             }
         }
     }

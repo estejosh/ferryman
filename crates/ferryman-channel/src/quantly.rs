@@ -5,7 +5,7 @@
 //! A Quantly process should reject a message that cannot pass these checks before it
 //! touches a strategy or paper ledger.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -189,10 +189,12 @@ mod tests {
         let service = quantly_service();
         assert_eq!(service.name, QUANTLY_AGENT);
         assert!(service.capabilities.iter().all(|cap| !cap.contains("live")));
-        assert!(service
-            .capabilities
-            .iter()
-            .all(|cap| !cap.contains("order.submit")));
+        assert!(
+            service
+                .capabilities
+                .iter()
+                .all(|cap| !cap.contains("order.submit"))
+        );
     }
 
     #[test]
@@ -223,11 +225,13 @@ mod tests {
             json!({"symbol": "SPY"}),
         );
         envelope.paper_only = false;
-        assert!(envelope
-            .validate()
-            .unwrap_err()
-            .to_string()
-            .contains("paper-only"));
+        assert!(
+            envelope
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("paper-only")
+        );
     }
 
     #[test]
@@ -237,8 +241,10 @@ mod tests {
             "research-1",
             json!({"api_key": "never-portable"}),
         );
-        assert!(envelope
-            .into_message("quantly", QUANTLY_AGENT, GROUCHLY_AGENT, false, None)
-            .is_err());
+        assert!(
+            envelope
+                .into_message("quantly", QUANTLY_AGENT, GROUCHLY_AGENT, false, None)
+                .is_err()
+        );
     }
 }

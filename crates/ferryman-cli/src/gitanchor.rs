@@ -202,10 +202,7 @@ pub async fn fetch_account(login: &str) -> Result<Result<AccountFacts, NotChecke
 
     Ok(Ok(AccountFacts {
         account_id,
-        login: body["login"]
-            .as_str()
-            .unwrap_or(login)
-            .to_ascii_lowercase(),
+        login: body["login"].as_str().unwrap_or(login).to_ascii_lowercase(),
         published_keys: published,
     }))
 }
@@ -366,8 +363,8 @@ pub fn sign_with_ssh(payload: &str, key: &Path, scratch: &Path) -> Result<String
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let armoured = std::fs::read_to_string(&signature)
-        .context("read the signature ssh-keygen produced")?;
+    let armoured =
+        std::fs::read_to_string(&signature).context("read the signature ssh-keygen produced")?;
     let _ = std::fs::remove_file(&file);
     let _ = std::fs::remove_file(&signature);
     Ok(armoured)
@@ -398,10 +395,7 @@ mod tests {
     #[test]
     fn a_token_is_looked_up_by_the_account_it_belongs_to() {
         let env = HashMap::from([
-            (
-                "FERRYMAN_GIT_TOKEN_ESTEJOSH".to_string(),
-                "one".to_string(),
-            ),
+            ("FERRYMAN_GIT_TOKEN_ESTEJOSH".to_string(), "one".to_string()),
             (
                 "FERRYMAN_GIT_TOKEN_SHINDEVLIN".to_string(),
                 "two".to_string(),

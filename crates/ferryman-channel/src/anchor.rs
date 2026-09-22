@@ -375,8 +375,7 @@ fn verify_sshsig(parsed: &Sshsig, message: &[u8]) -> bool {
 /// that silently accepts either, and accepting more than the format allows is how
 /// a parser becomes a liability.
 fn b64_decode(text: &str) -> Option<Vec<u8>> {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = Vec::with_capacity(text.len() * 3 / 4);
     let mut buffer = 0u32;
     let mut bits = 0u32;
@@ -440,7 +439,10 @@ pub fn remote_owner(remote: &str) -> Option<String> {
 /// One observer's file, so two machines watching at once never write the same one.
 /// The same reason marvin keeps a page per holder rather than a shared document.
 fn observation_path(route: &ProjectRoute, observer: &str) -> PathBuf {
-    anchors_dir(route).join(format!("seen.{}.json", crate::canonical_agent_name(observer)))
+    anchors_dir(route).join(format!(
+        "seen.{}.json",
+        crate::canonical_agent_name(observer)
+    ))
 }
 
 /// Put a verified claim into a channel. Refuses to publish one that does not
@@ -774,9 +776,13 @@ pub enum Standing {
     NotChecked,
     Verified,
     /// The provider disagreed, and has not yet disagreed for long enough to bite.
-    Contradicted { since: DateTime<Utc> },
+    Contradicted {
+        since: DateTime<Utc>,
+    },
     /// The provider disagreed and has kept disagreeing. The role is frozen.
-    Paused { since: DateTime<Utc> },
+    Paused {
+        since: DateTime<Utc>,
+    },
 }
 
 /// The newest verifiable observation wins.
@@ -956,7 +962,10 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
         let parsed = parse_signature(REAL_SIGNATURE).unwrap();
         let tampered = REAL_PAYLOAD.replace("196700792", "196700793");
         assert!(!verify_sshsig(&parsed, tampered.as_bytes()));
-        assert!(!verify_sshsig(&parsed, format!("{REAL_PAYLOAD}\n").as_bytes()));
+        assert!(!verify_sshsig(
+            &parsed,
+            format!("{REAL_PAYLOAD}\n").as_bytes()
+        ));
     }
 
     #[test]
@@ -981,8 +990,7 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
 
     // --- building signatures, for the end-to-end tests ---
 
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     fn b64_encode(bytes: &[u8]) -> String {
         let mut out = String::new();
@@ -1017,7 +1025,10 @@ jKfZX/1IvIKtx+F2N1MKYGElhGZMb8TPh7oAU=
     }
 
     fn published_key(signing: &SigningKey) -> String {
-        format!("ssh-ed25519 {} test@fixture", b64_encode(&key_blob(signing)))
+        format!(
+            "ssh-ed25519 {} test@fixture",
+            b64_encode(&key_blob(signing))
+        )
     }
 
     fn make_sshsig(signing: &SigningKey, namespace: &str, message: &[u8]) -> String {
@@ -1317,11 +1328,7 @@ mod watching {
         let route = channel(dir.path(), &josh);
 
         publish(&route, &anchored(&test_account(), &josh)).unwrap();
-        publish(
-            &route,
-            &second_account_anchor(&josh, 555_001, "shindevlin"),
-        )
-        .unwrap();
+        publish(&route, &second_account_anchor(&josh, 555_001, "shindevlin")).unwrap();
 
         let held = claims(&route, "josh").unwrap();
         assert_eq!(held.len(), 2, "both accounts survive: {held:?}");
@@ -1336,11 +1343,7 @@ mod watching {
         let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
         let mut route = channel(dir.path(), &josh);
         publish(&route, &anchored(&test_account(), &josh)).unwrap();
-        publish(
-            &route,
-            &second_account_anchor(&josh, 555_001, "shindevlin"),
-        )
-        .unwrap();
+        publish(&route, &second_account_anchor(&josh, 555_001, "shindevlin")).unwrap();
 
         // This route's remote is git@github.com:estejosh/ferryman.git
         assert_eq!(
@@ -1386,14 +1389,18 @@ mod watching {
         let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
         let mut route = channel(dir.path(), &josh);
         publish(&route, &anchored(&test_account(), &josh)).unwrap();
-        publish(
-            &route,
-            &second_account_anchor(&josh, 555_001, "shindevlin"),
-        )
-        .unwrap();
+        publish(&route, &second_account_anchor(&josh, 555_001, "shindevlin")).unwrap();
 
         // shindevlin's anchor goes bad, and has been bad for a week.
-        record(&route, &josh, "josh", 555_001, Outcome::Contradicted, "gone").unwrap();
+        record(
+            &route,
+            &josh,
+            "josh",
+            555_001,
+            Outcome::Contradicted,
+            "gone",
+        )
+        .unwrap();
         age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 24);
 
         // The project on shindevlin is paused...
@@ -1469,7 +1476,15 @@ mod watching {
 
         record(&route, &josh, "josh", 1, Outcome::Contradicted, "gone").unwrap();
         age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 1);
-        let again = record(&route, &josh, "josh", 1, Outcome::Contradicted, "still gone").unwrap();
+        let again = record(
+            &route,
+            &josh,
+            "josh",
+            1,
+            Outcome::Contradicted,
+            "still gone",
+        )
+        .unwrap();
 
         assert!(
             Utc::now() - again.contradicted_since.unwrap()
@@ -1632,7 +1647,15 @@ mod paused_work {
     }
 
     fn pause(route: &ProjectRoute, master: &AgentIdentity) {
-        record(route, master, master.name(), 1, Outcome::Contradicted, "gone").unwrap();
+        record(
+            route,
+            master,
+            master.name(),
+            1,
+            Outcome::Contradicted,
+            "gone",
+        )
+        .unwrap();
         let path = observation_path(route, master.name());
         let mut observation: AnchorObservation =
             serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1742,7 +1765,10 @@ mod judging {
     use crate::AgentIdentity;
 
     fn anchor() -> GitAnchor {
-        anchored(&test_account(), &AgentIdentity::from_seed("josh", [1u8; 32]))
+        anchored(
+            &test_account(),
+            &AgentIdentity::from_seed("josh", [1u8; 32]),
+        )
     }
 
     fn facts_with(keys: Vec<String>) -> AccountFacts {

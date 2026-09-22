@@ -66,10 +66,9 @@ fn owner_payload(attestation: &OwnerAttestation) -> String {
 
 /// Whether the roster publishes `name` with exactly `public_key`.
 fn published_with_key(route: &ProjectRoute, name: &str, public_key: &str) -> bool {
-    route
-        .agents
-        .iter()
-        .any(|agent| agent.name.eq_ignore_ascii_case(name) && agent.public_key.as_deref() == Some(public_key))
+    route.agents.iter().any(|agent| {
+        agent.name.eq_ignore_ascii_case(name) && agent.public_key.as_deref() == Some(public_key)
+    })
 }
 
 /// Claim a machine identity as your own.
@@ -474,9 +473,14 @@ mod tests {
         route.agents = vec![roster(&josh), roster(&mallory), roster(&grouchly)];
         attest_owner(&route, &josh, "josh-grouchly", &grouchly.public_key_hex()).unwrap();
 
-        let error = attest_owner(&route, &mallory, "josh-grouchly", &grouchly.public_key_hex())
-            .expect_err("mallory must not be able to adopt josh's machine")
-            .to_string();
+        let error = attest_owner(
+            &route,
+            &mallory,
+            "josh-grouchly",
+            &grouchly.public_key_hex(),
+        )
+        .expect_err("mallory must not be able to adopt josh's machine")
+        .to_string();
         assert!(error.contains("already claimed by josh"), "{error}");
     }
 
@@ -558,9 +562,7 @@ mod tests {
             signed_by: None,
             signature: None,
         };
-        let signature = mallory
-            .signing
-            .sign(revocation_payload(&forged).as_bytes());
+        let signature = mallory.signing.sign(revocation_payload(&forged).as_bytes());
         forged.signed_by = Some("mallory".into());
         forged.signature = Some(hex::encode(signature.to_bytes()));
         fs::create_dir_all(owners_dir(&route)).unwrap();
