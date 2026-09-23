@@ -6,7 +6,10 @@
 //! synced only to the master's own devices, so its records survive even if the
 //! shared channel is wiped.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -102,7 +105,24 @@ pub fn initialize_master(
 
 /// Read and verify the master declaration, if one exists.
 pub fn read_master(route: &ProjectRoute) -> Result<Option<MasterDeclaration>> {
-    let path = declaration_path(route);
+    let Some(declaration) = read_master_at(&route.communications, &route.agents)? else {
+        return Ok(None);
+    };
+    if declaration.project_id != route.project_id {
+        bail!("master declaration is for a different project");
+    }
+    Ok(Some(declaration))
+}
+
+/// Read and verify the declaration in a channel directory, against a roster.
+///
+/// For a caller holding a channel but no route: a machine that syncs a project it does
+/// not work in still needs to know who that project's master is.
+pub fn read_master_at(
+    communications: &Path,
+    roster: &[AgentRoute],
+) -> Result<Option<MasterDeclaration>> {
+    let path = communications.join("master.json");
     if !path.is_file() {
         return Ok(None);
     }
@@ -112,13 +132,10 @@ pub fn read_master(route: &ProjectRoute) -> Result<Option<MasterDeclaration>> {
         declaration.signed_by.as_ref(),
         declaration.signature.as_ref(),
         &master_payload(&declaration),
-        &route.agents,
+        roster,
     ) != SignatureCheck::Valid
     {
         bail!("master declaration signature does not verify");
-    }
-    if declaration.project_id != route.project_id {
-        bail!("master declaration is for a different project");
     }
     Ok(Some(declaration))
 }

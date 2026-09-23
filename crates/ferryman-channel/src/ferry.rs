@@ -38,7 +38,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
+use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
+
+use crate::{AgentIdentity, SignatureCheck};
 
 /// The file that marks a ferry root and describes what is in it.
 pub const MANIFEST: &str = ".ferry";
@@ -50,9 +54,53 @@ pub const MANIFEST: &str = ".ferry";
 /// and the channel is the one thing they all share. Syncthing carries the marker out and
 /// carries its removal back, so `--restore` travels the same way.
 ///
-/// Unsigned on purpose. It hides nothing and deletes nothing, so any peer that can write
-/// the channel may say the work is over, and any peer may take that back.
+/// Only the project's master can put it there. The marker is signed, and a machine
+/// honours it only when the signature is the master's, by the key the channel knows the
+/// master by - so a peer that can write the channel can write the file, but cannot make
+/// anyone believe it. Removing the file is the one thing a peer can do unsigned, and all
+/// that does is bring a project back into view: it hides nothing.
 pub const ARCHIVED: &str = "ARCHIVED";
+
+/// What the [`ARCHIVED`] marker holds: the master saying the project is finished.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ArchiveMark {
+    project_id: String,
+    archived_at: DateTime<Utc>,
+    signed_by: String,
+    signature: String,
+}
+
+/// Exactly what an archive mark's signature covers. The project id is in it so a mark
+/// cannot be lifted from one channel into another.
+fn mark_payload(project_id: &str, archived_at: &DateTime<Utc>) -> String {
+    format!(
+        "ferryman-archive-v1\n{project_id}\n{}",
+        archived_at.to_rfc3339()
+    )
+}
+
+fn sign_mark(project_id: &str, signer: &AgentIdentity) -> ArchiveMark {
+    let archived_at = Utc::now();
+    let signature = signer
+        .signing
+        .sign(mark_payload(project_id, &archived_at).as_bytes());
+    ArchiveMark {
+        project_id: project_id.to_owned(),
+        archived_at,
+        signed_by: signer.name().to_owned(),
+        signature: hex::encode(signature.to_bytes()),
+    }
+}
+
+/// Who the master of the project in this channel is, verified - `None` if it has none.
+///
+/// # Errors
+/// A declaration that is there but does not verify is an error, not a `None`: a forged
+/// master is not the same thing as no master.
+pub fn master_of(channel: &Path) -> Result<Option<String>> {
+    let roster = crate::read_agent_roster(channel)?;
+    Ok(crate::master::read_master_at(channel, &roster)?.map(|declaration| declaration.master))
+}
 
 /// One project, and where its two halves live on this machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,10 +127,32 @@ impl Entry {
     /// gone; a project that is simply *over* has neither a reason to be removed (its
     /// signed history is the record of what happened) nor a reason to keep appearing
     /// beside the live ones. Read from the channel's [`ARCHIVED`] marker, so every
-    /// machine that syncs the channel gives the same answer.
+    /// machine that syncs the channel gives the same answer - and honoured only when the
+    /// project's master signed it.
     #[must_use]
     pub fn is_archived(&self) -> bool {
-        self.channel.join(ARCHIVED).is_file()
+        self.mark_holds().unwrap_or(false)
+    }
+
+    fn mark_holds(&self) -> Result<bool> {
+        let path = self.channel.join(ARCHIVED);
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let mark: ArchiveMark = serde_json::from_slice(&std::fs::read(&path)?)?;
+        let roster = crate::read_agent_roster(&self.channel)?;
+        let Some(master) = crate::master::read_master_at(&self.channel, &roster)? else {
+            return Ok(false);
+        };
+        Ok(mark.project_id == self.project_id
+            && master.project_id == self.project_id
+            && mark.signed_by.eq_ignore_ascii_case(&master.master)
+            && crate::check_signature(
+                Some(&mark.signed_by),
+                Some(&mark.signature),
+                &mark_payload(&mark.project_id, &mark.archived_at),
+                &roster,
+            ) == SignatureCheck::Valid)
     }
 }
 
@@ -263,14 +333,22 @@ impl Root {
 
     /// Mark a project finished, or bring it back - on every machine that syncs it.
     ///
+    /// Only the project's master may do either, and `signer` must be the master by the
+    /// key the channel knows them by: a name alone proves nothing.
+    ///
     /// Nothing moves and nothing is unshared. That is the whole point: the channel keeps
     /// its signed history, Syncthing keeps carrying it, and the project simply stops
-    /// being offered as somewhere work happens. The one thing written is the [`ARCHIVED`]
-    /// marker in the channel, which is how the other machines hear about it.
+    /// being offered as somewhere work happens. The one thing written is the signed
+    /// [`ARCHIVED`] marker in the channel, which is how the other machines hear about it.
     ///
     /// Returns whether anything changed. Archiving an already-archived project is not an
     /// error - the desired state is that it is archived, and it is.
-    pub fn archive(&self, project_id: &str, archived: bool) -> Result<bool> {
+    pub fn archive(
+        &self,
+        project_id: &str,
+        archived: bool,
+        signer: &AgentIdentity,
+    ) -> Result<bool> {
         let manifest = self.read();
         let entry = manifest
             .projects
@@ -289,21 +367,48 @@ impl Root {
                 entry.channel.display()
             );
         }
-        if entry.is_archived() == archived {
-            return Ok(false);
+        let roster = crate::read_agent_roster(&entry.channel)?;
+        let Some(master) = crate::master::read_master_at(&entry.channel, &roster)? else {
+            bail!(
+                "{project_id} has no master, and only a project's master can archive it or bring it back"
+            );
+        };
+        if !signer.name().eq_ignore_ascii_case(&master.master) {
+            bail!(
+                "only {}, {project_id}'s master, can archive it or bring it back - not {}",
+                master.master,
+                signer.name()
+            );
         }
+        // The name is not the proof; the key is. A key minted under the master's name
+        // would sign a mark no machine honours, so refuse here rather than write one.
+        let known = roster
+            .iter()
+            .find(|agent| agent.name.eq_ignore_ascii_case(&master.master))
+            .and_then(|agent| agent.public_key.clone());
+        if known.as_deref() != Some(signer.public_key_hex().as_str()) {
+            bail!(
+                "this is not the key {} is known by in {project_id}'s channel, so nothing it signs would be honoured",
+                master.master
+            );
+        }
+        let was = entry.is_archived();
         let marker = entry.channel.join(ARCHIVED);
         if archived {
-            let note = format!(
-                "{project_id} is archived: finished, kept, and no longer offered as somewhere work happens.\n\
-                 Every machine that syncs this channel sees this. Nothing was deleted.\n\
-                 Undo, from any of them:  ferry root archive {project_id} --restore\n"
-            );
-            std::fs::write(&marker, note)
+            if was {
+                return Ok(false);
+            }
+            crate::atomic_json(&marker, &sign_mark(project_id, signer))
                 .with_context(|| format!("writing {}", marker.display()))?;
         } else {
-            std::fs::remove_file(&marker)
-                .with_context(|| format!("removing {}", marker.display()))?;
+            // Removed whether or not it verified: a mark nobody honours is litter.
+            if marker.exists() {
+                std::fs::remove_file(&marker)
+                    .with_context(|| format!("removing {}", marker.display()))?;
+            }
+            if !was {
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -620,6 +725,43 @@ mod tests {
         path
     }
 
+    fn josh() -> crate::AgentIdentity {
+        crate::AgentIdentity::from_seed("josh", [7u8; 32])
+    }
+
+    /// A channel with a master, and every one of `members` on its roster.
+    fn mastered(
+        dir: &Path,
+        id: &str,
+        master: &crate::AgentIdentity,
+        members: &[&crate::AgentIdentity],
+    ) -> PathBuf {
+        let communications = channel(dir, id);
+        let mut route = crate::ProjectRoute {
+            project_id: id.into(),
+            workspace: dir.join(id),
+            attachment: dir.join(format!("{id}-attachment")),
+            communications: communications.clone(),
+            shared_remote: format!("{id}-ferryman"),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        for member in std::iter::once(master).chain(members.iter().copied()) {
+            let agent = crate::AgentRoute {
+                name: member.name().into(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: Some(member.public_key_hex()),
+                encryption_key: None,
+            };
+            crate::register_agent(&route, &agent).unwrap();
+            route.agents.push(agent);
+        }
+        crate::master::initialize_master(&route, master, master.name()).unwrap();
+        communications
+    }
+
     #[test]
     fn a_root_is_a_layout_and_a_manifest() {
         let dir = tempfile::tempdir().unwrap();
@@ -640,13 +782,13 @@ mod tests {
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let root = root(dir.path());
         let live = channel(dir.path(), "live");
-        let done = channel(dir.path(), "done");
+        let done = mastered(dir.path(), "done", &josh(), &[]);
         root.adopt("live", &live, None).unwrap();
         root.adopt("done", &done, None).unwrap();
         // Something signed, to prove archiving is not a quiet delete.
         std::fs::write(done.join("ledger.josh.jsonl"), "{\"what\":\"happened\"}\n").unwrap();
 
-        assert!(root.archive("done", true).unwrap());
+        assert!(root.archive("done", true, &josh()).unwrap());
 
         let working: Vec<String> = root
             .projects()
@@ -672,15 +814,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let root = root(dir.path());
-        let done = channel(dir.path(), "done");
+        let done = mastered(dir.path(), "done", &josh(), &[]);
         root.adopt("done", &done, None).unwrap();
 
-        assert!(root.archive("done", true).unwrap());
+        assert!(root.archive("done", true, &josh()).unwrap());
         assert!(root.projects().is_empty());
         // Saying it twice is not an error; the desired state already holds.
-        assert!(!root.archive("done", true).unwrap());
+        assert!(!root.archive("done", true, &josh()).unwrap());
 
-        assert!(root.archive("done", false).unwrap());
+        assert!(root.archive("done", false, &josh()).unwrap());
         assert_eq!(root.projects().len(), 1);
         assert!(root.archived().is_empty());
     }
@@ -694,11 +836,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let root = root(dir.path());
-        let done = channel(dir.path(), "done");
+        let done = mastered(dir.path(), "done", &josh(), &[]);
         let repo = dir.path().join("done-repo");
         std::fs::create_dir_all(&repo).unwrap();
         root.adopt("done", &done, None).unwrap();
-        root.archive("done", true).unwrap();
+        root.archive("done", true, &josh()).unwrap();
 
         root.adopt("done", &done, Some(&repo)).unwrap();
 
@@ -719,11 +861,11 @@ mod tests {
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let beastly = root(&dir.path().join("beastly"));
         let grouchly = root(&dir.path().join("grouchly"));
-        let shared = channel(dir.path(), "done");
+        let shared = mastered(dir.path(), "done", &josh(), &[]);
         beastly.adopt("done", &shared, None).unwrap();
         grouchly.adopt("done", &shared, None).unwrap();
 
-        assert!(beastly.archive("done", true).unwrap());
+        assert!(beastly.archive("done", true, &josh()).unwrap());
         assert!(
             grouchly.projects().is_empty(),
             "archived there, so archived here"
@@ -733,7 +875,7 @@ mod tests {
         let index = std::fs::read_to_string(grouchly.manifest_path()).unwrap();
         assert!(!index.contains("archived"), "{index}");
 
-        assert!(grouchly.archive("done", false).unwrap());
+        assert!(grouchly.archive("done", false, &josh()).unwrap());
         assert_eq!(
             beastly.projects().len(),
             1,
@@ -747,14 +889,98 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let root = root(dir.path());
-        let gone = channel(dir.path(), "gone");
+        let gone = mastered(dir.path(), "gone", &josh(), &[]);
         root.adopt("gone", &gone, None).unwrap();
         std::fs::remove_dir_all(&gone).unwrap();
         let error = root
-            .archive("gone", true)
+            .archive("gone", true, &josh())
             .expect_err("nowhere to write the marker")
             .to_string();
         assert!(error.contains("not on this machine"), "{error}");
+    }
+
+    /// Only the master archives, and only the master brings it back.
+    #[test]
+    fn only_the_master_can_archive_or_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let done = mastered(dir.path(), "done", &josh(), &[&grouchly]);
+        root.adopt("done", &done, None).unwrap();
+
+        let error = root
+            .archive("done", true, &grouchly)
+            .expect_err("a member is not the master")
+            .to_string();
+        assert!(error.contains("only josh"), "{error}");
+        assert_eq!(root.projects().len(), 1);
+
+        // Wearing the master's name with some other key gets nowhere either.
+        let impostor = crate::AgentIdentity::from_seed("josh", [9u8; 32]);
+        let error = root
+            .archive("done", true, &impostor)
+            .expect_err("the name is not the key")
+            .to_string();
+        assert!(error.contains("not the key"), "{error}");
+        assert!(!done.join(ARCHIVED).exists(), "nothing was written");
+
+        root.archive("done", true, &josh()).unwrap();
+        let error = root
+            .archive("done", false, &grouchly)
+            .expect_err("a member cannot restore either")
+            .to_string();
+        assert!(error.contains("only josh"), "{error}");
+        assert!(root.projects().is_empty());
+    }
+
+    /// A mark anyone but the master wrote is not honoured, on any machine.
+    ///
+    /// A peer can write any file into the channel. What it cannot do is sign as the
+    /// master, and a mark that is not the master's is read as no mark at all.
+    #[test]
+    fn a_mark_the_master_did_not_sign_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let done = mastered(dir.path(), "done", &josh(), &[&grouchly]);
+        root.adopt("done", &done, None).unwrap();
+
+        // Signed, validly, by a member who is not the master.
+        crate::atomic_json(&done.join(ARCHIVED), &sign_mark("done", &grouchly)).unwrap();
+        assert_eq!(root.projects().len(), 1, "a member's mark is not honoured");
+
+        // The master's own mark, lifted from another project, does not carry across.
+        crate::atomic_json(&done.join(ARCHIVED), &sign_mark("elsewhere", &josh())).unwrap();
+        assert_eq!(
+            root.projects().len(),
+            1,
+            "another project's mark is not honoured"
+        );
+
+        // Nor does a file that is merely called ARCHIVED.
+        std::fs::write(done.join(ARCHIVED), "archived, trust me\n").unwrap();
+        assert_eq!(root.projects().len(), 1, "an unsigned mark is not honoured");
+
+        // The master's restore clears the litter.
+        assert!(!root.archive("done", false, &josh()).unwrap());
+        assert!(!done.join(ARCHIVED).exists());
+    }
+
+    /// With no master there is nobody who may archive, and it says so.
+    #[test]
+    fn a_project_with_no_master_cannot_be_archived() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let orphan = channel(dir.path(), "orphan");
+        root.adopt("orphan", &orphan, None).unwrap();
+        let error = root
+            .archive("orphan", true, &josh())
+            .expect_err("no master, no archive")
+            .to_string();
+        assert!(error.contains("no master"), "{error}");
     }
 
     /// Archiving something that was never filed is an error naming it, not a silent no-op.
@@ -764,7 +990,7 @@ mod tests {
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let root = root(dir.path());
         let error = root
-            .archive("never-filed", true)
+            .archive("never-filed", true, &josh())
             .expect_err("an unknown project is not archivable")
             .to_string();
         assert!(error.contains("never-filed"), "{error}");

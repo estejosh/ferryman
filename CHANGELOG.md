@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.5.13 - 2026-09-23
+
+This release exists for one thing: archiving now reaches the whole fleet. In 0.5.12
+`ferry root archive` wrote a flag into this machine's `.ferry`, and `.ferry` never leaves
+the machine it is on - so a project archived on beastly was still live on grouchly and
+everywhere else. Every machine has to run 0.5.13 to honour a fleet-wide archive, which
+is why this is a version and not a quiet patch.
+
+### Changed
+
+- **An archive is now a signed `ARCHIVED` file in the channel, not a line in the local
+  index.** Syncthing carries it to every machine that syncs the channel, and carries its
+  removal back, so `archive` and `--restore` both travel with the project. `.ferry` no
+  longer has an `archived` field.
+
+- **Only a project's master can archive it or bring it back.** The mark is signed, and a
+  machine honours it only when the signature is the master's, by the key the channel
+  knows the master by. A peer can write a file called `ARCHIVED` into the channel; it
+  cannot make any machine believe it. A mark signed by a member, lifted from another
+  project, or not signed at all is read as no mark. The master's `--restore` clears it.
+
+- **A project with no master cannot be archived**, and says so, with the command that
+  names one (`ferry channel master init`). Archiving also needs the channel on the
+  machine doing it, since that is the only place the fleet would hear it.
+
 ## v0.5.12 - 2026-09-23
 
 Your machines are you, a git account is proof of whose projects these are, and a
@@ -29,8 +54,6 @@ finished project can be put away without being thrown away.
   `forget` there was nothing for a project that is simply over. Archiving keeps the
   channel, its signed history, and its sync; it only stops the project being offered as
   somewhere work happens, and drops it from the anchor spread. `--restore` takes it back.
-  The mark is an `ARCHIVED` file in the channel, not a line in the machine-local index,
-  so archiving on one machine archives it on every machine that syncs the channel.
   `ferry root show` always says how many it is hiding; `--all` shows them.
 
 - **`ferry root forget`, and `--gone`.** The index could be added to and never

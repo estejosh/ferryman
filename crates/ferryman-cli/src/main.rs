@@ -545,7 +545,9 @@ enum RootCommand {
     /// until the running ones cannot be seen for them.
     ///
     /// Nothing moves, nothing is unshared, nothing is deleted. `--restore` takes it back.
-    /// Both are an `ARCHIVED` file in the channel, so every machine syncing it agrees.
+    /// Both are an `ARCHIVED` file in the channel, so every machine syncing it agrees, and
+    /// only the project's master can do either: the file is signed, and a mark anyone
+    /// else wrote is ignored.
     Archive {
         /// The project id.
         project: String,
@@ -5703,8 +5705,14 @@ fn signing_identity(
     route: &ferryman_channel::ProjectRoute,
     name: &str,
 ) -> anyhow::Result<ferryman_channel::AgentIdentity> {
-    if let Some(identity) = ferryman_channel::AgentIdentity::load_existing(name, &route.attachment)?
-    {
+    signing_identity_in(&route.attachment, name)
+}
+
+fn signing_identity_in(
+    attachment: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<ferryman_channel::AgentIdentity> {
+    if let Some(identity) = ferryman_channel::AgentIdentity::load_existing(name, attachment)? {
         return Ok(identity);
     }
     // A human operator is not a machine, and their key is not stored like one.
@@ -5722,7 +5730,7 @@ fn signing_identity(
     // reader sees `Unsigned` - but it is a message claiming to be from a person, carrying
     // no proof, and saying nothing about it. This project's own rule is that a refusal is
     // a message. Silently downgrading is a fourth option nobody chose.
-    let operators = ferryman_server::operators::OperatorStore::new(&route.attachment);
+    let operators = ferryman_server::operators::OperatorStore::new(attachment);
     if operators.exists(name) {
         let password = operator_password(name)?;
         return operators.login(name, &password);
@@ -8714,7 +8722,41 @@ fn root_command(command: RootCommand) -> Result<()> {
             let Some(root) = ferry::find_root() else {
                 bail!("no ferry root yet - make one with `ferry root init`")
             };
-            let changed = root.archive(&project, !restore)?;
+            let filed = root
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project)
+                .with_context(|| {
+                    format!(
+                        "no project '{project}' in {}",
+                        root.manifest_path().display()
+                    )
+                })?;
+            if !filed.channel.is_dir() {
+                bail!(
+                    "{project}'s channel is not on this machine ({}) - archive it from one that has it",
+                    filed.channel.display()
+                );
+            }
+            let Some(master) = ferry::master_of(&filed.channel)? else {
+                bail!(
+                    "{project} has no master, and only a project's master can archive it.\n\
+                     \n\
+                     Name one from its repository:  ferry channel master init"
+                );
+            };
+            // A machine master's key sits beside the repository; a person's is sealed in
+            // the operator store. A channel-only project has no repository here, so the
+            // ferry root stands in - it is local and never synced.
+            let attachment = filed
+                .repo
+                .as_ref()
+                .map(|repo| repo.join(".ferryman"))
+                .filter(|attachment| attachment.is_dir())
+                .unwrap_or_else(|| root.path.clone());
+            let identity = signing_identity_in(&attachment, &master)?;
+            let changed = root.archive(&project, !restore, &identity)?;
             let entry = root
                 .read()
                 .projects
@@ -8731,7 +8773,8 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                     println!("  Nothing moved and nothing was unshared. It is out of");
                     println!("  `ferry root show` and out of the anchor spread, on every machine");
-                    println!("  that syncs the channel - the mark travels with it.");
+                    println!("  that syncs the channel - the mark travels with it, signed by");
+                    println!("  {master}, the master, so no other peer can fake it.");
                     println!("  Back with:  ferry root archive {project} --restore");
                 }
                 (false, false) => println!("{project} was already archived"),
