@@ -413,6 +413,42 @@ impl Root {
         Ok(true)
     }
 
+    /// Declare `person` master of every project here whose channel has none.
+    ///
+    /// One unlocked identity, every channel: the CLI's `ferry root master` and the
+    /// dashboard both come through here. A project with a master is left alone - a
+    /// master is handed over, never taken - and so is one whose channel knows the
+    /// person's name by a different key. See [`crate::master::claim_if_masterless`].
+    pub fn claim_masters(
+        &self,
+        person: &AgentIdentity,
+    ) -> Vec<(String, Result<crate::master::Claim>)> {
+        self.read()
+            .projects
+            .into_iter()
+            .filter(|entry| entry.channel.is_dir())
+            .map(|entry| {
+                // Machine-local state lives beside the repository; a channel-only
+                // project uses the directory its channel sits in, as the roster's pins
+                // already do.
+                let attachment = entry
+                    .repo
+                    .as_ref()
+                    .map(|repo| repo.join(".ferryman"))
+                    .filter(|attachment| attachment.is_dir())
+                    .or_else(|| entry.channel.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(|| self.path.clone());
+                let outcome = crate::master::claim_if_masterless(
+                    &entry.channel,
+                    &entry.project_id,
+                    &attachment,
+                    person,
+                );
+                (entry.project_id, outcome)
+            })
+            .collect()
+    }
+
     /// Where this project's channel belongs once it lives in the root.
     #[must_use]
     pub fn comms_home(&self, project_id: &str) -> PathBuf {
@@ -981,6 +1017,38 @@ mod tests {
             .expect_err("no master, no archive")
             .to_string();
         assert!(error.contains("no master"), "{error}");
+    }
+
+    /// One identity claims every unclaimed project, and nothing that is someone else's.
+    #[test]
+    fn claiming_masters_takes_the_unclaimed_and_leaves_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let ada = crate::AgentIdentity::from_seed("ada", [3u8; 32]);
+        let open = channel(dir.path(), "open");
+        let hers = mastered(dir.path(), "hers", &ada, &[]);
+        root.adopt("open", &open, None).unwrap();
+        root.adopt("hers", &hers, None).unwrap();
+
+        let mut outcomes = root.claim_masters(&josh());
+        outcomes.sort_by(|a, b| a.0.cmp(&b.0));
+        let outcomes: Vec<(String, crate::master::Claim)> = outcomes
+            .into_iter()
+            .map(|(id, outcome)| (id, outcome.unwrap()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                (
+                    "hers".to_string(),
+                    crate::master::Claim::Other("ada".into())
+                ),
+                ("open".to_string(), crate::master::Claim::Declared),
+            ]
+        );
+        assert_eq!(master_of(&open).unwrap().as_deref(), Some("josh"));
+        assert_eq!(master_of(&hers).unwrap().as_deref(), Some("ada"));
     }
 
     /// Archiving something that was never filed is an error naming it, not a silent no-op.

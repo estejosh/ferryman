@@ -137,6 +137,21 @@ paths:
         '200': {description: the master's name and whether grants are now required}
         '403': {description: dashboard is read-only}
         '409': {description: a master already exists}
+  /api/master/claim-all:
+    post:
+      summary: The signed-in person becomes master of every project with none
+      description: >
+        The browser half of `ferry root master`. For every project in this machine's ferry
+        root whose channel has no master, puts the person's public key on the roster and
+        declares them master, signed with the session's key. A project with a master, or
+        whose channel knows the name by a different key, is left alone and reported. Does
+        not turn on required grants. The team page does the same unasked when the person
+        signed in is master of the project on screen.
+      responses:
+        '200': {description: 'the master, how many were declared, and per project: declared, already, other, key_conflict or error'}
+        '401': {description: no active session}
+        '403': {description: dashboard is read-only}
+        '404': {description: no ferry root on this machine}
   /api/team/{name}/revoke:
     post:
       summary: End a person's access, signed by the master

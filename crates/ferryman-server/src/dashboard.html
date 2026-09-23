@@ -988,6 +988,7 @@ pages.teammates = async () => {
         master is a person, not a machine.
         <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <button class="btn primary" id="tm-become-master">I am the master of ${esc(state.project || state.homeProject || "this project")}</button>
+          <button class="btn" id="tm-claim-all">I am the master of every project with none</button>
           <span class="s" id="tm-master-msg" style="color:var(--dim)"></span>
         </div>
       </div>
@@ -1092,6 +1093,24 @@ function wireTeammates() {
     } catch (err) {
       msg.textContent = String(err.message || err).slice(0, 300);
       become.disabled = false;
+    }
+  });
+
+  const claimAll = $("#tm-claim-all");
+  if (claimAll) claimAll.addEventListener("click", async () => {
+    const msg = $("#tm-master-msg");
+    msg.textContent = "";
+    claimAll.disabled = true;
+    try {
+      const r = await api("/api/master/claim-all", { method: "POST" });
+      const left = r.projects.filter((p) => p.outcome !== "declared" && p.outcome !== "already");
+      state.team = null;
+      msg.textContent = `${r.master} is now master of ${r.declared} more project${r.declared === 1 ? "" : "s"}` +
+        (left.length ? `; left alone: ${left.map((p) => p.project + (p.detail ? " (" + p.detail + ")" : "")).join(", ")}` : "");
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      claimAll.disabled = false;
     }
   });
 

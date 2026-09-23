@@ -398,6 +398,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/release/{version}/deny", post(deny_release))
         .route("/api/team/invite", post(invite_teammate))
         .route("/api/master/init", post(master_init))
+        .route("/api/master/claim-all", post(master_claim_all))
         .route("/api/team/{name}/revoke", post(revoke_access))
         .route("/api/team/{name}/access", post(set_access))
         .route("/api/conversations", get(conversations))
@@ -1183,6 +1184,25 @@ async fn team(
             }
         }
     }
+    // Projects nobody has claimed get the signed-in person as master - the human, never
+    // the machine. `enable` leaves the role empty whenever a person is on the machine:
+    // it will not make the machine master and cannot sign as the person. The session is
+    // the one place that person's key is unlocked, so this is where the gap closes,
+    // unasked, whenever the page opens. Only for the master of the project being
+    // viewed: a teammate signing in on their own machine must not become master of
+    // whatever happens to be unclaimed there.
+    if !state.read_only
+        && let Some(root) = ferryman_channel::ferry::find_root()
+        && master
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(current.name()))
+    {
+        for (project, outcome) in root.claim_masters(&current) {
+            if matches!(outcome, Ok(ferryman_channel::master::Claim::Declared)) {
+                settled_notes.push(format!("{} is now the master of {project}", current.name()));
+            }
+        }
+    }
     if let Ok(settled) = ferryman_channel::invite::settle_pending(&route) {
         for (id, device) in settled.paired {
             settled_notes.push(format!(
@@ -1729,6 +1749,55 @@ async fn master_init(
     Ok(Json(json!({
         "master": declaration.master,
         "grants_required": flipped || route.requires_grants(),
+    })))
+}
+
+/// POST /api/master/claim-all - the signed-in person becomes master of every project in
+/// this machine's ferry root that has none.
+///
+/// The browser half of `ferry root master`, for a person who is not yet master of the
+/// project on screen and so is not offered it unasked. Declares only: it does not turn
+/// on required grants the way claiming a single project here does, because switching
+/// thirty projects to grants-required at once would stop every agent that has been
+/// working in them without one.
+async fn master_claim_all(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::master::Claim;
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let root = ferryman_channel::ferry::find_root().ok_or((
+        StatusCode::NOT_FOUND,
+        "no ferry root on this machine".to_string(),
+    ))?;
+    let projects: Vec<Value> = root
+        .claim_masters(&current)
+        .into_iter()
+        .map(|(project, outcome)| {
+            let (outcome, detail) = match outcome {
+                Ok(Claim::Declared) => ("declared", None),
+                Ok(Claim::AlreadyTheirs) => ("already", None),
+                Ok(Claim::Other(master)) => ("other", Some(master)),
+                Ok(Claim::KeyConflict) => ("key_conflict", None),
+                Err(error) => ("error", Some(format!("{error:#}"))),
+            };
+            json!({ "project": project, "outcome": outcome, "detail": detail })
+        })
+        .collect();
+    let declared = projects
+        .iter()
+        .filter(|project| project["outcome"] == "declared")
+        .count();
+    Ok(Json(json!({
+        "master": current.name(),
+        "declared": declared,
+        "projects": projects,
     })))
 }
 

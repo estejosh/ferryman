@@ -37,6 +37,13 @@ is why this is a version and not a quiet patch.
   master, or that knows your name by a different key, is left alone and named.
   `--dry-run` shows the plan without a password. `enable` now points here.
 
+  **And in the browser, unasked.** Opening the dashboard's team page signed in as the
+  master of the project on screen claims every unclaimed project in the ferry root for
+  that person - the human, never the machine - and lists each one it took. A person
+  who is not yet master anywhere gets a button for the same thing. Neither turns on
+  required grants in bulk: switching thirty projects to grants-required at once would
+  stop every agent working in them.
+
 ## v0.5.12 - 2026-09-23
 
 Your machines are you, a git account is proof of whose projects these are, and a
