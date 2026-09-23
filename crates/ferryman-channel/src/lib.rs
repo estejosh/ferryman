@@ -23,6 +23,7 @@ pub mod encrypt;
 pub mod entitlement;
 pub mod events;
 pub mod ferry;
+pub mod head;
 pub mod interrupt;
 pub mod invite;
 pub mod keys;

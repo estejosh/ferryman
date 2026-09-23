@@ -1247,6 +1247,20 @@ enum Channel {
         #[command(subcommand)]
         action: MasterAction,
     },
+    /// Who the head agent is: the one the master named, in their own words.
+    ///
+    /// The master says it however they like - "grouchly, you're head agent for now" - in
+    /// the dashboard or a message. The agent named runs `claim`, which finds those signed
+    /// words and records them in the channel, and every machine then sees it as head.
+    Head {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// This agent's name. Defaults to this machine's.
+        #[arg(long)]
+        agent: Option<String>,
+        #[command(subcommand)]
+        action: Option<HeadAction>,
+    },
     /// Export a signed audit report of the attribution ledger.
     ///
     /// A standalone, verifiable record of who did what and when — signed by the
@@ -1728,6 +1742,42 @@ enum WorktreeAction {
         #[arg(long, value_parser = agent_name)]
         agent: String,
     },
+}
+
+/// Subcommands for [`Channel::Head`].
+#[derive(Subcommand, Clone)]
+enum HeadAction {
+    /// Take the role, because the master named this agent.
+    ///
+    /// Run this when the master tells you, in any words, that you are head agent. It
+    /// finds the newest thing the master signed in the last week that names you, and
+    /// records it where every machine reads it.
+    Claim {
+        /// The statement or message id to claim on, when it is not the newest.
+        #[arg(long)]
+        order: Option<String>,
+    },
+    /// Give the role up.
+    StepDown,
+}
+
+/// One line saying who the head agent is, for every place an agent looks.
+fn head_line(channel: &std::path::Path, project_id: &str) -> String {
+    match ferryman_channel::head::current(channel, project_id) {
+        Ok(Some(head)) => {
+            let words = head.order.words();
+            let words: String = words.chars().take(120).collect();
+            format!(
+                "{} - named by {}: \"{words}\"",
+                head.agent,
+                head.order.by().unwrap_or("the master")
+            )
+        }
+        Ok(None) => {
+            "none named. If the master names you, run: ferry channel head claim".to_string()
+        }
+        Err(error) => format!("unknown ({error:#})"),
+    }
 }
 
 /// Subcommands for [`Channel::Master`].
@@ -5509,6 +5559,13 @@ fn loadmem(
     if let Some(path) = &log {
         println!("log       {}", path.display());
     }
+    // Who is in charge is the first thing an agent coming back needs, before any memory.
+    if let Some(route) = route.as_ref() {
+        println!(
+            "head      {}",
+            head_line(&route.communications, &route.project_id)
+        );
+    }
     println!();
 
     let mut printed = false;
@@ -6785,6 +6842,10 @@ fn channel(command: Channel) -> Result<()> {
                     route.git_remote.clone()
                 }
             );
+            println!(
+                "head agent     {}",
+                head_line(&route.communications, &route.project_id)
+            );
             println!("messages       {}", messages.len());
             println!("outbox         {outbox} waiting, {acknowledgements} acknowledgements");
             if let Some(age) = oldest {
@@ -7831,6 +7892,44 @@ fn channel(command: Channel) -> Result<()> {
                     };
                     let added = ferryman_channel::add_trusted_signer(&route, grant)?;
                     println!("{}", if added { "added" } else { "no change" });
+                }
+            }
+        }
+        Channel::Head {
+            workspace,
+            agent,
+            action,
+        } => {
+            let route = here(workspace)?;
+            match action {
+                None => println!(
+                    "head agent  {}",
+                    head_line(&route.communications, &route.project_id)
+                ),
+                Some(HeadAction::Claim { order }) => {
+                    let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    let identity = signing_identity(&route, &agent)?;
+                    let head = ferryman_channel::head::claim(
+                        &route.communications,
+                        &route.project_id,
+                        &identity,
+                        order.as_deref(),
+                    )?;
+                    println!("{} is head agent of {}", head.agent, route.project_id);
+                    println!(
+                        "  on {}'s word: \"{}\"",
+                        head.order.by().unwrap_or("the master"),
+                        head.order.words()
+                    );
+                    println!("  Every machine syncing the channel sees it.");
+                }
+                Some(HeadAction::StepDown) => {
+                    let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    if ferryman_channel::head::step_down(&route.communications, &agent)? {
+                        println!("{agent} is no longer head agent of {}", route.project_id);
+                    } else {
+                        println!("{agent} was not head agent of {}", route.project_id);
+                    }
                 }
             }
         }

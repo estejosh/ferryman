@@ -236,6 +236,24 @@ ferry doctor
 That is the whole obligation. It covers version drift too: the `versions` line
 reports whether any registered machine is behind this one.
 
+### Who is in charge
+
+Every project has one master, and it is Josh, the person, not a machine. A project
+that has none gets him the next time he opens the dashboard, or with
+`ferry root master`.
+
+The head agent is whoever Josh last named, in plain words, in the dashboard or a
+message: "grouchly, you're head agent for now". When he names you, take it:
+
+```sh
+ferry channel head claim
+```
+
+That records his signed words in the channel, and every machine sees you as head
+agent. `ferry loadmem`, `ferry channel status` and `ferry channel head` all print
+who it is. When he names someone else, they are head agent from then on.
+`ferry channel head step-down` gives the role back.
+
 ### Every week, once, from anywhere
 
 ```sh

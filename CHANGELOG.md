@@ -44,6 +44,18 @@ is why this is a version and not a quiet patch.
   required grants in bulk: switching thirty projects to grants-required at once would
   stop every agent working in them.
 
+- **Head agents, named in plain words.** The master says it however they like -
+  "grouchly, you're head agent for now" - in the dashboard or in a message, and the
+  agent named runs `ferry channel head claim`. That finds the master's signed words
+  that name it and records them whole in the channel (`head/<agent>.json`), so every
+  machine can check them without trusting the agent. The newest words win, so naming
+  someone else replaces the head. `ferry loadmem`, `ferry channel status`,
+  `ferry channel head` and the dashboard's team page all show who it is and the
+  words it rests on. The dashboard now signs each thing a person says on its own
+  (`said/`), since a conversation file is signed whole by whoever wrote last. The
+  words are not parsed: anything the master signed that names an agent can back a
+  claim, so the page shows the words and gives the master a revoke.
+
 ## v0.5.12 - 2026-09-23
 
 Your machines are you, a git account is proof of whose projects these are, and a

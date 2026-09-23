@@ -137,6 +137,17 @@ paths:
         '200': {description: the master's name and whether grants are now required}
         '403': {description: dashboard is read-only}
         '409': {description: a master already exists}
+  /api/head/revoke:
+    post:
+      summary: The master clears the head agent of this project
+      description: >
+        A head agent is whoever the master last named in their own signed words and who
+        claimed it (`ferry channel head claim`). Naming someone else replaces it; this
+        clears it. Master only.
+      responses:
+        '200': {description: how many appointments were removed}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
   /api/master/claim-all:
     post:
       summary: The signed-in person becomes master of every project with none

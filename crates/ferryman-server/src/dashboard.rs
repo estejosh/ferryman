@@ -399,6 +399,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/team/invite", post(invite_teammate))
         .route("/api/master/init", post(master_init))
         .route("/api/master/claim-all", post(master_claim_all))
+        .route("/api/head/revoke", post(head_revoke))
         .route("/api/team/{name}/revoke", post(revoke_access))
         .route("/api/team/{name}/access", post(set_access))
         .route("/api/conversations", get(conversations))
@@ -1377,6 +1378,16 @@ async fn team(
         // Only the master's signature makes a grant, so the page must not offer the
         // controls to anybody else and then fail at the server. Same answer, one place.
         "may_grant": master.as_deref() == Some(current.name()),
+        // Who the master named head agent, and the words they did it with.
+        "head": ferryman_channel::head::current(&route.communications, &route.project_id)
+            .ok()
+            .flatten()
+            .map(|head| json!({
+                "agent": head.agent,
+                "by": head.order.by(),
+                "words": head.order.words(),
+                "at": head.order.at(),
+            })),
         "teammates": teammates,
         "agents": agents,
         "grants": grants,
@@ -1750,6 +1761,38 @@ async fn master_init(
         "master": declaration.master,
         "grants_required": flipped || route.requires_grants(),
     })))
+}
+
+/// POST /api/head/revoke - the master clears the head agent of the project on screen.
+///
+/// Naming someone else in plain words replaces a head too; this is for having none.
+async fn head_revoke(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let route = state.route_for(params.project.as_deref());
+    let master = ferryman_channel::master::read_master(&route)
+        .map_err(internal)?
+        .map(|declaration| declaration.master);
+    if !master
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(current.name()))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the master names or clears the head agent".to_string(),
+        ));
+    }
+    let removed = ferryman_channel::head::revoke_all(&route.communications).map_err(internal)?;
+    Ok(Json(json!({ "removed": removed })))
 }
 
 /// POST /api/master/claim-all - the signed-in person becomes master of every project in
@@ -2907,6 +2950,16 @@ async fn say(
     let bank = conversation_bank(&state.route);
     ferryman_channel::conversation::append_turn(&bank, &topic, identity.name(), said, &identity)
         .map_err(|e| internal(e.into()))?;
+    // Each turn signed on its own as well. The conversation file is signed whole, by
+    // whoever wrote last, so one line in it proves nothing about who said it - and a
+    // person's plain words are how they name a head agent. Best-effort: the turn is
+    // already said.
+    let _ = ferryman_channel::head::record_said(
+        &state.route.communications,
+        &state.route.project_id,
+        &identity,
+        said,
+    );
     Ok(Json(json!({ "topic": topic, "who": identity.name() })))
 }
 
