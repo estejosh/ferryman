@@ -29,6 +29,8 @@ finished project can be put away without being thrown away.
   `forget` there was nothing for a project that is simply over. Archiving keeps the
   channel, its signed history, and its sync; it only stops the project being offered as
   somewhere work happens, and drops it from the anchor spread. `--restore` takes it back.
+  The mark is an `ARCHIVED` file in the channel, not a line in the machine-local index,
+  so archiving on one machine archives it on every machine that syncs the channel.
   `ferry root show` always says how many it is hiding; `--all` shows them.
 
 - **`ferry root forget`, and `--gone`.** The index could be added to and never

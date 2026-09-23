@@ -43,6 +43,17 @@ use serde::{Deserialize, Serialize};
 /// The file that marks a ferry root and describes what is in it.
 pub const MANIFEST: &str = ".ferry";
 
+/// The marker, inside a channel, that says its project is finished.
+///
+/// It lives in the channel and not in the manifest because the manifest is machine-local
+/// and archiving is not: a project finished on one machine is finished on all of them,
+/// and the channel is the one thing they all share. Syncthing carries the marker out and
+/// carries its removal back, so `--restore` travels the same way.
+///
+/// Unsigned on purpose. It hides nothing and deletes nothing, so any peer that can write
+/// the channel may say the work is over, and any peer may take that back.
+pub const ARCHIVED: &str = "ARCHIVED";
+
 /// One project, and where its two halves live on this machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
@@ -58,17 +69,21 @@ pub struct Entry {
     /// Recorded so nothing ever assumes it may be moved or removed.
     #[serde(default)]
     pub adopted: bool,
-    /// Finished. Still here, still synced if Syncthing carries it, still readable - but
-    /// not offered as somewhere work happens.
+}
+
+impl Entry {
+    /// Finished. Still here, still synced, still readable - but not offered as somewhere
+    /// work happens.
     ///
     /// The third state the index was missing. `forget` is for an entry whose channel has
     /// gone; a project that is simply *over* has neither a reason to be removed (its
     /// signed history is the record of what happened) nor a reason to keep appearing
-    /// beside the live ones. Without this, a root accumulates finished work until nobody
-    /// can see the running projects for the dead ones - twelve of thirty-three on the
-    /// machine this was written for.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub archived: bool,
+    /// beside the live ones. Read from the channel's [`ARCHIVED`] marker, so every
+    /// machine that syncs the channel gives the same answer.
+    #[must_use]
+    pub fn is_archived(&self) -> bool {
+        self.channel.join(ARCHIVED).is_file()
+    }
 }
 
 /// What a ferry root holds.
@@ -169,7 +184,6 @@ impl Root {
             channel: channel.to_path_buf(),
             repo: repo.map(Path::to_path_buf),
             adopted,
-            archived: false,
         };
         match manifest
             .projects
@@ -187,8 +201,8 @@ impl Root {
                     existing.repo = entry.repo;
                     existing.adopted = entry.adopted;
                 }
-                // `archived` is deliberately not cleared. Filing a project again is
-                // something `enable` does on its own, and a project quietly coming back
+                // The archive marker is deliberately not touched. Filing a project again
+                // is something `enable` does on its own, and a project quietly coming back
                 // from the archive because a command was re-run is the kind of silent
                 // state change this index has been bitten by before. Coming back is
                 // `archive --restore`, which is a thing someone chose to type.
@@ -233,7 +247,7 @@ impl Root {
         self.read()
             .projects
             .into_iter()
-            .filter(|entry| entry.channel.is_dir() && !entry.archived)
+            .filter(|entry| entry.channel.is_dir() && !entry.is_archived())
             .collect()
     }
 
@@ -243,24 +257,24 @@ impl Root {
         self.read()
             .projects
             .into_iter()
-            .filter(|entry| entry.archived)
+            .filter(Entry::is_archived)
             .collect()
     }
 
-    /// Mark a project finished, or bring it back.
+    /// Mark a project finished, or bring it back - on every machine that syncs it.
     ///
-    /// Nothing on disk moves and nothing is unshared. That is the whole point: the
-    /// channel keeps its signed history, Syncthing keeps carrying it if it was, and the
-    /// project simply stops being offered as somewhere work happens. Archiving is a
-    /// statement about intent, not a deletion, and a statement that can be taken back.
+    /// Nothing moves and nothing is unshared. That is the whole point: the channel keeps
+    /// its signed history, Syncthing keeps carrying it, and the project simply stops
+    /// being offered as somewhere work happens. The one thing written is the [`ARCHIVED`]
+    /// marker in the channel, which is how the other machines hear about it.
     ///
-    /// Returns whether the flag changed. Archiving an already-archived project is not an
+    /// Returns whether anything changed. Archiving an already-archived project is not an
     /// error - the desired state is that it is archived, and it is.
     pub fn archive(&self, project_id: &str, archived: bool) -> Result<bool> {
-        let mut manifest = self.read();
+        let manifest = self.read();
         let entry = manifest
             .projects
-            .iter_mut()
+            .iter()
             .find(|entry| entry.project_id == project_id)
             .with_context(|| {
                 format!(
@@ -268,11 +282,29 @@ impl Root {
                     self.manifest_path().display()
                 )
             })?;
-        if entry.archived == archived {
+        // Without the channel there is nowhere to say it that the fleet would hear.
+        if !entry.channel.is_dir() {
+            bail!(
+                "{project_id}'s channel is not on this machine ({}) - archive it from one that has it",
+                entry.channel.display()
+            );
+        }
+        if entry.is_archived() == archived {
             return Ok(false);
         }
-        entry.archived = archived;
-        self.write(&manifest)?;
+        let marker = entry.channel.join(ARCHIVED);
+        if archived {
+            let note = format!(
+                "{project_id} is archived: finished, kept, and no longer offered as somewhere work happens.\n\
+                 Every machine that syncs this channel sees this. Nothing was deleted.\n\
+                 Undo, from any of them:  ferry root archive {project_id} --restore\n"
+            );
+            std::fs::write(&marker, note)
+                .with_context(|| format!("writing {}", marker.display()))?;
+        } else {
+            std::fs::remove_file(&marker)
+                .with_context(|| format!("removing {}", marker.display()))?;
+        }
         Ok(true)
     }
 
@@ -675,6 +707,54 @@ mod tests {
         assert_eq!(archived.len(), 1);
         // The re-adoption's new information was still recorded.
         assert_eq!(archived[0].repo.as_deref(), Some(repo.as_path()));
+    }
+
+    /// Archiving is fleet-wide: it travels in the channel, not in the machine-local index.
+    ///
+    /// Two roots sharing one channel directory is what two machines syncing it look like
+    /// from here - Syncthing is what makes the directory the same one.
+    #[test]
+    fn an_archive_made_on_one_machine_is_seen_on_every_other() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let beastly = root(&dir.path().join("beastly"));
+        let grouchly = root(&dir.path().join("grouchly"));
+        let shared = channel(dir.path(), "done");
+        beastly.adopt("done", &shared, None).unwrap();
+        grouchly.adopt("done", &shared, None).unwrap();
+
+        assert!(beastly.archive("done", true).unwrap());
+        assert!(
+            grouchly.projects().is_empty(),
+            "archived there, so archived here"
+        );
+        assert_eq!(grouchly.archived().len(), 1);
+        // And no machine's index was what carried it.
+        let index = std::fs::read_to_string(grouchly.manifest_path()).unwrap();
+        assert!(!index.contains("archived"), "{index}");
+
+        assert!(grouchly.archive("done", false).unwrap());
+        assert_eq!(
+            beastly.projects().len(),
+            1,
+            "restored there, so restored here"
+        );
+    }
+
+    /// A machine without the channel cannot tell the fleet anything, and says so.
+    #[test]
+    fn archiving_a_channel_that_is_not_here_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let gone = channel(dir.path(), "gone");
+        root.adopt("gone", &gone, None).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+        let error = root
+            .archive("gone", true)
+            .expect_err("nowhere to write the marker")
+            .to_string();
+        assert!(error.contains("not on this machine"), "{error}");
     }
 
     /// Archiving something that was never filed is an error naming it, not a silent no-op.

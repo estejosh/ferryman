@@ -545,6 +545,7 @@ enum RootCommand {
     /// until the running ones cannot be seen for them.
     ///
     /// Nothing moves, nothing is unshared, nothing is deleted. `--restore` takes it back.
+    /// Both are an `ARCHIVED` file in the channel, so every machine syncing it agrees.
     Archive {
         /// The project id.
         project: String,
@@ -8619,7 +8620,11 @@ fn root_command(command: RootCommand) -> Result<()> {
                 .max()
                 .unwrap_or(0);
             for entry in projects {
-                let mark = if entry.archived { "  [archived]" } else { "" };
+                let mark = if entry.is_archived() {
+                    "  [archived]"
+                } else {
+                    ""
+                };
                 println!(
                     "  {:width$}  {}{mark}",
                     entry.project_id,
@@ -8725,7 +8730,8 @@ fn root_command(command: RootCommand) -> Result<()> {
                         );
                     }
                     println!("  Nothing moved and nothing was unshared. It is out of");
-                    println!("  `ferry root show` and out of the anchor spread, and that is all.");
+                    println!("  `ferry root show` and out of the anchor spread, on every machine");
+                    println!("  that syncs the channel - the mark travels with it.");
                     println!("  Back with:  ferry root archive {project} --restore");
                 }
                 (false, false) => println!("{project} was already archived"),
