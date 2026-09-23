@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## v0.5.14 - 2026-09-23
+
+Three faults found on the live fleet the day 0.5.13 shipped: a worker that could never
+re-take its own task, a machine in daily use that never picked up work, and a sandbox
+that could not see its own launcher.
 
 ### Changed
 
