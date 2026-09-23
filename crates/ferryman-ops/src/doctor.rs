@@ -453,31 +453,25 @@ pub fn examine(start: &Path) -> Report {
         Err(err) => checks.push(check("master", false, false, format!("{err:#}"))),
     }
 
-    // Version skew across the fleet: the machine that is behind is the one that will
-    // misbehave first, and it is never the one you are sitting at.
-    let mine = env!("CARGO_PKG_VERSION");
-    let behind: Vec<String> = ferryman_channel::licensing::read_devices(&route)
+    // Version skew across the fleet, in both directions.
+    //
+    // This reported only the machines behind THIS one, reasoning that the stale machine
+    // misbehaves first and is never the one you are sitting at. The second half is false,
+    // and its falseness is silent: a machine that is itself behind read "no registered
+    // machine is behind it" and concluded it was current. The check reassured precisely
+    // the machine that needed telling, and a machine four versions back sat there for
+    // weeks being told it was fine.
+    //
+    // Being behind is also the more actionable half. "Some other machine is stale" is a
+    // note to go and find someone; "you are stale" is a command you can run where you are
+    // standing, so it leads.
+    let fleet: Vec<(String, String)> = ferryman_channel::licensing::read_devices(&route)
         .unwrap_or_default()
-        .iter()
-        .filter_map(|d| {
-            let v = d.ferry_version.as_deref()?;
-            ferryman_channel::licensing::version_is_older(v, mine)
-                .then(|| format!("{} ({v})", &d.id[..d.id.len().min(8)]))
-        })
+        .into_iter()
+        .filter_map(|d| Some((d.id, d.ferry_version?)))
         .collect();
-    checks.push(check(
-        "versions",
-        behind.is_empty(),
-        false,
-        if behind.is_empty() {
-            format!("this machine {mine}; no registered machine is behind it")
-        } else {
-            format!(
-                "this machine {mine}; behind: {} - run 'ferry update' there",
-                behind.join(", ")
-            )
-        },
-    ));
+    let (level, detail) = version_skew(env!("CARGO_PKG_VERSION"), &fleet);
+    checks.push(check("versions", level, false, detail));
 
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {
@@ -487,9 +481,120 @@ pub fn examine(start: &Path) -> Report {
     }
 }
 
+/// What the `versions` check should say, given this machine's version and what every
+/// registered machine reports. `fleet` is `(device id, version)`.
+///
+/// A free function rather than inline, because the defect it replaced was a *sentence* -
+/// a stale machine being told "no registered machine is behind it" - and a sentence is
+/// only catchable by asserting on the sentence. Inline, it needed a whole channel and a
+/// device roster to exercise, which is why nothing exercised it.
+fn version_skew(mine: &str, fleet: &[(String, String)]) -> (bool, String) {
+    use ferryman_channel::licensing::version_is_older;
+    let behind: Vec<String> = fleet
+        .iter()
+        .filter(|(_, version)| version_is_older(version, mine))
+        .map(|(id, version)| format!("{} ({version})", &id[..id.len().min(8)]))
+        .collect();
+    // The newest version anyone reports, when it beats ours.
+    let newer = fleet
+        .iter()
+        .map(|(_, version)| version.as_str())
+        .filter(|version| version_is_older(mine, version))
+        .fold(None::<&str>, |best, version| match best {
+            Some(best) if !version_is_older(best, version) => Some(best),
+            _ => Some(version),
+        });
+    let detail = match (newer, behind.is_empty()) {
+        (Some(newest), true) => {
+            format!("this machine {mine} is BEHIND the fleet's {newest} - run 'ferry update' here")
+        }
+        (Some(newest), false) => format!(
+            "this machine {mine} is BEHIND the fleet's {newest} - run 'ferry update' here; \
+             and behind this machine: {}",
+            behind.join(", ")
+        ),
+        (None, false) => format!(
+            "this machine {mine}; behind: {} - run 'ferry update' there",
+            behind.join(", ")
+        ),
+        (None, true) => format!("this machine {mine}; every registered machine is level with it"),
+    };
+    (newer.is_none() && behind.is_empty(), detail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fleet(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(id, version)| ((*id).to_string(), (*version).to_string()))
+            .collect()
+    }
+
+    /// The defect, reproduced: grouchly on 0.5.10 beside beastly on 0.5.11 was told
+    /// nothing was wrong, because the check only ever looked downhill.
+    #[test]
+    fn a_machine_that_is_itself_behind_is_told_so() {
+        let (level, detail) = version_skew("0.5.10", &fleet(&[("8799dfe2f32dc7aa", "0.5.11")]));
+        assert!(!level);
+        assert!(detail.contains("BEHIND"), "{detail}");
+        assert!(detail.contains("0.5.11"), "{detail}");
+        assert!(
+            detail.contains("here"),
+            "the remedy runs on this machine, not another: {detail}"
+        );
+    }
+
+    /// Both directions at once. Neither report may swallow the other.
+    #[test]
+    fn a_machine_in_the_middle_hears_about_both_sides() {
+        let (level, detail) = version_skew(
+            "0.5.10",
+            &fleet(&[
+                ("newer0001111aaaa", "0.5.12"),
+                ("older0002222bbbb", "0.5.9"),
+            ]),
+        );
+        assert!(!level);
+        assert!(detail.contains("0.5.12"), "{detail}");
+        // Named by the first eight of its device id, the way the listing has always
+        // shortened them - long enough to pick a machine out, short enough to read.
+        assert!(detail.contains("older000 (0.5.9)"), "{detail}");
+        assert!(!detail.contains("older0002222bbbb"), "{detail}");
+    }
+
+    /// The newest wins, not merely the first one seen.
+    #[test]
+    fn the_furthest_ahead_is_the_one_named() {
+        let (_, detail) = version_skew(
+            "0.5.9",
+            &fleet(&[("a", "0.5.10"), ("b", "0.6.0"), ("c", "0.5.11")]),
+        );
+        assert!(detail.contains("0.6.0"), "{detail}");
+        assert!(!detail.contains("0.5.10"), "{detail}");
+    }
+
+    /// The old behaviour, preserved: someone else is stale and the remedy is over there.
+    #[test]
+    fn a_machine_ahead_of_a_stale_peer_still_points_at_the_peer() {
+        let (level, detail) = version_skew("0.5.11", &fleet(&[("5695598bdb", "0.5.10")]));
+        assert!(!level);
+        assert!(detail.contains("5695598b (0.5.10)"), "{detail}");
+        assert!(detail.contains("there"), "{detail}");
+        assert!(!detail.contains("BEHIND"), "{detail}");
+    }
+
+    /// A level fleet says so plainly, and no longer claims something it cannot know.
+    #[test]
+    fn a_level_fleet_is_reported_as_level() {
+        let (level, detail) = version_skew("0.5.11", &fleet(&[("a", "0.5.11"), ("b", "0.5.11")]));
+        assert!(level);
+        assert!(detail.contains("level"), "{detail}");
+        let (alone, _) = version_skew("0.5.11", &fleet(&[]));
+        assert!(alone);
+    }
 
     fn tempdir(tag: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(

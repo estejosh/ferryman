@@ -679,7 +679,16 @@ async fn group_bridge(
     }
     // Before answering anything: the same name has to be able to sign in every project,
     // or the bridge takes a message in one topic and refuses it in the next.
-    seat_signer(&desks[0].issuer.clone(), &desks)?;
+    //
+    // A person relaying through their own bot signs as themselves. Unlock them once, here,
+    // and hold the key in memory for as long as the bridge runs - the way the dashboard
+    // holds a signed-in session. Without it every order and every word from the phone
+    // is signed by the machine, and reads as the machine's.
+    let issuer = desks[0].issuer.clone();
+    if crate::hold_operator(&desks[0].route.attachment, &issuer)? {
+        println!("telegram: signing as {issuer}, unlocked for as long as the bridge runs");
+    }
+    seat_signer(&issuer, &desks)?;
 
     if !known_group || !created.is_empty() {
         // A topic appearing in a group with no explanation is alarming rather than useful,
@@ -781,11 +790,21 @@ async fn group_bridge(
 /// everywhere. If the machine holds no such key at all, that is a real problem and it is
 /// reported once, before the bridge starts answering, rather than nineteen times.
 fn seat_signer(agent: &str, desks: &[Desk]) -> Result<()> {
-    let Some(identity) = desks.iter().find_map(|desk| {
-        ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)
-            .ok()
-            .flatten()
-    }) else {
+    // A person held in memory is published everywhere and seated nowhere: their key is
+    // never written out as a machine's key file.
+    let held = crate::held_operator()
+        .filter(|held| held.name().eq_ignore_ascii_case(agent))
+        .is_some();
+    let found = if held {
+        crate::held_operator()
+    } else {
+        desks.iter().find_map(|desk| {
+            ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)
+                .ok()
+                .flatten()
+        })
+    };
+    let Some(identity) = found else {
         bail!(
             "this machine holds no signing key for '{agent}' in any of the projects in the \
              map, so the bridge could not sign anything it was sent.\n\
@@ -807,7 +826,9 @@ fn seat_signer(agent: &str, desks: &[Desk]) -> Result<()> {
     // start would mean the operator loses all of them to fix one.
     let mut refused = Vec::new();
     for desk in desks {
-        if ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)?.is_some()
+        if !held
+            && ferryman_channel::AgentIdentity::load_existing(agent, &desk.route.attachment)?
+                .is_some()
         {
             continue;
         }
@@ -821,10 +842,15 @@ fn seat_signer(agent: &str, desks: &[Desk]) -> Result<()> {
             public_key: None,
             encryption_key: None,
         };
-        match identity
-            .seat_in(&desk.route.attachment)
+        let seated = if held {
+            Ok(())
+        } else {
+            identity.seat_in(&desk.route.attachment)
+        };
+        match seated
             .and_then(|()| ferryman_channel::register_agent_key(&desk.route, &published, &identity))
         {
+            Ok(_) if held => {}
             Ok(_) => println!(
                 "telegram: seated {agent} in {} and published it to the roster",
                 desk.route.project_id
@@ -1217,6 +1243,19 @@ async fn handle(
     let Some(text) = message.text.as_deref() else {
         return;
     };
+    // What the person said, signed on its own as them, when the bridge holds them. Plain
+    // words are how a person names a head agent, and the conversation file is signed
+    // whole, so it proves nothing about any one line in it.
+    if let Some(person) =
+        crate::held_operator().filter(|held| held.name().eq_ignore_ascii_case(issuer))
+    {
+        let _ = ferryman_channel::head::record_said(
+            &route.communications,
+            &route.project_id,
+            &person,
+            text,
+        );
+    }
     let reply = match parse_instruction(text) {
         None => help_text(default_to),
         Some(Instruction::Help) => help_text(default_to),

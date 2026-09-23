@@ -6,7 +6,10 @@
 //! synced only to the master's own devices, so its records survive even if the
 //! shared channel is wiped.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -63,6 +66,20 @@ pub fn initialize_master(
     identity: &AgentIdentity,
     master: &str,
 ) -> Result<MasterDeclaration> {
+    declare_master(route, identity, master, true)
+}
+
+/// `initialize_master`, optionally without making the local master folder.
+///
+/// A claim made across a whole ferry root reaches channels that have no repository on
+/// this machine, where the "attachment" is only the directory the channel sits in; making
+/// a `master` folder there left an empty directory among the channels.
+fn declare_master(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    master: &str,
+    make_master_folder: bool,
+) -> Result<MasterDeclaration> {
     if !crate::is_safe_component(master) {
         bail!("master name must be a path-safe identifier");
     }
@@ -94,15 +111,33 @@ pub fn initialize_master(
     declaration.signed_by = Some(identity.name().to_owned());
     declaration.signature = Some(hex::encode(signature.to_bytes()));
 
-    let directory = route.master_dir();
-    fs::create_dir_all(&directory)?;
+    if make_master_folder {
+        fs::create_dir_all(route.master_dir())?;
+    }
     crate::atomic_json(&path, &declaration)?;
     Ok(declaration)
 }
 
 /// Read and verify the master declaration, if one exists.
 pub fn read_master(route: &ProjectRoute) -> Result<Option<MasterDeclaration>> {
-    let path = declaration_path(route);
+    let Some(declaration) = read_master_at(&route.communications, &route.agents)? else {
+        return Ok(None);
+    };
+    if declaration.project_id != route.project_id {
+        bail!("master declaration is for a different project");
+    }
+    Ok(Some(declaration))
+}
+
+/// Read and verify the declaration in a channel directory, against a roster.
+///
+/// For a caller holding a channel but no route: a machine that syncs a project it does
+/// not work in still needs to know who that project's master is.
+pub fn read_master_at(
+    communications: &Path,
+    roster: &[AgentRoute],
+) -> Result<Option<MasterDeclaration>> {
+    let path = communications.join("master.json");
     if !path.is_file() {
         return Ok(None);
     }
@@ -112,15 +147,105 @@ pub fn read_master(route: &ProjectRoute) -> Result<Option<MasterDeclaration>> {
         declaration.signed_by.as_ref(),
         declaration.signature.as_ref(),
         &master_payload(&declaration),
-        &route.agents,
+        roster,
     ) != SignatureCheck::Valid
     {
         bail!("master declaration signature does not verify");
     }
-    if declaration.project_id != route.project_id {
-        bail!("master declaration is for a different project");
-    }
     Ok(Some(declaration))
+}
+
+/// What claiming a channel's master role did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// The person is now the master.
+    Declared,
+    /// They already were. Nothing written.
+    AlreadyTheirs,
+    /// Someone else is master. Nothing written: a master is handed over, never taken.
+    Other(String),
+    /// The channel knows this name by a different key. Nothing written - a declaration
+    /// signed by a key the fleet does not know this name by is one no peer would accept.
+    KeyConflict,
+}
+
+/// Declare `person` master of the project in `channel`, if it has none.
+///
+/// For a channel enabled while a person was present: `enable` will not make the machine
+/// master and cannot sign as the person, so it left the role empty, and nothing came
+/// back for it. This fills it, signed by the person, and first puts their public key on
+/// the channel's roster so every peer can verify the declaration. Both files are in the
+/// channel, so Syncthing carries them to every machine.
+pub fn claim_if_masterless(
+    channel: &Path,
+    project_id: &str,
+    attachment: &Path,
+    person: &AgentIdentity,
+) -> Result<Claim> {
+    let roster = crate::read_agent_roster(channel)?;
+    // Decided before anything is written: a project someone else masters gets nothing
+    // from this, not even a roster entry.
+    if let Some(declaration) = read_master_at(channel, &roster)? {
+        return Ok(if declaration.master.eq_ignore_ascii_case(person.name()) {
+            Claim::AlreadyTheirs
+        } else {
+            Claim::Other(declaration.master)
+        });
+    }
+    let key = person.public_key_hex();
+    let mut route = ProjectRoute {
+        project_id: project_id.to_owned(),
+        workspace: attachment.parent().unwrap_or(attachment).to_path_buf(),
+        attachment: attachment.to_path_buf(),
+        communications: channel.to_path_buf(),
+        shared_remote: format!("{project_id}-ferryman"),
+        git_remote: String::new(),
+        git_visibility: String::new(),
+        agents: Vec::new(),
+    };
+    let listing = channel.join("agents").join(format!(
+        "{}.json",
+        crate::canonical_agent_name(person.name())
+    ));
+    let listed: Option<AgentRoute> = if listing.is_file() {
+        Some(serde_json::from_slice(&fs::read(&listing)?).context("parse roster entry")?)
+    } else {
+        None
+    };
+    match listed
+        .as_ref()
+        .and_then(|agent| agent.public_key.as_deref())
+    {
+        Some(existing) if existing != key => return Ok(Claim::KeyConflict),
+        Some(_) => {}
+        // Absent, or reserved without a key: publish it, keeping any role it was given.
+        None => {
+            let agent = AgentRoute {
+                public_key: Some(key.clone()),
+                ..listed.unwrap_or_else(|| AgentRoute {
+                    name: person.name().to_owned(),
+                    role: "operator".into(),
+                    capabilities: Vec::new(),
+                    public_key: None,
+                    encryption_key: None,
+                })
+            };
+            crate::register_agent(&route, &agent)?;
+        }
+    }
+    // Read back through the pins: if this machine has pinned another key for the name,
+    // that is the key every check here uses, and a declaration would not verify.
+    route.agents = crate::read_agent_roster(channel)?;
+    let known = route
+        .agents
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(person.name()))
+        .and_then(|agent| agent.public_key.clone());
+    if known.as_deref() != Some(key.as_str()) {
+        return Ok(Claim::KeyConflict);
+    }
+    declare_master(&route, person, person.name(), false)?;
+    Ok(Claim::Declared)
 }
 
 /// Transfer the master role to another user. Signed by the current master.
@@ -278,6 +403,10 @@ pub fn grant_member(
     if declaration.master != master.name() {
         bail!("only the master ({}) may grant roles", declaration.master);
     }
+    // A master whose git anchor has stopped verifying may not hand out anything new
+    // (ADR 0022). They keep the role and may still transfer it; what they lose is
+    // the power to widen access on a project that may no longer be theirs.
+    crate::anchor::refuse_if_paused(route, &declaration.master, "grant new access")?;
 
     let mut grant = MasterGrant {
         grantee: grantee.to_owned(),
@@ -437,9 +566,51 @@ pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
 /// Whether `grantee` holds a valid master-signed grant for `role` on this
 /// project. In team mode this is the gate that decides who may act.
 pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
+    // A revocation aimed at this exact name wins over everything below it,
+    // including an owner who is still in good standing: taking one machine away
+    // from a person has to be possible without taking the person away.
     if is_revoked(route, grantee)? {
         return Ok(false);
     }
+    // The same, signed by an owner rather than the master. A person does not need
+    // the master's attention to turn off their own machine, and must be able to do
+    // it from whichever machine they are actually sitting at.
+    if crate::owner::is_revoked(route, grantee)? {
+        return Ok(false);
+    }
+    if holds_grant(route, grantee, role)? {
+        return Ok(true);
+    }
+
+    // Otherwise: a machine identity acts on behalf of the person who claimed it.
+    // The grant that was reviewed is the person's; the machine adds nothing of
+    // its own and is exactly as revoked as they are. One hop only - an owner
+    // cannot itself be owned, so a chain of claims cannot manufacture authority.
+    let Some(owner) = crate::owner::owner_of(route, grantee)? else {
+        return Ok(false);
+    };
+    if owner.eq_ignore_ascii_case(grantee) || is_revoked(route, &owner)? {
+        return Ok(false);
+    }
+    holds_grant(route, &owner, role)
+}
+
+/// Whether `grantee` has any live access here at all, whatever it covers.
+///
+/// A reserved name on the roster is not a member. This is the difference between
+/// someone who was let in and someone whose name was merely written down.
+pub fn has_any_access(route: &ProjectRoute, grantee: &str) -> Result<bool> {
+    if is_revoked(route, grantee)? {
+        return Ok(false);
+    }
+    Ok(member_grants(route)?
+        .iter()
+        .any(|(grant, check)| grant.grantee == grantee && *check == SignatureCheck::Valid))
+}
+
+/// Whether a valid grant naming `grantee` covers `role`. Ignores ownership and
+/// revocation; `is_granted` is the gate, this is the lookup behind it.
+fn holds_grant(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
     for (grant, check) in member_grants(route)? {
         if grant.grantee == grantee
             && check == SignatureCheck::Valid
@@ -453,6 +624,81 @@ pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<boo
 
 #[cfg(test)]
 mod tests {
+
+    /// A channel enabled while a person was present has no master. The person claims
+    /// it once, every peer can verify it, and nobody else's project is touched.
+    #[test]
+    fn a_person_claims_a_masterless_channel_and_only_that() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let comms = dir.path().join("comms");
+        let channel = comms.join("natv-ferryman");
+        fs::create_dir_all(&channel).unwrap();
+        let josh = AgentIdentity::from_seed("josh", [7u8; 32]);
+
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &josh).unwrap(),
+            Claim::Declared
+        );
+        assert!(
+            channel.join("agents").join("josh.json").is_file(),
+            "the key every peer verifies against"
+        );
+        let roster = crate::read_agent_roster(&channel).unwrap();
+        let declared = read_master_at(&channel, &roster)
+            .unwrap()
+            .expect("declared");
+        assert_eq!(declared.master, "josh");
+        assert_eq!(declared.project_id, "natv");
+        assert!(
+            !comms.join("master").exists(),
+            "no empty folder left among the channels"
+        );
+
+        // Again is a no-op, not a second declaration.
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &josh).unwrap(),
+            Claim::AlreadyTheirs
+        );
+
+        // Someone else claiming finds it taken, and leaves no trace on the roster.
+        let ada = AgentIdentity::from_seed("ada", [3u8; 32]);
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &ada).unwrap(),
+            Claim::Other("josh".into())
+        );
+        assert!(!channel.join("agents").join("ada.json").exists());
+    }
+
+    /// A key that is not the one the channel knows the name by declares nothing.
+    #[test]
+    fn a_different_key_under_the_same_name_claims_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let comms = dir.path().join("comms");
+        let channel = comms.join("natv-ferryman");
+        fs::create_dir_all(channel.join("agents")).unwrap();
+        let josh = AgentIdentity::from_seed("josh", [7u8; 32]);
+        let listed = AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(josh.public_key_hex()),
+            encryption_key: None,
+        };
+        fs::write(
+            channel.join("agents").join("josh.json"),
+            serde_json::to_vec(&listed).unwrap(),
+        )
+        .unwrap();
+
+        let impostor = AgentIdentity::from_seed("josh", [9u8; 32]);
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &impostor).unwrap(),
+            Claim::KeyConflict
+        );
+        assert!(!channel.join("master.json").exists());
+    }
 
     use super::*;
     use crate::AgentRoute;
@@ -653,6 +899,119 @@ mod tests {
                 vec![],
             )
             .is_err()
+        );
+    }
+
+    /// A person, their two machines, and the master who only ever reviewed the
+    /// person. This is the whole point of the owner attestation.
+    fn fleet(dir: &std::path::Path) -> (ProjectRoute, AgentIdentity, AgentIdentity) {
+        let mut route = test_route(dir);
+        std::fs::create_dir_all(&route.communications).unwrap();
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let grouchly = AgentIdentity::from_seed("josh-grouchly", [2u8; 32]);
+        let entry = |identity: &AgentIdentity| AgentRoute {
+            name: identity.name().to_owned(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
+        };
+        route.agents = vec![entry(&ada), entry(&josh), entry(&grouchly)];
+
+        initialize_master(&route, &ada, "ada").unwrap();
+        grant_member(
+            &route,
+            &ada,
+            "josh",
+            &josh.public_key_hex(),
+            vec!["hone".into()],
+            vec!["worker".into()],
+            vec!["code".into()],
+        )
+        .unwrap();
+        crate::owner::attest_owner(&route, &josh, "josh-grouchly", &grouchly.public_key_hex())
+            .unwrap();
+        (route, ada, josh)
+    }
+
+    #[test]
+    fn a_machine_inherits_the_grant_of_the_person_who_owns_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _ada, _josh) = fleet(dir.path());
+
+        assert!(
+            is_granted(&route, "josh-grouchly", "worker").unwrap(),
+            "the master reviewed josh; his machine is him"
+        );
+        assert!(
+            !is_granted(&route, "josh-grouchly", "orchestrator").unwrap(),
+            "inheriting means inheriting exactly, not more"
+        );
+        assert!(
+            !is_granted(&route, "josh-beastly", "worker").unwrap(),
+            "a machine nobody has claimed is a stranger"
+        );
+    }
+
+    #[test]
+    fn revoking_the_person_takes_their_machines_with_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, ada, _josh) = fleet(dir.path());
+        assert!(is_granted(&route, "josh-grouchly", "worker").unwrap());
+
+        revoke_member(&route, &ada, "josh", "left the project").unwrap();
+
+        assert!(!is_granted(&route, "josh", "worker").unwrap());
+        assert!(
+            !is_granted(&route, "josh-grouchly", "worker").unwrap(),
+            "revocation that leaves the laptop working is not revocation"
+        );
+    }
+
+    /// The master is not in this story at all, and does not need to be.
+    #[test]
+    fn one_machine_ends_another_without_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut route, _ada, _josh) = fleet(dir.path());
+        let grouchly = AgentIdentity::from_seed("josh-grouchly", [2u8; 32]);
+        let beastly = AgentIdentity::from_seed("josh-beastly", [3u8; 32]);
+        route.agents.push(AgentRoute {
+            name: "josh-beastly".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(beastly.public_key_hex()),
+            encryption_key: None,
+        });
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        crate::owner::attest_owner(&route, &josh, "josh-beastly", &beastly.public_key_hex())
+            .unwrap();
+        assert!(is_granted(&route, "josh-beastly", "worker").unwrap());
+
+        crate::owner::revoke_machine(&route, &grouchly, "josh-beastly", "left in a taxi").unwrap();
+
+        assert!(
+            !is_granted(&route, "josh-beastly", "worker").unwrap(),
+            "the laptop on the desk has to be able to kill the one that walked off"
+        );
+        assert!(is_granted(&route, "josh-grouchly", "worker").unwrap());
+        assert!(is_granted(&route, "josh", "worker").unwrap());
+    }
+
+    #[test]
+    fn revoking_one_machine_leaves_the_person_standing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, ada, _josh) = fleet(dir.path());
+
+        revoke_member(&route, &ada, "josh-grouchly", "laptop stolen").unwrap();
+
+        assert!(
+            !is_granted(&route, "josh-grouchly", "worker").unwrap(),
+            "the machine-specific revocation has to outrank the owner's standing"
+        );
+        assert!(
+            is_granted(&route, "josh", "worker").unwrap(),
+            "losing a laptop is not losing your access"
         );
     }
 }

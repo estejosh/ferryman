@@ -988,10 +988,19 @@ pages.teammates = async () => {
         master is a person, not a machine.
         <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
           <button class="btn primary" id="tm-become-master">I am the master of ${esc(state.project || state.homeProject || "this project")}</button>
+          <button class="btn" id="tm-claim-all">I am the master of every project with none</button>
           <span class="s" id="tm-master-msg" style="color:var(--dim)"></span>
         </div>
       </div>
     </div>` : ""}
+
+    <div class="notice" style="margin-bottom:18px">
+      <div>
+        <b>Head agent:</b> ${d.head ? `${esc(d.head.agent)} &mdash; named by ${esc(d.head.by || "the master")}: &ldquo;${esc(d.head.words)}&rdquo;` : "none named."}
+        <div class="s" style="color:var(--dim);margin-top:6px">Name one in plain words in any conversation (&ldquo;grouchly, you&rsquo;re head agent for now&rdquo;). The agent you name takes it with <code>ferry channel head claim</code>, and every machine sees it.</div>
+        ${d.head && d.may_grant ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn" id="tm-head-revoke">Clear head agent</button><span class="s" id="tm-head-msg" style="color:var(--dim)"></span></div>` : ""}
+      </div>
+    </div>
 
     ${d.may_grant ? `
     <div class="panel" style="margin-bottom:18px">
@@ -1092,6 +1101,37 @@ function wireTeammates() {
     } catch (err) {
       msg.textContent = String(err.message || err).slice(0, 300);
       become.disabled = false;
+    }
+  });
+
+  const headRevoke = $("#tm-head-revoke");
+  if (headRevoke) headRevoke.addEventListener("click", async () => {
+    headRevoke.disabled = true;
+    try {
+      await api("/api/head/revoke", { method: "POST" });
+      state.team = null;
+      await render();
+    } catch (err) {
+      $("#tm-head-msg").textContent = String(err.message || err).slice(0, 300);
+      headRevoke.disabled = false;
+    }
+  });
+
+  const claimAll = $("#tm-claim-all");
+  if (claimAll) claimAll.addEventListener("click", async () => {
+    const msg = $("#tm-master-msg");
+    msg.textContent = "";
+    claimAll.disabled = true;
+    try {
+      const r = await api("/api/master/claim-all", { method: "POST" });
+      const left = r.projects.filter((p) => p.outcome !== "declared" && p.outcome !== "already");
+      state.team = null;
+      msg.textContent = `${r.master} is now master of ${r.declared} more project${r.declared === 1 ? "" : "s"}` +
+        (left.length ? `; left alone: ${left.map((p) => p.project + (p.detail ? " (" + p.detail + ")" : "")).join(", ")}` : "");
+      await render();
+    } catch (err) {
+      msg.textContent = String(err.message || err).slice(0, 300);
+      claimAll.disabled = false;
     }
   });
 

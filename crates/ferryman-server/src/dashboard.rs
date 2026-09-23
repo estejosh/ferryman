@@ -398,6 +398,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/release/{version}/deny", post(deny_release))
         .route("/api/team/invite", post(invite_teammate))
         .route("/api/master/init", post(master_init))
+        .route("/api/master/claim-all", post(master_claim_all))
+        .route("/api/head/revoke", post(head_revoke))
         .route("/api/team/{name}/revoke", post(revoke_access))
         .route("/api/team/{name}/access", post(set_access))
         .route("/api/conversations", get(conversations))
@@ -1167,12 +1169,93 @@ async fn team(
     if let Ok(Some(name)) = ferryman_channel::invite::finish_handshake(&route) {
         settled_notes.push(format!("this device is now known as {name}"));
     }
+
+    // Spreading an anchor needs no key, so it happens whenever this page is opened.
+    // A project enabled or synced since the last visit picks up its master's claim
+    // here rather than waiting to be told.
+    if let Some(root) = ferryman_channel::ferry::find_root()
+        && let Some(master) = master_name.as_deref()
+    {
+        let held = ferryman_channel::anchor::held_by(&root, master);
+        if !held.is_empty() {
+            for (project, outcome) in ferryman_channel::anchor::spread(&root, &held) {
+                if outcome == ferryman_channel::anchor::Spread::Published {
+                    settled_notes.push(format!("{project} picked up the git anchor"));
+                }
+            }
+        }
+    }
+    // Projects nobody has claimed get the signed-in person as master - the human, never
+    // the machine. `enable` leaves the role empty whenever a person is on the machine:
+    // it will not make the machine master and cannot sign as the person. The session is
+    // the one place that person's key is unlocked, so this is where the gap closes,
+    // unasked, whenever the page opens. Only for the master of the project being
+    // viewed: a teammate signing in on their own machine must not become master of
+    // whatever happens to be unclaimed there.
+    if !state.read_only
+        && let Some(root) = ferryman_channel::ferry::find_root()
+        && master
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case(current.name()))
+    {
+        for (project, outcome) in root.claim_masters(&current) {
+            if matches!(outcome, Ok(ferryman_channel::master::Claim::Declared)) {
+                settled_notes.push(format!("{} is now the master of {project}", current.name()));
+            }
+        }
+    }
     if let Ok(settled) = ferryman_channel::invite::settle_pending(&route) {
         for (id, device) in settled.paired {
             settled_notes.push(format!(
                 "let in a device for invite {id} ({})",
                 &device[..device.len().min(7)]
             ));
+        }
+        // A machine joining under an existing identity is claimed by that identity,
+        // whoever the master is. The session holds exactly one unlocked key, so the
+        // person signed in as the owner is the one who can finish it.
+        {
+            let roster_now =
+                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+            for (invite, accept) in settled.ready_to_attest {
+                let Some(owner) = invite.owner.as_deref() else {
+                    continue;
+                };
+                if !owner.eq_ignore_ascii_case(current.name()) {
+                    settled_notes.push(format!(
+                        "{} is waiting for {owner} to claim it",
+                        accept.operator
+                    ));
+                    continue;
+                }
+                let Some(key) = roster_now
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&accept.operator))
+                    .and_then(|a| a.public_key.clone())
+                else {
+                    continue;
+                };
+                if ferryman_channel::owner::attest_owner(&route, &current, &accept.operator, &key)
+                    .is_ok()
+                {
+                    let _ = ferryman_channel::invite::mark_granted(&route, &invite.id);
+                    let _ = ferryman_channel::ledger::append_ledger_entry(
+                        &route,
+                        &current,
+                        "own",
+                        current.name(),
+                        &format!(
+                            "{owner} claimed {} as their machine on {}; it inherits their access",
+                            accept.operator, route.project_id
+                        ),
+                        None,
+                    );
+                    settled_notes.push(format!(
+                        "{} is yours now and inherits your access",
+                        accept.operator
+                    ));
+                }
+            }
         }
         if master_name
             .as_deref()
@@ -1295,6 +1378,16 @@ async fn team(
         // Only the master's signature makes a grant, so the page must not offer the
         // controls to anybody else and then fail at the server. Same answer, one place.
         "may_grant": master.as_deref() == Some(current.name()),
+        // Who the master named head agent, and the words they did it with.
+        "head": ferryman_channel::head::current(&route.communications, &route.project_id)
+            .ok()
+            .flatten()
+            .map(|head| json!({
+                "agent": head.agent,
+                "by": head.order.by(),
+                "words": head.order.words(),
+                "at": head.order.at(),
+            })),
         "teammates": teammates,
         "agents": agents,
         "grants": grants,
@@ -1545,10 +1638,21 @@ async fn revoke_access(
             }
         }
     }
+    // The master ends anyone. Everybody else ends their own machines and agents,
+    // from whichever one they happen to be signed in on.
+    let signed_in_as_master = ferryman_channel::master::read_master(&route)
+        .ok()
+        .flatten()
+        .is_some_and(|declaration| declaration.master.eq_ignore_ascii_case(current.name()));
     let mut revoked = Vec::new();
     for who in &names {
-        ferryman_channel::master::revoke_member(&route, &current, who, &reason)
-            .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        if signed_in_as_master {
+            ferryman_channel::master::revoke_member(&route, &current, who, &reason)
+                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        } else {
+            ferryman_channel::owner::revoke_machine(&route, &current, who, &reason)
+                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+        }
         revoked.push(who.clone());
     }
     let mut unshared = Vec::new();
@@ -1656,6 +1760,87 @@ async fn master_init(
     Ok(Json(json!({
         "master": declaration.master,
         "grants_required": flipped || route.requires_grants(),
+    })))
+}
+
+/// POST /api/head/revoke - the master clears the head agent of the project on screen.
+///
+/// Naming someone else in plain words replaces a head too; this is for having none.
+async fn head_revoke(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let route = state.route_for(params.project.as_deref());
+    let master = ferryman_channel::master::read_master(&route)
+        .map_err(internal)?
+        .map(|declaration| declaration.master);
+    if !master
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(current.name()))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the master names or clears the head agent".to_string(),
+        ));
+    }
+    let removed = ferryman_channel::head::revoke_all(&route.communications).map_err(internal)?;
+    Ok(Json(json!({ "removed": removed })))
+}
+
+/// POST /api/master/claim-all - the signed-in person becomes master of every project in
+/// this machine's ferry root that has none.
+///
+/// The browser half of `ferry root master`, for a person who is not yet master of the
+/// project on screen and so is not offered it unasked. Declares only: it does not turn
+/// on required grants the way claiming a single project here does, because switching
+/// thirty projects to grants-required at once would stop every agent that has been
+/// working in them without one.
+async fn master_claim_all(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::master::Claim;
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let root = ferryman_channel::ferry::find_root().ok_or((
+        StatusCode::NOT_FOUND,
+        "no ferry root on this machine".to_string(),
+    ))?;
+    let projects: Vec<Value> = root
+        .claim_masters(&current)
+        .into_iter()
+        .map(|(project, outcome)| {
+            let (outcome, detail) = match outcome {
+                Ok(Claim::Declared) => ("declared", None),
+                Ok(Claim::AlreadyTheirs) => ("already", None),
+                Ok(Claim::Other(master)) => ("other", Some(master)),
+                Ok(Claim::KeyConflict) => ("key_conflict", None),
+                Err(error) => ("error", Some(format!("{error:#}"))),
+            };
+            json!({ "project": project, "outcome": outcome, "detail": detail })
+        })
+        .collect();
+    let declared = projects
+        .iter()
+        .filter(|project| project["outcome"] == "declared")
+        .count();
+    Ok(Json(json!({
+        "master": current.name(),
+        "declared": declared,
+        "projects": projects,
     })))
 }
 
@@ -2765,6 +2950,16 @@ async fn say(
     let bank = conversation_bank(&state.route);
     ferryman_channel::conversation::append_turn(&bank, &topic, identity.name(), said, &identity)
         .map_err(|e| internal(e.into()))?;
+    // Each turn signed on its own as well. The conversation file is signed whole, by
+    // whoever wrote last, so one line in it proves nothing about who said it - and a
+    // person's plain words are how they name a head agent. Best-effort: the turn is
+    // already said.
+    let _ = ferryman_channel::head::record_said(
+        &state.route.communications,
+        &state.route.project_id,
+        &identity,
+        said,
+    );
     Ok(Json(json!({ "topic": topic, "who": identity.name() })))
 }
 

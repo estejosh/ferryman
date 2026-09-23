@@ -54,6 +54,12 @@ pub struct Invite {
     /// The access the master promised, granted when the keys arrive.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Set when this is not a new person but an existing identity adding one of
+    /// their own machines. The signer and the owner are then the same identity,
+    /// and what arrives gets an owner attestation instead of a master grant: the
+    /// machine inherits, it is not granted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     /// SHA-256 of the nonce the code carries. The acceptance must present the nonce.
@@ -123,7 +129,7 @@ pub fn handshake_name(id: &str) -> String {
 }
 
 fn invite_payload(invite: &Invite) -> String {
-    format!(
+    let base = format!(
         "ferryman-invite-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         invite.id,
         invite.project_id,
@@ -134,7 +140,15 @@ fn invite_payload(invite: &Invite) -> String {
         invite.roles.join(","),
         invite.expires_at.to_rfc3339(),
         invite.nonce_hash,
-    )
+    );
+    // Appended only when there is an owner, so every invitation written before this
+    // field existed still signs over exactly the bytes it was signed over. A field
+    // that quietly changes what old signatures cover is how a channel wakes up one
+    // morning unable to verify its own history.
+    match &invite.owner {
+        Some(owner) => format!("{base}\nowner={owner}"),
+        None => base,
+    }
 }
 
 fn acceptance_payload(accept: &Acceptance) -> String {
@@ -182,6 +196,9 @@ pub fn create(
             master.name()
         );
     }
+    // An invitation lets a new device into the synced folder, which is exactly the
+    // kind of new thing a paused master may not do (ADR 0022).
+    crate::anchor::refuse_if_paused(route, &declaration.master, "invite anybody new")?;
     if let Some(operator) = operator
         && !is_safe_component(operator)
     {
@@ -224,6 +241,7 @@ pub fn create(
             [r] if r.eq_ignore_ascii_case("full") => Vec::new(),
             _ => roles,
         },
+        owner: None,
         created_at: now,
         expires_at: now + ttl,
         nonce_hash: hash_nonce(&nonce),
@@ -246,6 +264,107 @@ pub fn create(
         device: inviter_device_id.to_string(),
         operator: operator.map(str::to_string),
         agent: agent.map(str::to_string),
+        expires: invite.expires_at.timestamp(),
+        nonce,
+    });
+    Ok((invite, code))
+}
+
+/// The name a machine takes when it joins under an existing identity.
+#[must_use]
+pub fn machine_name(identity: &str, machine: &str) -> String {
+    format!("{identity}-{machine}")
+}
+
+/// The role an identity invite carries so that it confers nothing if it is ever
+/// mistaken for an ordinary one. An empty role list on a grant means EVERY role;
+/// a role no grant ever names means none of them.
+const INHERITED: &str = "inherited";
+
+/// Invite one of your OWN machines onto a channel you are already on.
+///
+/// The first mode exists because a stranger needs a master to vouch for them. A
+/// second laptop is not a stranger. The person signing here is already a member,
+/// already reviewed, and the machine that joins ends up with exactly what they
+/// have and nothing else: it inherits through an owner attestation rather than
+/// through a grant of its own, so no new authority appears anywhere on the
+/// channel and there is nothing for the master to approve.
+///
+/// What it does add is a device, because every invitation lets a device into the
+/// synced folder. That is the reason this refuses anyone who does not already
+/// hold access here: a reserved name that has never been granted anything is not
+/// a member, and must not be able to open the folder to a machine.
+pub fn create_for_identity(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    machine: &str,
+    ttl: Duration,
+    inviter_device_id: &str,
+) -> Result<(Invite, String)> {
+    if !is_safe_component(machine) {
+        bail!("the machine label must be a plain identifier, e.g. beastly");
+    }
+    let owner = identity.name().to_string();
+    let roster = crate::read_agent_roster(&route.communications)?;
+    if !roster.iter().any(|a| {
+        a.name.eq_ignore_ascii_case(&owner)
+            && a.public_key.as_deref() == Some(identity.public_key_hex().as_str())
+    }) {
+        bail!("{owner} is not published on this channel with the key that is signing");
+    }
+    let is_master = crate::master::read_master(route)?
+        .is_some_and(|declaration| declaration.master.eq_ignore_ascii_case(&owner));
+    if !is_master && !crate::master::has_any_access(route, &owner)? {
+        bail!(
+            "{owner} holds no access on {} yet, so there is nothing for a machine to inherit; ask the master for an invitation instead",
+            route.project_id
+        );
+    }
+
+    let name = machine_name(&owner, machine);
+    if let Some(existing) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name))
+        && existing.public_key.is_some()
+    {
+        bail!("{name} is already on this channel and has published a key");
+    }
+    crate::register_expected_agent(route, &name, "worker", &["messages.receive".into()])?;
+
+    let id = random_hex(4);
+    let nonce = random_hex(16);
+    let now = Utc::now();
+    let mut invite = Invite {
+        id: id.clone(),
+        project_id: route.project_id.clone(),
+        folder: crate::channel_folder_id(route),
+        device_id: inviter_device_id.to_string(),
+        // The machine joins under its own name, which is what the joiner's side
+        // already knows how to do. Nothing on that side has to learn a new mode.
+        operator: Some(name.clone()),
+        agent: None,
+        roles: vec![INHERITED.to_string()],
+        owner: Some(owner),
+        created_at: now,
+        expires_at: now + ttl,
+        nonce_hash: hash_nonce(&nonce),
+        accepted_device: None,
+        granted_at: None,
+        signed_by: None,
+        signature: None,
+    };
+    let signature = identity.signing.sign(invite_payload(&invite).as_bytes());
+    invite.signed_by = Some(identity.name().to_string());
+    invite.signature = Some(hex::encode(signature.to_bytes()));
+    fs::create_dir_all(invites_dir(route))?;
+    crate::atomic_json(&invite_path(route, &id), &invite)?;
+
+    let code = encode_code(&InviteCode {
+        v: 1,
+        id,
+        project: route.project_id.clone(),
+        folder: invite.folder.clone(),
+        device: inviter_device_id.to_string(),
+        operator: Some(name),
+        agent: None,
         expires: invite.expires_at.timestamp(),
         nonce,
     });
@@ -423,6 +542,10 @@ pub struct Settled {
     /// Invites whose acceptance and keys have arrived and now need the master's grant,
     /// with the acceptance that names who actually joined.
     pub ready_to_grant: Vec<(Invite, Acceptance)>,
+    /// The same, for machines joining under an existing identity: these need that
+    /// identity's owner attestation, not the master's grant. Kept apart so a caller
+    /// holding the master key cannot accidentally grant one of these something.
+    pub ready_to_attest: Vec<(Invite, Acceptance)>,
 }
 
 /// The inviter's side, without the master key: trust any knocking device whose announced
@@ -518,6 +641,19 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
             &roster,
         ) != SignatureCheck::Valid
         {
+            continue;
+        }
+        if let Some(owner) = invite.owner.clone() {
+            // An identity invite is worth exactly what its signer is worth, and the
+            // signer must BE the owner. Anything else is a member writing a note that
+            // says somebody else vouched for this machine.
+            if invite
+                .signed_by
+                .as_deref()
+                .is_some_and(|signer| signer.eq_ignore_ascii_case(&owner))
+            {
+                settled.ready_to_attest.push((invite, accept));
+            }
             continue;
         }
         settled.ready_to_grant.push((invite, accept));
@@ -716,5 +852,136 @@ mod tests {
             let bytes: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(37)).collect();
             assert_eq!(b64url_decode(&b64url_encode(&bytes)).unwrap(), bytes);
         }
+    }
+
+    /// The guarantee that let `owner` be added at all: an invitation written
+    /// before the field existed signs over exactly the bytes it always did.
+    #[test]
+    fn adding_the_owner_field_did_not_change_what_an_old_invite_signs_over() {
+        let now = Utc::now();
+        let before = Invite {
+            id: "1a2b3c4d".into(),
+            project_id: "redaktly".into(),
+            folder: "redaktly-ferryman".into(),
+            device_id: "DEVICE".into(),
+            operator: Some("david".into()),
+            agent: Some("david-agent".into()),
+            roles: vec!["worker".into()],
+            owner: None,
+            created_at: now,
+            expires_at: now + Duration::days(7),
+            nonce_hash: hash_nonce("n"),
+            accepted_device: None,
+            granted_at: None,
+            signed_by: None,
+            signature: None,
+        };
+        let payload = invite_payload(&before);
+        assert!(
+            !payload.contains("owner="),
+            "an invite with no owner must sign the original bytes: {payload}"
+        );
+        let after = Invite {
+            owner: Some("josh".into()),
+            ..before
+        };
+        assert_eq!(
+            invite_payload(&after),
+            format!("{payload}\nowner=josh"),
+            "the owner is appended, never interleaved"
+        );
+    }
+
+    fn channel(dir: &std::path::Path) -> ProjectRoute {
+        let workspace = dir.join("project");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        fs::create_dir_all(&communications).unwrap();
+        ProjectRoute {
+            project_id: "hone".into(),
+            workspace,
+            attachment,
+            communications,
+            shared_remote: "hone-ferryman".into(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn publish(route: &mut ProjectRoute, identity: &AgentIdentity) {
+        crate::register_agent_key(
+            route,
+            &crate::AgentRoute {
+                name: identity.name().to_owned(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+                encryption_key: None,
+            },
+            identity,
+        )
+        .unwrap();
+        route.agents = crate::read_agent_roster(&route.communications).unwrap();
+    }
+
+    #[test]
+    fn an_established_identity_adds_its_own_machine_without_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = channel(dir.path());
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        publish(&mut route, &ada);
+        publish(&mut route, &josh);
+        crate::master::initialize_master(&route, &ada, "ada").unwrap();
+        crate::master::grant_member(
+            &route,
+            &ada,
+            "josh",
+            &josh.public_key_hex(),
+            vec!["hone".into()],
+            vec!["worker".into()],
+            Vec::new(),
+        )
+        .unwrap();
+
+        let (invite, code) =
+            create_for_identity(&route, &josh, "beastly", Duration::days(7), "DEVICE").unwrap();
+
+        assert_eq!(invite.operator.as_deref(), Some("josh-beastly"));
+        assert_eq!(invite.owner.as_deref(), Some("josh"));
+        assert_eq!(invite.signed_by.as_deref(), Some("josh"));
+        assert_eq!(
+            decode_code(&code).unwrap().operator.as_deref(),
+            Some("josh-beastly")
+        );
+        // The invitation verifies for everyone on the channel, not just its signer.
+        route.agents = crate::read_agent_roster(&route.communications).unwrap();
+        let (_, check) = list(&route)
+            .unwrap()
+            .into_iter()
+            .find(|(i, _)| i.id == invite.id)
+            .unwrap();
+        assert_eq!(check, SignatureCheck::Valid);
+        // Nothing was granted. The machine gets in by inheriting, later.
+        assert!(!crate::master::has_any_access(&route, "josh-beastly").unwrap());
+    }
+
+    /// A reserved name is not a member, and must not be able to open the synced
+    /// folder to a device just because it is written on the roster.
+    #[test]
+    fn a_name_that_was_never_granted_anything_cannot_add_a_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = channel(dir.path());
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        let mallory = AgentIdentity::from_seed("mallory", [9u8; 32]);
+        publish(&mut route, &ada);
+        publish(&mut route, &mallory);
+        crate::master::initialize_master(&route, &ada, "ada").unwrap();
+
+        let error = create_for_identity(&route, &mallory, "box", Duration::days(7), "DEVICE")
+            .expect_err("a name with no access has nothing for a machine to inherit")
+            .to_string();
+        assert!(error.contains("holds no access"), "{error}");
     }
 }

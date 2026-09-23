@@ -1,5 +1,194 @@
 # Changelog
 
+## v0.5.13 - 2026-09-23
+
+This release exists for one thing: archiving now reaches the whole fleet. In 0.5.12
+`ferry root archive` wrote a flag into this machine's `.ferry`, and `.ferry` never leaves
+the machine it is on - so a project archived on beastly was still live on grouchly and
+everywhere else. Every machine has to run 0.5.13 to honour a fleet-wide archive, which
+is why this is a version and not a quiet patch.
+
+### License
+
+- **Ferryman is now under the Usufruct License (UFL) 2.1, Seat-Limited.** It was adopted on
+  `main` as UFL-2.0 and updated to 2.1 (Section 2B, the license-text reproduction
+  carve-out). See `LICENSE`.
+
+### Changed
+
+- **An archive is now a signed `ARCHIVED` file in the channel, not a line in the local
+  index.** Syncthing carries it to every machine that syncs the channel, and carries its
+  removal back, so `archive` and `--restore` both travel with the project. `.ferry` no
+  longer has an `archived` field.
+
+- **Only a project's master can archive it or bring it back.** The mark is signed, and a
+  machine honours it only when the signature is the master's, by the key the channel
+  knows the master by. A peer can write a file called `ARCHIVED` into the channel; it
+  cannot make any machine believe it. A mark signed by a member, lifted from another
+  project, or not signed at all is read as no mark. The master's `--restore` clears it.
+
+- **A project with no master cannot be archived**, and says so, with the command that
+  names one (`ferry root master`). Archiving also needs the channel on the
+  machine doing it, since that is the only place the fleet would hear it.
+
+### Added
+
+- **`ferry root master`: one password, and you are master of every project that has
+  none.** `enable` never makes a machine the master where a person is present, and it
+  cannot sign as that person, so on a machine you use it left the role empty and
+  pointed at the dashboard - and nothing came back for it. On the machine this was
+  written for, 30 of 33 channels had no master and 30 had never seen the person's
+  public key. This goes through every project in the ferry root, puts your key on each
+  channel's roster, and declares you master where nobody is. A project with another
+  master, or that knows your name by a different key, is left alone and named.
+  `--dry-run` shows the plan without a password. `enable` now points here.
+
+  **And in the browser, unasked.** Opening the dashboard's team page signed in as the
+  master of the project on screen claims every unclaimed project in the ferry root for
+  that person - the human, never the machine - and lists each one it took. A person
+  who is not yet master anywhere gets a button for the same thing. Neither turns on
+  required grants in bulk: switching thirty projects to grants-required at once would
+  stop every agent working in them.
+
+- **Head agents, named in plain words.** The master says it however they like -
+  "grouchly, you're head agent for now" - in the dashboard or in a message, and the
+  agent named runs `ferry channel head claim`. That finds the master's signed words
+  that name it and records them whole in the channel (`head/<agent>.json`), so every
+  machine can check them without trusting the agent. The newest words win, so naming
+  someone else replaces the head. `ferry loadmem`, `ferry channel status`,
+  `ferry channel head` and the dashboard's team page all show who it is and the
+  words it rests on. The dashboard now signs each thing a person says on its own
+  (`said/`), since a conversation file is signed whole by whoever wrote last. The
+  words are not parsed: anything the master signed that names an agent can back a
+  claim, so the page shows the words and gives the master a revoke.
+
+- **The Telegram bridge signs as the person who runs it.** `ferry channel telegram
+  --agent josh` unlocks josh once at start, with the password, and holds the key in
+  memory for as long as the bridge runs - published to every roster, never written as a
+  key file. Before, it could only sign with a machine key, so every order and word
+  from the phone read as the machine's. Each message from the approver is also signed
+  on its own into `said/`, so "grouchly, you're head agent" works from Telegram too.
+  For an unattended start, FERRYMAN_OPERATOR_PASSWORD supplies the password.
+
+## v0.5.12 - 2026-09-23
+
+Your machines are you, a git account is proof of whose projects these are, and a
+finished project can be put away without being thrown away.
+
+### Added
+
+- **A master claims their git account, and every project that account owns gets it**
+  (ADR 0022). `ferry team anchor claim` binds the master's Ferryman key to a GitHub
+  account by signing with an SSH *signing* key published on that account - one that
+  grants no access to anything, only proves the account is yours. Claim once and every
+  project whose remote that account owns is anchored; nobody else can become master of
+  them without controlling the account. One identity can hold several accounts.
+
+  Required for projects on git, optional off it. The agent loop and the dashboard
+  re-check at irregular 3-11 day intervals, jittered from the machine's own name so a
+  fleet does not hit the provider in step. When an anchor stops verifying the master is
+  **paused, never vacated**: after 72 hours of contradiction a paused master directs no
+  new work, and the fleet finishes what it already holds. A sale of the account is a new
+  owner, and a new owner claims for themselves.
+
+  Verification reads `api.github.com/users/<login>/ssh_signing_keys`, not
+  `github.com/<login>.keys` - the second lists *authentication* keys, which grant push,
+  and a proof key must be one that grants nothing.
+
+- **`ferry root archive`: finished is a state, not a deletion.** Between `adopt` and
+  `forget` there was nothing for a project that is simply over. Archiving keeps the
+  channel, its signed history, and its sync; it only stops the project being offered as
+  somewhere work happens, and drops it from the anchor spread. `--restore` takes it back.
+  `ferry root show` always says how many it is hiding; `--all` shows them.
+
+- **`ferry root forget`, and `--gone`.** The index could be added to and never
+  subtracted from, and the gap did not show: `show` hides an entry whose channel has
+  gone, so a dead entry vanished from every listing while staying in the file forever.
+  `forget` touches the manifest and nothing on disk. `--gone` clears every unreachable
+  entry, and prints where each one pointed so a dead test run can be told from a project
+  you are about to stop tracking.
+
+- **`docs/FERRYMAN_IN_EVERY_PROJECT.md`**: the page a project reads to *stay* on
+  Ferryman. The eight ways a project gets stranded, what each looks like, and the command
+  that fixes it - every command run against the binary before being written down.
+
+- **A second machine can join as you, rather than as a stranger.**
+  `ferry team invite create --as-identity josh --machine beastly` invites one of your
+  own machines onto a project you are already on. It joins as `josh-beastly` and
+  inherits exactly what `josh` can do - no more, and nothing the master has to approve.
+  Until now every invitation needed the master's signature and produced a separate
+  member, so a person with two laptops was two people on the roster with two grants to
+  keep in step, and revoking them was two jobs, one of which was easy to forget.
+
+  The inheritance is a signed file of its own, `owners/<agent>.json`, sitting beside the
+  grants: a statement by an established identity that a named key is one of their
+  machines. It confers nothing by itself. `is_granted` resolves a machine to its owner
+  and answers with the owner's grant, so revoking the person takes every machine of
+  theirs dark in the same moment - the answer was never stored on the machine.
+
+  The claim is signed by the owner, not by the master, because it is a claim about your
+  own keys. That is worth exactly what your own access is worth: creating one of these
+  invitations refuses anyone who does not already hold a live grant here, since every
+  invitation lets a device into the synced folder and a name that was merely reserved is
+  not a member. The claim binds the machine's public key, so a name that is ever re-keyed
+  stops resolving to anybody. A machine cannot claim itself, an owner cannot be owned,
+  and the file being writable by anyone with the folder buys nothing: only a signature by
+  the identity being claimed *as* counts.
+
+  The machine finishes joining with `ferry team pending --as josh` on the machine holding
+  josh's key, or from the dashboard while signed in as josh. The agent loop reports the
+  wait rather than signing it, because it holds a machine's key and not a person's.
+
+  The `owner` field on an invitation is appended to the signed payload only when it is
+  set, so every invitation written before this release still verifies over exactly the
+  bytes it was signed over.
+
+- **A machine or an agent can be killed from any machine you own.** `ferry team revoke
+  --name josh-beastly` used to be the master's command and nobody else's. Now the master
+  still ends anyone on the project, and everybody else ends their own machines and agents
+  - signed by the owner, or by any *other* machine of the same owner. That last one is
+  the case that matters: a kill switch you can only reach from the machine you are trying
+  to kill is not a kill switch. The laptop still on your desk ends the one that left in a
+  taxi, with no master involved and without your operator key having to be on the machine
+  doing it.
+
+  A sibling can end a sibling and nothing else - it cannot grant, cannot claim, cannot
+  speak for its owner anywhere. The worst a stolen laptop does with this is switch your
+  other laptops off, which you undo by claiming them again; the alternative was a stolen
+  laptop that kept working because you were not sitting at the right desk. It cannot
+  revoke itself, so it cannot cover its tracks. Re-claiming a machine clears a revocation
+  a sibling or the owner signed, and never one the master signed.
+
+  It is a signed tombstone at `owners/<agent>.revoked.json`, not a deleted file: on a
+  synced folder a delete wins on one machine and then loses an argument with the next
+  replica that still had the file. Entitlement is checked when the revocation is read,
+  not when it is written, so writing one by hand into the folder achieves nothing.
+
+### Fixed
+
+- **`ferry doctor` told a stale machine the fleet was level.** The `versions` check
+  listed machines behind *this* one and never said this one was behind, reasoning in its
+  own comment that the stale machine "is never the one you are sitting at". It is, and
+  the check reassured precisely the machine that needed telling: grouchly sat on 0.5.10
+  beside 0.5.11 being told nothing was wrong. It now reports both directions and leads
+  with *"this machine 0.5.10 is BEHIND the fleet's 0.5.11 - run 'ferry update' here"*,
+  because that is the half you can act on without leaving the chair.
+
+- **Pinned public keys no longer share a name with private ones.** The trust-on-first-use
+  pin store wrote `agents-pinned/<name>.key`; the private key store next door is
+  `keys/<name>.key`. Same extension, and both files exactly 64 bytes, because a
+  hex-encoded 32-byte key is 64 characters whichever half it is. A careful reader with the
+  source open still took the pins for private keys. Pins are `<name>.pub` now. The old
+  name is read when the new one is absent and carried across, because a rename that
+  stopped finding the old pins would re-run trust-on-first-use against whatever the
+  channel says at that moment - the one moment a pin exists to distrust.
+
+### Security
+
+- **RUSTSEC-2026-0285 in `rustls`.** TLS 1.3 handshake messages were accepted across
+  encryption-level boundaries. 0.23.42 to 0.23.45, with `rustls-webpki` 0.103.13 to
+  0.103.15. A patch bump inside 0.23; nothing else in the lockfile moved.
+
 ## v0.5.11 - 2026-09-14
 
 Beta. Sync that said it was healthy while nothing moved, and licences that verify

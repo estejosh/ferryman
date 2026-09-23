@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+mod gitanchor;
 mod license;
 mod licensor;
 mod mcp;
@@ -530,7 +531,46 @@ enum RootCommand {
         path: Option<PathBuf>,
     },
     /// What the manifest knows: every project, its channel, and where its repository is.
-    Show,
+    Show {
+        /// Include archived projects, which are otherwise left out.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Mark a project finished: keep everything, stop offering it as somewhere work
+    /// happens.
+    ///
+    /// Between `adopt` and `forget` there was nothing for a project that is simply over.
+    /// Forgetting one is wrong - its channel is the signed record of what happened, and
+    /// the index is how you find it. Leaving it is wrong too: finished projects pile up
+    /// until the running ones cannot be seen for them.
+    ///
+    /// Nothing moves, nothing is unshared, nothing is deleted. `--restore` takes it back.
+    /// Both are an `ARCHIVED` file in the channel, so every machine syncing it agrees, and
+    /// only the project's master can do either: the file is signed, and a mark anyone
+    /// else wrote is ignored.
+    Archive {
+        /// The project id.
+        project: String,
+        /// Bring an archived project back into the working set.
+        #[arg(long)]
+        restore: bool,
+    },
+    /// Make you the master of every project here that has none: one password, every
+    /// channel.
+    ///
+    /// `enable` never makes a machine the master where a person is present, and cannot
+    /// sign as that person, so on a machine you use it left the role empty. This fills
+    /// every empty one, signed by you, and puts your public key on each channel's roster
+    /// so every machine can check it. A project with a different master is left alone:
+    /// a master is handed over, never taken.
+    Master {
+        /// Who to declare. Defaults to the one person identity on this machine.
+        #[arg(long)]
+        name: Option<String>,
+        /// Show what would change, without asking for a password or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Record a project here. Nothing is moved: a repository is noted where it stands,
     /// and `repos/` gets a link to it.
     Adopt {
@@ -550,6 +590,27 @@ enum RootCommand {
         #[arg(long)]
         project: Option<String>,
         /// Say what would move and move nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a project from the manifest. Nothing on disk is touched.
+    ///
+    /// The index recorded projects and never released them, and the gap did not show:
+    /// `show` hides an entry whose channel has gone, so a dead one disappears from every
+    /// listing while staying in the file - indistinguishable from a project nobody ever
+    /// adopted. This is how you say "that one is over" instead of editing the manifest
+    /// by hand, which is how a root gets truncated or written back with a byte-order
+    /// mark that makes the whole thing read as empty.
+    ///
+    /// The channel and the repository are left exactly where they are. Forgetting is an
+    /// index operation; deleting anyone's work is not Ferryman's to do.
+    Forget {
+        /// The project id to remove. Omit and pass --gone to clear every dead entry.
+        project: Option<String>,
+        /// Remove every entry whose channel is not on this machine.
+        #[arg(long)]
+        gone: bool,
+        /// Say what would be removed and remove nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -1186,6 +1247,20 @@ enum Channel {
         #[command(subcommand)]
         action: MasterAction,
     },
+    /// Who the head agent is: the one the master named, in their own words.
+    ///
+    /// The master says it however they like - "grouchly, you're head agent for now" - in
+    /// the dashboard or a message. The agent named runs `claim`, which finds those signed
+    /// words and records them in the channel, and every machine then sees it as head.
+    Head {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// This agent's name. Defaults to this machine's.
+        #[arg(long)]
+        agent: Option<String>,
+        #[command(subcommand)]
+        action: Option<HeadAction>,
+    },
     /// Export a signed audit report of the attribution ledger.
     ///
     /// A standalone, verifiable record of who did what and when — signed by the
@@ -1332,24 +1407,91 @@ enum TeamCommand {
         /// The name you want on the project.
         name: String,
     },
-    /// End a person's access: a master-signed revocation, the folder unshared from
-    /// their device, their open invitations burned. Master only.
+    /// End access: a signed revocation, the folder unshared from their device, their
+    /// open invitations burned.
+    ///
+    /// The master may end anyone on the project. Anyone else may end their own
+    /// machines and agents, from any of them - so a laptop that walked off is killed
+    /// from the one still on your desk.
     Revoke {
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// The person (or agent) to revoke.
+        /// The person, machine or agent to revoke.
         #[arg(long)]
         name: String,
         /// Why, kept in the ledger.
-        #[arg(long, default_value = "revoked by the master")]
+        #[arg(long, default_value = "revoked")]
         reason: String,
-        /// Sign as this operator (the master). Defaults to this machine's agent.
+        /// Sign as this operator. Defaults to this machine's agent.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
+    },
+    /// Bind your Ferryman key to a git account, and check that the binding still holds.
+    ///
+    /// The account's own published SSH key signs a statement naming your Ferryman key,
+    /// and your Ferryman key signs the record naming the account. Neither signature can
+    /// be lifted off and replayed against a different key. Proven once, verified offline
+    /// ever after. See ADR 0022.
+    Anchor {
+        #[command(subcommand)]
+        action: AnchorAction,
     },
     /// Trust any device knocking with a live invite's name and share the folder with it.
     /// The agent loop and the dashboard do this on their own; this runs one pass by hand.
     Pending {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Sign as this identity. A machine that joined under --as-identity is
+        /// claimed here, by the identity that invited it and nobody else.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum AnchorAction {
+    /// Claim a git account for your Ferryman identity. Asks the provider once.
+    Claim {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The account to claim, e.g. estejosh. Defaults to the owner of this
+        /// project's own git remote, which is almost always the right answer.
+        #[arg(long)]
+        account: Option<String>,
+        /// Sign as this identity. Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+        /// The SSH key to prove the account with. Defaults to ~/.ssh/id_ed25519, and
+        /// a .pub path works when ssh-agent holds the private half - no passphrase
+        /// ever reaches Ferryman that way.
+        #[arg(long)]
+        ssh_key: Option<PathBuf>,
+    },
+    /// Ask the provider whether the claims still hold, and record what it said.
+    ///
+    /// Safe to run at any time and on any machine: it writes only this machine's own
+    /// observation file, and being unable to reach the provider records nothing.
+    Check {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Whose anchor to check. Defaults to the project's master.
+        #[arg(long)]
+        master: Option<String>,
+        /// Sign the observation as this identity. Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
+    /// Put every account you have claimed into every project here that it owns.
+    ///
+    /// Claiming already does this. Run it again after enabling a project, or on a
+    /// machine that has just synced one. Publishing the same claim twice is free.
+    Sync {
+        /// Whose claims to spread. Defaults to this machine's agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        signer: Option<String>,
+    },
+    /// What this project currently believes about its master's anchor.
+    Status {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
@@ -1358,9 +1500,21 @@ enum TeamCommand {
 #[derive(Subcommand, Clone)]
 enum InviteAction {
     /// Reserve a person (and their agent) and print the code to send them. Master only.
+    ///
+    /// With --as-identity, a second mode: invite one of your OWN machines onto a
+    /// project you are already on. It joins as <identity>-<machine> and inherits
+    /// exactly your access, so it needs no master and grants nothing new.
     Create {
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Add a machine under an identity you already hold here, e.g. josh. Use with
+        /// --machine. Cannot be combined with --name, --agent or --roles.
+        #[arg(long = "as-identity", value_parser = agent_name)]
+        as_identity: Option<String>,
+        /// What to call the machine joining under --as-identity, e.g. beastly. The
+        /// name on the project becomes <identity>-<machine>.
+        #[arg(long)]
+        machine: Option<String>,
         /// Reserve this name for them, e.g. david. Omit for a generic invite: they pick
         /// any free name when they create their identity.
         #[arg(long)]
@@ -1588,6 +1742,42 @@ enum WorktreeAction {
         #[arg(long, value_parser = agent_name)]
         agent: String,
     },
+}
+
+/// Subcommands for [`Channel::Head`].
+#[derive(Subcommand, Clone)]
+enum HeadAction {
+    /// Take the role, because the master named this agent.
+    ///
+    /// Run this when the master tells you, in any words, that you are head agent. It
+    /// finds the newest thing the master signed in the last week that names you, and
+    /// records it where every machine reads it.
+    Claim {
+        /// The statement or message id to claim on, when it is not the newest.
+        #[arg(long)]
+        order: Option<String>,
+    },
+    /// Give the role up.
+    StepDown,
+}
+
+/// One line saying who the head agent is, for every place an agent looks.
+fn head_line(channel: &std::path::Path, project_id: &str) -> String {
+    match ferryman_channel::head::current(channel, project_id) {
+        Ok(Some(head)) => {
+            let words = head.order.words();
+            let words: String = words.chars().take(120).collect();
+            format!(
+                "{} - named by {}: \"{words}\"",
+                head.agent,
+                head.order.by().unwrap_or("the master")
+            )
+        }
+        Ok(None) => {
+            "none named. If the master names you, run: ferry channel head claim".to_string()
+        }
+        Err(error) => format!("unknown ({error:#})"),
+    }
 }
 
 /// Subcommands for [`Channel::Master`].
@@ -3955,6 +4145,8 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             action:
                 InviteAction::Create {
                     workspace,
+                    as_identity,
+                    machine,
                     name,
                     agent,
                     roles,
@@ -3963,14 +4155,57 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 },
         } => {
             let route = here(workspace)?;
-            let signer_name = match signer {
-                Some(s) => s,
-                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            let signer_name = match (&as_identity, signer) {
+                // --as-identity says who is signing AND who owns what joins; asking
+                // for it twice, in two flags that could disagree, helps nobody.
+                (Some(identity), _) => identity.clone(),
+                (None, Some(s)) => s,
+                (None, None) => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
             let identity = signing_identity(&route, &signer_name)?;
             let device = ferryman_channel::syncthing_my_id().context(
                 "the inviter's Syncthing must be running so the code can carry its device id",
             )?;
+
+            if let Some(owner) = as_identity {
+                if name.is_some() || agent.is_some() || roles.is_some() {
+                    bail!(
+                        "--as-identity adds a machine under your own access; it has no name, agent or roles of its own"
+                    );
+                }
+                let Some(machine) = machine else {
+                    bail!(
+                        "say which machine this is for: --machine beastly (it joins as {})",
+                        invite::machine_name(&owner, "beastly")
+                    );
+                };
+                let (invite, code) = invite::create_for_identity(
+                    &route,
+                    &identity,
+                    &machine,
+                    chrono::Duration::days(expires_days.max(1)),
+                    &device,
+                )?;
+                let joined_as = invite.operator.as_deref().unwrap_or(&machine);
+                println!("adding {joined_as} to {}", route.project_id);
+                println!("  inherits    everything {owner} can do here, and nothing else");
+                println!("  master      not needed; nothing new is granted");
+                println!(
+                    "  expires     {}",
+                    invite.expires_at.format("%Y-%m-%d %H:%M UTC")
+                );
+                println!();
+                println!("Run this on {machine}:");
+                println!();
+                println!("  ferry team invite accept {code}");
+                println!();
+                println!("Then, back here, once it has synced:  ferry team pending --as {owner}");
+                return Ok(());
+            }
+            if machine.is_some() {
+                bail!("--machine only means something with --as-identity");
+            }
+
             let roles: Vec<String> = roles
                 .unwrap_or_default()
                 .split(',')
@@ -4155,7 +4390,15 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 None => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
             let identity = signing_identity(&route, &signer_name)?;
-            ferryman_channel::master::revoke_member(&route, &identity, &name, &reason)?;
+            // The master ends anyone on the project. Everybody else ends their own
+            // machines and agents, and can do it from any of them.
+            let signed_in_as_master = ferryman_channel::master::read_master(&route)?
+                .is_some_and(|d| d.master.eq_ignore_ascii_case(identity.name()));
+            if signed_in_as_master {
+                ferryman_channel::master::revoke_member(&route, &identity, &name, &reason)?;
+            } else {
+                ferryman_channel::owner::revoke_machine(&route, &identity, &name, &reason)?;
+            }
             let devices: Vec<String> = invite::list(&route)?
                 .into_iter()
                 .filter(|(i, _)| {
@@ -4178,7 +4421,8 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 "note: what already synced is on their disk; rotate any secret sealed to them"
             );
         }
-        TeamCommand::Pending { workspace } => {
+        TeamCommand::Anchor { action } => anchor_command(action).await?,
+        TeamCommand::Pending { workspace, signer } => {
             let route = here(workspace)?;
             let settled = invite::settle_pending(&route)?;
             for (id, device) in &settled.paired {
@@ -4190,9 +4434,486 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     accept.operator
                 );
             }
-            if settled.paired.is_empty() && settled.ready_to_grant.is_empty() {
+            // Machines joining under an existing identity finish here rather than in
+            // the dashboard, because the key that has to sign is the owner's and this
+            // is the machine the owner is standing at.
+            for (invite, accept) in &settled.ready_to_attest {
+                let Some(owner) = invite.owner.as_deref() else {
+                    continue;
+                };
+                if signer
+                    .as_deref()
+                    .is_some_and(|s| !s.eq_ignore_ascii_case(owner))
+                {
+                    println!(
+                        "{} is waiting for {owner} to claim it: ferry team pending --as {owner}",
+                        accept.operator
+                    );
+                    continue;
+                }
+                let identity = match signing_identity(&route, owner) {
+                    Ok(identity) => identity,
+                    Err(err) => {
+                        println!(
+                            "{} is waiting for {owner} to claim it, and {owner}'s key is not usable here: {err:#}",
+                            accept.operator
+                        );
+                        continue;
+                    }
+                };
+                let key = ferryman_channel::read_agent_roster(&route.communications)?
+                    .into_iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&accept.operator))
+                    .and_then(|a| a.public_key);
+                let Some(key) = key else {
+                    println!("{}'s key has not synced here yet", accept.operator);
+                    continue;
+                };
+                ferryman_channel::owner::attest_owner(&route, &identity, &accept.operator, &key)?;
+                invite::mark_granted(&route, &invite.id)?;
+                let _ = ferryman_channel::ledger::append_ledger_entry(
+                    &route,
+                    &identity,
+                    "own",
+                    identity.name(),
+                    &format!(
+                        "{} claimed {} as their machine on {}; it inherits their access",
+                        owner, accept.operator, route.project_id
+                    ),
+                    None,
+                );
+                println!(
+                    "{} is yours now and inherits your access on {}",
+                    accept.operator, route.project_id
+                );
+            }
+            if settled.paired.is_empty()
+                && settled.ready_to_grant.is_empty()
+                && settled.ready_to_attest.is_empty()
+            {
                 println!("nothing waiting");
             }
+        }
+    }
+    Ok(())
+}
+
+/// Claiming a git account, checking a claim, and reporting where one stands.
+///
+/// The only place in Ferryman that asks a git provider anything about ownership. It
+/// asks unauthenticated wherever it can, because `<login>.keys` being public is what
+/// lets every member of a project watch its master rather than only the master's own
+/// machine.
+async fn anchor_command(action: AnchorAction) -> Result<()> {
+    use ferryman_channel::anchor;
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    match action {
+        AnchorAction::Claim {
+            workspace,
+            account,
+            signer,
+            ssh_key,
+        } => {
+            let route = here(workspace)?;
+            let signer_name = match signer {
+                Some(name) => name,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            let identity = signing_identity(&route, &signer_name)?;
+
+            // The account this project's own remote points at. Asking for it was the
+            // wrong default: the repository already says whose it is.
+            let account = match account.or_else(|| anchor::remote_owner(&route.git_remote)) {
+                Some(account) => account,
+                None => {
+                    bail!("this project has no git remote to read an account from; pass --account")
+                }
+            };
+            let facts = match gitanchor::fetch_account(&account).await? {
+                Ok(facts) => facts,
+                Err(gitanchor::NotChecked(why)) => bail!("cannot claim {account}: {why}"),
+            };
+            println!("{} is account {}", facts.login, facts.account_id);
+
+            // Find the key ourselves. A machine that already holds a key this account
+            // publishes needs no instructions and no flag - that IS the proof, sitting
+            // there. Asking for it was the reason this felt like paperwork.
+            let key = match ssh_key {
+                Some(key) => key,
+                None => match gitanchor::proving_key(&facts) {
+                    Some((path, _)) => {
+                        println!("  proving key {}", path.display());
+                        path
+                    }
+                    None => bail!(
+                        "nothing on this machine matches a key {} publishes.\n\
+                         Add one at https://github.com/settings/keys as a SIGNING key - it \
+                         grants no access, it only proves the account is yours:\n  {}",
+                        facts.login,
+                        gitanchor::local_signing_keys().first().map_or_else(
+                            || "ssh-keygen -t ed25519 -C ferryman-anchor".to_string(),
+                            |(_, line)| line.clone()
+                        )
+                    ),
+                },
+            };
+            let payload =
+                anchor::ssh_payload("github", facts.account_id, &identity.public_key_hex());
+            let armoured = gitanchor::sign_with_ssh(&payload, &key, &route.attachment.join("tmp"))?;
+
+            // Which published key actually signed it. The record has to carry that one,
+            // and a key that is not on the account proves nothing about the account.
+            let signing_key = anchor::signing_key_of(&armoured)
+                .context("ssh-keygen produced a signature this cannot read")?;
+            let Some(published) = facts
+                .published_keys
+                .iter()
+                .find(|line| anchor::parse_public_key(line) == Some(signing_key))
+            else {
+                bail!(
+                    "the key at {} is not published on {}, so it proves nothing about that \
+                     account. Add it to the account, or sign with one that is already there.",
+                    key.display(),
+                    facts.login
+                );
+            };
+
+            let mut claim = anchor::GitAnchor {
+                provider: "github".into(),
+                account_id: facts.account_id,
+                login: facts.login.clone(),
+                account_type: anchor::AccountType::User,
+                ferryman_key: identity.public_key_hex(),
+                ssh_key: published.clone(),
+                ssh_signature: armoured,
+                claimed_at: chrono::Utc::now(),
+                evidence_url: format!(
+                    "https://api.github.com/users/{}/ssh_signing_keys",
+                    facts.login
+                ),
+                evidence_read_at: chrono::Utc::now(),
+                signed_by: None,
+                signature: None,
+            };
+            anchor::sign_anchor(&mut claim, &identity)?;
+            anchor::publish(&route, &claim)?;
+
+            println!("claimed by {}", identity.name());
+            println!("  account     {} ({})", facts.login, facts.account_id);
+            println!("  proven with the key already published there");
+            println!("  verifies offline from now on; nothing re-asks github to use it");
+
+            // Once, not once per project. Every project on this machine whose remote
+            // this account owns learns about it now, and anything enabled later picks
+            // it up on the next sync.
+            spread_claims(&[claim]);
+        }
+        AnchorAction::Sync { signer } => {
+            let Some(root) = ferryman_channel::ferry::find_root() else {
+                bail!("no ferry root here, so there are no projects to spread a claim across");
+            };
+            let signer_name = match signer {
+                Some(name) => name,
+                None => ferryman_ops::identity::resolve(None, &root.path)?,
+            };
+            let held = anchor::held_by(&root, &signer_name);
+            if held.is_empty() {
+                println!("{signer_name} has claimed no git account on any project here");
+                return Ok(());
+            }
+            for claim in &held {
+                println!("{signer_name} holds {} {}", claim.provider, claim.login);
+            }
+            spread_claims(&held);
+        }
+        AnchorAction::Check {
+            workspace,
+            master,
+            signer,
+        } => {
+            let route = here(workspace)?;
+            let master = match master {
+                Some(name) => name,
+                None => match ferryman_channel::master::read_master(&route)? {
+                    Some(declaration) => declaration.master,
+                    None => bail!("this project has no master, so there is no anchor to check"),
+                },
+            };
+            let signer_name = match signer {
+                Some(name) => name,
+                None => ferryman_ops::identity::resolve(None, &route.attachment)?,
+            };
+            let observer = signing_identity(&route, &signer_name)?;
+
+            let Some(claim) = anchor::claim_for_project(&route, &master)? else {
+                println!("{master} has claimed no account that owns this project's repository");
+                return Ok(());
+            };
+            let dotenv = gitanchor::read_dotenv(&route.workspace);
+
+            // The anchor question first, because it needs no credential and anyone can
+            // corroborate it.
+            let mut verdict = None;
+            match gitanchor::fetch_account(&claim.login).await? {
+                Ok(facts) => verdict = Some(anchor::judge_account(&claim, &facts)),
+                Err(gitanchor::NotChecked(why)) => println!("not checked: {why}"),
+            }
+
+            // Then ownership, which is the one an acquisition actually trips.
+            if let Some((owner, name)) = gitanchor::remote_repository(&route.git_remote) {
+                let token = gitanchor::token_for(&claim.login, &dotenv);
+                match gitanchor::fetch_repository(&owner, &name, token.as_deref()).await? {
+                    Ok(facts) => {
+                        let owned = anchor::judge_repository(&claim, &facts);
+                        // A contradiction from either question is a contradiction.
+                        if owned.0 == anchor::Outcome::Contradicted || verdict.is_none() {
+                            verdict = Some(owned);
+                        }
+                    }
+                    Err(gitanchor::NotChecked(why)) => println!("not checked: {why}"),
+                }
+            }
+
+            match verdict {
+                Some((outcome, detail)) => {
+                    anchor::record(
+                        &route,
+                        &observer,
+                        &master,
+                        claim.account_id,
+                        outcome,
+                        &detail,
+                    )?;
+                    println!("{outcome:?}: {detail}");
+                }
+                None => println!(
+                    "nothing recorded - being unable to reach github is not evidence about anybody"
+                ),
+            }
+            print_standing(&route, &master)?;
+        }
+        AnchorAction::Status { workspace } => {
+            let route = here(workspace)?;
+            let Some(declaration) = ferryman_channel::master::read_master(&route)? else {
+                println!("this project has no master");
+                return Ok(());
+            };
+            let held = anchor::claims(&route, &declaration.master)?;
+            if held.is_empty() {
+                println!("{} has claimed no git account here", declaration.master);
+            }
+            for claim in &held {
+                println!(
+                    "{} claims {} {} ({})",
+                    declaration.master, claim.provider, claim.login, claim.account_id
+                );
+            }
+            if let Some(claim) = anchor::claim_for_project(&route, &declaration.master)? {
+                println!("this project answers to {}", claim.login);
+            }
+            print_standing(&route, &declaration.master)?;
+        }
+    }
+    Ok(())
+}
+
+/// Keeping anchors current without anybody present.
+///
+/// # What a loop may and may not do here
+///
+/// The loop holds this machine's key, not a person's. A machine key sits in plaintext
+/// because nobody is there at 3am; an operator's is sealed under their password
+/// because they are a person and there IS someone there. `refuse_person_as_machine`
+/// exists because blurring those two once put a whole fleet at a password prompt all
+/// night.
+///
+/// So this does the two things that need no password, and they are most of it:
+///
+/// - **Spreading** copies claims that are already signed into projects that do not yet
+///   have them. No key is involved at all, so a project enabled or synced since the
+///   last pass picks its master's anchor up on its own.
+/// - **Checking** signs an OBSERVATION, and an observation is the machine's own - it
+///   says what this machine saw, under this machine's name, which is exactly what it
+///   is entitled to say.
+///
+/// Making the first claim is the one thing left for a person, because it binds THEIR
+/// key and only their password opens it. The dashboard does that, holding the key they
+/// already unlocked to sign in.
+async fn anchor_maintenance<Config>(
+    served: &[(ferryman_channel::ProjectRoute, Config)],
+    report: &impl ferryman_ops::Progress,
+) {
+    use ferryman_channel::anchor;
+
+    // Spreading first, and it is local and cheap. Whoever's claims are already here go
+    // to every project on this machine that the account owns.
+    if let Some(root) = ferryman_channel::ferry::find_root() {
+        let mut spread_for: Vec<String> = Vec::new();
+        for (route, _) in served {
+            if let Ok(Some(declaration)) = ferryman_channel::master::read_master(route)
+                && !spread_for.contains(&declaration.master)
+            {
+                spread_for.push(declaration.master);
+            }
+        }
+        for master in spread_for {
+            let held = anchor::held_by(&root, &master);
+            if held.is_empty() {
+                continue;
+            }
+            for (project, outcome) in anchor::spread(&root, &held) {
+                if outcome == anchor::Spread::Published {
+                    report.info(&format!("{project}: picked up {master}'s git anchor"));
+                }
+            }
+        }
+    }
+
+    for (route, _) in served {
+        let Ok(Some(declaration)) = ferryman_channel::master::read_master(route) else {
+            continue;
+        };
+        let Ok(Some(claim)) = anchor::claim_for_project(route, &declaration.master) else {
+            continue;
+        };
+        let Ok(observer_name) = ferryman_ops::identity::resolve(None, &route.attachment) else {
+            continue;
+        };
+        if !due_for_a_check(route, &declaration.master, &observer_name) {
+            continue;
+        }
+        let Ok(Some(observer)) = sign_as(route, &observer_name) else {
+            continue;
+        };
+
+        let mut verdict = None;
+        if let Ok(Ok(facts)) = gitanchor::fetch_account(&claim.login).await {
+            verdict = Some(anchor::judge_account(&claim, &facts));
+        }
+        if let Some((owner, name)) = gitanchor::remote_repository(&route.git_remote) {
+            let dotenv = gitanchor::read_dotenv(&route.workspace);
+            let token = gitanchor::token_for(&claim.login, &dotenv);
+            if let Ok(Ok(facts)) =
+                gitanchor::fetch_repository(&owner, &name, token.as_deref()).await
+            {
+                let owned = anchor::judge_repository(&claim, &facts);
+                if owned.0 == anchor::Outcome::Contradicted || verdict.is_none() {
+                    verdict = Some(owned);
+                }
+            }
+        }
+
+        // No verdict means the provider could not be reached, and that is not evidence
+        // about anybody. Nothing is written and nothing is said: a fleet that is offline
+        // would otherwise log this on every pass forever.
+        let Some((outcome, detail)) = verdict else {
+            continue;
+        };
+        if anchor::record(
+            route,
+            &observer,
+            &declaration.master,
+            claim.account_id,
+            outcome,
+            &detail,
+        )
+        .is_ok()
+            && outcome == anchor::Outcome::Contradicted
+        {
+            report.warn(&format!(
+                "{}: {}'s git anchor does not verify - {detail}",
+                route.project_id, declaration.master
+            ));
+        }
+    }
+}
+
+/// Whether this machine's last look was long enough ago to look again.
+///
+/// Days, and never the same gap twice. A fixed schedule is a window an attacker can
+/// work around, and a fleet on a fixed schedule hits the provider's rate limit all at
+/// once. The jitter is derived from the machine's own name so two machines do not
+/// drift into step with each other.
+fn due_for_a_check(route: &ferryman_channel::ProjectRoute, master: &str, observer: &str) -> bool {
+    use ferryman_channel::anchor;
+    let Ok(seen) = anchor::observations(route, master) else {
+        return true;
+    };
+    let Some(mine) = seen.iter().rfind(|observation| {
+        observation
+            .signed_by
+            .as_deref()
+            .is_some_and(|who| who.eq_ignore_ascii_case(observer))
+    }) else {
+        return true;
+    };
+    // 3 to 11 days, spread by name so a fleet does not stampede.
+    let spread = i64::from(
+        observer
+            .bytes()
+            .fold(0u32, |sum, byte| sum.wrapping_add(u32::from(byte)))
+            % 8,
+    );
+    chrono::Utc::now() - mine.observed_at >= chrono::Duration::days(3 + spread)
+}
+
+/// Spread claims across every project in this machine's ferry root, and say what
+/// happened to each. Quiet about the ordinary cases; a project that could not verify
+/// the claim is the one worth naming.
+fn spread_claims(held: &[ferryman_channel::anchor::GitAnchor]) {
+    use ferryman_channel::anchor::Spread;
+    let Some(root) = ferryman_channel::ferry::find_root() else {
+        return;
+    };
+    let mut published = 0;
+    let mut already = 0;
+    for (project, outcome) in ferryman_channel::anchor::spread(&root, held) {
+        match outcome {
+            Spread::Published => {
+                published += 1;
+                println!("  {project}: claim published");
+            }
+            Spread::AlreadyThere => already += 1,
+            Spread::NotVerifiable => println!(
+                "  {project}: owned by a claimed account, but this identity is not on its \
+                 roster - register there first and run `ferry team anchor sync`"
+            ),
+            // Somebody else's repository, or a project with nothing to write to.
+            // Neither is a problem and neither is worth a line.
+            Spread::NotOurs { .. } | Spread::NoProject => {}
+        }
+    }
+    if published == 0 && already > 0 {
+        println!("  every project that this account owns already had it");
+    }
+}
+
+fn print_standing(route: &ferryman_channel::ProjectRoute, master: &str) -> Result<()> {
+    use ferryman_channel::anchor::Standing;
+    match ferryman_channel::anchor::standing(route, master)? {
+        Standing::NotChecked => {
+            println!("standing    not checked (which means nothing either way)")
+        }
+        Standing::Verified => println!("standing    verified"),
+        Standing::Contradicted { since } => println!(
+            "standing    contradicted since {} - pauses in {} hours if it keeps disagreeing",
+            since.format("%Y-%m-%d %H:%M UTC"),
+            (chrono::Duration::hours(ferryman_channel::anchor::PAUSE_AFTER_HOURS)
+                - (chrono::Utc::now() - since))
+                .num_hours()
+                .max(0)
+        ),
+        Standing::Paused { since } => {
+            println!("standing    PAUSED since {}", since.format("%Y-%m-%d"));
+            println!("            {master} grants nothing new and issues no new orders here.");
+            println!("            Work already in flight finishes; everyone else is unaffected.");
+            println!("            Re-publish the key to the account, or transfer the role.");
         }
     }
     Ok(())
@@ -4508,10 +5229,21 @@ async fn agent_command(command: Agent) -> Result<()> {
                                     route.project_id, accept.operator
                                 ));
                             }
+                            // The loop holds this machine's agent key, not a person's,
+                            // so it can say the machine arrived but not claim it.
+                            for (invite, accept) in settled.ready_to_attest {
+                                let owner = invite.owner.as_deref().unwrap_or("its owner");
+                                report.info(&format!(
+                                    "{}: {} has joined and is waiting for {owner} to claim it (ferry team pending --as {owner})",
+                                    route.project_id, accept.operator
+                                ));
+                            }
                         }
                         Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
                     }
                 }
+
+                anchor_maintenance(&fleet.served, &report).await;
 
                 for (route, config) in &mut fleet.served {
                     match agent::work_once(route, config, &report).await {
@@ -4827,6 +5559,13 @@ fn loadmem(
     if let Some(path) = &log {
         println!("log       {}", path.display());
     }
+    // Who is in charge is the first thing an agent coming back needs, before any memory.
+    if let Some(route) = route.as_ref() {
+        println!(
+            "head      {}",
+            head_line(&route.communications, &route.project_id)
+        );
+    }
     println!();
 
     let mut printed = false;
@@ -5039,8 +5778,45 @@ fn signing_identity(
     route: &ferryman_channel::ProjectRoute,
     name: &str,
 ) -> anyhow::Result<ferryman_channel::AgentIdentity> {
-    if let Some(identity) = ferryman_channel::AgentIdentity::load_existing(name, &route.attachment)?
-    {
+    signing_identity_in(&route.attachment, name)
+}
+
+/// A person's identity, unlocked once by them for a long-running process that relays what
+/// they say - the Telegram bridge. Held in memory for the life of the process and never
+/// written: it is not seated as a key file the way a machine's key is.
+static HELD_OPERATOR: std::sync::OnceLock<ferryman_channel::AgentIdentity> =
+    std::sync::OnceLock::new();
+
+/// The person this process holds, if any.
+pub(crate) fn held_operator() -> Option<ferryman_channel::AgentIdentity> {
+    HELD_OPERATOR
+        .get()
+        .map(|held| ferryman_channel::AgentIdentity::from_seed(held.name(), held.seed_bytes()))
+}
+
+/// Unlock `name` once, if it is a person on this machine, and hold it for this process.
+///
+/// Returns whether it was a person. A machine's name is left to its key file, as before.
+/// The password is asked for here, at start, with the person at the terminal - or read
+/// from FERRYMAN_OPERATOR_PASSWORD - and not again.
+pub(crate) fn hold_operator(attachment: &std::path::Path, name: &str) -> anyhow::Result<bool> {
+    let operators = ferryman_server::operators::OperatorStore::new(attachment);
+    if !operators.exists(name) {
+        return Ok(false);
+    }
+    let identity = operators.login(name, &operator_password(name)?)?;
+    let _ = HELD_OPERATOR.set(identity);
+    Ok(true)
+}
+
+fn signing_identity_in(
+    attachment: &std::path::Path,
+    name: &str,
+) -> anyhow::Result<ferryman_channel::AgentIdentity> {
+    if let Some(held) = held_operator().filter(|held| held.name().eq_ignore_ascii_case(name)) {
+        return Ok(held);
+    }
+    if let Some(identity) = ferryman_channel::AgentIdentity::load_existing(name, attachment)? {
         return Ok(identity);
     }
     // A human operator is not a machine, and their key is not stored like one.
@@ -5058,7 +5834,7 @@ fn signing_identity(
     // reader sees `Unsigned` - but it is a message claiming to be from a person, carrying
     // no proof, and saying nothing about it. This project's own rule is that a refusal is
     // a message. Silently downgrading is a fourth option nobody chose.
-    let operators = ferryman_server::operators::OperatorStore::new(&route.attachment);
+    let operators = ferryman_server::operators::OperatorStore::new(attachment);
     if operators.exists(name) {
         let password = operator_password(name)?;
         return operators.login(name, &password);
@@ -6096,6 +6872,10 @@ fn channel(command: Channel) -> Result<()> {
                 } else {
                     route.git_remote.clone()
                 }
+            );
+            println!(
+                "head agent     {}",
+                head_line(&route.communications, &route.project_id)
             );
             println!("messages       {}", messages.len());
             println!("outbox         {outbox} waiting, {acknowledgements} acknowledgements");
@@ -7146,6 +7926,44 @@ fn channel(command: Channel) -> Result<()> {
                 }
             }
         }
+        Channel::Head {
+            workspace,
+            agent,
+            action,
+        } => {
+            let route = here(workspace)?;
+            match action {
+                None => println!(
+                    "head agent  {}",
+                    head_line(&route.communications, &route.project_id)
+                ),
+                Some(HeadAction::Claim { order }) => {
+                    let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    let identity = signing_identity(&route, &agent)?;
+                    let head = ferryman_channel::head::claim(
+                        &route.communications,
+                        &route.project_id,
+                        &identity,
+                        order.as_deref(),
+                    )?;
+                    println!("{} is head agent of {}", head.agent, route.project_id);
+                    println!(
+                        "  on {}'s word: \"{}\"",
+                        head.order.by().unwrap_or("the master"),
+                        head.order.words()
+                    );
+                    println!("  Every machine syncing the channel sees it.");
+                }
+                Some(HeadAction::StepDown) => {
+                    let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+                    if ferryman_channel::head::step_down(&route.communications, &agent)? {
+                        println!("{agent} is no longer head agent of {}", route.project_id);
+                    } else {
+                        println!("{agent} was not head agent of {}", route.project_id);
+                    }
+                }
+            }
+        }
         Channel::Master { workspace, action } => {
             let route = here(workspace)?;
             match action {
@@ -7929,7 +8747,7 @@ fn root_command(command: RootCommand) -> Result<()> {
             }
         }
 
-        RootCommand::Show => {
+        RootCommand::Show { all } => {
             let Some(root) = ferry::find_root() else {
                 println!("no ferry root yet.");
                 println!();
@@ -7937,9 +8755,17 @@ fn root_command(command: RootCommand) -> Result<()> {
                 return Ok(());
             };
             println!("{}", root.path.display());
-            let projects = root.projects();
+            let archived = root.archived();
+            let mut projects = root.projects();
+            if all {
+                projects.extend(archived.iter().cloned());
+                projects.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+            }
             if projects.is_empty() {
                 println!("  nothing filed yet.  ferry root adopt <path>");
+                if !archived.is_empty() {
+                    println!("  {} archived.  ferry root show --all", archived.len());
+                }
                 return Ok(());
             }
             let width = projects
@@ -7948,7 +8774,16 @@ fn root_command(command: RootCommand) -> Result<()> {
                 .max()
                 .unwrap_or(0);
             for entry in projects {
-                println!("  {:width$}  {}", entry.project_id, entry.channel.display());
+                let mark = if entry.is_archived() {
+                    "  [archived]"
+                } else {
+                    ""
+                };
+                println!(
+                    "  {:width$}  {}{mark}",
+                    entry.project_id,
+                    entry.channel.display()
+                );
                 match entry.repo {
                     // Said out loud, because it is the promise this layout makes: an
                     // adopted repository was never moved and never will be.
@@ -7962,6 +8797,15 @@ fn root_command(command: RootCommand) -> Result<()> {
                     Some(repo) => println!("  {:width$}  {}", "", repo.display()),
                     None => println!("  {:width$}  channel only on this machine", ""),
                 }
+            }
+            // Named, not hidden. A listing that silently omits things is how this index
+            // got into trouble in the first place.
+            if !all && !archived.is_empty() {
+                println!();
+                println!(
+                    "  {} archived and not shown.  ferry root show --all",
+                    archived.len()
+                );
             }
         }
 
@@ -8004,6 +8848,262 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                 }
                 None => println!("  repo     none on this machine - channel only"),
+            }
+            // Filing does not un-archive, so say so rather than leave someone waiting for
+            // a project that will not reappear.
+            if root
+                .archived()
+                .iter()
+                .any(|entry| entry.project_id == route.project_id)
+            {
+                println!(
+                    "  note     {} is archived, so it stays out of `ferry root show`.\n\
+                     \x20          bring it back with:  ferry root archive {} --restore",
+                    route.project_id, route.project_id
+                );
+            }
+        }
+
+        RootCommand::Archive { project, restore } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let filed = root
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project)
+                .with_context(|| {
+                    format!(
+                        "no project '{project}' in {}",
+                        root.manifest_path().display()
+                    )
+                })?;
+            if !filed.channel.is_dir() {
+                bail!(
+                    "{project}'s channel is not on this machine ({}) - archive it from one that has it",
+                    filed.channel.display()
+                );
+            }
+            let Some(master) = ferry::master_of(&filed.channel)? else {
+                bail!(
+                    "{project} has no master, and only a project's master can archive it.\n\
+                     \n\
+                     Claim every project that has none:  ferry root master"
+                );
+            };
+            // A machine master's key sits beside the repository; a person's is sealed in
+            // the operator store. A channel-only project has no repository here, so the
+            // ferry root stands in - it is local and never synced.
+            let attachment = filed
+                .repo
+                .as_ref()
+                .map(|repo| repo.join(".ferryman"))
+                .filter(|attachment| attachment.is_dir())
+                .unwrap_or_else(|| root.path.clone());
+            let identity = signing_identity_in(&attachment, &master)?;
+            let changed = root.archive(&project, !restore, &identity)?;
+            let entry = root
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project);
+            match (restore, changed) {
+                (false, true) => {
+                    println!("archived {project}");
+                    if let Some(entry) = &entry {
+                        println!(
+                            "  channel  {}  (kept, and still synced)",
+                            entry.channel.display()
+                        );
+                    }
+                    println!("  Nothing moved and nothing was unshared. It is out of");
+                    println!("  `ferry root show` and out of the anchor spread, on every machine");
+                    println!("  that syncs the channel - the mark travels with it, signed by");
+                    println!("  {master}, the master, so no other peer can fake it.");
+                    println!("  Back with:  ferry root archive {project} --restore");
+                }
+                (false, false) => println!("{project} was already archived"),
+                (true, true) => {
+                    println!("restored {project}");
+                    if let Some(entry) = &entry {
+                        println!("  channel  {}", entry.channel.display());
+                    }
+                }
+                (true, false) => println!("{project} was not archived"),
+            }
+        }
+
+        RootCommand::Master { name, dry_run } => {
+            use ferryman_channel::master::Claim;
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let name = match name {
+                Some(name) => name,
+                None => {
+                    let names =
+                        ferryman_server::operators::OperatorStore::new(&root.path).names()?;
+                    match names.as_slice() {
+                        [one] => one.clone(),
+                        [] => bail!(
+                            "no person identity on this machine to make master.\n\
+                             \n\
+                             Make one:  ferry operator create --name <you>\n\
+                             Or carry yours here:  ferry operator import"
+                        ),
+                        many => bail!(
+                            "more than one person can sign here ({}) - say which with --name",
+                            many.join(", ")
+                        ),
+                    }
+                }
+            };
+            let projects: Vec<_> = root
+                .read()
+                .projects
+                .into_iter()
+                .filter(|entry| entry.channel.is_dir())
+                .collect();
+            let width = projects
+                .iter()
+                .map(|entry| entry.project_id.chars().count())
+                .max()
+                .unwrap_or(0);
+            // One password, before the loop, for every channel.
+            let identity = if dry_run {
+                None
+            } else {
+                Some(signing_identity_in(&root.path, &name)?)
+            };
+            let (mut declared, mut already, mut left) = (0, 0, 0);
+            for entry in &projects {
+                let id = &entry.project_id;
+                let said = match &identity {
+                    None => match ferry::master_of(&entry.channel) {
+                        Ok(Some(master)) if master.eq_ignore_ascii_case(&name) => {
+                            already += 1;
+                            format!("already {master}")
+                        }
+                        Ok(Some(master)) => {
+                            left += 1;
+                            format!("master is {master} - left alone")
+                        }
+                        Ok(None) => {
+                            declared += 1;
+                            format!("would declare {name}")
+                        }
+                        Err(error) => {
+                            left += 1;
+                            format!("left alone: {error:#}")
+                        }
+                    },
+                    Some(identity) => {
+                        // Where this project keeps machine-local state; a channel-only
+                        // project uses the directory its channel sits in, as the roster's
+                        // pins already do.
+                        let attachment = entry
+                            .repo
+                            .as_ref()
+                            .map(|repo| repo.join(".ferryman"))
+                            .filter(|attachment| attachment.is_dir())
+                            .or_else(|| entry.channel.parent().map(std::path::Path::to_path_buf))
+                            .unwrap_or_else(|| root.path.clone());
+                        match ferryman_channel::master::claim_if_masterless(
+                            &entry.channel,
+                            id,
+                            &attachment,
+                            identity,
+                        ) {
+                            Ok(Claim::Declared) => {
+                                declared += 1;
+                                format!("{name} is now master")
+                            }
+                            Ok(Claim::AlreadyTheirs) => {
+                                already += 1;
+                                format!("already {name}")
+                            }
+                            Ok(Claim::Other(master)) => {
+                                left += 1;
+                                format!("master is {master} - left alone")
+                            }
+                            Ok(Claim::KeyConflict) => {
+                                left += 1;
+                                format!("this channel knows {name} by a different key - left alone")
+                            }
+                            Err(error) => {
+                                left += 1;
+                                format!("failed: {error:#}")
+                            }
+                        }
+                    }
+                };
+                println!("  {id:width$}  {said}");
+            }
+            println!();
+            if dry_run {
+                println!(
+                    "{declared} would get {name} as master, {already} already have it, {left} left alone."
+                );
+                println!("Do it:  ferry root master");
+            } else {
+                println!(
+                    "{declared} declared, {already} already {name}'s, {left} left alone. \
+                     Syncthing carries it to every machine."
+                );
+            }
+        }
+
+        RootCommand::Forget {
+            project,
+            gone,
+            dry_run,
+        } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let targets: Vec<String> = match (&project, gone) {
+                (Some(id), _) => vec![id.clone()],
+                (None, true) => root
+                    .unreachable()
+                    .into_iter()
+                    .map(|entry| entry.project_id)
+                    .collect(),
+                (None, false) => bail!(
+                    "name a project, or pass --gone to clear every entry whose channel \
+                     is not on this machine"
+                ),
+            };
+            if targets.is_empty() {
+                println!("nothing to forget: every entry's channel is on this machine");
+                return Ok(());
+            }
+            // Say where it pointed as well as its name. An id alone does not let anyone
+            // tell a dead scratch run from a project they are about to lose track of,
+            // and this is the last moment the manifest can still answer that.
+            let claimed: std::collections::HashMap<String, PathBuf> = root
+                .read()
+                .projects
+                .into_iter()
+                .map(|entry| (entry.project_id, entry.channel))
+                .collect();
+            for id in &targets {
+                let where_it_pointed = claimed.get(id).map_or_else(
+                    || "not in the manifest".to_string(),
+                    |p| p.display().to_string(),
+                );
+                if dry_run {
+                    println!("would forget  {id:<20}  {where_it_pointed}");
+                } else if root.forget(id)? {
+                    println!("forgot        {id:<20}  {where_it_pointed}");
+                } else {
+                    println!("not filed     {id:<20}  nothing to do");
+                }
+            }
+            if dry_run {
+                println!("\n  Nothing changed. Run it without --dry-run to do it.");
+            } else {
+                println!("\n  The manifest only. Channels and repositories are where they were.");
             }
         }
     }

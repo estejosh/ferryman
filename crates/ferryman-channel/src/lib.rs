@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod anchor;
 pub mod ask;
 pub mod contract;
 pub mod conversation;
@@ -22,6 +23,7 @@ pub mod encrypt;
 pub mod entitlement;
 pub mod events;
 pub mod ferry;
+pub mod head;
 pub mod interrupt;
 pub mod invite;
 pub mod keys;
@@ -34,7 +36,9 @@ pub mod marvin;
 pub mod master;
 pub mod memory;
 pub mod migration;
+pub mod owner;
 pub mod portable_auth;
+pub mod quantly;
 pub mod release;
 pub mod secrets;
 pub mod seed;
@@ -1149,9 +1153,24 @@ pub(crate) fn write_task_file<T: Serialize>(path: &Path, value: &T) -> Result<()
 }
 
 /// Issue an order into the channel.
+///
+/// New work only. Claiming, working, returning a result and reviewing one are all
+/// untouched by anything below: an order already in flight is finished by whoever
+/// holds it, because stopping a fleet mid-task leaves repositories half-done and
+/// helps nobody.
 pub fn issue_order(route: &ProjectRoute, order: &Order) -> Result<PathBuf> {
     if !is_safe_component(&order.id) {
         bail!("order id must be a path-safe identifier")
+    }
+    // A master whose git anchor has stopped verifying directs no NEW work (ADR 0022).
+    // This is the acquisition case rather than the dramatic one: the repository has
+    // moved, the outgoing master's fleet is still running, and the thing that has to
+    // stop is them pointing it at a codebase that is no longer theirs. Everyone else
+    // carries on under their own grant - a paused master is not a paused project.
+    if let Ok(Some(declaration)) = master::read_master(route)
+        && declaration.master.eq_ignore_ascii_case(&order.issued_by)
+    {
+        anchor::refuse_if_paused(route, &declaration.master, "take new orders from you")?;
     }
     let path = task_dir(route, &order.id).join("order.json");
     if path.exists() {
@@ -3469,7 +3488,54 @@ fn bridge_field(attachment: &Path, key: &str) -> String {
 /// stop the rest of the fleet from talking.
 fn pin_path(attachment: &Path, name: &str) -> PathBuf {
     let name = canonical_agent_name(name);
+    attachment.join("agents-pinned").join(format!("{name}.pub"))
+}
+
+/// What pins were called before the rename. Read, never written.
+///
+/// They were `<name>.key`, which is also what the PRIVATE key store next door calls its
+/// files - `keys/<name>.key`. Two stores, one extension, and both files exactly 64 bytes
+/// on disk, because a hex-encoded 32-byte key is 64 characters whichever half of the pair
+/// it is. One must never leave the machine; the other is a published key that is fine to
+/// read, like a line of `known_hosts`. Nothing but the parent directory's name told them
+/// apart, and a reader who had this source open still called the pins private keys and
+/// raised an alarm about them. A name that misleads a careful reader is a defect in the
+/// name.
+fn legacy_pin_path(attachment: &Path, name: &str) -> PathBuf {
+    let name = canonical_agent_name(name);
     attachment.join("agents-pinned").join(format!("{name}.key"))
+}
+
+/// The key pinned for `name`, carrying a pre-rename pin across to its new name on the way.
+///
+/// The migration is the point. A rename that simply stopped finding the old pins would
+/// make every machine in the fleet re-pin from whatever the channel says at the moment it
+/// next reads - which is trust-on-first-use performed a second time, against a channel an
+/// attacker may already have written to. The whole value of a pin is that the first sight
+/// happened before anyone had a reason to forge. Losing them is worse than never having
+/// pinned, because it looks like nothing happened.
+fn read_pin(attachment: &Path, name: &str) -> Option<String> {
+    let current = pin_path(attachment, name);
+    if let Ok(pinned) = std::fs::read_to_string(&current) {
+        return Some(pinned.trim().to_string());
+    }
+    let pinned = std::fs::read_to_string(legacy_pin_path(attachment, name)).ok()?;
+    let pinned = pinned.trim().to_string();
+    write_pin(attachment, name, &pinned);
+    Some(pinned)
+}
+
+/// Pin `key` for `name`. Best-effort: a read-only attachment must not break the roster.
+///
+/// The legacy file is left where it is. Removing it would be tidier and is not worth the
+/// risk: this store is the thing that notices a forged key, and a migration that deletes
+/// evidence to save a few bytes has its priorities the wrong way round.
+fn write_pin(attachment: &Path, name: &str, key: &str) {
+    let path = pin_path(attachment, name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, key);
 }
 
 /// Collapse capitalisation variants of one agent into the single entry that agent is.
@@ -3535,38 +3601,26 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
         let Some(key) = agent.public_key.as_ref().filter(|k| !k.is_empty()) else {
             continue;
         };
-        let pin = pin_path(attachment, &agent.name);
-        match std::fs::read_to_string(&pin) {
-            Ok(pinned) if pinned.trim() != key.as_str() => {
-                agent.public_key = Some(pinned.trim().to_string());
+        match read_pin(attachment, &agent.name) {
+            Some(pinned) if pinned != key.as_str() => {
+                agent.public_key = Some(pinned);
             }
-            Ok(_) => {}
-            Err(_) => {
-                // First sight: pin it. Best-effort; a read-only attachment must
-                // not break the roster.
-                if let Some(parent) = pin.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                let _ = std::fs::write(&pin, key);
-            }
+            Some(_) => {}
+            // First sight: pin it.
+            None => write_pin(attachment, &agent.name, key),
         }
         // The same pinning applies to the encryption key, for the same reason:
         // a peer overwriting an agent's X25519 key would otherwise redirect the
         // next secret sealed to that agent. Trust-on-first-use, and only when a
         // key is actually present.
         if let Some(enc) = agent.encryption_key.as_ref().filter(|k| !k.is_empty()) {
-            let enc_pin = pin_path(attachment, &format!("{}.enc", agent.name));
-            match std::fs::read_to_string(&enc_pin) {
-                Ok(pinned) if pinned.trim() != enc.as_str() => {
-                    agent.encryption_key = Some(pinned.trim().to_string());
+            let enc_name = format!("{}.enc", agent.name);
+            match read_pin(attachment, &enc_name) {
+                Some(pinned) if pinned != enc.as_str() => {
+                    agent.encryption_key = Some(pinned);
                 }
-                Ok(_) => {}
-                Err(_) => {
-                    if let Some(parent) = enc_pin.parent() {
-                        let _ = std::fs::create_dir_all(parent);
-                    }
-                    let _ = std::fs::write(&enc_pin, enc);
-                }
+                Some(_) => {}
+                None => write_pin(attachment, &enc_name, enc),
             }
         }
     }
@@ -3786,13 +3840,25 @@ pub fn scrub_child_environment_names() -> Vec<String> {
 /// makes it reviewable, which a closure inside a loop was not.
 fn looks_like_a_secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    if !SECRET_NAME_HINTS.iter().any(|hint| upper.contains(hint)) {
+    // `PAT` is what GitHub itself calls a personal access token, so it is one of the
+    // commonest names a real machine gives one - and it matched none of the hints. Found
+    // on this repository's own box: a read-all GitHub PAT named `...readallPAT` sat in
+    // `.env` and would have reached the environment of every task any agent ran.
+    //
+    // It is a suffix rule and not a substring one on purpose. `PATH` contains `PAT`, and
+    // scrubbing `PATH` from a child environment would break every task there is, which is
+    // the kind of over-scrub that gets the whole mechanism turned off.
+    let named_pat = upper.ends_with("PAT") || upper.contains("_PAT_");
+    if !named_pat && !SECRET_NAME_HINTS.iter().any(|hint| upper.contains(hint)) {
         return false;
     }
     // The `GIT_` exemption exists so git's own configuration survives - `GIT_DIR`,
     // `GIT_TERMINAL_PROMPT` and friends, none of which look like secrets. It must not
     // become a way to smuggle one through: `GIT_TOKEN` was exempt purely for its prefix.
-    let git_configuration = upper.starts_with("GIT_")
+    // `!named_pat` first, or the prefix exemption would wave `GIT_PAT` straight through -
+    // the same hole `GIT_TOKEN` was already found in, wearing the other spelling.
+    let git_configuration = !named_pat
+        && upper.starts_with("GIT_")
         && !["TOKEN", "SECRET", "PASSWORD", "PASSPHRASE", "CREDENTIAL"]
             .iter()
             .any(|hint| upper.contains(hint));
@@ -3802,6 +3868,34 @@ fn looks_like_a_secret_name(name: &str) -> bool {
 #[cfg(test)]
 mod child_environment_scrub {
     use super::looks_like_a_secret_name as secret;
+
+    /// `PAT` is GitHub's own word for a personal access token, and the hint list missed
+    /// every spelling of it. Found live: a read-all PAT in this repository's `.env`,
+    /// named so that nothing here would have stopped it reaching a child process. The
+    /// same failure as the one below, three years of habit later.
+    #[test]
+    fn a_name_saying_pat_is_a_secret_too() {
+        assert!(secret("GITHUB_PAT"));
+        assert!(secret("ferrymanestejoshreadallPAT"));
+        assert!(secret("MY_PAT"));
+        assert!(secret("PAT"));
+        assert!(secret("SOME_PAT_HERE"));
+        // The prefix exemption must not wave this through the way it once did GIT_TOKEN.
+        assert!(secret("GIT_PAT"));
+    }
+
+    /// The reason this is a suffix rule and not a substring one. Scrubbing `PATH` from a
+    /// child environment breaks every task there is, and an over-scrub that breaks
+    /// everything is how the whole mechanism ends up switched off.
+    #[test]
+    fn path_is_not_a_secret_and_never_becomes_one() {
+        assert!(!secret("PATH"));
+        assert!(!secret("GOPATH"));
+        assert!(!secret("PYTHONPATH"));
+        assert!(!secret("LD_LIBRARY_PATH"));
+        assert!(!secret("PATTERN"));
+        assert!(!secret("COMPATIBILITY_MODE"));
+    }
 
     /// The names a real machine actually uses.
     ///
@@ -8562,6 +8656,90 @@ mod identity_tests {
 
     use super::*;
     use serde_json::json;
+
+    fn published(dir: &Path, name: &str, key: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.json")),
+            serde_json::to_vec(&json!({
+                "name": name,
+                "role": "worker",
+                "capabilities": [],
+                "public_key": key,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// A pin written before the rename still decides, and moves to its new name.
+    ///
+    /// The failure this guards against is the silent one. A rename that simply stopped
+    /// finding the old pins would re-run trust-on-first-use against whatever the channel
+    /// says at that moment - which is the one moment the pin exists to distrust.
+    #[test]
+    fn a_pin_written_under_the_old_name_is_carried_across_and_still_wins() {
+        hermetic_machine();
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join(".ferryman");
+        let communications = attachment.join("ferryman");
+        let real = AgentIdentity::from_seed("fang", [7u8; 32]);
+        let impostor = AgentIdentity::from_seed("mallory", [9u8; 32]);
+
+        // What this machine saw first, under the name pins used to have.
+        std::fs::create_dir_all(attachment.join("agents-pinned")).unwrap();
+        std::fs::write(
+            attachment.join("agents-pinned").join("fang.key"),
+            real.public_key_hex(),
+        )
+        .unwrap();
+        // What the shared folder says now: the impostor's key under fang's name.
+        published(
+            &communications.join("agents"),
+            "fang",
+            &impostor.public_key_hex(),
+        );
+
+        let roster = read_agent_roster(&communications).unwrap();
+        let fang = roster.iter().find(|a| a.name == "fang").unwrap();
+        assert_eq!(
+            fang.public_key.as_deref(),
+            Some(real.public_key_hex().as_str()),
+            "the legacy pin must still override a forged roster entry"
+        );
+
+        // It now lives under the new name, so the next read needs no migration.
+        let carried =
+            std::fs::read_to_string(attachment.join("agents-pinned").join("fang.pub")).unwrap();
+        assert_eq!(carried.trim(), real.public_key_hex());
+        // The old file is left where it is rather than deleted.
+        assert!(attachment.join("agents-pinned").join("fang.key").is_file());
+    }
+
+    /// A machine that has never seen this agent pins under the new name only.
+    #[test]
+    fn a_first_sighting_pins_under_the_new_name() {
+        hermetic_machine();
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join(".ferryman");
+        let communications = attachment.join("ferryman");
+        let wisp = AgentIdentity::from_seed("wisp", [3u8; 32]);
+        published(
+            &communications.join("agents"),
+            "wisp",
+            &wisp.public_key_hex(),
+        );
+
+        read_agent_roster(&communications).unwrap();
+
+        let pinned =
+            std::fs::read_to_string(attachment.join("agents-pinned").join("wisp.pub")).unwrap();
+        assert_eq!(pinned.trim(), wisp.public_key_hex());
+        assert!(
+            !attachment.join("agents-pinned").join("wisp.key").is_file(),
+            "nothing new goes under the name that collides with the private key store"
+        );
+    }
 
     fn message(text: &str) -> Message {
         Message::new(
