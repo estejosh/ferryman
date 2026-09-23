@@ -8,6 +8,12 @@ the machine it is on - so a project archived on beastly was still live on grouch
 everywhere else. Every machine has to run 0.5.13 to honour a fleet-wide archive, which
 is why this is a version and not a quiet patch.
 
+### License
+
+- **Ferryman is now under the Usufruct License (UFL) 2.1, Seat-Limited.** It was adopted on
+  `main` as UFL-2.0 and updated to 2.1 (Section 2B, the license-text reproduction
+  carve-out). See `LICENSE`.
+
 ### Changed
 
 - **An archive is now a signed `ARCHIVED` file in the channel, not a line in the local

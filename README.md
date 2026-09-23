@@ -6,7 +6,7 @@
 [![CI](https://github.com/estejosh/ferryman/actions/workflows/ci.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/ci.yml)
 [![container](https://github.com/estejosh/ferryman/actions/workflows/container.yml/badge.svg)](https://github.com/estejosh/ferryman/actions/workflows/container.yml)
 [![ghcr.io](https://img.shields.io/badge/ghcr.io-estejosh%2Fferryman-2496ED?logo=podman&logoColor=white)](https://github.com/estejosh/ferryman/pkgs/container/ferryman)
-[![license](https://img.shields.io/badge/license-source--available-blue)](LICENSE)
+[![license](https://img.shields.io/badge/license-UFL--S--1a-blue)](LICENSE)
 [![free tier](https://img.shields.io/badge/free-2%20seats%20%C2%B7%202%20PCs%20%C2%B7%202%20phones%20%C2%B7%20unlimited%20agents-brightgreen)](COMMERCIAL.md)
 
 **Self-hosted, local-first team coordination for a fleet of AI agents.**
@@ -436,21 +436,16 @@ The same is true of `ferry soak`: it sends a report only if you set
 
 ## License
 
-Ferryman is **source-available** under the [Ferryman Source-Available
-License](LICENSE): free for any non-production use, and free in production for
-up to **2 people, on 2 computers and 2 phones/tablets**.
+Ferryman is **source-available** under the [Usufruct License (UFL) v2.1](LICENSE),
+Operational Scope: **Seat-Limited** (tag `UFL-S-1a`): free for any non-production
+use, and free in production for up to **2 people, on 2 computers and 2
+phones/tablets** — production use beyond that threshold requires a paid,
+separate license from the Licensor.
 
 **Agents are unlimited and never counted.** One person running twenty agents
-across two computers is one Seat. Beyond that it is $60 per additional seat per
-year, dropping with volume — priced per human, not per machine or agent. See
-[COMMERCIAL.md](COMMERCIAL.md).
-
-**One obligation, and `ferry enable` discharges it for you.** Section 6 asks any
-project that uses Ferryman to carry a root-level `FERRYMAN.md` saying so. `ferry
-enable` writes that file into your project and tells you it did; if you already
-have one, it leaves yours alone. There is nothing else to remember, and nothing
-to strip: registration is a local file, the check-in endpoint is unset in every
-release, and failing to report is explicitly not enforced.
+across two computers is one Seat. Beyond the free threshold it is $60 per
+additional seat per year, dropping with volume — priced per human, not per
+machine or agent. See [COMMERCIAL.md](COMMERCIAL.md).
 
 Free production use asks for a contact email. **Ferryman never sends anything on
 its own.** There is no timer and no background sender: `ferry license checkin` is
@@ -460,12 +455,9 @@ inside the free tier is computed on your own machine — run `ferry license stat
 and it counts your seats, computers and phones locally and lists what it counted.
 See [What Ferryman sends](#what-ferryman-sends) for the whole payload.
 
-**You may fork it and take the reporting out.** Section 5 asks a redistributor not
-to weaken the Seat, Computer and Mobile Device limits — the commercial terms — and
-nothing more. It does not oblige anyone to keep reporting behaviour, and there is
-none to keep: a release ships with no endpoint. If you were reading §5 as "you may
-not fork out the phone-home", that is not what it means, and the wording was
-changed to stop it reading that way.
+UFL is not on the SPDX license list; cite it as `LicenseRef-UFL-2.1-S`. See the
+canonical license text and generator at
+[estejosh/UFL-Usufruct-License](https://github.com/estejosh/UFL-Usufruct-License).
 
 ## Contributing
 

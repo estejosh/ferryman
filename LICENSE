@@ -1,161 +1,123 @@
-Ferryman Source-Available License, Version 1.2
+The Usufruct License (UFL) — Version 2.1
+Canonical text, whitepaper, and FAQ: https://github.com/estejosh/UFL-Usufruct-License
 
-Licensor: estejosh ("Licensor")
-Licensed Work: Ferryman (the "Software"), including all versions, components,
-and source code contained in this repository.
+Copyright (c) 2026 Joshua D. Hale
 
-SUMMARY (non-binding): Ferryman is free for any non-production use. It is free in
-production for up to two (2) Seats, on up to two (2) Computers and up to two (2)
-Mobile Devices. You may run as many Agents as you like on each Computer at no
-charge; Agents are never Seats. Free production use requires registering a
-contact email address. Using it in production beyond those limits requires a
-paid, per-Seat commercial license from the Licensor. The full, binding terms are
-below.
+Operational Scope: Seat-Limited — 2 seats, 2 computers, 2 mobile devices free in production
 
-CHANGES FROM VERSION 1.1: the "four (4) Devices" allowance is replaced with the
-more precise "two (2) Computers and two (2) Mobile Devices"; "Agent" is defined
-and confirmed to be unlimited per Computer; and free production use now requires
-registering a contact email address (Section 3). Anyone who obtained the Software
-under Version 1.0 or 1.1 may continue to rely on that version for that copy; this
-version applies to copies obtained under it.
+## 1. Grant of Use
 
-This license is derived from the Business Source License 1.1, modified to be a
-PERMANENT source-available license. Unlike the Business Source License, it has no
-Change Date and does NOT automatically convert to an open-source license. It is
-NOT an Open Source Initiative (OSI) approved "open source" license; it is a
-source-available license.
+Subject to the terms below and the Operational Scope declared above,
+the Licensor grants anyone the free, perpetual, worldwide right to use
+the Software — in source or compiled form, at any scale — without
+payment or a separate license beyond what Section 1A requires. This
+includes running the Software, deploying it, integrating with it
+through its published interfaces, and operating a product or service
+built on top of it, as scoped by Section 1A.
 
-DEFINITIONS
+## 1A. Operational Scope
 
-"Seat" means each distinct human individual who operates, administers, deploys,
-or accesses the Software or its outputs on behalf of you or your organization.
-Seats count people, not machines and not software.
+The Operational Scope declared above states the only limit, if any, on
+Section 1's grant. Exactly one scope applies to this Software:
 
-"Agent" means any automated process, worker, model, or script that acts through
-the Software without a human deciding each action. Agents are NOT Seats and are
-NOT Devices, and there is no limit on the number of Agents you may run on a
-Computer. One person running twenty Agents across two Computers is two Computers
-and one Seat. Every Agent is attributed to the Seat of the human individual on
-whose behalf it acts.
+Seat-Limited — Section 1's grant is unconditional for non-production
+use. Production use is free up to 2 seats, 2 computers, 2 mobile devices; production use beyond
+that threshold requires a paid, separate written license from the
+Licensor.
 
-"Computer" means each distinct physical or virtual machine, including servers,
-desktops, laptops, containers, and virtual machines, on which the Software or any
-component of it is installed or run on your behalf. Each distinct virtual machine
-or long-lived container counts separately, even where several run on one physical
-host. A machine that only stores a synchronized channel directory, without running
-the Software, is not a Computer.
+## 2. Reserved Rights
 
-"Mobile Device" means each distinct phone or tablet used to review, approve,
-decline, or monitor work through the Software, including through a messaging
-integration, and which does not itself run the Software or any Agent. A phone or
-tablet that runs the Software or an Agent is a Computer, not a Mobile Device.
+The following rights are reserved to the Licensor and are NOT granted by
+Section 1. They require a separate written license from the Licensor,
+except as Section 2A permits:
 
-"Device" means a Computer or a Mobile Device.
+  (a) Distributing the Software, or any modified version, fork, or
+      substantially similar reimplementation of it, to any third party,
+      in source or compiled form.
+  (b) Incorporating the Software's source code into another product or
+      service that is distributed, sold, or otherwise made available to
+      third parties.
+  (c) Using the Licensor's name, marks, or claims of compatibility
+      ("Ferryman-compatible," "built on Ferryman," etc.) in
+      connection with a distributed derivative.
 
-"Production use" means any use other than for personal experimentation,
-evaluation, development, or testing.
+## 2A. Forks of Decentralized or Network Software
 
-1. GRANT OF RIGHTS
-Subject to the terms below, the Licensor grants you a non-exclusive, worldwide,
-royalty-free right to copy, modify, create derivative works of, and redistribute
-the Software, and to make non-production use of the Software without limit.
+If the Software is designed to run as a node, client, or peer in a
+decentralized network, blockchain, or similar peer-to-peer protocol,
+Section 2(a) does not require a separate license for distributing a
+modified version, fork, or independent reimplementation of it —
+including to operate a competing network — provided the distributed
+work:
 
-2. FREE PRODUCTION USE
-You may use the Software in production free of charge provided that all three of
-the following are true at the same time:
+  (i) prominently and accurately credits Ferryman as the origin
+      of the Software or protocol, in its README, whitepaper, or
+      equivalent primary documentation; and
+  (ii) keeps the canonical-source notice required by Section 7 intact.
 
-    (a) your total number of Seats does not exceed two (2);
-    (b) your total number of Computers does not exceed two (2); and
-    (c) your total number of Mobile Devices does not exceed two (2).
+Distributing a fork that removes, obscures, or falsifies this
+attribution is not permitted under this exception and still requires a
+separate license under Section 2(a). This section does not affect
+Sections 2(b) or 2(c): incorporating the Software into another
+distributed product, and using the Licensor's name or marks to claim
+compatibility, still require a separate license regardless of
+attribution.
 
-Each limit applies independently, and exceeding any one of them ends the free
-allowance even if the others are not reached. The three limits do not pool: three
-Computers and no Mobile Device exceeds this Section, because limit (b) is
-exceeded.
+## 2B. Reproducing This License Text
 
-There is no limit on the number of Agents.
+The text of this license — this document itself, independent of any
+particular copy's Operational Scope, copyright holder, or project name —
+may be freely copied, reproduced, and adapted by anyone to license their own
+software, including verbatim reproduction in a project's own LICENSE file.
+This permission is not limited by Section 2(a) and applies regardless of
+Operational Scope: licensing your own software under this text is not
+"distributing the Software" of any other project that also uses it, and
+requires no separate permission from any Licensor who has used it. This
+section grants no right to any particular Licensor's Software — only to the
+legal text of this license itself.
 
-3. REGISTRATION FOR FREE PRODUCTION USE
-Free production use under Section 2 is conditioned on registering a working
-contact email address for your deployment, through the mechanism the Software
-provides, and keeping it current. The Software records that address and the count
-of Seats, Computers, and Mobile Devices in your deployment, and may report those
-counts and that address to the Licensor so that the Licensor can identify use
-beyond the free allowance.
+## 3. Why "Usufruct"
 
-The Licensor collects this to administer this license and to contact you about
-licensing. What is collected and what is not is stated in PRIVACY.md, which forms
-part of the terms of this Section. The Software does not read, transmit, or
-inspect your projects, your code, your channel contents, or the work your Agents
-perform.
+In civil law, a usufruct is the right to use property belonging to
+another and enjoy its benefits, without the right to alter its substance
+or transfer ownership to someone else. This license grants exactly that:
+full use, no transfer.
 
-This Section does not apply to non-production use under Section 1.
+## 4. Contributions
 
-4. COMMERCIAL LICENSE REQUIRED ABOVE THOSE LIMITS
-Any production use of the Software that exceeds any limit in Section 2 requires a
-paid commercial license from the Licensor, granted on a per-Seat basis. A
-commercial license places no limit on Computers, Mobile Devices, or Agents. See
-COMMERCIAL.md for how to obtain one.
+Contributions submitted to a Software repository under this license are
+accepted under these same terms and are granted back to the Licensor to
+the extent necessary to keep this license enforceable across the
+combined work.
 
-The Software will not stop working when a limit is exceeded, and will not delete,
-disable, or withhold your data. It states plainly that the deployment is beyond
-the free allowance. That statement is a notice, not a grant: continuing to use the
-Software beyond the limits in Section 2 without a commercial license is a
-violation of this license regardless of whether the Software continues to run.
+## 5. No Warranty
 
-5. REDISTRIBUTION
-You may redistribute the Software or derivative works provided that you (a) retain
-this license text, the copyright notice, and all notices; and (b) do not remove,
-weaken, or circumvent the Seat, Computer, or Mobile Device limits in Section 2.
-Any recipient receives the Software under this same license, with the same rights
-and the same limitations.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+OTHER LIABILITY ARISING FROM THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
 
-This clause is about the commercial limits and nothing else. It does not oblige you
-to keep any reporting behaviour: registration is a local file, a downloaded release
-has no endpoint configured at all, and failure to report is explicitly not enforced.
-A fork that removes reporting entirely removes nothing this clause protects.
+## 6. Note on Classification
 
-6. ATTRIBUTION (NOTICE)
-If you deploy or redistribute the Software (including running it to coordinate or
-orchestrate work, whether or not you redistribute its source), you must include a
-file named FERRYMAN.md in the root of the source repository or distribution of any
-project that uses the Software, stating that the project uses Ferryman and linking
-to the Software's repository and this license. Text substantially as follows
-satisfies this requirement:
+This is a source-available license, not an OSI-approved open source
+license. The Open Source Definition requires unrestricted redistribution
+rights, which Section 2 intentionally withholds regardless of
+Operational Scope. Some Operational Scopes under Section 1A also
+withhold uses the Open Source Definition requires to be unrestricted.
+The source is public; which uses are free depends on the Operational
+Scope declared above.
 
-    This project uses Ferryman (https://github.com/estejosh/ferryman),
-    licensed under the Ferryman Source-Available License.
+## 7. Notice
 
-This requirement does not apply to individual end users who merely interact with
-the outputs of a project that uses the Software; it applies to the party that
-deploys or redistributes the Software. It is separate from, and in addition to,
-the notice-retention requirement in Section 5. `ferry enable` writes this
-FERRYMAN.md into your project for you, and leaves an existing one untouched.
+The canonical-source line at the top of this license text (or an
+equivalent pointer to https://github.com/estejosh/UFL-Usufruct-License)
+must be kept intact when this license text is copied into another
+project. This is a notice requirement on the license text itself, not
+an additional condition on using the Software beyond Section 1A.
 
-7. NO AUTOMATIC CONVERSION
-This license has no Change Date and does not convert to any other license over
-time. The Licensor may, at its sole discretion, choose to release any version of
-the Software under different terms, but no such release is automatic or
-guaranteed by this license.
-
-8. TRADEMARKS
-This license does not grant you any right to use the Licensor's names, logos, or
-trademarks, including the name "Ferryman".
-
-9. TERMINATION
-Any use of the Software in violation of this license automatically terminates your
-rights under it. Rights may be reinstated in writing by the Licensor.
-
-10. DISCLAIMER OF WARRANTY
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
-FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
-
-11. LIMITATION OF LIABILITY
-IN NO EVENT SHALL THE LICENSOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
-OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-Copyright (c) 2026 estejosh. All rights reserved except as expressly granted
-above.
+---
+SPDX identifier: UFL is not on the official SPDX license list. Per SPDX
+convention for licenses outside that list, use `LicenseRef-UFL-2.1-S` —
+not a bare `UFL-2.1-S`, which would misrepresent it as SPDX-registered.
