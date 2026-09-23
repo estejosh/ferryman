@@ -66,6 +66,20 @@ pub fn initialize_master(
     identity: &AgentIdentity,
     master: &str,
 ) -> Result<MasterDeclaration> {
+    declare_master(route, identity, master, true)
+}
+
+/// `initialize_master`, optionally without making the local master folder.
+///
+/// A claim made across a whole ferry root reaches channels that have no repository on
+/// this machine, where the "attachment" is only the directory the channel sits in; making
+/// a `master` folder there left an empty directory among the channels.
+fn declare_master(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    master: &str,
+    make_master_folder: bool,
+) -> Result<MasterDeclaration> {
     if !crate::is_safe_component(master) {
         bail!("master name must be a path-safe identifier");
     }
@@ -97,8 +111,9 @@ pub fn initialize_master(
     declaration.signed_by = Some(identity.name().to_owned());
     declaration.signature = Some(hex::encode(signature.to_bytes()));
 
-    let directory = route.master_dir();
-    fs::create_dir_all(&directory)?;
+    if make_master_folder {
+        fs::create_dir_all(route.master_dir())?;
+    }
     crate::atomic_json(&path, &declaration)?;
     Ok(declaration)
 }
@@ -229,7 +244,7 @@ pub fn claim_if_masterless(
     if known.as_deref() != Some(key.as_str()) {
         return Ok(Claim::KeyConflict);
     }
-    initialize_master(&route, person, person.name())?;
+    declare_master(&route, person, person.name(), false)?;
     Ok(Claim::Declared)
 }
 
@@ -635,6 +650,10 @@ mod tests {
             .expect("declared");
         assert_eq!(declared.master, "josh");
         assert_eq!(declared.project_id, "natv");
+        assert!(
+            !comms.join("master").exists(),
+            "no empty folder left among the channels"
+        );
 
         // Again is a no-op, not a second declaration.
         assert_eq!(

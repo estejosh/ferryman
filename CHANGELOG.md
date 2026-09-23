@@ -56,6 +56,14 @@ is why this is a version and not a quiet patch.
   words are not parsed: anything the master signed that names an agent can back a
   claim, so the page shows the words and gives the master a revoke.
 
+- **The Telegram bridge signs as the person who runs it.** `ferry channel telegram
+  --agent josh` unlocks josh once at start, with the password, and holds the key in
+  memory for as long as the bridge runs - published to every roster, never written as a
+  key file. Before, it could only sign with a machine key, so every order and word
+  from the phone read as the machine's. Each message from the approver is also signed
+  on its own into `said/`, so "grouchly, you're head agent" works from Telegram too.
+  For an unattended start, FERRYMAN_OPERATOR_PASSWORD supplies the password.
+
 ## v0.5.12 - 2026-09-23
 
 Your machines are you, a git account is proof of whose projects these are, and a

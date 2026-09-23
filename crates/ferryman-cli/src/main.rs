@@ -5781,10 +5781,41 @@ fn signing_identity(
     signing_identity_in(&route.attachment, name)
 }
 
+/// A person's identity, unlocked once by them for a long-running process that relays what
+/// they say - the Telegram bridge. Held in memory for the life of the process and never
+/// written: it is not seated as a key file the way a machine's key is.
+static HELD_OPERATOR: std::sync::OnceLock<ferryman_channel::AgentIdentity> =
+    std::sync::OnceLock::new();
+
+/// The person this process holds, if any.
+pub(crate) fn held_operator() -> Option<ferryman_channel::AgentIdentity> {
+    HELD_OPERATOR
+        .get()
+        .map(|held| ferryman_channel::AgentIdentity::from_seed(held.name(), held.seed_bytes()))
+}
+
+/// Unlock `name` once, if it is a person on this machine, and hold it for this process.
+///
+/// Returns whether it was a person. A machine's name is left to its key file, as before.
+/// The password is asked for here, at start, with the person at the terminal - or read
+/// from FERRYMAN_OPERATOR_PASSWORD - and not again.
+pub(crate) fn hold_operator(attachment: &std::path::Path, name: &str) -> anyhow::Result<bool> {
+    let operators = ferryman_server::operators::OperatorStore::new(attachment);
+    if !operators.exists(name) {
+        return Ok(false);
+    }
+    let identity = operators.login(name, &operator_password(name)?)?;
+    let _ = HELD_OPERATOR.set(identity);
+    Ok(true)
+}
+
 fn signing_identity_in(
     attachment: &std::path::Path,
     name: &str,
 ) -> anyhow::Result<ferryman_channel::AgentIdentity> {
+    if let Some(held) = held_operator().filter(|held| held.name().eq_ignore_ascii_case(name)) {
+        return Ok(held);
+    }
     if let Some(identity) = ferryman_channel::AgentIdentity::load_existing(name, attachment)? {
         return Ok(identity);
     }
