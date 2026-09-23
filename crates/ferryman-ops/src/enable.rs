@@ -440,8 +440,8 @@ pub fn perform(request: Request) -> Result<Outcome> {
     let person_here = person_identity_exists();
     if (request.master || implicit_master) && person_here {
         steps.push(Step {
-            what: "master left undeclared: a person on this machine claims it in the \
-                   dashboard (Teammates -> I am the master)",
+            what: "master left undeclared: a person on this machine claims it with \
+                   `ferry root master` (one password, every project)",
             path: route.communications.join("master.json"),
             created: false,
         });

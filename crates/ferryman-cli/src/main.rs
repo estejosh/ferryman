@@ -555,6 +555,22 @@ enum RootCommand {
         #[arg(long)]
         restore: bool,
     },
+    /// Make you the master of every project here that has none: one password, every
+    /// channel.
+    ///
+    /// `enable` never makes a machine the master where a person is present, and cannot
+    /// sign as that person, so on a machine you use it left the role empty. This fills
+    /// every empty one, signed by you, and puts your public key on each channel's roster
+    /// so every machine can check it. A project with a different master is left alone:
+    /// a master is handed over, never taken.
+    Master {
+        /// Who to declare. Defaults to the one person identity on this machine.
+        #[arg(long)]
+        name: Option<String>,
+        /// Show what would change, without asking for a password or writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Record a project here. Nothing is moved: a repository is noted where it stands,
     /// and `repos/` gets a link to it.
     Adopt {
@@ -8743,7 +8759,7 @@ fn root_command(command: RootCommand) -> Result<()> {
                 bail!(
                     "{project} has no master, and only a project's master can archive it.\n\
                      \n\
-                     Name one from its repository:  ferry channel master init"
+                     Claim every project that has none:  ferry root master"
                 );
             };
             // A machine master's key sits beside the repository; a person's is sealed in
@@ -8785,6 +8801,126 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                 }
                 (true, false) => println!("{project} was not archived"),
+            }
+        }
+
+        RootCommand::Master { name, dry_run } => {
+            use ferryman_channel::master::Claim;
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let name = match name {
+                Some(name) => name,
+                None => {
+                    let names =
+                        ferryman_server::operators::OperatorStore::new(&root.path).names()?;
+                    match names.as_slice() {
+                        [one] => one.clone(),
+                        [] => bail!(
+                            "no person identity on this machine to make master.\n\
+                             \n\
+                             Make one:  ferry operator create --name <you>\n\
+                             Or carry yours here:  ferry operator import"
+                        ),
+                        many => bail!(
+                            "more than one person can sign here ({}) - say which with --name",
+                            many.join(", ")
+                        ),
+                    }
+                }
+            };
+            let projects: Vec<_> = root
+                .read()
+                .projects
+                .into_iter()
+                .filter(|entry| entry.channel.is_dir())
+                .collect();
+            let width = projects
+                .iter()
+                .map(|entry| entry.project_id.chars().count())
+                .max()
+                .unwrap_or(0);
+            // One password, before the loop, for every channel.
+            let identity = if dry_run {
+                None
+            } else {
+                Some(signing_identity_in(&root.path, &name)?)
+            };
+            let (mut declared, mut already, mut left) = (0, 0, 0);
+            for entry in &projects {
+                let id = &entry.project_id;
+                let said = match &identity {
+                    None => match ferry::master_of(&entry.channel) {
+                        Ok(Some(master)) if master.eq_ignore_ascii_case(&name) => {
+                            already += 1;
+                            format!("already {master}")
+                        }
+                        Ok(Some(master)) => {
+                            left += 1;
+                            format!("master is {master} - left alone")
+                        }
+                        Ok(None) => {
+                            declared += 1;
+                            format!("would declare {name}")
+                        }
+                        Err(error) => {
+                            left += 1;
+                            format!("left alone: {error:#}")
+                        }
+                    },
+                    Some(identity) => {
+                        // Where this project keeps machine-local state; a channel-only
+                        // project uses the directory its channel sits in, as the roster's
+                        // pins already do.
+                        let attachment = entry
+                            .repo
+                            .as_ref()
+                            .map(|repo| repo.join(".ferryman"))
+                            .filter(|attachment| attachment.is_dir())
+                            .or_else(|| entry.channel.parent().map(std::path::Path::to_path_buf))
+                            .unwrap_or_else(|| root.path.clone());
+                        match ferryman_channel::master::claim_if_masterless(
+                            &entry.channel,
+                            id,
+                            &attachment,
+                            identity,
+                        ) {
+                            Ok(Claim::Declared) => {
+                                declared += 1;
+                                format!("{name} is now master")
+                            }
+                            Ok(Claim::AlreadyTheirs) => {
+                                already += 1;
+                                format!("already {name}")
+                            }
+                            Ok(Claim::Other(master)) => {
+                                left += 1;
+                                format!("master is {master} - left alone")
+                            }
+                            Ok(Claim::KeyConflict) => {
+                                left += 1;
+                                format!("this channel knows {name} by a different key - left alone")
+                            }
+                            Err(error) => {
+                                left += 1;
+                                format!("failed: {error:#}")
+                            }
+                        }
+                    }
+                };
+                println!("  {id:width$}  {said}");
+            }
+            println!();
+            if dry_run {
+                println!(
+                    "{declared} would get {name} as master, {already} already have it, {left} left alone."
+                );
+                println!("Do it:  ferry root master");
+            } else {
+                println!(
+                    "{declared} declared, {already} already {name}'s, {left} left alone. \
+                     Syncthing carries it to every machine."
+                );
             }
         }
 

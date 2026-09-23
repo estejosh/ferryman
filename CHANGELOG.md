@@ -22,8 +22,20 @@ is why this is a version and not a quiet patch.
   project, or not signed at all is read as no mark. The master's `--restore` clears it.
 
 - **A project with no master cannot be archived**, and says so, with the command that
-  names one (`ferry channel master init`). Archiving also needs the channel on the
+  names one (`ferry root master`). Archiving also needs the channel on the
   machine doing it, since that is the only place the fleet would hear it.
+
+### Added
+
+- **`ferry root master`: one password, and you are master of every project that has
+  none.** `enable` never makes a machine the master where a person is present, and it
+  cannot sign as that person, so on a machine you use it left the role empty and
+  pointed at the dashboard - and nothing came back for it. On the machine this was
+  written for, 30 of 33 channels had no master and 30 had never seen the person's
+  public key. This goes through every project in the ferry root, puts your key on each
+  channel's roster, and declares you master where nobody is. A project with another
+  master, or that knows your name by a different key, is left alone and named.
+  `--dry-run` shows the plan without a password. `enable` now points here.
 
 ## v0.5.12 - 2026-09-23
 

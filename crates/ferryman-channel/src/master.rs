@@ -140,6 +140,99 @@ pub fn read_master_at(
     Ok(Some(declaration))
 }
 
+/// What claiming a channel's master role did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// The person is now the master.
+    Declared,
+    /// They already were. Nothing written.
+    AlreadyTheirs,
+    /// Someone else is master. Nothing written: a master is handed over, never taken.
+    Other(String),
+    /// The channel knows this name by a different key. Nothing written - a declaration
+    /// signed by a key the fleet does not know this name by is one no peer would accept.
+    KeyConflict,
+}
+
+/// Declare `person` master of the project in `channel`, if it has none.
+///
+/// For a channel enabled while a person was present: `enable` will not make the machine
+/// master and cannot sign as the person, so it left the role empty, and nothing came
+/// back for it. This fills it, signed by the person, and first puts their public key on
+/// the channel's roster so every peer can verify the declaration. Both files are in the
+/// channel, so Syncthing carries them to every machine.
+pub fn claim_if_masterless(
+    channel: &Path,
+    project_id: &str,
+    attachment: &Path,
+    person: &AgentIdentity,
+) -> Result<Claim> {
+    let roster = crate::read_agent_roster(channel)?;
+    // Decided before anything is written: a project someone else masters gets nothing
+    // from this, not even a roster entry.
+    if let Some(declaration) = read_master_at(channel, &roster)? {
+        return Ok(if declaration.master.eq_ignore_ascii_case(person.name()) {
+            Claim::AlreadyTheirs
+        } else {
+            Claim::Other(declaration.master)
+        });
+    }
+    let key = person.public_key_hex();
+    let mut route = ProjectRoute {
+        project_id: project_id.to_owned(),
+        workspace: attachment.parent().unwrap_or(attachment).to_path_buf(),
+        attachment: attachment.to_path_buf(),
+        communications: channel.to_path_buf(),
+        shared_remote: format!("{project_id}-ferryman"),
+        git_remote: String::new(),
+        git_visibility: String::new(),
+        agents: Vec::new(),
+    };
+    let listing = channel.join("agents").join(format!(
+        "{}.json",
+        crate::canonical_agent_name(person.name())
+    ));
+    let listed: Option<AgentRoute> = if listing.is_file() {
+        Some(serde_json::from_slice(&fs::read(&listing)?).context("parse roster entry")?)
+    } else {
+        None
+    };
+    match listed
+        .as_ref()
+        .and_then(|agent| agent.public_key.as_deref())
+    {
+        Some(existing) if existing != key => return Ok(Claim::KeyConflict),
+        Some(_) => {}
+        // Absent, or reserved without a key: publish it, keeping any role it was given.
+        None => {
+            let agent = AgentRoute {
+                public_key: Some(key.clone()),
+                ..listed.unwrap_or_else(|| AgentRoute {
+                    name: person.name().to_owned(),
+                    role: "operator".into(),
+                    capabilities: Vec::new(),
+                    public_key: None,
+                    encryption_key: None,
+                })
+            };
+            crate::register_agent(&route, &agent)?;
+        }
+    }
+    // Read back through the pins: if this machine has pinned another key for the name,
+    // that is the key every check here uses, and a declaration would not verify.
+    route.agents = crate::read_agent_roster(channel)?;
+    let known = route
+        .agents
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(person.name()))
+        .and_then(|agent| agent.public_key.clone());
+    if known.as_deref() != Some(key.as_str()) {
+        return Ok(Claim::KeyConflict);
+    }
+    initialize_master(&route, person, person.name())?;
+    Ok(Claim::Declared)
+}
+
 /// Transfer the master role to another user. Signed by the current master.
 ///
 /// The chain of authority stays verifiable: the new declaration names the new
@@ -516,6 +609,77 @@ fn holds_grant(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> 
 
 #[cfg(test)]
 mod tests {
+
+    /// A channel enabled while a person was present has no master. The person claims
+    /// it once, every peer can verify it, and nobody else's project is touched.
+    #[test]
+    fn a_person_claims_a_masterless_channel_and_only_that() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let comms = dir.path().join("comms");
+        let channel = comms.join("natv-ferryman");
+        fs::create_dir_all(&channel).unwrap();
+        let josh = AgentIdentity::from_seed("josh", [7u8; 32]);
+
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &josh).unwrap(),
+            Claim::Declared
+        );
+        assert!(
+            channel.join("agents").join("josh.json").is_file(),
+            "the key every peer verifies against"
+        );
+        let roster = crate::read_agent_roster(&channel).unwrap();
+        let declared = read_master_at(&channel, &roster)
+            .unwrap()
+            .expect("declared");
+        assert_eq!(declared.master, "josh");
+        assert_eq!(declared.project_id, "natv");
+
+        // Again is a no-op, not a second declaration.
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &josh).unwrap(),
+            Claim::AlreadyTheirs
+        );
+
+        // Someone else claiming finds it taken, and leaves no trace on the roster.
+        let ada = AgentIdentity::from_seed("ada", [3u8; 32]);
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &ada).unwrap(),
+            Claim::Other("josh".into())
+        );
+        assert!(!channel.join("agents").join("ada.json").exists());
+    }
+
+    /// A key that is not the one the channel knows the name by declares nothing.
+    #[test]
+    fn a_different_key_under_the_same_name_claims_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let comms = dir.path().join("comms");
+        let channel = comms.join("natv-ferryman");
+        fs::create_dir_all(channel.join("agents")).unwrap();
+        let josh = AgentIdentity::from_seed("josh", [7u8; 32]);
+        let listed = AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(josh.public_key_hex()),
+            encryption_key: None,
+        };
+        fs::write(
+            channel.join("agents").join("josh.json"),
+            serde_json::to_vec(&listed).unwrap(),
+        )
+        .unwrap();
+
+        let impostor = AgentIdentity::from_seed("josh", [9u8; 32]);
+        assert_eq!(
+            claim_if_masterless(&channel, "natv", &comms, &impostor).unwrap(),
+            Claim::KeyConflict
+        );
+        assert!(!channel.join("master.json").exists());
+    }
 
     use super::*;
     use crate::AgentRoute;
