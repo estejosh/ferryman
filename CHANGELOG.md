@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **A worker that released its own claim could never hold the task again, and claimed it on
+  every poll.** A release counted against the agent forever rather than against the claim
+  it followed, and a claim file that already existed was never rewritten. A worker
+  releases its orphaned claims at every startup, so an order addressed to it stayed
+  Offered for good: one worker wrote 33,608 identical "claimed order" entries into the
+  signed ledger in a week, all of them synced to every machine. A release now ends only
+  the claim it came after, and claiming a released task writes a fresh claim.
+
 ## v0.5.13 - 2026-09-23
 
 This release exists for one thing: archiving now reaches the whole fleet. In 0.5.12

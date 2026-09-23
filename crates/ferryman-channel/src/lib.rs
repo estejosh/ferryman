@@ -942,11 +942,26 @@ pub struct Task {
 
 impl Task {
     /// Whether the given agent's claim on this task has been released.
+    ///
+    /// A release counts against the claim it was made after, not against the agent
+    /// forever. It used to be the second: once an agent had released a task - which a
+    /// worker does to its own orphaned claims at every startup - no claim it made
+    /// afterwards could ever count again. On an order addressed to it, that left the
+    /// task Offered to the agent for good, and the worker claimed it again on every
+    /// poll: one machine wrote 33,608 identical "claimed order" entries into the
+    /// signed ledger over a week, every one synced to every machine.
     #[must_use]
     pub fn released(&self, agent: &str) -> bool {
-        self.releases
+        let claimed = self
+            .claims
             .iter()
-            .any(|release| release.released.eq_ignore_ascii_case(agent))
+            .filter(|claim| claim.agent.eq_ignore_ascii_case(agent))
+            .map(|claim| claim.claimed_at)
+            .max();
+        self.releases.iter().any(|release| {
+            release.released.eq_ignore_ascii_case(agent)
+                && claimed.is_none_or(|claimed_at| release.at >= claimed_at)
+        })
     }
 
     /// The claims that still count: every claim except one its holder has released.
@@ -1202,9 +1217,14 @@ pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<
     let path = task_dir(route, order_id).join(format!("claim.{agent}.json"));
     // Re-claiming keeps the ORIGINAL timestamp: refreshing it would let a latecomer
     // win a race it already lost by simply claiming again.
-    if !path.exists() {
-        write_task_file(&path, &claim)?;
+    //
+    // Unless that claim was released. Then there is no race to have lost: the agent
+    // let the task go, and taking it back is a new claim, stamped now, behind anyone
+    // who claimed it in between.
+    if path.exists() && !read_task(route, order_id)?.released(agent) {
+        return Ok(claim);
     }
+    write_task_file(&path, &claim)?;
     Ok(claim)
 }
 
@@ -9244,6 +9264,52 @@ mod work_over_files_tests {
             read_task(&route, "t-2").unwrap().state(),
             TaskState::Offered { ref to } if to == "fang"
         ));
+    }
+
+    /// A release ends the claim it follows, not every claim the agent will ever make.
+    ///
+    /// The worker releases its own orphaned claims at startup and then picks the work
+    /// straight back up. Before this, the claim it wrote back never counted, so an
+    /// order addressed to it stayed Offered forever and was re-claimed on every poll.
+    #[test]
+    fn a_released_claim_can_be_taken_again() {
+        let (_t, route, identities) = signed_channel();
+        issue_order(&route, &order("t-1", Some("fang"), false)).unwrap();
+        claim_order(&route, "t-1", "fang").unwrap();
+        release_claim(
+            &route,
+            "t-1",
+            "fang",
+            "fang",
+            "orphaned at startup",
+            &identities["fang"],
+        )
+        .unwrap();
+        assert!(matches!(
+            read_task(&route, "t-1").unwrap().state(),
+            TaskState::Offered { .. }
+        ));
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        claim_order(&route, "t-1", "fang").unwrap();
+        let task = read_task(&route, "t-1").unwrap();
+        assert!(
+            !task.released("fang"),
+            "the new claim is newer than the release"
+        );
+        assert!(
+            matches!(task.state(), TaskState::Claimed { .. }),
+            "{:?}",
+            task.state()
+        );
+
+        // And claiming again while it is held still keeps the original timestamp.
+        let before = task.claims[0].claimed_at;
+        claim_order(&route, "t-1", "fang").unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().claims[0].claimed_at,
+            before
+        );
     }
 
     #[test]
