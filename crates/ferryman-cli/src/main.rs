@@ -531,7 +531,27 @@ enum RootCommand {
         path: Option<PathBuf>,
     },
     /// What the manifest knows: every project, its channel, and where its repository is.
-    Show,
+    Show {
+        /// Include archived projects, which are otherwise left out.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Mark a project finished: keep everything, stop offering it as somewhere work
+    /// happens.
+    ///
+    /// Between `adopt` and `forget` there was nothing for a project that is simply over.
+    /// Forgetting one is wrong - its channel is the signed record of what happened, and
+    /// the index is how you find it. Leaving it is wrong too: finished projects pile up
+    /// until the running ones cannot be seen for them.
+    ///
+    /// Nothing moves, nothing is unshared, nothing is deleted. `--restore` takes it back.
+    Archive {
+        /// The project id.
+        project: String,
+        /// Bring an archived project back into the working set.
+        #[arg(long)]
+        restore: bool,
+    },
     /// Record a project here. Nothing is moved: a repository is noted where it stands,
     /// and `repos/` gets a link to it.
     Adopt {
@@ -8572,7 +8592,7 @@ fn root_command(command: RootCommand) -> Result<()> {
             }
         }
 
-        RootCommand::Show => {
+        RootCommand::Show { all } => {
             let Some(root) = ferry::find_root() else {
                 println!("no ferry root yet.");
                 println!();
@@ -8580,9 +8600,17 @@ fn root_command(command: RootCommand) -> Result<()> {
                 return Ok(());
             };
             println!("{}", root.path.display());
-            let projects = root.projects();
+            let archived = root.archived();
+            let mut projects = root.projects();
+            if all {
+                projects.extend(archived.iter().cloned());
+                projects.sort_by(|a, b| a.project_id.cmp(&b.project_id));
+            }
             if projects.is_empty() {
                 println!("  nothing filed yet.  ferry root adopt <path>");
+                if !archived.is_empty() {
+                    println!("  {} archived.  ferry root show --all", archived.len());
+                }
                 return Ok(());
             }
             let width = projects
@@ -8591,7 +8619,12 @@ fn root_command(command: RootCommand) -> Result<()> {
                 .max()
                 .unwrap_or(0);
             for entry in projects {
-                println!("  {:width$}  {}", entry.project_id, entry.channel.display());
+                let mark = if entry.archived { "  [archived]" } else { "" };
+                println!(
+                    "  {:width$}  {}{mark}",
+                    entry.project_id,
+                    entry.channel.display()
+                );
                 match entry.repo {
                     // Said out loud, because it is the promise this layout makes: an
                     // adopted repository was never moved and never will be.
@@ -8605,6 +8638,15 @@ fn root_command(command: RootCommand) -> Result<()> {
                     Some(repo) => println!("  {:width$}  {}", "", repo.display()),
                     None => println!("  {:width$}  channel only on this machine", ""),
                 }
+            }
+            // Named, not hidden. A listing that silently omits things is how this index
+            // got into trouble in the first place.
+            if !all && !archived.is_empty() {
+                println!();
+                println!(
+                    "  {} archived and not shown.  ferry root show --all",
+                    archived.len()
+                );
             }
         }
 
@@ -8647,6 +8689,53 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                 }
                 None => println!("  repo     none on this machine - channel only"),
+            }
+            // Filing does not un-archive, so say so rather than leave someone waiting for
+            // a project that will not reappear.
+            if root
+                .archived()
+                .iter()
+                .any(|entry| entry.project_id == route.project_id)
+            {
+                println!(
+                    "  note     {} is archived, so it stays out of `ferry root show`.\n\
+                     \x20          bring it back with:  ferry root archive {} --restore",
+                    route.project_id, route.project_id
+                );
+            }
+        }
+
+        RootCommand::Archive { project, restore } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let changed = root.archive(&project, !restore)?;
+            let entry = root
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project);
+            match (restore, changed) {
+                (false, true) => {
+                    println!("archived {project}");
+                    if let Some(entry) = &entry {
+                        println!(
+                            "  channel  {}  (kept, and still synced)",
+                            entry.channel.display()
+                        );
+                    }
+                    println!("  Nothing moved and nothing was unshared. It is out of");
+                    println!("  `ferry root show` and out of the anchor spread, and that is all.");
+                    println!("  Back with:  ferry root archive {project} --restore");
+                }
+                (false, false) => println!("{project} was already archived"),
+                (true, true) => {
+                    println!("restored {project}");
+                    if let Some(entry) = &entry {
+                        println!("  channel  {}", entry.channel.display());
+                    }
+                }
+                (true, false) => println!("{project} was not archived"),
             }
         }
 

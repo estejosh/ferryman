@@ -58,6 +58,17 @@ pub struct Entry {
     /// Recorded so nothing ever assumes it may be moved or removed.
     #[serde(default)]
     pub adopted: bool,
+    /// Finished. Still here, still synced if Syncthing carries it, still readable - but
+    /// not offered as somewhere work happens.
+    ///
+    /// The third state the index was missing. `forget` is for an entry whose channel has
+    /// gone; a project that is simply *over* has neither a reason to be removed (its
+    /// signed history is the record of what happened) nor a reason to keep appearing
+    /// beside the live ones. Without this, a root accumulates finished work until nobody
+    /// can see the running projects for the dead ones - twelve of thirty-three on the
+    /// machine this was written for.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// What a ferry root holds.
@@ -158,6 +169,7 @@ impl Root {
             channel: channel.to_path_buf(),
             repo: repo.map(Path::to_path_buf),
             adopted,
+            archived: false,
         };
         match manifest
             .projects
@@ -175,6 +187,11 @@ impl Root {
                     existing.repo = entry.repo;
                     existing.adopted = entry.adopted;
                 }
+                // `archived` is deliberately not cleared. Filing a project again is
+                // something `enable` does on its own, and a project quietly coming back
+                // from the archive because a command was re-run is the kind of silent
+                // state change this index has been bitten by before. Coming back is
+                // `archive --restore`, which is a thing someone chose to type.
             }
             None => manifest.projects.push(entry),
         }
@@ -202,18 +219,61 @@ impl Root {
         under_temp_dir(channel) && !under_temp_dir(&self.path)
     }
 
-    /// Everything the manifest lists that is still on disk.
+    /// The projects work can happen in: on disk, and not archived.
     ///
     /// An entry whose channel has gone is dropped rather than returned: offering a
     /// project that cannot be opened looks, to the person who picks it, exactly like the
-    /// software ignoring them.
+    /// software ignoring them. An archived one is dropped for the opposite reason - it
+    /// can be opened perfectly well, and is simply finished.
+    ///
+    /// Callers asking "where does work happen here" want this. Callers asking "what does
+    /// this machine hold" want `read().projects`, and the two are not the same question.
     #[must_use]
     pub fn projects(&self) -> Vec<Entry> {
         self.read()
             .projects
             .into_iter()
-            .filter(|entry| entry.channel.is_dir())
+            .filter(|entry| entry.channel.is_dir() && !entry.archived)
             .collect()
+    }
+
+    /// The finished ones, still on disk.
+    #[must_use]
+    pub fn archived(&self) -> Vec<Entry> {
+        self.read()
+            .projects
+            .into_iter()
+            .filter(|entry| entry.archived)
+            .collect()
+    }
+
+    /// Mark a project finished, or bring it back.
+    ///
+    /// Nothing on disk moves and nothing is unshared. That is the whole point: the
+    /// channel keeps its signed history, Syncthing keeps carrying it if it was, and the
+    /// project simply stops being offered as somewhere work happens. Archiving is a
+    /// statement about intent, not a deletion, and a statement that can be taken back.
+    ///
+    /// Returns whether the flag changed. Archiving an already-archived project is not an
+    /// error - the desired state is that it is archived, and it is.
+    pub fn archive(&self, project_id: &str, archived: bool) -> Result<bool> {
+        let mut manifest = self.read();
+        let entry = manifest
+            .projects
+            .iter_mut()
+            .find(|entry| entry.project_id == project_id)
+            .with_context(|| {
+                format!(
+                    "no project '{project_id}' in {}",
+                    self.manifest_path().display()
+                )
+            })?;
+        if entry.archived == archived {
+            return Ok(false);
+        }
+        entry.archived = archived;
+        self.write(&manifest)?;
+        Ok(true)
     }
 
     /// Where this project's channel belongs once it lives in the root.
@@ -539,6 +599,95 @@ mod tests {
         assert!(root.work().is_dir());
         assert!(root.manifest_path().is_file());
         assert!(root.projects().is_empty());
+    }
+
+    /// Archiving keeps everything and only stops the project being offered.
+    #[test]
+    fn an_archived_project_leaves_the_working_set_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let live = channel(dir.path(), "live");
+        let done = channel(dir.path(), "done");
+        root.adopt("live", &live, None).unwrap();
+        root.adopt("done", &done, None).unwrap();
+        // Something signed, to prove archiving is not a quiet delete.
+        std::fs::write(done.join("ledger.josh.jsonl"), "{\"what\":\"happened\"}\n").unwrap();
+
+        assert!(root.archive("done", true).unwrap());
+
+        let working: Vec<String> = root
+            .projects()
+            .into_iter()
+            .map(|entry| entry.project_id)
+            .collect();
+        assert_eq!(working, vec!["live".to_string()]);
+        // Still in the file, still on disk, history intact.
+        assert_eq!(root.read().projects.len(), 2);
+        assert!(done.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(done.join("ledger.josh.jsonl")).unwrap(),
+            "{\"what\":\"happened\"}\n"
+        );
+        let archived = root.archived();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].project_id, "done");
+    }
+
+    /// And it can be taken back.
+    #[test]
+    fn an_archived_project_can_be_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let done = channel(dir.path(), "done");
+        root.adopt("done", &done, None).unwrap();
+
+        assert!(root.archive("done", true).unwrap());
+        assert!(root.projects().is_empty());
+        // Saying it twice is not an error; the desired state already holds.
+        assert!(!root.archive("done", true).unwrap());
+
+        assert!(root.archive("done", false).unwrap());
+        assert_eq!(root.projects().len(), 1);
+        assert!(root.archived().is_empty());
+    }
+
+    /// Filing a project again must not quietly un-archive it.
+    ///
+    /// `enable` files on its own, so a project coming back because a command was re-run
+    /// would be a state change nobody asked for and nobody would see.
+    #[test]
+    fn adopting_an_archived_project_does_not_revive_it() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let done = channel(dir.path(), "done");
+        let repo = dir.path().join("done-repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        root.adopt("done", &done, None).unwrap();
+        root.archive("done", true).unwrap();
+
+        root.adopt("done", &done, Some(&repo)).unwrap();
+
+        assert!(root.projects().is_empty(), "still archived");
+        let archived = root.archived();
+        assert_eq!(archived.len(), 1);
+        // The re-adoption's new information was still recorded.
+        assert_eq!(archived[0].repo.as_deref(), Some(repo.as_path()));
+    }
+
+    /// Archiving something that was never filed is an error naming it, not a silent no-op.
+    #[test]
+    fn archiving_an_unknown_project_says_which_one() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let error = root
+            .archive("never-filed", true)
+            .expect_err("an unknown project is not archivable")
+            .to_string();
+        assert!(error.contains("never-filed"), "{error}");
     }
 
     /// The asymmetry that let the index rot: everything filed, nothing ever removed.
