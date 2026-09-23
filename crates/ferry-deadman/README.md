@@ -193,7 +193,7 @@ Requires Rust ≥ 1.90. `#![forbid(unsafe_code)]`.
 
 ## License
 
-Source-available under the [Ferryman Source-Available License](../../LICENSE),
+Source-available under the [Usufruct License (UFL) v2.1](../../LICENSE),
 the same licence as the rest of this repository: free for any non-production use,
 and free in production inside the free tier. See
 [COMMERCIAL.md](../../COMMERCIAL.md).

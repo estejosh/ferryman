@@ -1,6 +1,6 @@
 # Commercial Licensing
 
-Ferryman is source-available under the [Ferryman Source-Available License](LICENSE).
+Ferryman is source-available under the [Usufruct License (UFL) v2.1](LICENSE).
 This page explains when it's free, when it isn't, and how to pay.
 
 ## Free
@@ -68,12 +68,6 @@ Open an issue titled `Commercial license` on
 [github.com/estejosh/ferryman](https://github.com/estejosh/ferryman/issues), or
 email `lafamiliahale@gmail.com`. Tell us your total production Seat count and
 we'll send terms.
-
-## Attribution
-
-Projects that use Ferryman must include a root-level `FERRYMAN.md` stating that
-the project uses it (License section 6). `ferry enable` writes that file into your
-work repository, and prints what it wrote.
 
 ## Questions people actually ask
 

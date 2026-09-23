@@ -8,8 +8,8 @@ so changes are reviewed more carefully than ordinary application changes.
 Ferryman is source-available, not open source, and it is sold above a free tier.
 You are entitled to know what that means for a patch you send, before you send it:
 
-- Your contribution is licensed under the [Ferryman Source-Available
-  License](LICENSE), the same licence as the rest of the project.
+- Your contribution is licensed under the [Usufruct License (UFL) v2.1](LICENSE),
+  the same licence as the rest of the project.
 - By opening a pull request you also grant the Licensor a perpetual, irrevocable,
   worldwide, royalty-free right to use, modify, sublicense and relicense your
   contribution, including under commercial terms. Without that, a contributed line

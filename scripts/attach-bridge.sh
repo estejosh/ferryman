@@ -87,9 +87,6 @@ project  = "$SLUG"
 # scoped token is in ./token (local-only, gitignored). Server + database are the hub's.
 EOF
 
-# attribution notice at the project root (Ferryman Source-Available License, section 5)
-[ -f "$PROJ/FERRYMAN.md" ] || printf '%s\n' '# Ferryman' '' 'This project uses Ferryman (https://github.com/estejosh/ferryman),' 'licensed under the Ferryman Source-Available License.' > "$PROJ/FERRYMAN.md"
-
 echo "attached '$SLUG' -> hub $HUB"
 echo "  config: $CFG/bridge.toml"
 echo "  token:  $CFG/token (local-only)"

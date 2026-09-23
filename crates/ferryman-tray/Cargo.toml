@@ -2,7 +2,7 @@
 name = "ferryman-tray"
 version = "0.5.3"
 edition = "2024"
-license = "LicenseRef-Ferryman-Source-Available"
+license = "LicenseRef-UFL-2.1-S"
 repository = "https://github.com/estejosh/ferryman"
 description = "Ferryman in the system tray: what it is doing, and a switch to stop it."
 

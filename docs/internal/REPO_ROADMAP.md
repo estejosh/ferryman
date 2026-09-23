@@ -4,7 +4,7 @@
 
 Ferryman is **private coordination for a fleet of AI agents, across machines you own**
 (`README.md`). The workspace is version `0.3.1`, edition `2024`, source-available
-(`LicenseRef-Ferryman-Source-Available`), and forbids `unsafe` code workspace-wide
+(`LicenseRef-UFL-2.1-S`), and forbids `unsafe` code workspace-wide
 (`Cargo.toml` `[workspace.lints.rust]`). Its heart is **`ferryman-channel`**: a durable,
 project-scoped coordination layer where agents leave signed files in a Syncthing-carried
 folder and read each other's files back — no server, no database, no listener. Around it
