@@ -1,8 +1,46 @@
 # Changelog
 
-## Unreleased
+## v0.5.12 - 2026-09-23
+
+Your machines are you, a git account is proof of whose projects these are, and a
+finished project can be put away without being thrown away.
 
 ### Added
+
+- **A master claims their git account, and every project that account owns gets it**
+  (ADR 0022). `ferry team anchor claim` binds the master's Ferryman key to a GitHub
+  account by signing with an SSH *signing* key published on that account - one that
+  grants no access to anything, only proves the account is yours. Claim once and every
+  project whose remote that account owns is anchored; nobody else can become master of
+  them without controlling the account. One identity can hold several accounts.
+
+  Required for projects on git, optional off it. The agent loop and the dashboard
+  re-check at irregular 3-11 day intervals, jittered from the machine's own name so a
+  fleet does not hit the provider in step. When an anchor stops verifying the master is
+  **paused, never vacated**: after 72 hours of contradiction a paused master directs no
+  new work, and the fleet finishes what it already holds. A sale of the account is a new
+  owner, and a new owner claims for themselves.
+
+  Verification reads `api.github.com/users/<login>/ssh_signing_keys`, not
+  `github.com/<login>.keys` - the second lists *authentication* keys, which grant push,
+  and a proof key must be one that grants nothing.
+
+- **`ferry root archive`: finished is a state, not a deletion.** Between `adopt` and
+  `forget` there was nothing for a project that is simply over. Archiving keeps the
+  channel, its signed history, and its sync; it only stops the project being offered as
+  somewhere work happens, and drops it from the anchor spread. `--restore` takes it back.
+  `ferry root show` always says how many it is hiding; `--all` shows them.
+
+- **`ferry root forget`, and `--gone`.** The index could be added to and never
+  subtracted from, and the gap did not show: `show` hides an entry whose channel has
+  gone, so a dead entry vanished from every listing while staying in the file forever.
+  `forget` touches the manifest and nothing on disk. `--gone` clears every unreachable
+  entry, and prints where each one pointed so a dead test run can be told from a project
+  you are about to stop tracking.
+
+- **`docs/FERRYMAN_IN_EVERY_PROJECT.md`**: the page a project reads to *stay* on
+  Ferryman. The eight ways a project gets stranded, what each looks like, and the command
+  that fixes it - every command run against the binary before being written down.
 
 - **A second machine can join as you, rather than as a stranger.**
   `ferry team invite create --as-identity josh --machine beastly` invites one of your
@@ -55,6 +93,31 @@
   synced folder a delete wins on one machine and then loses an argument with the next
   replica that still had the file. Entitlement is checked when the revocation is read,
   not when it is written, so writing one by hand into the folder achieves nothing.
+
+### Fixed
+
+- **`ferry doctor` told a stale machine the fleet was level.** The `versions` check
+  listed machines behind *this* one and never said this one was behind, reasoning in its
+  own comment that the stale machine "is never the one you are sitting at". It is, and
+  the check reassured precisely the machine that needed telling: grouchly sat on 0.5.10
+  beside 0.5.11 being told nothing was wrong. It now reports both directions and leads
+  with *"this machine 0.5.10 is BEHIND the fleet's 0.5.11 - run 'ferry update' here"*,
+  because that is the half you can act on without leaving the chair.
+
+- **Pinned public keys no longer share a name with private ones.** The trust-on-first-use
+  pin store wrote `agents-pinned/<name>.key`; the private key store next door is
+  `keys/<name>.key`. Same extension, and both files exactly 64 bytes, because a
+  hex-encoded 32-byte key is 64 characters whichever half it is. A careful reader with the
+  source open still took the pins for private keys. Pins are `<name>.pub` now. The old
+  name is read when the new one is absent and carried across, because a rename that
+  stopped finding the old pins would re-run trust-on-first-use against whatever the
+  channel says at that moment - the one moment a pin exists to distrust.
+
+### Security
+
+- **RUSTSEC-2026-0285 in `rustls`.** TLS 1.3 handshake messages were accepted across
+  encryption-level boundaries. 0.23.42 to 0.23.45, with `rustls-webpki` 0.103.13 to
+  0.103.15. A patch bump inside 0.23; nothing else in the lockfile moved.
 
 ## v0.5.11 - 2026-09-14
 
