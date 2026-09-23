@@ -223,6 +223,21 @@ pub fn available_memory_mb() -> Option<u64> {
     (available > 0).then_some(available / 1024 / 1024)
 }
 
+/// How busy the machine is right now: total CPU use across every core, 0 to 100.
+///
+/// Two readings are needed for a rate, so this takes a quarter of a second. It is only
+/// asked when someone is at the machine and there is work waiting. `None` when the
+/// figure cannot be read.
+#[must_use]
+pub fn cpu_busy_percent() -> Option<f32> {
+    let mut system = sysinfo::System::new();
+    system.refresh_cpu_usage();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL.max(Duration::from_millis(250)));
+    system.refresh_cpu_usage();
+    let usage = system.global_cpu_usage();
+    usage.is_finite().then_some(usage)
+}
+
 /// Decide whether to claim, given how much room the operator asked to keep free.
 #[must_use]
 pub fn may_claim(config: &AgentConfig) -> Decision {
@@ -241,7 +256,16 @@ pub fn may_claim(config: &AgentConfig) -> Decision {
     // Presence next: it is the cheap check, and it is the one whose answer a person
     // recognises as being about them.
     if config.pause_while_active {
-        let decision = judge_presence(presence(), config.idle_after);
+        let present = presence();
+        // Sampled only when it can change the answer: someone was here recently and
+        // this agent is willing to share the machine with them.
+        let busy = match present {
+            Presence::Active(idle) if idle < config.idle_after && config.busy_cpu_percent > 0 => {
+                cpu_busy_percent()
+            }
+            _ => None,
+        };
+        let decision = judge_presence(present, config.idle_after, config.busy_cpu_percent, busy);
         if !decision.is_go() {
             return decision;
         }
@@ -268,15 +292,40 @@ fn judge_window(window: Option<Window>, now: Option<NaiveTime>) -> Decision {
 }
 
 /// Whether someone being at the machine should stop it taking on more.
-fn judge_presence(presence: Presence, idle_after: Duration) -> Decision {
+///
+/// Presence alone used to decide it, and on a machine somebody uses all day that meant
+/// never: the idle window never opened, and from the channel the worker looked dead. A
+/// person typing leaves most of a machine idle, so the question is whether they are
+/// using its capacity, not whether they are there.
+fn judge_presence(
+    presence: Presence,
+    idle_after: Duration,
+    busy_cpu_percent: u8,
+    cpu: Option<f32>,
+) -> Decision {
     match presence {
         // No session to ask about. A server has nobody to get in the way of.
         Presence::Unknown => Decision::Go,
         Presence::Active(idle) if idle >= idle_after => Decision::Go,
-        Presence::Active(idle) => Decision::Wait(format!(
+        Presence::Active(_)
+            if busy_cpu_percent > 0 && cpu.is_some_and(|cpu| cpu < f32::from(busy_cpu_percent)) =>
+        {
+            Decision::Go
+        }
+        Presence::Active(idle) if busy_cpu_percent == 0 => Decision::Wait(format!(
             "you used this machine {}s ago; work resumes after {}s idle, and anything \
              already running is unaffected (pause_while_active in agent.toml)",
             idle.as_secs(),
+            idle_after.as_secs()
+        )),
+        Presence::Active(_) => Decision::Wait(format!(
+            "you are using this machine and it is busy ({}, over the {busy_cpu_percent}% \
+             it shares with you); work resumes when it quiets down or after {}s idle, and \
+             anything already running is unaffected (busy_cpu_percent in agent.toml)",
+            cpu.map_or_else(
+                || "CPU use unreadable".to_string(),
+                |cpu| format!("{cpu:.0}% CPU")
+            ),
             idle_after.as_secs()
         )),
     }
@@ -416,6 +465,8 @@ mod tests {
         let Decision::Wait(reason) = judge_presence(
             Presence::Active(Duration::from_secs(5)),
             Duration::from_secs(300),
+            0,
+            None,
         ) else {
             panic!("input five seconds ago should hold work back")
         };
@@ -430,9 +481,54 @@ mod tests {
         assert_eq!(
             judge_presence(
                 Presence::Active(Duration::from_secs(600)),
-                Duration::from_secs(300)
+                Duration::from_secs(300),
+                50,
+                Some(95.0)
             ),
             Decision::Go
+        );
+    }
+
+    /// Someone typing leaves most of the machine idle; that is room, not a reason to stop.
+    #[test]
+    fn a_quiet_machine_keeps_working_while_you_use_it() {
+        assert_eq!(
+            judge_presence(
+                Presence::Active(Duration::from_secs(5)),
+                Duration::from_secs(300),
+                50,
+                Some(12.0)
+            ),
+            Decision::Go
+        );
+    }
+
+    /// When the person is using the capacity, new work waits, and says why.
+    #[test]
+    fn a_busy_machine_leaves_you_the_room() {
+        let Decision::Wait(reason) = judge_presence(
+            Presence::Active(Duration::from_secs(5)),
+            Duration::from_secs(300),
+            50,
+            Some(85.0),
+        ) else {
+            panic!("85% CPU with someone at the keyboard should hold new work back")
+        };
+        assert!(reason.contains("85% CPU"), "{reason}");
+        assert!(reason.contains("busy_cpu_percent"), "{reason}");
+    }
+
+    /// Not knowing how busy the machine is is not permission to pile on.
+    #[test]
+    fn an_unreadable_cpu_waits_while_someone_is_here() {
+        assert!(
+            !judge_presence(
+                Presence::Active(Duration::from_secs(5)),
+                Duration::from_secs(300),
+                50,
+                None
+            )
+            .is_go()
         );
     }
 
@@ -442,7 +538,7 @@ mod tests {
         // is running agents unattended, so treating "no session" as "someone is here"
         // would stop work exactly where it should never stop.
         assert_eq!(
-            judge_presence(Presence::Unknown, Duration::from_secs(300)),
+            judge_presence(Presence::Unknown, Duration::from_secs(300), 50, None),
             Decision::Go
         );
     }

@@ -250,6 +250,9 @@ pub struct AgentConfig {
     pub pause_while_active: bool,
     /// How long the machine must be untouched before work resumes.
     pub idle_after: Duration,
+    /// While someone is at the machine, keep taking work as long as total CPU use stays
+    /// under this percentage. 0 pauses whenever anyone is active, the old behaviour.
+    pub busy_cpu_percent: u8,
     /// Hours during which this machine picks work up. `None` means any hour.
     pub claim_window: Option<crate::governor::Window>,
     pub poll: Duration,
@@ -451,6 +454,10 @@ impl AgentConfig {
                 Some(other) => bail!("pause_while_active must be true or false, not '{other}'"),
             },
             idle_after: Duration::from_secs(number("idle_after_secs", 300)?),
+            busy_cpu_percent: match number("busy_cpu_percent", 50)? {
+                percent @ 0..=100 => u8::try_from(percent).unwrap_or(100),
+                other => bail!("busy_cpu_percent is a percentage, 0 to 100, not {other}"),
+            },
             claim_window: match fields.get("claim_window").map(String::as_str) {
                 None | Some("") => None,
                 Some(value) => Some(crate::governor::Window::parse(value)?),
@@ -612,12 +619,17 @@ poll_secs = "10"
 # stops it taking the last of your memory. Set to 0 to turn the check off.
 min_free_ram_mb = "1024"
 
-# Stop taking new work while you are using this machine, and start again once it
-# has been untouched for idle_after_secs. Work already running is never
-# interrupted - only the decision to pick up something new waits. On a machine
+# Share this machine with you rather than wait for you to leave. While you are
+# using it, it keeps taking new work as long as total CPU use stays under
+# busy_cpu_percent - typing and browsing leave most of a machine idle, and an
+# agent that mostly waits on a remote model barely touches it. When the machine
+# is busy, new work waits until it quiets down or has been untouched for
+# idle_after_secs. Work already running is never interrupted. Set
+# busy_cpu_percent to 0 to pause whenever you are active at all. On a machine
 # with no desktop session, such as a server, there is nobody to get in the way
-# and this does nothing.
+# and none of this applies.
 pause_while_active = "true"
+busy_cpu_percent = "50"
 idle_after_secs = "300"
 
 # Hours during which this machine picks work up, as HH:MM-HH:MM. Unset means
@@ -1013,6 +1025,18 @@ fn run_command(
                 full.push("-v".to_string());
                 full.push(mount.clone());
             }
+            // A command given as an absolute path to a file on this machine is the
+            // operator's own launcher, not something the image ships. Left outside, the
+            // image's entrypoint is handed a path that does not exist and does whatever
+            // it does with one: the Node image's runs it as a script and dies with
+            // MODULE_NOT_FOUND, which is how one worker failed every task for a week. So
+            // it goes in read-only at the same path, and runs as configured. A command
+            // that only exists inside the image is left alone, and so is one the
+            // operator already mounted.
+            if let Some(launcher) = host_launcher(config) {
+                full.push("-v".to_string());
+                full.push(format!("{launcher}:{launcher}:ro"));
+            }
             full.push("-w".to_string());
             full.push("/workspace".to_string());
             full.push(image.clone());
@@ -1021,6 +1045,18 @@ fn run_command(
             (config.runner.runtime().to_string(), full)
         }
     }
+}
+
+/// The configured command, when it is a launcher on this machine that the container
+/// needs mounted: an absolute Unix path to a file here that no configured mount already
+/// puts at that path.
+fn host_launcher(config: &AgentConfig) -> Option<&str> {
+    let command = config.command.as_str();
+    let already = config
+        .mounts
+        .iter()
+        .any(|mount| mount.split(':').nth(1) == Some(command));
+    (command.starts_with('/') && !already && Path::new(command).is_file()).then_some(command)
 }
 
 /// The Claude Code `.mcp.json` that points the agent at `ferry mcp serve` for
@@ -2897,6 +2933,44 @@ mod tests {
         );
     }
 
+    /// A launcher that lives on the host goes into the container with the task, at the
+    /// same path, read-only - and a command that only exists in the image does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_host_launcher_is_mounted_into_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let launcher = dir.path().join("ferryman-opencode-linux");
+        std::fs::write(&launcher, "#!/usr/bin/env bash\n").unwrap();
+        let launcher = launcher.display().to_string();
+        let toml = |command: &str| {
+            format!(
+                "agent = \"a\"\nrole = \"worker\"\ncommand = \"{command}\"\n\
+                 args = [\"-p\",\"{{prompt}}\"]\nsandbox = \"podman:img\"\n"
+            )
+        };
+        let config = AgentConfig::parse(&toml(&launcher)).unwrap();
+        let (_, args) = run_command(&config, Path::new("/ws"), "p", &[]);
+        let mount = format!("{launcher}:{launcher}:ro");
+        assert!(args.contains(&mount), "{args:?}");
+        let image = args.iter().position(|a| a == "img").unwrap();
+        assert!(
+            args.iter().position(|a| *a == mount).unwrap() < image,
+            "a mount is a runtime flag, so it comes before the image: {args:?}"
+        );
+        assert_eq!(
+            args[image + 1],
+            launcher,
+            "and the command runs as configured"
+        );
+
+        let config = AgentConfig::parse(&toml("/usr/local/bin/not-on-this-host-at-all")).unwrap();
+        let (_, args) = run_command(&config, Path::new("/ws"), "p", &[]);
+        assert!(
+            !args.iter().any(|a| a.contains("not-on-this-host-at-all:")),
+            "a command only the image has is not mounted: {args:?}"
+        );
+    }
+
     /// Several mounts, and the bare runner ignores them - it has no container to mount into.
     #[test]
     fn mounts_are_a_container_concern_only() {
@@ -3540,6 +3614,20 @@ mod tests {
     /// wants: they are asserting on the task text, not on what precedes it.
     fn bare_config() -> AgentConfig {
         AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\n").unwrap()
+    }
+
+    #[test]
+    fn busy_cpu_percent_parses_and_refuses_nonsense() {
+        let config = AgentConfig::parse("agent = \"w\"\ncommand = \"c\"\n").unwrap();
+        assert_eq!(config.busy_cpu_percent, 50, "sharing is the default");
+        let config =
+            AgentConfig::parse("agent = \"w\"\ncommand = \"c\"\nbusy_cpu_percent = \"0\"\n")
+                .unwrap();
+        assert_eq!(config.busy_cpu_percent, 0);
+        assert!(
+            AgentConfig::parse("agent = \"w\"\ncommand = \"c\"\nbusy_cpu_percent = \"150\"\n")
+                .is_err()
+        );
     }
 
     fn order(id: &str) -> Order {

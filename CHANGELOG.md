@@ -2,7 +2,25 @@
 
 ## Unreleased
 
+### Changed
+
+- **A worker shares the machine with you instead of waiting for you to leave.**
+  `pause_while_active` used to stop new work whenever anyone had touched the keyboard in
+  the last `idle_after_secs`, so on a machine somebody uses all day the window never
+  opened and the worker looked dead from the channel. Now, while you are at the machine,
+  it keeps taking work as long as total CPU use stays under `busy_cpu_percent` (default
+  50) - typing leaves most of a machine idle, and an agent that mostly waits on a remote
+  model barely touches it. When the machine is busy it waits, and says how busy. Set
+  `busy_cpu_percent = "0"` for the old behaviour.
+
 ### Fixed
+
+- **A sandboxed worker whose command is a launcher on the host now runs it.** The
+  container got the workspace and the configured mounts, but not the launcher script
+  itself, so the image's entrypoint was handed a path that did not exist - the Node
+  image ran it as a script and died with MODULE_NOT_FOUND on every task. An absolute
+  command that is a file on this machine is now mounted read-only at the same path.
+
 
 - **A worker that released its own claim could never hold the task again, and claimed it on
   every poll.** A release counted against the agent forever rather than against the claim
