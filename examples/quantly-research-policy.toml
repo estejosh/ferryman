@@ -1,0 +1,77 @@
+schema = "quantly.research-policy/v1"
+
+[ownership]
+application_runtime_language = "rust"
+quantly_owned_code_license = "UFL-1.1"
+python_runtime = false
+
+[safety]
+paper_only = true
+read_only_public_data = true
+live_exchange_credentials = false
+authenticated_order_submission = false
+fund_movement = false
+
+[lifecycle]
+stages = [
+  "idea",
+  "point_in_time_data_integrity",
+  "experiment",
+  "walk_forward_and_purged_validation",
+  "paper_execution",
+  "attribution",
+  "adversarial_challenge",
+  "promotion_or_retirement",
+]
+required_time_fields = ["known_at", "effective_at"]
+lineage_fields = [
+  "strategy_version",
+  "genome_version",
+  "dataset_hash",
+  "code_revision",
+  "seed",
+  "split_definition",
+  "cost_model",
+  "latency_model",
+]
+
+[evolution]
+independent_implementation = true
+populations = true
+species = true
+mutation = true
+crossover = true
+random_immigrants = true
+elitism = true
+preserve_species_diversity = true
+champion_and_population = true
+seeded_reproducibility = true
+same_strategy_across_all_contexts = true
+contexts = [
+  "historical_replay",
+  "walk_forward",
+  "synthetic_simulation",
+  "paper_trading",
+]
+adverse_first_intrabar_ambiguity = true
+
+[fitness]
+raw_win_rate_is_primary = false
+objectives = [
+  "net_pnl_after_all_costs",
+  "robustness_across_windows_regimes_cost_and_latency_perturbations",
+  "drawdown_and_tail_risk",
+  "turnover_and_capacity",
+  "complexity",
+  "parameter_stability",
+  "diversification_contribution",
+]
+
+[implementation]
+order = [
+  "experiment_and_evolution_core",
+  "read_only_real_data_ingestion_and_persistence",
+  "population_search_and_validation",
+  "paper_portfolio_allocation",
+]
+add_signal_families_before_core = false

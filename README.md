@@ -227,6 +227,8 @@ other. See its [README](crates/ferry-deadman/README.md).
 |---|---|
 | [Running in a container](docs/CONTAINER.md) | podman and Docker, single or multi-project |
 | [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
+| [Quantly, Beastly, and Grouchly](docs/QUANTLY_GROUCHLY.md) | Rust-only, paper-only peer protocol and setup |
+| [Quantly research direction](docs/BEASTLY_QUANTLY_DIRECTION.md) | experiment/evolution core, validation, and build order for Beastly |
 | [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
 | [Writing a worker (server mode)](docs/WRITING_A_WORKER.md) | the lease-based worker protocol behind `ferryman-server` |

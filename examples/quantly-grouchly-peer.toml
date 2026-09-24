@@ -1,0 +1,35 @@
+# Reviewed coordination policy for the Quantly Ferryman channel.
+# This is never a place for broker, exchange, account, or trading secrets.
+
+[service]
+agent = "quantly"
+role = "research-service"
+protocol = "quantly.ferryman/v1"
+capabilities = [
+  "quantly.research.receive",
+  "quantly.research.publish",
+  "quantly.paper.replay",
+  "quantly.paper.ledger",
+  "quantly.paper.market",
+]
+
+[peers.beastly]
+agent = "beastly"
+role = "worker"
+purpose = "experiment and evolution core"
+
+[peers.grouchly]
+agent = "grouchly"
+role = "worker"
+purpose = "read-only data and durable paper workloads"
+
+[transport]
+local_first = true
+device_to_device = true
+cloud_relay = false
+
+[safety]
+paper_only = true
+allow_live_trading = false
+allow_order_submission = false
+allow_broker_credentials = false
