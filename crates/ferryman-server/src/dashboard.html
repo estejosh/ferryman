@@ -917,7 +917,26 @@ pages.review = async () => {
       : `<div class="empty">Nothing is waiting on you.</div>`}</div>`;
 };
 
+/* What an agent may do here, and - for the master - the one click that allows it. A
+   worker needs no approval; any other role needs the master's signed grant, which the
+   server looks the agent's key up for, so nobody copies a key or a path. */
+function agentAccess(a, team) {
+  const role = a.role || "worker";
+  if (role === "worker") return `<span class="badge good">works</span>`;
+  const g = ((team && team.grants) || []).find((g) => g.grantee === a.name);
+  if (g && (!(g.roles || []).length || (g.roles || []).includes(role))) {
+    return `<span class="badge good">approved as ${esc(role)}</span>`;
+  }
+  if (!a.key) return `<span class="badge warn">not online yet</span>`;
+  if (team && team.may_grant) {
+    return `<button class="btn" data-approve="${esc(a.name)}" data-role="${esc(role)}">Approve as ${esc(role)}</button>`;
+  }
+  return `<span class="badge warn">waiting for the master</span>`;
+}
+
 pages.agents = async () => {
+  let team = state.team;
+  if (!team) { try { team = state.team = await api("/api/team"); } catch (_) { team = null; } }
   const rows = state.roster.filter((a) => matches(`${a.name} ${a.role} ${a.engine}`));
   return `
     <div class="head">
@@ -925,17 +944,18 @@ pages.agents = async () => {
     </div>
     <div class="panel scroll">
       <table class="grid">
-        <thead><tr><th>Agent</th><th>Role</th><th>Engine</th><th>Runs</th><th>Accepted</th><th>Key</th><th>Last active</th></tr></thead>
+        <thead><tr><th>Agent</th><th>Role</th><th>Access</th><th>Engine</th><th>Runs</th><th>Accepted</th><th>Key</th><th>Last active</th></tr></thead>
         <tbody>${rows.length ? rows.map((a) => `
           <tr>
             <td class="lead">${esc(a.name)}</td>
             <td>${esc(a.role || "—")}</td>
+            <td>${agentAccess(a, team)}</td>
             <td>${esc(a.engine || "—")}</td>
             <td class="num">${esc(a.runs ?? 0)}</td>
             <td class="num">${esc(a.accepted ?? 0)}</td>
             <td>${a.key ? `<span class="badge good">keyed</span>` : `<span class="badge warn">no key yet</span>`}</td>
             <td>${esc(a.last_active || "—")}</td>
-          </tr>`).join("") : `<tr><td colspan="7"><div class="empty">Nobody has joined yet.</div></td></tr>`}
+          </tr>`).join("") : `<tr><td colspan="8"><div class="empty">Nobody has joined yet.</div></td></tr>`}
         </tbody>
       </table>
     </div>`;
@@ -1086,6 +1106,23 @@ pages.teammates = async () => {
       </div>
     </div>` : ""}`;
 };
+
+function wireAgents() {
+  document.querySelectorAll("[data-approve]").forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      await api(`/api/team/${encodeURIComponent(b.dataset.approve)}/access`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projects: [], roles: [b.dataset.role], capabilities: [] }),
+      });
+      state.team = null;
+      await render();
+    } catch (err) {
+      b.textContent = String(err.message || err).slice(0, 120);
+    }
+  }));
+}
 
 function wireTeammates() {
   const become = $("#tm-become-master");
@@ -1848,6 +1885,7 @@ async function render() {
   wireChat();
   wireRelease();
   wireTeammates();
+  wireAgents();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {
