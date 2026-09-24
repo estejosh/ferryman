@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.5.15 - 2026-09-24
+
+A worker works without waiting for approval, and approving anything else is one step.
 
 ### Changed
 
