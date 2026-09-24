@@ -1393,6 +1393,20 @@ enum SecretCommand {
 
 #[derive(Subcommand, Clone)]
 enum TeamCommand {
+    /// Let an agent work here in its role: one command, no key to copy.
+    ///
+    /// Signed by the project's master. The agent's public key comes from the channel's
+    /// roster, so the grant names the key the fleet already knows. A worker needs no
+    /// approval from 0.5.15 on; approving one still helps machines on older versions.
+    Approve {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The agent, as it appears on the roster.
+        name: String,
+        /// The role to approve. Defaults to the role the agent joined with.
+        #[arg(long)]
+        role: Option<String>,
+    },
     /// Invitations: one code from the master, one line for the newcomer.
     Invite {
         #[command(subcommand)]
@@ -4141,6 +4155,51 @@ async fn team_command(command: TeamCommand) -> Result<()> {
         ferryman_channel::route_for(&start)
     };
     match command {
+        TeamCommand::Approve {
+            workspace,
+            name,
+            role,
+        } => {
+            let route = here(workspace)?;
+            let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+            let Some(agent) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) else {
+                bail!(
+                    "{name} is not on {}'s roster yet; it joins first, then it can be approved",
+                    route.project_id
+                );
+            };
+            let Some(public_key) = agent.public_key.clone().filter(|key| !key.is_empty()) else {
+                bail!("{name} has not come online yet, so there is no key to approve");
+            };
+            let role = role.unwrap_or_else(|| agent.role.clone());
+            let Some(master) = ferryman_channel::master::read_master(&route)?.map(|d| d.master)
+            else {
+                bail!(
+                    "{} has no master yet; claim it with 'ferry root master'",
+                    route.project_id
+                );
+            };
+            let identity = signing_identity(&route, &master)?;
+            let grant = ferryman_channel::master::grant_member(
+                &route,
+                &identity,
+                &agent.name,
+                &public_key,
+                vec![route.project_id.clone()],
+                vec![role.clone()],
+                Vec::new(),
+            )?;
+            println!(
+                "{} may now work in {} as {role} (signed by {master})",
+                grant.grantee, route.project_id
+            );
+            if role.eq_ignore_ascii_case("worker") {
+                println!(
+                    "  A worker needs no approval from 0.5.15 on; this one helps machines \
+                     still on an older version."
+                );
+            }
+        }
         TeamCommand::Invite {
             action:
                 InviteAction::Create {

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **A worker needs no approval to work.** In a team that requires grants, every agent
+  waited for a master-signed grant for its role - including plain workers, which ADR 0014
+  already said should not. The first worker on a second machine sat idle for a day until
+  someone found the channel path, its public key and the role flags. Now a worker works
+  unless it, or the person who owns it, has been revoked; every other role still waits
+  for the master.
+
+### Added
+
+- **Approving an agent is one step.** `ferry team approve <agent>` signs the grant as the
+  master, reading the agent's key from the roster and its role from what it joined as.
+  The dashboard's Agents page shows what each agent may do and gives the master an
+  Approve button for any agent still waiting.
+
 ## v0.5.14 - 2026-09-23
 
 Three faults found on the live fleet the day 0.5.13 shipped: a worker that could never

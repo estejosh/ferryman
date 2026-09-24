@@ -563,6 +563,29 @@ pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
     Ok(out)
 }
 
+/// Whether `agent` may take work in this project in the given role.
+///
+/// A worker is the floor (ADR 0014): it takes the work it is given and returns
+/// results, and needs no grant for that. Requiring one made every new worker
+/// machine sit idle until someone found a channel path, a public key and a role
+/// flag, which is how the first worker on a second machine stayed idle for a
+/// day. What a worker can still lose is the right to be here at all, so a
+/// signed revocation - of it, or of the person who owns it - stops it exactly as
+/// it stops anyone else. Every other role is authority over other agents, and
+/// waits for the master's grant.
+pub fn may_work(route: &ProjectRoute, agent: &str, role: &str) -> Result<bool> {
+    if !role.eq_ignore_ascii_case("worker") {
+        return is_granted(route, agent, role);
+    }
+    if is_revoked(route, agent)? || crate::owner::is_revoked(route, agent)? {
+        return Ok(false);
+    }
+    match crate::owner::owner_of(route, agent)? {
+        Some(owner) if !owner.eq_ignore_ascii_case(agent) => Ok(!is_revoked(route, &owner)?),
+        _ => Ok(true),
+    }
+}
+
 /// Whether `grantee` holds a valid master-signed grant for `role` on this
 /// project. In team mode this is the gate that decides who may act.
 pub fn is_granted(route: &ProjectRoute, grantee: &str, role: &str) -> Result<bool> {
@@ -844,6 +867,48 @@ mod tests {
         // A non-master cannot transfer.
         let mallory = AgentIdentity::load_or_create_in("mallory", &route.attachment, None).unwrap();
         assert!(transfer_master(&route, &mallory, "carol").is_err());
+    }
+
+    /// A worker works without a grant; authority still needs one; a revocation stops both.
+    #[test]
+    fn a_worker_needs_no_grant_but_a_revocation_still_stops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = test_route(dir.path());
+        fs::create_dir_all(&route.attachment).unwrap();
+        let johnny = AgentIdentity::load_or_create_in("johnny", &route.attachment, None).unwrap();
+        let bob = AgentIdentity::load_or_create_in("bob", &route.attachment, None).unwrap();
+        route.agents = vec![
+            AgentRoute {
+                name: "johnny".into(),
+                role: "orchestrator".into(),
+                capabilities: vec![],
+                public_key: Some(johnny.public_key_hex()),
+                encryption_key: None,
+            },
+            AgentRoute {
+                name: "bob".into(),
+                role: "worker".into(),
+                capabilities: vec![],
+                public_key: Some(bob.public_key_hex()),
+                encryption_key: None,
+            },
+        ];
+        initialize_master(&route, &johnny, "johnny").unwrap();
+
+        assert!(
+            may_work(&route, "bob", "worker").unwrap(),
+            "no grant, and still works"
+        );
+        assert!(
+            !may_work(&route, "bob", "orchestrator").unwrap(),
+            "authority waits for the master"
+        );
+
+        revoke_member(&route, &johnny, "bob", "left").unwrap();
+        assert!(
+            !may_work(&route, "bob", "worker").unwrap(),
+            "revoked means stopped"
+        );
     }
 
     #[test]
