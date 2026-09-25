@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **An order says whether it arrived.** A worker writes a signed, write-once
+  `delivered.<agent>.json` beside every order meant for it as soon as it sees one - even
+  while paused or held off by the governor - and a signed `read.<agent>.json` just before
+  it hands the order to the engine, or when `ferry channel work` shows it to a live
+  session. Each worker also keeps a signed `presence/<agent>.json` in every channel it
+  serves (machine, version, paused or held), rewritten at most every five minutes.
+  `ferry channel status` now lists each open order's furthest stage - sent, delivered,
+  read, claimed, done - with ages, warns when an order is undelivered after 5 minutes or
+  delivered and unread after 15, and names any roster worker or machine not seen in the
+  last hour. Receipts that do not verify are shown as unverified and count for nothing.
+  The dashboard's task list shows the stage too, and `/api/tasks` and `/api/roster` carry
+  it. Ten channels had silently stopped syncing to one machine for weeks; this is the
+  signal that was missing.
+
 ## v0.5.15 - 2026-09-24
 
 A worker works without waiting for approval, and approving anything else is one step.

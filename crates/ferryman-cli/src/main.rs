@@ -1775,6 +1775,79 @@ enum HeadAction {
     StepDown,
 }
 
+/// The part of `ferry channel status` that answers "did my orders get there?".
+///
+/// Each unfinished order with the furthest stage it has reached and how long ago, a
+/// warning when it has sat too long at `sent` or `delivered`, and every worker's
+/// presence in the channel with anyone who has gone quiet. Receipts and presence that do
+/// not verify are printed as unverified and move nothing.
+fn print_order_progress(route: &ferryman_channel::ProjectRoute) -> Result<()> {
+    use ferryman_channel::receipts::{self, short_age};
+    let now = chrono::Utc::now();
+    let progress = receipts::channel_progress(route, now)?;
+    println!("open orders    {}", progress.len());
+    for order in &progress {
+        let stage = match &order.by {
+            Some(by) => format!("{} by {by}", order.stage.as_str()),
+            None => order.stage.as_str().to_string(),
+        };
+        println!(
+            "  {:<24} to {:<12} {:<22} {:>4} ago  (sent {} ago)",
+            order.order_id,
+            order.to.as_deref().unwrap_or("anyone"),
+            stage,
+            short_age(now.signed_duration_since(order.since)),
+            short_age(now.signed_duration_since(order.sent_at)),
+        );
+        if let Some(warning) = &order.warning {
+            println!("    ! {warning}");
+        }
+        for receipt in &order.unverified {
+            println!("    unverified receipt {receipt}");
+        }
+    }
+    let presence = receipts::list_presence(route)?;
+    println!(
+        "presence       {} worker(s), rewritten at most every {}",
+        presence.len(),
+        short_age(chrono::Duration::seconds(receipts::PRESENCE_REFRESH_SECS))
+    );
+    for (seen, check) in &presence {
+        let state = match (&seen.held, seen.paused) {
+            (_, true) => "paused".to_string(),
+            (Some(why), false) => format!("holding off: {why}"),
+            (None, false) => "free to work".to_string(),
+        };
+        let verified = if *check == ferryman_channel::SignatureCheck::Valid {
+            String::new()
+        } else {
+            format!("  UNVERIFIED ({check:?})")
+        };
+        println!(
+            "  {:<14} on {:<14} seen {:>4} ago  v{:<8} {state}{verified}",
+            seen.agent,
+            seen.machine,
+            short_age(now.signed_duration_since(seen.seen_at)),
+            seen.ferry_version,
+        );
+    }
+    for absent in receipts::absent_at(&route.agents, &presence, now) {
+        match (absent.last_seen, absent.machine) {
+            (Some(at), Some(machine)) => println!(
+                "  ! {} not seen for {} (last on {machine})",
+                absent.agent,
+                short_age(now.signed_duration_since(at))
+            ),
+            _ => println!(
+                "  ! {} has no presence here: no worker serves this channel as it, or its ferry \
+                 predates presence",
+                absent.agent
+            ),
+        }
+    }
+    Ok(())
+}
+
 /// One line saying who the head agent is, for every place an agent looks.
 fn head_line(channel: &std::path::Path, project_id: &str) -> String {
     match ferryman_channel::head::current(channel, project_id) {
@@ -6944,6 +7017,7 @@ fn channel(command: Channel) -> Result<()> {
             if quarantined > 0 {
                 println!("quarantined    {quarantined} (inspect before retrying)");
             }
+            print_order_progress(&route)?;
         }
 
         Channel::Seat {
@@ -7567,6 +7641,13 @@ fn channel(command: Channel) -> Result<()> {
                     }
                 }
             }
+            // This is where a live session is shown what it has been sent, so it is where
+            // it has read it. Only under a key this machine already holds: a read receipt
+            // is signed, and a name without a key here is someone else's to sign.
+            let identity =
+                ferryman_channel::AgentIdentity::load_existing(&agent, &route.attachment)
+                    .ok()
+                    .flatten();
             for task in work {
                 println!(
                     "  {:<12} {:<28} {:?}",
@@ -7578,6 +7659,15 @@ fn channel(command: Channel) -> Result<()> {
                         .unwrap_or("(structured)"),
                     task.state()
                 );
+                if let Some(identity) = &identity
+                    && let Err(error) =
+                        ferryman_channel::receipts::record_read(&route, &task.order.id, identity)
+                {
+                    eprintln!(
+                        "  {}: could not write the read receipt: {error:#}",
+                        task.order.id
+                    );
+                }
             }
         }
 

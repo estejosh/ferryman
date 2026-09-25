@@ -1942,12 +1942,16 @@ async fn tasks(
 ) -> Result<Json<Vec<Value>>, DashboardError> {
     let route = state.route_for(params.project.as_deref());
     let tasks = ferryman_channel::list_tasks(&route).map_err(internal)?;
+    let now = chrono::Utc::now();
     let items = tasks
         .iter()
         .map(|task| {
             json!({
                 "id": task.order.id,
                 "state": state_value(&task.state()),
+                // How far an unfinished order has got (sent, delivered, read, claimed,
+                // done), from signed receipts; null once it is finished.
+                "stage": ferryman_channel::receipts::progress(&route, task, now),
                 "holder": task.holder(),
                 "result_count": task.results.len(),
                 "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
@@ -2175,9 +2179,25 @@ async fn roster(
     let route = state.route_for(params.project.as_deref());
     let agents = ferryman_channel::read_agent_roster(&route.communications).map_err(internal)?;
     let runs = ferryman_channel::trajectory::agent_runs(&route).map_err(internal)?;
+    let presence = ferryman_channel::receipts::list_presence(&route).map_err(internal)?;
+    let absent =
+        ferryman_channel::receipts::absent_at(&route.agents, &presence, chrono::Utc::now());
     let items = agents
         .iter()
         .map(|agent| {
+            let seen = presence
+                .iter()
+                .find(|(p, _)| p.agent.eq_ignore_ascii_case(&agent.name))
+                .map(|(p, check)| {
+                    json!({
+                        "machine": p.machine,
+                        "seen_at": p.seen_at.to_rfc3339(),
+                        "ferry_version": p.ferry_version,
+                        "paused": p.paused,
+                        "held": p.held,
+                        "sig": sig(check),
+                    })
+                });
             let (engine, last_active, runs) = match runs.get(&agent.name) {
                 Some(info) => (
                     Some(info.engine.clone()),
@@ -2196,6 +2216,8 @@ async fn roster(
                 "engine": engine,
                 "last_active": last_active,
                 "runs": runs,
+                "presence": seen,
+                "absent": absent.iter().any(|a| a.agent.eq_ignore_ascii_case(&agent.name)),
             })
         })
         .collect();

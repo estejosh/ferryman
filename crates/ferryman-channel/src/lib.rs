@@ -39,6 +39,7 @@ pub mod migration;
 pub mod owner;
 pub mod portable_auth;
 pub mod quantly;
+pub mod receipts;
 pub mod release;
 pub mod secrets;
 pub mod seed;
@@ -1578,8 +1579,17 @@ pub fn dependencies_satisfied(route: &ProjectRoute, order: &Order) -> Result<boo
 }
 
 pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
+    work_among(route, agent, list_tasks(route)?)
+}
+
+/// [`work_for`], over tasks the caller has already read.
+///
+/// The worker reads the channel once per pass and uses it twice: for receipts, which
+/// it writes whether or not it may work, and for the work itself. Reading every task
+/// directory twice to answer both would double the cost of a pass for nothing.
+pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result<Vec<Task>> {
     let mut out = Vec::new();
-    for task in list_tasks(route)? {
+    for task in tasks {
         // The same trust boundary the loop enforces before it acts. This was missing
         // here, and the gap had a name: `ferry agent run --dry-run` printed
         // `postpurge-20260827  claim it, then run the agent` for an order the real loop
