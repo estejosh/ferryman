@@ -676,6 +676,192 @@ pub fn short_age(age: Duration) -> String {
     }
 }
 
+// --- engines ------------------------------------------------------------------------------
+//
+// Presence says a worker is alive. The engines file beside it says what that worker can
+// run right now: which engines, which are out of credit and until when, which answered
+// their last probe. It is what lets anyone ask "who can build this week" without asking
+// every machine. Same rules as presence: one writer, signed, rewritten at most every
+// five minutes - sooner only when an engine's state actually changed, and never more
+// than once a minute. It never carries a credential or a reference to one.
+
+/// The least time between two rewrites of one worker's engines file, even when
+/// something changed.
+pub const ENGINES_MIN_SECS: i64 = 60;
+
+/// One engine, as the worker running it reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EngineReport {
+    pub name: String,
+    /// `cli` or `http`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `judge`, `build` or `chore`.
+    pub tier: String,
+    /// `subscription`, `prepaid`, `free-tier`, `local` or `unknown`.
+    pub paid: String,
+    /// `up`, `down`, `exhausted` or `unknown`.
+    pub state: String,
+    /// When an exhausted engine is expected back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+}
+
+impl EngineReport {
+    /// The report without what changes on every probe, for deciding whether anything
+    /// worth telling the fleet has changed.
+    fn settled(&self) -> Self {
+        Self {
+            latency_ms: None,
+            checked_at: None,
+            ..self.clone()
+        }
+    }
+}
+
+/// A worker's engines, signed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EngineInventory {
+    pub agent: String,
+    pub machine: String,
+    pub updated_at: DateTime<Utc>,
+    pub ferry_version: String,
+    pub engines: Vec<EngineReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+fn engines_payload(inventory: &EngineInventory) -> String {
+    format!(
+        "ferryman-engines-v1\n{}\n{}\n{}\n{}\n{}",
+        inventory.agent,
+        inventory.machine,
+        inventory.updated_at.to_rfc3339(),
+        inventory.ferry_version,
+        serde_jcs::to_string(&inventory.engines).unwrap_or_default(),
+    )
+}
+
+fn engines_path(route: &ProjectRoute, agent: &str) -> PathBuf {
+    route
+        .communications
+        .join("engines")
+        .join(format!("{agent}.json"))
+}
+
+/// Who says this is what their worker can run, checkably.
+#[must_use]
+pub fn verify_engines(inventory: &EngineInventory, roster: &[AgentRoute]) -> SignatureCheck {
+    verify_as(
+        &inventory.agent,
+        inventory.signed_by.as_ref(),
+        inventory.signature.as_ref(),
+        &engines_payload(inventory),
+        roster,
+    )
+}
+
+/// Publish this worker's engines, signed. Returns whether anything was written.
+///
+/// Written when the last write is five minutes old, or when an engine's state changed
+/// and the last write is at least a minute old. A clock that went backwards past the
+/// last write counts as due, as for presence.
+pub fn refresh_engines(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    machine: &str,
+    ferry_version: &str,
+    engines: Vec<EngineReport>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let agent = identity.name();
+    if !is_safe_component(agent) {
+        bail!("agent name must be a path-safe identifier")
+    }
+    let path = engines_path(route, agent);
+    if let Ok(text) = fs::read_to_string(&path)
+        && let Ok(existing) = serde_json::from_str::<EngineInventory>(&text)
+        && existing.agent.eq_ignore_ascii_case(agent)
+    {
+        let since = now.signed_duration_since(existing.updated_at);
+        if since >= Duration::zero() {
+            let changed = existing.engines.len() != engines.len()
+                || existing
+                    .engines
+                    .iter()
+                    .zip(&engines)
+                    .any(|(old, new)| old.settled() != new.settled());
+            let floor = if changed {
+                ENGINES_MIN_SECS
+            } else {
+                PRESENCE_REFRESH_SECS
+            };
+            if since < Duration::seconds(floor) {
+                return Ok(false);
+            }
+        }
+    }
+    let mut inventory = EngineInventory {
+        agent: agent.to_string(),
+        machine: machine.to_string(),
+        updated_at: now,
+        ferry_version: ferry_version.to_string(),
+        engines,
+        signed_by: Some(agent.to_string()),
+        signature: None,
+    };
+    inventory.signature = Some(identity.sign_bytes(engines_payload(&inventory).as_bytes()));
+    write_task_file(&path, &inventory)?;
+    Ok(true)
+}
+
+/// Every worker's engines file in this channel, newest valid one per agent first.
+pub fn list_engines(route: &ProjectRoute) -> Result<Vec<(EngineInventory, SignatureCheck)>> {
+    let Ok(entries) = fs::read_dir(route.communications.join("engines")) else {
+        return Ok(Vec::new());
+    };
+    let mut all: Vec<(EngineInventory, SignatureCheck)> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|text| serde_json::from_str::<EngineInventory>(&text).ok())
+        .map(|inventory| {
+            let check = verify_engines(&inventory, &route.agents);
+            (inventory, check)
+        })
+        .collect();
+    all.sort_by(|(a, a_check), (b, b_check)| {
+        (*b_check == SignatureCheck::Valid)
+            .cmp(&(*a_check == SignatureCheck::Valid))
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    let mut kept: Vec<(EngineInventory, SignatureCheck)> = Vec::new();
+    for (inventory, check) in all {
+        if !kept
+            .iter()
+            .any(|(i, _)| i.agent.eq_ignore_ascii_case(&inventory.agent))
+        {
+            kept.push((inventory, check));
+        }
+    }
+    Ok(kept)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1070,5 +1256,124 @@ mod tests {
         assert_eq!(short_age(Duration::minutes(12)), "12m");
         assert_eq!(short_age(Duration::hours(3)), "3h");
         assert_eq!(short_age(Duration::days(9)), "9d");
+    }
+
+    fn engine(state: &str) -> EngineReport {
+        EngineReport {
+            name: "nvidia".into(),
+            kind: "http".into(),
+            model: Some("qwen/qwen3-coder".into()),
+            tier: "build".into(),
+            paid: "free-tier".into(),
+            state: state.into(),
+            until: None,
+            reason: None,
+            latency_ms: Some(8000),
+            balance: None,
+            checked_at: Some(Utc::now()),
+        }
+    }
+
+    #[test]
+    fn the_engines_file_is_signed_and_rate_limited_like_presence() {
+        let (_t, route, fang, _, _) = channel();
+        let start = Utc::now();
+        assert!(
+            refresh_engines(
+                &route,
+                &fang,
+                "grouchly",
+                "0.5.15",
+                vec![engine("up")],
+                start
+            )
+            .unwrap()
+        );
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        assert_eq!(listed[0].0.machine, "grouchly");
+
+        // Only the latency moved: nothing worth a write for five minutes.
+        let mut slower = engine("up");
+        slower.latency_ms = Some(40_000);
+        assert!(
+            !refresh_engines(
+                &route,
+                &fang,
+                "grouchly",
+                "0.5.15",
+                vec![slower.clone()],
+                start + Duration::minutes(4)
+            )
+            .unwrap()
+        );
+        // A real change waits only for the one-minute floor.
+        assert!(
+            !refresh_engines(
+                &route,
+                &fang,
+                "grouchly",
+                "0.5.15",
+                vec![engine("exhausted")],
+                start + Duration::seconds(30)
+            )
+            .unwrap()
+        );
+        assert!(
+            refresh_engines(
+                &route,
+                &fang,
+                "grouchly",
+                "0.5.15",
+                vec![engine("exhausted")],
+                start + Duration::seconds(90)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            list_engines(&route).unwrap()[0].0.engines[0].state,
+            "exhausted"
+        );
+        assert!(
+            refresh_engines(
+                &route,
+                &fang,
+                "grouchly",
+                "0.5.15",
+                vec![slower],
+                start + Duration::minutes(7)
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn an_engines_file_edited_or_written_for_someone_else_does_not_verify() {
+        let (_t, route, fang, nebra, _) = channel();
+        refresh_engines(
+            &route,
+            &fang,
+            "grouchly",
+            "0",
+            vec![engine("up")],
+            Utc::now(),
+        )
+        .unwrap();
+        let path = engines_path(&route, "fang");
+        let mut tampered: EngineInventory =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        tampered.engines[0].state = "exhausted".into();
+        write_task_file(&path, &tampered).unwrap();
+        assert_eq!(list_engines(&route).unwrap()[0].1, SignatureCheck::Invalid);
+
+        // nebra signing a file about fang is a forgery of fang's record.
+        let mut forged = tampered.clone();
+        forged.signed_by = Some("nebra".into());
+        forged.signature = Some(nebra.sign_bytes(engines_payload(&forged).as_bytes()));
+        assert_eq!(
+            verify_engines(&forged, &route.agents),
+            SignatureCheck::Invalid
+        );
     }
 }

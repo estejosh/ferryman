@@ -265,6 +265,15 @@ pub struct AgentConfig {
     /// cache mid-run, and so a file that has been moved or deleted is a loud failure
     /// before any work is claimed rather than a quiet degradation forty tasks in.
     pub preamble: Option<String>,
+    /// Every engine this agent may run, in the operator's order of preference. Without
+    /// an `engines` list it is the one engine `command` names, so an old config works
+    /// exactly as it did. See [`crate::engines`].
+    pub engines: Vec<crate::engines::EngineSpec>,
+    /// The engine this config is running right now, set by [`Self::with_engine`].
+    /// `None` runs `command` as it always has.
+    pub active: Option<crate::engines::EngineSpec>,
+    /// Let the worker run `ferry improve run` itself, at most hourly.
+    pub improve: bool,
 }
 
 impl AgentConfig {
@@ -345,6 +354,38 @@ impl AgentConfig {
         Ok(config)
     }
 
+    /// This config, running `engine` instead of whatever it would have run.
+    #[must_use]
+    pub fn with_engine(&self, engine: &crate::engines::EngineSpec) -> Self {
+        let mut config = self.clone();
+        if engine.kind == crate::engines::Kind::Cli {
+            config.command.clone_from(&engine.command);
+            config.args = engine.cli_args();
+        } else {
+            config.command.clone_from(&engine.name);
+        }
+        if engine.model.is_some() {
+            config.model.clone_from(&engine.model);
+        }
+        config.active = Some(engine.clone());
+        config
+    }
+
+    /// The engine this config runs: the active one, or the first configured.
+    #[must_use]
+    pub fn engine(&self) -> crate::engines::EngineSpec {
+        self.active
+            .clone()
+            .or_else(|| self.engines.first().cloned())
+            .unwrap_or_else(|| {
+                crate::engines::EngineSpec::implicit(
+                    &self.command,
+                    &self.args,
+                    self.model.as_deref(),
+                )
+            })
+    }
+
     /// Read the configured preamble, and refuse to start without it.
     ///
     /// A missing preamble is an error, not an empty string. The whole value of this file
@@ -412,15 +453,21 @@ impl AgentConfig {
                     .with_context(|| format!("{key} must be a whole number of seconds")),
             }
         };
+        let command = take("command")?;
+        let model = fields.get("model").cloned().filter(|m| !m.is_empty());
+        let engines = crate::engines::parse_engines(&fields, &command, &args, model.as_deref())?;
         Ok(Self {
             agent: take("agent")?,
             role: fields
                 .get("role")
                 .cloned()
                 .unwrap_or_else(|| "worker".to_string()),
-            command: take("command")?,
+            command,
             args,
-            model: fields.get("model").cloned().filter(|m| !m.is_empty()),
+            model,
+            engines,
+            active: None,
+            improve: fields.get("improve").map(String::as_str) == Some("true"),
             mcp: match fields.get("mcp").map(String::as_str) {
                 None | Some("false") => false,
                 Some("true") => true,
@@ -665,6 +712,23 @@ idle_after_secs = "300"
 # paths resolve against this directory. If the file is named but cannot be read,
 # the agent refuses to start rather than quietly working without it.
 # preamble_file = "preamble.md"
+
+# More than one engine, in order of preference. When one runs out of credit the
+# same order goes straight to the next and nothing is counted against it. Each is
+# a CLI (the command above, unless it names its own) or an OpenAI-compatible
+# endpoint. Keys are secret:NAME or env:NAME, never the key. docs/ENGINE_SETUP.md
+# has the rest: tiers, weekly caps, local models.
+# engines = ["nvidia", "main"]
+# engine.nvidia.base_url = "https://integrate.api.nvidia.com/v1"
+# engine.nvidia.model = "qwen/qwen3-coder-480b-a35b-instruct"
+# engine.nvidia.key = "secret:NVIDIA_API_KEY"
+# engine.nvidia.tier = "build"
+# engine.main.kind = "cli"
+# engine.main.tier = "build"
+
+# Let this worker run the weekly improvement loop (ferry improve run) itself, at
+# most hourly. Off by default; n8n or cron can run it instead.
+# improve = "true"
 "#,
             review = review.as_str(),
             sandbox = sandbox.unwrap_or(""),
@@ -674,11 +738,75 @@ idle_after_secs = "300"
 }
 
 /// What the agent CLI printed, and whether it got to finish.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct AgentRun {
     stdout: String,
     stderr: String,
     ok: bool,
+    /// What the engine reported spending, when it reported it outside stdout.
+    usage: Option<ferryman_channel::trajectory::TokenUsage>,
+    /// An HTTP engine that nothing answered for.
+    unreachable: bool,
+}
+
+/// Run whichever engine `config` is set to: its CLI, or one request to its endpoint.
+///
+/// `key` is an endpoint's resolved key and goes nowhere else; a CLI engine's own
+/// environment arrives with the operator's `credentials`, as every CLI secret does.
+async fn run_engine(
+    config: &AgentConfig,
+    workspace: &Path,
+    prompt: &str,
+    credentials: &[(String, String)],
+    key: Option<&str>,
+    heartbeat: Option<TaskHeartbeat>,
+) -> Result<AgentRun> {
+    match config
+        .active
+        .as_ref()
+        .filter(|engine| engine.kind == crate::engines::Kind::Http)
+    {
+        Some(engine) => {
+            // Written once, removed when the request is done: an HTTP engine has no
+            // child process, but the claim still needs a live heartbeat.
+            let heartbeat = heartbeat.inspect(TaskHeartbeat::write);
+            let run = crate::engines::chat(engine, key, prompt, config.timeout).await;
+            drop(heartbeat);
+            Ok(AgentRun {
+                stdout: run.text,
+                stderr: run.detail,
+                ok: run.ok,
+                usage: run.usage,
+                unreachable: run.unreachable,
+            })
+        }
+        None => run_agent(config, workspace, prompt, credentials, heartbeat).await,
+    }
+}
+
+/// Why the engine this config runs cannot take the work, when the reason is its wallet
+/// or its reachability rather than the work.
+fn unavailable(config: &AgentConfig, run: &AgentRun) -> Option<crate::engines::Unavailable> {
+    let engine = config.engine().name;
+    // The whole of stderr and the end of stdout: an engine that explains itself on
+    // stdout usually does so last, after pages of progress.
+    let stdout_tail: String = {
+        let chars: Vec<char> = run.stdout.chars().collect();
+        chars[chars.len().saturating_sub(4000)..].iter().collect()
+    };
+    let said = format!("{}\n{stdout_tail}", run.stderr);
+    if let Some(until) = crate::engines::quota_reset(&said, chrono::Utc::now()) {
+        return Some(crate::engines::Unavailable {
+            engine,
+            until: Some(until),
+            reason: engine_failure_detail(run),
+        });
+    }
+    run.unreachable.then(|| crate::engines::Unavailable {
+        engine,
+        until: None,
+        reason: engine_failure_detail(run),
+    })
 }
 
 /// The most bytes of engine output worth putting in one error.
@@ -1198,6 +1326,7 @@ async fn run_agent(
                 stdout,
                 stderr,
                 ok: status.success(),
+                ..AgentRun::default()
             });
         }
         poll.tick().await;
@@ -2144,6 +2273,8 @@ pub async fn work_once(
     // machine that says nothing is indistinguishable from one the channel never reached.
     note_deliveries(route, config, &identity, &tasks, report);
     let waiting = ferryman_channel::work_among(route, &config.agent, tasks)?;
+    // Probe first, so the decision below sees an engine that came back since last time.
+    note_engines(route, config, &identity, report).await;
     let held = hold_off(route, config, !waiting.is_empty())?;
     note_presence(route, &identity, held.clone(), report);
     if let Some(reason) = held {
@@ -2170,6 +2301,19 @@ pub async fn work_once(
             // Without it an order addressed to a machine that never ran looks exactly like
             // one being worked on.
             TaskState::Open | TaskState::Offered { .. } => {
+                // Nothing here can run an order of this tier right now: leave it for a
+                // machine that can, rather than claim it and sit on it.
+                if crate::engines::pick(
+                    &config.engines,
+                    &crate::engines::Ledger::load(&config.agent),
+                    chrono::Utc::now(),
+                    order_tier(&task),
+                    &[],
+                )
+                .is_none()
+                {
+                    continue;
+                }
                 ferryman_channel::claim_order(route, &id, &config.agent)?;
                 // Re-read: another machine's claim may have arrived while this one was
                 // being written, and the older claim wins. Acting on a stale read is
@@ -2250,6 +2394,15 @@ fn hold_off(
     }
     if let crate::governor::Decision::Wait(reason) = crate::governor::may_claim(config) {
         return Ok(Some(reason));
+    }
+    // Claiming work no engine here can do would only hold it away from a machine that
+    // can. Said in the presence file, so the fleet can see why.
+    if let Some(why) = crate::engines::all_exhausted(
+        &config.engines,
+        &crate::engines::Ledger::load(&config.agent),
+        chrono::Utc::now(),
+    ) {
+        return Ok(Some(why));
     }
     // In a grant-gated team, only a worker works without the master's grant; any
     // other role waits for one. Full-permissions projects (`grants = "open"`) skip
@@ -2334,6 +2487,32 @@ fn note_presence(
         report.warn(&format!(
             "could not write this worker's presence: {error:#}"
         ));
+    }
+}
+
+/// Probe the engines that are due, and publish what this worker can run. Nothing is
+/// probed while the machine is paused; the inventory is still published, rate-limited
+/// inside, so the fleet sees the last known state.
+async fn note_engines(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    report: &dyn Progress,
+) {
+    let now = chrono::Utc::now();
+    if crate::governor::paused().is_none() {
+        crate::engines::probe_due(route, &config.agent, &config.engines, now).await;
+    }
+    let ledger = crate::engines::Ledger::load(&config.agent);
+    if let Err(error) = ferryman_channel::receipts::refresh_engines(
+        route,
+        identity,
+        &ferryman_channel::receipts::machine_label(),
+        env!("CARGO_PKG_VERSION"),
+        crate::engines::reports(&config.engines, &ledger, now),
+        now,
+    ) {
+        report.warn(&format!("could not write this worker's engines: {error:#}"));
     }
 }
 
@@ -2478,7 +2657,56 @@ async fn attempt(
         Attempt::Now => {}
     }
 
-    match do_work(route, config, identity, task, report).await {
+    // Engine fallback. An engine that is out of credit, or cannot run here, is not a
+    // failed attempt: it is marked, and the same order goes straight to the next engine
+    // at its tier or above. Each engine is tried at most once per attempt, so this ends.
+    let wanted = order_tier(task);
+    let mut tried: Vec<String> = Vec::new();
+    let result = loop {
+        let ledger = crate::engines::Ledger::load(&config.agent);
+        let Some(engine) =
+            crate::engines::pick(&config.engines, &ledger, chrono::Utc::now(), wanted, &tried)
+                .cloned()
+        else {
+            report.warn(&format!(
+                "  {id}: no {} engine can run it now ({}); it waits, and nothing is counted \
+                 against it",
+                wanted.as_str(),
+                if tried.is_empty() {
+                    "every one is out of credit or below its tier".to_string()
+                } else {
+                    format!("tried {}", tried.join(", "))
+                }
+            ));
+            // Held here it would wait for this machine's engines; let go, so a machine
+            // whose engines are up can take it.
+            let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
+            return false;
+        };
+        tried.push(engine.name.clone());
+        let effective = config.with_engine(&engine);
+        match do_work(route, &effective, identity, task, report).await {
+            Err(error)
+                if error
+                    .downcast_ref::<crate::engines::Unavailable>()
+                    .is_some() =>
+            {
+                if let Some(skip) = error.downcast_ref::<crate::engines::Unavailable>() {
+                    if let Some(until) = skip.until {
+                        crate::engines::mark_exhausted(
+                            &config.agent,
+                            &skip.engine,
+                            until,
+                            &skip.reason,
+                        );
+                    }
+                    report.warn(&format!("  {id}: {skip}; trying the next engine"));
+                }
+            }
+            other => break other,
+        }
+    };
+    match result {
         Ok(()) => {
             if let Ok(mut ledger) = attempt_ledger().lock() {
                 ledger.succeeded(&route.project_id, id);
@@ -2513,6 +2741,115 @@ async fn attempt(
     }
 }
 
+/// The tier an order asks for: `"tier": "chore"` in its payload, otherwise build.
+fn order_tier(task: &Task) -> crate::engines::Tier {
+    task.order
+        .payload
+        .get("tier")
+        .and_then(Value::as_str)
+        .and_then(|tier| crate::engines::Tier::parse(tier).ok())
+        .unwrap_or(crate::engines::Tier::Build)
+}
+
+/// Environment for a CLI engine, and the key for an endpoint engine.
+type EngineCredentials = (Vec<(String, String)>, Option<String>);
+
+/// The operator's credentials plus the running engine's own environment, resolved, and
+/// the engine's key when it is an endpoint.
+///
+/// An engine whose secret this channel does not hold, or whose environment variable is
+/// not set, cannot run here - which is [`crate::engines::Unavailable`], so the next
+/// engine is tried instead of the order being failed.
+fn engine_credentials(route: &ProjectRoute, config: &AgentConfig) -> Result<EngineCredentials> {
+    let loaded =
+        ferryman_channel::credentials::load_credentials(&route.attachment).unwrap_or_default();
+    let encryption = ferryman_channel::secrets::EncryptionIdentity::load_existing(
+        &config.agent,
+        &route.attachment,
+    )?;
+    let mut credentials: Vec<(String, String)> =
+        ferryman_channel::secrets::resolve_credentials(route, loaded, encryption.as_ref())?
+            .into_iter()
+            .collect();
+    let Some(engine) = &config.active else {
+        return Ok((credentials, None));
+    };
+    let cannot = |error: anyhow::Error| crate::engines::Unavailable {
+        engine: engine.name.clone(),
+        until: None,
+        reason: format!("{error:#}"),
+    };
+    match engine.kind {
+        crate::engines::Kind::Cli => {
+            let own = crate::engines::engine_env(route, &config.agent, engine).map_err(cannot)?;
+            // The engine's own settings win over a same-named operator credential.
+            credentials.retain(|(name, _)| !own.iter().any(|(own_name, _)| own_name == name));
+            credentials.extend(own);
+            Ok((credentials, None))
+        }
+        crate::engines::Kind::Http => {
+            let key = crate::engines::engine_key(route, &config.agent, engine).map_err(cannot)?;
+            Ok((Vec::new(), key))
+        }
+    }
+}
+
+/// Count a request against the engine's weekly caps, priced at list rates when the
+/// engine said what it spent.
+fn count_use(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    engine: &crate::engines::EngineSpec,
+    usage: Option<ferryman_channel::trajectory::TokenUsage>,
+) {
+    let cost = usage.map_or(0.0, |usage| {
+        let price = ferryman_channel::cost::Rates::load(route)
+            .price_for(engine.model.as_deref().unwrap_or(&engine.name));
+        (usage.prompt_tokens as f64 * price.prompt_per_million
+            + usage.completion_tokens as f64 * price.completion_per_million)
+            / 1_000_000.0
+    });
+    crate::engines::record_use(&config.agent, &engine.name, cost, chrono::Utc::now());
+}
+
+/// Ask an engine one question outside any order, in a scratch directory so a CLI
+/// engine cannot touch the project while it thinks. For planning and review.
+///
+/// Out of credit and unreachable come back as [`crate::engines::Unavailable`].
+pub async fn ask(route: &ProjectRoute, config: &AgentConfig, prompt: &str) -> Result<String> {
+    let (credentials, key) = engine_credentials(route, config)?;
+    let scratch = std::env::temp_dir().join(format!(
+        "ferryman-ask-{}-{}",
+        std::process::id(),
+        ferryman_channel::new_run_id()
+    ));
+    fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
+    let run = run_engine(
+        config,
+        &scratch,
+        &with_preamble(config, prompt.to_string()),
+        &credentials,
+        key.as_deref(),
+        None,
+    )
+    .await;
+    let _ = fs::remove_dir_all(&scratch);
+    let run = run?;
+    let usage = run.usage.or_else(|| engine_usage(&run.stdout));
+    count_use(route, config, &config.engine(), usage);
+    if !run.ok {
+        if let Some(skip) = unavailable(config, &run) {
+            return Err(skip.into());
+        }
+        bail!(
+            "'{}' failed: {}",
+            config.command,
+            engine_failure_detail(&run)
+        )
+    }
+    Ok(engine_answer(&run.stdout))
+}
+
 #[tracing::instrument(name = "do_work", skip(route, config, identity, task, report), fields(order = %task.order.id, agent = %config.agent))]
 async fn do_work(
     route: &ProjectRoute,
@@ -2529,6 +2866,15 @@ async fn do_work(
         "  {id}: running {} (revision {revision})",
         config.command
     ));
+
+    // Operator-listed credentials are the only secrets the agent CLI receives.
+    // A value of `secret:<name>` is resolved here, in the worker, before the
+    // agent CLI ever runs: the decrypted value is injected like any other
+    // credential, and a reference this machine cannot decrypt fails loudly
+    // rather than reaching the engine as an empty or literal string. Resolved before
+    // any worktree exists or any interrupt is acknowledged, so an engine that cannot run
+    // here leaves nothing behind and consumes nothing meant for the next one.
+    let (credentials, key) = engine_credentials(route, config)?;
 
     // An operator may interrupt a running task mid-flight. This is Ferryman's
     // answer to groundcrew's live-terminal takeover: a signed order the worker
@@ -2623,22 +2969,6 @@ async fn do_work(
             "The operator has sent a new instruction that takes precedence over your previous plan.\n\n{note}\n\n---\n\n{prompt}"
         );
     }
-    // Operator-listed credentials are the only secrets the agent CLI receives.
-    // A value of `secret:<name>` is resolved here, in the worker, before the
-    // agent CLI ever runs: the decrypted value is injected like any other
-    // credential, and a reference this machine cannot decrypt fails loudly
-    // rather than reaching the engine as an empty or literal string.
-    let credentials: Vec<(String, String)> = {
-        let loaded =
-            ferryman_channel::credentials::load_credentials(&route.attachment).unwrap_or_default();
-        let encryption = ferryman_channel::secrets::EncryptionIdentity::load_existing(
-            &config.agent,
-            &route.attachment,
-        )?;
-        ferryman_channel::secrets::resolve_credentials(route, loaded, encryption.as_ref())?
-            .into_iter()
-            .collect()
-    };
     if config.mcp {
         std::fs::write(workdir.join(".mcp.json"), gateway_config(&route.workspace))
             .context("write .mcp.json for the agent's MCP access")?;
@@ -2658,12 +2988,22 @@ async fn do_work(
             "  {id}: could not write the read receipt: {error:#}"
         ));
     }
-    let run = run_agent(config, &workdir, &prompt, &credentials, Some(heartbeat)).await?;
+    let run = run_engine(
+        config,
+        &workdir,
+        &prompt,
+        &credentials,
+        key.as_deref(),
+        Some(heartbeat),
+    )
+    .await?;
     // What the engine says it spent, when it says anything. Recorded twice on
     // purpose: into the trajectory (what the cost aggregator reads) and into
     // the signed result payload (what reviewers and the fleet can read without
     // access to this machine's trajectories).
-    let usage = engine_usage(&run.stdout);
+    let usage = run.usage.or_else(|| engine_usage(&run.stdout));
+    let engine = config.engine();
+    count_use(route, config, &engine, usage);
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
     // never fail the run itself.
@@ -2677,14 +3017,31 @@ async fn do_work(
             at: chrono::Utc::now(),
             ok: run.ok,
             prompt_digest: ferryman_channel::trajectory::digest(&prompt),
-            output: ferryman_channel::trajectory::truncate(&run.stdout),
+            // A failed request to an endpoint prints nothing; what it said is the
+            // record worth keeping.
+            output: ferryman_channel::trajectory::truncate(
+                if run.ok || !run.stdout.trim().is_empty() {
+                    &run.stdout
+                } else {
+                    &run.stderr
+                },
+            ),
             usage,
         },
     );
+    // Out of credit, or nothing answered: not this order's failure. Returned before
+    // anything is committed or published, and the worktree is left where it is: the
+    // next engine is handed the same checkout, with whatever the last one got done.
+    if !run.ok
+        && let Some(skip) = unavailable(config, &run)
+    {
+        return Err(skip.into());
+    }
 
     let mut payload = json!({
         "output": engine_answer(&run.stdout),
         "produced_by": config.command,
+        "engine": engine.name,
         "worktree_branch": branch,
     });
     if let Some(usage) = usage {
@@ -2845,6 +3202,21 @@ pub async fn review_once(
     config: &AgentConfig,
     report: &dyn Progress,
 ) -> Result<usize> {
+    review_where(route, config, report, |_| true).await
+}
+
+/// [`review_once`], over only the tasks `wanted` picks out.
+///
+/// When `config` runs a particular engine ([`AgentConfig::with_engine`]), a result
+/// another engine produced may be judged even though the same agent signed it: that is
+/// a different model reading the work, which is what review is for. Work the same
+/// engine produced is still skipped, as ever.
+pub async fn review_where(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    report: &dyn Progress,
+    wanted: impl Fn(&Task) -> bool,
+) -> Result<usize> {
     if config.review == ReviewMode::Off {
         report.info("review is off; results wait for a person");
         return Ok(0);
@@ -2856,6 +3228,9 @@ pub async fn review_once(
         let TaskState::AwaitingReview { by, revision } = task.state() else {
             continue;
         };
+        if !wanted(&task) {
+            continue;
+        }
         // Trust boundary: judge only work whose order and result signatures
         // verify. A forged order or result must not be reviewed as if real.
         let order_check = ferryman_channel::verify_order(&task.order, &route.agents);
@@ -2866,12 +3241,8 @@ pub async fn review_once(
         // The verdict of the revision under review, so the refusal can name it. An
         // absent result is not the same as a badly signed one and should not read the
         // same either.
-        let result_check = task
-            .results
-            .iter()
-            .find(|r| r.revision == revision)
-            .map(|r| ferryman_channel::verify_result(r, &route.agents));
-        match result_check {
+        let result = task.results.iter().find(|r| r.revision == revision);
+        match result.map(|r| ferryman_channel::verify_result(r, &route.agents)) {
             Some(ferryman_channel::SignatureCheck::Valid) => {}
             Some(check) => {
                 refuse_once(route, &task.order.id, "this result", check);
@@ -2891,7 +3262,14 @@ pub async fn review_once(
         // machine configured as both worker and reviewer would otherwise look like a
         // reviewer that silently does nothing, and the operator would go hunting for a
         // bug instead of starting a second agent.
-        if by == config.agent {
+        let produced_by = result
+            .and_then(|r| r.payload.get("engine"))
+            .and_then(Value::as_str);
+        let another_engine = config
+            .active
+            .as_ref()
+            .is_some_and(|engine| produced_by.is_some_and(|made| made != engine.name));
+        if by == config.agent && !another_engine {
             skipped_own += 1;
             continue;
         }
@@ -2899,88 +3277,7 @@ pub async fn review_once(
         if task.pending_recommendation().is_some() {
             continue;
         }
-        let id = task.order.id.clone();
-        report.info(&format!("  {id}: judging revision {revision}"));
-        let credentials: Vec<(String, String)> =
-            ferryman_channel::credentials::load_credentials(&route.attachment)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-        // The reviewer sees the same peer roster, so it too can flag when another
-        // agent was better suited to the work it is judging.
-        let task_text = task
-            .order
-            .payload
-            .get("task")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| task.order.payload.to_string());
-        let roster = peer_roster_block(route, &config.agent, &task_text);
-        let run = run_agent(
-            config,
-            &route.workspace,
-            &review_prompt(config, &task, revision, &roster),
-            &credentials,
-            None,
-        )
-        .await?;
-        if !run.ok {
-            bail!(
-                "'{}' failed reviewing {id}: {}",
-                config.command,
-                engine_failure_detail(&run)
-            )
-        }
-        let verdict = parse_verdict(&run.stdout)
-            .with_context(|| format!("could not read a verdict for {id}"))?;
-        match config.review {
-            ReviewMode::Auto => {
-                let mut review = Review {
-                    order_id: id.clone(),
-                    revision,
-                    reviewer: config.agent.clone(),
-                    reviewed_at: chrono::Utc::now(),
-                    accepted: verdict.accept,
-                    notes: Some(verdict.reasoning.clone()),
-                    signed_by: None,
-                    signature: None,
-                };
-                identity.sign_review(&mut review);
-                ferryman_channel::submit_review(route, &review)?;
-                report.info(&format!(
-                    "  {id}: {} - {}",
-                    if verdict.accept {
-                        "accepted"
-                    } else {
-                        "sent back"
-                    },
-                    verdict.reasoning
-                ));
-            }
-            ReviewMode::Confirm => {
-                let mut recommendation = Recommendation {
-                    order_id: id.clone(),
-                    revision,
-                    reviewer: config.agent.clone(),
-                    recommended_at: chrono::Utc::now(),
-                    accept: verdict.accept,
-                    reasoning: verdict.reasoning.clone(),
-                    signed_by: None,
-                    signature: None,
-                };
-                identity.sign_recommendation(&mut recommendation);
-                ferryman_channel::submit_recommendation(route, &recommendation)?;
-                report.info(&format!(
-                    "  {id}: recommends {} - {}",
-                    if verdict.accept { "accept" } else { "changes" },
-                    verdict.reasoning
-                ));
-                report.info(&format!(
-                    "  {id}: waiting for a human; settle it with 'ferry channel review'"
-                ));
-            }
-            ReviewMode::Off => unreachable!("returned above"),
-        }
+        judge(route, config, &identity, &task, revision, report).await?;
         acted += 1;
     }
     if acted == 0 && skipped_own > 0 {
@@ -2991,6 +3288,106 @@ pub async fn review_once(
         ));
     }
     Ok(acted)
+}
+
+/// Judge one result and record the verdict, as far as the configured authority goes.
+async fn judge(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    task: &Task,
+    revision: u32,
+    report: &dyn Progress,
+) -> Result<()> {
+    let id = task.order.id.clone();
+    report.info(&format!("  {id}: judging revision {revision}"));
+    let (credentials, key) = engine_credentials(route, config)?;
+    // The reviewer sees the same peer roster, so it too can flag when another
+    // agent was better suited to the work it is judging.
+    let task_text = task
+        .order
+        .payload
+        .get("task")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| task.order.payload.to_string());
+    let roster = peer_roster_block(route, &config.agent, &task_text);
+    let run = run_engine(
+        config,
+        &route.workspace,
+        &review_prompt(config, task, revision, &roster),
+        &credentials,
+        key.as_deref(),
+        None,
+    )
+    .await?;
+    count_use(
+        route,
+        config,
+        &config.engine(),
+        run.usage.or_else(|| engine_usage(&run.stdout)),
+    );
+    if !run.ok {
+        if let Some(skip) = unavailable(config, &run) {
+            return Err(skip.into());
+        }
+        bail!(
+            "'{}' failed reviewing {id}: {}",
+            config.command,
+            engine_failure_detail(&run)
+        )
+    }
+    let verdict =
+        parse_verdict(&run.stdout).with_context(|| format!("could not read a verdict for {id}"))?;
+    match config.review {
+        ReviewMode::Auto => {
+            let mut review = Review {
+                order_id: id.clone(),
+                revision,
+                reviewer: config.agent.clone(),
+                reviewed_at: chrono::Utc::now(),
+                accepted: verdict.accept,
+                notes: Some(verdict.reasoning.clone()),
+                signed_by: None,
+                signature: None,
+            };
+            identity.sign_review(&mut review);
+            ferryman_channel::submit_review(route, &review)?;
+            report.info(&format!(
+                "  {id}: {} - {}",
+                if verdict.accept {
+                    "accepted"
+                } else {
+                    "sent back"
+                },
+                verdict.reasoning
+            ));
+        }
+        ReviewMode::Confirm => {
+            let mut recommendation = Recommendation {
+                order_id: id.clone(),
+                revision,
+                reviewer: config.agent.clone(),
+                recommended_at: chrono::Utc::now(),
+                accept: verdict.accept,
+                reasoning: verdict.reasoning.clone(),
+                signed_by: None,
+                signature: None,
+            };
+            identity.sign_recommendation(&mut recommendation);
+            ferryman_channel::submit_recommendation(route, &recommendation)?;
+            report.info(&format!(
+                "  {id}: recommends {} - {}",
+                if verdict.accept { "accept" } else { "changes" },
+                verdict.reasoning
+            ));
+            report.info(&format!(
+                "  {id}: waiting for a human; settle it with 'ferry channel review'"
+            ));
+        }
+        ReviewMode::Off => unreachable!("review_where returns before judging when off"),
+    }
+    Ok(())
 }
 
 /// Everything a human has been asked to settle.
@@ -3133,6 +3530,7 @@ mod tests {
                 .into(),
             stderr: String::new(),
             ok: false,
+            ..AgentRun::default()
         };
         let detail = engine_failure_detail(&run);
         assert!(detail.contains("OAuth session expired"), "got: {detail}");
@@ -3146,6 +3544,7 @@ mod tests {
             stdout: "some progress chatter".into(),
             stderr: "error: could not open config".into(),
             ok: false,
+            ..AgentRun::default()
         };
         assert_eq!(engine_failure_detail(&run), "error: could not open config");
     }
@@ -3160,6 +3559,7 @@ mod tests {
                      Failed to authenticate: OAuth session expired\n"
                 .into(),
             ok: false,
+            ..AgentRun::default()
         };
         assert!(
             engine_failure_detail(&run).contains("Failed to authenticate"),
@@ -3175,6 +3575,7 @@ mod tests {
             stdout: "   \n".into(),
             stderr: "\n\n".into(),
             ok: false,
+            ..AgentRun::default()
         };
         let detail = engine_failure_detail(&run);
         assert!(
@@ -3191,6 +3592,7 @@ mod tests {
             stdout: String::new(),
             stderr: "é".repeat(5000),
             ok: false,
+            ..AgentRun::default()
         };
         let detail = engine_failure_detail(&run);
         assert!(
@@ -4520,6 +4922,118 @@ mod tests {
             receipts.delivered[0].0.delivered_at <= receipts.read[0].0.read_at,
             "delivered comes first"
         );
+    }
+
+    /// The grouchly example in docs/ENGINE_SETUP.md, as written there.
+    #[test]
+    fn the_documented_two_engine_config_parses_as_described() {
+        let doc = include_str!("../../../docs/ENGINE_SETUP.md");
+        let start = doc
+            .find("agent = \"ichabod-grouchly-cline\"")
+            .expect("the example is in the doc");
+        let example = &doc[start..start + doc[start..].find("```").unwrap()];
+        let config = AgentConfig::parse(example).unwrap();
+        let [nvidia, deepseek] = config.engines.as_slice() else {
+            panic!("two engines: {:?}", config.engines)
+        };
+        assert_eq!(nvidia.kind, crate::engines::Kind::Cli);
+        assert_eq!(nvidia.command, "ferryman-cline");
+        assert!(nvidia.probe_chat);
+        assert_eq!(nvidia.key.as_deref(), Some("secret:NVIDIA_API_KEY"));
+        assert!(
+            nvidia
+                .env
+                .iter()
+                .any(|(name, value)| name == "OPENAI_API_KEY" && value == "secret:NVIDIA_API_KEY")
+        );
+        assert_eq!(nvidia.weekly_requests, Some(400));
+        assert_eq!(deepseek.kind, crate::engines::Kind::Cli);
+        assert_eq!(deepseek.command, "ferryman-cline");
+        assert_eq!(deepseek.paid, crate::engines::Paid::Prepaid);
+        assert_eq!(deepseek.weekly_usd, Some(5.0));
+        assert_eq!(
+            deepseek.args,
+            AgentConfig::parse("agent = \"a\"\ncommand = \"c\"\n")
+                .unwrap()
+                .args
+        );
+        let running = config.with_engine(nvidia);
+        assert_eq!(running.command, "ferryman-cline");
+        assert_eq!(
+            running.model.as_deref(),
+            Some("nvidia/nemotron-3-super-120b-a12b")
+        );
+    }
+    /// Two endpoint engines: the first answers every prompt with "Insufficient
+    /// Balance", the way grouchly's DeepSeek did; the second works.
+    const TWO_ENGINES: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+         engines = [\"broke\", \"free\"]\n\
+         engine.broke.base_url = \"fake://quota\"\nengine.broke.model = \"m\"\n\
+         engine.free.base_url = \"fake://ok:the work is done\"\nengine.free.model = \"m\"\n";
+
+    #[tokio::test]
+    async fn an_engine_out_of_credit_hands_the_order_to_the_next_without_counting_an_attempt() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-fallback", TWO_ENGINES);
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 1, "the order was done in the same pass");
+        let task = ferryman_channel::read_task(&route, "t-fallback").unwrap();
+        assert_eq!(task.results.len(), 1);
+        assert_eq!(task.results[0].payload["engine"], "free");
+        assert_eq!(task.results[0].payload["output"], "the work is done");
+        let ledger = crate::engines::Ledger::load("wisp");
+        assert!(
+            ledger
+                .state("broke")
+                .exhausted_until
+                .is_some_and(|until| until > chrono::Utc::now()),
+            "the engine that ran out is marked: {ledger:?}"
+        );
+        let key = (route.project_id.clone(), "t-fallback".to_string());
+        assert!(
+            !attempt_ledger().lock().unwrap().failures.contains_key(&key),
+            "running out of credit is not a failed attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_every_engine_out_of_credit_the_worker_holds_off_and_says_why() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-all-broke", TWO_ENGINES);
+        let until = chrono::Utc::now() + chrono::Duration::hours(2);
+        crate::engines::mark_exhausted("wisp", "broke", until, "Insufficient Balance");
+        crate::engines::mark_exhausted("wisp", "free", until, "weekly cap reached");
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 0);
+        let task = ferryman_channel::read_task(&route, "t-all-broke").unwrap();
+        assert!(
+            task.claims.is_empty(),
+            "nothing is claimed that nothing can run"
+        );
+        let presence = ferryman_channel::receipts::list_presence(&route).unwrap();
+        assert!(
+            presence[0]
+                .0
+                .held
+                .as_deref()
+                .is_some_and(|why| why.contains("out of credit")),
+            "{:?}",
+            presence[0].0.held
+        );
+        let engines = ferryman_channel::receipts::list_engines(&route).unwrap();
+        assert_eq!(
+            engines.len(),
+            1,
+            "the inventory is published beside presence"
+        );
+        assert!(engines[0].0.engines.iter().all(|e| e.state == "exhausted"));
     }
 }
 
