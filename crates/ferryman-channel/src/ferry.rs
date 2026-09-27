@@ -156,6 +156,155 @@ impl Entry {
     }
 }
 
+/// Refuse unless `signer` is the master of the project in `channel`, by the key the
+/// channel knows the master by. `what` finishes "only the master can ...".
+fn require_master(
+    channel: &Path,
+    project_id: &str,
+    signer: &AgentIdentity,
+    what: &str,
+) -> Result<()> {
+    let roster = crate::read_agent_roster(channel)?;
+    let Some(master) = crate::master::read_master_at(channel, &roster)? else {
+        bail!("{project_id} has no master, and only a project's master can {what}");
+    };
+    if !signer.name().eq_ignore_ascii_case(&master.master) {
+        bail!(
+            "only {}, {project_id}'s master, can {what} - not {}",
+            master.master,
+            signer.name()
+        );
+    }
+    // The name is not the proof; the key is. A key minted under the master's name
+    // would sign a mark no machine honours, so refuse here rather than write one.
+    let known = roster
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(&master.master))
+        .and_then(|agent| agent.public_key.clone());
+    if known.as_deref() != Some(signer.public_key_hex().as_str()) {
+        bail!(
+            "this is not the key {} is known by in {project_id}'s channel, so nothing it signs would be honoured",
+            master.master
+        );
+    }
+    Ok(())
+}
+
+/// The setting, inside a channel, that says whether its project takes part in the weekly
+/// self-improvement loop (`ferry improve`).
+///
+/// Off unless this file says on, signed by the project's master: the same trust as
+/// [`ARCHIVED`], and in the channel for the same reason - it applies on every machine
+/// that syncs the project. A missing, unreadable, edited, forged or non-master file reads
+/// as off, so a peer that can write the channel can at most switch it off, never on.
+pub const SELF_IMPROVE: &str = "SELF_IMPROVE";
+
+/// What the [`SELF_IMPROVE`] file holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImproveSetting {
+    pub project_id: String,
+    pub enabled: bool,
+    pub set_at: DateTime<Utc>,
+    pub signed_by: String,
+    pub signature: String,
+}
+
+/// Exactly what a self-improve setting's signature covers. The project id is in it so a
+/// setting cannot be lifted from one channel into another.
+fn improve_payload(project_id: &str, enabled: bool, set_at: &DateTime<Utc>) -> String {
+    format!(
+        "ferryman-self-improve-v1\n{project_id}\n{}\n{}",
+        if enabled { "on" } else { "off" },
+        set_at.to_rfc3339()
+    )
+}
+
+/// The master's self-improve setting for the project in `channel`, when there is one
+/// and it verifies as the master's. Anything else is `None`, which means off.
+#[must_use]
+pub fn self_improve_setting(channel: &Path, project_id: &str) -> Option<ImproveSetting> {
+    let setting: ImproveSetting =
+        serde_json::from_slice(&std::fs::read(channel.join(SELF_IMPROVE)).ok()?).ok()?;
+    let roster = crate::read_agent_roster(channel).ok()?;
+    let master = crate::master::read_master_at(channel, &roster).ok()??;
+    (setting.project_id == project_id
+        && master.project_id == project_id
+        && setting.signed_by.eq_ignore_ascii_case(&master.master)
+        && crate::check_signature(
+            Some(&setting.signed_by),
+            Some(&setting.signature),
+            &improve_payload(&setting.project_id, setting.enabled, &setting.set_at),
+            &roster,
+        ) == SignatureCheck::Valid)
+        .then_some(setting)
+}
+
+/// Whether the project in `channel` is switched on for self-improvement. Off by default.
+#[must_use]
+pub fn self_improve_enabled(channel: &Path, project_id: &str) -> bool {
+    self_improve_setting(channel, project_id).is_some_and(|setting| setting.enabled)
+}
+
+/// Switch self-improvement on or off for the project in `channel`, signed by `signer`,
+/// who must be the project's master. Returns whether the setting changed.
+pub fn set_self_improve(
+    channel: &Path,
+    project_id: &str,
+    enabled: bool,
+    signer: &AgentIdentity,
+) -> Result<bool> {
+    if !channel.is_dir() {
+        bail!(
+            "{project_id}'s channel is not on this machine ({})",
+            channel.display()
+        );
+    }
+    require_master(channel, project_id, signer, "switch self-improve on or off")?;
+    if self_improve_enabled(channel, project_id) == enabled {
+        return Ok(false);
+    }
+    let set_at = Utc::now();
+    let signature = signer
+        .signing
+        .sign(improve_payload(project_id, enabled, &set_at).as_bytes());
+    let setting = ImproveSetting {
+        project_id: project_id.to_owned(),
+        enabled,
+        set_at,
+        signed_by: signer.name().to_owned(),
+        signature: hex::encode(signature.to_bytes()),
+    };
+    let path = channel.join(SELF_IMPROVE);
+    crate::atomic_json(&path, &setting).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+/// The latest week the self-improvement loop wrote anything for in `channel`, and which
+/// of its steps that week holds: `evidence`, `plan`, `review`, `report`. `None` when it
+/// has never run there. Read from `improve/<ISO week>/` in the channel.
+#[must_use]
+pub fn improve_last_run(channel: &Path) -> Option<(String, Vec<&'static str>)> {
+    let week = std::fs::read_dir(channel.join("improve"))
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+        .filter(|name| name.len() == 8 && name.as_bytes()[4] == b'-')
+        .max()?;
+    let dir = channel.join("improve").join(&week);
+    let steps = [
+        ("evidence.md", "evidence"),
+        ("plan.json", "plan"),
+        ("plan-review.md", "review"),
+        ("report.md", "report"),
+    ]
+    .into_iter()
+    .filter(|(file, _)| dir.join(file).is_file())
+    .map(|(_, step)| step)
+    .collect();
+    Some((week, steps))
+}
+
 /// What a ferry root holds.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct Manifest {
@@ -367,31 +516,12 @@ impl Root {
                 entry.channel.display()
             );
         }
-        let roster = crate::read_agent_roster(&entry.channel)?;
-        let Some(master) = crate::master::read_master_at(&entry.channel, &roster)? else {
-            bail!(
-                "{project_id} has no master, and only a project's master can archive it or bring it back"
-            );
-        };
-        if !signer.name().eq_ignore_ascii_case(&master.master) {
-            bail!(
-                "only {}, {project_id}'s master, can archive it or bring it back - not {}",
-                master.master,
-                signer.name()
-            );
-        }
-        // The name is not the proof; the key is. A key minted under the master's name
-        // would sign a mark no machine honours, so refuse here rather than write one.
-        let known = roster
-            .iter()
-            .find(|agent| agent.name.eq_ignore_ascii_case(&master.master))
-            .and_then(|agent| agent.public_key.clone());
-        if known.as_deref() != Some(signer.public_key_hex().as_str()) {
-            bail!(
-                "this is not the key {} is known by in {project_id}'s channel, so nothing it signs would be honoured",
-                master.master
-            );
-        }
+        require_master(
+            &entry.channel,
+            project_id,
+            signer,
+            "archive it or bring it back",
+        )?;
         let was = entry.is_archived();
         let marker = entry.channel.join(ARCHIVED);
         if archived {
@@ -1440,5 +1570,75 @@ mod tests {
 
         // And outside one, nothing is invented.
         assert!(find_root_from(dir.path()).is_none());
+    }
+
+    /// Off until the master says on; the master's word travels with the channel; nobody
+    /// else's counts, however it got there.
+    #[test]
+    fn self_improve_is_off_by_default_and_only_the_master_switches_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
+
+        assert!(!self_improve_enabled(&channel, "demo"), "off by default");
+
+        let error = set_self_improve(&channel, "demo", true, &grouchly)
+            .expect_err("a member is not the master")
+            .to_string();
+        assert!(error.contains("only josh"), "{error}");
+        let impostor = crate::AgentIdentity::from_seed("josh", [9u8; 32]);
+        let error = set_self_improve(&channel, "demo", true, &impostor)
+            .expect_err("the name is not the key")
+            .to_string();
+        assert!(error.contains("not the key"), "{error}");
+        assert!(!channel.join(SELF_IMPROVE).exists(), "nothing was written");
+
+        assert!(set_self_improve(&channel, "demo", true, &josh()).unwrap());
+        assert!(self_improve_enabled(&channel, "demo"));
+        assert!(
+            !set_self_improve(&channel, "demo", true, &josh()).unwrap(),
+            "already on"
+        );
+        assert!(set_self_improve(&channel, "demo", false, &josh()).unwrap());
+        assert!(!self_improve_enabled(&channel, "demo"));
+    }
+
+    #[test]
+    fn a_self_improve_setting_the_master_did_not_sign_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
+        let forge = |signer: &crate::AgentIdentity, project: &str, enabled: bool| {
+            let set_at = Utc::now();
+            let signature = signer
+                .signing
+                .sign(improve_payload(project, enabled, &set_at).as_bytes());
+            ImproveSetting {
+                project_id: project.into(),
+                enabled,
+                set_at,
+                signed_by: signer.name().into(),
+                signature: hex::encode(signature.to_bytes()),
+            }
+        };
+        let path = channel.join(SELF_IMPROVE);
+
+        // Validly signed, by a member who is not the master.
+        crate::atomic_json(&path, &forge(&grouchly, "demo", true)).unwrap();
+        assert!(!self_improve_enabled(&channel, "demo"));
+        // The master's own setting, lifted from another project.
+        crate::atomic_json(&path, &forge(&josh(), "elsewhere", true)).unwrap();
+        assert!(!self_improve_enabled(&channel, "demo"));
+        // The master's "off", edited to "on".
+        let mut edited = forge(&josh(), "demo", false);
+        edited.enabled = true;
+        crate::atomic_json(&path, &edited).unwrap();
+        assert!(!self_improve_enabled(&channel, "demo"));
+        // Garbage.
+        std::fs::write(&path, "on").unwrap();
+        assert!(!self_improve_enabled(&channel, "demo"));
+        // And the real thing.
+        crate::atomic_json(&path, &forge(&josh(), "demo", true)).unwrap();
+        assert!(self_improve_enabled(&channel, "demo"));
     }
 }
