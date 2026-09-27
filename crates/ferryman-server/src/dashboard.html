@@ -997,10 +997,41 @@ function scopeLabel(grant) {
   return p.length ? p.join(", ") : "every project";
 }
 
+/* Self-improve: the master's signed per-project switch for the weekly loop, and what
+   each worker can run right now - its signed engine inventory, never a credential. */
+function improvePanel(imp) {
+  const when = (at) => esc(String(at || "").slice(0, 16).replace("T", " "));
+  const last = imp.last_run
+    ? `${esc(imp.last_run.week)} (${esc((imp.last_run.steps || []).join(", ") || "started")})`
+    : "never";
+  const set = imp.set_by ? ` &mdash; set by ${esc(imp.set_by)}, ${when(imp.set_at)} UTC` : "";
+  const rows = [];
+  for (const w of (imp.engines || [])) {
+    for (const e of (w.engines || [])) {
+      const st = e.state === "exhausted" && e.until ? `out of credit until ${when(e.until)} UTC` : esc(e.state);
+      rows.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td>${esc(e.name)}</td><td>${esc(e.tier)}</td><td>${esc(e.paid)}</td>` +
+        `<td title="${esc(e.reason || "")}">${st}</td><td>${e.latency_ms != null ? (e.latency_ms / 1000).toFixed(1) + "s" : ""}</td><td>${esc(e.balance || "")}</td></tr>`);
+    }
+  }
+  return `
+    <div class="notice" style="margin-bottom:18px">
+      <div style="flex:1;min-width:0">
+        <b>Self-improve:</b> ${imp.enabled ? "on" : "off"}${set}. Last run: ${last}.
+        <div class="s" style="color:var(--dim);margin-top:6px">When on, each week the best available AI plans a few improvements to this project from what the channel recorded, and they are built as reviewed orders on their own branches. Nothing merges without you. Only the master can switch it.</div>
+        ${imp.may_set ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn${imp.enabled ? "" : " primary"}" id="tm-improve" data-enabled="${imp.enabled ? "0" : "1"}">${imp.enabled ? "Turn self-improve off" : "Turn self-improve on"}</button><span class="s" id="tm-improve-msg" style="color:var(--dim)"></span></div>` : ""}
+        ${rows.length
+          ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Worker</th><th>Engine</th><th>Tier</th><th>Paid</th><th>State</th><th>Latency</th><th>Balance</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
+          : `<div class="s" style="color:var(--dim);margin-top:6px">No worker has published which AI engines it can run yet.</div>`}
+      </div>
+    </div>`;
+}
+
 pages.teammates = async () => {
   let d = state.team;
   if (!d) { try { d = state.team = await api("/api/team"); } catch (_) { d = null; } }
   if (!d) return `<div class="head"><div><h1>Teammates</h1></div></div><div class="empty">Could not read the team.</div>`;
+  let imp = null;
+  try { imp = await api("/api/improve"); } catch (_) { imp = null; }
 
   const grants = {};
   for (const g of (d.grants || [])) grants[g.grantee] = g;
@@ -1032,6 +1063,8 @@ pages.teammates = async () => {
         ${d.head && d.may_grant ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn" id="tm-head-revoke">Clear head agent</button><span class="s" id="tm-head-msg" style="color:var(--dim)"></span></div>` : ""}
       </div>
     </div>
+
+    ${imp ? improvePanel(imp) : ""}
 
     ${d.may_grant ? `
     <div class="panel" style="margin-bottom:18px">
@@ -1149,6 +1182,22 @@ function wireTeammates() {
     } catch (err) {
       msg.textContent = String(err.message || err).slice(0, 300);
       become.disabled = false;
+    }
+  });
+
+  const improve = $("#tm-improve");
+  if (improve) improve.addEventListener("click", async () => {
+    improve.disabled = true;
+    try {
+      await api("/api/improve", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: improve.dataset.enabled === "1" }),
+      });
+      await render();
+    } catch (err) {
+      $("#tm-improve-msg").textContent = String(err.message || err).slice(0, 300);
+      improve.disabled = false;
     }
   });
 

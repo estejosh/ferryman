@@ -148,6 +148,41 @@ paths:
         '200': {description: how many appointments were removed}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/improve:
+    get:
+      summary: Self-improve for this project, its last run, and every worker's engines
+      description: >
+        Whether the project's master has switched the weekly self-improvement loop
+        (`ferry improve`) on, who signed that and when, the latest week the loop wrote
+        anything for, and each worker's signed engine inventory (tier, how it is paid,
+        up, down or out of credit until when; never a credential). `may_set` is true
+        only when the person signed in is the master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'enabled, set_by, set_at, master, may_set, last_run and engines'}
+        '401': {description: no active session}
+    post:
+      summary: The master switches self-improve on or off for this project
+      description: >
+        Writes the master-signed SELF_IMPROVE setting into the channel, where every
+        machine that syncs it reads it. Off by default; a setting anyone but the master
+        signed is ignored. Master only.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: {type: boolean}
+      responses:
+        '200': {description: 'the new state, and whether it changed'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
   /api/master/claim-all:
     post:
       summary: The signed-in person becomes master of every project with none
