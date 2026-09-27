@@ -183,6 +183,89 @@ paths:
         '200': {description: 'the new state, and whether it changed'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/improve/all:
+    post:
+      summary: Self-improve on (or off) for every project the signed-in person masters
+      description: >
+        "On for all my repos". Writes the master-signed SELF_IMPROVE setting into every
+        project in this machine's ferry root whose master is the person signed in (only
+        this project on a machine without a root). Projects mastered by someone else are
+        reported and left alone. The CLI equivalent is `ferry improve on --all`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: {type: boolean}
+      responses:
+        '200': {description: 'how many were switched, and per project: switched, already, mastered by, no master or error'}
+        '401': {description: no active session}
+        '403': {description: dashboard is read-only}
+  /api/delegations:
+    get:
+      summary: Who may act for the master here, and whether each delegation counts
+      description: >
+        Every delegation in this project's channel (delegate, principal, scopes, issue
+        and expiry times, and its standing: active, expired, revoked or invalid and why),
+        the agents on the roster that could be delegated to (a Telegram bridge publishes
+        itself with the role `delegate`), and `may_set`, true only for the master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'project, master, may_set, scopes, delegations and candidates'}
+        '401': {description: no active session}
+    post:
+      summary: The master lets an agent act for them
+      description: >
+        Signs a delegation with the session's key: the named agent's current key may act
+        for the master in the listed scopes (orders, review, improve; all three when none
+        are given), until revoked or, with `expires_days`, until it expires. `all` does
+        this in every project in the ferry root the person is master of. Everything the
+        delegate signs is recorded as "<master> via <delegate>". Master only.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delegate]
+              properties:
+                delegate: {type: string}
+                scopes: {type: array, items: {type: string, enum: [orders, review, improve]}}
+                expires_days: {type: integer}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many projects were delegated, and per project the outcome'}
+        '401': {description: no active session}
+        '403': {description: read-only, not the master, an unknown scope, or no key for the delegate}
+  /api/delegations/revoke:
+    post:
+      summary: The master ends a delegation
+      description: >
+        Writes a master-signed revocation of the agent's delegation in this project, or
+        with `all` in every project that has one. From then on nothing it signs counts
+        as the master's, including what it signed before.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [delegate]
+              properties:
+                delegate: {type: string}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many delegations were revoked'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
   /api/master/claim-all:
     post:
       summary: The signed-in person becomes master of every project with none

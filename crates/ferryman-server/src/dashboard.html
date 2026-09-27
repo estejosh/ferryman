@@ -1018,10 +1018,34 @@ function improvePanel(imp) {
       <div style="flex:1;min-width:0">
         <b>Self-improve:</b> ${imp.enabled ? "on" : "off"}${set}. Last run: ${last}.
         <div class="s" style="color:var(--dim);margin-top:6px">When on, each week the best available AI plans a few improvements to this project from what the channel recorded, and they are built as reviewed orders on their own branches. Nothing merges without you. Only the master can switch it.</div>
-        ${imp.may_set ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn${imp.enabled ? "" : " primary"}" id="tm-improve" data-enabled="${imp.enabled ? "0" : "1"}">${imp.enabled ? "Turn self-improve off" : "Turn self-improve on"}</button><span class="s" id="tm-improve-msg" style="color:var(--dim)"></span></div>` : ""}
+        ${imp.may_set ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn${imp.enabled ? "" : " primary"}" id="tm-improve" data-enabled="${imp.enabled ? "0" : "1"}">${imp.enabled ? "Turn self-improve off" : "Turn self-improve on"}</button><button class="btn" id="tm-improve-all">On for all my repos</button><span class="s" id="tm-improve-msg" style="color:var(--dim)"></span></div>` : ""}
         ${rows.length
           ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Worker</th><th>Engine</th><th>Tier</th><th>Paid</th><th>State</th><th>Latency</th><th>Balance</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
           : `<div class="s" style="color:var(--dim);margin-top:6px">No worker has published which AI engines it can run yet.</div>`}
+      </div>
+    </div>`;
+}
+
+/* Delegations: the master lets an agent - the Telegram bridge - act for them by its own
+   key, in named scopes, instead of holding their password. Everything it signs reads as
+   "<master> via <agent>", and it counts only while the delegation does. */
+function phonePanel(dl) {
+  const when = (at) => esc(String(at || "").slice(0, 10));
+  const rows = (dl.delegations || []).map((x) =>
+    `<tr><td>${esc(x.delegate)}</td><td>${esc(x.principal)}</td><td>${esc((x.scopes || []).join(", "))}</td>` +
+    `<td>${esc(x.standing)}</td><td>${x.expires_at ? when(x.expires_at) : "until revoked"}</td>` +
+    `<td>${dl.may_set && x.active ? `<button class="btn" data-undelegate="${esc(x.delegate)}">Revoke everywhere</button>` : ""}</td></tr>`);
+  const offered = (dl.candidates || []).filter((name) => !(dl.delegations || []).some((x) => x.delegate === name && x.active));
+  return `
+    <div class="notice" style="margin-bottom:18px">
+      <div style="flex:1;min-width:0">
+        <b>Phone (Telegram):</b> ${rows.length ? "" : "nothing acts for you yet."}
+        <div class="s" style="color:var(--dim);margin-top:6px">Run <code>ferry telegram</code> on an always-on machine, then let it act for you here. It signs with its own key; your password never leaves you. Orders, reviews and self-improve from the phone are recorded as you, via it.</div>
+        ${rows.length ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Agent</th><th>For</th><th>May</th><th>Standing</th><th>Until</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : ""}
+        ${dl.may_set ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">${offered.map((name) =>
+          `<button class="btn primary" data-delegate="${esc(name)}">Let ${esc(name)} act for me in every project</button>`).join("")}
+          ${offered.length ? "" : `<span class="s" style="color:var(--dim)">No bridge has published its key yet; start <code>ferry telegram</code> once.</span>`}
+          <span class="s" id="tm-delegate-msg" style="color:var(--dim)"></span></div>` : ""}
       </div>
     </div>`;
 }
@@ -1032,6 +1056,8 @@ pages.teammates = async () => {
   if (!d) return `<div class="head"><div><h1>Teammates</h1></div></div><div class="empty">Could not read the team.</div>`;
   let imp = null;
   try { imp = await api("/api/improve"); } catch (_) { imp = null; }
+  let dl = null;
+  try { dl = await api("/api/delegations"); } catch (_) { dl = null; }
 
   const grants = {};
   for (const g of (d.grants || [])) grants[g.grantee] = g;
@@ -1065,6 +1091,8 @@ pages.teammates = async () => {
     </div>
 
     ${imp ? improvePanel(imp) : ""}
+
+    ${dl ? phonePanel(dl) : ""}
 
     ${d.may_grant ? `
     <div class="panel" style="margin-bottom:18px">
@@ -1200,6 +1228,58 @@ function wireTeammates() {
       improve.disabled = false;
     }
   });
+
+  const improveAll = $("#tm-improve-all");
+  if (improveAll) improveAll.addEventListener("click", async () => {
+    improveAll.disabled = true;
+    try {
+      const r = await api("/api/improve/all", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled: true }),
+      });
+      $("#tm-improve-msg").textContent = `Switched on in ${r.switched} more project${r.switched === 1 ? "" : "s"}.`;
+      await render();
+    } catch (err) {
+      $("#tm-improve-msg").textContent = String(err.message || err).slice(0, 300);
+      improveAll.disabled = false;
+    }
+  });
+
+  for (const btn of document.querySelectorAll("[data-delegate]")) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        const r = await api("/api/delegations", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ delegate: btn.dataset.delegate, all: true }),
+        });
+        $("#tm-delegate-msg").textContent = `${r.delegate} may now act for ${r.principal} in ${r.delegated} project${r.delegated === 1 ? "" : "s"} (${r.scopes.join(", ")}).`;
+        await render();
+      } catch (err) {
+        $("#tm-delegate-msg").textContent = String(err.message || err).slice(0, 300);
+        btn.disabled = false;
+      }
+    });
+  }
+
+  for (const btn of document.querySelectorAll("[data-undelegate]")) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await api("/api/delegations/revoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ delegate: btn.dataset.undelegate, all: true }),
+        });
+        await render();
+      } catch (err) {
+        btn.disabled = false;
+        btn.textContent = String(err.message || err).slice(0, 120);
+      }
+    });
+  }
 
   const headRevoke = $("#tm-head-revoke");
   if (headRevoke) headRevoke.addEventListener("click", async () => {

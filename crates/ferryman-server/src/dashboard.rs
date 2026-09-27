@@ -412,6 +412,12 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/cost/rates", get(cost_rates))
         .route("/api/cost/plan", post(cost_plan))
         .route("/api/improve", get(improve_get).post(improve_set))
+        .route("/api/improve/all", post(improve_all))
+        .route(
+            "/api/delegations",
+            get(delegations_get).post(delegations_set),
+        )
+        .route("/api/delegations/revoke", post(delegations_revoke))
         // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
         // session check. A rebinding attempt is refused without its token being examined,
         // and a missing session is never reported to an origin that should not be talking
@@ -1801,7 +1807,7 @@ async fn improve_get(
     Ok(Json(json!({
         "project": route.project_id,
         "enabled": setting.as_ref().is_some_and(|s| s.enabled),
-        "set_by": setting.as_ref().map(|s| s.signed_by.clone()),
+        "set_by": setting.as_ref().map(ferryman_channel::ferry::ImproveSetting::set_by),
         "set_at": setting.as_ref().map(|s| s.set_at),
         "master": master,
         "may_set": may_set,
@@ -1857,6 +1863,252 @@ async fn improve_set(
         );
     }
     Ok(Json(json!({ "enabled": body.enabled, "changed": changed })))
+}
+
+/// Every project "all my repos" means: the ferry root's projects, or only this one on a
+/// machine without a root.
+fn every_project(state: &DashboardState) -> Vec<(String, std::path::PathBuf)> {
+    match ferryman_channel::ferry::find_root() {
+        Some(root) => root
+            .projects()
+            .into_iter()
+            .map(|entry| (entry.project_id, entry.channel))
+            .collect(),
+        None => vec![(
+            state.route.project_id.clone(),
+            state.route.communications.clone(),
+        )],
+    }
+}
+
+/// The projects a request acts on: every one the signed-in person is master of when
+/// `all`, else the project on screen.
+fn acted_on(
+    state: &DashboardState,
+    project: Option<&str>,
+    all: bool,
+) -> Vec<(String, std::path::PathBuf)> {
+    if all {
+        every_project(state)
+    } else {
+        let route = state.route_for(project);
+        vec![(route.project_id.clone(), route.communications.clone())]
+    }
+}
+
+fn session_identity(
+    state: &DashboardState,
+    headers: &HeaderMap,
+) -> Result<Arc<ferryman_channel::AgentIdentity>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    state.sessions.resolve(session_token(headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ImproveAllBody {
+    enabled: bool,
+}
+
+/// POST /api/improve/all - "On for all my repos": self-improve on (or off) in every
+/// project the signed-in person is master of. Projects mastered by someone else are
+/// listed and left alone.
+async fn improve_all(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<ImproveAllBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let mut switched = 0;
+    let projects: Vec<Value> = every_project(&state)
+        .into_iter()
+        .map(|(project, channel)| {
+            let outcome = match ferryman_channel::ferry::master_of(&channel) {
+                Ok(Some(master)) if master.eq_ignore_ascii_case(current.name()) => {
+                    match ferryman_channel::ferry::set_self_improve(
+                        &channel,
+                        &project,
+                        body.enabled,
+                        &current,
+                    ) {
+                        Ok(true) => {
+                            switched += 1;
+                            "switched".to_string()
+                        }
+                        Ok(false) => "already".to_string(),
+                        Err(error) => format!("error: {error:#}"),
+                    }
+                }
+                Ok(Some(master)) => format!("mastered by {master}"),
+                Ok(None) => "no master".to_string(),
+                Err(error) => format!("error: {error:#}"),
+            };
+            json!({ "project": project, "outcome": outcome })
+        })
+        .collect();
+    Ok(Json(json!({
+        "enabled": body.enabled,
+        "switched": switched,
+        "projects": projects,
+    })))
+}
+
+/// GET /api/delegations - who may act for the master in this project (the Telegram
+/// bridge, say), whether each delegation counts right now, and which agents on the
+/// roster could be delegated to.
+async fn delegations_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let master = ferryman_channel::ferry::master_of(&route.communications)
+        .ok()
+        .flatten();
+    let may_set = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    let delegations: Vec<Value> = ferryman_channel::delegation::list(
+        &route.communications,
+        &route.project_id,
+        chrono::Utc::now(),
+    )
+    .into_iter()
+    .map(|(delegation, standing)| {
+        json!({
+            "delegate": delegation.delegate,
+            "principal": delegation.principal,
+            "scopes": delegation.scopes,
+            "issued_at": delegation.issued_at,
+            "expires_at": delegation.expires_at,
+            "standing": standing.describe(),
+            "active": standing == ferryman_channel::delegation::Standing::Active,
+        })
+    })
+    .collect();
+    let candidates: Vec<String> = ferryman_channel::read_agent_roster(&route.communications)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| {
+            agent.public_key.as_ref().is_some_and(|key| !key.is_empty())
+                && (agent.role.eq_ignore_ascii_case("delegate")
+                    || agent.name.starts_with("telegram-"))
+        })
+        .map(|agent| agent.name)
+        .collect();
+    Ok(Json(json!({
+        "project": route.project_id,
+        "master": master,
+        "may_set": may_set,
+        "scopes": ferryman_channel::delegation::SCOPES,
+        "delegations": delegations,
+        "candidates": candidates,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DelegateBody {
+    delegate: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    expires_days: Option<i64>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// POST /api/delegations - the master lets an agent act for them, in this project or
+/// (`all`) every project they are master of. The browser half of `ferry team delegate`.
+async fn delegations_set(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<DelegateBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let scopes: Vec<String> = if body.scopes.is_empty() {
+        ferryman_channel::delegation::SCOPES
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    } else {
+        body.scopes.clone()
+    };
+    let expires_at = body
+        .expires_days
+        .map(|days| chrono::Utc::now() + chrono::Duration::days(days));
+    let mut delegated = 0;
+    let mut projects = Vec::new();
+    for (project, channel) in acted_on(&state, params.project.as_deref(), body.all) {
+        let outcome = match ferryman_channel::delegation::grant(
+            &channel,
+            &project,
+            &current,
+            &body.delegate,
+            &scopes,
+            expires_at,
+        ) {
+            Ok(_) => {
+                delegated += 1;
+                "delegated".to_string()
+            }
+            Err(error) if body.all => format!("skipped: {error:#}"),
+            Err(error) => return Err((StatusCode::FORBIDDEN, format!("{error:#}"))),
+        };
+        projects.push(json!({ "project": project, "outcome": outcome }));
+    }
+    Ok(Json(json!({
+        "delegate": body.delegate,
+        "principal": current.name(),
+        "scopes": scopes,
+        "delegated": delegated,
+        "projects": projects,
+    })))
+}
+
+#[derive(Deserialize)]
+struct UndelegateBody {
+    delegate: String,
+    #[serde(default)]
+    all: bool,
+}
+
+/// POST /api/delegations/revoke - the master ends a delegation here, or everywhere.
+async fn delegations_revoke(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<UndelegateBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let mut revoked = 0;
+    for (project, channel) in acted_on(&state, params.project.as_deref(), body.all) {
+        if body.all && ferryman_channel::delegation::read(&channel, &body.delegate).is_none() {
+            continue;
+        }
+        match ferryman_channel::delegation::revoke(
+            &channel,
+            &project,
+            &current,
+            &body.delegate,
+            "revoked from the dashboard",
+        ) {
+            Ok(true) => revoked += 1,
+            Ok(false) => {}
+            Err(_) if body.all => {}
+            Err(error) => return Err((StatusCode::FORBIDDEN, format!("{error:#}"))),
+        }
+    }
+    Ok(Json(
+        json!({ "delegate": body.delegate, "revoked": revoked }),
+    ))
 }
 
 /// POST /api/head/revoke - the master clears the head agent of the project on screen.
@@ -4400,6 +4652,92 @@ mod tests {
             &route.communications,
             &route.project_id
         ));
+    }
+
+    /// The master lets the Telegram bridge act for them from the browser, the delegation
+    /// counts, and revoking it from the browser ends it. Nobody else can do either.
+    #[tokio::test]
+    async fn the_master_delegates_to_the_bridge_from_the_browser_and_revokes_it() {
+        use ferryman_channel::delegation::{ORDERS, authority};
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        let bridge = ferryman_channel::AgentIdentity::from_seed("telegram-grouchly", [4; 32]);
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "telegram-grouchly".into(),
+                role: "delegate".into(),
+                capabilities: Vec::new(),
+                public_key: Some(bridge.public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        let body = r#"{"delegate":"telegram-grouchly","scopes":["orders","review"]}"#;
+        assert_eq!(
+            post(&app, "/api/delegations", body, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post(&app, "/api/delegations", body, Some(&token))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN,
+            "nobody is master yet"
+        );
+        assert_eq!(
+            post(&app, "/api/master/init", "{}", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let listed = get_json(&app, "/api/delegations", Some(&token)).await;
+        assert_eq!(listed["may_set"], true);
+        assert_eq!(listed["candidates"][0], "telegram-grouchly", "{listed}");
+
+        assert_eq!(
+            post(&app, "/api/delegations", body, Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let listed = get_json(&app, "/api/delegations", Some(&token)).await;
+        assert_eq!(listed["delegations"][0]["standing"], "active", "{listed}");
+        assert_eq!(listed["delegations"][0]["principal"], "alice");
+        let now = chrono::Utc::now();
+        assert!(
+            authority(
+                &route.communications,
+                &route.project_id,
+                "alice",
+                "telegram-grouchly",
+                ORDERS,
+                now
+            )
+            .allowed()
+        );
+
+        let revoke = r#"{"delegate":"telegram-grouchly"}"#;
+        assert_eq!(
+            post(&app, "/api/delegations/revoke", revoke, Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert!(
+            !authority(
+                &route.communications,
+                &route.project_id,
+                "alice",
+                "telegram-grouchly",
+                ORDERS,
+                now
+            )
+            .allowed()
+        );
     }
 
     /// Setting a secret from the dashboard is signed by the operator, not the
