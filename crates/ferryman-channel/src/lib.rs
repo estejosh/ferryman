@@ -18,6 +18,7 @@ pub mod contract;
 pub mod conversation;
 pub mod cost;
 pub mod credentials;
+pub mod delegation;
 pub mod discovery;
 pub mod encrypt;
 pub mod entitlement;
@@ -39,6 +40,7 @@ pub mod migration;
 pub mod owner;
 pub mod portable_auth;
 pub mod quantly;
+pub mod questions;
 pub mod receipts;
 pub mod release;
 pub mod secrets;
@@ -1388,6 +1390,14 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
     {
         bail!("sending work back requires notes saying what to change")
     }
+    // A verdict signed by someone other than the reviewer it names counts only under the
+    // reviewer's delegation. Refused here as well as ignored on read, so the person who
+    // pressed the button is told rather than finding out from a task that did not move.
+    if let Some(signer) = review.signed_by.as_deref()
+        && let delegation::Authority::Refused(why) = review_authority(route, review)
+    {
+        bail!("{signer} cannot review for {}: {why}", review.reviewer)
+    }
     // Independent approval: an order marked `requires_approval` may only be
     // accepted by the master (a separate principal), never by the agent that
     // produced the work. Enforced here so no code path can self-approve.
@@ -1399,7 +1409,9 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
                 .iter()
                 .find(|r| r.revision == review.revision)
                 .map(|r| r.agent.as_str());
-            if worker == Some(review.reviewer.as_str()) {
+            if worker == Some(review.reviewer.as_str())
+                || worker.is_some() && worker == review.signed_by.as_deref()
+            {
                 bail!("an agent cannot approve its own work")
             }
             match crate::master::read_master(route)? {
@@ -1490,6 +1502,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         } else if name.starts_with("review.")
             && let Ok(value) = serde_json::from_str::<Review>(&text)
             && verify_review(&value, &route.agents) == SignatureCheck::Valid
+            && review_authority(route, &value).allowed()
         {
             reviews.push(value);
         } else if name.starts_with("recommendation.")
@@ -1601,7 +1614,7 @@ pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result
         // Verifying here rather than only in the loop also fixes `ferry channel work`
         // and anything else that asks what can be picked up: there is now one answer to
         // that question rather than an optimistic one and a real one.
-        if verify_order(&task.order, &route.agents) != SignatureCheck::Valid {
+        if verify_order_in(route, &task.order) != SignatureCheck::Valid {
             continue;
         }
         // An order whose dependencies are not yet done must not be offered.
@@ -2166,6 +2179,49 @@ pub fn verify_order(order: &Order, roster: &[AgentRoute]) -> SignatureCheck {
         order.signature.as_ref(),
         &order_payload(order),
         roster,
+    )
+}
+
+/// Whether whoever signed this order may issue it under the name it carries.
+///
+/// Signed by the issuer is the ordinary case. Signed by someone else - a bridge relaying
+/// the master from a phone - counts only under the master's valid `orders` delegation
+/// to that signer; see [`delegation`].
+#[must_use]
+pub fn order_authority(route: &ProjectRoute, order: &Order) -> delegation::Authority {
+    delegation::authority(
+        &route.communications,
+        &route.project_id,
+        &order.issued_by,
+        order.signed_by.as_deref().unwrap_or_default(),
+        delegation::ORDERS,
+        Utc::now(),
+    )
+}
+
+/// [`verify_order`], and then [`order_authority`]: an order signed by one name and
+/// issued under another reads as `Invalid` unless a delegation covers it. This is the
+/// check anything that acts on an order uses.
+#[must_use]
+pub fn verify_order_in(route: &ProjectRoute, order: &Order) -> SignatureCheck {
+    let check = verify_order(order, &route.agents);
+    if check == SignatureCheck::Valid && !order_authority(route, order).allowed() {
+        return SignatureCheck::Invalid;
+    }
+    check
+}
+
+/// Whether whoever signed this verdict may give it under the reviewer's name: the
+/// reviewer themself, or a delegate holding their `review` delegation.
+#[must_use]
+pub fn review_authority(route: &ProjectRoute, review: &Review) -> delegation::Authority {
+    delegation::authority(
+        &route.communications,
+        &route.project_id,
+        &review.reviewer,
+        review.signed_by.as_deref().unwrap_or_default(),
+        delegation::REVIEW,
+        Utc::now(),
     )
 }
 

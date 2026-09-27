@@ -543,6 +543,36 @@ pub fn is_revoked(route: &ProjectRoute, grantee: &str) -> Result<bool> {
     ) == SignatureCheck::Valid)
 }
 
+/// [`is_revoked`], for a caller holding a channel directory and its roster rather than
+/// a route.
+#[must_use]
+pub fn is_revoked_in(communications: &Path, roster: &[AgentRoute], grantee: &str) -> bool {
+    let path = communications
+        .join("grants")
+        .join(format!("{grantee}.revoked.json"));
+    let Some(revocation) = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<MasterRevocation>(&text).ok())
+    else {
+        return false;
+    };
+    let Ok(Some(declaration)) = read_master_at(communications, roster) else {
+        return false;
+    };
+    let Some(master) = roster
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(&declaration.master))
+    else {
+        return false;
+    };
+    check_signature(
+        revocation.signed_by.as_ref(),
+        revocation.signature.as_ref(),
+        &revocation_payload(&revocation),
+        std::slice::from_ref(master),
+    ) == SignatureCheck::Valid
+}
+
 /// Every valid revocation on this project, by grantee.
 pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
     let dir = grants_dir(route);
