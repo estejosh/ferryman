@@ -6,6 +6,7 @@ mod mcp;
 mod mcp_client;
 mod telegram;
 mod tgmap;
+mod tgv2;
 mod update;
 
 use ferryman_ops::Progress;
@@ -357,6 +358,25 @@ enum Command {
     License {
         #[command(subcommand)]
         command: License,
+    },
+    /// Run every project from your phone: one Telegram chat, private or a group, with
+    /// buttons for projects, engines, tasks, reviews and self-improve.
+    ///
+    /// The bridge signs with its own key, never your password: the master delegates to it
+    /// once (`ferry team delegate telegram-<machine>`, or the dashboard). Reads
+    /// TELEGRAM_BOT_TOKEN, TELEGRAM_APPROVERS (comma-separated numeric user ids; the older
+    /// TELEGRAM_APPROVER_ID works too) and, for a group, TELEGRAM_CHAT_ID. Never send
+    /// credentials in the chat.
+    Telegram {
+        /// The bridge's own identity. Defaults to telegram-<this machine>.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+        /// Serve every channel under this folder instead of the ferry root's projects.
+        #[arg(long)]
+        comms: Option<PathBuf>,
+        /// Where a message goes before a project has been picked in the chat.
+        #[arg(long, default_value = "ferryman")]
+        default_project: String,
     },
     /// Write an `orchestrator.toml` for SERVER mode. Almost nobody wants this.
     ///
@@ -1318,6 +1338,10 @@ enum Channel {
     /// Bridge one Telegram chat to this channel: a message becomes a signed order,
     /// and a result comes back to the chat. Runs until stopped.
     ///
+    /// The older bridge, kept for installs that run it. `ferry telegram` serves every
+    /// project from one chat with buttons, and signs by a delegated key instead of
+    /// holding your password.
+    ///
     /// Reads TELEGRAM_BOT_TOKEN and TELEGRAM_APPROVER_ID from the environment, and
     /// refuses to start without both: an unauthenticated bridge would take orders
     /// from whoever finds the bot.
@@ -1429,6 +1453,43 @@ enum TeamCommand {
     Invite {
         #[command(subcommand)]
         action: InviteAction,
+    },
+    /// Let an agent act for you - the Telegram bridge - in the scopes you name, so it
+    /// never needs your password.
+    ///
+    /// Signed by you as master, into every project in the ferry root you are master of
+    /// (or just --project). The agent must have published its key first: start it once.
+    /// Everything it does is recorded as "you via <agent>". End it with `undelegate`.
+    Delegate {
+        /// The agent, as it appears on the roster: telegram-grouchly, say.
+        name: String,
+        /// What it may do: orders, review, improve (comma separated).
+        #[arg(long, value_delimiter = ',', default_value = "orders,review,improve")]
+        scopes: Vec<String>,
+        /// End it on its own after this many days. Without it, it lasts until revoked.
+        #[arg(long)]
+        expires_days: Option<i64>,
+        /// Only this project, by id.
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        workspace: Option<PathBuf>,
+    },
+    /// End what `delegate` started, in every project you are master of (or --project).
+    Undelegate {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        workspace: Option<PathBuf>,
+        /// Why, kept with the revocation.
+        #[arg(long, default_value = "revoked")]
+        reason: String,
+    },
+    /// Every delegation in every project here, and whether it counts right now.
+    Delegations {
+        #[arg(long)]
+        json: bool,
     },
     /// On a machine that accepted an invitation: check a name against the project's
     /// roster and, if it is free, pin it so the browser offers it. Says "taken" or
@@ -2140,6 +2201,9 @@ enum License {
         /// computer (runs agents) or mobile (approves only).
         #[arg(long, default_value = "computer")]
         device: String,
+        /// Register this machine in every channel under the ferry root, not just one.
+        #[arg(long, conflicts_with = "workspace")]
+        all: bool,
     },
     /// Report the counts to the Licensor.
     Checkin {
@@ -2225,7 +2289,8 @@ enum ImproveCommand {
         max: usize,
     },
     /// Switch self-improvement on for a project. Only its master can: the setting is
-    /// signed and travels with the channel, so it applies on every machine.
+    /// signed and travels with the channel, so it applies on every machine. `--all`
+    /// switches it on for every project in the ferry root that you are master of.
     On {
         #[command(flatten)]
         which: ImproveProject,
@@ -2251,6 +2316,62 @@ struct ImproveProject {
     project: Option<String>,
     #[arg(long, conflicts_with = "project")]
     workspace: Option<PathBuf>,
+    /// Every project in the ferry root whose master you are.
+    #[arg(long, conflicts_with_all = ["project", "workspace"])]
+    all: bool,
+}
+
+/// The projects a master-signed command acts on: the one named, the one at `workspace`,
+/// or - with neither - every project in the ferry root. Each as (id, channel, attachment).
+fn mastered_targets(
+    project: Option<&String>,
+    workspace: Option<&PathBuf>,
+) -> Result<Vec<(String, PathBuf, PathBuf)>> {
+    if project.is_some() || workspace.is_some() {
+        return Ok(vec![improve_project(&ImproveProject {
+            project: project.cloned(),
+            workspace: workspace.cloned(),
+            all: false,
+        })?]);
+    }
+    let root = ferryman_channel::ferry::find_root()
+        .context("no ferry root yet - make one with `ferry root init`, or name a --project")?;
+    Ok(root
+        .projects()
+        .into_iter()
+        .map(|entry| {
+            let attachment = entry
+                .repo
+                .as_ref()
+                .map(|repo| repo.join(".ferryman"))
+                .filter(|attachment| attachment.is_dir())
+                .unwrap_or_else(|| root.path.clone());
+            (entry.project_id, entry.channel, attachment)
+        })
+        .collect())
+}
+
+/// The master of the project in `channel`, and their key, unlocked at most once per run.
+///
+/// `me` is the master already signed in for this run: a project mastered by somebody
+/// else is refused rather than asking for a second person's password.
+fn mastered_signer(
+    channel: &Path,
+    attachment: &Path,
+    me: Option<&str>,
+) -> Result<(String, ferryman_channel::AgentIdentity)> {
+    let Some(master) = ferryman_channel::ferry::master_of(channel)? else {
+        bail!("it has no master yet; claim it with 'ferry root master'");
+    };
+    if let Some(me) = me
+        && !me.eq_ignore_ascii_case(&master)
+    {
+        bail!("its master is {master}, not {me}");
+    }
+    if held_operator().is_none() {
+        hold_operator(attachment, &master)?;
+    }
+    Ok((master.clone(), signing_identity_in(attachment, &master)?))
 }
 
 /// The project id, its channel, and where its local keys live.
@@ -2288,6 +2409,35 @@ fn improve_project(which: &ImproveProject) -> Result<(String, PathBuf, PathBuf)>
 }
 
 fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
+    if which.all {
+        let word = if enabled { "on" } else { "off" };
+        let mut me: Option<String> = None;
+        let mut changed = 0;
+        for (project, channel, attachment) in mastered_targets(None, None)? {
+            let (master, identity) = match mastered_signer(&channel, &attachment, me.as_deref()) {
+                Ok(signer) => signer,
+                Err(error) => {
+                    println!("  {project}: skipped - {error:#}");
+                    continue;
+                }
+            };
+            me.get_or_insert(master);
+            match ferryman_channel::ferry::set_self_improve(&channel, &project, enabled, &identity)
+            {
+                Ok(true) => {
+                    changed += 1;
+                    println!("  {project}: self-improve {word}");
+                }
+                Ok(false) => println!("  {project}: already {word}"),
+                Err(error) => println!("  {project}: skipped - {error:#}"),
+            }
+        }
+        println!(
+            "self-improve switched {word} in {changed} project(s), signed by {}",
+            me.as_deref().unwrap_or("nobody")
+        );
+        return Ok(());
+    }
     let (project, channel, attachment) = improve_project(which)?;
     let Some(master) = ferryman_channel::ferry::master_of(&channel)? else {
         bail!(
@@ -2332,7 +2482,7 @@ fn improve_status(as_json: bool) -> Result<()> {
                 "project": project,
                 "enabled": setting.as_ref().is_some_and(|s| s.enabled),
                 "has_master": ferryman_channel::ferry::master_of(channel).ok().flatten().is_some(),
-                "set_by": setting.as_ref().map(|s| s.signed_by.clone()),
+                "set_by": setting.as_ref().map(ferryman_channel::ferry::ImproveSetting::set_by),
                 "set_at": setting.as_ref().map(|s| s.set_at),
                 "last_run": last.map(|(week, steps)| json!({ "week": week, "steps": steps })),
             })
@@ -3321,6 +3471,11 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Engines { at, json } => engines_command(&at, json)?,
         Command::Improve { command } => improve_command(command).await?,
         Command::License { command } => license_command(command).await?,
+        Command::Telegram {
+            agent,
+            comms,
+            default_project,
+        } => tgv2::run(agent, comms, default_project).await?,
         Command::Jobs { command } => jobs(&cli, command).await?,
         Command::Projects { command } => match command {
             Projects::Create { id, name, token } => {
@@ -4656,11 +4811,31 @@ async fn license_command(command: License) -> Result<()> {
             workspace,
             email,
             device,
-        } => license::register(
-            &route_for(workspace)?,
-            &email,
-            ferryman_channel::licensing::DeviceKind::parse(&device)?,
-        )?,
+            all,
+        } => {
+            let kind = ferryman_channel::licensing::DeviceKind::parse(&device)?;
+            if all {
+                let routes = target_routes(&Targets {
+                    workspace: None,
+                    comms: None,
+                })?;
+                let mut failed = 0;
+                for route in &routes {
+                    println!("{}:", route.project_id);
+                    if let Err(error) = license::register(route, &email, kind) {
+                        failed += 1;
+                        eprintln!("  not registered: {error:#}");
+                    }
+                }
+                println!(
+                    "registered in {} of {} channel(s)",
+                    routes.len() - failed,
+                    routes.len()
+                );
+            } else {
+                license::register(&route_for(workspace)?, &email, kind)?;
+            }
+        }
         License::Checkin { workspace, dry_run } => {
             license::check_in(&route_for(workspace)?, dry_run).await?
         }
@@ -5017,6 +5192,127 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             println!(
                 "note: what already synced is on their disk; rotate any secret sealed to them"
             );
+        }
+        TeamCommand::Delegate {
+            name,
+            scopes,
+            expires_days,
+            project,
+            workspace,
+        } => {
+            let all = project.is_none() && workspace.is_none();
+            let expires_at =
+                expires_days.map(|days| chrono::Utc::now() + chrono::Duration::days(days));
+            let mut me: Option<String> = None;
+            let mut done = 0;
+            for (project, channel, attachment) in
+                mastered_targets(project.as_ref(), workspace.as_ref())?
+            {
+                let signed = mastered_signer(&channel, &attachment, me.as_deref()).and_then(
+                    |(master, identity)| {
+                        me.get_or_insert(master);
+                        ferryman_channel::delegation::grant(
+                            &channel, &project, &identity, &name, &scopes, expires_at,
+                        )
+                    },
+                );
+                match signed {
+                    Ok(delegation) => {
+                        done += 1;
+                        println!(
+                            "  {project}: {} may act for {} ({})",
+                            delegation.delegate,
+                            delegation.principal,
+                            delegation.scopes.join(", ")
+                        );
+                    }
+                    Err(error) if all => println!("  {project}: skipped - {error:#}"),
+                    Err(error) => return Err(error),
+                }
+            }
+            println!(
+                "{name} delegated in {done} project(s){}",
+                expires_at.map_or_else(String::new, |at| format!(
+                    ", until {}",
+                    at.format("%Y-%m-%d")
+                ))
+            );
+        }
+        TeamCommand::Undelegate {
+            name,
+            project,
+            workspace,
+            reason,
+        } => {
+            let all = project.is_none() && workspace.is_none();
+            let mut me: Option<String> = None;
+            let mut done = 0;
+            for (project, channel, attachment) in
+                mastered_targets(project.as_ref(), workspace.as_ref())?
+            {
+                if all && ferryman_channel::delegation::read(&channel, &name).is_none() {
+                    continue;
+                }
+                let revoked = mastered_signer(&channel, &attachment, me.as_deref()).and_then(
+                    |(master, identity)| {
+                        me.get_or_insert(master);
+                        ferryman_channel::delegation::revoke(
+                            &channel, &project, &identity, &name, &reason,
+                        )
+                    },
+                );
+                match revoked {
+                    Ok(true) => {
+                        done += 1;
+                        println!("  {project}: {name} no longer acts for anyone");
+                    }
+                    Ok(false) => println!("  {project}: {name} held no delegation"),
+                    Err(error) if all => println!("  {project}: skipped - {error:#}"),
+                    Err(error) => return Err(error),
+                }
+            }
+            println!("{name} revoked in {done} project(s)");
+        }
+        TeamCommand::Delegations { json } => {
+            let now = chrono::Utc::now();
+            let mut rows = Vec::new();
+            for (project, channel, _) in mastered_targets(None, None)? {
+                for (delegation, standing) in
+                    ferryman_channel::delegation::list(&channel, &project, now)
+                {
+                    rows.push(json!({
+                        "project": project,
+                        "delegate": delegation.delegate,
+                        "principal": delegation.principal,
+                        "scopes": delegation.scopes,
+                        "issued_at": delegation.issued_at,
+                        "expires_at": delegation.expires_at,
+                        "standing": standing.describe(),
+                    }));
+                }
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if rows.is_empty() {
+                println!("no delegations; make one with 'ferry team delegate <agent>'");
+            } else {
+                for row in &rows {
+                    println!(
+                        "{:<22} {:<22} for {:<10} {:<22} {}",
+                        row["project"].as_str().unwrap_or_default(),
+                        row["delegate"].as_str().unwrap_or_default(),
+                        row["principal"].as_str().unwrap_or_default(),
+                        row["scopes"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        row["standing"].as_str().unwrap_or_default()
+                    );
+                }
+            }
         }
         TeamCommand::Anchor { action } => anchor_command(action).await?,
         TeamCommand::Pending { workspace, signer } => {
@@ -5870,6 +6166,12 @@ async fn agent_command(command: Agent) -> Result<()> {
                     .served
                     .iter()
                     .filter(|(_, config)| config.improve)
+                    // The loop waits while the person is at this machine; it is theirs to
+                    // use first. `ferry improve run` by hand is never held back.
+                    .filter(|(_, config)| {
+                        !(config.defer_improvements_while_active
+                            && ferryman_ops::governor::someone_here(config.idle_after))
+                    })
                     .cloned()
                     .collect();
                 if !improving.is_empty() && ferryman_ops::improve::hourly_due(chrono::Utc::now()) {

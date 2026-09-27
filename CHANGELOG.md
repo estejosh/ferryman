@@ -4,6 +4,47 @@
 
 ### Added
 
+- **Delegation: an agent acts for the master by its own key, never their password.**
+  The master signs, once, that an agent's key may act for them in named scopes -
+  `orders`, `review`, `improve` - per project, until revoked or an optional expiry:
+  `ferry team delegate telegram-grouchly` (every project you master, or `--project`),
+  `ferry team undelegate`, `ferry team delegations`, or the dashboard's Teammates page
+  ("Let ... act for me in every project", "Revoke everywhere"). Verifiers accept an
+  order, a verdict (including master-only approvals), a self-improve switch or an answer
+  signed by someone other than the name it carries only under a valid, unrevoked,
+  unexpired, master-signed delegation for that scope and that exact key; the record reads
+  "josh via telegram-grouchly". An order signed by one agent in another's name no longer
+  verifies without one. Revoking withdraws what the delegate signed, too.
+- **`ferry telegram`: every project from one chat, by buttons.** A private chat or a
+  group (`TELEGRAM_CHAT_ID`), usable only by the ids in `TELEGRAM_APPROVERS`; anyone else
+  is logged and ignored. A menu - Projects, Engines, Tasks, Self-improve - with a project
+  picker, the signed engine inventory, tasks with their stages, and self-improve toggles
+  per project plus "On for all my repos". Free text is a signed order to the chosen
+  project (default `ferryman`), and one status message is edited as it goes sent,
+  delivered, read, claimed, done; the result follows. Work that needs you arrives with
+  Approve / Send back / Details; Send back takes the note as a reply. When no engine
+  anywhere can run an order it says so, and says again when one is back. `/start` and
+  `/menu` only show the menu. It signs as `telegram-<machine>` under a delegation and
+  needs no `FERRYMAN_OPERATOR_PASSWORD`. `ferry channel telegram` is unchanged.
+- **The improve loop asks, and never merges.** `ferry improve plan` may record up to two
+  clarifying questions, and review records a "ready to merge" notice for each accepted
+  improvement, as signed `questions/<id>.json`. The bridge posts each with option buttons
+  or a reply in words; the answer is a signed statement from the master (or their
+  delegate), and next week's evidence reads it.
+- **Improvements wait while you are at the machine.** A worker leaves unclaimed
+  `improvement` orders, and its hourly improve loop, until you have been idle for
+  `idle_after_secs`; orders you give directly are never deferred.
+  `defer_improvements_while_active = "false"` in `agent.toml` turns it off.
+- `ferry improve on --all` / `off --all`, and the dashboard's "On for all my repos":
+  self-improve for every project you master.
+- `ferry license register --email X --all` registers this machine in every channel under
+  the ferry root.
+
+### Fixed
+
+- `ferry license status` counted Syncthing conflict copies (`*.sync-conflict-*`) of a
+  device record as extra computers. They are ignored, and a record is counted once.
+
 - **An order says whether it arrived.** A worker writes a signed, write-once
   `delivered.<agent>.json` beside every order meant for it as soon as it sees one - even
   while paused or held off by the governor - and a signed `read.<agent>.json` just before
