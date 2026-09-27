@@ -274,6 +274,10 @@ pub struct AgentConfig {
     pub active: Option<crate::engines::EngineSpec>,
     /// Let the worker run `ferry improve run` itself, at most hourly.
     pub improve: bool,
+    /// While someone is at this machine, leave improvement orders (and the worker's own
+    /// improve loop) for later or for another machine. Orders a person gave directly are
+    /// never deferred by this. On unless set to "false".
+    pub defer_improvements_while_active: bool,
 }
 
 impl AgentConfig {
@@ -501,6 +505,16 @@ impl AgentConfig {
                 Some(other) => bail!("pause_while_active must be true or false, not '{other}'"),
             },
             idle_after: Duration::from_secs(number("idle_after_secs", 300)?),
+            defer_improvements_while_active: match fields
+                .get("defer_improvements_while_active")
+                .map(String::as_str)
+            {
+                None | Some("true") => true,
+                Some("false") => false,
+                Some(other) => {
+                    bail!("defer_improvements_while_active must be true or false, not '{other}'")
+                }
+            },
             busy_cpu_percent: match number("busy_cpu_percent", 50)? {
                 percent @ 0..=100 => u8::try_from(percent).unwrap_or(100),
                 other => bail!("busy_cpu_percent is a percentage, 0 to 100, not {other}"),
@@ -678,6 +692,11 @@ min_free_ram_mb = "1024"
 pause_while_active = "true"
 busy_cpu_percent = "50"
 idle_after_secs = "300"
+
+# The weekly improve loop's own orders wait while you are at this machine (touched
+# within idle_after_secs), so they run while you are away. Orders you give directly
+# are never held back by this. Set to "false" to let improvements run any time.
+defer_improvements_while_active = "true"
 
 # Hours during which this machine picks work up, as HH:MM-HH:MM. Unset means
 # any hour, which is the default and what you want unless you have a reason.
@@ -2273,6 +2292,12 @@ pub async fn work_once(
     // machine that says nothing is indistinguishable from one the channel never reached.
     note_deliveries(route, config, &identity, &tasks, report);
     let waiting = ferryman_channel::work_among(route, &config.agent, tasks)?;
+    let waiting = defer_improvements(
+        config,
+        waiting,
+        crate::governor::someone_here(config.idle_after),
+        report,
+    );
     // Probe first, so the decision below sees an engine that came back since last time.
     note_engines(route, config, &identity, report).await;
     let held = hold_off(route, config, !waiting.is_empty())?;
@@ -2290,7 +2315,7 @@ pub async fn work_once(
         // Trust boundary: never act on an order whose signature does not verify.
         // Any peer can write to the synced folder, so an unsigned or forged
         // order must be skipped, not executed.
-        let order_check = ferryman_channel::verify_order(&task.order, &route.agents);
+        let order_check = ferryman_channel::verify_order_in(route, &task.order);
         if order_check != ferryman_channel::SignatureCheck::Valid {
             refuse_once(route, &id, "this order", order_check);
             continue;
@@ -2378,6 +2403,33 @@ pub async fn work_once(
     Ok(acted)
 }
 
+/// Leave unclaimed improvement orders alone while someone is at this machine.
+///
+/// Only orders the weekly loop issued, and only before they are claimed: work already
+/// started runs to completion, and an order a person gave directly is never held back.
+fn defer_improvements(
+    config: &AgentConfig,
+    waiting: Vec<Task>,
+    someone_here: bool,
+    report: &dyn Progress,
+) -> Vec<Task> {
+    let deferrable = |task: &Task| {
+        crate::improve::is_improvement(task)
+            && matches!(task.state(), TaskState::Open | TaskState::Offered { .. })
+    };
+    if !config.defer_improvements_while_active || !someone_here || !waiting.iter().any(&deferrable)
+    {
+        return waiting;
+    }
+    let (deferred, kept): (Vec<Task>, Vec<Task>) = waiting.into_iter().partition(&deferrable);
+    report.info(&format!(
+        "  leaving {} improvement order(s) until you are away from this machine; your own \
+         orders go ahead (defer_improvements_while_active in agent.toml)",
+        deferred.len()
+    ));
+    kept
+}
+
 /// Why this machine may not start work right now, or `None` when it may.
 ///
 /// Asked in full only when there is work waiting: with nothing to claim there is nothing
@@ -2445,7 +2497,7 @@ fn note_deliveries(
             _ => false,
         };
         if !meant_for_us
-            || ferryman_channel::verify_order(&task.order, &route.agents)
+            || ferryman_channel::verify_order_in(route, &task.order)
                 != ferryman_channel::SignatureCheck::Valid
         {
             continue;
@@ -3233,7 +3285,7 @@ pub async fn review_where(
         }
         // Trust boundary: judge only work whose order and result signatures
         // verify. A forged order or result must not be reviewed as if real.
-        let order_check = ferryman_channel::verify_order(&task.order, &route.agents);
+        let order_check = ferryman_channel::verify_order_in(route, &task.order);
         if order_check != ferryman_channel::SignatureCheck::Valid {
             refuse_once(route, &task.order.id, "this order", order_check);
             continue;
@@ -4121,6 +4173,74 @@ mod tests {
     /// wants: they are asserting on the task text, not on what precedes it.
     fn bare_config() -> AgentConfig {
         AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\n").unwrap()
+    }
+
+    fn open_task(id: &str, tags: &[&str]) -> Task {
+        Task {
+            order: ferryman_channel::Order {
+                id: id.into(),
+                project_id: "demo".into(),
+                issued_by: "josh".into(),
+                assigned_to: None,
+                created_at: chrono::Utc::now(),
+                payload: serde_json::json!({ "task": "x", "tags": tags }),
+                requires_review: false,
+                requires_approval: false,
+                depends_on: Vec::new(),
+                signed_by: None,
+                signature: None,
+                result_contract: None,
+            },
+            claims: Vec::new(),
+            results: Vec::new(),
+            reviews: Vec::new(),
+            recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
+            kills: Vec::new(),
+        }
+    }
+
+    /// With the person at the machine, the weekly loop's orders wait and theirs do not;
+    /// away, or with the setting off, everything goes.
+    #[test]
+    fn improvement_orders_wait_while_someone_is_here_and_direct_orders_never_do() {
+        let ids = |tasks: Vec<Task>| tasks.into_iter().map(|t| t.order.id).collect::<Vec<_>>();
+        let waiting = || {
+            vec![
+                open_task("improve-w39-1", &["improvement"]),
+                open_task("tg-1", &[]),
+            ]
+        };
+        let config = bare_config();
+        assert!(config.defer_improvements_while_active, "on by default");
+        assert_eq!(
+            ids(defer_improvements(&config, waiting(), true, &crate::Silent)),
+            ["tg-1"]
+        );
+        assert_eq!(
+            ids(defer_improvements(
+                &config,
+                waiting(),
+                false,
+                &crate::Silent
+            )),
+            ["improve-w39-1", "tg-1"]
+        );
+        let off = AgentConfig::parse(
+            "agent = \"worker\"\ncommand = \"claude\"\ndefer_improvements_while_active = \"false\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            ids(defer_improvements(&off, waiting(), true, &crate::Silent)),
+            ["improve-w39-1", "tg-1"]
+        );
+        assert!(
+            AgentConfig::parse(
+                "agent = \"w\"\ncommand = \"c\"\ndefer_improvements_while_active = \"maybe\"\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
