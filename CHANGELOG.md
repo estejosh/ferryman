@@ -44,6 +44,9 @@
 
 - `ferry license status` counted Syncthing conflict copies (`*.sync-conflict-*`) of a
   device record as extra computers. They are ignored, and a record is counted once.
+- One unreadable message envelope no longer hides a project's history. A 0-byte file
+  from a truncated write made `ferry channel log` and the dashboard fail for every
+  message; it is now skipped with a warning naming the file.
 
 - **An order says whether it arrived.** A worker writes a signed, write-once
   `delivered.<agent>.json` beside every order meant for it as soon as it sees one - even

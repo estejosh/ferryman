@@ -6600,17 +6600,27 @@ pub fn list_messages(route: &ProjectRoute) -> Result<Vec<Message>> {
         })
         .collect::<Vec<_>>();
     paths.sort();
-    paths
-        .into_iter()
-        .map(|path| {
-            let message: Message = serde_json::from_slice(&fs::read(&path)?)?;
-            message.validate()?;
-            if message.project_id != route.project_id {
-                bail!("message {} crossed project boundary", message.id)
-            }
-            Ok(message)
-        })
-        .collect()
+    // One unreadable envelope - a truncated write, a half-synced file - must not
+    // blind the whole project: `ferry channel log` and the dashboard read through
+    // here, and a single 0-byte file made both fail for every message. Skip it,
+    // say which file, and keep reading. A skipped file is never treated as valid.
+    let mut messages = Vec::new();
+    for path in paths {
+        match read_message_file(route, &path) {
+            Ok(message) => messages.push(message),
+            Err(error) => eprintln!("warning: skipped message {}: {error}", path.display()),
+        }
+    }
+    Ok(messages)
+}
+
+fn read_message_file(route: &ProjectRoute, path: &Path) -> Result<Message> {
+    let message: Message = serde_json::from_slice(&fs::read(path)?)?;
+    message.validate()?;
+    if message.project_id != route.project_id {
+        bail!("message {} crossed project boundary", message.id)
+    }
+    Ok(message)
 }
 
 pub fn find_message_by_idempotency_key(
@@ -8762,6 +8772,31 @@ mod serverless_tests {
             on_disk.is_file(),
             "the message is a file, not a database row"
         );
+    }
+
+    #[test]
+    fn one_empty_envelope_does_not_hide_the_rest() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        let message = Message::new(
+            "demo",
+            "wisp",
+            "fang",
+            "text/plain",
+            json!({"text": "still readable"}),
+            false,
+            None,
+        );
+        let mut transport = LocalFilesystemTransport;
+        transport.deliver(&route, &message).unwrap();
+        let directory = route.communications.join("messages/demo");
+        // A truncated write, as found on grouchly: exactly 0 bytes.
+        fs::write(directory.join("00000000-truncated.json"), b"").unwrap();
+        fs::write(directory.join("00000001-garbage.json"), b"{not json").unwrap();
+
+        let listed = list_messages(&route).unwrap();
+        assert_eq!(listed.len(), 1, "the good message is still listed");
+        assert_eq!(listed[0].id, message.id);
     }
 }
 
