@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod encrypt;
 pub mod entitlement;
 pub mod events;
+pub mod evidence;
 pub mod ferry;
 pub mod head;
 pub mod interrupt;
@@ -900,6 +901,12 @@ pub enum TaskState {
     Accepted,
     /// Finished, with no review asked for.
     Done,
+    /// A result is in, and no review has settled it, but the result is refuted by its
+    /// own evidence or is no answer at all ([`crate::evidence::classify`]). Never
+    /// success: not done, not a satisfied dependency, not counted as finished work. An
+    /// order that asks for review goes back to a reviewer, who sends it back; one that
+    /// does not waits here for a person.
+    Refuted { by: String, revision: u32 },
     /// An operator killed it. Terminal, and terminal for everyone: no machine may
     /// claim it again.
     ///
@@ -1064,6 +1071,25 @@ impl Task {
         self.state_at(Utc::now())
     }
 
+    /// Whether the result at `revision` is refuted - by its worker's evidence, or by
+    /// being no answer at all. See [`crate::evidence::classify`].
+    #[must_use]
+    pub fn refuted(&self, revision: u32) -> bool {
+        self.results
+            .iter()
+            .find(|r| r.revision == revision)
+            .is_some_and(|result| crate::evidence::is_refuted(&self.order.payload, result))
+    }
+
+    /// How the result at `revision` classifies: verified, unverified or refuted.
+    #[must_use]
+    pub fn classification(&self, revision: u32) -> Option<crate::evidence::Classification> {
+        self.results
+            .iter()
+            .find(|r| r.revision == revision)
+            .map(|result| crate::evidence::classify(&self.order.payload, result))
+    }
+
     /// `state`, with the current instant passed in rather than read, so staleness can be
     /// reasoned about without sleeping in a test.
     #[must_use]
@@ -1127,6 +1153,10 @@ impl Task {
             Some(review) if review.accepted => TaskState::Accepted,
             Some(_) => TaskState::ChangesRequested {
                 revision: revision + 1,
+            },
+            None if self.refuted(revision) => TaskState::Refuted {
+                by: holder.to_string(),
+                revision,
             },
             None if self.order.requires_review => TaskState::AwaitingReview {
                 by: holder.to_string(),
@@ -1403,6 +1433,18 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
     // produced the work. Enforced here so no code path can self-approve.
     if review.accepted {
         let task = crate::read_task(route, &review.order_id)?;
+        // Evidence, not claims: a result whose worker-recorded evidence shows nothing
+        // was done, or contradicts what the answer says, is refused here - whoever
+        // reviews it, model or person - so no path can accept an invented success.
+        if let Some(result) = task.results.iter().find(|r| r.revision == review.revision)
+            && let Some(why) = crate::evidence::blocking_reason(&task.order.payload, result)
+        {
+            bail!(
+                "revision {} of {} cannot be accepted: {why}",
+                review.revision,
+                review.order_id
+            )
+        }
         if task.order.requires_approval {
             let worker = task
                 .results

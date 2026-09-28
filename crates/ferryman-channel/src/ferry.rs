@@ -156,6 +156,60 @@ impl Entry {
     }
 }
 
+/// Whether the project in `channel` carries a valid master-signed [`ARCHIVED`] mark.
+///
+/// For callers that hold a channel rather than a ferry-root entry: the same check as
+/// [`Entry::is_archived`], so an unsigned, forged or non-master file reads as not
+/// archived.
+#[must_use]
+pub fn is_archived(channel: &Path, project_id: &str) -> bool {
+    Entry {
+        project_id: project_id.to_owned(),
+        channel: channel.to_path_buf(),
+        repo: None,
+        adopted: false,
+    }
+    .is_archived()
+}
+
+/// Archive the project in `channel`, or bring it back, signed by its master. What
+/// [`Root::archive`] does once it has found the channel. Returns whether anything
+/// changed.
+pub fn set_archived(
+    channel: &Path,
+    project_id: &str,
+    archived: bool,
+    signer: &AgentIdentity,
+) -> Result<bool> {
+    // Without the channel there is nowhere to say it that the fleet would hear.
+    if !channel.is_dir() {
+        bail!(
+            "{project_id}'s channel is not on this machine ({}) - archive it from one that has it",
+            channel.display()
+        );
+    }
+    require_master(channel, project_id, signer, "archive it or bring it back")?;
+    let was = is_archived(channel, project_id);
+    let marker = channel.join(ARCHIVED);
+    if archived {
+        if was {
+            return Ok(false);
+        }
+        crate::atomic_json(&marker, &sign_mark(project_id, signer))
+            .with_context(|| format!("writing {}", marker.display()))?;
+    } else {
+        // Removed whether or not it verified: a mark nobody honours is litter.
+        if marker.exists() {
+            std::fs::remove_file(&marker)
+                .with_context(|| format!("removing {}", marker.display()))?;
+        }
+        if !was {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Refuse unless `signer` is the master of the project in `channel`, by the key the
 /// channel knows the master by. `what` finishes "only the master can ...".
 pub(crate) fn require_master(
@@ -276,10 +330,13 @@ pub fn self_improve_setting(channel: &Path, project_id: &str) -> Option<ImproveS
         .then_some(setting)
 }
 
-/// Whether the project in `channel` is switched on for self-improvement. Off by default.
+/// Whether the project in `channel` is switched on for self-improvement. Off by default,
+/// and always off for an archived project: the loop leaves finished work alone, whatever
+/// the setting said before it was archived.
 #[must_use]
 pub fn self_improve_enabled(channel: &Path, project_id: &str) -> bool {
     self_improve_setting(channel, project_id).is_some_and(|setting| setting.enabled)
+        && !is_archived(channel, project_id)
 }
 
 /// Switch self-improvement on or off for the project in `channel`, signed by `signer`,
@@ -338,7 +395,16 @@ pub fn set_self_improve_as(
             }
         }
     }
-    if self_improve_enabled(channel, project_id) == enabled {
+    if enabled && is_archived(channel, project_id) {
+        bail!(
+            "{project_id} is archived, and an archived project cannot have self-improve switched \
+             on; bring it back first with 'ferry root archive {project_id} --restore'"
+        );
+    }
+    // Compared with the signed setting itself, not with the effective answer: an
+    // archived project reads as off whatever its setting, and switching it off must
+    // still write, or it would come back on when it is brought back.
+    if self_improve_setting(channel, project_id).is_some_and(|setting| setting.enabled) == enabled {
         return Ok(false);
     }
     let mut setting = ImproveSetting {
@@ -590,38 +656,7 @@ impl Root {
                     self.manifest_path().display()
                 )
             })?;
-        // Without the channel there is nowhere to say it that the fleet would hear.
-        if !entry.channel.is_dir() {
-            bail!(
-                "{project_id}'s channel is not on this machine ({}) - archive it from one that has it",
-                entry.channel.display()
-            );
-        }
-        require_master(
-            &entry.channel,
-            project_id,
-            signer,
-            "archive it or bring it back",
-        )?;
-        let was = entry.is_archived();
-        let marker = entry.channel.join(ARCHIVED);
-        if archived {
-            if was {
-                return Ok(false);
-            }
-            crate::atomic_json(&marker, &sign_mark(project_id, signer))
-                .with_context(|| format!("writing {}", marker.display()))?;
-        } else {
-            // Removed whether or not it verified: a mark nobody honours is litter.
-            if marker.exists() {
-                std::fs::remove_file(&marker)
-                    .with_context(|| format!("removing {}", marker.display()))?;
-            }
-            if !was {
-                return Ok(false);
-            }
-        }
-        Ok(true)
+        set_archived(&entry.channel, project_id, archived, signer)
     }
 
     /// Declare `person` master of every project here whose channel has none.

@@ -49,6 +49,15 @@ const LONG_RETRY_SECS: u64 = 10 * 60;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How much of an engine's complaint is kept in the inventory.
 const REASON_CHARS: usize = 200;
+/// Refuted results, inside [`TRUST_WINDOW_DAYS`], that demote an engine to chore
+/// work until it passes the canary.
+pub const DEMOTE_AFTER: usize = 2;
+/// The rolling window refutations are counted over.
+pub const TRUST_WINDOW_DAYS: i64 = 14;
+/// How often a demoted engine is given the canary.
+pub const CANARY_EVERY_SECS: i64 = 60 * 60;
+/// The file the canary asks for.
+pub const CANARY_FILE: &str = "CANARY.txt";
 
 /// What kind of work an engine is trusted with. Ordered: a judge can do anything a
 /// builder can, a builder anything a chore engine can.
@@ -382,6 +391,38 @@ pub struct EngineState {
     pub requests: u64,
     #[serde(default)]
     pub spend_usd: f64,
+    /// Results whose worker-recorded evidence agreed with the claim.
+    #[serde(default)]
+    pub verified: u64,
+    /// Results whose evidence refuted the claim, ever.
+    #[serde(default, alias = "contradicted")]
+    pub refuted: u64,
+    /// Results the evidence could neither confirm nor refute.
+    #[serde(default)]
+    pub unverified: u64,
+    /// When each refutation inside [`TRUST_WINDOW_DAYS`] happened.
+    #[serde(
+        default,
+        alias = "contradictions",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub refutations: Vec<DateTime<Utc>>,
+    /// Demoted to chore work after [`DEMOTE_AFTER`] refutations, until the canary
+    /// passes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demoted_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_tried_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_passed_at: Option<DateTime<Utc>>,
+}
+
+impl EngineState {
+    /// Whether refuted results have demoted this engine to chore work.
+    #[must_use]
+    pub fn demoted(&self) -> bool {
+        self.demoted_at.is_some()
+    }
 }
 
 /// Every engine one agent runs on this machine.
@@ -588,12 +629,18 @@ pub fn pick<'a>(
     specs
         .iter()
         .enumerate()
-        .filter(|(_, spec)| spec.tier >= wanted && !tried.contains(&spec.name))
+        .filter(|(_, spec)| !tried.contains(&spec.name))
         .filter_map(|(index, spec)| {
-            let available = availability(spec, &ledger.state(&spec.name), now);
+            let state = ledger.state(&spec.name);
+            // A demoted engine is trusted with chore work only, whatever its own tier.
+            let tier = effective_tier(spec, &state);
+            if tier < wanted {
+                return None;
+            }
+            let available = availability(spec, &state, now);
             available.usable().then(|| {
                 let down = matches!(available, Availability::Down(_));
-                ((spec.tier as u8 - wanted as u8, down, index), spec)
+                ((tier as u8 - wanted as u8, down, index), spec)
             })
         })
         .min_by_key(|(rank, _)| *rank)
@@ -610,7 +657,7 @@ pub fn best_up<'a>(
 ) -> Option<&'a EngineSpec> {
     let usable: Vec<&EngineSpec> = specs
         .iter()
-        .filter(|spec| spec.tier == tier)
+        .filter(|spec| effective_tier(spec, &ledger.state(&spec.name)) == tier)
         .filter(|spec| availability(spec, &ledger.state(&spec.name), now).usable())
         .collect();
     usable
@@ -640,6 +687,161 @@ pub fn all_exhausted(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) 
         }
     }
     Some(format!("every engine is out of credit: {}", why.join("; ")))
+}
+
+// --- trust: whether an engine's claims hold up ------------------------------------------
+
+/// The tier an engine may work at now: its own, or chore while it is demoted.
+#[must_use]
+pub fn effective_tier(spec: &EngineSpec, state: &EngineState) -> Tier {
+    if state.demoted() {
+        spec.tier.min(Tier::Chore)
+    } else {
+        spec.tier
+    }
+}
+
+/// Count one result's evidence for the engine that produced it, on this machine.
+/// [`DEMOTE_AFTER`] refutations inside [`TRUST_WINDOW_DAYS`] demote it to chore work
+/// until it passes the canary. Returns whether this result demoted it.
+pub fn record_verification(
+    agent: &str,
+    engine: &str,
+    status: ferryman_channel::evidence::Status,
+    now: DateTime<Utc>,
+) -> bool {
+    let mut demoted = false;
+    update(agent, |ledger| {
+        demoted = ledger.entry(engine).note(status, now)
+    });
+    demoted
+}
+
+impl EngineState {
+    /// Count one verification outcome. Returns whether it demoted the engine.
+    pub fn note(&mut self, status: ferryman_channel::evidence::Status, now: DateTime<Utc>) -> bool {
+        use ferryman_channel::evidence::Status;
+        let window = now - chrono::Duration::days(TRUST_WINDOW_DAYS);
+        self.refutations.retain(|at| *at > window);
+        match status {
+            Status::Verified => self.verified += 1,
+            Status::Refuted => {
+                self.refuted += 1;
+                self.refutations.push(now);
+                if !self.demoted() && self.refutations.len() >= DEMOTE_AFTER {
+                    self.demoted_at = Some(now);
+                    self.canary_tried_at = None;
+                    return true;
+                }
+            }
+            Status::Unverified => self.unverified += 1,
+            Status::NotApplicable => {}
+        }
+        false
+    }
+
+    /// Count one canary run. A pass lifts the demotion and clears the recent
+    /// refutations; the lifetime counts stay.
+    pub fn canary(&mut self, passed: bool, now: DateTime<Utc>) {
+        self.canary_tried_at = Some(now);
+        if passed {
+            self.canary_passed_at = Some(now);
+            self.demoted_at = None;
+            self.refutations.clear();
+        }
+    }
+}
+
+/// Whether a demoted engine is due its canary: never tried since demotion, or not for
+/// [`CANARY_EVERY_SECS`].
+#[must_use]
+pub fn canary_due(state: &EngineState, now: DateTime<Utc>) -> bool {
+    state.demoted()
+        && state.canary_tried_at.is_none_or(|at| {
+            let since = now.signed_duration_since(at);
+            since < chrono::Duration::zero()
+                || since >= chrono::Duration::seconds(CANARY_EVERY_SECS)
+        })
+}
+
+/// Record a canary run. A pass lifts the demotion and clears the recent
+/// refutations; the lifetime counts stay.
+pub fn record_canary(agent: &str, engine: &str, passed: bool, now: DateTime<Utc>) {
+    update(agent, |ledger| ledger.entry(engine).canary(passed, now));
+}
+
+/// The trust line published for an engine, once anything is known.
+#[must_use]
+pub fn trust(state: &EngineState) -> Option<ferryman_channel::receipts::EngineTrust> {
+    (state.verified > 0 || state.refuted > 0 || state.unverified > 0 || state.demoted()).then(
+        || ferryman_channel::receipts::EngineTrust {
+            verified: state.verified,
+            refuted: state.refuted,
+            unverified: state.unverified,
+            recent: u32::try_from(state.refutations.len()).unwrap_or(u32::MAX),
+            demoted: state.demoted(),
+            demoted_at: state.demoted_at,
+            canary_passed_at: state.canary_passed_at,
+        },
+    )
+}
+
+fn git_in(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Make the canary's throwaway repository in the empty directory `dir`: one commit, so
+/// there is a `HEAD` to measure from. Returns that commit and the line the engine is
+/// asked to write.
+pub fn canary_repo(dir: &Path) -> Result<(String, String)> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    for args in [
+        vec!["init", "-q", "--template="],
+        vec!["config", "user.email", "canary@ferryman.invalid"],
+        vec!["config", "user.name", "ferryman canary"],
+    ] {
+        git_in(dir, &args).with_context(|| format!("git {args:?} in {}", dir.display()))?;
+    }
+    std::fs::write(
+        dir.join("README.md"),
+        "A throwaway repository for a canary.\n",
+    )?;
+    git_in(dir, &["add", "README.md"]).context("git add")?;
+    git_in(dir, &["commit", "-q", "-m", "start"]).context("git commit")?;
+    let base = git_in(dir, &["rev-parse", "HEAD"]).context("git rev-parse")?;
+    let token = format!("ferryman canary {}", ferryman_channel::new_run_id());
+    Ok((base, token))
+}
+
+/// What the canary asks.
+#[must_use]
+pub fn canary_prompt(token: &str) -> String {
+    format!(
+        "This is a short test of whether you can change files and commit them. In the \
+         current directory, which is a git repository, create a file named {CANARY_FILE} \
+         containing exactly this one line:\n\n{token}\n\nThen commit it with git (git add \
+         {CANARY_FILE}, then git commit -m \"canary\"). Reply with the commit hash."
+    )
+}
+
+/// Whether the canary was really done: a new commit after `base` that adds the file with
+/// the line in it. Checked with git, never taken from the engine's answer.
+#[must_use]
+pub fn canary_holds(dir: &Path, base: &str, token: &str) -> bool {
+    let range = format!("{base}..HEAD");
+    let committed = git_in(dir, &["log", "--format=%H", &range, "--", CANARY_FILE])
+        .is_some_and(|commits| !commits.is_empty());
+    let content = git_in(dir, &["show", &format!("HEAD:{CANARY_FILE}")]);
+    committed && content.is_some_and(|text| text.contains(token))
 }
 
 // --- telling a wallet from a failure ---------------------------------------------------
@@ -1281,6 +1483,7 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
                 latency_ms: state.latency_ms,
                 balance: state.balance.clone(),
                 checked_at: state.checked_at,
+                trust: trust(&state),
             }
         })
         .collect()
@@ -1583,5 +1786,67 @@ engine.local.tier = "chore"
         assert!(!text.contains("NVIDIA_API_KEY"), "{text}");
         assert!(!text.contains("secret:"), "{text}");
         assert_eq!(reports[0].state, "unknown");
+    }
+
+    /// Repeated refutations inside the window demote an engine to chore work; build
+    /// work goes to the next engine; only the canary brings it back. Unverified results
+    /// are counted but never demote.
+    #[test]
+    fn refutations_demote_an_engine_and_only_the_canary_restores_it() {
+        use ferryman_channel::evidence::Status;
+        let now = monday_noon();
+        let specs = vec![
+            http("nemotron", Tier::Build, "https://example.invalid/v1"),
+            http("deepseek", Tier::Build, "https://example.invalid/v1"),
+        ];
+        let mut state = EngineState::default();
+        // One refutation three weeks ago has left the window by now.
+        assert!(!state.note(Status::Refuted, now - chrono::Duration::days(21)));
+        assert!(!state.note(Status::Unverified, now));
+        assert!(!state.note(Status::Unverified, now));
+        assert!(!state.note(Status::Refuted, now));
+        assert!(!state.demoted(), "one refutation in the window, not two");
+        assert!(state.note(Status::Refuted, now), "the second one demotes");
+        assert!(!state.note(Status::Refuted, now), "demoted once, not again");
+        assert!(state.demoted());
+        assert_eq!((state.refuted, state.unverified, state.verified), (4, 2, 0));
+        assert_eq!(effective_tier(&specs[0], &state), Tier::Chore);
+
+        let mut ledger = Ledger::default();
+        ledger.engines.insert("nemotron".into(), state.clone());
+        assert_eq!(
+            pick(&specs, &ledger, now, Tier::Build, &[]).map(|s| s.name.as_str()),
+            Some("deepseek"),
+            "build work is routed past a demoted engine"
+        );
+        assert_eq!(
+            pick(&specs[..1], &ledger, now, Tier::Chore, &[]).map(|s| s.name.as_str()),
+            Some("nemotron"),
+            "chore and canary work still go to it"
+        );
+        assert!(pick(&specs[..1], &ledger, now, Tier::Build, &[]).is_none());
+        let published = reports(&specs, &ledger, now);
+        let trust = published[0].trust.clone().unwrap();
+        assert!(trust.demoted && trust.demoted_at == Some(now));
+        assert_eq!(trust.score(), Some(0));
+        assert!(trust.describe().contains("DEMOTED"), "{}", trust.describe());
+        assert!(
+            published[1].trust.is_none(),
+            "nothing known, nothing claimed"
+        );
+
+        // A failed canary changes nothing but when the next one is due.
+        assert!(canary_due(&state, now));
+        state.canary(false, now);
+        assert!(state.demoted() && !canary_due(&state, now));
+        assert!(canary_due(&state, now + chrono::Duration::hours(1)));
+        // A pass restores its tier and clears the window; the history stays.
+        state.canary(true, now + chrono::Duration::hours(1));
+        assert!(!state.demoted());
+        assert_eq!(effective_tier(&specs[0], &state), Tier::Build);
+        assert!(state.refutations.is_empty());
+        assert_eq!(state.refuted, 4);
+        assert!(!state.note(Status::Refuted, now + chrono::Duration::hours(2)));
+        assert!(!state.demoted(), "a fresh window after the canary");
     }
 }
