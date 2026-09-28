@@ -38,17 +38,26 @@ pub struct Said {
     pub said: String,
     pub at: DateTime<Utc>,
     pub signature: String,
+    /// The delegate that relayed and signed it for `who`, when it was not `who` themself.
+    /// Such a statement is a record of what was said, never an appointment: only words
+    /// signed by the master's own key can name a head.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 fn said_payload(said: &Said) -> String {
-    format!(
+    let mut payload = format!(
         "ferryman-said-v1\n{}\n{}\n{}\n{}\n{}",
         said.id,
         said.project_id,
         said.who,
         said.at.to_rfc3339(),
         said.said
-    )
+    );
+    if let Some(via) = &said.via {
+        payload.push_str(&format!("\nvia:{via}"));
+    }
+    payload
 }
 
 /// Keep a signed copy of one thing a person said, where every agent can read it.
@@ -65,6 +74,7 @@ pub fn record_said(
         said: said.to_owned(),
         at: Utc::now(),
         signature: String::new(),
+        via: None,
     };
     record.signature = hex::encode(
         person
@@ -72,6 +82,30 @@ pub fn record_said(
             .sign(said_payload(&record).as_bytes())
             .to_bytes(),
     );
+    let dir = channel.join("said");
+    fs::create_dir_all(&dir)?;
+    crate::atomic_json(&dir.join(format!("{}.json", record.id)), &record)?;
+    Ok(record)
+}
+
+/// Keep a signed copy of something `principal` said, relayed and signed by `delegate`.
+pub fn record_said_via(
+    channel: &Path,
+    project_id: &str,
+    principal: &str,
+    delegate: &AgentIdentity,
+    said: &str,
+) -> Result<Said> {
+    let mut record = Said {
+        id: uuid::Uuid::new_v4().to_string(),
+        project_id: project_id.to_owned(),
+        who: principal.to_owned(),
+        said: said.to_owned(),
+        at: Utc::now(),
+        signature: String::new(),
+        via: Some(delegate.name().to_owned()),
+    };
+    record.signature = delegate.sign_bytes(said_payload(&record).as_bytes());
     let dir = channel.join("said");
     fs::create_dir_all(&dir)?;
     crate::atomic_json(&dir.join(format!("{}.json", record.id)), &record)?;
@@ -142,6 +176,8 @@ impl Order {
             return false;
         }
         let check = match self {
+            // Relayed words are a record, not an appointment.
+            Self::Said(said) if said.via.is_some() => return false,
             Self::Said(said) => crate::check_signature(
                 Some(&said.who),
                 Some(&said.signature),

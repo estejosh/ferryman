@@ -158,7 +158,7 @@ impl Entry {
 
 /// Refuse unless `signer` is the master of the project in `channel`, by the key the
 /// channel knows the master by. `what` finishes "only the master can ...".
-fn require_master(
+pub(crate) fn require_master(
     channel: &Path,
     project_id: &str,
     signer: &AgentIdentity,
@@ -207,16 +207,40 @@ pub struct ImproveSetting {
     pub set_at: DateTime<Utc>,
     pub signed_by: String,
     pub signature: String,
+    /// Whose switch this is, when a delegate signed it for them. `None` is the signer's
+    /// own. Honoured only under a valid `improve` delegation from the master.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<String>,
+}
+
+impl ImproveSetting {
+    /// Who set it, as a person reads it: `josh`, or `josh via telegram-grouchly`.
+    #[must_use]
+    pub fn set_by(&self) -> String {
+        match &self.on_behalf_of {
+            Some(principal) => crate::delegation::label(principal, &self.signed_by),
+            None => self.signed_by.clone(),
+        }
+    }
 }
 
 /// Exactly what a self-improve setting's signature covers. The project id is in it so a
-/// setting cannot be lifted from one channel into another.
+/// setting cannot be lifted from one channel into another; a delegated setting binds the
+/// principal too.
 fn improve_payload(project_id: &str, enabled: bool, set_at: &DateTime<Utc>) -> String {
     format!(
         "ferryman-self-improve-v1\n{project_id}\n{}\n{}",
         if enabled { "on" } else { "off" },
         set_at.to_rfc3339()
     )
+}
+
+fn setting_payload(setting: &ImproveSetting) -> String {
+    let mut payload = improve_payload(&setting.project_id, setting.enabled, &setting.set_at);
+    if let Some(principal) = &setting.on_behalf_of {
+        payload.push_str(&format!("\nfor:{principal}"));
+    }
+    payload
 }
 
 /// The master's self-improve setting for the project in `channel`, when there is one
@@ -227,13 +251,26 @@ pub fn self_improve_setting(channel: &Path, project_id: &str) -> Option<ImproveS
         serde_json::from_slice(&std::fs::read(channel.join(SELF_IMPROVE)).ok()?).ok()?;
     let roster = crate::read_agent_roster(channel).ok()?;
     let master = crate::master::read_master_at(channel, &roster).ok()??;
+    let principal = setting
+        .on_behalf_of
+        .clone()
+        .unwrap_or_else(|| setting.signed_by.clone());
     (setting.project_id == project_id
         && master.project_id == project_id
-        && setting.signed_by.eq_ignore_ascii_case(&master.master)
+        && principal.eq_ignore_ascii_case(&master.master)
+        && crate::delegation::authority(
+            channel,
+            project_id,
+            &principal,
+            &setting.signed_by,
+            crate::delegation::IMPROVE,
+            Utc::now(),
+        )
+        .allowed()
         && crate::check_signature(
             Some(&setting.signed_by),
             Some(&setting.signature),
-            &improve_payload(&setting.project_id, setting.enabled, &setting.set_at),
+            &setting_payload(&setting),
             &roster,
         ) == SignatureCheck::Valid)
         .then_some(setting)
@@ -253,27 +290,71 @@ pub fn set_self_improve(
     enabled: bool,
     signer: &AgentIdentity,
 ) -> Result<bool> {
+    set_self_improve_as(channel, project_id, enabled, signer, None)
+}
+
+/// [`set_self_improve`], signed by a delegate for `on_behalf_of`, who must be the master
+/// and must have delegated `improve` to the signer. `None` is the signer's own switch.
+pub fn set_self_improve_as(
+    channel: &Path,
+    project_id: &str,
+    enabled: bool,
+    signer: &AgentIdentity,
+    on_behalf_of: Option<&str>,
+) -> Result<bool> {
     if !channel.is_dir() {
         bail!(
             "{project_id}'s channel is not on this machine ({})",
             channel.display()
         );
     }
-    require_master(channel, project_id, signer, "switch self-improve on or off")?;
+    let on_behalf_of =
+        on_behalf_of.filter(|principal| !principal.eq_ignore_ascii_case(signer.name()));
+    match on_behalf_of {
+        None => require_master(channel, project_id, signer, "switch self-improve on or off")?,
+        Some(principal) => {
+            let Some(master) = master_of(channel)? else {
+                bail!(
+                    "{project_id} has no master, and only a project's master can switch self-improve"
+                );
+            };
+            if !principal.eq_ignore_ascii_case(&master) {
+                bail!(
+                    "only {master}, {project_id}'s master, can switch self-improve - not {principal}"
+                );
+            }
+            if let crate::delegation::Authority::Refused(why) = crate::delegation::authority(
+                channel,
+                project_id,
+                principal,
+                signer.name(),
+                crate::delegation::IMPROVE,
+                Utc::now(),
+            ) {
+                bail!(
+                    "{} cannot switch self-improve for {principal}: {why}",
+                    signer.name()
+                );
+            }
+        }
+    }
     if self_improve_enabled(channel, project_id) == enabled {
         return Ok(false);
     }
-    let set_at = Utc::now();
-    let signature = signer
-        .signing
-        .sign(improve_payload(project_id, enabled, &set_at).as_bytes());
-    let setting = ImproveSetting {
+    let mut setting = ImproveSetting {
         project_id: project_id.to_owned(),
         enabled,
-        set_at,
+        set_at: Utc::now(),
         signed_by: signer.name().to_owned(),
-        signature: hex::encode(signature.to_bytes()),
+        signature: String::new(),
+        on_behalf_of: on_behalf_of.map(str::to_owned),
     };
+    setting.signature = hex::encode(
+        signer
+            .signing
+            .sign(setting_payload(&setting).as_bytes())
+            .to_bytes(),
+    );
     let path = channel.join(SELF_IMPROVE);
     crate::atomic_json(&path, &setting).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
@@ -1603,6 +1684,53 @@ mod tests {
         assert!(!self_improve_enabled(&channel, "demo"));
     }
 
+    /// A delegate with `improve` switches it for the master, the record says so, and
+    /// nothing short of that delegation is honoured.
+    #[test]
+    fn a_delegate_switches_self_improve_only_under_an_improve_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = crate::AgentIdentity::from_seed("telegram-grouchly", [8u8; 32]);
+        let channel = mastered(dir.path(), "demo", &josh(), &[&bridge]);
+
+        // No delegation: refused, whoever it claims to act for.
+        assert!(set_self_improve_as(&channel, "demo", true, &bridge, Some("josh")).is_err());
+        // A delegation without the scope: refused.
+        crate::delegation::grant(
+            &channel,
+            "demo",
+            &josh(),
+            "telegram-grouchly",
+            &["orders".to_string()],
+            None,
+        )
+        .unwrap();
+        let error = set_self_improve_as(&channel, "demo", true, &bridge, Some("josh"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not delegated 'improve'"), "{error}");
+        // Acting for someone who is not the master: refused.
+        assert!(set_self_improve_as(&channel, "demo", true, &bridge, Some("ada")).is_err());
+
+        crate::delegation::grant(
+            &channel,
+            "demo",
+            &josh(),
+            "telegram-grouchly",
+            &["improve".to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(set_self_improve_as(&channel, "demo", true, &bridge, Some("josh")).unwrap());
+        let setting = self_improve_setting(&channel, "demo").unwrap();
+        assert!(setting.enabled);
+        assert_eq!(setting.set_by(), "josh via telegram-grouchly");
+
+        // Revoked: the setting it signed stops counting, and so does any new one.
+        crate::delegation::revoke(&channel, "demo", &josh(), "telegram-grouchly", "done").unwrap();
+        assert!(!self_improve_enabled(&channel, "demo"));
+        assert!(set_self_improve_as(&channel, "demo", true, &bridge, Some("josh")).is_err());
+    }
+
     #[test]
     fn a_self_improve_setting_the_master_did_not_sign_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
@@ -1619,6 +1747,7 @@ mod tests {
                 set_at,
                 signed_by: signer.name().into(),
                 signature: hex::encode(signature.to_bytes()),
+                on_behalf_of: None,
             }
         };
         let path = channel.join(SELF_IMPROVE);

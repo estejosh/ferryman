@@ -489,10 +489,23 @@ fn read_devices_in(dir: &Path) -> Result<Vec<DeviceRecord>> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        // A Syncthing conflict copy (`<id>.sync-conflict-<date>-<device>.json`) is a
+        // second copy of one machine's record, not a second machine. Counting it made
+        // one computer read as two.
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains(".sync-conflict-"))
+        {
+            continue;
+        }
         // One unreadable record must not hide the rest, or a corrupt file would quietly
         // shrink the count and report a fleet as compliant when it is not.
         if let Ok(text) = fs::read_to_string(&path)
             && let Ok(record) = serde_json::from_str::<DeviceRecord>(&text)
+            && !devices
+                .iter()
+                .any(|known: &DeviceRecord| known.id == record.id)
         {
             devices.push(record);
         }
@@ -650,6 +663,24 @@ mod device_identity {
         );
     }
 
+    /// Syncthing keeps both sides of a conflict as `<name>.sync-conflict-...`; that is
+    /// one machine's record twice, and `ferry license status` counted it as two.
+    #[test]
+    fn a_conflict_copy_of_a_device_record_is_not_another_computer() {
+        let root = temp("conflict-copy");
+        use_machine_state_dir_per_thread(root.join("machine"));
+        let route = route_at(&root.join("project"), "a");
+        register_device(&route, &record("1111111111111111", DeviceKind::Computer)).unwrap();
+        let dir = devices_dir(&route);
+        let original = fs::read_to_string(dir.join("1111111111111111.json")).unwrap();
+        fs::write(
+            dir.join("1111111111111111.sync-conflict-20260927-101010-ABCDEFG.json"),
+            original.replace("1111111111111111", "3333333333333333"),
+        )
+        .unwrap();
+        fs::write(dir.join("copy.json"), &original).unwrap();
+        assert_eq!(count(&read_devices(&route).unwrap()).computers, 1);
+    }
     fn record(id: &str, kind: DeviceKind) -> DeviceRecord {
         DeviceRecord {
             id: id.to_string(),

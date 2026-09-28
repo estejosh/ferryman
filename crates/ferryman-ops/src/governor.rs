@@ -191,6 +191,20 @@ pub fn presence() -> Presence {
     }
 }
 
+/// Whether someone has used this machine within `idle_after`.
+///
+/// Asked before improvement work is claimed: the weekly loop's own orders wait while the
+/// person is at the machine, and their direct orders never do. A machine with no desktop
+/// session to ask has nobody at it.
+#[must_use]
+pub fn someone_here(idle_after: Duration) -> bool {
+    judge_someone_here(presence(), idle_after)
+}
+
+fn judge_someone_here(presence: Presence, idle_after: Duration) -> bool {
+    matches!(presence, Presence::Active(idle) if idle < idle_after)
+}
+
 /// What the loop should do, and - when the answer is no - what to tell the operator.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -541,6 +555,20 @@ mod tests {
             judge_presence(Presence::Unknown, Duration::from_secs(300), 50, None),
             Decision::Go
         );
+    }
+
+    #[test]
+    fn someone_here_means_touched_within_the_idle_window_and_a_server_never_is() {
+        let idle_after = Duration::from_secs(300);
+        assert!(judge_someone_here(
+            Presence::Active(Duration::from_secs(5)),
+            idle_after
+        ));
+        assert!(!judge_someone_here(
+            Presence::Active(Duration::from_secs(900)),
+            idle_after
+        ));
+        assert!(!judge_someone_here(Presence::Unknown, idle_after));
     }
 
     #[test]

@@ -305,6 +305,29 @@ pub fn gather(route: &ProjectRoute, now: DateTime<Utc>) -> Result<PathBuf> {
         }
     }
 
+    let _ = writeln!(md, "\n## What the master answered\n");
+    let answered: Vec<String> = ferryman_channel::questions::list(route)
+        .into_iter()
+        .filter_map(|(question, answer)| {
+            let answer = answer?;
+            (answer.answered_at >= since).then(|| {
+                format!(
+                    "- {} ({}): \"{}\" - {}",
+                    question.id,
+                    first_line(&question.text),
+                    answer.answer,
+                    answer.from()
+                )
+            })
+        })
+        .collect();
+    if answered.is_empty() {
+        let _ = writeln!(md, "Nothing answered this week.");
+    }
+    for line in answered {
+        let _ = writeln!(md, "{line}");
+    }
+
     let _ = writeln!(md, "\n## Improvements already open\n");
     let open: Vec<&Task> = tasks
         .iter()
@@ -447,10 +470,92 @@ fn plan_prompt(project: &str, evidence: &str, max: usize) -> String {
          and stuck work next week, ranked most valuable first. Each must be small enough \
          for one engine to finish on one branch, and must say how a reviewer will know \
          it is done: tests to add or pass, or checks to run.\n\n\
+         If something only the project's owner can answer would change what you plan, \
+         add at most two short questions, each with a few answers to choose from; leave \
+         \"questions\" out otherwise. Plan anyway: the owner answers on their phone, and \
+         next week's plan reads the answers.\n\n\
          Reply with exactly one JSON object and nothing else:\n\
          {{\"improvements\": [{{\"title\": \"...\", \"why\": \"...\", \
-         \"acceptance\": [\"...\"]}}]}}\n\n---\n\n{evidence}"
+         \"acceptance\": [\"...\"]}}], \"questions\": [{{\"text\": \"...\", \
+         \"options\": [\"...\"]}}]}}\n\n---\n\n{evidence}"
     )
+}
+
+/// The clarifying questions a planner asked, at most two, each with its options.
+fn parse_questions(text: &str) -> Vec<(String, Vec<String>)> {
+    let Some(value) = extract_json(text) else {
+        return Vec::new();
+    };
+    value
+        .get("questions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let text = item.get("text")?.as_str()?.trim().to_string();
+            (!text.is_empty()).then(|| {
+                let options = item
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(|option| option.trim().chars().take(40).collect::<String>())
+                    .filter(|option| !option.is_empty())
+                    .take(4)
+                    .collect();
+                (text, options)
+            })
+        })
+        .take(2)
+        .collect()
+}
+
+/// Ask the master, through the channel, whether each improvement accepted by review is
+/// one they want to merge. A notice with buttons, never an action: nothing here merges,
+/// pushes or bumps a version. Asked once per order. Returns how many were asked.
+pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usize> {
+    let tasks: Vec<Task> = ferryman_channel::list_tasks(route)?
+        .into_iter()
+        .filter(|task| is_improvement(task) && task.state() == TaskState::Accepted)
+        .collect();
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+    let identity = signing_identity(route, config)?;
+    let mut asked = 0;
+    for task in tasks {
+        let reviewer = task
+            .reviews
+            .iter()
+            .rev()
+            .find(|review| review.accepted)
+            .map(|review| {
+                ferryman_channel::delegation::label(
+                    &review.reviewer,
+                    review.signed_by.as_deref().unwrap_or_default(),
+                )
+            })
+            .unwrap_or_else(|| "review".to_string());
+        let text = format!(
+            "Ready to merge: {}\n\nOrder {} was accepted by {reviewer}. The work is on its own \
+             branch; nothing merges on its own. Merge it when you are happy with it.",
+            task_title(&task),
+            task.order.id
+        );
+        if ferryman_channel::questions::ask(
+            route,
+            &identity,
+            &format!("merge-{}", task.order.id),
+            ferryman_channel::questions::MERGE,
+            &text,
+            &["I will merge it".to_string(), "Not yet".to_string()],
+            Some(&task.order.id),
+        )? {
+            asked += 1;
+        }
+    }
+    Ok(asked)
 }
 
 fn order_text(
@@ -677,6 +782,25 @@ pub async fn plan(
     // same plan rather than asking again and planning something different.
     write_plan(route, &plan)?;
     issue_missing(route, config, &identity, &plan)?;
+    for (rank, (text, options)) in parse_questions(&answer).into_iter().enumerate() {
+        let id = format!("clarify-{}-{}", plan.week.to_ascii_lowercase(), rank + 1);
+        match ferryman_channel::questions::ask(
+            route,
+            &identity,
+            &id,
+            ferryman_channel::questions::CLARIFY,
+            &text,
+            &options,
+            None,
+        ) {
+            Ok(true) => report.info(&format!("  {}: asked {id}: {text}", route.project_id)),
+            Ok(false) => {}
+            Err(error) => report.warn(&format!(
+                "  {}: could not ask {id}: {error:#}",
+                route.project_id
+            )),
+        }
+    }
     Ok(PlanOutcome::Planned {
         engine: engine.name,
         unreviewed: plan.unreviewed,
@@ -722,6 +846,17 @@ pub async fn review(
         return Ok(0);
     };
     let mut judged = 0;
+    match request_merges(route, config) {
+        Ok(0) => {}
+        Ok(count) => report.info(&format!(
+            "  {}: {count} improvement(s) ready to merge; asked the master",
+            route.project_id
+        )),
+        Err(error) => report.warn(&format!(
+            "  {}: could not ask about merging: {error:#}",
+            route.project_id
+        )),
+    }
 
     let week = engines::iso_week(now);
     if let Some(mut plan) = read_plan(route, &week).filter(|plan| plan.unreviewed) {
@@ -1061,6 +1196,11 @@ pub async fn run(
             Tier::Judge,
         )
         .is_some();
+        match request_merges(route, config) {
+            Ok(0) => {}
+            Ok(count) => done.push(format!("{project}: {count} ready to merge, asked")),
+            Err(error) => report.warn(&format!("{project}: merge notice failed: {error:#}")),
+        }
         if judge_up && (plan_unreviewed || awaiting_improvement_review(route)) {
             match review(route, config, now, report).await {
                 Ok(0) => {}
@@ -1207,6 +1347,101 @@ mod tests {
             .into_iter()
             .filter(is_improvement)
             .collect()
+    }
+
+    #[test]
+    fn a_planner_may_ask_at_most_two_questions_with_their_options() {
+        let text = r#"{"improvements": [], "questions": [
+            {"text": "Keep Windows 7 support?", "options": ["Yes", "No"]},
+            {"text": "  "},
+            {"text": "Which CI?", "options": []},
+            {"text": "A third", "options": ["x"]}
+        ]}"#;
+        let asked = parse_questions(text);
+        assert_eq!(
+            asked,
+            vec![
+                (
+                    "Keep Windows 7 support?".to_string(),
+                    vec!["Yes".to_string(), "No".to_string()]
+                ),
+                ("Which CI?".to_string(), Vec::new()),
+            ]
+        );
+        assert!(parse_questions(PLAN).is_empty(), "questions are optional");
+    }
+
+    /// Accepted improvement work is announced to the master as ready to merge, once, and
+    /// nothing is merged.
+    #[test]
+    fn accepted_improvements_become_one_merge_notice_each() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = channel(dir.path(), Vec::new());
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        let mut order = Order {
+            id: "improve-2026-w39-1".into(),
+            project_id: "demo".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "x", "tags": [TAG], "improvement": { "title": "Name the engine" } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        wisp.sign_order(&mut order);
+        ferryman_channel::issue_order(&route, &order).unwrap();
+        assert_eq!(
+            request_merges(&route, &config).unwrap(),
+            0,
+            "nothing accepted yet"
+        );
+        let mut result = ferryman_channel::TaskResult {
+            order_id: order.id.clone(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "done" }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp.sign_result(&mut result);
+        ferryman_channel::claim_order(&route, &order.id, "wisp").unwrap();
+        ferryman_channel::submit_result(&route, &result).unwrap();
+        let mut review = ferryman_channel::Review {
+            order_id: order.id.clone(),
+            revision: 1,
+            reviewer: "wisp".into(),
+            reviewed_at: Utc::now(),
+            accepted: true,
+            notes: None,
+            signed_by: None,
+            signature: None,
+        };
+        wisp.sign_review(&mut review);
+        ferryman_channel::submit_review(&route, &review).unwrap();
+
+        assert_eq!(request_merges(&route, &config).unwrap(), 1);
+        assert_eq!(request_merges(&route, &config).unwrap(), 0, "asked once");
+        let pending = ferryman_channel::questions::pending(&route);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, ferryman_channel::questions::MERGE);
+        assert!(
+            pending[0]
+                .text
+                .starts_with("Ready to merge: Name the engine")
+        );
+        assert_eq!(
+            ferryman_channel::read_task(&route, &order.id)
+                .unwrap()
+                .state(),
+            TaskState::Accepted,
+            "a notice changes nothing"
+        );
     }
 
     #[tokio::test]
