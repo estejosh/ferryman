@@ -203,7 +203,20 @@ fn tools() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        json!({
+            "name": "list_engines",
+            "description": "Which engines each worker on this channel can run right now: tier, how it is paid, up, down or out of credit until when. Read-only; no credentials.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
     ]
+}
+
+fn list_engines(route: &ProjectRoute) -> Result<Value> {
+    let rows: Vec<Value> = ferryman_channel::receipts::list_engines(route)?
+        .into_iter()
+        .map(|(inventory, check)| json!({ "signature": format!("{check:?}"), "inventory": inventory }))
+        .collect();
+    Ok(json!(rows))
 }
 
 fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
@@ -221,6 +234,7 @@ fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
         "read_memory" => read_memory(route, &args),
         "list_ledger" => list_ledger(route, &args),
         "list_learnings" => list_learnings(route, &args),
+        "list_engines" => list_engines(route),
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
     match outcome {

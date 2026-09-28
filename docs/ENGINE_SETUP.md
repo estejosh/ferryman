@@ -126,6 +126,98 @@ ids change often enough that you should check rather than copy).
 - Large tasks can abort mid-stream in `-p` mode (see Known issues in the
   README). Scope orders small until that is understood.
 
+## Several engines, and falling back between them
+
+One agent can list several engines in order of preference. When one runs out of
+credit - HTTP 402, "insufficient balance", "usage limit", a 429 asking for ten
+minutes or more - it is marked exhausted until the reset the message gives (six
+hours when it gives none), the failure is **not** counted against the order, and
+the same order goes straight to the next engine at the same tier or above. An
+ordinary failure is handled exactly as before.
+
+```toml
+agent = "ichabod-grouchly-cline"
+# command, args and model stay as they are: they are what an old config runs, and
+# what a CLI engine without a command of its own runs.
+command = "ferryman-cline"
+engines = ["nvidia", "deepseek"]
+
+# NVIDIA's free tier, through the same cline runner, so it can edit and commit.
+# `env` points the runner at NVIDIA's OpenAI-compatible endpoint: use the names your
+# runner reads (the common OPENAI_* ones shown). Values are secret:NAME or env:NAME,
+# never a key. base_url and key are for the probe; probe = "chat" asks for one token
+# instead of listing models, because some listed models answer 404.
+engine.nvidia.kind = "cli"
+engine.nvidia.model = "nvidia/nemotron-3-super-120b-a12b"
+engine.nvidia.env = {"OPENAI_BASE_URL":"https://integrate.api.nvidia.com/v1","OPENAI_API_KEY":"secret:NVIDIA_API_KEY","OPENAI_MODEL":"nvidia/nemotron-3-super-120b-a12b"}
+engine.nvidia.base_url = "https://integrate.api.nvidia.com/v1"
+engine.nvidia.key = "secret:NVIDIA_API_KEY"
+engine.nvidia.tier = "build"
+engine.nvidia.paid = "free-tier"
+engine.nvidia.probe = "chat"
+engine.nvidia.weekly_requests = "400"
+
+# The runner as it is set up today (DeepSeek). With base_url and key the probe also
+# reads DeepSeek's balance, so an empty wallet is known before an order is tried.
+engine.deepseek.kind = "cli"
+engine.deepseek.model = "deepseek-v4-pro"
+engine.deepseek.base_url = "https://api.deepseek.com"
+engine.deepseek.key = "secret:DEEPSEEK_API_KEY"
+engine.deepseek.tier = "build"
+engine.deepseek.paid = "prepaid"
+engine.deepseek.weekly_usd = "5"
+```
+
+An engine can also be `kind = "http"`: an OpenAI-compatible endpoint asked once per
+order (`base_url`, `model`, `key`). It answers in text and cannot edit files, so it
+suits judging, planning and chores, not building.
+
+- **Tiers**: `judge` plans and reviews, `build` builds, `chore` does orders marked
+  `"tier": "chore"`. An order goes to its own tier first and only climbs: a chore
+  engine never builds, and a judge builds only when every builder is out.
+- **A CLI pointed at an endpoint** is how an HTTP-only model edits code: give the
+  CLI engine its own `command`, `args` (`{model}` and `{base_url}` are filled in)
+  and `env` - a JSON object whose values may be `secret:NAME` or `env:NAME`, e.g.
+  `engine.nim-code.env = {"OPENAI_BASE_URL":"https://integrate.api.nvidia.com/v1","OPENAI_API_KEY":"secret:NVIDIA_API_KEY"}`.
+  `base_url` and `key` on a CLI engine are used only by the probe.
+- **Local models**: `engine.local.base_url = "http://localhost:1234/v1"` (LM Studio)
+  or `http://localhost:11434/v1` (Ollama) is `paid = "local"` automatically.
+- **Probes**: every ten minutes the worker lists each endpoint's models (or asks
+  for one token), reads DeepSeek's and OpenRouter's balance endpoints when it has
+  their key, and checks a CLI is on PATH. A CLI is never run just to probe it.
+- **Budgets**: `weekly_requests` and `weekly_usd` (list prices, from the usage the
+  engine reports) make an engine exhausted until Monday 00:00 UTC once reached.
+- **Where it shows**: each worker publishes a signed `engines/<agent>.json` beside
+  its presence file, with no credentials in it. `ferry engines` shows the whole
+  fleet; `ferry mcp serve` has a read-only `list_engines` tool.
+
+## The weekly improvement loop
+
+Off for every project until its master switches it on: `ferry improve on [project]`
+(or `--workspace <dir>`), or the Self-improve button on the dashboard's Teammates
+page. The setting is signed by the master and lives in the channel, so every machine
+honours it; one anyone else signed is ignored. `ferry improve off` switches it back,
+and `ferry improve status` lists every project with its switch and last run. Only
+projects switched on take part in anything below.
+
+`ferry improve run` does whichever steps are due for every project (all of them in
+the ferry root, or `--comms <dir>`, or `--workspace <dir>`), and is safe to call from
+n8n or cron as often as you like:
+
+- `gather` - the last seven days (send-backs, failed runs, late orders, doctor,
+  TODO/FIXME, the learning database) into `improve/<week>/evidence.md`;
+- `plan` - the best judge-tier engine up turns it into at most `--max` (5) ranked
+  improvements with acceptance checks, each a signed order tagged `improvement`,
+  open to any worker, on its own branch. With no judge up a builder plans and the
+  plan is marked unreviewed. Once a week; a second run issues nothing new;
+- `review` - with a judge up, reviews improvement results through the ordinary
+  review mechanism and reads any unreviewed plan. Never merges;
+- `report` - `improve/<week>/report.md`: done, success and send-back rates, median
+  time to claim and cost, this week against last, and what is ready to merge.
+
+`improve = "true"` in `agent.toml` lets the worker run it itself, at most hourly.
+`ferry pause` stops all of it.
+
 ## Diagnosing
 
 ```sh

@@ -11,6 +11,7 @@ anyhow.workspace = true
 chrono.workspace = true
 ferryman-channel = { path = "../ferryman-channel" }
 hostname.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 sysinfo.workspace = true
 system-idle-time.workspace = true

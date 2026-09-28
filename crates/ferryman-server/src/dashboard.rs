@@ -411,6 +411,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/secrets/{name}", delete(secret_remove))
         .route("/api/cost/rates", get(cost_rates))
         .route("/api/cost/plan", post(cost_plan))
+        .route("/api/improve", get(improve_get).post(improve_set))
         // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
         // session check. A rebinding attempt is refused without its token being examined,
         // and a missing session is never reported to an origin that should not be talking
@@ -1761,6 +1762,101 @@ async fn master_init(
         "master": declaration.master,
         "grants_required": flipped || route.requires_grants(),
     })))
+}
+
+/// GET /api/improve - whether this project's master has switched self-improve on, when
+/// the weekly loop last ran here, and which engines each worker on the channel can run.
+///
+/// The engines are each worker's signed inventory, as `ferry engines` reads it: tier,
+/// how it is paid, up, down or out of credit until when - never a credential. `may_set`
+/// says whether the person signed in is the master, the only one whose switch counts.
+async fn improve_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let channel = &route.communications;
+    let setting = ferryman_channel::ferry::self_improve_setting(channel, &route.project_id);
+    let master = ferryman_channel::ferry::master_of(channel).ok().flatten();
+    let may_set = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    let engines: Vec<Value> = ferryman_channel::receipts::list_engines(&route)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(inventory, check)| {
+            json!({
+                "agent": inventory.agent,
+                "machine": inventory.machine,
+                "updated_at": inventory.updated_at,
+                "signature": format!("{check:?}"),
+                "engines": inventory.engines,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "project": route.project_id,
+        "enabled": setting.as_ref().is_some_and(|s| s.enabled),
+        "set_by": setting.as_ref().map(|s| s.signed_by.clone()),
+        "set_at": setting.as_ref().map(|s| s.set_at),
+        "master": master,
+        "may_set": may_set,
+        "last_run": ferryman_channel::ferry::improve_last_run(channel)
+            .map(|(week, steps)| json!({ "week": week, "steps": steps })),
+        "engines": engines,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ImproveBody {
+    enabled: bool,
+}
+
+/// POST /api/improve - the master switches self-improve on or off for this project.
+///
+/// Signed with the session's key into the channel, where every machine reads it; the
+/// same check as `ferry improve on|off`, so anyone but the master is refused.
+async fn improve_set(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<ImproveBody>,
+) -> Result<Json<Value>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let current = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let route = state.route_for(params.project.as_deref());
+    let changed = ferryman_channel::ferry::set_self_improve(
+        &route.communications,
+        &route.project_id,
+        body.enabled,
+        &current,
+    )
+    .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    if changed {
+        let _ = ferryman_channel::ledger::append_ledger_entry(
+            &route,
+            &current,
+            "self-improve",
+            current.name(),
+            &format!(
+                "{} switched self-improve {} for {}",
+                current.name(),
+                if body.enabled { "on" } else { "off" },
+                route.project_id
+            ),
+            None,
+        );
+    }
+    Ok(Json(json!({ "enabled": body.enabled, "changed": changed })))
 }
 
 /// POST /api/head/revoke - the master clears the head agent of the project on screen.
@@ -3342,6 +3438,7 @@ mod tests {
             "/api/fleet",
             "/api/memory",
             "/api/cost/rates",
+            "/api/improve",
         ] {
             let response = app
                 .clone()
@@ -4271,6 +4368,38 @@ mod tests {
             task.reviews[0].signature.is_some(),
             "the verdict must be signed"
         );
+    }
+
+    /// Self-improve is off until the master switches it on, from the browser, and
+    /// nobody else can.
+    #[tokio::test]
+    async fn only_the_master_switches_self_improve_from_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let before = get_json(&app, "/api/improve", Some(&token)).await;
+        assert_eq!(before["enabled"], false, "off by default: {before}");
+        assert_eq!(before["may_set"], false, "nobody is master yet");
+
+        let refused = post(&app, "/api/improve", r#"{"enabled":true}"#, Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let on = post(&app, "/api/improve", r#"{"enabled":true}"#, Some(&token)).await;
+        assert_eq!(on.status(), StatusCode::OK);
+
+        let after = get_json(&app, "/api/improve", Some(&token)).await;
+        assert_eq!(after["enabled"], true, "{after}");
+        assert_eq!(after["may_set"], true);
+        assert_eq!(after["set_by"], "alice");
+        assert!(ferryman_channel::ferry::self_improve_enabled(
+            &route.communications,
+            &route.project_id
+        ));
     }
 
     /// Setting a secret from the dashboard is signed by the operator, not the

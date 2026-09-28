@@ -335,6 +335,24 @@ enum Command {
         #[command(subcommand)]
         command: Cost,
     },
+    /// Which engine works on which machine right now.
+    ///
+    /// Read from every channel's signed engines files, which each worker rewrites as
+    /// its engines are probed: tier, how each is paid, and whether it is up, down, or
+    /// out of credit until when. Never shows a credential.
+    Engines {
+        #[command(flatten)]
+        at: Targets,
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The weekly improvement loop: gather evidence, plan improvements as orders,
+    /// review what was built, and report the week. Nothing is ever merged.
+    Improve {
+        #[command(subcommand)]
+        command: ImproveCommand,
+    },
     /// What this deployment counts as under the licence.
     License {
         #[command(subcommand)]
@@ -2159,6 +2177,451 @@ enum Agents {
         project: String,
     },
 }
+/// Which projects a fleet-wide command reads: one workspace, every channel under a
+/// folder, or - with neither - every project in the ferry root, then the current one.
+#[derive(clap::Args, Clone)]
+struct Targets {
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Every channel under this folder, as `ferry agent run --comms` watches them.
+    #[arg(long, conflicts_with = "workspace")]
+    comms: Option<PathBuf>,
+}
+
+#[derive(Subcommand, Clone)]
+enum ImproveCommand {
+    /// Collect the last seven days of failures, send-backs, late orders, doctor
+    /// findings, TODOs and engine records into improve/<week>/evidence.md.
+    Gather {
+        #[command(flatten)]
+        at: Targets,
+    },
+    /// Ask the best judge-tier engine up to turn the evidence into ranked
+    /// improvements, and issue each as a signed order tagged `improvement`. Once a
+    /// week; a second run issues nothing new.
+    Plan {
+        #[command(flatten)]
+        at: Targets,
+        #[arg(long, default_value_t = ferryman_ops::improve::DEFAULT_MAX)]
+        max: usize,
+    },
+    /// With a judge-tier engine up, review improvement results nobody has judged, and
+    /// read a plan no judge wrote. Never merges.
+    Review {
+        #[command(flatten)]
+        at: Targets,
+    },
+    /// Write improve/<week>/report.md: this week against last week.
+    Report {
+        #[command(flatten)]
+        at: Targets,
+    },
+    /// Run whichever of the steps above are due, for every project. Safe to call from
+    /// n8n or cron as often as you like: nothing due costs nothing.
+    Run {
+        #[command(flatten)]
+        at: Targets,
+        #[arg(long, default_value_t = ferryman_ops::improve::DEFAULT_MAX)]
+        max: usize,
+    },
+    /// Switch self-improvement on for a project. Only its master can: the setting is
+    /// signed and travels with the channel, so it applies on every machine.
+    On {
+        #[command(flatten)]
+        which: ImproveProject,
+    },
+    /// Switch self-improvement off for a project. Master only, like `on`.
+    Off {
+        #[command(flatten)]
+        which: ImproveProject,
+    },
+    /// Every project in the ferry root: self-improve on or off, and its last run.
+    Status {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The one project `ferry improve on|off` acts on.
+#[derive(clap::Args, Clone)]
+struct ImproveProject {
+    /// A project in the ferry root, by id. Without it (or `--workspace`), the project
+    /// the current directory belongs to.
+    project: Option<String>,
+    #[arg(long, conflicts_with = "project")]
+    workspace: Option<PathBuf>,
+}
+
+/// The project id, its channel, and where its local keys live.
+fn improve_project(which: &ImproveProject) -> Result<(String, PathBuf, PathBuf)> {
+    if let Some(project) = &which.project {
+        let root = ferryman_channel::ferry::find_root()
+            .context("no ferry root yet - make one with `ferry root init`, or pass --workspace")?;
+        let entry = root
+            .read()
+            .projects
+            .into_iter()
+            .find(|entry| entry.project_id == *project)
+            .with_context(|| {
+                format!(
+                    "no project '{project}' in {}",
+                    root.manifest_path().display()
+                )
+            })?;
+        // As for `ferry root archive`: a channel-only project has no repository here,
+        // so the ferry root stands in for where the keys are.
+        let attachment = entry
+            .repo
+            .as_ref()
+            .map(|repo| repo.join(".ferryman"))
+            .filter(|attachment| attachment.is_dir())
+            .unwrap_or_else(|| root.path.clone());
+        return Ok((project.clone(), entry.channel, attachment));
+    }
+    let start = match &which.workspace {
+        Some(workspace) => workspace.clone(),
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    let route = ferryman_channel::route_for(&start)?;
+    Ok((route.project_id, route.communications, route.attachment))
+}
+
+fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
+    let (project, channel, attachment) = improve_project(which)?;
+    let Some(master) = ferryman_channel::ferry::master_of(&channel)? else {
+        bail!(
+            "{project} has no master, and only a project's master can switch self-improve.\n\
+             \n\
+             Claim every project that has none:  ferry root master"
+        );
+    };
+    let identity = signing_identity_in(&attachment, &master)?;
+    let word = if enabled { "on" } else { "off" };
+    if ferryman_channel::ferry::set_self_improve(&channel, &project, enabled, &identity)? {
+        println!(
+            "self-improve is {word} for {project}, signed by {master}; every machine that \
+             syncs the channel sees it"
+        );
+    } else {
+        println!("self-improve was already {word} for {project}");
+    }
+    Ok(())
+}
+
+fn improve_status(as_json: bool) -> Result<()> {
+    let projects: Vec<(String, PathBuf)> = match ferryman_channel::ferry::find_root() {
+        Some(root) => root
+            .projects()
+            .into_iter()
+            .map(|entry| (entry.project_id, entry.channel))
+            .collect(),
+        None => {
+            let route = ferryman_channel::route_for(
+                &std::env::current_dir().context("read the current directory")?,
+            )?;
+            vec![(route.project_id, route.communications)]
+        }
+    };
+    let rows: Vec<Value> = projects
+        .iter()
+        .map(|(project, channel)| {
+            let setting = ferryman_channel::ferry::self_improve_setting(channel, project);
+            let last = ferryman_ops::improve::last_run(channel);
+            json!({
+                "project": project,
+                "enabled": setting.as_ref().is_some_and(|s| s.enabled),
+                "has_master": ferryman_channel::ferry::master_of(channel).ok().flatten().is_some(),
+                "set_by": setting.as_ref().map(|s| s.signed_by.clone()),
+                "set_at": setting.as_ref().map(|s| s.set_at),
+                "last_run": last.map(|(week, steps)| json!({ "week": week, "steps": steps })),
+            })
+        })
+        .collect();
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<14} {:<30} LAST RUN",
+        "PROJECT", "SELF-IMPROVE", "SET BY"
+    );
+    for row in &rows {
+        let state = match (row["enabled"].as_bool(), row["has_master"].as_bool()) {
+            (Some(true), _) => "on",
+            (_, Some(false)) => "off (no master)",
+            _ => "off",
+        };
+        let set = match (row["set_by"].as_str(), row["set_at"].as_str()) {
+            (Some(by), Some(at)) => {
+                format!("{by}, {}", at.get(..16).unwrap_or(at).replace('T', " "))
+            }
+            _ => "-".to_string(),
+        };
+        let last = match row["last_run"].as_object() {
+            Some(last) => format!(
+                "{}: {}",
+                last["week"].as_str().unwrap_or_default(),
+                last["steps"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => "never".to_string(),
+        };
+        println!(
+            "{:<24} {state:<14} {set:<30} {last}",
+            row["project"].as_str().unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+/// Only the projects whose master has switched self-improve on, saying which were
+/// passed over.
+fn switched_on<T>(items: Vec<T>, route: impl Fn(&T) -> &ferryman_channel::ProjectRoute) -> Vec<T> {
+    items
+        .into_iter()
+        .filter(|item| {
+            let route = route(item);
+            let on = ferryman_channel::ferry::self_improve_enabled(
+                &route.communications,
+                &route.project_id,
+            );
+            if !on {
+                eprintln!(
+                    "  {}: self-improve is off; its master can switch it on with \
+                     'ferry improve on {}'",
+                    route.project_id, route.project_id
+                );
+            }
+            on
+        })
+        .collect()
+}
+
+/// The channels a fleet-wide command reads.
+fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
+    if let Some(comms) = &at.comms {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(comms)
+            .with_context(|| format!("read {}", comms.display()))?
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.join(".ferryman").is_dir())
+            .collect();
+        entries.sort();
+        return Ok(entries
+            .iter()
+            .filter_map(|path| ferryman_channel::route_for(path).ok())
+            .collect());
+    }
+    if let Some(workspace) = &at.workspace {
+        return Ok(vec![ferryman_channel::route_for(workspace)?]);
+    }
+    if let Some(root) = ferryman_channel::ferry::find_root() {
+        let routes: Vec<_> = root
+            .projects()
+            .iter()
+            .filter_map(|entry| ferryman_channel::route_for(&entry.channel).ok())
+            .collect();
+        if !routes.is_empty() {
+            return Ok(routes);
+        }
+    }
+    let here = std::env::current_dir().context("read the current directory")?;
+    Ok(vec![ferryman_channel::route_for(&here)?])
+}
+
+/// The channels a fleet-wide command acts on, each with the agent config it acts under.
+fn target_configs(
+    at: &Targets,
+) -> Result<
+    Vec<(
+        ferryman_channel::ProjectRoute,
+        ferryman_ops::agent::AgentConfig,
+    )>,
+> {
+    if let Some(comms) = &at.comms {
+        let fleet = ferryman_ops::agent::fleet_under(comms)?;
+        for (path, why) in &fleet.skipped {
+            eprintln!("  not acting on {}: {why}", path.display());
+        }
+        return Ok(fleet.served);
+    }
+    let shared = ferryman_channel::ferry::find_root()
+        .filter(|_| at.workspace.is_none())
+        .and_then(|root| ferryman_ops::agent::AgentConfig::load(&root.comms()).ok());
+    let mut out = Vec::new();
+    for route in target_routes(at)? {
+        match ferryman_ops::agent::AgentConfig::load(&route.attachment)
+            .ok()
+            .or_else(|| shared.clone())
+        {
+            Some(config) => out.push((route, config)),
+            None => eprintln!("  {}: no agent.toml, skipped", route.project_id),
+        }
+    }
+    Ok(out)
+}
+
+fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
+    use ferryman_channel::{SignatureCheck, receipts::EngineInventory};
+    // One row per agent and machine, however many channels it publishes into: the
+    // newest valid file wins.
+    let mut rows: std::collections::BTreeMap<
+        (String, String),
+        (EngineInventory, SignatureCheck, Vec<String>),
+    > = std::collections::BTreeMap::new();
+    for route in target_routes(at)? {
+        for (inventory, check) in ferryman_channel::receipts::list_engines(&route)? {
+            let key = (
+                inventory.agent.to_ascii_lowercase(),
+                inventory.machine.to_ascii_lowercase(),
+            );
+            let entry = rows
+                .entry(key)
+                .or_insert_with(|| (inventory.clone(), check.clone(), Vec::new()));
+            entry.2.push(route.project_id.clone());
+            let better = (check == SignatureCheck::Valid && entry.1 != SignatureCheck::Valid)
+                || (check == entry.1 && inventory.updated_at > entry.0.updated_at);
+            if better {
+                entry.0 = inventory;
+                entry.1 = check;
+            }
+        }
+    }
+    if as_json {
+        let out: Vec<Value> = rows
+            .values()
+            .map(|(inventory, check, channels)| {
+                json!({
+                    "agent": inventory.agent,
+                    "machine": inventory.machine,
+                    "updated_at": inventory.updated_at,
+                    "ferry_version": inventory.ferry_version,
+                    "signature": format!("{check:?}"),
+                    "channels": channels,
+                    "engines": inventory.engines,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!(
+            "no worker has published its engines yet; a worker on this version publishes \
+             them within ten minutes of starting"
+        );
+        return Ok(());
+    }
+    let now = chrono::Utc::now();
+    for (inventory, check, channels) in rows.values() {
+        println!(
+            "{} on {}  (updated {} ago, {:?}, {} channel(s))",
+            inventory.agent,
+            inventory.machine,
+            ferryman_channel::receipts::short_age(now - inventory.updated_at),
+            check,
+            channels.len()
+        );
+        for engine in &inventory.engines {
+            let state = match (engine.state.as_str(), engine.until) {
+                ("exhausted", Some(until)) => {
+                    format!("exhausted until {}", until.format("%a %H:%M UTC"))
+                }
+                (state, _) => state.to_string(),
+            };
+            let latency = engine
+                .latency_ms
+                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                .unwrap_or_default();
+            println!(
+                "  {:<12} {:<6} {:<12} {:<30} {:<36} {:>7} {}",
+                engine.name,
+                engine.tier,
+                engine.paid,
+                state,
+                engine.model.as_deref().unwrap_or("-"),
+                latency,
+                engine.balance.as_deref().unwrap_or("")
+            );
+            if engine.state != "up"
+                && let Some(reason) = &engine.reason
+            {
+                println!("  {:<12} {reason}", "");
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn improve_command(command: ImproveCommand) -> Result<()> {
+    use ferryman_ops::improve;
+    let report = ferryman_ops::Stdout;
+    let now = chrono::Utc::now();
+    match command {
+        ImproveCommand::Gather { at } => {
+            for route in switched_on(target_routes(&at)?, |route| route) {
+                let path = improve::gather(&route, now)?;
+                println!("{}: {}", route.project_id, path.display());
+            }
+        }
+        ImproveCommand::Plan { at, max } => {
+            for (route, config) in switched_on(target_configs(&at)?, |(route, _)| route) {
+                match improve::plan(&route, &config, max, now, &report).await {
+                    Ok(outcome) => println!("{}: {outcome:?}", route.project_id),
+                    Err(error) => eprintln!("{}: {error:#}", route.project_id),
+                }
+            }
+        }
+        ImproveCommand::Review { at } => {
+            for (route, config) in switched_on(target_configs(&at)?, |(route, _)| route) {
+                match improve::review(&route, &config, now, &report).await {
+                    Ok(count) => println!("{}: judged {count}", route.project_id),
+                    Err(error) => eprintln!("{}: {error:#}", route.project_id),
+                }
+            }
+        }
+        ImproveCommand::Report { at } => {
+            for route in switched_on(target_routes(&at)?, |route| route) {
+                let path = improve::report(&route, now)?;
+                println!("{}: {}", route.project_id, path.display());
+            }
+        }
+        ImproveCommand::Run { at, max } => {
+            let targets = target_configs(&at)?;
+            let on = targets
+                .iter()
+                .filter(|(route, _)| {
+                    ferryman_channel::ferry::self_improve_enabled(
+                        &route.communications,
+                        &route.project_id,
+                    )
+                })
+                .count();
+            let done = improve::run(&targets, max, now, &report).await;
+            if on == 0 {
+                println!(
+                    "no project here has self-improve switched on; see 'ferry improve status'"
+                );
+            } else if done.is_empty() {
+                println!("nothing was due ({on} project(s) switched on)");
+            }
+            for line in done {
+                println!("{line}");
+            }
+        }
+        ImproveCommand::On { which } => improve_switch(&which, true)?,
+        ImproveCommand::Off { which } => improve_switch(&which, false)?,
+        ImproveCommand::Status { json } => improve_status(json)?,
+    }
+    Ok(())
+}
+
 #[derive(Subcommand, Clone)]
 enum Cost {
     /// The published per-engine price table, dollars per million tokens.
@@ -2855,6 +3318,8 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Cost { command } => cost_command(command)?,
+        Command::Engines { at, json } => engines_command(&at, json)?,
+        Command::Improve { command } => improve_command(command).await?,
         Command::License { command } => license_command(command).await?,
         Command::Jobs { command } => jobs(&cli, command).await?,
         Command::Projects { command } => match command {
@@ -5296,7 +5761,14 @@ async fn agent_command(command: Agent) -> Result<()> {
             for (route, config) in &fleet.served {
                 report.info(&format!(
                     "  {} as '{}' running '{}'",
-                    route.project_id, config.agent, config.command
+                    route.project_id,
+                    config.agent,
+                    config
+                        .engines
+                        .iter()
+                        .map(|engine| format!("{} ({})", engine.name, engine.tier.as_str()))
+                        .collect::<Vec<_>>()
+                        .join(" > ")
                 ));
             }
             // The shortest poll wins. A fleet paced by its slowest channel would leave the
@@ -5390,6 +5862,26 @@ async fn agent_command(command: Agent) -> Result<()> {
                             "{} failed, will retry: {error:#}",
                             route.project_id
                         )),
+                    }
+                }
+                // The weekly improvement loop, for the channels whose agent.toml asks
+                // for it. At most hourly, and cheap when nothing is due.
+                let improving: Vec<_> = fleet
+                    .served
+                    .iter()
+                    .filter(|(_, config)| config.improve)
+                    .cloned()
+                    .collect();
+                if !improving.is_empty() && ferryman_ops::improve::hourly_due(chrono::Utc::now()) {
+                    for line in ferryman_ops::improve::run(
+                        &improving,
+                        ferryman_ops::improve::DEFAULT_MAX,
+                        chrono::Utc::now(),
+                        &report,
+                    )
+                    .await
+                    {
+                        report.info(&format!("improve: {line}"));
                     }
                 }
                 if once {

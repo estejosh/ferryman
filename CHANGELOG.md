@@ -17,6 +17,31 @@
   The dashboard's task list shows the stage too, and `/api/tasks` and `/api/roster` carry
   it. Ten channels had silently stopped syncing to one machine for weeks; this is the
   signal that was missing.
+- **An agent can run several engines, and falls back when one runs out of credit.**
+  `engines = [...]` in `agent.toml` lists them in order, each a CLI or an
+  OpenAI-compatible endpoint, with a tier (`judge`, `build`, `chore`), how it is paid,
+  and optional weekly request or dollar caps; keys are only ever `secret:NAME` or
+  `env:NAME`. A 402, "insufficient balance", "usage limit" or long 429 marks that engine
+  exhausted until its reset, is not counted as an attempt, and the same order goes to
+  the next engine at once. With every engine out, the worker holds off and says why.
+  Engines are probed every ten minutes (models list or one token, plus DeepSeek and
+  OpenRouter balances), and each worker publishes a signed `engines/<agent>.json`.
+  `ferry engines` shows which engine works on which machine; `ferry mcp serve` gains a
+  read-only `list_engines` tool. A config without `engines` runs exactly as before.
+  grouchly's worker failed every order in a second on "Insufficient Balance" and could
+  not even read the order telling it to switch.
+- **`ferry improve`: a weekly improvement loop per project, off until its master
+  switches it on.** `ferry improve on|off` (or the Self-improve button on the
+  dashboard's Teammates page, for the signed-in master) writes a master-signed
+  `SELF_IMPROVE` setting into the channel, so it applies on every machine; a setting
+  anyone else signed is ignored. `ferry improve status` lists every project with its
+  switch and last run, and the dashboard shows each worker's engines. `gather` collects the
+  week's evidence, `plan` has a judge-tier engine turn it into at most five ranked,
+  signed `improvement` orders (a builder plans when no judge is up, and the plan is
+  marked unreviewed), `review` judges the results through the usual review, and
+  `report` compares the week with the last. `ferry improve run` does whatever is due,
+  is idempotent and cheap, and can be run by n8n or cron, or hourly by the worker with
+  `improve = "true"`. Nothing merges; `ferry pause` stops it.
 
 ## v0.5.15 - 2026-09-24
 
