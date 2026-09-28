@@ -83,6 +83,43 @@
   `report` compares the week with the last. `ferry improve run` does whatever is due,
   is idempotent and cheap, and can be run by n8n or cron, or hourly by the worker with
   `improve = "true"`. Nothing merges; `ferry pause` stops it.
+- **fm checks results instead of trusting them.** A worker records what git and its own
+  processes saw around each engine run - HEAD before and after, commits made, diff stat,
+  uncommitted paths, duration, whether commit hashes the answer names exist, and the
+  checks the order names (cargo, npm, pnpm, yarn, go, pytest, make; no shell) with exit
+  codes and output tails - as an optional signed `evidence` block in the result. Each
+  result is then verified, unverified or refuted, recomputed from those facts. A result
+  that claims changes with HEAD unchanged and no diff, names a commit that does not exist,
+  skips required checks, claims success over a failing check, or is empty, a refusal, a
+  redirect or all placeholders ("no output") is refuted: it never counts as done, never
+  satisfies a dependency, cannot be accepted, and shows as refuted in `ferry channel
+  status`, the dashboard, Telegram and the improve report. The verdict is a separate
+  signed `verification.<verifier>.<rev>.json` plus a ledger entry; the worker's file is
+  never touched. grouchly's headless worker had signed "no output" seven times, twelve
+  seconds after claiming, and fm counted it as success.
+- **Engines that fabricate get demoted.** Verified, unverified and refuted counts per
+  agent and engine are kept in the signed `engines/<agent>.json`. Two refutations within
+  14 days drop an engine to chore tier, so it gets no build or judge work, and a worker
+  will not claim a build order with only a demoted engine. A demoted engine runs an
+  hourly canary (commit a known line in a throwaway repo, checked with git only); a pass
+  restores it. `ferry engines` shows trust, DEMOTED, and a tally of what other machines'
+  signed verifications found.
+- **PROBLEMS.md is a list of claims, not a list of facts.** `ferry improve gather` reads
+  `PROBLEMS.md` in any letter case at each project root, one claim per section or list
+  item, as unverified. `ferry improve plan` sends a verification order for each claim
+  first (confirm or refute, with `file:line` citations that are checked to exist); only
+  confirmed claims reach the planner, and refuted ones are recorded in
+  `improve/claims.json` and not raised again.
+- **Archived projects are left alone.** Self-improve is off for a project with a
+  master-signed ARCHIVED mark and cannot be switched on; `improve run`, `improve plan`,
+  `improve on --all`, the dashboard's and Telegram's "On for all my repos" skip it, and
+  `improve status` shows "archived".
+
+### Changed
+
+- An `improvement` order, or any order with `requires_changes: true`, is only accepted
+  with an evidence block. Workers need this release before their build work can pass
+  review.
 
 ## v0.5.15 - 2026-09-24
 
