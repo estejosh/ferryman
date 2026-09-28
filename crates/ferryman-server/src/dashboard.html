@@ -846,9 +846,20 @@ function taskRow(t) {
         ${t.holder ? `<span class="badge">${esc(t.holder)}</span>` : ""}
         ${t.engine ? `<span class="badge">${esc(t.engine)}</span>` : ""}
         ${sigBadge(t.sig)}
+        ${stageBadge(t.stage)}
         <span class="badge ${st.tone}">${esc(st.word)}</span>
       </div>
     </div>`;
+}
+
+// How far an unfinished order has got, from signed receipts: sent, delivered, read,
+// claimed, done. A warning (not delivered, or delivered and unread, for too long)
+// turns it red and says why on hover.
+function stageBadge(stage) {
+  if (!stage || !stage.stage) return "";
+  const tone = stage.warning ? "bad" : "";
+  const title = stage.warning || (stage.by ? `${stage.stage} by ${stage.by}` : stage.stage);
+  return `<span class="badge ${tone}" title="${esc(title)}">${esc(stage.stage)} ${esc(ago(stage.since))}</span>`;
 }
 
 function wireRows() {

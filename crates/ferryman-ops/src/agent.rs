@@ -2138,36 +2138,21 @@ pub async fn work_once(
         }
     }
     let mut acted = 0;
-    let waiting = ferryman_channel::work_for(route, &config.agent)?;
-    // Checked here rather than at the top of the loop so an idle machine stays quiet:
-    // with nothing to claim there is nothing to decline, and repeating "not enough
-    // memory" every poll would be noise about a non-event.
-    if !waiting.is_empty()
-        && let crate::governor::Decision::Wait(reason) = crate::governor::may_claim(config)
-    {
-        report.warn(&format!("holding off: {reason}"));
-        return Ok(0);
-    }
-    // In a grant-gated team, only a worker works without the master's grant; any
-    // other role waits for one. Full-permissions projects (`grants = "open"`) skip
-    // this. See `master::may_work`.
-    if !waiting.is_empty() && route.requires_grants() {
-        let allowed = ferryman_channel::master::may_work(route, &config.agent, &config.role)?;
-        if !allowed {
-            report.warn(&if config.role.eq_ignore_ascii_case("worker") {
-                format!(
-                    "holding off: {} has been revoked in this team",
-                    config.agent
-                )
-            } else {
-                format!(
-                    "holding off: {} is not granted the '{}' role in this team; the master \
-                     approves it with 'ferry team approve {}' or on the dashboard's Agents page",
-                    config.agent, config.role, config.agent
-                )
-            });
-            return Ok(0);
+    let tasks = ferryman_channel::list_tasks(route)?;
+    // Receipts first, before anything that can say no. Whether this machine may work is
+    // a separate question from whether the order reached it, and a paused or busy
+    // machine that says nothing is indistinguishable from one the channel never reached.
+    note_deliveries(route, config, &identity, &tasks, report);
+    let waiting = ferryman_channel::work_among(route, &config.agent, tasks)?;
+    let held = hold_off(route, config, !waiting.is_empty())?;
+    note_presence(route, &identity, held.clone(), report);
+    if let Some(reason) = held {
+        // Only said when there was work to decline: an idle machine stays quiet, and
+        // repeating "not enough memory" every poll would be noise about a non-event.
+        if !waiting.is_empty() {
+            report.warn(&format!("holding off: {reason}"));
         }
+        return Ok(0);
     }
     for task in waiting {
         let id = task.order.id.clone();
@@ -2247,6 +2232,109 @@ pub async fn work_once(
         }
     }
     Ok(acted)
+}
+
+/// Why this machine may not start work right now, or `None` when it may.
+///
+/// Asked in full only when there is work waiting: with nothing to claim there is nothing
+/// to decline, and the governor samples the CPU for a quarter of a second to answer.
+/// With nothing waiting only a deliberate pause is reported, because that is free to
+/// read and is what the presence file should say.
+fn hold_off(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    work_waiting: bool,
+) -> Result<Option<String>> {
+    if !work_waiting {
+        return Ok(crate::governor::paused());
+    }
+    if let crate::governor::Decision::Wait(reason) = crate::governor::may_claim(config) {
+        return Ok(Some(reason));
+    }
+    // In a grant-gated team, only a worker works without the master's grant; any
+    // other role waits for one. Full-permissions projects (`grants = "open"`) skip
+    // this. See `master::may_work`.
+    if route.requires_grants()
+        && !ferryman_channel::master::may_work(route, &config.agent, &config.role)?
+    {
+        return Ok(Some(if config.role.eq_ignore_ascii_case("worker") {
+            format!("{} has been revoked in this team", config.agent)
+        } else {
+            format!(
+                "{} is not granted the '{}' role in this team; the master approves it with \
+                 'ferry team approve {}' or on the dashboard's Agents page",
+                config.agent, config.role, config.agent
+            )
+        }));
+    }
+    Ok(None)
+}
+
+/// Write a signed delivered receipt for every order meant for this agent that does not
+/// have one yet.
+///
+/// "Meant for" is the same rule the worker claims by: addressed to this agent, or open
+/// to anyone and not yet claimed. Only orders whose signature verifies are receipted, for
+/// the reason the loop refuses to act on the rest. Best effort: a receipt that cannot be
+/// written is reported and never stops the pass.
+fn note_deliveries(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    tasks: &[Task],
+    report: &dyn Progress,
+) {
+    let machine = ferryman_channel::receipts::machine_label();
+    for task in tasks {
+        let meant_for_us = match task.state() {
+            TaskState::Open => true,
+            TaskState::Offered { to } => to.eq_ignore_ascii_case(&config.agent),
+            _ => false,
+        };
+        if !meant_for_us
+            || ferryman_channel::verify_order(&task.order, &route.agents)
+                != ferryman_channel::SignatureCheck::Valid
+        {
+            continue;
+        }
+        match ferryman_channel::receipts::record_delivered(
+            route,
+            &task.order.id,
+            identity,
+            &machine,
+            env!("CARGO_PKG_VERSION"),
+        ) {
+            Ok(true) => report.info(&format!("  {}: delivered here", task.order.id)),
+            Ok(false) => {}
+            Err(error) => report.warn(&format!(
+                "  {}: could not write the delivered receipt: {error:#}",
+                task.order.id
+            )),
+        }
+    }
+}
+
+/// Refresh this worker's presence in the channel; rate-limited inside, so calling it
+/// every pass costs a file read. Best effort, like the receipts.
+fn note_presence(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    held: Option<String>,
+    report: &dyn Progress,
+) {
+    if let Err(error) = ferryman_channel::receipts::refresh_presence(
+        route,
+        identity,
+        &ferryman_channel::receipts::machine_label(),
+        env!("CARGO_PKG_VERSION"),
+        held,
+        crate::governor::paused().is_some(),
+        chrono::Utc::now(),
+    ) {
+        report.warn(&format!(
+            "could not write this worker's presence: {error:#}"
+        ));
+    }
 }
 
 /// How many times one task may fail on this machine before the worker stops trying it.
@@ -2562,6 +2650,14 @@ async fn do_work(
         run: ferryman_channel::new_run_id(),
         pid: 0,
     };
+    // The read receipt, at the last moment before the engine is given the order: from
+    // here on the order is being acted on, not merely sitting on this machine. Best
+    // effort - a receipt is a report about the work and must never stop it.
+    if let Err(error) = ferryman_channel::receipts::record_read(route, id, identity) {
+        report.warn(&format!(
+            "  {id}: could not write the read receipt: {error:#}"
+        ));
+    }
     let run = run_agent(config, &workdir, &prompt, &credentials, Some(heartbeat)).await?;
     // What the engine says it spent, when it says anything. Recorded twice on
     // purpose: into the trajectory (what the cost aggregator reads) and into
@@ -4298,6 +4394,132 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// Point this thread's machine state (keys, the pause marker) at a temporary
+    /// directory, and prove it did, before anything below writes a pause.
+    fn hermetic_machine() {
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-ops-selftest-{}", std::process::id())),
+        );
+        let dir = ferryman_channel::licensing::machine_state_dir().unwrap();
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "a test must never pause or re-key the machine it runs on: {}",
+            dir.display()
+        );
+    }
+
+    /// An enabled channel served by wisp, with `config` as its agent.toml, holding one
+    /// order for wisp signed by an issuer the roster knows.
+    fn channel_with_order_for_wisp(
+        comms: &Path,
+        order_id: &str,
+        config: &str,
+    ) -> (ProjectRoute, AgentConfig) {
+        let workspace = comms.join("demo-ferryman");
+        enabled_channel(&workspace, "demo");
+        std::fs::write(AgentConfig::path(&workspace.join(".ferryman")), config).unwrap();
+        let mut route = ferryman_channel::route_for(&workspace).unwrap();
+        // The key `holds_key` writes, so receipts verify against the roster.
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        let boss = AgentIdentity::from_seed("boss", [9; 32]);
+        route.agents = [(&wisp, "worker"), (&boss, "operator")]
+            .into_iter()
+            .map(|(identity, role)| ferryman_channel::AgentRoute {
+                name: identity.name().to_string(),
+                role: role.to_string(),
+                capabilities: Vec::new(),
+                public_key: Some(identity.public_key_hex()),
+                encryption_key: None,
+            })
+            .collect();
+        let mut order = order(order_id);
+        order.project_id = route.project_id.clone();
+        order.issued_by = "boss".into();
+        order.assigned_to = Some("wisp".into());
+        order.requires_review = false;
+        boss.sign_order(&mut order);
+        ferryman_channel::issue_order(&route, &order).unwrap();
+        let config = AgentConfig::load(&route.attachment).unwrap();
+        (route, config)
+    }
+
+    #[tokio::test]
+    async fn a_paused_machine_still_says_the_order_arrived() {
+        // The failure this exists for: a machine held off by a pause or the governor
+        // did nothing visible, so an order that had arrived looked exactly like one
+        // that never would.
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(
+            comms.path(),
+            "t-paused",
+            "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n",
+        );
+        let marker = crate::governor::pause_marker().unwrap();
+        std::fs::write(&marker, "paused for the test").unwrap();
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+        let _ = std::fs::remove_file(&marker);
+
+        assert_eq!(acted, 0);
+        let task = ferryman_channel::read_task(&route, "t-paused").unwrap();
+        assert!(task.claims.is_empty(), "a paused machine claims nothing");
+        let receipts = ferryman_channel::receipts::read_receipts(&route, "t-paused").unwrap();
+        assert_eq!(receipts.delivered.len(), 1, "delivered even while paused");
+        assert_eq!(receipts.delivered[0].0.agent, "wisp");
+        assert_eq!(
+            receipts.delivered[0].1,
+            ferryman_channel::SignatureCheck::Valid
+        );
+        assert!(
+            receipts.read.is_empty(),
+            "nothing was read: no work was done"
+        );
+        let progress =
+            ferryman_channel::receipts::progress_at(&task, &receipts, chrono::Utc::now()).unwrap();
+        assert_eq!(progress.stage, ferryman_channel::receipts::Stage::Delivered);
+
+        let presence = ferryman_channel::receipts::list_presence(&route).unwrap();
+        assert_eq!(presence.len(), 1);
+        assert!(presence[0].0.paused);
+        assert!(
+            presence[0]
+                .0
+                .held
+                .as_deref()
+                .is_some_and(|why| why.contains("paused for the test")),
+            "{:?}",
+            presence[0].0.held
+        );
+    }
+
+    #[tokio::test]
+    async fn the_read_receipt_is_written_before_the_engine_is_started() {
+        // The engine here does not exist, so it never runs: a read receipt that is
+        // present afterwards was written before the hand-off, not after it.
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(
+            comms.path(),
+            "t-read-first",
+            "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+             pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n",
+        );
+
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        let task = ferryman_channel::read_task(&route, "t-read-first").unwrap();
+        assert!(task.results.is_empty(), "the engine never ran");
+        assert_eq!(task.claims.len(), 1, "it was claimed and handed over");
+        let receipts = ferryman_channel::receipts::read_receipts(&route, "t-read-first").unwrap();
+        assert_eq!(receipts.read.len(), 1);
+        assert_eq!(receipts.read[0].1, ferryman_channel::SignatureCheck::Valid);
+        assert!(
+            receipts.delivered[0].0.delivered_at <= receipts.read[0].0.read_at,
+            "delivered comes first"
+        );
     }
 }
 
