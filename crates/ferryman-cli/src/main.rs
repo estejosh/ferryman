@@ -1059,6 +1059,10 @@ enum Channel {
         /// quote and newline survives the trip - which is not true of a command line.
         #[arg(long)]
         task_file: Option<PathBuf>,
+        /// Select the model for this task. The worker must expose `{model}` in its
+        /// agent.toml args; otherwise it refuses the order instead of ignoring it.
+        #[arg(long)]
+        model: Option<String>,
         /// Hold the result for review before the task counts as done.
         #[arg(long)]
         requires_review: bool,
@@ -7262,6 +7266,7 @@ fn channel(command: Channel) -> Result<()> {
             to,
             task,
             task_file,
+            model,
             requires_review,
             require,
             requires_approval,
@@ -7286,11 +7291,24 @@ fn channel(command: Channel) -> Result<()> {
             if task.trim().is_empty() {
                 bail!("an order with no work in it cannot be acted on")
             }
-            let payload = if task.trim_start().starts_with('{') {
+            let mut payload = if task.trim_start().starts_with('{') {
                 serde_json::from_str(&task).context("--task looked like JSON but did not parse")?
             } else {
                 json!({ "task": task })
             };
+            if let Some(model) = model {
+                let model = model.trim();
+                if model.is_empty() {
+                    bail!("--model must not be empty")
+                }
+                let object = payload
+                    .as_object_mut()
+                    .context("--model requires a JSON-object task payload")?;
+                if object.contains_key("model") {
+                    bail!("specify the model either with --model or in the JSON task, not both")
+                }
+                object.insert("model".into(), json!(model));
+            }
             let mut order = ferryman_channel::Order {
                 id: id.clone(),
                 project_id: route.project_id.clone(),

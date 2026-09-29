@@ -183,9 +183,9 @@ pub struct AgentConfig {
     pub role: String,
     /// The agent binary. Ferryman runs no models itself and is not tied to one vendor.
     pub command: String,
-    /// Passed to the binary verbatim. The literal token `{prompt}` is replaced with the
-    /// prompt; everything else is untouched, so a different CLI's flags need a config
-    /// edit rather than a new build.
+    /// Passed to the binary verbatim. The literal tokens `{prompt}` and `{model}` are
+    /// replaced with the task prompt and selected model; everything else is untouched.
+    /// `{model}` uses the order's model field when present, then this config's model.
     pub args: Vec<String>,
     /// The model this agent runs, e.g. `deepseek-v4-pro`. Recorded on every result
     /// so the fleet's cost estimator can credit measured quality to the right
@@ -1021,6 +1021,35 @@ fn run_command(
             (config.runner.runtime().to_string(), full)
         }
     }
+}
+
+/// Apply an order's optional model choice to the worker command line.
+fn config_for_task(config: &AgentConfig, payload: &Value) -> Result<AgentConfig> {
+    let requested = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let uses_model_placeholder = config.args.iter().any(|arg| arg.contains("{model}"));
+    if requested.is_some() && !uses_model_placeholder {
+        bail!(
+            "task requests model '{}' but this worker does not expose a {{model}} argument",
+            requested.as_deref().unwrap_or_default()
+        );
+    }
+    let selected = requested.or_else(|| config.model.clone());
+    let mut task_config = config.clone();
+    if uses_model_placeholder {
+        let model = selected.as_deref().context(
+            "worker args use {model}, but neither the task nor agent.toml specifies a model",
+        )?;
+        for arg in &mut task_config.args {
+            *arg = arg.replace("{model}", model);
+        }
+    }
+    task_config.model = selected;
+    Ok(task_config)
 }
 
 /// The Claude Code `.mcp.json` that points the agent at `ferry mcp serve` for
@@ -2517,7 +2546,15 @@ async fn do_work(
         run: ferryman_channel::new_run_id(),
         pid: 0,
     };
-    let run = run_agent(config, &workdir, &prompt, &credentials, Some(heartbeat)).await?;
+    let task_config = config_for_task(config, &task.order.payload)?;
+    let run = run_agent(
+        &task_config,
+        &workdir,
+        &prompt,
+        &credentials,
+        Some(heartbeat),
+    )
+    .await?;
     // What the engine says it spent, when it says anything. Recorded twice on
     // purpose: into the trajectory (what the cost aggregator reads) and into
     // the signed result payload (what reviewers and the fleet can read without
@@ -2552,7 +2589,7 @@ async fn do_work(
             "completion_tokens": usage.completion_tokens,
         });
     }
-    if let Some(model) = &config.model {
+    if let Some(model) = &task_config.model {
         payload["model"] = json!(model);
     }
     if used_worktree {
@@ -3814,6 +3851,42 @@ mod tests {
         assert_eq!(config.stall, Duration::from_secs(600));
         assert!(!config.worktree);
         assert_eq!(config.push, None, "publishing is opt-in");
+    }
+
+    #[test]
+    fn an_order_can_override_the_configured_model() {
+        let config = AgentConfig::parse(
+            r#"agent = "wisp"
+command = "cline"
+args = ["--model", "{model}", "{prompt}"]
+model = "deepseek-flash"
+"#,
+        )
+        .unwrap();
+        let selected = config_for_task(
+            &config,
+            &serde_json::json!({"task": "hard problem", "model": "deepseek-v4-pro"}),
+        )
+        .unwrap();
+        assert_eq!(selected.model.as_deref(), Some("deepseek-v4-pro"));
+        assert_eq!(selected.args, vec!["--model", "deepseek-v4-pro", "{prompt}"]);
+    }
+
+    #[test]
+    fn a_model_request_is_rejected_when_the_worker_does_not_expose_it() {
+        let config = AgentConfig::parse(
+            r#"agent = "wisp"
+command = "cline"
+args = ["--model", "deepseek-flash", "{prompt}"]
+"#,
+        )
+        .unwrap();
+        let error = config_for_task(
+            &config,
+            &serde_json::json!({"task": "work", "model": "deepseek-v4-pro"}),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not expose"));
     }
 
     #[test]

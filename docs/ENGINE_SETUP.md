@@ -3,12 +3,32 @@
 `.ferryman/agent.toml` decides what actually does the work. Ferryman runs no
 models itself and has no preferred vendor: it starts one command per task, with
 the task text substituted where you put `{prompt}`, and reads back whatever the
-engine prints.
+engine prints. Put `{model}` in the args when the orchestrator should choose a
+model per task; the order's `model` field overrides the config `model` default.
 
 ```toml
 command = "claude"
 args = ["-p", "{prompt}"]
 ```
+
+For a worker with two models available:
+
+```toml
+command = "cline"
+args = ["--auto-approve", "true", "--json", "--provider", "deepseek", "--model", "{model}", "{prompt}"]
+model = "deepseek-flash"
+```
+
+The orchestrator can choose the larger model only for a demanding task:
+
+```sh
+ferry channel order --agent josh --id t-pro \
+  --model deepseek-v4-pro \
+  --task "Analyze the consensus failure and propose a tested fix"
+```
+
+Without `--model`, the worker uses its configured default. A worker that has no
+`{model}` placeholder refuses a model-specific order instead of silently ignoring it.
 
 This page covers the three contracts Ferryman knows out of the box, how to wire
 any other engine, and how credentials reach an engine that authenticates from
