@@ -4,6 +4,7 @@
 //! ```text
 //! <channel>/improve/2026-W39/
 //!   evidence.md    what the last seven days recorded           (ferry improve gather)
+//!                  and, marked `unverified-claims`, what an audit's PROBLEMS.md says
 //!   plan.json      at most N ranked improvements, and the orders (ferry improve plan)
 //!   plan-review.md a judge's reading of a plan no judge wrote    (ferry improve review)
 //!   report.md      this week against last week                 (ferry improve report)
@@ -14,8 +15,22 @@
 //! A judge-tier engine turns evidence into a plan and reviews what comes back; build-tier
 //! engines do the building, through the ordinary worker loop and its engine fallback.
 //! Every improvement is a signed order open to any worker, done on its own branch and
-//! reviewed. Nothing here merges, pushes to a main branch or bumps a version: accepted
-//! work is listed as ready, and a person merges it.
+//! reviewed - and a result can only be accepted when the worker's own evidence shows the
+//! work exists ([`ferryman_channel::evidence`]).
+//!
+//! # Audit claims are claims
+//!
+//! An AI audit that writes PROBLEMS.md into a repository is right some of the time: of
+//! eight findings checked by hand, two were wrong (a "missing admin check" where
+//! `requireAdmin` was already applied; an "empty repo" that was a stray empty copy). So
+//! each claim becomes a verification order first - confirm or refute, citing
+//! `file:line` - and only a confirmed finding reaches the planner. Every claim's fate is
+//! kept in `improve/claims.json`, so a refuted one is not raised again every week.
+//!
+//! An archived project is left alone entirely: no evidence, plan, review or switch-on.
+//!
+//! Nothing here merges, pushes to a main branch or bumps a version: accepted work is
+//! listed as ready, and a person merges it.
 //!
 //! # Never blocking the week
 //!
@@ -328,6 +343,41 @@ pub fn gather(route: &ProjectRoute, now: DateTime<Utc>) -> Result<PathBuf> {
         let _ = writeln!(md, "{line}");
     }
 
+    let claims = refresh_claims(route);
+    let _ = writeln!(md, "\n{CLAIMS_HEADING}\n");
+    let _ = writeln!(
+        md,
+        "Marked `unverified-claims`: what an audit wrote, not what is known. Each is checked \
+         by a verification order before anything is planned from it.\n"
+    );
+    let mut any = false;
+    for claim in claims.values().filter(|claim| claim.status == PENDING) {
+        any = true;
+        let _ = writeln!(
+            md,
+            "- [unverified-claims] `{}` ({}): {}{}",
+            claim.id,
+            claim.source,
+            claim.text,
+            claim
+                .order
+                .as_deref()
+                .map(|order| format!(" - being checked by `{order}`"))
+                .unwrap_or_default()
+        );
+    }
+    if !any {
+        let _ = writeln!(md, "None waiting.");
+    }
+    let refuted = claims.values().filter(|c| c.status == REFUTED).count();
+    let confirmed = claims.values().filter(|c| c.status == CONFIRMED).count();
+    if refuted + confirmed > 0 {
+        let _ = writeln!(
+            md,
+            "\n{confirmed} confirmed against the code; {refuted} refuted and not raised again."
+        );
+    }
+
     let _ = writeln!(md, "\n## Improvements already open\n");
     let open: Vec<&Task> = tasks
         .iter()
@@ -348,6 +398,346 @@ pub fn gather(route: &ProjectRoute, now: DateTime<Utc>) -> Result<PathBuf> {
     Ok(path)
 }
 
+// --- claims an audit made ---------------------------------------------------------------
+
+/// The evidence heading audit claims sit under. The planner is never shown this section.
+const CLAIMS_HEADING: &str = "## Unverified claims (PROBLEMS.md)";
+/// A claim not yet confirmed or refuted.
+pub const PENDING: &str = "pending";
+pub const CONFIRMED: &str = "confirmed";
+pub const REFUTED: &str = "refuted";
+/// The tag a verification order carries beside [`TAG`].
+pub const VERIFICATION: &str = "verification";
+/// The most claims read from one file.
+const MAX_CLAIMS: usize = 30;
+
+/// One claim from an audit file, and what became of it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Claim {
+    pub id: String,
+    pub text: String,
+    /// `PROBLEMS.md` or `problems.md`.
+    pub source: String,
+    /// [`PENDING`], [`CONFIRMED`] or [`REFUTED`].
+    pub status: String,
+    /// The verification order checking it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decided_at: Option<DateTime<Utc>>,
+    /// The week a confirmed finding was handed to the planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_in: Option<String>,
+}
+
+fn claims_path(route: &ProjectRoute) -> PathBuf {
+    route.communications.join("improve").join("claims.json")
+}
+
+/// Every claim this project has seen, by id.
+#[must_use]
+pub fn load_claims(route: &ProjectRoute) -> BTreeMap<String, Claim> {
+    fs::read_to_string(claims_path(route))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_claims(route: &ProjectRoute, claims: &BTreeMap<String, Claim>) -> Result<()> {
+    let path = claims_path(route);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(claims)?)
+        .with_context(|| format!("write {}", path.display()))
+}
+
+/// The audit file at the workspace root, when there is one: its name and text. The name
+/// is matched without regard to case (`PROBLEMS.md`, `problems.md`, `Problems.md`), the
+/// all-capitals spelling first when a case-sensitive disk holds more than one.
+fn problems_file(workspace: &Path) -> Option<(String, String)> {
+    let mut names: Vec<String> = fs::read_dir(workspace)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.eq_ignore_ascii_case("problems.md"))
+        .collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        fs::read_to_string(workspace.join(&name))
+            .ok()
+            .map(|text| (name, text))
+    })
+}
+
+fn clip_claim(text: &str) -> String {
+    let flat = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("**", "");
+    if flat.chars().count() > 400 {
+        format!("{}...", flat.chars().take(400).collect::<String>())
+    } else {
+        flat
+    }
+}
+
+/// The claims in an audit file. With second- or third-level headings, each heading and
+/// the lines under it is one claim (the bullets under a finding are its details, not
+/// more findings); without, each top-level list item is one.
+#[must_use]
+pub fn parse_claims(text: &str) -> Vec<String> {
+    fn heading(line: &str) -> Option<&str> {
+        line.strip_prefix("### ")
+            .or_else(|| line.strip_prefix("## "))
+            .map(str::trim)
+    }
+    let mut claims: Vec<String> = Vec::new();
+    if text.lines().any(|line| heading(line).is_some()) {
+        let mut current: Option<String> = None;
+        for line in text.lines() {
+            if let Some(title) = heading(line) {
+                claims.extend(current.take());
+                current = Some(title.to_string());
+            } else if let Some(claim) = current.as_mut()
+                && !line.trim().is_empty()
+                && !line.starts_with('#')
+                && claim.len() < 400
+            {
+                claim.push_str(if claim.contains(" - ") { " " } else { " - " });
+                claim.push_str(line.trim());
+            }
+        }
+        claims.extend(current);
+    } else {
+        for line in text.lines() {
+            let item = line
+                .strip_prefix("- ")
+                .or_else(|| line.strip_prefix("* "))
+                .or_else(|| line.strip_prefix("+ "))
+                .or_else(|| {
+                    let digits = line.chars().take_while(char::is_ascii_digit).count();
+                    (digits > 0)
+                        .then(|| &line[digits..])
+                        .and_then(|rest| rest.strip_prefix(". ").or(rest.strip_prefix(") ")))
+                });
+            if let Some(item) = item {
+                claims.push(item.trim_start_matches("[ ] ").to_string());
+            }
+        }
+    }
+    let mut seen = Vec::new();
+    for claim in claims.iter().map(|claim| clip_claim(claim)) {
+        if claim.chars().count() >= 8 && !seen.contains(&claim) {
+            seen.push(claim);
+        }
+    }
+    seen.truncate(MAX_CLAIMS);
+    seen
+}
+
+/// A claim's id: from its words, so the same claim in next week's file is the same claim.
+fn claim_id(text: &str) -> String {
+    let normal = text
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    ferryman_channel::trajectory::digest(&normal)[..12].to_string()
+}
+/// Bring the claim record up to date: new claims from the audit file, and the verdict of
+/// every verification order review has accepted. Claims are never dropped, so a refuted
+/// one stays refuted however often the file repeats it.
+#[must_use]
+pub fn refresh_claims(route: &ProjectRoute) -> BTreeMap<String, Claim> {
+    let mut claims = load_claims(route);
+    let before = claims.clone();
+    if let Some((source, text)) = problems_file(&route.workspace) {
+        for text in parse_claims(&text) {
+            let id = claim_id(&text);
+            claims.entry(id.clone()).or_insert(Claim {
+                id,
+                text,
+                source: source.clone(),
+                status: PENDING.to_string(),
+                order: None,
+                citations: Vec::new(),
+                reason: None,
+                decided_at: None,
+                planned_in: None,
+            });
+        }
+    }
+    for claim in claims.values_mut().filter(|claim| claim.status == PENDING) {
+        let Some(task) = claim
+            .order
+            .as_deref()
+            .and_then(|order| ferryman_channel::read_task(route, order).ok())
+        else {
+            continue;
+        };
+        if task.state() != TaskState::Accepted {
+            continue;
+        }
+        let accepted = task.reviews.iter().rev().find(|review| review.accepted);
+        let Some((verdict, citations, reason)) = accepted
+            .and_then(|review| task.results.iter().find(|r| r.revision == review.revision))
+            .and_then(|result| result.payload.get("output").and_then(Value::as_str))
+            .and_then(ferryman_channel::evidence::verdict_of)
+        else {
+            continue;
+        };
+        claim.status = if verdict == CONFIRMED {
+            CONFIRMED
+        } else {
+            REFUTED
+        }
+        .to_string();
+        claim.citations = citations;
+        claim.reason = (!reason.is_empty()).then_some(reason);
+        claim.decided_at = accepted.map(|review| review.reviewed_at);
+    }
+    if claims != before
+        && let Err(error) = save_claims(route, &claims)
+    {
+        tracing::warn!("could not save the claim record: {error:#}");
+    }
+    claims
+}
+
+fn verification_text(project: &str, claim: &Claim) -> String {
+    format!(
+        "Verify a claim an automated audit made about {project}, before anyone acts on \
+         it.\n\nThe claim (from {}, not established):\n{}\n\nRead the code and decide \
+         whether it is true. Confirm it only if the code shows it; refute it if the code \
+         shows otherwise - for example, a check it says is missing is applied somewhere \
+         else, or a file it names is a stray copy. Cite file:line for every statement, as \
+         paths relative to the repository root; the citations are checked.\n\nDo not change \
+         any files.\n\nReply with exactly one JSON object and nothing else:\n\
+         {{\"verdict\": \"confirmed\" | \"refuted\", \"citations\": [\"path/to/file:123\"], \
+         \"reason\": \"one or two sentences\"}}",
+        claim.source, claim.text
+    )
+}
+
+/// Issue a verification order for every pending claim that has none. Returns the ids
+/// issued. The order id comes from the claim, so each claim is checked once, ever.
+fn verify_claims(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    week: &str,
+) -> Result<Vec<String>> {
+    let mut claims = refresh_claims(route);
+    let mut issued = Vec::new();
+    for claim in claims
+        .values_mut()
+        .filter(|claim| claim.status == PENDING && claim.order.is_none())
+    {
+        let id = format!("verify-{}", claim.id);
+        if ferryman_channel::read_task(route, &id).is_err() {
+            let mut order = Order {
+                id: id.clone(),
+                project_id: route.project_id.clone(),
+                issued_by: config.agent.clone(),
+                assigned_to: None,
+                created_at: Utc::now(),
+                payload: json!({
+                    "task": verification_text(&route.project_id, claim),
+                    "tags": [TAG, VERIFICATION],
+                    "tier": Tier::Build.as_str(),
+                    "improvement": {
+                        "kind": VERIFICATION,
+                        "week": week,
+                        "title": format!("Verify: {}", first_line(&claim.text)),
+                        "claim": claim.text,
+                        "claim_id": claim.id,
+                        "source": claim.source,
+                    },
+                }),
+                requires_review: true,
+                requires_approval: false,
+                depends_on: Vec::new(),
+                signed_by: None,
+                signature: None,
+                result_contract: None,
+            };
+            identity.sign_order(&mut order);
+            match ferryman_channel::issue_order(route, &order) {
+                Ok(_) => issued.push(id.clone()),
+                Err(error) if format!("{error}").contains("already exists") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        claim.order = Some(id);
+    }
+    save_claims(route, &claims)?;
+    Ok(issued)
+}
+
+/// What the planner reads: the evidence without the audit's unverified claims, plus the
+/// findings verification confirmed that no earlier week has planned from.
+#[must_use]
+pub fn planner_evidence(evidence: &str, claims: &BTreeMap<String, Claim>, week: &str) -> String {
+    let mut text = match evidence.find(CLAIMS_HEADING) {
+        Some(start) => {
+            let after = start + CLAIMS_HEADING.len();
+            let end = evidence[after..]
+                .find("\n## ")
+                .map_or(evidence.len(), |at| after + at + 1);
+            format!("{}{}", &evidence[..start], &evidence[end..])
+        }
+        None => evidence.to_string(),
+    };
+    let confirmed: Vec<&Claim> = claims
+        .values()
+        .filter(|claim| {
+            claim.status == CONFIRMED && claim.planned_in.as_deref().is_none_or(|w| w == week)
+        })
+        .collect();
+    if !confirmed.is_empty() {
+        text.push_str(
+            "\n## Confirmed findings\n\nAn audit's claims, each confirmed against the code by a \
+             verification order. Plan from an audit only through these.\n\n",
+        );
+        for claim in confirmed {
+            let _ = writeln!(
+                text,
+                "- {} (cites {})",
+                claim.text,
+                if claim.citations.is_empty() {
+                    "nothing".to_string()
+                } else {
+                    claim.citations.join(", ")
+                }
+            );
+        }
+    }
+    text
+}
+
+/// Mark the confirmed findings the planner was shown this week as planned from.
+fn mark_planned(route: &ProjectRoute, week: &str) -> Result<()> {
+    let mut claims = load_claims(route);
+    let mut changed = false;
+    for claim in claims
+        .values_mut()
+        .filter(|claim| claim.status == CONFIRMED && claim.planned_in.is_none())
+    {
+        claim.planned_in = Some(week.to_string());
+        changed = true;
+    }
+    if changed {
+        save_claims(route, &claims)?;
+    }
+    Ok(())
+}
 // --- plan -------------------------------------------------------------------------------
 
 /// One improvement as the planner wrote it.
@@ -398,15 +788,21 @@ pub enum PlanOutcome {
     AlreadyPlanned {
         orders: usize,
         issued: usize,
+        /// Verification orders issued for audit claims that arrived since.
+        verifications: usize,
     },
     Planned {
         engine: String,
         unreviewed: bool,
         orders: Vec<String>,
+        /// Verification orders issued for audit claims: confirm or refute first.
+        verifications: Vec<String>,
     },
     /// No engine could plan. Not an error: the next run tries again.
     NoEngine(String),
     Paused(String),
+    /// The project is archived: the loop leaves it alone.
+    Archived,
 }
 
 /// The order id for one improvement: derived from the week, so a second plan in the same
@@ -725,24 +1121,42 @@ pub async fn plan(
     report: &dyn Progress,
 ) -> Result<PlanOutcome> {
     let week = engines::iso_week(now);
+    if ferryman_channel::ferry::is_archived(&route.communications, &route.project_id) {
+        return Ok(PlanOutcome::Archived);
+    }
     if let Some(existing) = read_plan(route, &week) {
         let identity = signing_identity(route, config)?;
         let issued = issue_missing(route, config, &identity, &existing)?;
+        let verifications = verify_claims(route, config, &identity, &week)?.len();
         return Ok(PlanOutcome::AlreadyPlanned {
             orders: existing.orders.len(),
             issued,
+            verifications,
         });
     }
     if let Some(why) = paused() {
         return Ok(PlanOutcome::Paused(why));
     }
     let identity = signing_identity(route, config)?;
+    // An audit's claims are checked before anything is planned from them, and need no
+    // engine to be issued: they go out even in a week no engine can plan.
+    let verifications = verify_claims(route, config, &identity, &week)?;
+    for id in &verifications {
+        report.info(&format!(
+            "  {}: {id} checks an audit claim before anything is planned from it",
+            route.project_id
+        ));
+    }
     let evidence_path = week_dir(route, &week).join("evidence.md");
     if !evidence_path.is_file() {
         gather(route, now)?;
     }
-    let evidence = fs::read_to_string(&evidence_path)
-        .with_context(|| format!("read {}", evidence_path.display()))?;
+    let evidence = planner_evidence(
+        &fs::read_to_string(&evidence_path)
+            .with_context(|| format!("read {}", evidence_path.display()))?,
+        &load_claims(route),
+        &week,
+    );
     let max = max.max(1);
     let Some((answer, engine, judged)) = ask_best(
         route,
@@ -782,6 +1196,7 @@ pub async fn plan(
     // same plan rather than asking again and planning something different.
     write_plan(route, &plan)?;
     issue_missing(route, config, &identity, &plan)?;
+    mark_planned(route, &plan.week)?;
     for (rank, (text, options)) in parse_questions(&answer).into_iter().enumerate() {
         let id = format!("clarify-{}-{}", plan.week.to_ascii_lowercase(), rank + 1);
         match ferryman_channel::questions::ask(
@@ -805,6 +1220,7 @@ pub async fn plan(
         engine: engine.name,
         unreviewed: plan.unreviewed,
         orders: plan.orders,
+        verifications,
     })
 }
 
@@ -816,9 +1232,64 @@ fn awaiting_improvement_review(route: &ProjectRoute) -> bool {
         .iter()
         .any(|task| {
             is_improvement(task)
-                && matches!(task.state(), TaskState::AwaitingReview { .. })
+                && match task.state() {
+                    TaskState::AwaitingReview { .. } => true,
+                    TaskState::Refuted { .. } => task.order.requires_review,
+                    _ => false,
+                }
                 && task.pending_recommendation().is_none()
         })
+}
+
+/// One improvement result, as verification classed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checked {
+    pub order: String,
+    pub revision: u32,
+    pub worker: String,
+    /// `verified`, `unverified` or `refuted`.
+    pub status: String,
+    pub reasons: Vec<String>,
+}
+
+/// Check the newest result of every improvement against its evidence, and record each
+/// verdict signed by `identity` - beside the result and in the ledger, never in the
+/// worker's own file. Needs no engine: the decision is read from recorded facts. A
+/// result already checked by this agent is neither recorded nor returned again, so an
+/// hourly run reports each verdict once.
+pub fn verify_results(route: &ProjectRoute, identity: &AgentIdentity) -> Vec<Checked> {
+    let mut checked = Vec::new();
+    for task in ferryman_channel::list_tasks(route).unwrap_or_default() {
+        if !is_improvement(&task) {
+            continue;
+        }
+        let Some(revision) = task.latest_revision() else {
+            continue;
+        };
+        let already = ferryman_channel::evidence::read_verifications(route, &task.order.id)
+            .iter()
+            .any(|record| {
+                record.revision == revision && record.verifier.eq_ignore_ascii_case(identity.name())
+            });
+        if already {
+            continue;
+        }
+        match ferryman_channel::evidence::record(route, &task, revision, identity) {
+            Ok(Some(record)) => checked.push(Checked {
+                order: record.order_id,
+                revision,
+                worker: record.worker,
+                status: record.status,
+                reasons: record.reasons,
+            }),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                "could not record the verification of {}: {error:#}",
+                task.order.id
+            ),
+        }
+    }
+    checked
 }
 
 /// With a judge-tier engine up: read an unreviewed plan, and judge improvement results
@@ -836,6 +1307,24 @@ pub async fn review(
             route.project_id
         ));
         return Ok(0);
+    }
+    // Evidence before opinion, and with no engine: every improvement result is classed
+    // verified, unverified or refuted from what its worker recorded, and the class is
+    // recorded, signed, before any judge reads the claim.
+    if let Ok(identity) = signing_identity(route, config) {
+        for found in verify_results(route, &identity)
+            .iter()
+            .filter(|found| found.status == ferryman_channel::evidence::Status::Refuted.class())
+        {
+            report.warn(&format!(
+                "  {}: {} r{} by {} is refuted - {}; it does not count as done",
+                route.project_id,
+                found.order,
+                found.revision,
+                found.worker,
+                found.reasons.join("; ")
+            ));
+        }
     }
     let ledger = engines::Ledger::load(&config.agent);
     let Some(judge) = engines::best_up(&config.engines, &ledger, now, Tier::Judge).cloned() else {
@@ -936,6 +1425,9 @@ pub struct WeekNumbers {
     pub runs_ok: usize,
     pub reviews: usize,
     pub sent_back: usize,
+    /// Results submitted in the week that their own evidence, or their emptiness,
+    /// refutes. Never counted in `done`.
+    pub refuted: usize,
     pub median_claim_minutes: Option<i64>,
     /// At list prices, from the runs whose engine reported usage.
     pub cost_usd: Option<f64>,
@@ -990,15 +1482,41 @@ pub fn numbers(
         .flat_map(|task| task.reviews.iter())
         .filter(|review| within(review.reviewed_at))
         .collect();
+    // A run whose result is refuted did not succeed, whatever the engine's exit code.
+    let refuted: Vec<(&str, u32)> = tasks
+        .iter()
+        .flat_map(|task| {
+            task.results
+                .iter()
+                .filter(|result| {
+                    ferryman_channel::evidence::is_refuted(&task.order.payload, result)
+                })
+                .map(|result| (result.order_id.as_str(), result.revision))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let refuted_run = |run: &Trajectory| refuted.contains(&(run.order_id.as_str(), run.revision));
     WeekNumbers {
         done: tasks
             .iter()
             .filter(|task| finished_at(task).is_some_and(within))
             .count(),
         runs: runs.iter().filter(|run| within(run.at)).count(),
-        runs_ok: runs.iter().filter(|run| run.ok && within(run.at)).count(),
+        runs_ok: runs
+            .iter()
+            .filter(|run| run.ok && within(run.at) && !refuted_run(run))
+            .count(),
         reviews: reviews.len(),
         sent_back: reviews.iter().filter(|review| !review.accepted).count(),
+        refuted: tasks
+            .iter()
+            .flat_map(|task| {
+                task.results
+                    .iter()
+                    .filter(|result| within(result.submitted_at))
+                    .filter(|result| refuted.contains(&(result.order_id.as_str(), result.revision)))
+            })
+            .count(),
         median_claim_minutes: claims.get(claims.len() / 2).copied(),
         cost_usd: cost,
     }
@@ -1028,6 +1546,11 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
     let _ = writeln!(md, "# {} - week {week}\n", route.project_id);
     let _ = writeln!(md, "| | this week | last week |\n|---|---|---|");
     let _ = writeln!(md, "| tasks done | {} | {} |", this.done, last.done);
+    let _ = writeln!(
+        md,
+        "| results refuted by their own evidence (not done) | {} | {} |",
+        this.refuted, last.refuted
+    );
     let _ = writeln!(
         md,
         "| engine runs that succeeded | {} | {} |",
@@ -1176,6 +1699,7 @@ pub async fn run(
                     engine,
                     unreviewed,
                     orders,
+                    ..
                 }) => done.push(format!(
                     "{project}: planned {} improvement(s) with {engine}{}",
                     orders.len(),
@@ -1200,6 +1724,22 @@ pub async fn run(
             Ok(0) => {}
             Ok(count) => done.push(format!("{project}: {count} ready to merge, asked")),
             Err(error) => report.warn(&format!("{project}: merge notice failed: {error:#}")),
+        }
+        // Evidence needs no engine: every new improvement result is classed and the
+        // verdict recorded, signed, whether or not a judge is up to read it after.
+        if let Ok(identity) = signing_identity(route, config) {
+            for found in verify_results(route, &identity)
+                .iter()
+                .filter(|found| found.status == REFUTED)
+            {
+                done.push(format!(
+                    "{project}: {} r{} by {} refuted, not done - {}",
+                    found.order,
+                    found.revision,
+                    found.worker,
+                    found.reasons.join("; ")
+                ));
+            }
         }
         if judge_up && (plan_unreviewed || awaiting_improvement_review(route)) {
             match review(route, config, now, report).await {
@@ -1405,7 +1945,10 @@ mod tests {
             agent: "wisp".into(),
             revision: 1,
             submitted_at: Utc::now(),
-            payload: json!({ "output": "done" }),
+            payload: json!({
+                "output": "done",
+                "evidence": { "recorded_by": "worker", "git": true, "commits": ["abc1234 name the engine"] },
+            }),
             signed_by: None,
             signature: None,
         };
@@ -1459,6 +2002,7 @@ mod tests {
             engine,
             unreviewed,
             orders,
+            ..
         } = first
         else {
             panic!("expected a plan, got {first:?}")
@@ -1493,7 +2037,8 @@ mod tests {
             second,
             PlanOutcome::AlreadyPlanned {
                 orders: 2,
-                issued: 0
+                issued: 0,
+                verifications: 0
             }
         );
         assert_eq!(improvements(&route).len(), 2, "no duplicate orders");
@@ -1513,7 +2058,7 @@ mod tests {
         let now = Utc::now();
         let outcome = plan(&route, &config, 1, now, &crate::Silent).await.unwrap();
         assert!(
-            matches!(&outcome, PlanOutcome::Planned { engine, unreviewed: true, orders } if engine == "nvidia" && orders.len() == 1),
+            matches!(&outcome, PlanOutcome::Planned { engine, unreviewed: true, orders, .. } if engine == "nvidia" && orders.len() == 1),
             "{outcome:?}"
         );
         assert!(
@@ -1590,6 +2135,70 @@ mod tests {
         assert_eq!(steps, vec!["evidence", "plan"]);
     }
 
+    /// With no engine at all, a run still classes improvement results from their
+    /// evidence and records the verdict, signed - and says so once, not every hour.
+    #[tokio::test]
+    async fn run_records_a_refuted_result_with_no_engine_up_and_reports_it_once() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = channel(dir.path(), Vec::new());
+        let targets = vec![(route.clone(), config)];
+        switch_on(&route);
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        let mut order = Order {
+            id: "improve-2026-w39-1".into(),
+            project_id: "demo".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "x", "tags": [TAG], "improvement": { "title": "t" } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        wisp.sign_order(&mut order);
+        ferryman_channel::issue_order(&route, &order).unwrap();
+        ferryman_channel::claim_order(&route, &order.id, "wisp").unwrap();
+        let mut result = ferryman_channel::TaskResult {
+            order_id: order.id.clone(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "better suited to 'claw'\n1. no output\n2. no output" }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp.sign_result(&mut result);
+        ferryman_channel::submit_result(&route, &result).unwrap();
+
+        let first = run(&targets, DEFAULT_MAX, Utc::now(), &crate::Silent).await;
+        assert_eq!(
+            first
+                .iter()
+                .filter(|line| line.contains("improve-2026-w39-1 r1 by wisp refuted, not done"))
+                .count(),
+            1,
+            "{first:?}"
+        );
+        let records = ferryman_channel::evidence::read_verifications(&route, &order.id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, REFUTED);
+
+        let second = run(&targets, DEFAULT_MAX, Utc::now(), &crate::Silent).await;
+        assert!(
+            !second.iter().any(|line| line.contains("refuted")),
+            "{second:?}"
+        );
+        assert_eq!(
+            ferryman_channel::evidence::read_verifications(&route, &order.id).len(),
+            1,
+            "recorded once"
+        );
+    }
+
     #[tokio::test]
     async fn run_passes_over_a_project_its_master_has_not_switched_on() {
         hermetic();
@@ -1629,5 +2238,312 @@ mod tests {
         assert!(this.cost_usd.is_some_and(|cost| cost > 0.0));
         let last = numbers(&[], &runs, &rates, start - Duration::days(7));
         assert_eq!((last.runs, last.runs_ok), (1, 1));
+    }
+
+    /// An audit's PROBLEMS.md is read as claims. Each becomes a verification order, not
+    /// an improvement; the planner never sees an unverified claim; a refuted claim is
+    /// recorded and not raised again; only a confirmed one reaches the planner.
+    #[tokio::test]
+    async fn problems_md_claims_become_verification_orders_not_improvements() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let judge = engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"));
+        let (route, config) = channel(dir.path(), vec![judge]);
+        fs::write(
+            route.workspace.join("PROBLEMS.md"),
+            "# Audit\n\n## Missing admin check\ndeleteUser in src/admin.ts has no requireAdmin.\n\
+             - Severity: high\n\n## Empty repository\nThe repo old-copy has no commits.\n",
+        )
+        .unwrap();
+        fs::create_dir_all(route.workspace.join("src")).unwrap();
+        fs::write(
+            route.workspace.join("src").join("admin.ts"),
+            "import { requireAdmin } from './auth';\nrouter.delete('/user', requireAdmin, deleteUser);\n",
+        )
+        .unwrap();
+        let now = Utc::now();
+        let week = engines::iso_week(now);
+
+        let evidence = fs::read_to_string(gather(&route, now).unwrap()).unwrap();
+        assert!(evidence.contains("[unverified-claims]"), "{evidence}");
+        assert!(evidence.contains("Missing admin check - deleteUser in src/admin.ts"));
+        assert!(
+            !evidence.contains("Severity: high -"),
+            "details are not claims"
+        );
+        let shown = planner_evidence(&evidence, &load_claims(&route), &week);
+        assert!(
+            !shown.contains("Missing admin check") && !shown.contains("unverified-claims"),
+            "the planner never reads an unverified claim: {shown}"
+        );
+
+        let outcome = plan(&route, &config, DEFAULT_MAX, now, &crate::Silent)
+            .await
+            .unwrap();
+        let PlanOutcome::Planned { verifications, .. } = &outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(verifications.len(), 2);
+        let tasks = improvements(&route);
+        let checks: Vec<&Task> = tasks
+            .iter()
+            .filter(|task| ferryman_channel::evidence::is_verification(&task.order.payload))
+            .collect();
+        assert_eq!(checks.len(), 2);
+        assert_eq!(tasks.len(), 4, "two verifications and the plan's two");
+        for task in &checks {
+            let text = task.order.payload["task"].as_str().unwrap();
+            assert!(text.contains("file:line") && text.contains("Do not change any files"));
+            assert!(!ferryman_channel::evidence::requires_changes(
+                &task.order.payload
+            ));
+            assert_eq!(
+                ferryman_channel::verify_order(&task.order, &route.agents),
+                ferryman_channel::SignatureCheck::Valid
+            );
+        }
+
+        // A worker refutes the admin claim, citing the line, and confirms the other.
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        for task in &checks {
+            let claim = task.order.payload["improvement"]["claim"].as_str().unwrap();
+            let output = if claim.starts_with("Missing admin check") {
+                r#"{"verdict": "refuted", "citations": ["src/admin.ts:2"], "reason": "requireAdmin is applied on the route"}"#
+            } else {
+                r#"{"verdict": "confirmed", "citations": ["src/admin.ts:1"], "reason": "no commits"}"#
+            };
+            let mut found = ferryman_channel::evidence::Evidence {
+                recorded_by: "worker".into(),
+                ..Default::default()
+            };
+            ferryman_channel::evidence::cite(&mut found, &route.workspace, output);
+            let mut result = ferryman_channel::TaskResult {
+                order_id: task.order.id.clone(),
+                agent: "wisp".into(),
+                revision: 1,
+                submitted_at: Utc::now(),
+                payload: json!({ "output": output, "evidence": found }),
+                signed_by: None,
+                signature: None,
+            };
+            wisp.sign_result(&mut result);
+            ferryman_channel::claim_order(&route, &task.order.id, "wisp").unwrap();
+            ferryman_channel::submit_result(&route, &result).unwrap();
+            let mut review = ferryman_channel::Review {
+                order_id: task.order.id.clone(),
+                revision: 1,
+                reviewer: "wisp".into(),
+                reviewed_at: Utc::now(),
+                accepted: true,
+                notes: None,
+                signed_by: None,
+                signature: None,
+            };
+            wisp.sign_review(&mut review);
+            ferryman_channel::submit_review(&route, &review).unwrap();
+        }
+
+        let next = now + Duration::days(7);
+        let next_week = engines::iso_week(next);
+        let evidence = fs::read_to_string(gather(&route, next).unwrap()).unwrap();
+        assert!(
+            evidence.contains("1 confirmed against the code; 1 refuted and not raised again"),
+            "{evidence}"
+        );
+        assert!(!evidence.contains("[unverified-claims]"));
+        let claims = load_claims(&route);
+        let refuted: Vec<&Claim> = claims.values().filter(|c| c.status == REFUTED).collect();
+        assert_eq!(refuted.len(), 1);
+        assert!(refuted[0].text.starts_with("Missing admin check"));
+        assert_eq!(refuted[0].citations, vec!["src/admin.ts:2".to_string()]);
+        let shown = planner_evidence(&evidence, &claims, &next_week);
+        assert!(shown.contains("## Confirmed findings") && shown.contains("Empty repository"));
+        assert!(
+            !shown.contains("Missing admin check"),
+            "refuted: never planned from"
+        );
+
+        let outcome = plan(&route, &config, DEFAULT_MAX, next, &crate::Silent)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PlanOutcome::Planned { verifications, .. } if verifications.is_empty()),
+            "the same file next week raises nothing again: {outcome:?}"
+        );
+        assert_eq!(
+            load_claims(&route)
+                .values()
+                .find(|c| c.status == CONFIRMED)
+                .and_then(|c| c.planned_in.clone()),
+            Some(next_week)
+        );
+    }
+
+    /// Josh archived btcpc, pc-agent-bridge and bullship-bridge: the loop leaves an
+    /// archived project alone, and it cannot be switched back on while archived.
+    #[tokio::test]
+    async fn an_archived_project_is_skipped_and_cannot_be_switched_on() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let judge = engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"));
+        let (route, config) = channel(dir.path(), vec![judge]);
+        let targets = vec![(route.clone(), config.clone())];
+        switch_on(&route);
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        assert!(
+            ferryman_channel::ferry::set_archived(&route.communications, "demo", true, &josh)
+                .unwrap()
+        );
+
+        assert!(!ferryman_channel::ferry::self_improve_enabled(
+            &route.communications,
+            "demo"
+        ));
+        let done = run(&targets, DEFAULT_MAX, Utc::now(), &crate::Silent).await;
+        assert!(done.is_empty(), "{done:?}");
+        assert_eq!(
+            plan(&route, &config, DEFAULT_MAX, Utc::now(), &crate::Silent)
+                .await
+                .unwrap(),
+            PlanOutcome::Archived
+        );
+        assert!(improvements(&route).is_empty());
+        let error =
+            ferryman_channel::ferry::set_self_improve(&route.communications, "demo", true, &josh)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("archived"), "{error:#}");
+
+        // Brought back, it is on again: archiving did not rewrite the setting.
+        assert!(
+            ferryman_channel::ferry::set_archived(&route.communications, "demo", false, &josh)
+                .unwrap()
+        );
+        assert!(ferryman_channel::ferry::self_improve_enabled(
+            &route.communications,
+            "demo"
+        ));
+
+        // Switched off while archived, it stays off when it is brought back.
+        ferryman_channel::ferry::set_archived(&route.communications, "demo", true, &josh).unwrap();
+        assert!(
+            ferryman_channel::ferry::set_self_improve(&route.communications, "demo", false, &josh)
+                .unwrap(),
+            "off is written even though an archived project already reads as off"
+        );
+        ferryman_channel::ferry::set_archived(&route.communications, "demo", false, &josh).unwrap();
+        assert!(!ferryman_channel::ferry::self_improve_enabled(
+            &route.communications,
+            "demo"
+        ));
+    }
+
+    /// The audit file as an LLM really writes it (X:\pc-secrets\PROBLEMS.md): a title, a
+    /// preamble, then one `##` section per finding with bold labels. Each section is one
+    /// claim; the preamble is none. The file is found whatever its case.
+    #[test]
+    fn an_audit_file_is_read_one_claim_per_section_whatever_its_name_case() {
+        let text = "# PROBLEMS.md - PC Secrets\n\nWritten by an AI audit pass on 2026-09-27 \
+                    while building a knowledge vault.\nFindings came from reading the source.\n\n\
+                    ## Live secret leak: posting key in plaintext\n**Severity:** SECURITY - fix \
+                    this one first\n**What we found:** `ferryman.env` holds a posting key outside \
+                    the encrypted tier.\n**Suggested fix:** Move it into the vault and rotate \
+                    it.\n\n## Stale copy of the repo\n**What we found:** old-copy has no \
+                    commits.\n";
+        let claims = parse_claims(text);
+        assert_eq!(claims.len(), 2, "{claims:?}");
+        assert!(claims[0].starts_with("Live secret leak: posting key in plaintext - Severity:"));
+        assert!(
+            claims[0].contains("What we found: `ferryman.env`"),
+            "{}",
+            claims[0]
+        );
+        assert!(!claims.iter().any(|claim| claim.contains("AI audit pass")));
+        assert!(claims[1].starts_with("Stale copy of the repo"));
+        assert_ne!(claim_id(&claims[0]), claim_id(&claims[1]));
+        assert_eq!(
+            claim_id(&claims[0]),
+            claim_id(&claims[0].to_uppercase()),
+            "the same claim next week is the same claim"
+        );
+
+        // A flat list is read item by item.
+        let flat = parse_claims("- the admin route has no auth check\n- tests are skipped on CI\n");
+        assert_eq!(flat.len(), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        assert!(problems_file(dir.path()).is_none());
+        fs::write(dir.path().join("Problems.md"), text).unwrap();
+        fs::create_dir(dir.path().join("problems")).unwrap();
+        let (name, read) = problems_file(dir.path()).unwrap();
+        assert_eq!(name, "Problems.md");
+        assert_eq!(read, text);
+    }
+
+    /// A refuted result is never done: not in the report's done count, not a run that
+    /// succeeded, and counted on a line of its own.
+    #[test]
+    fn the_report_never_counts_a_refuted_result_as_done() {
+        let start = week_start(Utc::now());
+        let at = start + Duration::hours(1);
+        let order = |id: &str| ferryman_channel::Order {
+            id: id.into(),
+            project_id: "demo".into(),
+            issued_by: "boss".into(),
+            assigned_to: Some("ichabod".into()),
+            created_at: at,
+            payload: json!({ "task": "run the checks and paste the output" }),
+            requires_review: false,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        let task = |id: &str, output: &str| Task {
+            order: order(id),
+            claims: Vec::new(),
+            results: vec![ferryman_channel::TaskResult {
+                order_id: id.into(),
+                agent: "ichabod".into(),
+                revision: 1,
+                submitted_at: at,
+                payload: json!({ "output": output }),
+                signed_by: None,
+                signature: None,
+            }],
+            reviews: Vec::new(),
+            recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
+            kills: Vec::new(),
+        };
+        let tasks = vec![
+            task(
+                "fabricated",
+                "better suited to 'deepseek'\n1. no output\n2. no output",
+            ),
+            task("real", "1. root 812 node bridge.js\n2. no output"),
+        ];
+        let run = |id: &str| Trajectory {
+            order_id: id.into(),
+            agent: "ichabod".into(),
+            engine: "cline".into(),
+            revision: 1,
+            at,
+            ok: true,
+            prompt_digest: String::new(),
+            output: String::new(),
+            usage: None,
+        };
+        let runs = vec![run("fabricated"), run("real")];
+        let week = numbers(
+            &tasks,
+            &runs,
+            &ferryman_channel::cost::Rates::default(),
+            start,
+        );
+        assert_eq!(week.done, 1, "{week:?}");
+        assert_eq!(week.refuted, 1);
+        assert_eq!((week.runs, week.runs_ok), (2, 1));
     }
 }

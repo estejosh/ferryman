@@ -373,6 +373,9 @@ pub enum Stage {
     Read,
     Claimed,
     Done,
+    /// A result came back, and its own evidence - or its emptiness - refutes it. Never
+    /// shown as done.
+    Refuted,
 }
 
 impl Stage {
@@ -384,6 +387,7 @@ impl Stage {
             Self::Read => "read",
             Self::Claimed => "claimed",
             Self::Done => "done",
+            Self::Refuted => "refuted",
         }
     }
 }
@@ -465,12 +469,24 @@ pub fn progress_at(task: &Task, receipts: &Receipts, now: DateTime<Utc>) -> Opti
     {
         advance(Stage::Claimed, claim.claimed_at, &claim.agent);
     }
+    let mut refuted = None;
     if let Some(result) = task.results.iter().max_by_key(|r| r.revision) {
-        advance(Stage::Done, result.submitted_at, &result.agent);
+        let found = crate::evidence::classify(&task.order.payload, result);
+        if found.status == crate::evidence::Status::Refuted {
+            advance(Stage::Refuted, result.submitted_at, &result.agent);
+            refuted = Some(found.reasons.join("; "));
+        } else {
+            advance(Stage::Done, result.submitted_at, &result.agent);
+        }
     }
     let (stage, since, by) = reached;
     let waited = now.signed_duration_since(since);
     let warning = match stage {
+        Stage::Refuted => Some(format!(
+            "r{} came back refuted by its own evidence, not done: {}",
+            task.latest_revision().unwrap_or(1),
+            refuted.unwrap_or_default()
+        )),
         Stage::Sent if waited > Duration::seconds(UNDELIVERED_AFTER_SECS) => Some(match &to {
             Some(agent) => format!(
                 "not delivered after {}: {agent}'s worker has not seen it - is this channel \
@@ -714,6 +730,64 @@ pub struct EngineReport {
     pub balance: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<DateTime<Utc>>,
+    /// How far this engine's claims have held up against the worker's own evidence.
+    /// `None` until one of its results has been checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust: Option<EngineTrust>,
+}
+
+/// What a worker's own evidence says about how far one engine's (and so one model's)
+/// claims can be believed: results the evidence agreed with, results it refuted, and
+/// whether that has demoted the engine to chore work until it passes the canary.
+/// Published inside the signed engines inventory, so every machine reads the same.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EngineTrust {
+    pub verified: u64,
+    #[serde(alias = "contradicted")]
+    pub refuted: u64,
+    #[serde(default)]
+    pub unverified: u64,
+    /// Refutations inside the rolling window that decides demotion.
+    #[serde(default)]
+    pub recent: u32,
+    #[serde(default)]
+    pub demoted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demoted_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_passed_at: Option<DateTime<Utc>>,
+}
+
+impl EngineTrust {
+    /// Verified results as a share of those the evidence decided, `None` before any.
+    #[must_use]
+    pub fn score(&self) -> Option<u64> {
+        let decided = self.verified + self.refuted;
+        (decided > 0).then(|| self.verified * 100 / decided)
+    }
+
+    /// `trust 67% (4 verified, 2 refuted, 1 unverified) - DEMOTED to chore work (2
+    /// recent refutations) until it passes the canary`
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut text = format!(
+            "trust {} ({} verified, {} refuted, {} unverified)",
+            self.score()
+                .map_or("-".to_string(), |score| format!("{score}%")),
+            self.verified,
+            self.refuted,
+            self.unverified
+        );
+        if self.demoted {
+            text.push_str(&format!(
+                " - DEMOTED to chore work ({} recent refutations) until it passes the canary",
+                self.recent
+            ));
+        } else if let Some(at) = self.canary_passed_at {
+            text.push_str(&format!(" - canary passed {}", at.format("%a %H:%M UTC")));
+        }
+        text
+    }
 }
 
 impl EngineReport {
@@ -1093,6 +1167,42 @@ mod tests {
         );
     }
 
+    /// The grouchly answer: a redirect and seven placeholders. It is not done, and the
+    /// progress view says so rather than "done".
+    #[test]
+    fn a_refuted_result_is_shown_as_refuted_never_as_done() {
+        let (_t, route, fang, _, operator) = channel();
+        issue(&route, &operator, "t-1", Some("fang"));
+        crate::claim_order(&route, "t-1", "fang").unwrap();
+        let mut result = TaskResult {
+            order_id: "t-1".into(),
+            agent: "fang".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({"output": "better suited to 'nebra'\n1. no output\n2. no output"}),
+            signed_by: None,
+            signature: None,
+        };
+        fang.sign_result(&mut result);
+        crate::submit_result(&route, &result).unwrap();
+        let open = channel_progress(&route, Utc::now()).unwrap();
+        assert_eq!(
+            open.len(),
+            1,
+            "still open: a refuted result is not finished"
+        );
+        assert_eq!(open[0].stage, Stage::Refuted);
+        assert_eq!(open[0].stage.as_str(), "refuted");
+        assert!(
+            open[0]
+                .warning
+                .as_deref()
+                .is_some_and(|w| w.contains("not done") && w.contains("hands the work")),
+            "{:?}",
+            open[0].warning
+        );
+    }
+
     #[test]
     fn an_open_order_counts_whoever_saw_it() {
         let (_t, route, _, nebra, operator) = channel();
@@ -1271,6 +1381,7 @@ mod tests {
             latency_ms: Some(8000),
             balance: None,
             checked_at: Some(Utc::now()),
+            trust: None,
         }
     }
 

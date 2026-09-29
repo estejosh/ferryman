@@ -1928,6 +1928,10 @@ async fn improve_all(
         .into_iter()
         .map(|(project, channel)| {
             let outcome = match ferryman_channel::ferry::master_of(&channel) {
+                // Left alone: the loop never runs in an archived project.
+                _ if body.enabled && ferryman_channel::ferry::is_archived(&channel, &project) => {
+                    "archived".to_string()
+                }
                 Ok(Some(master)) if master.eq_ignore_ascii_case(current.name()) => {
                     match ferryman_channel::ferry::set_self_improve(
                         &channel,
@@ -3529,6 +3533,9 @@ fn state_value(state: &TaskState) -> Value {
         }
         TaskState::Accepted => json!({ "status": "accepted" }),
         TaskState::Done => json!({ "status": "done" }),
+        TaskState::Refuted { by, revision } => {
+            json!({ "status": "refuted", "by": by, "revision": revision })
+        }
         TaskState::Killed { by, at } => {
             json!({ "status": "killed", "by": by, "at": at.to_rfc3339() })
         }
@@ -4649,6 +4656,52 @@ mod tests {
         assert_eq!(after["may_set"], true);
         assert_eq!(after["set_by"], "alice");
         assert!(ferryman_channel::ferry::self_improve_enabled(
+            &route.communications,
+            &route.project_id
+        ));
+    }
+
+    /// "On for all my repos" passes over an archived project: the loop leaves finished
+    /// work alone, and the page says why.
+    #[tokio::test]
+    async fn on_for_all_leaves_an_archived_project_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        // Its own machine, so "all my repos" is this project and not a real ferry root.
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            dir.path().join("machine-state"),
+        );
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let alice = dashboard_state.sessions.resolve(&token).unwrap();
+        assert!(
+            ferryman_channel::ferry::set_archived(
+                &route.communications,
+                &route.project_id,
+                true,
+                &alice
+            )
+            .unwrap()
+        );
+
+        let all = post(
+            &app,
+            "/api/improve/all",
+            r#"{"enabled":true}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(all.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(all.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["switched"], 0, "{body}");
+        assert_eq!(body["projects"][0]["outcome"], "archived", "{body}");
+        assert!(!ferryman_channel::ferry::self_improve_enabled(
             &route.communications,
             &route.project_id
         ));

@@ -2414,6 +2414,12 @@ fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
         let mut me: Option<String> = None;
         let mut changed = 0;
         for (project, channel, attachment) in mastered_targets(None, None)? {
+            // An archived project is left alone: switching it on is refused anyway.
+            // Switching off still reaches it, so it stays off when it is brought back.
+            if enabled && ferryman_channel::ferry::is_archived(&channel, &project) {
+                println!("  {project}: skipped - archived");
+                continue;
+            }
             let (master, identity) = match mastered_signer(&channel, &attachment, me.as_deref()) {
                 Ok(signer) => signer,
                 Err(error) => {
@@ -2481,6 +2487,7 @@ fn improve_status(as_json: bool) -> Result<()> {
             json!({
                 "project": project,
                 "enabled": setting.as_ref().is_some_and(|s| s.enabled),
+                "archived": ferryman_channel::ferry::is_archived(channel, project),
                 "has_master": ferryman_channel::ferry::master_of(channel).ok().flatten().is_some(),
                 "set_by": setting.as_ref().map(ferryman_channel::ferry::ImproveSetting::set_by),
                 "set_at": setting.as_ref().map(|s| s.set_at),
@@ -2498,6 +2505,7 @@ fn improve_status(as_json: bool) -> Result<()> {
     );
     for row in &rows {
         let state = match (row["enabled"].as_bool(), row["has_master"].as_bool()) {
+            _ if row["archived"].as_bool() == Some(true) => "archived",
             (Some(true), _) => "on",
             (_, Some(false)) => "off (no master)",
             _ => "off",
@@ -2541,7 +2549,12 @@ fn switched_on<T>(items: Vec<T>, route: impl Fn(&T) -> &ferryman_channel::Projec
                 &route.communications,
                 &route.project_id,
             );
-            if !on {
+            if ferryman_channel::ferry::is_archived(&route.communications, &route.project_id) {
+                eprintln!(
+                    "  {}: archived; the improve loop leaves it alone",
+                    route.project_id
+                );
+            } else if !on {
                 eprintln!(
                     "  {}: self-improve is off; its master can switch it on with \
                      'ferry improve on {}'",
@@ -2625,7 +2638,19 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
         (String, String),
         (EngineInventory, SignatureCheck, Vec<String>),
     > = std::collections::BTreeMap::new();
+    // What others' signed checks say about each worker's engine, summed across channels.
+    let mut checked: std::collections::BTreeMap<
+        (String, String),
+        ferryman_channel::evidence::Tally,
+    > = std::collections::BTreeMap::new();
     for route in target_routes(at)? {
+        let records = ferryman_channel::evidence::channel_verifications(&route);
+        for (key, count) in ferryman_channel::evidence::tally(&records) {
+            let sum = checked.entry(key).or_default();
+            sum.verified += count.verified;
+            sum.unverified += count.unverified;
+            sum.refuted += count.refuted;
+        }
         for (inventory, check) in ferryman_channel::receipts::list_engines(&route)? {
             let key = (
                 inventory.agent.to_ascii_lowercase(),
@@ -2655,6 +2680,12 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                     "signature": format!("{check:?}"),
                     "channels": channels,
                     "engines": inventory.engines,
+                    // Verdicts others recorded, signed, on this worker's results.
+                    "checked_by_others": checked
+                        .iter()
+                        .filter(|((worker, _), _)| worker.eq_ignore_ascii_case(&inventory.agent))
+                        .map(|((_, engine), count)| json!({ "engine": engine, "checked": count }))
+                        .collect::<Vec<_>>(),
                 })
             })
             .collect();
@@ -2666,6 +2697,7 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             "no worker has published its engines yet; a worker on this version publishes \
              them within ten minutes of starting"
         );
+        print_checked_by_others(&checked);
         return Ok(());
     }
     let now = chrono::Utc::now();
@@ -2684,6 +2716,12 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                     format!("exhausted until {}", until.format("%a %H:%M UTC"))
                 }
                 (state, _) => state.to_string(),
+            };
+            // Demoted engines get chore and canary work only, whatever their tier says.
+            let state = if engine.trust.as_ref().is_some_and(|trust| trust.demoted) {
+                format!("{state}, DEMOTED")
+            } else {
+                state
             };
             let latency = engine
                 .latency_ms
@@ -2704,9 +2742,36 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             {
                 println!("  {:<12} {reason}", "");
             }
+            // Whether its claims have held up against the worker's own evidence.
+            if let Some(trust) = &engine.trust {
+                println!("  {:<12} {}", "", trust.describe());
+            }
         }
     }
+    print_checked_by_others(&checked);
     Ok(())
+}
+
+/// The receiving side's view of each worker's engines: verdicts other agents recorded,
+/// signed, on their results. It covers workers too old to publish trust of their own.
+fn print_checked_by_others(
+    checked: &std::collections::BTreeMap<(String, String), ferryman_channel::evidence::Tally>,
+) {
+    if checked.is_empty() {
+        return;
+    }
+    println!("\nChecked by others (signed verification records):");
+    for ((worker, engine), count) in checked {
+        let flag = if count.refuted > 0 {
+            "  <- refuted results do not count as done"
+        } else {
+            ""
+        };
+        println!(
+            "  {worker:<28} {engine:<36} {} verified, {} unverified, {} refuted{flag}",
+            count.verified, count.unverified, count.refuted
+        );
+    }
 }
 
 async fn improve_command(command: ImproveCommand) -> Result<()> {
@@ -8405,6 +8470,12 @@ fn channel(command: Channel) -> Result<()> {
                             ferryman_channel::TaskState::Accepted => "finished".to_string(),
                             ferryman_channel::TaskState::Done => {
                                 "finished, no review asked for".to_string()
+                            }
+                            ferryman_channel::TaskState::Refuted { by, revision } => {
+                                format!(
+                                    "revision {revision} by {by} is refuted by its own \
+                                     evidence - not done"
+                                )
                             }
                             ferryman_channel::TaskState::Killed { by, .. } => {
                                 format!("killed by {by}; nobody may claim it again")

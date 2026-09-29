@@ -925,8 +925,16 @@ impl Bridge {
                 Some(self.improve_view())
             }
             "impall" => {
-                let projects: Vec<String> =
-                    self.routes.iter().map(|r| r.project_id.clone()).collect();
+                // An archived project is left alone: switching it on is refused anyway,
+                // and it is not offered.
+                let projects: Vec<String> = self
+                    .routes
+                    .iter()
+                    .filter(|r| {
+                        !ferryman_channel::ferry::is_archived(&r.communications, &r.project_id)
+                    })
+                    .map(|r| r.project_id.clone())
+                    .collect();
                 let switched = projects
                     .iter()
                     .filter(|project| {
@@ -1201,13 +1209,26 @@ impl Bridge {
                 if matches!(task.state_at(now), TaskState::AwaitingReview { .. }) {
                     buttons.push(self.review_buttons(&w.project, &w.order, true));
                 }
-                actions.push(send(
-                    w.chat,
+                // A refuted result is never reported as done.
+                let found = ferryman_channel::evidence::classify(&task.order.payload, result);
+                let headline = if found.status == ferryman_channel::evidence::Status::Refuted {
                     format!(
-                        "{} is done - r{} by {}:\n\n{}",
+                        "{} came back REFUTED, not done - r{} by {}: {}",
                         w.order,
                         result.revision,
                         result.agent,
+                        found.reasons.join("; ")
+                    )
+                } else {
+                    format!(
+                        "{} is done - r{} by {}:",
+                        w.order, result.revision, result.agent
+                    )
+                };
+                actions.push(send(
+                    w.chat,
+                    format!(
+                        "{headline}\n\n{}",
                         excerpt(&result_text(&result.payload), EXCERPT_CHARS)
                     ),
                     buttons,
@@ -1347,6 +1368,7 @@ fn stage_of(route: &ProjectRoute, task: &ferryman_channel::Task, now: DateTime<U
         TaskState::Accepted | TaskState::Done | TaskState::AwaitingReview { .. } => {
             "done".to_string()
         }
+        TaskState::Refuted { .. } => "refuted - not done".to_string(),
         _ => ferryman_channel::receipts::progress(route, task, now)
             .map_or_else(|| "sent".to_string(), |p| p.stage.as_str().to_string()),
     }
@@ -1358,6 +1380,7 @@ fn where_it_is(route: &ProjectRoute, task: &ferryman_channel::Task, now: DateTim
         TaskState::Accepted => "approved".to_string(),
         TaskState::ChangesRequested { revision } => format!("sent back (r{revision})"),
         TaskState::Done => "done".to_string(),
+        TaskState::Refuted { revision, .. } => format!("refuted (r{revision}) - not done"),
         TaskState::Killed { by, .. } => format!("stopped by {by}"),
         _ => stage_of(route, task, now),
     }
@@ -2115,6 +2138,81 @@ mod tests {
         ));
     }
 
+    /// "On for all" from the phone passes over an archived project, even one the bridge
+    /// may switch.
+    #[test]
+    fn on_for_all_from_the_phone_leaves_an_archived_project_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, bullship) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        delegate(&bullship, &["improve"]);
+        assert!(
+            ferryman_channel::ferry::set_archived(
+                &bullship.communications,
+                "bullship",
+                true,
+                &josh()
+            )
+            .unwrap()
+        );
+        let all = bridge.handle(press(JOSH_TG, GROUP, 90, "impall"), Utc::now());
+        assert!(
+            matches!(&all[0], Action::Answer { text, .. } if text == "Switched on in 1 project(s)"),
+            "{all:?}"
+        );
+        assert!(ferryman_channel::ferry::self_improve_enabled(
+            &ferryman.communications,
+            "ferryman"
+        ));
+        assert!(
+            ferryman_channel::ferry::self_improve_setting(&bullship.communications, "bullship")
+                .is_none(),
+            "nothing was signed for the archived project"
+        );
+    }
+
+    /// A result its own words refute is announced as refuted, never as done.
+    #[test]
+    fn a_refuted_result_is_never_announced_as_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_bridge, ferryman, _) = bridge(dir.path());
+        let mut order = ferryman_channel::Order {
+            id: "archcheck".into(),
+            project_id: "ferryman".into(),
+            issued_by: "josh".into(),
+            assigned_to: Some("wisp".into()),
+            created_at: Utc::now(),
+            payload: json!({ "task": "Run these and paste the raw output" }),
+            requires_review: false,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        josh().sign_order(&mut order);
+        ferryman_channel::issue_order(&ferryman, &order).unwrap();
+        ferryman_channel::claim_order(&ferryman, "archcheck", "wisp").unwrap();
+        let mut result = ferryman_channel::TaskResult {
+            order_id: "archcheck".into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "better suited to 'claw'\n1. no output\n2. no output" }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp().sign_result(&mut result);
+        ferryman_channel::submit_result(&ferryman, &result).unwrap();
+        let task = ferryman_channel::read_task(&ferryman, "archcheck").unwrap();
+        let now = Utc::now();
+        assert_eq!(stage_of(&ferryman, &task, now), "refuted - not done");
+        assert_eq!(
+            where_it_is(&ferryman, &task, now),
+            "refuted (r1) - not done"
+        );
+    }
+
     #[test]
     fn with_every_engine_down_it_says_so_and_speaks_up_when_one_is_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -2132,6 +2230,7 @@ mod tests {
             latency_ms: None,
             balance: None,
             checked_at: None,
+            trust: None,
         };
         let now = Utc::now();
         ferryman_channel::receipts::refresh_engines(

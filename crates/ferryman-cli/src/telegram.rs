@@ -1731,12 +1731,19 @@ async fn announce(
                 .map(str::to_string)
                 .unwrap_or_else(|| result.payload.to_string());
             let signature = ferryman_channel::verify_result(result, &route.agents);
+            // A refuted result is announced as what it is, never as work done.
+            let found = ferryman_channel::evidence::classify(&task.order.payload, result);
+            let verdict = if found.status == ferryman_channel::evidence::Status::Refuted {
+                format!("REFUTED, not done - {}\n", found.reasons.join("; "))
+            } else {
+                String::new()
+            };
             fresh.push((
                 key,
                 task.order.id.clone(),
                 output.clone(),
                 format!(
-                    "{} r{} by {} ({signature:?})\n\n{}",
+                    "{} r{} by {} ({signature:?})\n{verdict}\n{}",
                     task.order.id,
                     result.revision,
                     result.agent,

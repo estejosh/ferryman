@@ -1735,12 +1735,27 @@ fn review_prompt(config: &AgentConfig, task: &Task, revision: u32, roster: &str)
         .find(|r| r.revision == revision)
         .map(|r| r.payload.to_string())
         .unwrap_or_default();
+    let evidence = task
+        .results
+        .iter()
+        .find(|r| r.revision == revision)
+        .and_then(|r| ferryman_channel::evidence::of(&task.order.payload, r))
+        .map(|found| {
+            format!(
+                "What the worker process recorded itself - git before and after the run, and \
+                 the exit codes of checks it ran - not written by the model:\n{}\n\
+                 Where the claim and this evidence disagree, believe the evidence.\n\n",
+                found.describe()
+            )
+        })
+        .unwrap_or_default();
     with_preamble(
         config,
         format!(
             "{roster}You are reviewing another agent's work.\n\n\
              The task was:\n{request}\n\n\
              What was submitted:\n{submitted}\n\n\
+             {evidence}\
              Decide whether this should be accepted or sent back for another revision. \
              Judge it against the task as stated, not against what you would have done.\n\n\
              Reply with exactly one JSON object and nothing else:\n\
@@ -2554,6 +2569,7 @@ async fn note_engines(
     let now = chrono::Utc::now();
     if crate::governor::paused().is_none() {
         crate::engines::probe_due(route, &config.agent, &config.engines, now).await;
+        run_due_canaries(route, config, report).await;
     }
     let ledger = crate::engines::Ledger::load(&config.agent);
     if let Err(error) = ferryman_channel::receipts::refresh_engines(
@@ -2566,6 +2582,78 @@ async fn note_engines(
     ) {
         report.warn(&format!("could not write this worker's engines: {error:#}"));
     }
+}
+
+/// Give every demoted engine that is due one the canary, at most hourly each. A pass
+/// gives it build work back; anything else, including an engine that could not run,
+/// leaves it demoted until the next hour.
+async fn run_due_canaries(route: &ProjectRoute, config: &AgentConfig, report: &dyn Progress) {
+    let ledger = crate::engines::Ledger::load(&config.agent);
+    let now = chrono::Utc::now();
+    let due: Vec<crate::engines::EngineSpec> = config
+        .engines
+        .iter()
+        .filter(|spec| crate::engines::canary_due(&ledger.state(&spec.name), now))
+        .cloned()
+        .collect();
+    for spec in due {
+        let passed = match run_canary(route, &config.with_engine(&spec)).await {
+            Ok(passed) => passed,
+            Err(error) => {
+                report.warn(&format!(
+                    "canary for {} could not run: {error:#}",
+                    spec.name
+                ));
+                false
+            }
+        };
+        crate::engines::record_canary(&config.agent, &spec.name, passed, chrono::Utc::now());
+        if passed {
+            report.info(&format!(
+                "{} passed the canary: it made and committed a file, checked with git; it \
+                 takes build work again",
+                spec.name
+            ));
+        } else {
+            report.warn(&format!(
+                "{} failed the canary: no commit with the file was found; it stays on chore \
+                 work",
+                spec.name
+            ));
+        }
+    }
+}
+
+/// Give the engine `config` runs the canary: in a throwaway git repository, create a
+/// file and commit it. Whether it did is read from git, never from its answer. Returns
+/// whether it passed; an engine that could not run at all is an error.
+pub async fn run_canary(route: &ProjectRoute, config: &AgentConfig) -> Result<bool> {
+    let (credentials, key) = engine_credentials(route, config)?;
+    let dir = std::env::temp_dir().join(format!(
+        "ferryman-canary-{}-{}",
+        std::process::id(),
+        ferryman_channel::new_run_id()
+    ));
+    let (base, token) = crate::engines::canary_repo(&dir)?;
+    let run = run_engine(
+        config,
+        &dir,
+        &crate::engines::canary_prompt(&token),
+        &credentials,
+        key.as_deref(),
+        None,
+    )
+    .await;
+    let passed = crate::engines::canary_holds(&dir, &base, &token);
+    let _ = fs::remove_dir_all(&dir);
+    let run = run?;
+    count_use(
+        route,
+        config,
+        &config.engine(),
+        run.usage.or_else(|| engine_usage(&run.stdout)),
+    );
+    Ok(run.ok && passed)
 }
 
 /// How many times one task may fail on this machine before the worker stops trying it.
@@ -3040,6 +3128,11 @@ async fn do_work(
             "  {id}: could not write the read receipt: {error:#}"
         ));
     }
+    // Evidence, not claims: the workspace as git saw it just before the engine was
+    // handed the order, so what it did can be told from what it says it did.
+    let git_before = ferryman_channel::evidence::before(&workdir);
+    let started_at = chrono::Utc::now();
+    let clock = std::time::Instant::now();
     let run = run_engine(
         config,
         &workdir,
@@ -3049,6 +3142,7 @@ async fn do_work(
         Some(heartbeat),
     )
     .await?;
+    let ran = (started_at, clock.elapsed().as_secs());
     // What the engine says it spent, when it says anything. Recorded twice on
     // purpose: into the trajectory (what the cost aggregator reads) and into
     // the signed result payload (what reviewers and the fleet can read without
@@ -3104,6 +3198,33 @@ async fn do_work(
     }
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
+    }
+    if run.ok {
+        // Recorded here, by the worker, before anything is committed or torn down - and
+        // counted for or against the engine on this machine.
+        let answer = engine_answer(&run.stdout);
+        let found =
+            collect_evidence(&workdir, git_before.as_ref(), ran, task, &answer, report).await;
+        if found.status == ferryman_channel::evidence::Status::Refuted {
+            report.warn(&format!("  {id}: evidence {}", found.describe()));
+        } else {
+            report.info(&format!("  {id}: evidence {}", found.describe()));
+        }
+        if crate::engines::record_verification(
+            &config.agent,
+            &engine.name,
+            found.status,
+            chrono::Utc::now(),
+        ) {
+            report.warn(&format!(
+                "  {id}: {} is demoted to chore work: {} results refuted by their own \
+                 evidence within {} days. It gets build work back when it passes the canary.",
+                engine.name,
+                crate::engines::DEMOTE_AFTER,
+                crate::engines::TRUST_WINDOW_DAYS
+            ));
+        }
+        payload["evidence"] = json!(found);
     }
     if used_worktree {
         // The work is committed here, before anything is torn down.
@@ -3173,6 +3294,48 @@ async fn do_work(
         identity,
     );
     Ok(())
+}
+
+/// How long one acceptance check the worker runs itself may take.
+const CHECK_LIMIT: Duration = Duration::from_secs(30 * 60);
+
+/// What the worker saw the engine do: git before and after, how long it ran, the commit
+/// hashes its answer names looked up in git, a verification's citations, and the checks
+/// the order requires, run here rather than asked about. Git is read first, so a
+/// check's build output is never taken for the work.
+async fn collect_evidence(
+    workdir: &Path,
+    before: Option<&ferryman_channel::evidence::Before>,
+    (started_at, seconds): (chrono::DateTime<chrono::Utc>, u64),
+    task: &Task,
+    answer: &str,
+    report: &dyn Progress,
+) -> ferryman_channel::evidence::Evidence {
+    use ferryman_channel::evidence;
+    let id = &task.order.id;
+    let mut found = evidence::after(workdir, before);
+    found.started_at = Some(started_at);
+    found.duration_secs = Some(seconds);
+    evidence::check_claimed_commits(&mut found, workdir, answer);
+    if evidence::is_verification(&task.order.payload) {
+        evidence::cite(&mut found, workdir, answer);
+    }
+    for argv in evidence::required_checks(&task.order.payload) {
+        let command = argv.join(" ");
+        report.info(&format!("  {id}: running `{command}` to check the claim"));
+        let dir = workdir.to_path_buf();
+        let check =
+            tokio::task::spawn_blocking(move || evidence::run_check(&dir, &argv, CHECK_LIMIT))
+                .await
+                .unwrap_or_else(|error| evidence::CheckRun {
+                    command,
+                    error: Some(format!("{error}")),
+                    ..evidence::CheckRun::default()
+                });
+        found.checks.push(check);
+    }
+    evidence::judge(&mut found, &task.order.payload, answer);
+    found
 }
 
 /// Commit the worktree, retire it, and publish the branch when it is worth keeping.
@@ -3277,8 +3440,12 @@ pub async fn review_where(
     let mut acted = 0;
     let mut skipped_own = 0;
     for task in ferryman_channel::list_tasks(route)? {
-        let TaskState::AwaitingReview { by, revision } = task.state() else {
-            continue;
+        // A refuted result on an order that asks for review is still owed a verdict:
+        // it is sent back, on its evidence, so the next revision can be done.
+        let (by, revision) = match task.state() {
+            TaskState::AwaitingReview { by, revision } => (by, revision),
+            TaskState::Refuted { by, revision } if task.order.requires_review => (by, revision),
+            _ => continue,
         };
         if !wanted(&task) {
             continue;
@@ -3321,7 +3488,10 @@ pub async fn review_where(
             .active
             .as_ref()
             .is_some_and(|engine| produced_by.is_some_and(|made| made != engine.name));
-        if by == config.agent && !another_engine {
+        // Sending back a result its own evidence refutes takes no opinion, so it is not
+        // self-review: any agent, the worker's own included, may do it.
+        let refuted = matches!(task.state(), TaskState::Refuted { .. });
+        if by == config.agent && !another_engine && !refuted {
             skipped_own += 1;
             continue;
         }
@@ -3353,6 +3523,42 @@ async fn judge(
 ) -> Result<()> {
     let id = task.order.id.clone();
     report.info(&format!("  {id}: judging revision {revision}"));
+    // The reviewer's own signed record of what the evidence says, beside the worker's
+    // result rather than in it, and in its ledger. Best effort: the verdict below is
+    // recomputed from the same facts whether or not the record could be written.
+    match ferryman_channel::evidence::record(route, task, revision, identity) {
+        Ok(Some(record)) => report.info(&format!(
+            "  {id}: revision {revision} is {}{}",
+            record.status,
+            if record.reasons.is_empty() {
+                String::new()
+            } else {
+                format!(" - {}", record.reasons.join("; "))
+            }
+        )),
+        Ok(None) => {}
+        Err(error) => report.warn(&format!(
+            "  {id}: could not record the verification: {error:#}"
+        )),
+    }
+    // Evidence first, and deterministically: a result its own worker's record
+    // refutes, or that shows nothing done where something had to be, is sent back
+    // without asking a model what it thinks of the claim.
+    if let Some(why) = task
+        .results
+        .iter()
+        .find(|r| r.revision == revision)
+        .and_then(|result| ferryman_channel::evidence::blocking_reason(&task.order.payload, result))
+    {
+        let verdict = Verdict {
+            accept: false,
+            reasoning: format!(
+                "Sent back on the worker's own evidence, not a model's opinion - {why}. Do \
+                 the work in the workspace and commit it: a claim alone is not accepted."
+            ),
+        };
+        return record_verdict(route, config, identity, &id, revision, &verdict, report);
+    }
     let (credentials, key) = engine_credentials(route, config)?;
     // The reviewer sees the same peer roster, so it too can flag when another
     // agent was better suited to the work it is judging.
@@ -3391,6 +3597,20 @@ async fn judge(
     }
     let verdict =
         parse_verdict(&run.stdout).with_context(|| format!("could not read a verdict for {id}"))?;
+    record_verdict(route, config, identity, &id, revision, &verdict, report)
+}
+
+/// Write a verdict as a review or, when a person settles it, as a recommendation.
+fn record_verdict(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    id: &str,
+    revision: u32,
+    verdict: &Verdict,
+    report: &dyn Progress,
+) -> Result<()> {
+    let id = id.to_string();
     match config.review {
         ReviewMode::Auto => {
             let mut review = Review {
@@ -5154,6 +5374,267 @@ mod tests {
             "the inventory is published beside presence"
         );
         assert!(engines[0].0.engines.iter().all(|e| e.state == "exhausted"));
+    }
+
+    /// An engine that answers every order with a confident success and touches nothing -
+    /// the 2026-09-27 incident, in miniature.
+    const LIAR: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\nreview = \"auto\"\n\
+         defer_improvements_while_active = \"false\"\n\
+         engines = [\"liar\"]\n\
+         engine.liar.base_url = \"fake://ok:cloned (success). Everything is up to date.\"\n\
+         engine.liar.model = \"m\"\n";
+
+    fn judge_engine(answer: &str) -> crate::engines::EngineSpec {
+        crate::engines::EngineSpec {
+            name: "judge".into(),
+            kind: crate::engines::Kind::Http,
+            tier: crate::engines::Tier::Judge,
+            paid: crate::engines::Paid::Prepaid,
+            command: String::new(),
+            args: Vec::new(),
+            model: Some("m".into()),
+            base_url: Some(format!("fake://ok:{answer}")),
+            key: None,
+            env: Vec::new(),
+            probe_chat: false,
+            weekly_requests: None,
+            weekly_usd: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fabricated_success_with_no_diff_is_rejected_and_costs_the_engine_its_tier() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-plain", LIAR);
+        // The workspace is a git repository, as a project's is.
+        run_git(&route.workspace, &["init", "-q", "--template="]);
+        run_git(&route.workspace, &["config", "user.email", "t@example.com"]);
+        run_git(&route.workspace, &["config", "user.name", "tester"]);
+        fs::write(route.workspace.join("README.md"), "demo\n").unwrap();
+        run_git(&route.workspace, &["add", "README.md"]);
+        run_git(&route.workspace, &["commit", "-q", "-m", "init"]);
+        let boss = AgentIdentity::from_seed("boss", [9; 32]);
+        for id in ["improve-t-1", "improve-t-2"] {
+            let mut order = order(id);
+            order.project_id = route.project_id.clone();
+            order.issued_by = "boss".into();
+            order.assigned_to = Some("wisp".into());
+            order.payload = json!({
+                "task": "Retry a stale sync folder",
+                "tags": ["improvement"],
+                "improvement": { "title": "Retry a stale sync folder", "acceptance": ["a stale folder is re-registered"] },
+            });
+            boss.sign_order(&mut order);
+            ferryman_channel::issue_order(&route, &order).unwrap();
+        }
+
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        let task = ferryman_channel::read_task(&route, "improve-t-1").unwrap();
+        let evidence = &task.results[0].payload["evidence"];
+        assert_eq!(evidence["recorded_by"], "worker");
+        assert_eq!(evidence["git"], true);
+        assert_eq!(evidence["status"], "refuted", "{evidence}");
+        assert_eq!(
+            evidence["schema"],
+            ferryman_channel::evidence::EVIDENCE_SCHEMA
+        );
+        assert!(evidence["duration_secs"].is_u64() && evidence["started_at"].is_string());
+        assert!(matches!(
+            task.state(),
+            ferryman_channel::TaskState::Refuted { revision: 1, .. }
+        ));
+        assert!(evidence["head_before"] == evidence["head_after"]);
+        assert!(
+            evidence["reasons"][0]
+                .as_str()
+                .unwrap()
+                .contains("no commit and no diff")
+        );
+        let plain = ferryman_channel::read_task(&route, "t-plain").unwrap();
+        assert_eq!(
+            plain.results[0].payload["evidence"]["status"], "not-applicable",
+            "an order that needed no change and claimed none is neither"
+        );
+
+        // Review refuses it on the evidence, without asking the judge, which would have
+        // accepted it.
+        let reviewer = config.with_engine(&judge_engine(
+            r#"{"accept": true, "reasoning": "looks right"}"#,
+        ));
+        let judged = review_where(&route, &reviewer, &crate::Silent, |task| {
+            task.order.id == "improve-t-1"
+        })
+        .await
+        .unwrap();
+        assert_eq!(judged, 1);
+        let task = ferryman_channel::read_task(&route, "improve-t-1").unwrap();
+        assert!(!task.reviews[0].accepted);
+        assert!(
+            task.reviews[0]
+                .notes
+                .as_deref()
+                .unwrap()
+                .contains("worker's own evidence")
+        );
+        assert_eq!(
+            task.state(),
+            ferryman_channel::TaskState::ChangesRequested { revision: 2 }
+        );
+        // The reviewer recorded what it found, signed, beside the result - the worker's
+        // own signed file untouched - and in its ledger.
+        let records = ferryman_channel::evidence::read_verifications(&route, "improve-t-1");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, "refuted");
+        assert_eq!(records[0].verifier, "wisp");
+        assert_eq!(records[0].engine.as_deref(), Some("liar"));
+        assert_eq!(
+            ferryman_channel::verify_result(&task.results[0], &route.agents),
+            ferryman_channel::SignatureCheck::Valid
+        );
+        let ledger = ferryman_channel::ledger::read_ledger(&route).unwrap();
+        assert!(ledger.intact);
+        assert!(
+            ledger
+                .entries
+                .iter()
+                .any(|entry| entry.kind == "verification"
+                    && entry.reference.as_deref() == Some("improve-t-1")
+                    && entry.summary.contains("refuted"))
+        );
+        // And nobody can accept it by hand either.
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        let mut review = Review {
+            order_id: "improve-t-2".into(),
+            revision: 1,
+            reviewer: "wisp".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: true,
+            notes: None,
+            signed_by: None,
+            signature: None,
+        };
+        wisp.sign_review(&mut review);
+        let refused = ferryman_channel::submit_review(&route, &review).unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("cannot be accepted"),
+            "{refused:#}"
+        );
+
+        // Two refutations: the engine is demoted to chore work, and says so.
+        let ledger = crate::engines::Ledger::load("wisp");
+        let state = ledger.state("liar");
+        assert_eq!((state.refuted, state.verified), (2, 0));
+        assert!(state.demoted());
+        let now = chrono::Utc::now();
+        assert!(
+            crate::engines::pick(
+                &config.engines,
+                &ledger,
+                now,
+                crate::engines::Tier::Build,
+                &[]
+            )
+            .is_none()
+        );
+        assert!(
+            crate::engines::pick(
+                &config.engines,
+                &ledger,
+                now,
+                crate::engines::Tier::Chore,
+                &[]
+            )
+            .is_some()
+        );
+        let reports = crate::engines::reports(&config.engines, &ledger, now);
+        let trust = reports[0].trust.as_ref().unwrap();
+        assert!(trust.demoted);
+        assert_eq!(
+            trust.describe(),
+            "trust 0% (0 verified, 2 refuted, 0 unverified) - DEMOTED to chore work (2 recent \
+             refutations) until it passes the canary"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_demoted_engine_gets_build_work_back_only_by_passing_the_canary() {
+        use crate::engines::{self, Tier};
+        use ferryman_channel::evidence::Status;
+        hermetic_machine();
+        let now = chrono::Utc::now();
+        // One refutation long ago and one now: outside the window, not two.
+        engines::record_verification(
+            "wisp",
+            "liar",
+            Status::Refuted,
+            now - chrono::Duration::days(20),
+        );
+        assert!(!engines::record_verification(
+            "wisp",
+            "liar",
+            Status::Refuted,
+            now
+        ));
+        assert!(!engines::Ledger::load("wisp").state("liar").demoted());
+        assert!(engines::record_verification(
+            "wisp",
+            "liar",
+            Status::Refuted,
+            now
+        ));
+        assert!(engines::canary_due(
+            &engines::Ledger::load("wisp").state("liar"),
+            now
+        ));
+
+        // An engine that only says it made the commit fails the canary, and waits an
+        // hour for the next one.
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-canary", LIAR);
+        let liar = config.engines[0].clone();
+        assert!(
+            !run_canary(&route, &config.with_engine(&liar))
+                .await
+                .unwrap()
+        );
+        run_due_canaries(&route, &config, &crate::Silent).await;
+        let state = engines::Ledger::load("wisp").state("liar");
+        assert!(state.demoted() && state.canary_tried_at.is_some());
+        assert!(!engines::canary_due(&state, chrono::Utc::now()));
+
+        // What passes is the commit itself, read from git.
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("canary");
+        let (base, token) = engines::canary_repo(&repo).unwrap();
+        assert!(!engines::canary_holds(&repo, &base, &token));
+        fs::write(repo.join(engines::CANARY_FILE), "not the line\n").unwrap();
+        run_git(&repo, &["add", engines::CANARY_FILE]);
+        run_git(&repo, &["commit", "-q", "-m", "canary"]);
+        assert!(
+            !engines::canary_holds(&repo, &base, &token),
+            "the wrong line"
+        );
+        fs::write(repo.join(engines::CANARY_FILE), format!("{token}\n")).unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "canary"]);
+        assert!(engines::canary_holds(&repo, &base, &token));
+
+        engines::record_canary("wisp", "liar", true, chrono::Utc::now());
+        let ledger = engines::Ledger::load("wisp");
+        assert!(!ledger.state("liar").demoted());
+        assert_eq!(
+            engines::pick(
+                &config.engines,
+                &ledger,
+                chrono::Utc::now(),
+                Tier::Build,
+                &[]
+            )
+            .map(|spec| spec.name.as_str()),
+            Some("liar")
+        );
     }
 }
 

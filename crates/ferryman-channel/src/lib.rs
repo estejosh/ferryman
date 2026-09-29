@@ -23,6 +23,7 @@ pub mod discovery;
 pub mod encrypt;
 pub mod entitlement;
 pub mod events;
+pub mod evidence;
 pub mod ferry;
 pub mod head;
 pub mod interrupt;
@@ -900,6 +901,12 @@ pub enum TaskState {
     Accepted,
     /// Finished, with no review asked for.
     Done,
+    /// A result is in, and no review has settled it, but the result is refuted by its
+    /// own evidence or is no answer at all ([`crate::evidence::classify`]). Never
+    /// success: not done, not a satisfied dependency, not counted as finished work. An
+    /// order that asks for review goes back to a reviewer, who sends it back; one that
+    /// does not waits here for a person.
+    Refuted { by: String, revision: u32 },
     /// An operator killed it. Terminal, and terminal for everyone: no machine may
     /// claim it again.
     ///
@@ -1064,6 +1071,25 @@ impl Task {
         self.state_at(Utc::now())
     }
 
+    /// Whether the result at `revision` is refuted - by its worker's evidence, or by
+    /// being no answer at all. See [`crate::evidence::classify`].
+    #[must_use]
+    pub fn refuted(&self, revision: u32) -> bool {
+        self.results
+            .iter()
+            .find(|r| r.revision == revision)
+            .is_some_and(|result| crate::evidence::is_refuted(&self.order.payload, result))
+    }
+
+    /// How the result at `revision` classifies: verified, unverified or refuted.
+    #[must_use]
+    pub fn classification(&self, revision: u32) -> Option<crate::evidence::Classification> {
+        self.results
+            .iter()
+            .find(|r| r.revision == revision)
+            .map(|result| crate::evidence::classify(&self.order.payload, result))
+    }
+
     /// `state`, with the current instant passed in rather than read, so staleness can be
     /// reasoned about without sleeping in a test.
     #[must_use]
@@ -1127,6 +1153,10 @@ impl Task {
             Some(review) if review.accepted => TaskState::Accepted,
             Some(_) => TaskState::ChangesRequested {
                 revision: revision + 1,
+            },
+            None if self.refuted(revision) => TaskState::Refuted {
+                by: holder.to_string(),
+                revision,
             },
             None if self.order.requires_review => TaskState::AwaitingReview {
                 by: holder.to_string(),
@@ -1403,6 +1433,18 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
     // produced the work. Enforced here so no code path can self-approve.
     if review.accepted {
         let task = crate::read_task(route, &review.order_id)?;
+        // Evidence, not claims: a result whose worker-recorded evidence shows nothing
+        // was done, or contradicts what the answer says, is refused here - whoever
+        // reviews it, model or person - so no path can accept an invented success.
+        if let Some(result) = task.results.iter().find(|r| r.revision == review.revision)
+            && let Some(why) = crate::evidence::blocking_reason(&task.order.payload, result)
+        {
+            bail!(
+                "revision {} of {} cannot be accepted: {why}",
+                review.revision,
+                review.order_id
+            )
+        }
         if task.order.requires_approval {
             let worker = task
                 .results
@@ -6558,17 +6600,27 @@ pub fn list_messages(route: &ProjectRoute) -> Result<Vec<Message>> {
         })
         .collect::<Vec<_>>();
     paths.sort();
-    paths
-        .into_iter()
-        .map(|path| {
-            let message: Message = serde_json::from_slice(&fs::read(&path)?)?;
-            message.validate()?;
-            if message.project_id != route.project_id {
-                bail!("message {} crossed project boundary", message.id)
-            }
-            Ok(message)
-        })
-        .collect()
+    // One unreadable envelope - a truncated write, a half-synced file - must not
+    // blind the whole project: `ferry channel log` and the dashboard read through
+    // here, and a single 0-byte file made both fail for every message. Skip it,
+    // say which file, and keep reading. A skipped file is never treated as valid.
+    let mut messages = Vec::new();
+    for path in paths {
+        match read_message_file(route, &path) {
+            Ok(message) => messages.push(message),
+            Err(error) => eprintln!("warning: skipped message {}: {error}", path.display()),
+        }
+    }
+    Ok(messages)
+}
+
+fn read_message_file(route: &ProjectRoute, path: &Path) -> Result<Message> {
+    let message: Message = serde_json::from_slice(&fs::read(path)?)?;
+    message.validate()?;
+    if message.project_id != route.project_id {
+        bail!("message {} crossed project boundary", message.id)
+    }
+    Ok(message)
 }
 
 pub fn find_message_by_idempotency_key(
@@ -8720,6 +8772,31 @@ mod serverless_tests {
             on_disk.is_file(),
             "the message is a file, not a database row"
         );
+    }
+
+    #[test]
+    fn one_empty_envelope_does_not_hide_the_rest() {
+        let (_temp, workspace) = attached();
+        let route = route_for(&workspace).unwrap();
+        let message = Message::new(
+            "demo",
+            "wisp",
+            "fang",
+            "text/plain",
+            json!({"text": "still readable"}),
+            false,
+            None,
+        );
+        let mut transport = LocalFilesystemTransport;
+        transport.deliver(&route, &message).unwrap();
+        let directory = route.communications.join("messages/demo");
+        // A truncated write, as found on grouchly: exactly 0 bytes.
+        fs::write(directory.join("00000000-truncated.json"), b"").unwrap();
+        fs::write(directory.join("00000001-garbage.json"), b"{not json").unwrap();
+
+        let listed = list_messages(&route).unwrap();
+        assert_eq!(listed.len(), 1, "the good message is still listed");
+        assert_eq!(listed[0].id, message.id);
     }
 }
 
