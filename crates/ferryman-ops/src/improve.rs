@@ -1059,7 +1059,7 @@ fn signing_identity(route: &ProjectRoute, config: &AgentConfig) -> Result<AgentI
 /// What asking for a plan came to.
 enum Asked {
     /// The answer, the engine, whether it is a judge, and what it cost.
-    Answered(String, EngineSpec, bool, f64),
+    Answered(String, Box<EngineSpec>, bool, f64),
     /// Nothing the engine policy allows could be asked: the work waits.
     Held(String),
     /// Every allowed engine was asked and none answered.
@@ -1097,7 +1097,7 @@ async fn ask_best(
         tried.push(engine.name.clone());
         let judge = engines::effective_tier(&engine, &ledger.state(&engine.name)) == Tier::Judge;
         match crate::agent::ask_costed(route, &config.with_engine(&engine), prompt).await {
-            Ok((answer, cost)) => return Asked::Answered(answer, engine, judge, cost),
+            Ok((answer, cost)) => return Asked::Answered(answer, Box::new(engine), judge, cost),
             Err(error) => {
                 if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
                     crate::agent::note_unavailable(route, config, skip);
@@ -1323,7 +1323,7 @@ pub async fn plan(
     )
     .await
     {
-        Asked::Answered(answer, engine, judged, cost) => (answer, engine, judged, cost),
+        Asked::Answered(answer, engine, judged, cost) => (answer, *engine, judged, cost),
         Asked::Held(why) => {
             hold(route, config, Role::Plan, &week, &why, report);
             return Ok(PlanOutcome::Held(why));
