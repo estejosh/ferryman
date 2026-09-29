@@ -37,8 +37,34 @@
   top in Telegram's Engines menu under the `improve` delegation. `ferry improve on`, the
   dashboard and Telegram offer the recommendation when a project has no policy.
 
+- **Pick two engines, simply.** The dashboard's policy panel opens with two dropdowns -
+  "Improvement engine" (plans and builds) and "Review engine" - each engine shown with
+  its paid class and the recommended one marked, and a "Use recommended" button; the
+  full prefer / never / where editor moved under "Advanced". Telegram's Engines menu
+  picks each with two buttons. CLI: `ferry engines policy set --improve <sel> --review
+  <sel> [--all]`.
+- **Two keys before an improvement goes live.** An improvement is "approved for live"
+  only with both: a signed verdict accepting it from the policy's review engine, on a
+  result whose evidence passes verification and that no verifier refuted; and a signed
+  approval from the master (or their `review` delegate acting on the master's button).
+  Neither alone is enough - `submit_review` refuses an agent's accept, and the master's
+  until the engine's key is there - and a blocked or unavailable review engine holds
+  and asks, never skips. Nothing merges on its own even with both: the "ready to merge"
+  notice and the report's list now need both keys. `ferry improve pending | approve |
+  send-back`, a "Waiting for your approval" list on the dashboard (diff stat, evidence,
+  the review engine's summary, Approve / Send back), and the same on the phone.
+- **OmniRoute as a first-class engine.** `provider = "omniroute"` (or a base URL on port
+  20128) is recognised. The probe lists its models and combos and each combo's steps;
+  a route is free, subscription or unknown by where it ends, so protection and `never
+  claude` see through the gateway. Its combos and free models are published as engines
+  of their own ("OmniRoute: free-stack") for the dropdowns, a free combo ranks as free
+  tier, and its per-request cost header is counted. `ferry engines policy recommend` and
+  `ferry enable` point out a local OmniRoute nobody uses yet.
+
 ### Changed
 
+- An engine's accepting verdict on an improvement is recorded as a signed engine
+  review and a recommendation, never as an acceptance; approving is the master's.
 - Improvement orders now go to engines in the policy's order (auto when none is set),
   not the operator's engine order; a subscription engine no longer takes them unless a
   policy allows it. Free-tier and local engines count no spend unless the provider

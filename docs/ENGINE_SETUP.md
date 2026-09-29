@@ -254,8 +254,18 @@ class (`paid:free-tier`, `paid:subscription`) or an endpoint host
 worker anywhere else leaves its improvement orders unclaimed. `--cap-usd` with
 `--role` caps what the fleet spends on that role in a week.
 
+The simple way is two choices: what **improves** (plans and builds) and what
+**reviews**. The dashboard's Engine policy panel has a dropdown for each, with each
+engine's paid class and the recommended one marked, and a "Use recommended" button;
+Telegram's Engines menu has an "Improvement engine" and a "Review engine" button. From
+the CLI:
+
+```sh
+ferry engines policy set --improve nemotron --review deepseek --never claude --where grouchly --all
+```
+
 Example - free model first, never my subscription, only on the always-on machine,
-for every project I am master of:
+for every project I am master of, with the full lists:
 
 ```sh
 ferry engines policy set --prefer nemotron --prefer deepseek --never claude --where grouchly --all
@@ -273,6 +283,72 @@ the channel; one anybody else signed or edited is ignored. The dashboard's Teamm
 page and the Telegram Engines menu show the same thing and can accept, block or move
 an engine to the top. `ferry improve status` and `ferry improve report` say which
 engine and model, on which machine, did each step, and what each engine spent.
+## Two keys before an improvement goes live
+
+Every improvement the loop builds needs **two** keys before it may go live - merge,
+deploy or release:
+
+1. **The review engine's.** The engine the policy picks for review (a judge-tier engine
+   it does not block, on a machine it names) reads the result and records a signed
+   verdict. It never accepts on its own: a "keep" becomes a recommendation. The result's
+   own evidence must pass verification, and no verifier may have refuted it.
+2. **Yours.** The master approves - or a delegate with the `review` scope acting on the
+   master's button press on the phone.
+
+Neither alone is enough: an agent's accept is refused, and so is yours until the
+review engine has given its key. If the review engine is blocked or out of credit the
+loop holds and asks you once; it never skips the review and never approves by itself.
+Even with both keys nothing merges: the improvement becomes "approved, ready to merge",
+and merging stays yours.
+
+```sh
+ferry improve pending                        # what waits, with diff stat, evidence and the review engine's verdict
+ferry improve approve improve-2026-w40-1     # your key
+ferry improve send-back improve-2026-w40-1 --notes "cover the error path"
+```
+
+The dashboard's Teammates page lists them under "Waiting for your approval" with
+Approve and Send back; Telegram sends each one with the same buttons once the review
+engine has given its key.
+
+## OmniRoute: a free gateway as an engine
+
+[OmniRoute](https://github.com/diegosouzapw/OmniRoute) (MIT) is a self-hosted AI
+gateway: one OpenAI-compatible endpoint, `http://localhost:20128/v1` by default, in front
+of hundreds of providers - many free - with quota-aware fallback and **combos**, named
+routes over several models. Install and start it as its README says (`npm i -g
+omniroute`, then `omniroute`), then add it to `agent.toml`:
+
+```toml
+engines = ["omniroute", "deepseek"]
+engine.omniroute.provider = "omniroute"
+engine.omniroute.kind = "http"
+engine.omniroute.base_url = "http://localhost:20128/v1"
+engine.omniroute.model = "free-stack"            # a combo, or a model id such as "nvidia/nemotron-70b:free"
+engine.omniroute.key = "secret:OMNIROUTE_API_KEY" # an OmniRoute API key, sealed; leave out if yours needs none
+engine.omniroute.tier = "build"
+```
+
+`provider = "omniroute"` (or a base URL on port 20128) makes it a first-class engine:
+
+- The probe lists its models and combos (`/v1/models`) and, when the key may read it,
+  each combo's steps (`/api/combos`).
+- **Each route is paid for the way it ends.** A `:free` model is free tier. A route that
+  ends at somebody's plan - Claude Code or Codex signed in through OmniRoute, Cursor,
+  Copilot - is a subscription, so `protect_subscriptions` and `never claude` block it
+  **through** the gateway: the policy matches the provider/model names on the route, not
+  just the combo's name. A combo is a subscription if any step is one, free if every
+  step is free. A combo whose steps cannot be read counts as a subscription when that
+  OmniRoute has any subscription provider connected, because it may route there.
+- Its combos and free models are offered as engines of their own - `omniroute.free-stack`,
+  shown as "OmniRoute: free-stack" - so the dashboard dropdowns and Telegram can pick one.
+  Auto ranks a free combo as free tier: a strong improvement engine.
+- OmniRoute reports what each request cost (`X-OmniRoute-Response-Cost`), so a free
+  route's spend stays at $0 and a paid one is counted.
+
+When OmniRoute answers on the machine and no engine uses it yet, `ferry enable` points it
+out and `ferry engines policy recommend` prints the lines above.
+
 ## Diagnosing
 
 ```sh
