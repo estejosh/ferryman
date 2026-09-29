@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Engine policy: which engines do background work, and where.** A master-signed
+  `ENGINE_POLICY` per project (or `--all` of them) says, for each background role -
+  `plan`, `build`, `review`, `chore` - which engines are preferred in which order, which
+  are `never` used, which machines may run self-improve (`where`), optional weekly
+  dollar caps per role, and whether subscriptions are protected (on by default).
+  Selectors match an engine name, a model glob (`nvidia/nemotron*`), a paid class
+  (`paid:free-tier`) or an endpoint host. Unsigned, edited or forged policies are ignored
+  exactly like `SELF_IMPROVE`. Background work is improvement orders and the loop's own
+  planning and review; orders a person gives are untouched unless the policy says
+  `never_applies_to = "all"`.
+- **Auto, when no policy is set.** Local > free tier > capped prepaid > unknown >
+  uncapped prepaid; never a subscription while protected. Ties go to trust, then cost
+  per verified result, then operator order; plan and review prefer a judge. An unmarked
+  `claude` or `codex` CLI counts as a subscription. `ferry engines policy recommend`
+  prints the proposal with one reason per choice ("nemotron first for build: free-tier,
+  12 verified, 0 refuted"); `accept [--all]` signs it.
+- **No fallback.** With nothing the policy allows available, background work waits -
+  never on a blocked engine - the reason is recorded, and the master is asked once per
+  role per week, with buttons on the phone. A worker outside `where` does not claim
+  improvement orders. A free tier that returns a payment or quota error, or reports a
+  cost, is flagged in the ledger and the published inventory, ranked down, and the
+  master told once.
+- **Who did what.** Each improve step (gather, plan, build per order, review) is
+  recorded, signed by the agent that did it, with engine, model, machine and cost.
+  `ferry improve status` and `ferry improve report` show them with spend per engine;
+  `ferry engines` ends with each project's effective policy - each role's engines in
+  order and every blocked engine with the reason.
+- **Everywhere.** `ferry engines policy show | recommend | accept | set | clear`; an
+  Engine policy panel on the dashboard's Teammates page (accept, edit prefer / never /
+  where, back to auto, for one or all projects); Accept recommended, Block and Move to
+  top in Telegram's Engines menu under the `improve` delegation. `ferry improve on`, the
+  dashboard and Telegram offer the recommendation when a project has no policy.
+
+### Changed
+
+- Improvement orders now go to engines in the policy's order (auto when none is set),
+  not the operator's engine order; a subscription engine no longer takes them unless a
+  policy allows it. Free-tier and local engines count no spend unless the provider
+  reports a cost.
+- Engine inventories carry the endpoint host, whether a weekly cap is set, this week's
+  requests and spend, and any free-tier flag. A worker on an older version sees a newer
+  worker's inventory as unverified until it is upgraded, as with engine trust in 0.5.16.
 ## v0.5.16 - 2026-09-29
 
 fm checks what its workers did instead of trusting what they said, and it gets better on its own: a weekly self-improve loop per repo, engines that fall back when one runs out, delivered and read receipts, and every project from one Telegram chat.

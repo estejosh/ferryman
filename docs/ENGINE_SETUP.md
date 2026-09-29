@@ -206,7 +206,7 @@ n8n or cron as often as you like:
 
 - `gather` - the last seven days (send-backs, failed runs, late orders, doctor,
   TODO/FIXME, the learning database) into `improve/<week>/evidence.md`;
-- `plan` - the best judge-tier engine up turns it into at most `--max` (5) ranked
+- `plan` - the engine the engine policy (below) puts first, a judge when it allows one, turns it into at most `--max` (5) ranked
   improvements with acceptance checks, each a signed order tagged `improvement`,
   open to any worker, on its own branch. With no judge up a builder plans and the
   plan is marked unreviewed. Once a week; a second run issues nothing new;
@@ -218,6 +218,61 @@ n8n or cron as often as you like:
 `improve = "true"` in `agent.toml` lets the worker run it itself, at most hourly.
 `ferry pause` stops all of it.
 
+## Which engines do background work: the engine policy
+
+Self-improve runs with nobody watching, so it must never quietly spend the Claude or
+Codex limits you need on Thursday. Each project has an **engine policy** that decides
+which engines do its background work - the loop's planning and review, and the
+improvement orders it issues - in what order, which never, and on which machines.
+Orders you give yourself are yours to spend on: the policy does not touch them unless
+it says `never_applies_to = "all"`.
+
+With no policy signed the fleet runs on **auto**: local engines first, then free
+tiers, then prepaid engines with a weekly cap, then unknown, then uncapped prepaid,
+and a subscription never. Ties go to the engine whose results have held up best
+(verified against refuted), then the cheaper per verified result, then your order in
+`agent.toml`. A `claude` or `codex` CLI with no `paid` set is taken for the
+subscription it almost always is; set `paid` to say otherwise. A free tier that
+returns a payment or quota error, or reports a cost, is flagged, ranked down for a
+week, and you are told once.
+
+```sh
+ferry engines                        # the fleet, then each project's policy and who it blocks
+ferry engines policy recommend       # what auto would choose, one reason per choice
+ferry engines policy accept [--all]  # sign it
+ferry engines policy show [--json]
+ferry engines policy set --role build --prefer <selector>... --never <selector>... --where <agent>...
+ferry engines policy clear           # back to auto
+```
+
+A selector is an engine name (`nemotron`), a model glob (`nvidia/nemotron*`), a paid
+class (`paid:free-tier`, `paid:subscription`) or an endpoint host
+(`host:deepseek.com`). A bare word also matches a model or host containing it, so
+`claude` blocks the `claude` engine and every `claude-*` model. Without `--role`,
+`--prefer` sets the order for all four roles: `plan`, `build`, `review`, `chore`.
+`--where` lists the agents or machines allowed to run the project's self-improve; a
+worker anywhere else leaves its improvement orders unclaimed. `--cap-usd` with
+`--role` caps what the fleet spends on that role in a week.
+
+Example - free model first, never my subscription, only on the always-on machine,
+for every project I am master of:
+
+```sh
+ferry engines policy set --prefer nemotron --prefer deepseek --never claude --where grouchly --all
+```
+
+Planning and review want a `judge`-tier engine: a builder may plan (the plan is
+marked unreviewed), but only a judge reviews. If nothing you allow is a judge, give
+one `engine.<name>.tier = "judge"` in `agent.toml`, or review waits.
+
+When nothing the policy allows can do the work it **waits** - it never falls back to
+a blocked engine - and you are asked once a week per role, with buttons on the phone
+(Accept recommended, or keep holding). Setting the policy takes the master's
+signature, like `ferry improve on`, and the signed `ENGINE_POLICY` file travels with
+the channel; one anybody else signed or edited is ignored. The dashboard's Teammates
+page and the Telegram Engines menu show the same thing and can accept, block or move
+an engine to the top. `ferry improve status` and `ferry improve report` say which
+engine and model, on which machine, did each step, and what each engine spent.
 ## Diagnosing
 
 ```sh
