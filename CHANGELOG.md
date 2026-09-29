@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.5.16 - 2026-09-29
+
+fm checks what its workers did instead of trusting what they said, and it gets better on its own: a weekly self-improve loop per repo, engines that fall back when one runs out, delivered and read receipts, and every project from one Telegram chat.
 
 ### Added
 
