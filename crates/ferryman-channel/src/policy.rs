@@ -688,6 +688,89 @@ pub fn rank(policy: &Policy, role: Role, tier: &str, work: Work, engines: &[Cand
     ranking
 }
 
+/// The policy as it falls on the fleet: per role, who does the work in which order and
+/// who is out of credit; and every engine the policy blocks, with why. For the
+/// dashboard and `--json`.
+#[must_use]
+pub fn view(policy: &Policy, engines: &[Candidate]) -> serde_json::Value {
+    let describe = |engine: &Candidate| {
+        serde_json::json!({
+            "engine": engine.name,
+            "agent": engine.agent,
+            "machine": engine.machine,
+            "model": engine.model,
+            "paid": engine.paid_class(),
+            "facts": engine.facts(),
+        })
+    };
+    let mut roles = serde_json::Map::new();
+    let mut blocked: Vec<serde_json::Value> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for role in Role::ALL {
+        let ranking = rank(policy, role, role.tier(), Work::Background, engines);
+        roles.insert(
+            role.as_str().to_string(),
+            serde_json::json!({
+                "order": ranking.order.iter().map(|i| describe(&engines[*i])).collect::<Vec<_>>(),
+                "out": ranking.out.iter().map(|(i, why)| {
+                    let mut line = describe(&engines[*i]);
+                    line["why"] = serde_json::json!(why);
+                    line
+                }).collect::<Vec<_>>(),
+            }),
+        );
+        for (index, why) in ranking.blocked {
+            if seen.insert(engines[index].label()) {
+                let mut line = describe(&engines[index]);
+                line["why"] = serde_json::json!(why);
+                blocked.push(line);
+            }
+        }
+    }
+    serde_json::json!({ "roles": roles, "blocked": blocked })
+}
+
+/// [`view`] as lines a person reads: one per role, one per blocked engine.
+#[must_use]
+pub fn summary(policy: &Policy, engines: &[Candidate]) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut blocked: Vec<String> = Vec::new();
+    for role in Role::ALL {
+        let ranking = rank(policy, role, role.tier(), Work::Background, engines);
+        let order: Vec<String> = ranking
+            .order
+            .iter()
+            .map(|index| engines[*index].label())
+            .collect();
+        let mut line = format!(
+            "{:<7}{}",
+            role.as_str(),
+            if order.is_empty() {
+                "nothing allowed can do it now - it waits".to_string()
+            } else {
+                order.join(" > ")
+            }
+        );
+        if !ranking.out.is_empty() {
+            let out: Vec<String> = ranking
+                .out
+                .iter()
+                .map(|(index, why)| format!("{} {why}", engines[*index].label()))
+                .collect();
+            line.push_str(&format!(" (also allowed: {})", out.join(", ")));
+        }
+        lines.push(line);
+        for (index, why) in ranking.blocked {
+            let text = format!("blocked {}: {why}", engines[index].label());
+            if !blocked.contains(&text) {
+                blocked.push(text);
+            }
+        }
+    }
+    lines.extend(blocked);
+    lines
+}
+
 // --- auto: the policy the fleet would choose ---------------------------------------------
 
 /// A proposed policy, with one line of reason per choice.

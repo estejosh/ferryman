@@ -37,6 +37,7 @@
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use ferryman_channel::policy::{self, Policy};
 use ferryman_channel::{AgentIdentity, ProjectRoute, TaskState, delegation, questions};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -661,7 +662,7 @@ impl Bridge {
         (format!("Pick a project. Now: {current}."), rows)
     }
 
-    fn engines_view(&self, now: DateTime<Utc>) -> (String, Vec<Row>) {
+    fn engines_view(&mut self, chat: i64, now: DateTime<Utc>) -> (String, Vec<Row>) {
         let mut seen: BTreeMap<(String, String), ferryman_channel::receipts::EngineInventory> =
             BTreeMap::new();
         for route in &self.routes {
@@ -710,7 +711,82 @@ impl Bridge {
                 ));
             }
         }
-        (lines.join("\n"), vec![menu_row()])
+        let (policy_lines, mut rows) = self.policy_part(chat, now);
+        lines.push(String::new());
+        lines.extend(policy_lines);
+        rows.push(menu_row());
+        (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
+    }
+
+    /// The engine policy of the chat's project, as it falls on its fleet, with buttons
+    /// to accept the recommendation, block an engine, or move one to the top.
+    fn policy_part(&mut self, chat: i64, now: DateTime<Utc>) -> (Vec<String>, Vec<Row>) {
+        let project = self.current(chat);
+        let Some(route) = self.route(&project).cloned() else {
+            return (Vec::new(), Vec::new());
+        };
+        let (current, setting) = policy::effective(&route.communications, &project);
+        let fleet = policy::fleet(&route, now);
+        let mut lines = vec![format!(
+            "Engine policy for {project} (background work: self-improve plans, builds, \
+             reviews): {}",
+            match &setting {
+                Some(setting) if setting.policy.is_some() => format!("set by {}", setting.set_by()),
+                _ => "auto - subscriptions never".to_string(),
+            }
+        )];
+        lines.extend(current.describe());
+        lines.extend(policy::summary(&current, &fleet));
+        let mut rows = vec![vec![button(
+            "Accept recommended",
+            self.data(format!("pacc:{project}")),
+        )]];
+        let mut names: Vec<String> = Vec::new();
+        for engine in &fleet {
+            if !names.iter().any(|n| n.eq_ignore_ascii_case(&engine.name)) {
+                names.push(engine.name.clone());
+            }
+        }
+        for name in names.into_iter().take(6) {
+            rows.push(vec![
+                button(
+                    format!("Block {name}"),
+                    self.data(format!("pblk:{project}:{name}")),
+                ),
+                button(
+                    format!("Move {name} to top"),
+                    self.data(format!("ptop:{project}:{name}")),
+                ),
+            ]);
+        }
+        (lines, rows)
+    }
+
+    /// Change a project's engine policy as its master, signed by the bridge under the
+    /// `improve` delegation. `change` gets the policy in force and the recommendation,
+    /// and returns the new one, or `None` for no change.
+    fn change_policy(
+        &self,
+        project: &str,
+        change: impl FnOnce(Policy, Policy) -> Option<Policy>,
+    ) -> std::result::Result<bool, String> {
+        let route = self
+            .route(project)
+            .ok_or_else(|| format!("{project} is not here"))?;
+        let principal = self.principal(route)?;
+        let (current, _) = policy::effective(&route.communications, &route.project_id);
+        let recommended = policy::recommend_for(route, Utc::now()).policy;
+        let Some(next) = change(current, recommended) else {
+            return Ok(false);
+        };
+        policy::set_policy_as(
+            &route.communications,
+            &route.project_id,
+            Some(next),
+            &self.agent,
+            Some(&principal),
+        )
+        .map_err(|error| format!("{error:#}"))
     }
     fn tasks_view(&mut self, chat: i64, now: DateTime<Utc>) -> (String, Vec<Row>) {
         let project = self.current(chat);
@@ -865,10 +941,27 @@ impl Bridge {
                 ),
                 data,
             )]);
+            // Switched on with no engine policy of its own: say what auto would choose,
+            // and offer to sign it.
+            if on
+                && let Some(route) = self.route(&project).cloned()
+                && !policy::is_set(&route.communications, &project)
+            {
+                let proposal = policy::recommend_for(&route, Utc::now());
+                lines.push(format!(
+                    "  no engine policy yet - runs on auto. Recommended: {}",
+                    proposal.policy.describe().join("; ")
+                ));
+                let data = self.data(format!("pacc:{project}:imp"));
+                rows.push(vec![button(
+                    format!("Accept recommended engines for {project}"),
+                    data,
+                )]);
+            }
         }
         rows.push(vec![button("On for all my repos", "impall")]);
         rows.push(menu_row());
-        (lines.join("\n"), rows)
+        (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
     }
 
     /// Switch self-improve for one project as its master, signed by the bridge.
@@ -907,7 +1000,35 @@ impl Bridge {
         let view: Option<(String, Vec<Row>)> = match verb.as_str() {
             "menu" => Some(self.menu(chat)),
             "projects" => Some(self.projects_view(chat)),
-            "engines" => Some(self.engines_view(now)),
+            "engines" => Some(self.engines_view(chat, now)),
+            "pacc" | "pblk" | "ptop" => {
+                let engine = id.clone();
+                let outcome = match verb.as_str() {
+                    "pacc" => self.change_policy(&project, |_, recommended| Some(recommended)),
+                    "pblk" => self.change_policy(&project, |mut current, _| {
+                        current.block(&engine).then_some(current)
+                    }),
+                    _ => self.change_policy(&project, |mut current, _| {
+                        current.move_to_top(&engine);
+                        Some(current)
+                    }),
+                };
+                toast = match outcome {
+                    Ok(true) => match verb.as_str() {
+                        "pacc" => format!("Recommended engine policy signed for {project}"),
+                        "pblk" => format!("{engine} blocked for background work in {project}"),
+                        _ => format!("{engine} first for every role in {project}"),
+                    },
+                    Ok(false) => "Already so".to_string(),
+                    Err(why) => excerpt(&why, 190),
+                };
+                // Accepted from the self-improve screen: stay there.
+                Some(if extra == "imp" || id == "imp" {
+                    self.improve_view()
+                } else {
+                    self.engines_view(chat, now)
+                })
+            }
             "tasks" => Some(self.tasks_view(chat, now)),
             "improve" => Some(self.improve_view()),
             "pick" if self.route(&project).is_some() => {
@@ -1099,8 +1220,21 @@ impl Bridge {
         };
         match questions::answer(&route, question, &choice, &principal, &self.agent) {
             Ok(answer) => {
+                // An engine-policy question's buttons do what they say: accept the
+                // recommended policy, or block the engine - signed for the master.
+                let changed = if asked.kind == questions::POLICY {
+                    match self.change_policy(project, |current, recommended| {
+                        policy::answer_changes(&choice, &current, &recommended)
+                    }) {
+                        Ok(true) => " The engine policy is changed.".to_string(),
+                        Ok(false) => String::new(),
+                        Err(why) => format!(" The policy was not changed: {why}"),
+                    }
+                } else {
+                    String::new()
+                };
                 let text = format!(
-                    "{}\n\nAnswered \"{}\" - {}.",
+                    "{}\n\nAnswered \"{}\" - {}.{changed}",
                     excerpt(&asked.text, 1500),
                     answer.answer,
                     answer.from()
@@ -1307,6 +1441,8 @@ impl Bridge {
                 buttons.push(vec![button("Answer in words", data)]);
                 let heading = if question.kind == questions::MERGE {
                     format!("{project} - ready to merge (nothing merges on its own)")
+                } else if question.kind == questions::POLICY {
+                    format!("{project} - engine policy")
                 } else {
                     format!("{project} - a question from {}", question.asked_by)
                 };
@@ -2231,6 +2367,7 @@ mod tests {
             balance: None,
             checked_at: None,
             trust: None,
+            billing: None,
         };
         let now = Utc::now();
         ferryman_channel::receipts::refresh_engines(
@@ -2263,6 +2400,150 @@ mod tests {
                 .any(|t| t.starts_with("An engine is back: claude on beastly")),
             "{back:?}"
         );
+    }
+
+    /// Publish, as wisp on beastly, a subscription, a free tier and a prepaid engine.
+    fn three_engines(route: &ProjectRoute) {
+        let engine =
+            |name: &str, tier: &str, paid: &str| ferryman_channel::receipts::EngineReport {
+                name: name.into(),
+                kind: "http".into(),
+                model: None,
+                tier: tier.into(),
+                paid: paid.into(),
+                state: "up".into(),
+                until: None,
+                reason: None,
+                latency_ms: None,
+                balance: None,
+                checked_at: None,
+                trust: None,
+                billing: None,
+            };
+        ferryman_channel::receipts::refresh_engines(
+            route,
+            &wisp(),
+            "beastly",
+            "0",
+            vec![
+                engine("claude", "judge", "subscription"),
+                engine("nemotron", "build", "free-tier"),
+                engine("deepseek", "judge", "prepaid"),
+            ],
+            Utc::now(),
+        )
+        .unwrap();
+    }
+
+    fn press_labelled(bridge: &mut Bridge, view: &[Action], label: &str, id: i64) -> Vec<Action> {
+        let (_, data) = buttons(view)
+            .into_iter()
+            .find(|(text, _)| text == label)
+            .unwrap_or_else(|| panic!("no button '{label}' in {:?}", buttons(view)));
+        bridge.handle(press(JOSH_TG, GROUP, id, &data), Utc::now())
+    }
+
+    /// The Engines menu shows the policy in force and who it blocks, and its buttons
+    /// sign changes for josh - only under the improve delegation.
+    #[test]
+    fn the_engines_menu_shows_the_policy_and_its_buttons_act_for_josh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        three_engines(&ferryman);
+        let view = bridge.handle(press(JOSH_TG, GROUP, 80, "engines"), Utc::now());
+        let shown = texts(&view).join("\n");
+        assert!(shown.contains("Engine policy for ferryman"), "{shown}");
+        assert!(
+            shown.contains("blocked claude on beastly: a subscription"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("build  nemotron on beastly > deepseek on beastly"),
+            "{shown}"
+        );
+
+        // Not delegated: refused, nothing signed.
+        let refused = press_labelled(&mut bridge, &view, "Block nemotron", 80);
+        assert!(
+            matches!(&refused[0], Action::Answer { text, .. } if text.contains("delegated")),
+            "{refused:?}"
+        );
+        assert!(policy::setting(&ferryman.communications, "ferryman").is_none());
+
+        delegate(&ferryman, &["improve"]);
+        press_labelled(&mut bridge, &view, "Block nemotron", 80);
+        let set = policy::setting(&ferryman.communications, "ferryman").unwrap();
+        assert_eq!(set.set_by(), "josh via telegram-grouchly");
+        assert_eq!(set.policy.as_ref().unwrap().never, ["name:nemotron"]);
+        press_labelled(&mut bridge, &view, "Move deepseek to top", 80);
+        let (now_in_force, _) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(
+            now_in_force.preferences(policy::Role::Build)[0],
+            "name:deepseek"
+        );
+        let accepted = press_labelled(&mut bridge, &view, "Accept recommended", 80);
+        assert!(
+            matches!(&accepted[0], Action::Answer { text, .. } if text.starts_with("Recommended engine policy signed")),
+            "{accepted:?}"
+        );
+        let (now_in_force, _) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(
+            now_in_force.preferences(policy::Role::Build),
+            ["name:nemotron", "name:deepseek"]
+        );
+    }
+
+    /// Held work's question arrives with buttons; "Accept recommended" answers it and
+    /// signs the recommended policy for josh. Switching self-improve on with no policy
+    /// offers the same.
+    #[test]
+    fn a_hold_question_accepted_from_the_phone_signs_the_recommended_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        three_engines(&ferryman);
+        let _ = bridge.tick(Utc::now());
+        assert!(
+            policy::ask_hold(
+                &ferryman,
+                &wisp(),
+                policy::Role::Build,
+                "2026-W40",
+                "all blocked"
+            )
+            .unwrap()
+        );
+        let posted = bridge.tick(Utc::now());
+        assert!(
+            texts(&posted)
+                .iter()
+                .any(|t| t.starts_with("ferryman - engine policy")),
+            "{posted:?}"
+        );
+        let answered = press_labelled(&mut bridge, &posted, policy::ACCEPT_RECOMMENDED, 81);
+        assert!(
+            texts(&answered)
+                .iter()
+                .any(|t| t.contains("The engine policy is changed")),
+            "{answered:?}"
+        );
+        assert!(policy::is_set(&ferryman.communications, "ferryman"));
+
+        // Onboarding: on, with no policy - the self-improve screen offers one.
+        policy::set_policy(&ferryman.communications, "ferryman", None, &josh()).unwrap();
+        bridge.handle(press(JOSH_TG, GROUP, 82, "imp:ferryman:on"), Utc::now());
+        let view = bridge.handle(press(JOSH_TG, GROUP, 82, "improve"), Utc::now());
+        assert!(
+            texts(&view).join("\n").contains("no engine policy yet"),
+            "{view:?}"
+        );
+        press_labelled(
+            &mut bridge,
+            &view,
+            "Accept recommended engines for ferryman",
+            82,
+        );
+        assert!(policy::is_set(&ferryman.communications, "ferryman"));
     }
 
     #[test]
