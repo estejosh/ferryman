@@ -56,6 +56,8 @@ use ferryman_channel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use ferryman_channel::policy::{Policy, Role, Step};
+
 use crate::{
     Progress,
     agent::AgentConfig,
@@ -800,6 +802,11 @@ pub enum PlanOutcome {
     },
     /// No engine could plan. Not an error: the next run tries again.
     NoEngine(String),
+    /// Nothing the engine policy allows can plan, or its weekly cap is spent. The plan
+    /// waits - never on a blocked engine - and the master is asked once a week.
+    Held(String),
+    /// The engine policy runs this project's self-improve on other machines.
+    NotHere(String),
     Paused(String),
     /// The project is archived: the loop leaves it alone.
     Archived,
@@ -1049,55 +1056,51 @@ fn signing_identity(route: &ProjectRoute, config: &AgentConfig) -> Result<AgentI
     })
 }
 
-/// The engines to ask, best first: judges that are up, then builders (whose answer is
-/// marked unreviewed). Exhausted engines are left out.
-fn askers<'a>(
-    specs: &'a [EngineSpec],
-    ledger: &engines::Ledger,
-    now: DateTime<Utc>,
-    tried: &[String],
-) -> Option<(&'a EngineSpec, bool)> {
-    let left: Vec<EngineSpec> = specs
-        .iter()
-        .filter(|spec| !tried.contains(&spec.name))
-        .cloned()
-        .collect();
-    let chosen = engines::best_up(&left, ledger, now, Tier::Judge)
-        .map(|spec| (spec.name.clone(), false))
-        .or_else(|| {
-            engines::best_up(&left, ledger, now, Tier::Build).map(|spec| (spec.name.clone(), true))
-        })?;
-    specs
-        .iter()
-        .find(|spec| spec.name == chosen.0)
-        .map(|spec| (spec, chosen.1))
+/// What asking for a plan came to.
+enum Asked {
+    /// The answer, the engine, whether it is a judge, and what it cost.
+    Answered(String, EngineSpec, bool, f64),
+    /// Nothing the engine policy allows could be asked: the work waits.
+    Held(String),
+    /// Every allowed engine was asked and none answered.
+    Failed(String),
 }
 
-/// Ask the best engine available, falling through engines that are out of credit or
-/// fail. Returns the answer, the engine, and whether it was a judge.
+/// Ask the engine the policy puts first for planning, falling through engines that are
+/// out of credit or fail - never to one the policy blocks. A judge plans first; with no
+/// judge allowed and up, a builder does and the plan is marked unreviewed.
 async fn ask_best(
     route: &ProjectRoute,
     config: &AgentConfig,
+    policy: &Policy,
     prompt: &str,
-    judges_only: bool,
     report: &dyn Progress,
-) -> Option<(String, EngineSpec, bool)> {
+) -> Asked {
+    let machine = ferryman_channel::receipts::machine_label();
     let mut tried = Vec::new();
     loop {
         let ledger = engines::Ledger::load(&config.agent);
-        let (engine, unreviewed) = askers(&config.engines, &ledger, Utc::now(), &tried)?;
-        if judges_only && unreviewed {
-            return None;
-        }
-        let engine = engine.clone();
+        let engine = match engines::choose(
+            &config.engines,
+            &ledger,
+            Utc::now(),
+            policy,
+            Role::Plan,
+            Tier::Judge,
+            &tried,
+            (&config.agent, &machine),
+        ) {
+            Ok(engine) => engine.clone(),
+            Err(why) if tried.is_empty() => return Asked::Held(why),
+            Err(why) => return Asked::Failed(why),
+        };
         tried.push(engine.name.clone());
-        match crate::agent::ask(route, &config.with_engine(&engine), prompt).await {
-            Ok(answer) => return Some((answer, engine, !unreviewed)),
+        let judge = engines::effective_tier(&engine, &ledger.state(&engine.name)) == Tier::Judge;
+        match crate::agent::ask_costed(route, &config.with_engine(&engine), prompt).await {
+            Ok((answer, cost)) => return Asked::Answered(answer, engine, judge, cost),
             Err(error) => {
-                if let Some(skip) = error.downcast_ref::<engines::Unavailable>()
-                    && let Some(until) = skip.until
-                {
-                    engines::mark_exhausted(&config.agent, &skip.engine, until, &skip.reason);
+                if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
+                    crate::agent::note_unavailable(route, config, skip);
                 }
                 report.warn(&format!(
                     "  {}: {} could not answer, trying the next engine: {error:#}",
@@ -1106,6 +1109,151 @@ async fn ask_best(
             }
         }
     }
+}
+
+/// Record one step of this week's loop, signed by this agent. Best effort.
+#[allow(clippy::too_many_arguments)]
+fn note_step(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    week: &str,
+    step: &str,
+    role: Option<Role>,
+    engine: Option<&EngineSpec>,
+    cost: Option<f64>,
+    outcome: &str,
+) {
+    let Ok(identity) = signing_identity(route, config) else {
+        return;
+    };
+    let record = Step {
+        step: step.to_string(),
+        role: role.map(|role| role.as_str().to_string()),
+        at: Utc::now(),
+        agent: config.agent.clone(),
+        machine: ferryman_channel::receipts::machine_label(),
+        engine: engine.map(|engine| engine.name.clone()),
+        model: engine.and_then(|engine| engine.model.clone()),
+        cost_usd: cost,
+        order: None,
+        outcome: outcome.to_string(),
+    };
+    if let Err(error) = ferryman_channel::policy::record_step(route, &identity, week, record) {
+        tracing::warn!("could not record the {step} step: {error:#}");
+    }
+}
+
+/// Background work the policy leaves nothing to do: record why, and ask the master -
+/// once per role per week, however many machines and hours it stays held.
+fn hold(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    role: Role,
+    week: &str,
+    why: &str,
+    report: &dyn Progress,
+) {
+    report.warn(&format!(
+        "  {}: {} work held: {why}",
+        route.project_id,
+        role.as_str()
+    ));
+    match signing_identity(route, config)
+        .and_then(|identity| ferryman_channel::policy::ask_hold(route, &identity, role, week, why))
+    {
+        Ok(true) => {
+            // Recorded with the question, once, not every hour it stays held.
+            note_step(
+                route,
+                config,
+                week,
+                role.as_str(),
+                Some(role),
+                None,
+                None,
+                &format!("held: {why}"),
+            );
+            report.info(&format!(
+                "  {}: asked the master what to do about the held {} work",
+                route.project_id,
+                role.as_str()
+            ));
+        }
+        Ok(false) => {}
+        Err(error) => report.warn(&format!(
+            "  {}: could not ask the master: {error:#}",
+            route.project_id
+        )),
+    }
+}
+
+/// Improvement orders nobody has claimed, when the fleet - as its signed engine
+/// inventories describe it - has no engine the policy allows to build them, on no
+/// machine it names, or the build cap is spent: held, and the master asked once a week.
+///
+/// Workers already leave such orders unclaimed rather than fall back; this is what makes
+/// the wait visible. With no inventory at all nothing is known, and nothing is said.
+fn hold_unbuildable(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    week: &str,
+    now: DateTime<Utc>,
+    report: &dyn Progress,
+) {
+    let waiting: Vec<Tier> = ferryman_channel::list_tasks(route)
+        .unwrap_or_default()
+        .iter()
+        .filter(|task| is_improvement(task))
+        .filter(|task| matches!(task.state(), TaskState::Open | TaskState::Offered { .. }))
+        .map(|task| {
+            task.order.payload["tier"]
+                .as_str()
+                .and_then(|tier| Tier::parse(tier).ok())
+                .unwrap_or(Tier::Build)
+        })
+        .collect();
+    if waiting.is_empty() {
+        return;
+    }
+    let fleet = ferryman_channel::policy::fleet(route, now);
+    if fleet.is_empty() {
+        return;
+    }
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let mut tiers = waiting;
+    tiers.sort();
+    tiers.dedup();
+    for tier in tiers {
+        let role = Role::for_order_tier(tier.as_str());
+        let why = ferryman_channel::policy::over_cap(route, &policy, week, role).or_else(|| {
+            let ranking = ferryman_channel::policy::rank(
+                &policy,
+                role,
+                tier.as_str(),
+                ferryman_channel::policy::Work::Background,
+                &fleet,
+            );
+            ranking
+                .order
+                .is_empty()
+                .then(|| ranking.why_none(role, &fleet))
+        });
+        if let Some(why) = why {
+            hold(route, config, role, week, &why, report);
+        }
+    }
+}
+
+/// This agent and machine, when the project's engine policy lets them run its
+/// self-improve work; otherwise why not.
+fn here(route: &ProjectRoute, config: &AgentConfig, policy: &Policy) -> Result<(), String> {
+    let machine = ferryman_channel::receipts::machine_label();
+    if policy.allows_machine(&config.agent, &machine) {
+        Ok(())
+    } else {
+        Err(crate::agent::not_here(&config.agent, &machine, policy))
+    }
+    .map_err(|why| format!("{}: {why}", route.project_id))
 }
 
 /// Turn this week's evidence into at most `max` ranked improvements, each issued as a
@@ -1158,20 +1306,55 @@ pub async fn plan(
         &week,
     );
     let max = max.max(1);
-    let Some((answer, engine, judged)) = ask_best(
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    if let Err(why) = here(route, config, &policy) {
+        return Ok(PlanOutcome::NotHere(why));
+    }
+    if let Some(why) = ferryman_channel::policy::over_cap(route, &policy, &week, Role::Plan) {
+        hold(route, config, Role::Plan, &week, &why, report);
+        return Ok(PlanOutcome::Held(why));
+    }
+    let (answer, engine, judged, cost) = match ask_best(
         route,
         config,
+        &policy,
         &plan_prompt(&route.project_id, &evidence, max),
-        false,
         report,
     )
     .await
-    else {
-        return Ok(PlanOutcome::NoEngine(
-            engines::all_exhausted(&config.engines, &engines::Ledger::load(&config.agent), now)
-                .unwrap_or_else(|| "no judge- or build-tier engine answered".to_string()),
-        ));
+    {
+        Asked::Answered(answer, engine, judged, cost) => (answer, engine, judged, cost),
+        Asked::Held(why) => {
+            hold(route, config, Role::Plan, &week, &why, report);
+            return Ok(PlanOutcome::Held(why));
+        }
+        Asked::Failed(why) => {
+            note_step(
+                route,
+                config,
+                &week,
+                "plan",
+                Some(Role::Plan),
+                None,
+                None,
+                &format!("failed: {why}"),
+            );
+            return Ok(PlanOutcome::NoEngine(
+                engines::all_exhausted(&config.engines, &engines::Ledger::load(&config.agent), now)
+                    .unwrap_or(why),
+            ));
+        }
     };
+    note_step(
+        route,
+        config,
+        &week,
+        "plan",
+        Some(Role::Plan),
+        Some(&engine),
+        Some(cost),
+        if judged { "done" } else { "done (unreviewed)" },
+    );
     let improvements = parse_improvements(&answer, max);
     if improvements.is_empty() {
         bail!(
@@ -1326,14 +1509,45 @@ pub async fn review(
             ));
         }
     }
-    let ledger = engines::Ledger::load(&config.agent);
-    let Some(judge) = engines::best_up(&config.engines, &ledger, now, Tier::Judge).cloned() else {
-        report.info(&format!(
-            "  {}: no judge-tier engine is up; review waits",
-            route.project_id
-        ));
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    if let Err(why) = here(route, config, &policy) {
+        report.info(&format!("  {why}; not reviewing here"));
         return Ok(0);
+    }
+    let week = engines::iso_week(now);
+    let waiting = read_plan(route, &week).is_some_and(|plan| plan.unreviewed)
+        || awaiting_improvement_review(route);
+    let ledger = engines::Ledger::load(&config.agent);
+    let machine = ferryman_channel::receipts::machine_label();
+    let chosen = match ferryman_channel::policy::over_cap(route, &policy, &week, Role::Review) {
+        Some(why) => Err(why),
+        None => engines::choose(
+            &config.engines,
+            &ledger,
+            now,
+            &policy,
+            Role::Review,
+            Tier::Judge,
+            &[],
+            (&config.agent, &machine),
+        )
+        .cloned(),
     };
+    let judge = match chosen {
+        Ok(judge) => judge,
+        Err(why) if waiting => {
+            hold(route, config, Role::Review, &week, &why, report);
+            return Ok(0);
+        }
+        Err(_) => {
+            report.info(&format!(
+                "  {}: no judge-tier engine the policy allows is up; review waits",
+                route.project_id
+            ));
+            return Ok(0);
+        }
+    };
+    let spent_before = ledger.state(&judge.name);
     let mut judged = 0;
     match request_merges(route, config) {
         Ok(0) => {}
@@ -1347,7 +1561,6 @@ pub async fn review(
         )),
     }
 
-    let week = engines::iso_week(now);
     if let Some(mut plan) = read_plan(route, &week).filter(|plan| plan.unreviewed) {
         let prompt = format!(
             "A build-tier engine wrote this week's improvement plan for '{}' while no judge \
@@ -1371,7 +1584,16 @@ pub async fn review(
                 write_plan(route, &plan)?;
                 judged += 1;
             }
-            Err(error) => return Ok(settle(config, &error, judged, route, report)),
+            Err(error) => {
+                return Ok(settle(
+                    config,
+                    &error,
+                    judged,
+                    route,
+                    (&judge, &spent_before, &week),
+                    report,
+                ));
+            }
         }
     }
 
@@ -1380,10 +1602,48 @@ pub async fn review(
             .await
         {
             Ok(count) => judged += count,
-            Err(error) => return Ok(settle(config, &error, judged, route, report)),
+            Err(error) => {
+                return Ok(settle(
+                    config,
+                    &error,
+                    judged,
+                    route,
+                    (&judge, &spent_before, &week),
+                    report,
+                ));
+            }
         }
     }
+    if judged > 0 {
+        note_step(
+            route,
+            config,
+            &week,
+            "review",
+            Some(Role::Review),
+            Some(&judge),
+            Some(spent_since(config, &judge, &spent_before, now)),
+            &format!("judged {judged}"),
+        );
+    }
     Ok(judged)
+}
+
+/// What an engine spent since `before` was read from the ledger, this week.
+fn spent_since(
+    config: &AgentConfig,
+    engine: &EngineSpec,
+    before: &engines::EngineState,
+    now: DateTime<Utc>,
+) -> f64 {
+    let after = engines::Ledger::load(&config.agent).state(&engine.name);
+    if before.week == after.week {
+        (after.spend_usd - before.spend_usd).max(0.0)
+    } else if after.week == engines::iso_week(now) {
+        after.spend_usd
+    } else {
+        0.0
+    }
 }
 
 /// A judge that failed mid-review: mark it if it ran out of credit, say so, keep what
@@ -1393,13 +1653,22 @@ fn settle(
     error: &anyhow::Error,
     judged: usize,
     route: &ProjectRoute,
+    (judge, before, week): (&EngineSpec, &engines::EngineState, &str),
     report: &dyn Progress,
 ) -> usize {
-    if let Some(skip) = error.downcast_ref::<engines::Unavailable>()
-        && let Some(until) = skip.until
-    {
-        engines::mark_exhausted(&config.agent, &skip.engine, until, &skip.reason);
+    if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
+        crate::agent::note_unavailable(route, config, skip);
     }
+    note_step(
+        route,
+        config,
+        week,
+        "review",
+        Some(Role::Review),
+        Some(judge),
+        Some(spent_since(config, judge, before, Utc::now())),
+        &format!("stopped after {judged}: {error:#}"),
+    );
     report.warn(&format!(
         "  {}: review stopped: {error:#}",
         route.project_id
@@ -1533,6 +1802,24 @@ fn percent(part: usize, whole: usize) -> String {
     }
 }
 
+/// What self-improve spent in `week`, per engine and machine, from the signed step
+/// records: (engine, machine, dollars), most first.
+#[must_use]
+pub fn spend_by_engine(route: &ProjectRoute, week: &str) -> Vec<(String, String, f64)> {
+    let mut sums: BTreeMap<(String, String), f64> = BTreeMap::new();
+    for step in ferryman_channel::policy::read_steps(route, week) {
+        if let (Some(engine), Some(cost)) = (step.engine, step.cost_usd) {
+            *sums.entry((engine, step.machine)).or_default() += cost;
+        }
+    }
+    let mut out: Vec<(String, String, f64)> = sums
+        .into_iter()
+        .map(|((engine, machine), usd)| (engine, machine, usd))
+        .collect();
+    out.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    out
+}
+
 /// Write `improve/<week>/report.md` for the week `at` falls in, against the week before.
 pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
     let week = engines::iso_week(at);
@@ -1640,6 +1927,27 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
         let _ = writeln!(md, "{line}");
     }
 
+    let _ = writeln!(md, "\n## Who did each step\n");
+    let _ = writeln!(
+        md,
+        "The newest signed record of each step: which engine and model, on which machine.\n"
+    );
+    let steps = ferryman_channel::policy::latest_steps(route, &week);
+    if steps.is_empty() {
+        let _ = writeln!(md, "Nothing recorded.");
+    }
+    for step in &steps {
+        let _ = writeln!(md, "- {}", step.describe());
+    }
+    let _ = writeln!(md, "\n## Self-improve spend per engine\n");
+    let spend = spend_by_engine(route, &week);
+    if spend.is_empty() {
+        let _ = writeln!(md, "Nothing recorded.");
+    }
+    for (engine, machine, usd) in spend {
+        let _ = writeln!(md, "- {engine} on {machine}: ${usd:.2}");
+    }
+
     let dir = week_dir(route, &week);
     fs::create_dir_all(&dir)?;
     let path = dir.join("report.md");
@@ -1689,7 +1997,10 @@ pub async fn run(
         let dir = week_dir(route, &week);
         if !dir.join("evidence.md").is_file() {
             match gather(route, now) {
-                Ok(_) => done.push(format!("{project}: gathered {week}")),
+                Ok(_) => {
+                    note_step(route, config, &week, "gather", None, None, None, "done");
+                    done.push(format!("{project}: gathered {week}"));
+                }
                 Err(error) => report.warn(&format!("{project}: gather failed: {error:#}")),
             }
         }
@@ -1713,13 +2024,7 @@ pub async fn run(
             }
         }
         let plan_unreviewed = read_plan(route, &week).is_some_and(|plan| plan.unreviewed);
-        let judge_up = engines::best_up(
-            &config.engines,
-            &engines::Ledger::load(&config.agent),
-            now,
-            Tier::Judge,
-        )
-        .is_some();
+        hold_unbuildable(route, config, &week, now, report);
         match request_merges(route, config) {
             Ok(0) => {}
             Ok(count) => done.push(format!("{project}: {count} ready to merge, asked")),
@@ -1741,7 +2046,9 @@ pub async fn run(
                 ));
             }
         }
-        if judge_up && (plan_unreviewed || awaiting_improvement_review(route)) {
+        // Review picks its judge through the engine policy, and holds - asking the
+        // master once - when there is work to judge and nothing allowed to judge it.
+        if plan_unreviewed || awaiting_improvement_review(route) {
             match review(route, config, now, report).await {
                 Ok(0) => {}
                 Ok(count) => done.push(format!("{project}: judged {count}")),
@@ -2477,6 +2784,146 @@ mod tests {
         let (name, read) = problems_file(dir.path()).unwrap();
         assert_eq!(name, "Problems.md");
         assert_eq!(read, text);
+    }
+
+    /// Only a subscription judge is configured: planning holds rather than spend it,
+    /// records why once, and asks the master once - however often the loop runs.
+    #[tokio::test]
+    async fn planning_holds_on_a_subscription_and_asks_the_master_once() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let mut claude = engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"));
+        claude.paid = Paid::Subscription;
+        let (route, config) = channel(dir.path(), vec![claude]);
+        switch_on(&route);
+        let now = Utc::now();
+        let week = engines::iso_week(now);
+
+        for _ in 0..3 {
+            let outcome = plan(&route, &config, DEFAULT_MAX, now, &crate::Silent)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&outcome, PlanOutcome::Held(why) if why.contains("subscription")),
+                "{outcome:?}"
+            );
+        }
+        assert!(improvements(&route).is_empty(), "nothing fell back");
+        assert!(read_plan(&route, &week).is_none());
+        let asked = ferryman_channel::questions::pending(&route);
+        assert_eq!(asked.len(), 1, "one question, not one an hour: {asked:?}");
+        assert_eq!(asked[0].kind, ferryman_channel::questions::POLICY);
+        assert_eq!(
+            asked[0].options[0],
+            ferryman_channel::policy::ACCEPT_RECOMMENDED
+        );
+        let steps = ferryman_channel::policy::read_steps(&route, &week);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert!(steps[0].outcome.starts_with("held: "));
+
+        // The master lets it spend the subscription after all: it plans.
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        ferryman_channel::policy::set_policy(
+            &route.communications,
+            "demo",
+            Some(Policy {
+                protect_subscriptions: false,
+                ..Policy::default()
+            }),
+            &josh,
+        )
+        .unwrap();
+        let outcome = plan(&route, &config, DEFAULT_MAX, now, &crate::Silent)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PlanOutcome::Planned { engine, .. } if engine == "claude"),
+            "{outcome:?}"
+        );
+    }
+
+    /// The policy's order decides who plans and who reviews, `never` is never used, and
+    /// each step is recorded with its engine, model and machine.
+    #[tokio::test]
+    async fn the_policy_picks_the_planner_and_the_judge_and_each_step_is_recorded() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let mut nemotron = engine("nemotron", Tier::Build, &format!("fake://ok:{PLAN}"));
+        nemotron.paid = Paid::FreeTier;
+        nemotron.model = Some("nvidia/nemotron-70b".into());
+        let (route, mut config) = channel(
+            dir.path(),
+            vec![
+                engine("claude", Tier::Judge, "fake://ok:should never be asked"),
+                engine("deepseek", Tier::Judge, "fake://ok:keep both"),
+                nemotron,
+            ],
+        );
+        switch_on(&route);
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        let mut policy = Policy::default();
+        policy.move_to_top("deepseek");
+        policy.move_to_top("nemotron");
+        policy.never.push("claude".into());
+        ferryman_channel::policy::set_policy(&route.communications, "demo", Some(policy), &josh)
+            .unwrap();
+        let now = Utc::now();
+        let week = engines::iso_week(now);
+
+        let outcome = plan(&route, &config, 1, now, &crate::Silent).await.unwrap();
+        assert!(
+            matches!(&outcome, PlanOutcome::Planned { engine, unreviewed: true, .. } if engine == "nemotron"),
+            "the operator's first choice plans, marked unreviewed as a builder: {outcome:?}"
+        );
+        // Review is a judge's: deepseek, never claude.
+        assert_eq!(
+            review(&route, &config, now, &crate::Silent).await.unwrap(),
+            1
+        );
+        assert!(
+            fs::read_to_string(week_dir(&route, &week).join("plan-review.md"))
+                .unwrap()
+                .contains("by deepseek")
+        );
+        let steps = ferryman_channel::policy::latest_steps(&route, &week);
+        let plan_step = steps.iter().find(|s| s.step == "plan").unwrap();
+        assert_eq!(plan_step.engine.as_deref(), Some("nemotron"));
+        assert_eq!(plan_step.model.as_deref(), Some("nvidia/nemotron-70b"));
+        assert_eq!(
+            plan_step.machine,
+            ferryman_channel::receipts::machine_label()
+        );
+        assert_eq!(plan_step.cost_usd, Some(0.0), "a free tier costs nothing");
+        let review_step = steps.iter().find(|s| s.step == "review").unwrap();
+        assert_eq!(review_step.engine.as_deref(), Some("deepseek"));
+        let report = fs::read_to_string(self::report(&route, now).unwrap()).unwrap();
+        assert!(report.contains("## Who did each step"), "{report}");
+        assert!(
+            report.contains("plan: nemotron (nvidia/nemotron-70b) on"),
+            "{report}"
+        );
+
+        // A policy that names another machine: this one plans and reviews nothing.
+        let elsewhere = Policy {
+            machines: vec!["grouchly-only".into()],
+            ..Policy::default()
+        };
+        ferryman_channel::policy::set_policy(&route.communications, "demo", Some(elsewhere), &josh)
+            .unwrap();
+        config.engines.truncate(2);
+        let later = now + Duration::days(7);
+        assert!(matches!(
+            plan(&route, &config, 1, later, &crate::Silent)
+                .await
+                .unwrap(),
+            PlanOutcome::NotHere(_)
+        ));
+        assert_eq!(
+            review(&route, &config, later, &crate::Silent)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     /// A refuted result is never done: not in the report's done count, not a run that

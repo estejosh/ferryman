@@ -39,6 +39,7 @@ pub mod master;
 pub mod memory;
 pub mod migration;
 pub mod owner;
+pub mod policy;
 pub mod portable_auth;
 pub mod quantly;
 pub mod questions;

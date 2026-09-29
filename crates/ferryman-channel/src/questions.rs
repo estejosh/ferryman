@@ -25,6 +25,9 @@ use crate::{AgentIdentity, ProjectRoute, SignatureCheck, check_signature, delega
 pub const CLARIFY: &str = "clarify";
 /// Accepted work that a person may now merge. A notice; nothing merges on its own.
 pub const MERGE: &str = "merge";
+/// Background work held by the engine policy, or a free tier that asked for money.
+/// Answered with the policy's buttons; see [`crate::policy`].
+pub const POLICY: &str = "engine-policy";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {
