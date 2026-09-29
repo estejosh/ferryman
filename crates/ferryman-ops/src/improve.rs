@@ -914,13 +914,17 @@ fn parse_questions(text: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Ask the master, through the channel, whether each improvement accepted by review is
-/// one they want to merge. A notice with buttons, never an action: nothing here merges,
-/// pushes or bumps a version. Asked once per order. Returns how many were asked.
+/// Tell the master, through the channel, that an improvement holds both keys - the
+/// review engine's and their own - and is approved, ready to merge. A notice with
+/// buttons, never an action: nothing here merges, pushes or bumps a version; merging
+/// stays the master's own act. Asked once per order. Returns how many were asked.
 pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usize> {
     let tasks: Vec<Task> = ferryman_channel::list_tasks(route)?
         .into_iter()
-        .filter(|task| is_improvement(task) && task.state() == TaskState::Accepted)
+        .filter(|task| {
+            ferryman_channel::gate::gated(&task.order.payload)
+                && ferryman_channel::gate::approved_for_live(route, task)
+        })
         .collect();
     if tasks.is_empty() {
         return Ok(0);
@@ -940,9 +944,16 @@ pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usiz
                 )
             })
             .unwrap_or_else(|| "review".to_string());
+        let (policy, _) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        let engine = ferryman_channel::gate::gate(route, &task, &policy)
+            .engine
+            .map(|review| review.describe())
+            .unwrap_or_default();
         let text = format!(
-            "Ready to merge: {}\n\nOrder {} was accepted by {reviewer}. The work is on its own \
-             branch; nothing merges on its own. Merge it when you are happy with it.",
+            "Ready to merge: {}\n\nOrder {} holds both keys: the review engine ({engine}) and \
+             {reviewer}. Approved, ready to merge - the work is on its own branch and nothing \
+             merges on its own. Merge it when you are happy with it.",
             task_title(&task),
             task.order.id
         );
@@ -1090,7 +1101,7 @@ async fn ask_best(
             &tried,
             (&config.agent, &machine),
         ) {
-            Ok(engine) => engine.clone(),
+            Ok(engine) => engine,
             Err(why) if tried.is_empty() => return Asked::Held(why),
             Err(why) => return Asked::Failed(why),
         };
@@ -1530,8 +1541,7 @@ pub async fn review(
             Tier::Judge,
             &[],
             (&config.agent, &machine),
-        )
-        .cloned(),
+        ),
     };
     let judge = match chosen {
         Ok(judge) => judge,
@@ -1899,14 +1909,22 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
         let advised = task
             .pending_recommendation()
             .is_some_and(|advice| advice.accept);
-        if matches!(state, TaskState::Accepted) || advised {
+        // An improvement is ready only with both keys: the review engine's and the
+        // master's. Anything else is what it always was: accepted.
+        let live = if ferryman_channel::gate::gated(&task.order.payload) {
+            ferryman_channel::gate::approved_for_live(route, task)
+        } else {
+            matches!(state, TaskState::Accepted)
+        };
+        if live || advised {
             ready.push(format!(
                 "- `{}` on `{branch}`{}: {}",
                 task.order.id,
-                if advised {
-                    " (a reviewer recommends it; confirm with 'ferry channel review')"
-                } else {
+                if live {
                     ""
+                } else {
+                    " (the review engine keeps it; waiting for your approval: 'ferry improve \
+                     approve')"
                 },
                 task_title(task)
             ));
@@ -1918,7 +1936,8 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
     let _ = writeln!(md, "\n## Ready to merge\n");
     let _ = writeln!(
         md,
-        "Reviewed and accepted. Nothing here merges by itself; a person merges it.\n"
+        "Approved with both keys - the review engine's and the master's. Nothing here merges \
+         by itself; a person merges it.\n"
     );
     if ready.is_empty() {
         let _ = writeln!(md, "Nothing yet.");
@@ -2120,6 +2139,8 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 
@@ -2218,13 +2239,22 @@ mod tests {
         assert!(parse_questions(PLAN).is_empty(), "questions are optional");
     }
 
-    /// Accepted improvement work is announced to the master as ready to merge, once, and
-    /// nothing is merged.
+    /// An improvement is announced as ready to merge only with both keys - the review
+    /// engine's and the master's - once, and nothing is merged.
     #[test]
     fn accepted_improvements_become_one_merge_notice_each() {
         hermetic();
         let dir = tempfile::tempdir().unwrap();
-        let (route, config) = channel(dir.path(), Vec::new());
+        let (mut route, config) = channel(dir.path(), Vec::new());
+        switch_on(&route);
+        // The route as a worker loads it: the roster, the master included.
+        route.agents.push(ferryman_channel::AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(AgentIdentity::from_seed("josh", [9; 32]).public_key_hex()),
+            encryption_key: None,
+        });
         let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
         let mut order = Order {
             id: "improve-2026-w39-1".into(),
@@ -2273,7 +2303,39 @@ mod tests {
             signature: None,
         };
         wisp.sign_review(&mut review);
-        ferryman_channel::submit_review(&route, &review).unwrap();
+        assert!(
+            ferryman_channel::submit_review(&route, &review).is_err(),
+            "an agent never accepts an improvement"
+        );
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        assert!(
+            ferryman_channel::gate::decide(&route, &order.id, true, None, "josh", &josh).is_err(),
+            "not before the review engine"
+        );
+        ferryman_channel::gate::record_engine_review(
+            &route,
+            &wisp,
+            ferryman_channel::gate::EngineReview {
+                order_id: order.id.clone(),
+                revision: 1,
+                reviewer: "wisp".into(),
+                machine: "grouchly".into(),
+                engine: "deepseek".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                host: None,
+                route: Vec::new(),
+                accept: true,
+                summary: "names the engine in every failure".into(),
+                reviewed_at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(request_merges(&route, &config).unwrap(), 0, "one key");
+        ferryman_channel::gate::decide(&route, &order.id, true, None, "josh", &josh).unwrap();
 
         assert_eq!(request_merges(&route, &config).unwrap(), 1);
         assert_eq!(request_merges(&route, &config).unwrap(), 0, "asked once");
@@ -2284,6 +2346,11 @@ mod tests {
             pending[0]
                 .text
                 .starts_with("Ready to merge: Name the engine")
+        );
+        assert!(
+            pending[0].text.contains("holds both keys"),
+            "{}",
+            pending[0].text
         );
         assert_eq!(
             ferryman_channel::read_task(&route, &order.id)

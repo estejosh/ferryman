@@ -170,6 +170,10 @@ pub struct EngineSpec {
     pub probe_chat: bool,
     pub weekly_requests: Option<u64>,
     pub weekly_usd: Option<f64>,
+    /// `omniroute` for an OmniRoute gateway; see [`crate::omniroute`].
+    pub provider: Option<String>,
+    /// For a gateway engine: the provider/models its route ends at, as its probe found.
+    pub route: Vec<String>,
 }
 
 impl EngineSpec {
@@ -190,6 +194,8 @@ impl EngineSpec {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 
@@ -276,7 +282,14 @@ pub fn parse_engines(
                 .filter(|value| !value.is_empty())
         };
         let own_command = get("command");
-        let base_url = get("base_url").map(|url| url.trim_end_matches('/').to_string());
+        let provider = get("provider").map(|provider| provider.to_ascii_lowercase());
+        // An OmniRoute engine with no address is the local one on its default port.
+        let base_url = get("base_url")
+            .or_else(|| {
+                (provider.as_deref() == Some("omniroute"))
+                    .then(|| crate::omniroute::DEFAULT_URL.to_string())
+            })
+            .map(|url| url.trim_end_matches('/').to_string());
         let kind = match get("kind").as_deref() {
             Some("http") => Kind::Http,
             Some("cli") => Kind::Cli,
@@ -353,6 +366,8 @@ pub fn parse_engines(
             probe_chat: get("probe").as_deref() == Some("chat"),
             weekly_requests: number("weekly_requests")?,
             weekly_usd,
+            provider,
+            route: Vec::new(),
             name,
         });
     }
@@ -421,6 +436,9 @@ pub struct EngineState {
     pub free_tier_flag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_tier_flagged_at: Option<DateTime<Utc>>,
+    /// What an OmniRoute gateway offers, from its last probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<crate::omniroute::Catalog>,
 }
 
 impl EngineState {
@@ -720,6 +738,17 @@ pub fn all_exhausted(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) 
 
 // --- the engine policy ------------------------------------------------------------------
 
+/// The engines as the policy sees them: each configured one, with a gateway's (OmniRoute's)
+/// paid class and route read from its last probe, followed by one engine per combo and
+/// free model the gateway offers. What a worker publishes and chooses among.
+#[must_use]
+pub fn effective_specs(specs: &[EngineSpec], ledger: &Ledger) -> Vec<EngineSpec> {
+    specs
+        .iter()
+        .flat_map(|spec| crate::omniroute::expand(spec, ledger.state(&spec.name).gateway.as_ref()))
+        .collect()
+}
+
 /// This worker's engines as the engine policy ranks them: the same lines it publishes,
 /// so a local choice and the fleet's view of it can never disagree.
 #[must_use]
@@ -745,8 +774,8 @@ pub fn candidates(
 ///
 /// `tier` is the order's tier for build and chore work; plan and review ignore it.
 #[allow(clippy::too_many_arguments)]
-pub fn choose<'a>(
-    specs: &'a [EngineSpec],
+pub fn choose(
+    specs: &[EngineSpec],
     ledger: &Ledger,
     now: DateTime<Utc>,
     policy: &ferryman_channel::policy::Policy,
@@ -754,8 +783,9 @@ pub fn choose<'a>(
     tier: Tier,
     tried: &[String],
     (agent, machine): (&str, &str),
-) -> std::result::Result<&'a EngineSpec, String> {
-    let all = candidates(agent, machine, specs, ledger, now);
+) -> std::result::Result<EngineSpec, String> {
+    let specs = effective_specs(specs, ledger);
+    let all = candidates(agent, machine, &specs, ledger, now);
     let ranking = ferryman_channel::policy::rank(
         policy,
         role,
@@ -768,6 +798,7 @@ pub fn choose<'a>(
         .iter()
         .map(|index| &specs[*index])
         .find(|spec| !tried.contains(&spec.name))
+        .cloned()
         .ok_or_else(|| {
             if ranking.order.is_empty() {
                 ranking.why_none(role, &all)
@@ -1285,6 +1316,13 @@ pub async fn chat(
         .and_then(|value| value.to_str().ok())
         .map(|value| format!(" retry-after: {value}"))
         .unwrap_or_default();
+    // OmniRoute says what each request cost, $0 for a free route.
+    let gateway_cost = response
+        .headers()
+        .get("x-omniroute-response-cost")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
         return ChatRun {
@@ -1295,7 +1333,9 @@ pub async fn chat(
             ..ChatRun::default()
         };
     }
-    chat_reply(&text)
+    let mut run = chat_reply(&text);
+    run.cost_usd = run.cost_usd.or(gateway_cost);
+    run
 }
 
 /// Read an OpenAI-shaped chat completion.
@@ -1389,6 +1429,8 @@ pub struct Probe {
     /// The provider's balance endpoint says there is credit.
     pub funded: Option<bool>,
     pub balance: Option<String>,
+    /// What an OmniRoute gateway offers.
+    pub catalog: Option<crate::omniroute::Catalog>,
 }
 
 /// Probe one engine: list its models (or ask for one token), and read its balance where
@@ -1456,6 +1498,12 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
             let said = clip(&redact(&format!("HTTP {status}: {body}"), key));
             match status {
                 200..=299 => {
+                    if !spec.probe_chat && crate::omniroute::is_omniroute(spec) {
+                        found.catalog = Some(crate::omniroute::Catalog {
+                            models: crate::omniroute::parse_models(&body),
+                            ..Default::default()
+                        });
+                    }
                     if !spec.probe_chat
                         && let Some(model) = &spec.model
                         && let Some(ids) = model_ids(&body)
@@ -1475,6 +1523,25 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
     }
     if let Some(key) = key {
         balance(&http, base, key, &mut found).await;
+    }
+    // A combo's steps, when OmniRoute lets this key read them: what decides whether a
+    // route ends at somebody's plan.
+    if let Some(catalog) = found.catalog.as_mut() {
+        let mut request = http.get(format!("{}/api/combos", crate::omniroute::api_root(base)));
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+        if let Ok(response) = request.send().await
+            && response.status().is_success()
+            && let Some(combos) = response
+                .text()
+                .await
+                .ok()
+                .and_then(|body| crate::omniroute::parse_combos(&body))
+        {
+            catalog.combos = combos;
+            catalog.combos_known = true;
+        }
     }
     found
 }
@@ -1553,6 +1620,9 @@ pub fn apply_probe(ledger: &mut Ledger, engine: &str, probe: &Probe, now: DateTi
     state.down = probe.down.clone();
     if probe.balance.is_some() {
         state.balance = probe.balance.clone();
+    }
+    if probe.catalog.is_some() {
+        state.gateway.clone_from(&probe.catalog);
     }
     if let Some(reason) = &probe.exhausted {
         if state.exhausted_until.is_none_or(|until| until <= now) {
@@ -1659,6 +1729,7 @@ fn billing(
         flag: (spec.paid == Paid::FreeTier)
             .then(|| state.free_tier_flag(now))
             .flatten(),
+        route: spec.route.clone(),
     }
 }
 
@@ -1694,6 +1765,8 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 

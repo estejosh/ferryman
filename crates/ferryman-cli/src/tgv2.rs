@@ -737,10 +737,30 @@ impl Bridge {
         )];
         lines.extend(current.describe());
         lines.extend(policy::summary(&current, &fleet));
-        let mut rows = vec![vec![button(
-            "Accept recommended",
-            self.data(format!("pacc:{project}")),
-        )]];
+        let shown = |selector: Option<&str>| {
+            selector
+                .map(|s| s.trim_start_matches("name:").to_string())
+                .unwrap_or_else(|| "auto".to_string())
+        };
+        let mut rows = vec![
+            vec![
+                button(
+                    format!(
+                        "Improvement engine: {}",
+                        shown(current.improvement_engine())
+                    ),
+                    self.data(format!("pim:{project}")),
+                ),
+                button(
+                    format!("Review engine: {}", shown(current.review_engine())),
+                    self.data(format!("pre:{project}")),
+                ),
+            ],
+            vec![
+                button("Use recommended", self.data(format!("prec:{project}"))),
+                button("Accept recommended", self.data(format!("pacc:{project}"))),
+            ],
+        ];
         let mut names: Vec<String> = Vec::new();
         for engine in &fleet {
             if !names.iter().any(|n| n.eq_ignore_ascii_case(&engine.name)) {
@@ -760,6 +780,59 @@ impl Bridge {
             ]);
         }
         (lines, rows)
+    }
+
+    /// The simple pick: one button per engine that can improve (or, for `review`, that
+    /// can review), with how it is paid for and whether auto recommends it.
+    fn pick_view(&mut self, project: &str, review: bool, now: DateTime<Utc>) -> (String, Vec<Row>) {
+        let Some(route) = self.route(project).cloned() else {
+            return (format!("{project} is not here."), vec![menu_row()]);
+        };
+        let (current, _) = policy::effective(&route.communications, project);
+        let fleet = policy::fleet(&route, now);
+        let recommended = policy::recommend(&fleet, &[]).policy;
+        let picks = policy::choices(&current, &fleet, &recommended);
+        let list = picks[if review { "review" } else { "improve" }]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        for option in &list {
+            let selector = option["selector"].as_str().unwrap_or_default().to_string();
+            let name = selector.trim_start_matches("name:").to_string();
+            let label = format!(
+                "{}{} - {}{}",
+                if option["recommended"].as_bool() == Some(true) {
+                    "Recommended: "
+                } else {
+                    ""
+                },
+                option["label"].as_str().unwrap_or_default(),
+                option["paid"].as_str().unwrap_or_default(),
+                if option["blocked"].is_string() {
+                    " (blocked)"
+                } else {
+                    ""
+                }
+            );
+            let verb = if review { "sre" } else { "sim" };
+            rows.push(vec![button(
+                label,
+                self.data(format!("{verb}:{project}:{name}")),
+            )]);
+        }
+        rows.push(vec![button("Back to engines", "engines")]);
+        let text = if list.is_empty() {
+            format!("No engine in {project}'s fleet can do this yet.")
+        } else if review {
+            format!(
+                "Pick {project}'s review engine. Every improvement needs its verdict, then yours, \
+                 before it can go live."
+            )
+        } else {
+            format!("Pick {project}'s improvement engine: it plans and builds self-improvements.")
+        };
+        (text, rows)
     }
 
     /// Change a project's engine policy as its master, signed by the bridge under the
@@ -1001,6 +1074,39 @@ impl Bridge {
             "menu" => Some(self.menu(chat)),
             "projects" => Some(self.projects_view(chat)),
             "engines" => Some(self.engines_view(chat, now)),
+            "pim" | "pre" => Some(self.pick_view(&project, verb == "pre", now)),
+            "sim" | "sre" | "prec" => {
+                let engine = id.clone();
+                let outcome = match verb.as_str() {
+                    "sim" => self.change_policy(&project, |mut current, _| {
+                        current.set_improvement_engine(&format!("name:{engine}"));
+                        Some(current)
+                    }),
+                    "sre" => self.change_policy(&project, |mut current, _| {
+                        current.set_review_engine(&format!("name:{engine}"));
+                        Some(current)
+                    }),
+                    _ => self.change_policy(&project, |mut current, recommended| {
+                        if let Some(improve) = recommended.improvement_engine() {
+                            current.set_improvement_engine(improve);
+                        }
+                        if let Some(review) = recommended.review_engine() {
+                            current.set_review_engine(review);
+                        }
+                        Some(current)
+                    }),
+                };
+                toast = match outcome {
+                    Ok(true) => match verb.as_str() {
+                        "sim" => format!("{engine} improves {project}"),
+                        "sre" => format!("{engine} reviews {project}"),
+                        _ => format!("Recommended engines set for {project}"),
+                    },
+                    Ok(false) => "Already so".to_string(),
+                    Err(why) => excerpt(&why, 190),
+                };
+                Some(self.engines_view(chat, now))
+            }
             "pacc" | "pblk" | "ptop" => {
                 let engine = id.clone();
                 let outcome = match verb.as_str() {
@@ -1393,6 +1499,11 @@ impl Bridge {
                 delegation::active(&route.communications, &project, self.agent.name(), now)
                     .map(|granted| granted.principal);
             for task in ferryman_channel::list_tasks(&route).unwrap_or_default() {
+                // An improvement comes to the person below, once the review engine has
+                // given the first key - never before.
+                if ferryman_channel::gate::gated(&task.order.payload) {
+                    continue;
+                }
                 let TaskState::AwaitingReview { by, revision } = task.state_at(now) else {
                     continue;
                 };
@@ -1425,6 +1536,41 @@ impl Bridge {
                     ),
                     buttons,
                 ));
+            }
+            for waiting in ferryman_channel::gate::waiting(&route) {
+                let key = format!("g:{project}:{}:{}", waiting.order_id, waiting.revision);
+                if !waiting.ready_for_you || self.state.posted.contains(&key) {
+                    continue;
+                }
+                self.state.posted.push(key);
+                if !self.state.seeded {
+                    continue;
+                }
+                let mut lines = vec![
+                    format!(
+                        "{project} - waiting for your approval: {} r{} by {}",
+                        waiting.order_id, waiting.revision, waiting.worker
+                    ),
+                    excerpt(&waiting.title, 200),
+                    String::new(),
+                ];
+                if let Some(stat) = &waiting.diff_stat {
+                    lines.push(format!("Diff: {stat}"));
+                }
+                lines.push(format!("Evidence: {}", waiting.evidence));
+                if let Some(engine) = &waiting.engine {
+                    lines.push(format!(
+                        "Review engine: {}",
+                        excerpt(&engine.describe(), 600)
+                    ));
+                }
+                lines.push(
+                    "Approving is the second key. Nothing merges on its own: it becomes \
+                     approved, ready to merge."
+                        .to_string(),
+                );
+                let buttons = vec![self.review_buttons(&project, &waiting.order_id, true)];
+                actions.push(send(home, lines.join("\n"), buttons));
             }
             for question in questions::pending(&route) {
                 let key = format!("q:{project}:{}", question.id);
@@ -2544,6 +2690,130 @@ mod tests {
             82,
         );
         assert!(policy::is_set(&ferryman.communications, "ferryman"));
+    }
+
+    /// The two-button pick: improvement engine and review engine, signed for josh.
+    #[test]
+    fn the_improvement_and_review_engines_are_picked_with_two_buttons() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        three_engines(&ferryman);
+        let view = bridge.handle(press(JOSH_TG, GROUP, 90, "engines"), Utc::now());
+        let picker = press_labelled(&mut bridge, &view, "Improvement engine: auto", 90);
+        let options = buttons(&picker);
+        assert!(
+            options
+                .iter()
+                .any(|(label, _)| label.starts_with("Recommended: nemotron")),
+            "{options:?}"
+        );
+        assert!(
+            options
+                .iter()
+                .any(|(label, _)| label.contains("claude") && label.ends_with("(blocked)")),
+            "{options:?}"
+        );
+        let label = options
+            .iter()
+            .find(|(label, _)| label.starts_with("Recommended: nemotron"))
+            .unwrap()
+            .0
+            .clone();
+        press_labelled(&mut bridge, &picker, &label, 90);
+        let view = bridge.handle(press(JOSH_TG, GROUP, 90, "engines"), Utc::now());
+        let picker = press_labelled(&mut bridge, &view, "Review engine: auto", 90);
+        let label = buttons(&picker)
+            .into_iter()
+            .find(|(label, _)| label.contains("deepseek"))
+            .unwrap()
+            .0;
+        press_labelled(&mut bridge, &picker, &label, 90);
+        let (chosen, setting) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(chosen.improvement_engine(), Some("name:nemotron"));
+        assert_eq!(chosen.review_engine(), Some("name:deepseek"));
+        assert_eq!(setting.unwrap().set_by(), "josh via telegram-grouchly");
+    }
+
+    /// An improvement reaches the phone only after the review engine's key, and the
+    /// Approve button there is the master's key; before it, approval is refused.
+    #[test]
+    fn an_improvement_is_approved_from_the_phone_only_after_the_review_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["review"]);
+        let _ = bridge.tick(Utc::now());
+        let mut order = ferryman_channel::Order {
+            id: "improve-2026-w40-1".into(),
+            project_id: "ferryman".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "better", "tags": ["improvement"], "improvement": { "title": "Better errors" } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        wisp().sign_order(&mut order);
+        ferryman_channel::issue_order(&ferryman, &order).unwrap();
+        ferryman_channel::claim_order(&ferryman, &order.id, "wisp").unwrap();
+        let mut result = ferryman_channel::TaskResult {
+            order_id: order.id.clone(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "done", "evidence": { "recorded_by": "worker", "git": true, "commits": ["abc1234 better"], "diff_stat": "2 files changed" } }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp().sign_result(&mut result);
+        ferryman_channel::submit_result(&ferryman, &result).unwrap();
+        assert!(
+            bridge.tick(Utc::now()).is_empty(),
+            "nothing for the person before the review engine"
+        );
+        let early = bridge.handle(
+            press(JOSH_TG, GROUP, 91, &format!("ok:ferryman:{}", order.id)),
+            Utc::now(),
+        );
+        assert!(
+            texts(&early)
+                .iter()
+                .any(|t| t.contains("review engine has not reviewed it")),
+            "{early:?}"
+        );
+        ferryman_channel::gate::record_engine_review(
+            &ferryman,
+            &wisp(),
+            ferryman_channel::gate::EngineReview {
+                order_id: order.id.clone(),
+                revision: 1,
+                reviewer: "wisp".into(),
+                machine: "grouchly".into(),
+                engine: "deepseek".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                host: None,
+                route: Vec::new(),
+                accept: true,
+                summary: "clear and tested".into(),
+                reviewed_at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        let posted = bridge.tick(Utc::now());
+        let said = texts(&posted).join("\n");
+        assert!(said.contains("waiting for your approval"), "{said}");
+        assert!(said.contains("Diff: 2 files changed") && said.contains("clear and tested"));
+        press_labelled(&mut bridge, &posted, "Approve", 92);
+        let task = ferryman_channel::read_task(&ferryman, &order.id).unwrap();
+        assert!(ferryman_channel::gate::approved_for_live(&ferryman, &task));
     }
 
     #[test]

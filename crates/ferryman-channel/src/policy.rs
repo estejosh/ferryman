@@ -280,6 +280,34 @@ impl Policy {
         }
     }
 
+    /// The simple choice: `selector` first for improvement work - planning and building.
+    pub fn set_improvement_engine(&mut self, selector: &str) {
+        for role in [Role::Plan, Role::Build] {
+            self.prefer
+                .insert(role.as_str().to_string(), vec![selector.trim().to_string()]);
+        }
+    }
+
+    /// The simple choice: `selector` first for review.
+    pub fn set_review_engine(&mut self, selector: &str) {
+        self.prefer.insert(
+            Role::Review.as_str().to_string(),
+            vec![selector.trim().to_string()],
+        );
+    }
+
+    /// What does improvement work first, when the policy says.
+    #[must_use]
+    pub fn improvement_engine(&self) -> Option<&str> {
+        self.preferences(Role::Build).first().map(String::as_str)
+    }
+
+    /// What reviews first, when the policy says.
+    #[must_use]
+    pub fn review_engine(&self) -> Option<&str> {
+        self.preferences(Role::Review).first().map(String::as_str)
+    }
+
     /// One line per part, as a person reads it.
     #[must_use]
     pub fn describe(&self) -> Vec<String> {
@@ -376,6 +404,9 @@ pub struct Candidate {
     pub spend_usd: f64,
     /// Why a free tier is flagged, while it is.
     pub flag: Option<String>,
+    /// For a gateway engine (OmniRoute): the provider/models its route ends at. A
+    /// selector that names any of them matches, so `never claude` holds through it.
+    pub route: Vec<String>,
 }
 
 impl Candidate {
@@ -400,6 +431,7 @@ impl Candidate {
             demoted: trust.demoted,
             spend_usd: billing.spend_usd,
             flag: billing.flag,
+            route: billing.route,
         }
     }
 
@@ -535,17 +567,35 @@ pub fn matches(selector: &str, engine: &Candidate) -> bool {
     if pattern.is_empty() {
         return false;
     }
+    // A gateway's route: `cc/claude-sonnet-4-6`, `nvidia/nemotron-70b:free`.
+    let route: Vec<String> = engine
+        .route
+        .iter()
+        .map(|step| step.to_ascii_lowercase())
+        .collect();
+    let provider_of = |step: &String| step.split('/').next().unwrap_or_default().to_string();
     match kind {
         "paid" => normal_paid(pattern) == engine.paid_class(),
-        "model" => !model.is_empty() && glob(pattern, &model),
+        "model" => {
+            (!model.is_empty() && glob(pattern, &model))
+                || route.iter().any(|step| glob(pattern, step))
+        }
         "name" | "engine" => glob(pattern, &name),
         "host" | "provider" => {
-            !host.is_empty() && (glob(pattern, &host) || host.ends_with(&format!(".{pattern}")))
+            (!host.is_empty() && (glob(pattern, &host) || host.ends_with(&format!(".{pattern}"))))
+                || route.iter().any(|step| provider_of(step) == pattern)
         }
         _ if pattern.contains(['*', '?', '/']) => {
-            glob(pattern, &name) || (!model.is_empty() && glob(pattern, &model))
+            glob(pattern, &name)
+                || (!model.is_empty() && glob(pattern, &model))
+                || route.iter().any(|step| glob(pattern, step))
         }
-        _ => name == pattern || model.contains(pattern) || host.contains(pattern),
+        _ => {
+            name == pattern
+                || model.contains(pattern)
+                || host.contains(pattern)
+                || route.iter().any(|step| step.contains(pattern))
+        }
     }
 }
 
@@ -728,6 +778,64 @@ pub fn view(policy: &Policy, engines: &[Candidate]) -> serde_json::Value {
         }
     }
     serde_json::json!({ "roles": roles, "blocked": blocked })
+}
+
+/// What a person picks from: every engine the fleet published that can improve (plan
+/// and build) or review, once each by name, with how it is paid for, the machines it is
+/// on, whether the policy blocks it, and whether it is what auto recommends. The value
+/// to set is the selector `name:<engine>`.
+#[must_use]
+pub fn choices(policy: &Policy, engines: &[Candidate], recommended: &Policy) -> serde_json::Value {
+    let option = |engine: &Candidate, recommend: Option<&str>| {
+        let selector = format!("name:{}", engine.name.to_ascii_lowercase());
+        let machines: Vec<String> = engines
+            .iter()
+            .filter(|other| other.name.eq_ignore_ascii_case(&engine.name))
+            .map(|other| other.machine.clone())
+            .collect();
+        serde_json::json!({
+            "selector": selector,
+            "label": label(engine),
+            "paid": engine.paid_class(),
+            "machines": machines,
+            "blocked": policy.blocked(engine, Work::Background),
+            "recommended": recommend.is_some_and(|chosen| chosen.eq_ignore_ascii_case(&selector)),
+        })
+    };
+    let mut improve = Vec::new();
+    let mut review = Vec::new();
+    let mut seen = BTreeSet::new();
+    for engine in engines {
+        if !seen.insert(engine.name.to_ascii_lowercase()) {
+            continue;
+        }
+        if engine.level() >= 1 {
+            improve.push(option(engine, recommended.improvement_engine()));
+        }
+        if engine.level() == 2 {
+            review.push(option(engine, recommended.review_engine()));
+        }
+    }
+    serde_json::json!({
+        "improve": improve,
+        "review": review,
+        "current": { "improve": policy.improvement_engine(), "review": policy.review_engine() },
+        "recommended": {
+            "improve": recommended.improvement_engine(),
+            "review": recommended.review_engine(),
+        },
+    })
+}
+
+/// How a person reads an engine: `nemotron (nvidia/nemotron-70b)`, or for a gateway
+/// route `OmniRoute: free-stack`.
+#[must_use]
+pub fn label(engine: &Candidate) -> String {
+    match (&engine.model, engine.route.is_empty()) {
+        (Some(model), false) => format!("OmniRoute: {model}"),
+        (Some(model), true) => format!("{} ({model})", engine.name),
+        (None, _) => engine.name.clone(),
+    }
 }
 
 /// [`view`] as lines a person reads: one per role, one per blocked engine.
@@ -1623,6 +1731,96 @@ mod tests {
             none.why_none(Role::Build, &only_claude)
                 .contains("claude on grouchly never")
         );
+    }
+
+    /// Claude reached through OmniRoute is still Claude: `never claude` and subscription
+    /// protection see through the gateway to the route it ends at.
+    #[test]
+    fn never_and_protection_see_through_a_gateway_route() {
+        let gateway = |name: &str, paid: &str, model: &str, route: &[&str]| {
+            let mut engine = engine(name, "build", paid);
+            engine.model = Some(model.into());
+            engine.host = Some("localhost".into());
+            engine.route = route.iter().map(ToString::to_string).collect();
+            engine
+        };
+        let engines = vec![
+            gateway(
+                "omniroute.claude-first",
+                "subscription",
+                "claude-first",
+                &["cc/claude-sonnet-4-6", "nvidia/nemotron-70b:free"],
+            ),
+            gateway(
+                "omniroute.free-stack",
+                "free-tier",
+                "free-stack",
+                &["nvidia/nemotron-70b:free"],
+            ),
+            gateway(
+                "omniroute.or-claude",
+                "unknown",
+                "openrouter/anthropic/claude-sonnet-4",
+                &["openrouter/anthropic/claude-sonnet-4"],
+            ),
+        ];
+        assert!(matches("claude", &engines[0]), "the route names it");
+        assert!(matches("provider:cc", &engines[0]));
+        assert!(matches("model:*nemotron*", &engines[1]));
+        assert!(!matches("claude", &engines[1]));
+        let protected = rank(
+            &Policy::default(),
+            Role::Build,
+            "build",
+            Work::Background,
+            &engines,
+        );
+        assert_eq!(
+            names(&protected, &engines),
+            ["omniroute.free-stack", "omniroute.or-claude"],
+            "a Claude Code step makes the combo a subscription"
+        );
+        let never = Policy {
+            never: vec!["claude".into()],
+            ..Policy::default()
+        };
+        let ranking = rank(&never, Role::Build, "build", Work::Background, &engines);
+        assert_eq!(names(&ranking, &engines), ["omniroute.free-stack"]);
+        assert_eq!(ranking.blocked.len(), 2);
+    }
+
+    #[test]
+    fn the_simple_choice_sets_improvement_and_review_and_lists_what_to_pick() {
+        let mut policy = Policy::default();
+        policy.set_improvement_engine("name:nemotron");
+        policy.set_review_engine("name:deepseek");
+        assert_eq!(policy.preferences(Role::Plan), ["name:nemotron"]);
+        assert_eq!(policy.preferences(Role::Build), ["name:nemotron"]);
+        assert_eq!(policy.review_engine(), Some("name:deepseek"));
+        policy.check().unwrap();
+        let engines = vec![
+            engine("nemotron", "build", "free-tier"),
+            engine("deepseek", "judge", "prepaid"),
+            engine("claude", "judge", "subscription"),
+            engine("ollama", "chore", "local"),
+        ];
+        let recommended = recommend(&engines, &[]).policy;
+        let picks = choices(&policy, &engines, &recommended);
+        let improve = picks["improve"].as_array().unwrap();
+        assert_eq!(improve.len(), 3, "a chore engine cannot improve: {picks}");
+        assert_eq!(improve[0]["selector"], "name:nemotron");
+        assert_eq!(improve[0]["recommended"], true);
+        assert_eq!(improve[0]["paid"], "free-tier");
+        let review = picks["review"].as_array().unwrap();
+        assert_eq!(review.len(), 2, "only a judge reviews: {picks}");
+        assert_eq!(review[0]["recommended"], true);
+        assert!(
+            review[1]["blocked"]
+                .as_str()
+                .unwrap()
+                .contains("subscription")
+        );
+        assert_eq!(picks["current"]["improve"], "name:nemotron");
     }
 
     #[test]

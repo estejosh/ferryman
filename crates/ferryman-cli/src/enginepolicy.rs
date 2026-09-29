@@ -49,10 +49,17 @@ pub(crate) enum PolicyCommand {
     /// (`nvidia/nemotron*`), a paid class (`paid:free-tier`) or a host
     /// (`host:deepseek.com`). `--where any` lets any worker run it again.
     ///
-    ///   ferry engines policy set --prefer nemotron --prefer deepseek --never claude --where grouchly --all
+    ///   ferry engines policy set --improve nemotron --review deepseek --never claude --where grouchly --all
     Set {
         #[command(flatten)]
         which: ImproveProject,
+        /// The simple choice: what improves (plans and builds) first.
+        #[arg(long, value_name = "SELECTOR")]
+        improve: Option<String>,
+        /// The simple choice: what reviews first - the first of the two keys every
+        /// improvement needs before it can go live.
+        #[arg(long, value_name = "SELECTOR")]
+        review: Option<String>,
         /// plan, build, review or chore; repeat for several. Default: all four.
         #[arg(long = "role", value_name = "ROLE")]
         roles: Vec<String>,
@@ -107,15 +114,23 @@ pub(crate) fn recommendation(channel: &Path) -> policy::Recommendation {
     }
 }
 
-pub(crate) fn command(command: PolicyCommand) -> Result<()> {
+pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
     match command {
         PolicyCommand::Show { which, json } => show(&which, json),
-        PolicyCommand::Recommend { which, json } => recommend(&which, json),
+        PolicyCommand::Recommend { which, json } => {
+            recommend(&which, json)?;
+            if !json {
+                suggest_omniroute(&which).await;
+            }
+            Ok(())
+        }
         PolicyCommand::Accept { which } => sign_each(&which, "accepted", |_, channel, _| {
             Ok(Some(recommendation(channel).policy))
         }),
         PolicyCommand::Set {
             which,
+            improve,
+            review,
             roles,
             prefer,
             never,
@@ -140,7 +155,9 @@ pub(crate) fn command(command: PolicyCommand) -> Result<()> {
                     other => bail!("--never-applies-to is background or all, not '{other}'"),
                 })
                 .transpose()?;
-            if prefer.is_empty()
+            if improve.is_none()
+                && review.is_none()
+                && prefer.is_empty()
                 && never.is_empty()
                 && machines.is_empty()
                 && cap_usd.is_none()
@@ -148,11 +165,17 @@ pub(crate) fn command(command: PolicyCommand) -> Result<()> {
                 && scope.is_none()
             {
                 bail!(
-                    "nothing to set: name --prefer, --never, --where, --cap-usd, \
-                     --protect-subscriptions or --never-applies-to"
+                    "nothing to set: name --improve, --review, --prefer, --never, --where, \
+                     --cap-usd, --protect-subscriptions or --never-applies-to"
                 );
             }
             sign_each(&which, "set", |_, _, mut current| {
+                if let Some(selector) = &improve {
+                    current.set_improvement_engine(selector);
+                }
+                if let Some(selector) = &review {
+                    current.set_review_engine(selector);
+                }
                 for role in &roles {
                     if !prefer.is_empty() {
                         current
@@ -322,6 +345,21 @@ fn recommend(which: &ImproveProject, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// When OmniRoute answers on this machine and no engine in the fleet goes through it,
+/// say so, with the agent.toml lines that add it.
+async fn suggest_omniroute(which: &ImproveProject) {
+    let Some(catalog) = ferryman_ops::omniroute::detect().await else {
+        return;
+    };
+    let used = projects(which).is_ok_and(|all| {
+        all.iter()
+            .any(|(_, channel, _)| fleet(channel).iter().any(|engine| !engine.route.is_empty()))
+    });
+    if !used {
+        println!("\n{}", ferryman_ops::omniroute::suggestion(&catalog));
+    }
+}
+
 /// After `ferry improve on`: for the projects just switched on that have no policy of
 /// their own, show what auto would choose and offer to sign it. At a terminal the
 /// master is asked once; anywhere else the command to accept it is printed.
@@ -387,6 +425,32 @@ mod tests {
     struct Cli {
         #[command(subcommand)]
         command: PolicyCommand,
+    }
+
+    #[test]
+    fn the_simple_choice_parses() {
+        let cli = Cli::try_parse_from([
+            "policy",
+            "set",
+            "--improve",
+            "nemotron",
+            "--review",
+            "deepseek",
+            "--never",
+            "claude",
+            "--where",
+            "grouchly",
+            "--all",
+        ])
+        .unwrap();
+        let PolicyCommand::Set {
+            improve, review, ..
+        } = cli.command
+        else {
+            panic!("not set")
+        };
+        assert_eq!(improve.as_deref(), Some("nemotron"));
+        assert_eq!(review.as_deref(), Some("deepseek"));
     }
 
     /// Josh's own policy, as the docs give it, parses into what it says.

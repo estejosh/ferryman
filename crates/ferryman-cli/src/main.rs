@@ -2324,6 +2324,108 @@ enum ImproveCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Improvements waiting on a key. Each needs two before it can go live: the review
+    /// engine's verdict, then yours. Shows the diff stat, the evidence and what the review
+    /// engine said.
+    Pending {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve an improvement for live - the second key, after the review engine's.
+    /// Nothing merges: it becomes "approved, ready to merge", and merging stays yours.
+    Approve {
+        /// The order id, e.g. improve-2026-w40-1.
+        id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        workspace: Option<PathBuf>,
+    },
+    /// Send an improvement back with what to change.
+    SendBack {
+        id: String,
+        #[arg(long)]
+        notes: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        workspace: Option<PathBuf>,
+    },
+}
+
+/// Sign the master's decision on an improvement, as its master.
+fn improve_decide(
+    id: &str,
+    project: Option<String>,
+    workspace: Option<PathBuf>,
+    accept: bool,
+    notes: Option<&str>,
+) -> Result<()> {
+    let (project, channel, attachment) = improve_project(&ImproveProject {
+        project,
+        workspace,
+        all: false,
+    })?;
+    let Some(master) = ferryman_channel::ferry::master_of(&channel)? else {
+        bail!("{project} has no master, and only its master approves an improvement for live");
+    };
+    let identity = signing_identity_in(&attachment, &master)?;
+    let route = ferryman_channel::route_for(&channel)?;
+    let revision = ferryman_channel::gate::decide(&route, id, accept, notes, &master, &identity)?;
+    if accept {
+        println!(
+            "{id} r{revision} approved by {master}: both keys are there - approved, ready to \
+             merge. Nothing merges on its own; merge it when you are happy with it."
+        );
+    } else {
+        println!("{id} r{revision} sent back by {master}");
+    }
+    Ok(())
+}
+
+/// Every improvement waiting on a key, in every project here.
+fn improve_pending(as_json: bool) -> Result<()> {
+    let mut rows: Vec<Value> = Vec::new();
+    for route in target_routes(&Targets {
+        workspace: None,
+        comms: None,
+    })? {
+        for waiting in ferryman_channel::gate::waiting(&route) {
+            if !as_json {
+                println!(
+                    "{}  {}  r{} by {} - {}",
+                    route.project_id,
+                    waiting.order_id,
+                    waiting.revision,
+                    waiting.worker,
+                    waiting.title
+                );
+                println!("    {}", waiting.waiting_for);
+                if let Some(stat) = &waiting.diff_stat {
+                    println!("    diff: {stat}");
+                }
+                println!("    evidence: {}", waiting.evidence);
+                if let Some(engine) = &waiting.engine {
+                    println!("    review engine: {}", engine.describe());
+                }
+                if waiting.ready_for_you {
+                    println!(
+                        "    ferry improve approve {} --project {}   |   ferry improve send-back {} --notes \"...\"",
+                        waiting.order_id, route.project_id, waiting.order_id
+                    );
+                }
+            }
+            let mut row = serde_json::to_value(&waiting)?;
+            row["project"] = json!(route.project_id);
+            rows.push(row);
+        }
+    }
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        println!("no improvement is waiting on a key");
+    }
+    Ok(())
 }
 
 /// The one project `ferry improve on|off` acts on.
@@ -2997,6 +3099,18 @@ async fn improve_command(command: ImproveCommand) -> Result<()> {
         ImproveCommand::On { which } => improve_switch(&which, true)?,
         ImproveCommand::Off { which } => improve_switch(&which, false)?,
         ImproveCommand::Status { json } => improve_status(json)?,
+        ImproveCommand::Pending { json } => improve_pending(json)?,
+        ImproveCommand::Approve {
+            id,
+            project,
+            workspace,
+        } => improve_decide(&id, project, workspace, true, None)?,
+        ImproveCommand::SendBack {
+            id,
+            notes,
+            project,
+            workspace,
+        } => improve_decide(&id, project, workspace, false, Some(&notes))?,
     }
     Ok(())
 }
@@ -3700,7 +3814,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Engines {
             command: Some(EnginesCommand::Policy { command }),
             ..
-        } => enginepolicy::command(command)?,
+        } => enginepolicy::command(command).await?,
         Command::Engines { at, json, .. } => engines_command(&at, json)?,
         Command::Improve { command } => improve_command(command).await?,
         Command::License { command } => license_command(command).await?,
@@ -4490,6 +4604,8 @@ fn report_enable_json(
             // Checked now rather than discovered at first-task time: a missing
             // engine is the most common reason a fresh setup does nothing.
             "command_found": outcome.command_found,
+            // OmniRoute answers here and nothing uses it yet: see docs/ENGINE_SETUP.md.
+            "omniroute_available": outcome.omniroute_unused,
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
             "already_configured": outcome.steps.iter().all(|s| !s.created),
@@ -4618,6 +4734,14 @@ fn report_enable_human(
              start. Install it, or edit command/args in .ferryman/agent.toml \
              (see docs/ENGINE_SETUP.md). Run 'ferry doctor' after fixing.",
             outcome.config.command
+        );
+    }
+    if outcome.omniroute_unused {
+        println!(
+            "  TIP      OmniRoute answers on this machine ({}): a free gateway to many \
+             providers. Add it as an engine - `ferry engines policy recommend` shows the \
+             lines for .ferryman/agent.toml, and docs/ENGINE_SETUP.md explains it.",
+            ferryman_ops::omniroute::DEFAULT_URL
         );
     }
     println!();

@@ -1052,11 +1052,32 @@ function policyPanel(ep) {
   const source = ep.auto
     ? `auto &mdash; nobody has signed one, so local and free engines go first and subscriptions are never used`
     : `signed by ${esc(ep.set_by)}, ${when(ep.set_at)} UTC`;
+  const ch = ep.choices || {};
+  const cur = ch.current || {};
+  const recd = ch.recommended || {};
+  const opt = (list, chosen) => (list || []).map((o) =>
+    `<option value="${esc(o.selector)}"${o.selector === chosen ? " selected" : ""}${o.blocked ? " disabled" : ""}>` +
+    `${esc(o.label)} &mdash; ${esc(o.paid)}${o.recommended ? " &mdash; Recommended" : ""}${o.blocked ? " (blocked)" : ""}</option>`).join("");
+  const nameOf = (sel) => esc(String(sel || "").replace(/^name:/, "")) || "nothing yet";
+  const simple = `
+        <div style="margin-top:12px;display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Improvement engine</span>
+            <select id="ep-improve" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.improve, cur.improve)}</select></label>
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Review engine</span>
+            <select id="ep-review" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.review, cur.review)}</select></label>
+          ${ep.may_set ? `<button class="btn primary" id="ep-choose">Save</button><button class="btn" id="ep-use-rec">Use recommended</button>
+          <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="ep-all" /> for all my projects</label>` : ""}
+        </div>
+        <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)}.
+          Every improvement needs the review engine's verdict and then yours before it can go live.</div>
+        <div class="s" id="ep-msg" style="color:var(--dim);margin-top:4px"></div>`;
   return `
     <div class="notice" style="margin-bottom:18px">
       <div style="flex:1;min-width:0">
         <b>Engine policy:</b> ${source}.
-        ${ep.auto && ep.self_improve ? `<div style="margin-top:6px"><span class="badge warn">Self-improve is on with no engine policy of its own.</span> Accept the recommendation below, or edit it.</div>` : ""}
+        ${ep.auto && ep.self_improve ? `<div style="margin-top:6px"><span class="badge warn">Self-improve is on with no engine policy of its own.</span> Pick the engines below, or use the recommended ones.</div>` : ""}
+        ${simple}
+        <details style="margin-top:12px"><summary>Advanced</summary>
         <div class="s" style="color:var(--dim);margin-top:6px">Which AI does background work here - planning, building and reviewing self-improvements - and on which machines. Orders you give yourself are never restricted by it.</div>
         <div style="margin-top:10px">${(ep.describe || []).map(esc).join("<br>")}</div>
         <div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Work</th><th>Engines, first choice first</th></tr></thead><tbody>${ranking}</tbody></table></div>
@@ -1067,8 +1088,7 @@ function policyPanel(ep) {
         ${ep.may_set ? `
         <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-            <button class="btn primary" id="ep-accept">Accept recommendation</button>
-            <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="ep-all" /> for all my projects</label>
+            <button class="btn" id="ep-accept">Accept the whole recommended policy</button>
             ${ep.auto ? "" : `<button class="btn" id="ep-clear">Back to auto</button>`}
           </div>
           <div class="k">Edit</div>
@@ -1078,17 +1098,83 @@ function policyPanel(ep) {
           <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="ep-protect" ${p.protect_subscriptions === false ? "" : "checked"} /> never spend a subscription on background work</label>
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
             <button class="btn" id="ep-save">Sign this policy</button>
-            <span class="s" id="ep-msg" style="color:var(--dim)"></span>
           </div>
         </div>` : ""}
+        </details>
       </div>
     </div>`;
+}
+
+/* Two keys before an improvement goes live: the review engine's verdict, then the
+   master's. Each waiting improvement with its diff stat, evidence and what the review
+   engine said. Approving never merges: it becomes "approved, ready to merge". */
+function approvalsPanel(pd) {
+  const items = pd.waiting || [];
+  if (!items.length) return "";
+  const rows = items.map((w) => `
+      <div class="row">
+        <div style="min-width:0"><div class="t">${esc(w.order_id)} r${w.revision} &mdash; ${esc(w.title)}</div>
+          <div class="m">by ${esc(w.worker)}${w.diff_stat ? ` &middot; ${esc(w.diff_stat)}` : ""} &middot; evidence: ${esc(w.evidence)}</div>
+          ${w.engine ? `<div class="m">review engine: ${esc(w.engine.engine)}${w.engine.model ? ` (${esc(w.engine.model)})` : ""} on ${esc(w.engine.machine)} &mdash; ${esc(w.engine.summary)}</div>` : ""}
+          <div class="m">${esc(w.waiting_for)}</div></div>
+        <div class="r" style="white-space:nowrap">${pd.may_decide && w.ready_for_you
+          ? `<button class="btn primary" data-imp-approve="${esc(w.order_id)}">Approve</button> <button class="btn" data-imp-back="${esc(w.order_id)}">Send back</button>`
+          : `<span class="badge">${w.ready_for_you ? "waiting for the master" : "waiting for the review engine"}</span>`}</div>
+      </div>`).join("");
+  return `
+    <div class="panel" style="margin-bottom:18px">
+      <div class="chat-top"><b>Waiting for your approval</b> <span class="s" style="color:var(--dim)">&mdash; improvements need the review engine's verdict, then yours. Nothing merges on its own.</span></div>
+      ${rows}
+      <div class="s" id="imp-msg" style="color:var(--dim);padding:8px 16px"></div>
+    </div>`;
+}
+
+function wireApprovals() {
+  const msg = (text) => { const m = $("#imp-msg"); if (m) m.textContent = String(text).slice(0, 300); };
+  const decide = async (btn, order, accept, notes) => {
+    btn.disabled = true;
+    try {
+      const r = await api("/api/improve/decide", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ order, accept, notes }),
+      });
+      msg(`${r.order} r${r.revision}: ${r.state}.`);
+      await render();
+    } catch (err) { msg(err.message || err); btn.disabled = false; }
+  };
+  document.querySelectorAll("[data-imp-approve]").forEach((b) =>
+    b.addEventListener("click", () => decide(b, b.dataset.impApprove, true, null)));
+  document.querySelectorAll("[data-imp-back]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const notes = window.prompt("What should change?");
+      if (notes && notes.trim()) decide(b, b.dataset.impBack, false, notes.trim());
+    }));
 }
 
 function wirePolicy() {
   const msg = (text) => { const m = $("#ep-msg"); if (m) m.textContent = String(text).slice(0, 300); };
   const all = () => !!($("#ep-all") && $("#ep-all").checked);
   const list = (id) => (($(id) && $(id).value) || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const choose = async (btn, body) => {
+    btn.disabled = true;
+    try {
+      const r = await api("/api/engine-policy/choose", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify(Object.assign({ all: all() }, body)),
+      });
+      msg(`Signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
+      await render();
+    } catch (err) { msg(err.message || err); btn.disabled = false; }
+  };
+  const chooseBtn = $("#ep-choose");
+  if (chooseBtn) chooseBtn.addEventListener("click", () => {
+    const improve = $("#ep-improve").value || null;
+    const review = $("#ep-review").value || null;
+    if (!improve && !review) { msg("Pick an improvement engine or a review engine."); return; }
+    choose(chooseBtn, { improve, review });
+  });
+  const useRec = $("#ep-use-rec");
+  if (useRec) useRec.addEventListener("click", () => choose(useRec, { recommended: true }));
   const accept = $("#ep-accept");
   if (accept) accept.addEventListener("click", async () => {
     accept.disabled = true;
@@ -1167,6 +1253,8 @@ pages.teammates = async () => {
   try { dl = await api("/api/delegations"); } catch (_) { dl = null; }
   let ep = null;
   try { ep = await api("/api/engine-policy"); } catch (_) { ep = null; }
+  let pd = null;
+  try { pd = await api("/api/improve/pending"); } catch (_) { pd = null; }
 
   const grants = {};
   for (const g of (d.grants || [])) grants[g.grantee] = g;
@@ -1198,6 +1286,8 @@ pages.teammates = async () => {
         ${d.head && d.may_grant ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center"><button class="btn" id="tm-head-revoke">Clear head agent</button><span class="s" id="tm-head-msg" style="color:var(--dim)"></span></div>` : ""}
       </div>
     </div>
+
+    ${pd ? approvalsPanel(pd) : ""}
 
     ${imp ? improvePanel(imp) : ""}
 
@@ -1325,6 +1415,7 @@ function wireTeammates() {
   });
 
   wirePolicy();
+  wireApprovals();
 
   const improve = $("#tm-improve");
   if (improve) improve.addEventListener("click", async () => {

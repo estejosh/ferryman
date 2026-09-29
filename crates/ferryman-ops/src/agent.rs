@@ -2601,7 +2601,11 @@ async fn note_engines(
         identity,
         &ferryman_channel::receipts::machine_label(),
         env!("CARGO_PKG_VERSION"),
-        crate::engines::reports(&config.engines, &ledger, now),
+        crate::engines::reports(
+            &crate::engines::effective_specs(&config.engines, &ledger),
+            &ledger,
+            now,
+        ),
         now,
     ) {
         report.warn(&format!("could not write this worker's engines: {error:#}"));
@@ -3100,8 +3104,7 @@ fn next_engine(
             wanted,
             tried,
             here,
-        )
-        .cloned();
+        );
     }
     crate::engines::pick_direct(&config.engines, &ledger, now, wanted, tried, &policy, here)
         .cloned()
@@ -3837,6 +3840,57 @@ fn record_verdict(
     report: &dyn Progress,
 ) -> Result<()> {
     let id = id.to_string();
+    // An improvement is never accepted by an engine. Its verdict is the first of two
+    // keys, recorded signed with the engine that gave it; a keep becomes a
+    // recommendation, and only the master's approval - the second key - accepts it.
+    let gated = ferryman_channel::read_task(route, &id)
+        .is_ok_and(|task| ferryman_channel::gate::gated(&task.order.payload));
+    if gated {
+        let engine = config.engine();
+        let ledger = crate::engines::Ledger::load(&config.agent);
+        let review = ferryman_channel::gate::EngineReview {
+            order_id: id.clone(),
+            revision,
+            reviewer: config.agent.clone(),
+            machine: ferryman_channel::receipts::machine_label(),
+            engine: engine.name.clone(),
+            model: engine.model.clone().or_else(|| config.model.clone()),
+            tier: crate::engines::effective_tier(&engine, &ledger.state(&engine.name))
+                .as_str()
+                .to_string(),
+            paid: engine.paid.as_str().to_string(),
+            host: engine
+                .base_url
+                .as_deref()
+                .and_then(crate::engines::url_host),
+            route: engine.route.clone(),
+            accept: verdict.accept,
+            summary: verdict.reasoning.clone(),
+            reviewed_at: chrono::Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        ferryman_channel::gate::record_engine_review(route, identity, review)?;
+        if verdict.accept {
+            let mut recommendation = Recommendation {
+                order_id: id.clone(),
+                revision,
+                reviewer: config.agent.clone(),
+                recommended_at: chrono::Utc::now(),
+                accept: true,
+                reasoning: verdict.reasoning.clone(),
+                signed_by: None,
+                signature: None,
+            };
+            identity.sign_recommendation(&mut recommendation);
+            ferryman_channel::submit_recommendation(route, &recommendation)?;
+            report.info(&format!(
+                "  {id}: {} keeps it - {}; waiting for the master's approval, the second key",
+                engine.name, verdict.reasoning
+            ));
+            return Ok(());
+        }
+    }
     match config.review {
         ReviewMode::Auto => {
             let mut review = Review {
@@ -5626,6 +5680,8 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 

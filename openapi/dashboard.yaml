@@ -272,6 +272,71 @@ paths:
         '200': {description: 'how many changed, and per project: set, already, skipped or error'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/engine-policy/choose:
+    post:
+      summary: The master picks the improvement engine and the review engine
+      description: >
+        The simple choice. `improve` goes first for planning and building, `review` first
+        for review - the first of the two keys every improvement needs before it can go
+        live. `recommended` uses what auto recommends for both. The rest of the policy is
+        kept. `all` does it in every project the person is master of. The CLI equivalent
+        is `ferry engines policy set --improve <sel> --review <sel>`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                improve: {type: string}
+                review: {type: string}
+                recommended: {type: boolean}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: nothing picked}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/improve/pending:
+    get:
+      summary: Improvements waiting on a key
+      description: >
+        Every improvement whose newest result is not yet approved for live: its diff stat,
+        what its evidence says, the review engine's verdict when it has given the first key,
+        and whether only the master's approval is missing (`ready_for_you`). `may_decide` is
+        true only for the signed-in master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'project, may_decide and waiting'}
+        '401': {description: no active session}
+  /api/improve/decide:
+    post:
+      summary: The master's key - approve an improvement for live, or send it back
+      description: >
+        Signed with the session's key. Approving is refused until the policy's review
+        engine has accepted the same revision, on a result whose evidence passes
+        verification; sending back needs notes. Nothing merges: an approved improvement is
+        "approved, ready to merge", and merging stays the master's act.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order, accept]
+              properties:
+                order: {type: string}
+                accept: {type: boolean}
+                notes: {type: string}
+      responses:
+        '200': {description: 'the order, the revision decided and its state'}
+        '401': {description: no active session}
+        '403': {description: read-only, not the master, or the review engine has not given its key}
   /api/delegations:
     get:
       summary: Who may act for the master here, and whether each delegation counts

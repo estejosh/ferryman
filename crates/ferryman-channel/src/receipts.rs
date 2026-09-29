@@ -765,6 +765,10 @@ pub struct EngineBilling {
     /// reported a cost - while the flag lasts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flag: Option<String>,
+    /// For a gateway engine (OmniRoute): the provider/models its route ends at, so a
+    /// policy can see - and block - what is really behind it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route: Vec<String>,
 }
 
 /// What a worker's own evidence says about how far one engine's (and so one model's)

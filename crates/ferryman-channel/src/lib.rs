@@ -25,6 +25,7 @@ pub mod entitlement;
 pub mod events;
 pub mod evidence;
 pub mod ferry;
+pub mod gate;
 pub mod head;
 pub mod interrupt;
 pub mod invite;
@@ -1463,6 +1464,9 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
                 None => bail!("order requires approval but no master is declared"),
             }
         }
+        // Two keys before an improvement goes live: the review engine's, then the
+        // master's. Enforced here so no surface can accept one with either missing.
+        crate::gate::check_acceptance(route, &task, review)?;
     }
     let path =
         task_dir(route, &review.order_id).join(format!("review.{:03}.json", review.revision));

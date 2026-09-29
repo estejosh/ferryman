@@ -99,6 +99,9 @@ pub struct Outcome {
     /// error: the engine may legitimately be installed after enabling, on
     /// another machine of the fleet, or inside the sandbox image.
     pub command_found: bool,
+    /// OmniRoute answers on this machine and no engine here goes through it yet: worth
+    /// suggesting, since its free combos make a strong improvement engine.
+    pub omniroute_unused: bool,
     pub steps: Vec<Step>,
 }
 
@@ -555,6 +558,10 @@ pub fn perform(request: Request) -> Result<Outcome> {
         let _ = ferryman_channel::ferry::Root::create(&beside.join("ferry"));
     }
 
+    // A test must not depend on what happens to listen on this machine.
+    let omniroute_unused = !cfg!(test)
+        && crate::omniroute::listening()
+        && !loaded.engines.iter().any(crate::omniroute::is_omniroute);
     Ok(Outcome {
         project,
         syncthing,
@@ -565,6 +572,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
         public_key: identity.public_key_hex(),
         config: loaded,
         command_found: crate::doctor::find_on_path(&request.command).is_some(),
+        omniroute_unused,
         steps,
     })
 }
