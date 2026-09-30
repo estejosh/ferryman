@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.5.17 - 2026-09-29
+
+You choose which model does self-improve and on which machine, fm recommends one that spares your subscriptions, and nothing goes live without both an engine review and your approval. OmniRoute works as an engine.
 
 ### Added
 
