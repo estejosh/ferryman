@@ -206,7 +206,7 @@ n8n or cron as often as you like:
 
 - `gather` - the last seven days (send-backs, failed runs, late orders, doctor,
   TODO/FIXME, the learning database) into `improve/<week>/evidence.md`;
-- `plan` - the best judge-tier engine up turns it into at most `--max` (5) ranked
+- `plan` - the engine the engine policy (below) puts first, a judge when it allows one, turns it into at most `--max` (5) ranked
   improvements with acceptance checks, each a signed order tagged `improvement`,
   open to any worker, on its own branch. With no judge up a builder plans and the
   plan is marked unreviewed. Once a week; a second run issues nothing new;
@@ -217,6 +217,177 @@ n8n or cron as often as you like:
 
 `improve = "true"` in `agent.toml` lets the worker run it itself, at most hourly.
 `ferry pause` stops all of it.
+
+## Which engines do background work: the engine policy
+
+Self-improve runs with nobody watching, so it must never quietly spend the Claude or
+Codex limits you need on Thursday. Each project has an **engine policy** that decides
+which engines do its background work - the loop's planning and review, and the
+improvement orders it issues - in what order, which never, and on which machines.
+Orders you give yourself are yours to spend on: the policy does not touch them unless
+it says `never_applies_to = "all"`.
+
+With no policy signed the fleet runs on **auto**: local engines first, then free
+tiers, then prepaid engines with a weekly cap, then unknown, then uncapped prepaid,
+and a subscription never. Ties go to the engine whose results have held up best
+(verified against refuted), then the cheaper per verified result, then your order in
+`agent.toml`. A `claude` or `codex` CLI with no `paid` set is taken for the
+subscription it almost always is; set `paid` to say otherwise. A free tier that
+returns a payment or quota error, or reports a cost, is flagged, ranked down for a
+week, and you are told once.
+
+```sh
+ferry engines                        # the fleet, then each project's policy and who it blocks
+ferry engines policy recommend       # what auto would choose, one reason per choice
+ferry engines policy accept [--all]  # sign it
+ferry engines policy show [--json]
+ferry engines policy set --role build --prefer <selector>... --never <selector>... --where <agent>...
+ferry engines policy clear           # back to auto
+```
+
+A selector is an engine name (`nemotron`), a model glob (`nvidia/nemotron*`), a paid
+class (`paid:free-tier`, `paid:subscription`) or an endpoint host
+(`host:deepseek.com`). A bare word also matches a model or host containing it, so
+`claude` blocks the `claude` engine and every `claude-*` model. Without `--role`,
+`--prefer` sets the order for all four roles: `plan`, `build`, `review`, `chore`.
+`--where` lists the agents or machines allowed to run the project's self-improve; a
+worker anywhere else leaves its improvement orders unclaimed. `--cap-usd` with
+`--role` caps what the fleet spends on that role in a week.
+
+The simple way is two choices: what **improves** (plans and builds) and what
+**reviews**. The dashboard's Engine policy panel has a dropdown for each, with each
+engine's paid class and the recommended one marked, and a "Use recommended" button;
+Telegram's Engines menu has an "Improvement engine" and a "Review engine" button. From
+the CLI:
+
+```sh
+ferry engines policy set --improve nemotron --review deepseek --never claude --where grouchly --all
+```
+
+Example - free model first, never my subscription, only on the always-on machine,
+for every project I am master of, with the full lists:
+
+```sh
+ferry engines policy set --prefer nemotron --prefer deepseek --never claude --where grouchly --all
+```
+
+Planning and review want a `judge`-tier engine: a builder may plan (the plan is
+marked unreviewed), but only a judge reviews. If nothing you allow is a judge, give
+one `engine.<name>.tier = "judge"` in `agent.toml`, or review waits.
+
+When nothing the policy allows can do the work it **waits** - it never falls back to
+a blocked engine - and you are asked once a week per role, with buttons on the phone
+(Accept recommended, or keep holding). Setting the policy takes the master's
+signature, like `ferry improve on`, and the signed `ENGINE_POLICY` file travels with
+the channel; one anybody else signed or edited is ignored. The dashboard's Teammates
+page and the Telegram Engines menu show the same thing and can accept, block or move
+an engine to the top. `ferry improve status` and `ferry improve report` say which
+engine and model, on which machine, did each step, and what each engine spent.
+## Two keys before an improvement goes live
+
+Every improvement the loop builds needs **two** keys before it may go live - merge,
+deploy or release:
+
+1. **The review engine's.** The engine the policy picks for review (a judge-tier engine
+   it does not block, on a machine it names) reads the result and records a signed
+   verdict. It never accepts on its own: a "keep" becomes a recommendation. The result's
+   own evidence must pass verification, and no verifier may have refuted it.
+2. **Yours.** The master approves - or a delegate with the `review` scope acting on the
+   master's button press on the phone.
+
+Neither alone is enough: an agent's accept is refused, and so is yours until the
+review engine has given its key. If the review engine is blocked or out of credit the
+loop holds and asks you once; it never skips the review and never approves by itself.
+With both keys the improvement becomes "approved, ready to merge", and merging is yours -
+unless you turn on auto-merge for low-risk work, below.
+
+```sh
+ferry improve pending                        # what waits, with diff stat, evidence and the review engine's verdict
+ferry improve approve improve-2026-w40-1     # your key
+ferry improve send-back improve-2026-w40-1 --notes "cover the error path"
+```
+
+The dashboard's Teammates page lists them under "Waiting for your approval" with
+Approve and Send back; Telegram sends each one with the same buttons once the review
+engine has given its key.
+
+### Auto-merge: docs, tests and dependency bumps, after both keys
+
+Off by default. Turn it on per project (or `--all`) and fm merges an improvement on its
+own - but only once it holds **both** keys, and only when every file it changes is low
+risk:
+
+- **docs**: `*.md`, `docs/**`, LICENSE / COPYING / NOTICE / AUTHORS, and Rust changes to
+  comments only;
+- **tests**: `tests/**` (not under `src/`), `*_test.*`, `test_*.*`, `*.spec.*`, `*.test.*`,
+  and Rust changes inside a `#[cfg(test)]` module that runs to the end of its file;
+- **dependencies**: a lockfile changed in place (`Cargo.lock`, `package-lock.json`,
+  `pnpm-lock.yaml`, `yarn.lock`, `go.sum`, `poetry.lock`, `uv.lock`), or a manifest whose only
+  change is dependency versions (`Cargo.toml`, `package.json`, `pyproject.toml`,
+  `requirements*.txt`, `go.mod`).
+
+Anything else - code, config, a new dependency, a feature flag, a git source, the
+package's own version, an executable bit - still stops at "approved, ready to merge"
+for you. So does fm's own repository: self-improve on the ferryman project gets no
+exemption.
+
+```sh
+ferry engines policy set --auto-merge low-risk --all     # or: --auto-merge none
+```
+
+On the dashboard it is the "Auto-merge docs/tests/deps after both approvals" checkbox in
+the policy panel; on the phone, the button of the same name in the Engines menu.
+
+How it happens: the improve loop records a signed `merge-authorized` for each
+improvement with both keys. The worker that built the branch then checks everything
+again itself - the policy, both keys, that the branch is still at the commit that was
+reviewed, and every changed file as git has it - and merges into the default branch in
+its own checkout: a fast-forward when it can, a merge commit otherwise. If the default
+branch is checked out with uncommitted changes, or the merge conflicts, nothing is
+merged. It pushes the default branch only if that worker already pushes for the project
+(`push = "origin"` in `agent.toml`), after checking the remote is not ahead, and never
+with force; a refused push puts the branch back. The merge commit goes into the ledger
+and Telegram says so. Whatever goes wrong, the improvement falls back to you,
+"approved, ready to merge", with the reason. fm cannot see CI, so it does not wait on
+it: the checks the worker ran are in the evidence the review engine judged.
+
+## OmniRoute: a free gateway as an engine
+
+[OmniRoute](https://github.com/diegosouzapw/OmniRoute) (MIT) is a self-hosted AI
+gateway: one OpenAI-compatible endpoint, `http://localhost:20128/v1` by default, in front
+of hundreds of providers - many free - with quota-aware fallback and **combos**, named
+routes over several models. Install and start it as its README says (`npm i -g
+omniroute`, then `omniroute`), then add it to `agent.toml`:
+
+```toml
+engines = ["omniroute", "deepseek"]
+engine.omniroute.provider = "omniroute"
+engine.omniroute.kind = "http"
+engine.omniroute.base_url = "http://localhost:20128/v1"
+engine.omniroute.model = "free-stack"            # a combo, or a model id such as "nvidia/nemotron-70b:free"
+engine.omniroute.key = "secret:OMNIROUTE_API_KEY" # an OmniRoute API key, sealed; leave out if yours needs none
+engine.omniroute.tier = "build"
+```
+
+`provider = "omniroute"` (or a base URL on port 20128) makes it a first-class engine:
+
+- The probe lists its models and combos (`/v1/models`) and, when the key may read it,
+  each combo's steps (`/api/combos`).
+- **Each route is paid for the way it ends.** A `:free` model is free tier. A route that
+  ends at somebody's plan - Claude Code or Codex signed in through OmniRoute, Cursor,
+  Copilot - is a subscription, so `protect_subscriptions` and `never claude` block it
+  **through** the gateway: the policy matches the provider/model names on the route, not
+  just the combo's name. A combo is a subscription if any step is one, free if every
+  step is free. A combo whose steps cannot be read counts as a subscription when that
+  OmniRoute has any subscription provider connected, because it may route there.
+- Its combos and free models are offered as engines of their own - `omniroute.free-stack`,
+  shown as "OmniRoute: free-stack" - so the dashboard dropdowns and Telegram can pick one.
+  Auto ranks a free combo as free tier: a strong improvement engine.
+- OmniRoute reports what each request cost (`X-OmniRoute-Response-Cost`), so a free
+  route's spend stays at $0 and a paid one is counted.
+
+When OmniRoute answers on the machine and no engine uses it yet, `ferry enable` points it
+out and `ferry engines policy recommend` prints the lines above.
 
 ## Diagnosing
 

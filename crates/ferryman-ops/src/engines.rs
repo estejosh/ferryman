@@ -170,6 +170,10 @@ pub struct EngineSpec {
     pub probe_chat: bool,
     pub weekly_requests: Option<u64>,
     pub weekly_usd: Option<f64>,
+    /// `omniroute` for an OmniRoute gateway; see [`crate::omniroute`].
+    pub provider: Option<String>,
+    /// For a gateway engine: the provider/models its route ends at, as its probe found.
+    pub route: Vec<String>,
 }
 
 impl EngineSpec {
@@ -190,6 +194,8 @@ impl EngineSpec {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 
@@ -276,7 +282,14 @@ pub fn parse_engines(
                 .filter(|value| !value.is_empty())
         };
         let own_command = get("command");
-        let base_url = get("base_url").map(|url| url.trim_end_matches('/').to_string());
+        let provider = get("provider").map(|provider| provider.to_ascii_lowercase());
+        // An OmniRoute engine with no address is the local one on its default port.
+        let base_url = get("base_url")
+            .or_else(|| {
+                (provider.as_deref() == Some("omniroute"))
+                    .then(|| crate::omniroute::DEFAULT_URL.to_string())
+            })
+            .map(|url| url.trim_end_matches('/').to_string());
         let kind = match get("kind").as_deref() {
             Some("http") => Kind::Http,
             Some("cli") => Kind::Cli,
@@ -353,6 +366,8 @@ pub fn parse_engines(
             probe_chat: get("probe").as_deref() == Some("chat"),
             weekly_requests: number("weekly_requests")?,
             weekly_usd,
+            provider,
+            route: Vec::new(),
             name,
         });
     }
@@ -415,6 +430,15 @@ pub struct EngineState {
     pub canary_tried_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canary_passed_at: Option<DateTime<Utc>>,
+    /// A free-tier engine that asked for payment, ran out of quota or reported a cost:
+    /// why, and when. Auto mode ranks it down for [`ferryman_channel::policy::FLAG_DAYS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_tier_flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_tier_flagged_at: Option<DateTime<Utc>>,
+    /// What an OmniRoute gateway offers, from its last probe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gateway: Option<crate::omniroute::Catalog>,
 }
 
 impl EngineState {
@@ -423,6 +447,29 @@ impl EngineState {
     pub fn demoted(&self) -> bool {
         self.demoted_at.is_some()
     }
+
+    /// Why a free tier is flagged, while the flag lasts.
+    #[must_use]
+    pub fn free_tier_flag(&self, now: DateTime<Utc>) -> Option<String> {
+        let at = self.free_tier_flagged_at?;
+        (now.signed_duration_since(at)
+            < chrono::Duration::days(ferryman_channel::policy::FLAG_DAYS))
+        .then(|| self.free_tier_flag.clone())
+        .flatten()
+    }
+}
+
+/// Flag a free-tier engine that asked for money. Returns whether it was not flagged
+/// already, so the master is told once rather than on every failure.
+pub fn flag_free_tier(agent: &str, engine: &str, reason: &str, now: DateTime<Utc>) -> bool {
+    let mut fresh = false;
+    update(agent, |ledger| {
+        let state = ledger.entry(engine);
+        fresh = state.free_tier_flag(now).is_none();
+        state.free_tier_flag = Some(clip(reason));
+        state.free_tier_flagged_at = Some(now);
+    });
+    fresh
 }
 
 /// Every engine one agent runs on this machine.
@@ -687,6 +734,125 @@ pub fn all_exhausted(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) 
         }
     }
     Some(format!("every engine is out of credit: {}", why.join("; ")))
+}
+
+// --- the engine policy ------------------------------------------------------------------
+
+/// The engines as the policy sees them: each configured one, with a gateway's (OmniRoute's)
+/// paid class and route read from its last probe, followed by one engine per combo and
+/// free model the gateway offers. What a worker publishes and chooses among.
+#[must_use]
+pub fn effective_specs(specs: &[EngineSpec], ledger: &Ledger) -> Vec<EngineSpec> {
+    specs
+        .iter()
+        .flat_map(|spec| crate::omniroute::expand(spec, ledger.state(&spec.name).gateway.as_ref()))
+        .collect()
+}
+
+/// This worker's engines as the engine policy ranks them: the same lines it publishes,
+/// so a local choice and the fleet's view of it can never disagree.
+#[must_use]
+pub fn candidates(
+    agent: &str,
+    machine: &str,
+    specs: &[EngineSpec],
+    ledger: &Ledger,
+    now: DateTime<Utc>,
+) -> Vec<ferryman_channel::policy::Candidate> {
+    reports(specs, ledger, now)
+        .iter()
+        .enumerate()
+        .map(|(order, report)| {
+            ferryman_channel::policy::Candidate::from_report(agent, machine, order, report)
+        })
+        .collect()
+}
+
+/// The engine to run next for background work in `role`, skipping those already
+/// `tried`: the policy's choice, or why there is none. Never falls back to an engine the
+/// policy blocks - with nothing allowed, the work waits.
+///
+/// `tier` is the order's tier for build and chore work; plan and review ignore it.
+#[allow(clippy::too_many_arguments)]
+pub fn choose(
+    specs: &[EngineSpec],
+    ledger: &Ledger,
+    now: DateTime<Utc>,
+    policy: &ferryman_channel::policy::Policy,
+    role: ferryman_channel::policy::Role,
+    tier: Tier,
+    tried: &[String],
+    (agent, machine): (&str, &str),
+) -> std::result::Result<EngineSpec, String> {
+    let specs = effective_specs(specs, ledger);
+    let all = candidates(agent, machine, &specs, ledger, now);
+    let ranking = ferryman_channel::policy::rank(
+        policy,
+        role,
+        tier.as_str(),
+        ferryman_channel::policy::Work::Background,
+        &all,
+    );
+    ranking
+        .order
+        .iter()
+        .map(|index| &specs[*index])
+        .find(|spec| !tried.contains(&spec.name))
+        .cloned()
+        .ok_or_else(|| {
+            if ranking.order.is_empty() {
+                ranking.why_none(role, &all)
+            } else {
+                format!(
+                    "every allowed engine for {} work was tried ({})",
+                    role.as_str(),
+                    tried.join(", ")
+                )
+            }
+        })
+}
+
+/// The engine to run next for a person's own order: [`pick`], except that a policy whose
+/// `never` applies to all work is honoured. Subscriptions are never protected from the
+/// person who pays for them.
+#[must_use]
+pub fn pick_direct<'a>(
+    specs: &'a [EngineSpec],
+    ledger: &Ledger,
+    now: DateTime<Utc>,
+    wanted: Tier,
+    tried: &[String],
+    policy: &ferryman_channel::policy::Policy,
+    (agent, machine): (&str, &str),
+) -> Option<&'a EngineSpec> {
+    if policy.never_applies_to != ferryman_channel::policy::NeverScope::All {
+        return pick(specs, ledger, now, wanted, tried);
+    }
+    let all = candidates(agent, machine, specs, ledger, now);
+    let mut skip = tried.to_vec();
+    for (spec, candidate) in specs.iter().zip(&all) {
+        if policy
+            .blocked(candidate, ferryman_channel::policy::Work::Direct)
+            .is_some()
+        {
+            skip.push(spec.name.clone());
+        }
+    }
+    pick(specs, ledger, now, wanted, &skip)
+}
+
+/// The host of an endpoint URL, never more: no path, no credentials, no port.
+#[must_use]
+pub fn url_host(url: &str) -> Option<String> {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?;
+    let host = if host.starts_with('[') {
+        host.split(']').next().map(|h| format!("{h}]"))?
+    } else {
+        host.split(':').next()?.to_string()
+    };
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
 // --- trust: whether an engine's claims hold up ------------------------------------------
@@ -1085,6 +1251,9 @@ pub struct ChatRun {
     /// Why it failed, as the provider said it. Never carries the key.
     pub detail: String,
     pub usage: Option<TokenUsage>,
+    /// Dollars, when the provider itself said what the request cost (OpenRouter's
+    /// `usage.cost`, say). A free tier that reports a cost is flagged.
+    pub cost_usd: Option<f64>,
     /// Nothing answered at all.
     pub unreachable: bool,
 }
@@ -1147,6 +1316,13 @@ pub async fn chat(
         .and_then(|value| value.to_str().ok())
         .map(|value| format!(" retry-after: {value}"))
         .unwrap_or_default();
+    // OmniRoute says what each request cost, $0 for a free route.
+    let gateway_cost = response
+        .headers()
+        .get("x-omniroute-response-cost")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
         return ChatRun {
@@ -1157,7 +1333,9 @@ pub async fn chat(
             ..ChatRun::default()
         };
     }
-    chat_reply(&text)
+    let mut run = chat_reply(&text);
+    run.cost_usd = run.cost_usd.or(gateway_cost);
+    run
 }
 
 /// Read an OpenAI-shaped chat completion.
@@ -1188,10 +1366,15 @@ fn chat_reply(body: &str) -> ChatRun {
             completion_tokens: usage.get("completion_tokens")?.as_u64()?,
         })
     });
+    let cost_usd = value["usage"]["cost"]
+        .as_f64()
+        .or_else(|| value["cost"].as_f64())
+        .filter(|cost| cost.is_finite() && *cost >= 0.0);
     if answer.is_empty() {
         return ChatRun {
             detail: "the reply carried no answer".to_string(),
             usage,
+            cost_usd,
             ..ChatRun::default()
         };
     }
@@ -1199,13 +1382,23 @@ fn chat_reply(body: &str) -> ChatRun {
         ok: true,
         text: answer,
         usage,
+        cost_usd,
         ..ChatRun::default()
     }
 }
 
-/// Canned replies for tests: `fake://ok:<answer>`, `fake://quota`, `fake://down`.
+/// Canned replies for tests: `fake://ok:<answer>`, `fake://quota`, `fake://down`, and
+/// `fake://paid:<answer>`, an answer whose provider says it cost a cent.
 #[cfg(test)]
 fn fake_chat(canned: &str) -> ChatRun {
+    if let Some(answer) = canned.strip_prefix("paid:") {
+        return ChatRun {
+            ok: true,
+            text: answer.to_string(),
+            cost_usd: Some(0.01),
+            ..ChatRun::default()
+        };
+    }
     match canned {
         "quota" => ChatRun {
             detail: "HTTP 402: Insufficient Balance".to_string(),
@@ -1236,6 +1429,8 @@ pub struct Probe {
     /// The provider's balance endpoint says there is credit.
     pub funded: Option<bool>,
     pub balance: Option<String>,
+    /// What an OmniRoute gateway offers.
+    pub catalog: Option<crate::omniroute::Catalog>,
 }
 
 /// Probe one engine: list its models (or ask for one token), and read its balance where
@@ -1303,6 +1498,12 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
             let said = clip(&redact(&format!("HTTP {status}: {body}"), key));
             match status {
                 200..=299 => {
+                    if !spec.probe_chat && crate::omniroute::is_omniroute(spec) {
+                        found.catalog = Some(crate::omniroute::Catalog {
+                            models: crate::omniroute::parse_models(&body),
+                            ..Default::default()
+                        });
+                    }
                     if !spec.probe_chat
                         && let Some(model) = &spec.model
                         && let Some(ids) = model_ids(&body)
@@ -1322,6 +1523,25 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
     }
     if let Some(key) = key {
         balance(&http, base, key, &mut found).await;
+    }
+    // A combo's steps, when OmniRoute lets this key read them: what decides whether a
+    // route ends at somebody's plan.
+    if let Some(catalog) = found.catalog.as_mut() {
+        let mut request = http.get(format!("{}/api/combos", crate::omniroute::api_root(base)));
+        if let Some(key) = key {
+            request = request.bearer_auth(key);
+        }
+        if let Ok(response) = request.send().await
+            && response.status().is_success()
+            && let Some(combos) = response
+                .text()
+                .await
+                .ok()
+                .and_then(|body| crate::omniroute::parse_combos(&body))
+        {
+            catalog.combos = combos;
+            catalog.combos_known = true;
+        }
     }
     found
 }
@@ -1400,6 +1620,9 @@ pub fn apply_probe(ledger: &mut Ledger, engine: &str, probe: &Probe, now: DateTi
     state.down = probe.down.clone();
     if probe.balance.is_some() {
         state.balance = probe.balance.clone();
+    }
+    if probe.catalog.is_some() {
+        state.gateway.clone_from(&probe.catalog);
     }
     if let Some(reason) = &probe.exhausted {
         if state.exhausted_until.is_none_or(|until| until <= now) {
@@ -1484,9 +1707,30 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
                 balance: state.balance.clone(),
                 checked_at: state.checked_at,
                 trust: trust(&state),
+                billing: Some(billing(spec, &state, now)),
             }
         })
         .collect()
+}
+
+/// What the engine policy ranks by, as this machine knows it.
+fn billing(
+    spec: &EngineSpec,
+    state: &EngineState,
+    now: DateTime<Utc>,
+) -> ferryman_channel::receipts::EngineBilling {
+    let this_week = state.week == iso_week(now);
+    ferryman_channel::receipts::EngineBilling {
+        host: spec.base_url.as_deref().and_then(url_host),
+        capped: spec.weekly_usd.is_some() || spec.weekly_requests.is_some(),
+        week: iso_week(now),
+        requests: if this_week { state.requests } else { 0 },
+        spend_usd: if this_week { state.spend_usd } else { 0.0 },
+        flag: (spec.paid == Paid::FreeTier)
+            .then(|| state.free_tier_flag(now))
+            .flatten(),
+        route: spec.route.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -1521,6 +1765,8 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 
@@ -1786,6 +2032,118 @@ engine.local.tier = "chore"
         assert!(!text.contains("NVIDIA_API_KEY"), "{text}");
         assert!(!text.contains("secret:"), "{text}");
         assert_eq!(reports[0].state, "unknown");
+    }
+
+    /// `never` is never used for background work, not even when it is the only engine
+    /// up and `pick` would have taken it: the work waits, with the reason.
+    #[test]
+    fn background_work_never_falls_back_to_a_blocked_engine() {
+        use ferryman_channel::policy::{NeverScope, Policy, Role};
+        let now = monday_noon();
+        let mut claude = http("claude", Tier::Judge, "https://api.anthropic.com/v1");
+        claude.paid = Paid::Subscription;
+        let mut nemotron = http(
+            "nemotron",
+            Tier::Build,
+            "https://integrate.api.nvidia.com/v1",
+        );
+        nemotron.paid = Paid::FreeTier;
+        let specs = vec![claude, nemotron];
+        let ledger = Ledger::default();
+        let here = ("wisp", "grouchly");
+        let auto = Policy::default();
+        assert_eq!(
+            choose(
+                &specs,
+                &ledger,
+                now,
+                &auto,
+                Role::Build,
+                Tier::Build,
+                &[],
+                here
+            )
+            .unwrap()
+            .name,
+            "nemotron"
+        );
+        let tried = vec!["nemotron".to_string()];
+        let held = choose(
+            &specs,
+            &ledger,
+            now,
+            &auto,
+            Role::Build,
+            Tier::Build,
+            &tried,
+            here,
+        )
+        .unwrap_err();
+        assert!(held.contains("was tried"), "{held}");
+        assert_eq!(
+            pick(&specs, &ledger, now, Tier::Build, &tried)
+                .unwrap()
+                .name,
+            "claude",
+            "the old rule would have fallen back to the subscription"
+        );
+        let never_nvidia = Policy {
+            never: vec!["host:nvidia.com".into()],
+            ..Policy::default()
+        };
+        let why = choose(
+            &specs,
+            &ledger,
+            now,
+            &never_nvidia,
+            Role::Build,
+            Tier::Build,
+            &[],
+            here,
+        )
+        .unwrap_err();
+        assert!(
+            why.contains("nemotron on grouchly never") && why.contains("claude on grouchly"),
+            "{why}"
+        );
+        // A person's own order may use anything - unless never says all work.
+        assert_eq!(
+            pick_direct(&specs, &ledger, now, Tier::Build, &[], &never_nvidia, here)
+                .unwrap()
+                .name,
+            "nemotron"
+        );
+        let everything = Policy {
+            never_applies_to: NeverScope::All,
+            ..never_nvidia
+        };
+        assert_eq!(
+            pick_direct(&specs, &ledger, now, Tier::Build, &[], &everything, here)
+                .unwrap()
+                .name,
+            "claude"
+        );
+    }
+
+    #[test]
+    fn only_the_host_of_an_endpoint_is_published() {
+        assert_eq!(
+            url_host("https://integrate.api.nvidia.com/v1").as_deref(),
+            Some("integrate.api.nvidia.com")
+        );
+        assert_eq!(
+            url_host("http://user:pass@LOCALHOST:1234/v1").as_deref(),
+            Some("localhost")
+        );
+        assert_eq!(url_host("http://[::1]:8080/").as_deref(), Some("[::1]"));
+        let mut spec = http("n", Tier::Build, "https://a.example/v1");
+        spec.weekly_usd = Some(3.0);
+        let billing = reports(&[spec], &Ledger::default(), monday_noon())[0]
+            .billing
+            .clone()
+            .unwrap();
+        assert_eq!(billing.host.as_deref(), Some("a.example"));
+        assert!(billing.capped);
     }
 
     /// Repeated refutations inside the window demote an engine to chore work; build

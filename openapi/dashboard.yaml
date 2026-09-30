@@ -204,6 +204,142 @@ paths:
         '200': {description: 'how many were switched, and per project: switched, already, mastered by, no master or error'}
         '401': {description: no active session}
         '403': {description: dashboard is read-only}
+  /api/engine-policy:
+    get:
+      summary: The engine policy background work runs under, and what auto recommends
+      description: >
+        Which engines do this project's background work (self-improve planning,
+        building and review), in what order, which never, and on which machines: the
+        master-signed ENGINE_POLICY, or auto when none is signed (local and free engines
+        first, subscriptions never). `effective` is how it falls on the engines the
+        fleet published - each role's engines in order, and every blocked engine with
+        the reason. `recommended` is what auto would sign, with one reason per choice.
+        `may_set` is true only for the signed-in master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, self_improve and may_set'}
+        '401': {description: no active session}
+    post:
+      summary: The master signs an engine policy, or goes back to auto
+      description: >
+        Signs `policy` with the session's key into the channel, where every machine
+        reads it; `null` goes back to auto. `all` does it in every project in the ferry
+        root the person is master of. The CLI equivalent is `ferry engines policy set`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                policy:
+                  type: object
+                  nullable: true
+                  properties:
+                    prefer: {type: object, additionalProperties: {type: array, items: {type: string}}}
+                    never: {type: array, items: {type: string}}
+                    where: {type: array, items: {type: string}}
+                    caps_usd: {type: object, additionalProperties: {type: number}}
+                    protect_subscriptions: {type: boolean}
+                    never_applies_to: {type: string, enum: [background, all]}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: a role, selector or cap that means nothing}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/engine-policy/accept:
+    post:
+      summary: The master signs what auto recommends
+      description: >
+        Signs the recommended engine policy, computed from each project's own fleet.
+        `all` does it in every project the person is master of. The CLI equivalent is
+        `ferry engines policy accept`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/engine-policy/choose:
+    post:
+      summary: The master picks the improvement engine and the review engine
+      description: >
+        The simple choice. `improve` goes first for planning and building, `review` first
+        for review - the first of the two keys every improvement needs before it can go
+        live. `recommended` uses what auto recommends for both. The rest of the policy is
+        kept. `auto_merge` is `none` or `low-risk`: whether fm merges an improvement on its
+        own once it holds both keys, when every changed file is docs, tests or a dependency
+        version bump. `all` does it in every project the person is master of. The CLI
+        equivalent is `ferry engines policy set --improve <sel> --review <sel> --auto-merge <mode>`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                improve: {type: string}
+                review: {type: string}
+                recommended: {type: boolean}
+                auto_merge: {type: string, enum: [none, low-risk]}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: nothing picked, or an auto_merge that is neither none nor low-risk}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/improve/pending:
+    get:
+      summary: Improvements waiting on a key
+      description: >
+        Every improvement whose newest result is not yet approved for live: its diff stat,
+        what its evidence says, the review engine's verdict when it has given the first key,
+        and whether only the master's approval is missing (`ready_for_you`). `may_decide` is
+        true only for the signed-in master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'project, may_decide and waiting'}
+        '401': {description: no active session}
+  /api/improve/decide:
+    post:
+      summary: The master's key - approve an improvement for live, or send it back
+      description: >
+        Signed with the session's key. Approving is refused until the policy's review
+        engine has accepted the same revision, on a result whose evidence passes
+        verification; sending back needs notes. Nothing merges: an approved improvement is
+        "approved, ready to merge", and merging stays the master's act.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [order, accept]
+              properties:
+                order: {type: string}
+                accept: {type: boolean}
+                notes: {type: string}
+      responses:
+        '200': {description: 'the order, the revision decided and its state'}
+        '401': {description: no active session}
+        '403': {description: read-only, not the master, or the review engine has not given its key}
   /api/delegations:
     get:
       summary: Who may act for the master here, and whether each delegation counts

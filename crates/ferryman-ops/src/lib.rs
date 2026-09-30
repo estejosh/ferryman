@@ -24,6 +24,7 @@ pub mod eval;
 pub mod governor;
 pub mod identity;
 pub mod improve;
+pub mod omniroute;
 pub mod priority;
 pub mod runlog;
 pub mod soak;

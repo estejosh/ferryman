@@ -734,6 +734,41 @@ pub struct EngineReport {
     /// `None` until one of its results has been checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust: Option<EngineTrust>,
+    /// What the engine policy ranks by: where it is served from, whether a weekly cap
+    /// bounds it, what it spent this week, and whether a free tier asked for money.
+    /// `None` from a worker older than the engine policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<EngineBilling>,
+}
+
+/// How one engine is billed, as far as the worker running it can tell. Never a
+/// credential: the host is the endpoint's host name only.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct EngineBilling {
+    /// The endpoint's host, e.g. `integrate.api.nvidia.com`. `None` for a CLI engine
+    /// that names no endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// A weekly request or dollar cap is set in agent.toml.
+    #[serde(default)]
+    pub capped: bool,
+    /// The ISO week the counts are for.
+    #[serde(default)]
+    pub week: String,
+    #[serde(default)]
+    pub requests: u64,
+    /// Dollars spent this week: what the provider reported, else list prices. A free
+    /// tier or local engine counts nothing unless its provider reports a cost.
+    #[serde(default)]
+    pub spend_usd: f64,
+    /// Why a free-tier engine is flagged - it asked for payment, ran out of quota or
+    /// reported a cost - while the flag lasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+    /// For a gateway engine (OmniRoute): the provider/models its route ends at, so a
+    /// policy can see - and block - what is really behind it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route: Vec<String>,
 }
 
 /// What a worker's own evidence says about how far one engine's (and so one model's)
@@ -1382,6 +1417,7 @@ mod tests {
             balance: None,
             checked_at: Some(Utc::now()),
             trust: None,
+            billing: None,
         }
     }
 

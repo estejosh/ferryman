@@ -414,6 +414,14 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/improve", get(improve_get).post(improve_set))
         .route("/api/improve/all", post(improve_all))
         .route(
+            "/api/engine-policy",
+            get(engine_policy_get).post(engine_policy_set),
+        )
+        .route("/api/engine-policy/accept", post(engine_policy_accept))
+        .route("/api/engine-policy/choose", post(engine_policy_choose))
+        .route("/api/improve/pending", get(improve_pending))
+        .route("/api/improve/decide", post(improve_decide))
+        .route(
             "/api/delegations",
             get(delegations_get).post(delegations_set),
         )
@@ -1813,6 +1821,15 @@ async fn improve_get(
         "may_set": may_set,
         "last_run": ferryman_channel::ferry::improve_last_run(channel)
             .map(|(week, steps)| json!({ "week": week, "steps": steps })),
+        // Which engine and model, on which machine, did each step of the last run.
+        "who": ferryman_channel::ferry::improve_last_run(channel)
+            .map(|(week, _)| {
+                ferryman_channel::policy::latest_steps(&route, &week)
+                    .iter()
+                    .map(ferryman_channel::policy::Step::describe)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
         "engines": engines,
     })))
 }
@@ -1958,6 +1975,300 @@ async fn improve_all(
         "enabled": body.enabled,
         "switched": switched,
         "projects": projects,
+    })))
+}
+
+/// GET /api/engine-policy - the engine policy this project's background work runs under:
+/// who signed it (or auto), what it says, how it falls on the engines the fleet
+/// published - each role's engines in order, every blocked engine and why - and what
+/// auto would recommend, with one reason per choice. `may_set` is true only for the
+/// signed-in master.
+async fn engine_policy_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::policy;
+    let route = state.route_for(params.project.as_deref());
+    let channel = &route.communications;
+    let (current, setting) = policy::effective(channel, &route.project_id);
+    let now = chrono::Utc::now();
+    let fleet = policy::fleet(&route, now);
+    let recommended = policy::recommend_for(&route, now);
+    let master = ferryman_channel::ferry::master_of(channel).ok().flatten();
+    let may_set = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    Ok(Json(json!({
+        "project": route.project_id,
+        "auto": setting.as_ref().is_none_or(|s| s.policy.is_none()),
+        "set_by": setting.as_ref().map(policy::PolicySetting::set_by),
+        "set_at": setting.as_ref().map(|s| s.set_at),
+        "policy": current,
+        "describe": current.describe(),
+        "effective": policy::view(&current, &fleet),
+        "choices": policy::choices(&current, &fleet, &recommended.policy),
+        "recommended": { "policy": recommended.policy, "reasons": recommended.reasons },
+        "self_improve": ferryman_channel::ferry::self_improve_enabled(channel, &route.project_id),
+        "may_set": may_set,
+    })))
+}
+
+#[derive(Deserialize)]
+struct EnginePolicyBody {
+    /// The new policy; `null` goes back to auto.
+    policy: Option<ferryman_channel::policy::Policy>,
+    /// Every project the signed-in master is master of, not only this one.
+    #[serde(default)]
+    all: bool,
+}
+
+#[derive(Deserialize, Default)]
+struct AcceptBody {
+    #[serde(default)]
+    all: bool,
+}
+
+/// Sign a policy for the project on screen, or with `all` every project in the ferry
+/// root, as the signed-in person, who must be each one's master. `policy_for` gives the
+/// policy for a project's route.
+fn sign_policies(
+    state: &DashboardState,
+    current: &ferryman_channel::AgentIdentity,
+    project: Option<&str>,
+    all: bool,
+    policy_for: impl Fn(&ferryman_channel::ProjectRoute) -> Option<ferryman_channel::policy::Policy>,
+) -> Result<Json<Value>, DashboardError> {
+    let mut changed = 0;
+    let mut outcomes = Vec::new();
+    // The project on screen is the state's own route; "all" finds each channel's.
+    let routes: Vec<(String, Result<ferryman_channel::ProjectRoute, String>)> = if all {
+        every_project(state)
+            .into_iter()
+            .map(|(id, channel)| {
+                let route = ferryman_channel::route_for(&channel)
+                    .map_err(|error| format!("{error:#}"))
+                    .and_then(|route| {
+                        if route.project_id == id {
+                            Ok(route)
+                        } else {
+                            Err(format!("{} is not {id}", channel.display()))
+                        }
+                    });
+                (id, route)
+            })
+            .collect()
+    } else {
+        let route = state.route_for(project);
+        vec![(route.project_id.clone(), Ok(route.as_ref().clone()))]
+    };
+    for (id, route) in routes {
+        let outcome = match route {
+            Err(error) => format!("error: {error}"),
+            Ok(route) => match ferryman_channel::policy::set_policy(
+                &route.communications,
+                &id,
+                policy_for(&route),
+                current,
+            ) {
+                Ok(true) => {
+                    changed += 1;
+                    let _ = ferryman_channel::ledger::append_ledger_entry(
+                        &route,
+                        current,
+                        "engine-policy",
+                        current.name(),
+                        &format!("{} set the engine policy for {id}", current.name()),
+                        None,
+                    );
+                    "set".to_string()
+                }
+                Ok(false) => "already".to_string(),
+                // One project refusing does not stop the rest; alone, it is the answer.
+                Err(error) if all => format!("skipped: {error:#}"),
+                Err(error) => return Err((StatusCode::FORBIDDEN, format!("{error:#}"))),
+            },
+        };
+        outcomes.push(json!({ "project": id, "outcome": outcome }));
+    }
+    Ok(Json(json!({ "changed": changed, "projects": outcomes })))
+}
+
+/// POST /api/engine-policy - the master sets (or, with `null`, clears) the engine policy,
+/// signed with the session's key; `all` does it for every project they are master of.
+async fn engine_policy_set(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<EnginePolicyBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    if let Some(policy) = &body.policy {
+        policy
+            .check()
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    }
+    sign_policies(
+        &state,
+        &current,
+        params.project.as_deref(),
+        body.all,
+        |_| body.policy.clone(),
+    )
+}
+
+/// POST /api/engine-policy/accept - sign what auto recommends, from each project's own
+/// fleet.
+async fn engine_policy_accept(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<AcceptBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    sign_policies(
+        &state,
+        &current,
+        params.project.as_deref(),
+        body.all,
+        |route| Some(ferryman_channel::policy::recommend_for(route, chrono::Utc::now()).policy),
+    )
+}
+
+#[derive(Deserialize)]
+struct ChooseBody {
+    /// The selector that improves (plans and builds) first.
+    #[serde(default)]
+    improve: Option<String>,
+    /// The selector that reviews first.
+    #[serde(default)]
+    review: Option<String>,
+    /// Use what auto recommends for both.
+    #[serde(default)]
+    recommended: bool,
+    /// `none` or `low-risk`: whether fm merges docs, tests and dependency bumps on its
+    /// own once both keys are there.
+    #[serde(default)]
+    auto_merge: Option<String>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// POST /api/engine-policy/choose - the simple choice: the improvement engine and the
+/// review engine, or what auto recommends for both. Everything else in the policy stays.
+async fn engine_policy_choose(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<ChooseBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let auto_merge = body
+        .auto_merge
+        .as_deref()
+        .map(ferryman_channel::policy::AutoMerge::parse)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    if body.improve.is_none() && body.review.is_none() && !body.recommended && auto_merge.is_none()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "pick an improvement engine, a review engine, the recommended ones, or auto-merge"
+                .to_string(),
+        ));
+    }
+    sign_policies(
+        &state,
+        &current,
+        params.project.as_deref(),
+        body.all,
+        |route| {
+            let (mut policy, _) =
+                ferryman_channel::policy::effective(&route.communications, &route.project_id);
+            if body.recommended {
+                let recommended =
+                    ferryman_channel::policy::recommend_for(route, chrono::Utc::now()).policy;
+                if let Some(improve) = recommended.improvement_engine() {
+                    policy.set_improvement_engine(improve);
+                }
+                if let Some(review) = recommended.review_engine() {
+                    policy.set_review_engine(review);
+                }
+            }
+            if let Some(improve) = body.improve.as_deref().filter(|s| !s.trim().is_empty()) {
+                policy.set_improvement_engine(improve);
+            }
+            if let Some(review) = body.review.as_deref().filter(|s| !s.trim().is_empty()) {
+                policy.set_review_engine(review);
+            }
+            if let Some(mode) = auto_merge {
+                policy.auto_merge = mode;
+            }
+            Some(policy)
+        },
+    )
+}
+
+/// GET /api/improve/pending - improvements waiting on a key: the review engine's verdict,
+/// then the master's approval. Each with its diff stat, its evidence, and what the
+/// review engine said.
+async fn improve_pending(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let master = ferryman_channel::ferry::master_of(&route.communications)
+        .ok()
+        .flatten();
+    let may_decide = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    Ok(Json(json!({
+        "project": route.project_id,
+        "may_decide": may_decide,
+        "waiting": ferryman_channel::gate::waiting(&route),
+    })))
+}
+
+#[derive(Deserialize)]
+struct DecideBody {
+    order: String,
+    accept: bool,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+/// POST /api/improve/decide - the master's key: approve an improvement for live, or send
+/// it back with notes. Refused until the review engine has given the first key. Nothing
+/// merges: an approved improvement is "approved, ready to merge".
+async fn improve_decide(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<DecideBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let route = state.route_for(params.project.as_deref());
+    let revision = ferryman_channel::gate::decide(
+        &route,
+        &body.order,
+        body.accept,
+        body.notes.as_deref(),
+        current.name(),
+        &current,
+    )
+    .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    Ok(Json(json!({
+        "order": body.order,
+        "revision": revision,
+        "state": if body.accept { "approved, ready to merge" } else { "sent back" },
     })))
 }
 
@@ -3698,6 +4009,8 @@ mod tests {
             "/api/memory",
             "/api/cost/rates",
             "/api/improve",
+            "/api/engine-policy",
+            "/api/improve/pending",
         ] {
             let response = app
                 .clone()
@@ -4627,6 +4940,160 @@ mod tests {
             task.reviews[0].signature.is_some(),
             "the verdict must be signed"
         );
+    }
+
+    /// The engine policy from the browser: auto until the master signs one, what auto
+    /// recommends and why, accept and edit for the master only, and back to auto.
+    #[tokio::test]
+    async fn only_the_master_sets_the_engine_policy_from_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let before = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(before["auto"], true, "{before}");
+        assert_eq!(before["may_set"], false, "nobody is master yet");
+        assert_eq!(before["policy"]["protect_subscriptions"], true);
+        assert!(before["recommended"]["reasons"].is_array(), "{before}");
+        let refused = post(&app, "/api/engine-policy/accept", "{}", Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let accepted = post(&app, "/api/engine-policy/accept", "{}", Some(&token)).await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let after = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(after["auto"], false, "{after}");
+        assert_eq!(after["may_set"], true);
+        assert_eq!(after["set_by"], "alice");
+
+        let edit = r#"{"policy":{"prefer":{"build":["nemotron","deepseek"]},"never":["claude"],"where":["grouchly"]}}"#;
+        let set = post(&app, "/api/engine-policy", edit, Some(&token)).await;
+        assert_eq!(set.status(), StatusCode::OK);
+        let (policy, setting) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        assert_eq!(setting.unwrap().set_by(), "alice");
+        assert_eq!(policy.never, ["claude"]);
+        assert_eq!(policy.machines, ["grouchly"]);
+        assert!(policy.protect_subscriptions, "on unless said otherwise");
+        assert_eq!(
+            policy.preferences(ferryman_channel::policy::Role::Build),
+            ["nemotron", "deepseek"]
+        );
+        let nonsense = post(
+            &app,
+            "/api/engine-policy",
+            r#"{"policy":{"prefer":{"dance":["x"]}}}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(nonsense.status(), StatusCode::BAD_REQUEST);
+
+        let cleared = post(
+            &app,
+            "/api/engine-policy",
+            r#"{"policy":null}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let back = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(back["auto"], true, "{back}");
+    }
+
+    /// The simple choice from the browser, and the improvements waiting for the master:
+    /// approving one the review engine has not reviewed is refused.
+    #[tokio::test]
+    async fn the_master_picks_engines_and_cannot_approve_before_the_review_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        // The worker is on the route's roster, so its signed result is read.
+        let wisp = ferryman_channel::AgentIdentity::from_seed("wisp", [5; 32]);
+        let mut known = test_route(dir.path());
+        known.agents.push(ferryman_channel::AgentRoute {
+            name: "wisp".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(wisp.public_key_hex()),
+            encryption_key: None,
+        });
+        let route = Arc::new(known);
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        // alice, signed in, is the channel's master, by the key her session signs with.
+        let alice = dashboard_state.sessions.resolve(&token).unwrap();
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "alice".into(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: Some(alice.public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        ferryman_channel::master::initialize_master(&route, &alice, "alice").unwrap();
+
+        let chosen = post(
+            &app,
+            "/api/engine-policy/choose",
+            r#"{"improve":"name:nemotron","review":"name:deepseek"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(chosen.status(), StatusCode::OK);
+        let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(
+            view["choices"]["current"]["improve"], "name:nemotron",
+            "{view}"
+        );
+        assert_eq!(view["choices"]["current"]["review"], "name:deepseek");
+        let empty = post(&app, "/api/engine-policy/choose", "{}", Some(&token)).await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        let mut improvement = order("improve-2026-w40-1");
+        improvement.payload = json!({ "task": "better", "tags": ["improvement"], "improvement": { "title": "Better errors" } });
+        improvement.requires_review = true;
+        ferryman_channel::issue_order(&route, &improvement).unwrap();
+        ferryman_channel::claim_order(&route, "improve-2026-w40-1", "wisp").unwrap();
+        let mut result = TaskResult {
+            order_id: "improve-2026-w40-1".into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "done", "evidence": { "recorded_by": "worker", "git": true, "commits": ["abc1234 better"], "diff_stat": "2 files changed" } }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp.sign_result(&mut result);
+        ferryman_channel::submit_result(&route, &result).unwrap();
+
+        let pending = get_json(&app, "/api/improve/pending", Some(&token)).await;
+        assert_eq!(pending["may_decide"], true, "{pending}");
+        let waiting = &pending["waiting"][0];
+        assert_eq!(waiting["order_id"], "improve-2026-w40-1", "{pending}");
+        assert_eq!(waiting["ready_for_you"], false);
+        assert_eq!(waiting["diff_stat"], "2 files changed");
+
+        let early = post(
+            &app,
+            "/api/improve/decide",
+            r#"{"order":"improve-2026-w40-1","accept":true}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(early.status(), StatusCode::FORBIDDEN);
+        let body = early.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("review engine has not reviewed it"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let task = ferryman_channel::read_task(&route, "improve-2026-w40-1").unwrap();
+        assert!(!ferryman_channel::gate::approved_for_live(&route, &task));
     }
 
     /// Self-improve is off until the master switches it on, from the browser, and

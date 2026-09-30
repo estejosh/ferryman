@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+mod enginepolicy;
 mod gitanchor;
 mod license;
 mod licensor;
@@ -340,13 +341,20 @@ enum Command {
     ///
     /// Read from every channel's signed engines files, which each worker rewrites as
     /// its engines are probed: tier, how each is paid, and whether it is up, down, or
-    /// out of credit until when. Never shows a credential.
+    /// out of credit until when. Never shows a credential. Then the engine policy each
+    /// project runs under: which engines do its background work in which order, and
+    /// which are blocked and why.
+    ///
+    /// `ferry engines policy` shows, recommends, accepts and sets that policy.
+    #[command(args_conflicts_with_subcommands = true)]
     Engines {
         #[command(flatten)]
         at: Targets,
         /// Print JSON instead of a table.
         #[arg(long)]
         json: bool,
+        #[command(subcommand)]
+        command: Option<EnginesCommand>,
     },
     /// The weekly improvement loop: gather evidence, plan improvements as orders,
     /// review what was built, and report the week. Nothing is ever merged.
@@ -2253,6 +2261,16 @@ struct Targets {
 }
 
 #[derive(Subcommand, Clone)]
+enum EnginesCommand {
+    /// The engine policy: which engines do a project's background work (self-improve
+    /// planning, building and review), in what order, never which, and where.
+    Policy {
+        #[command(subcommand)]
+        command: enginepolicy::PolicyCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum ImproveCommand {
     /// Collect the last seven days of failures, send-backs, late orders, doctor
     /// findings, TODOs and engine records into improve/<week>/evidence.md.
@@ -2306,6 +2324,117 @@ enum ImproveCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Improvements waiting on a key. Each needs two before it can go live: the review
+    /// engine's verdict, then yours. Shows the diff stat, the evidence and what the review
+    /// engine said.
+    Pending {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Approve an improvement for live - the second key, after the review engine's.
+    /// Nothing merges: it becomes "approved, ready to merge", and merging stays yours.
+    Approve {
+        /// The order id, e.g. improve-2026-w40-1.
+        id: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        workspace: Option<PathBuf>,
+    },
+    /// Send an improvement back with what to change.
+    SendBack {
+        id: String,
+        #[arg(long)]
+        notes: String,
+        #[arg(long)]
+        project: Option<String>,
+        #[arg(long, conflicts_with = "project")]
+        workspace: Option<PathBuf>,
+    },
+}
+
+/// Sign the master's decision on an improvement, as its master.
+fn improve_decide(
+    id: &str,
+    project: Option<String>,
+    workspace: Option<PathBuf>,
+    accept: bool,
+    notes: Option<&str>,
+) -> Result<()> {
+    let (project, channel, attachment) = improve_project(&ImproveProject {
+        project,
+        workspace,
+        all: false,
+    })?;
+    let Some(master) = ferryman_channel::ferry::master_of(&channel)? else {
+        bail!("{project} has no master, and only its master approves an improvement for live");
+    };
+    let identity = signing_identity_in(&attachment, &master)?;
+    let route = ferryman_channel::route_for(&channel)?;
+    let revision = ferryman_channel::gate::decide(&route, id, accept, notes, &master, &identity)?;
+    if accept {
+        let (policy, _) = ferryman_channel::policy::effective(&channel, &project);
+        if policy.auto_merge == ferryman_channel::policy::AutoMerge::LowRisk {
+            println!(
+                "{id} r{revision} approved by {master}: both keys are there. Auto-merge is on: if \
+                 every file it changes is docs, tests or a dependency bump, the worker that built \
+                 it merges it; otherwise it waits for you, approved, ready to merge."
+            );
+        } else {
+            println!(
+                "{id} r{revision} approved by {master}: both keys are there - approved, ready to \
+                 merge. Nothing merges on its own; merge it when you are happy with it."
+            );
+        }
+    } else {
+        println!("{id} r{revision} sent back by {master}");
+    }
+    Ok(())
+}
+
+/// Every improvement waiting on a key, in every project here.
+fn improve_pending(as_json: bool) -> Result<()> {
+    let mut rows: Vec<Value> = Vec::new();
+    for route in target_routes(&Targets {
+        workspace: None,
+        comms: None,
+    })? {
+        for waiting in ferryman_channel::gate::waiting(&route) {
+            if !as_json {
+                println!(
+                    "{}  {}  r{} by {} - {}",
+                    route.project_id,
+                    waiting.order_id,
+                    waiting.revision,
+                    waiting.worker,
+                    waiting.title
+                );
+                println!("    {}", waiting.waiting_for);
+                if let Some(stat) = &waiting.diff_stat {
+                    println!("    diff: {stat}");
+                }
+                println!("    evidence: {}", waiting.evidence);
+                if let Some(engine) = &waiting.engine {
+                    println!("    review engine: {}", engine.describe());
+                }
+                if waiting.ready_for_you {
+                    println!(
+                        "    ferry improve approve {} --project {}   |   ferry improve send-back {} --notes \"...\"",
+                        waiting.order_id, route.project_id, waiting.order_id
+                    );
+                }
+            }
+            let mut row = serde_json::to_value(&waiting)?;
+            row["project"] = json!(route.project_id);
+            rows.push(row);
+        }
+    }
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else if rows.is_empty() {
+        println!("no improvement is waiting on a key");
+    }
+    Ok(())
 }
 
 /// The one project `ferry improve on|off` acts on.
@@ -2413,6 +2542,7 @@ fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
         let word = if enabled { "on" } else { "off" };
         let mut me: Option<String> = None;
         let mut changed = 0;
+        let mut on = Vec::new();
         for (project, channel, attachment) in mastered_targets(None, None)? {
             // An archived project is left alone: switching it on is refused anyway.
             // Switching off still reaches it, so it stays off when it is brought back.
@@ -2430,11 +2560,17 @@ fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
             me.get_or_insert(master);
             match ferryman_channel::ferry::set_self_improve(&channel, &project, enabled, &identity)
             {
-                Ok(true) => {
-                    changed += 1;
-                    println!("  {project}: self-improve {word}");
+                Ok(changed_now) => {
+                    if changed_now {
+                        changed += 1;
+                        println!("  {project}: self-improve {word}");
+                    } else {
+                        println!("  {project}: already {word}");
+                    }
+                    if enabled {
+                        on.push((project, channel, identity));
+                    }
                 }
-                Ok(false) => println!("  {project}: already {word}"),
                 Err(error) => println!("  {project}: skipped - {error:#}"),
             }
         }
@@ -2442,6 +2578,7 @@ fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
             "self-improve switched {word} in {changed} project(s), signed by {}",
             me.as_deref().unwrap_or("nobody")
         );
+        enginepolicy::offer(&on);
         return Ok(());
     }
     let (project, channel, attachment) = improve_project(which)?;
@@ -2461,6 +2598,9 @@ fn improve_switch(which: &ImproveProject, enabled: bool) -> Result<()> {
         );
     } else {
         println!("self-improve was already {word} for {project}");
+    }
+    if enabled {
+        enginepolicy::offer(&[(project, channel, identity)]);
     }
     Ok(())
 }
@@ -2484,6 +2624,20 @@ fn improve_status(as_json: bool) -> Result<()> {
         .map(|(project, channel)| {
             let setting = ferryman_channel::ferry::self_improve_setting(channel, project);
             let last = ferryman_ops::improve::last_run(channel);
+            // Which engine on which machine did each step of the last run, signed.
+            let route = ferryman_channel::route_for(channel).ok();
+            let who: Vec<ferryman_channel::policy::Step> = match (&route, &last) {
+                (Some(route), Some((week, _))) => {
+                    ferryman_channel::policy::latest_steps(route, week)
+                }
+                _ => Vec::new(),
+            };
+            let spend = match (&route, &last) {
+                (Some(route), Some((week, _))) => {
+                    ferryman_ops::improve::spend_by_engine(route, week)
+                }
+                _ => Vec::new(),
+            };
             json!({
                 "project": project,
                 "enabled": setting.as_ref().is_some_and(|s| s.enabled),
@@ -2492,6 +2646,14 @@ fn improve_status(as_json: bool) -> Result<()> {
                 "set_by": setting.as_ref().map(ferryman_channel::ferry::ImproveSetting::set_by),
                 "set_at": setting.as_ref().map(|s| s.set_at),
                 "last_run": last.map(|(week, steps)| json!({ "week": week, "steps": steps })),
+                "engine_policy": enginepolicy::source(
+                    ferryman_channel::policy::setting(channel, project).as_ref()
+                ),
+                "who": who,
+                "spend": spend
+                    .iter()
+                    .map(|(engine, machine, usd)| json!({ "engine": engine, "machine": machine, "usd": usd }))
+                    .collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -2534,8 +2696,67 @@ fn improve_status(as_json: bool) -> Result<()> {
             "{:<24} {state:<14} {set:<30} {last}",
             row["project"].as_str().unwrap_or_default()
         );
+        if row["enabled"].as_bool() == Some(true) {
+            println!(
+                "{:<24} engines: {}",
+                "",
+                row["engine_policy"].as_str().unwrap_or_default()
+            );
+        }
+        for step in row["who"].as_array().into_iter().flatten() {
+            if let Ok(step) = serde_json::from_value::<ferryman_channel::policy::Step>(step.clone())
+            {
+                println!("{:<24} {}", "", step.describe());
+            }
+        }
+        let spend: Vec<String> = row["spend"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|line| {
+                format!(
+                    "{} on {} ${:.2}",
+                    line["engine"].as_str().unwrap_or_default(),
+                    line["machine"].as_str().unwrap_or_default(),
+                    line["usd"].as_f64().unwrap_or_default()
+                )
+            })
+            .collect();
+        if !spend.is_empty() {
+            println!("{:<24} self-improve spend: {}", "", spend.join(", "));
+        }
     }
+    print_week_spend(&projects);
     Ok(())
+}
+
+/// What each engine spent this week on every kind of work, from the fleet's signed
+/// inventories - each worker counted once, however many channels it publishes into.
+fn print_week_spend(projects: &[(String, PathBuf)]) {
+    let mut seen: BTreeMap<(String, String, String), f64> = BTreeMap::new();
+    let now = chrono::Utc::now();
+    for (_, channel) in projects {
+        let Ok(route) = ferryman_channel::route_for(channel) else {
+            continue;
+        };
+        for engine in ferryman_channel::policy::fleet(&route, now) {
+            seen.entry((engine.name, engine.machine, engine.agent))
+                .or_insert(engine.spend_usd);
+        }
+    }
+    let spent: Vec<String> = seen
+        .iter()
+        .filter(|(_, usd)| **usd > 0.0)
+        .map(|((engine, machine, _), usd)| format!("{engine} on {machine} ${usd:.2}"))
+        .collect();
+    println!(
+        "\nThis week, every kind of work: {}",
+        if spent.is_empty() {
+            "nothing spent that any engine reported".to_string()
+        } else {
+            spent.join(", ")
+        }
+    );
 }
 
 /// Only the projects whose master has switched self-improve on, saying which were
@@ -2746,9 +2967,56 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             if let Some(trust) = &engine.trust {
                 println!("  {:<12} {}", "", trust.describe());
             }
+            if let Some(billing) = &engine.billing {
+                if billing.spend_usd > 0.0 || billing.requests > 0 {
+                    println!(
+                        "  {:<12} this week: {} request(s), ${:.2}",
+                        "", billing.requests, billing.spend_usd
+                    );
+                }
+                if let Some(flag) = &billing.flag {
+                    println!("  {:<12} FREE TIER FLAGGED: {flag}", "");
+                }
+            }
         }
     }
     print_checked_by_others(&checked);
+    print_policies(at)?;
+    Ok(())
+}
+
+/// The engine policy each project runs under, over the engines its fleet published.
+/// Projects whose policy falls the same way share one block.
+fn print_policies(at: &Targets) -> Result<()> {
+    let now = chrono::Utc::now();
+    let mut blocks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for route in target_routes(at)? {
+        let (policy, setting) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        let fleet = ferryman_channel::policy::fleet(&route, now);
+        let mut lines = vec![match &setting {
+            Some(setting) if setting.policy.is_some() => {
+                format!("signed by {}", setting.set_by())
+            }
+            _ => "auto: nobody has signed one".to_string(),
+        }];
+        lines.extend(policy.describe());
+        lines.extend(ferryman_channel::policy::summary(&policy, &fleet));
+        match blocks.iter_mut().find(|(_, shown)| *shown == lines) {
+            Some((projects, _)) => projects.push(route.project_id.clone()),
+            None => blocks.push((vec![route.project_id.clone()], lines)),
+        }
+    }
+    for (projects, lines) in blocks {
+        println!("\nEngine policy for {}:", projects.join(", "));
+        for line in lines {
+            println!("  {line}");
+        }
+    }
+    println!(
+        "\nChange it: ferry engines policy recommend | accept | set --prefer <engine> --never \
+         <engine> --where <machine> [--all]"
+    );
     Ok(())
 }
 
@@ -2805,6 +3073,13 @@ async fn improve_command(command: ImproveCommand) -> Result<()> {
             for route in switched_on(target_routes(&at)?, |route| route) {
                 let path = improve::report(&route, now)?;
                 println!("{}: {}", route.project_id, path.display());
+                let week = ferryman_ops::engines::iso_week(now);
+                for step in ferryman_channel::policy::latest_steps(&route, &week) {
+                    println!("  {}", step.describe());
+                }
+                for (engine, machine, usd) in improve::spend_by_engine(&route, &week) {
+                    println!("  spent: {engine} on {machine} ${usd:.2}");
+                }
             }
         }
         ImproveCommand::Run { at, max } => {
@@ -2833,6 +3108,18 @@ async fn improve_command(command: ImproveCommand) -> Result<()> {
         ImproveCommand::On { which } => improve_switch(&which, true)?,
         ImproveCommand::Off { which } => improve_switch(&which, false)?,
         ImproveCommand::Status { json } => improve_status(json)?,
+        ImproveCommand::Pending { json } => improve_pending(json)?,
+        ImproveCommand::Approve {
+            id,
+            project,
+            workspace,
+        } => improve_decide(&id, project, workspace, true, None)?,
+        ImproveCommand::SendBack {
+            id,
+            notes,
+            project,
+            workspace,
+        } => improve_decide(&id, project, workspace, false, Some(&notes))?,
     }
     Ok(())
 }
@@ -3533,7 +3820,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Cost { command } => cost_command(command)?,
-        Command::Engines { at, json } => engines_command(&at, json)?,
+        Command::Engines {
+            command: Some(EnginesCommand::Policy { command }),
+            ..
+        } => enginepolicy::command(command).await?,
+        Command::Engines { at, json, .. } => engines_command(&at, json)?,
         Command::Improve { command } => improve_command(command).await?,
         Command::License { command } => license_command(command).await?,
         Command::Telegram {
@@ -4322,6 +4613,8 @@ fn report_enable_json(
             // Checked now rather than discovered at first-task time: a missing
             // engine is the most common reason a fresh setup does nothing.
             "command_found": outcome.command_found,
+            // OmniRoute answers here and nothing uses it yet: see docs/ENGINE_SETUP.md.
+            "omniroute_available": outcome.omniroute_unused,
             "review": outcome.config.review.as_str(),
             "public_key": outcome.public_key,
             "already_configured": outcome.steps.iter().all(|s| !s.created),
@@ -4450,6 +4743,14 @@ fn report_enable_human(
              start. Install it, or edit command/args in .ferryman/agent.toml \
              (see docs/ENGINE_SETUP.md). Run 'ferry doctor' after fixing.",
             outcome.config.command
+        );
+    }
+    if outcome.omniroute_unused {
+        println!(
+            "  TIP      OmniRoute answers on this machine ({}): a free gateway to many \
+             providers. Add it as an engine - `ferry engines policy recommend` shows the \
+             lines for .ferryman/agent.toml, and docs/ENGINE_SETUP.md explains it.",
+            ferryman_ops::omniroute::DEFAULT_URL
         );
     }
     println!();

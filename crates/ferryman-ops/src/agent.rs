@@ -764,6 +764,8 @@ struct AgentRun {
     ok: bool,
     /// What the engine reported spending, when it reported it outside stdout.
     usage: Option<ferryman_channel::trajectory::TokenUsage>,
+    /// Dollars, when the provider said what the run cost outside stdout.
+    cost_usd: Option<f64>,
     /// An HTTP engine that nothing answered for.
     unreachable: bool,
 }
@@ -796,6 +798,7 @@ async fn run_engine(
                 stderr: run.detail,
                 ok: run.ok,
                 usage: run.usage,
+                cost_usd: run.cost_usd,
                 unreachable: run.unreachable,
             })
         }
@@ -942,6 +945,33 @@ fn engine_usage(stdout: &str) -> Option<ferryman_channel::trajectory::TokenUsage
         });
     }
     found
+}
+
+/// What the engine itself said the run cost, in dollars, when it printed a JSON line
+/// saying so: Claude Code's `total_cost_usd`, a `cost_usd`, or a `usage.cost`. The last
+/// one printed, as for [`engine_usage`].
+fn engine_cost(stdout: &str) -> Option<f64> {
+    let mut found = None;
+    for line in stdout.lines().map(str::trim).filter(|l| l.starts_with('{')) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if let Some(cost) = value
+            .get("total_cost_usd")
+            .or_else(|| value.get("cost_usd"))
+            .or_else(|| value.get("usage").and_then(|usage| usage.get("cost")))
+            .and_then(Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        {
+            found = Some(cost);
+        }
+    }
+    found
+}
+
+/// What a run cost by the provider's own account, when it gave one.
+fn reported_cost(run: &AgentRun) -> Option<f64> {
+    run.cost_usd.or_else(|| engine_cost(&run.stdout))
 }
 
 /// The engine's answer, dug out of a machine-readable event stream if that is what it
@@ -2325,6 +2355,10 @@ pub async fn work_once(
         }
         return Ok(0);
     }
+    // Low-risk improvements this worker built, with both keys, where the engine policy
+    // lets fm merge them: merged here, in the repository they were built in, before any
+    // new work starts from the default branch.
+    merge_approved(route, config, &identity, report);
     for task in waiting {
         let id = task.order.id.clone();
         // Trust boundary: never act on an order whose signature does not verify.
@@ -2341,17 +2375,11 @@ pub async fn work_once(
             // Without it an order addressed to a machine that never ran looks exactly like
             // one being worked on.
             TaskState::Open | TaskState::Offered { .. } => {
-                // Nothing here can run an order of this tier right now: leave it for a
-                // machine that can, rather than claim it and sit on it.
-                if crate::engines::pick(
-                    &config.engines,
-                    &crate::engines::Ledger::load(&config.agent),
-                    chrono::Utc::now(),
-                    order_tier(&task),
-                    &[],
-                )
-                .is_none()
-                {
+                // Nothing here can run an order of this tier right now - or, for an
+                // improvement order, nothing the engine policy allows, or this machine is
+                // not one it names: leave it for a machine that can, rather than claim it
+                // and sit on it.
+                if next_engine(route, config, &task, &[]).is_err() {
                     continue;
                 }
                 ferryman_channel::claim_order(route, &id, &config.agent)?;
@@ -2416,6 +2444,54 @@ pub async fn work_once(
         }
     }
     Ok(acted)
+}
+
+/// Merge what [`ferryman_channel::automerge::run`] allows - low-risk improvements this
+/// agent built, holding both keys, in a project whose engine policy says
+/// `auto_merge = "low-risk"` - record each merge in the ledger, and tell the master about
+/// each one it held back instead. Returns how many merged.
+pub fn merge_approved(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    report: &dyn Progress,
+) -> usize {
+    use ferryman_channel::automerge::Outcome;
+    let mut merged = 0;
+    let mut held = false;
+    for outcome in ferryman_channel::automerge::run(route, identity, config.push.as_deref()) {
+        let (kind, record) = match outcome {
+            Outcome::Merged(record) => {
+                merged += 1;
+                report.info(&format!("  {}", record.describe()));
+                ("merge", record)
+            }
+            Outcome::Held(record) => {
+                held = true;
+                report.warn(&format!("  {}", record.describe()));
+                ("merge-held", record)
+            }
+        };
+        if let Err(error) = ferryman_channel::ledger::append_ledger_entry(
+            route,
+            identity,
+            kind,
+            &config.agent,
+            &record.describe(),
+            Some(&record.order_id),
+        ) {
+            report.warn(&format!(
+                "  {}: could not write the ledger: {error:#}",
+                record.order_id
+            ));
+        }
+    }
+    // Held back: the master hears now, with the reason, rather than at the next
+    // improve run.
+    if held && let Err(error) = crate::improve::request_merges(route, config) {
+        report.warn(&format!("  could not ask about merging: {error:#}"));
+    }
+    merged
 }
 
 /// Leave unclaimed improvement orders alone while someone is at this machine.
@@ -2577,7 +2653,11 @@ async fn note_engines(
         identity,
         &ferryman_channel::receipts::machine_label(),
         env!("CARGO_PKG_VERSION"),
-        crate::engines::reports(&config.engines, &ledger, now),
+        crate::engines::reports(
+            &crate::engines::effective_specs(&config.engines, &ledger),
+            &ledger,
+            now,
+        ),
         now,
     ) {
         report.warn(&format!("could not write this worker's engines: {error:#}"));
@@ -2652,6 +2732,7 @@ pub async fn run_canary(route: &ProjectRoute, config: &AgentConfig) -> Result<bo
         config,
         &config.engine(),
         run.usage.or_else(|| engine_usage(&run.stdout)),
+        reported_cost(&run),
     );
     Ok(run.ok && passed)
 }
@@ -2800,28 +2881,19 @@ async fn attempt(
     // Engine fallback. An engine that is out of credit, or cannot run here, is not a
     // failed attempt: it is marked, and the same order goes straight to the next engine
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
-    let wanted = order_tier(task);
     let mut tried: Vec<String> = Vec::new();
     let result = loop {
-        let ledger = crate::engines::Ledger::load(&config.agent);
-        let Some(engine) =
-            crate::engines::pick(&config.engines, &ledger, chrono::Utc::now(), wanted, &tried)
-                .cloned()
-        else {
-            report.warn(&format!(
-                "  {id}: no {} engine can run it now ({}); it waits, and nothing is counted \
-                 against it",
-                wanted.as_str(),
-                if tried.is_empty() {
-                    "every one is out of credit or below its tier".to_string()
-                } else {
-                    format!("tried {}", tried.join(", "))
-                }
-            ));
-            // Held here it would wait for this machine's engines; let go, so a machine
-            // whose engines are up can take it.
-            let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
-            return false;
+        let engine = match next_engine(route, config, task, &tried) {
+            Ok(engine) => engine,
+            Err(why) => {
+                report.warn(&format!(
+                    "  {id}: {why}; it waits, and nothing is counted against it"
+                ));
+                // Held here it would wait for this machine's engines; let go, so a machine
+                // whose engines are up can take it. Never a fallback past the policy.
+                let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
+                return false;
+            }
         };
         tried.push(engine.name.clone());
         let effective = config.with_engine(&engine);
@@ -2832,14 +2904,7 @@ async fn attempt(
                     .is_some() =>
             {
                 if let Some(skip) = error.downcast_ref::<crate::engines::Unavailable>() {
-                    if let Some(until) = skip.until {
-                        crate::engines::mark_exhausted(
-                            &config.agent,
-                            &skip.engine,
-                            until,
-                            &skip.reason,
-                        );
-                    }
+                    note_unavailable(route, config, skip);
                     report.warn(&format!("  {id}: {skip}; trying the next engine"));
                 }
             }
@@ -2934,22 +2999,178 @@ fn engine_credentials(route: &ProjectRoute, config: &AgentConfig) -> Result<Engi
     }
 }
 
-/// Count a request against the engine's weekly caps, priced at list rates when the
-/// engine said what it spent.
+/// Count a request against the engine's weekly caps, and return what it cost: what the
+/// provider reported, else list prices for the tokens it said it used. A free tier or a
+/// local engine costs nothing unless its provider says otherwise - and a free tier that
+/// does is flagged, and the master told.
 fn count_use(
     route: &ProjectRoute,
     config: &AgentConfig,
     engine: &crate::engines::EngineSpec,
     usage: Option<ferryman_channel::trajectory::TokenUsage>,
-) {
-    let cost = usage.map_or(0.0, |usage| {
-        let price = ferryman_channel::cost::Rates::load(route)
-            .price_for(engine.model.as_deref().unwrap_or(&engine.name));
-        (usage.prompt_tokens as f64 * price.prompt_per_million
-            + usage.completion_tokens as f64 * price.completion_per_million)
-            / 1_000_000.0
-    });
+    reported: Option<f64>,
+) -> f64 {
+    use crate::engines::Paid;
+    let cost = match reported {
+        Some(cost) => cost,
+        None if matches!(engine.paid, Paid::FreeTier | Paid::Local) => 0.0,
+        None => usage.map_or(0.0, |usage| {
+            let price = ferryman_channel::cost::Rates::load(route)
+                .price_for(engine.model.as_deref().unwrap_or(&engine.name));
+            (usage.prompt_tokens as f64 * price.prompt_per_million
+                + usage.completion_tokens as f64 * price.completion_per_million)
+                / 1_000_000.0
+        }),
+    };
     crate::engines::record_use(&config.agent, &engine.name, cost, chrono::Utc::now());
+    if engine.paid == Paid::FreeTier && reported.is_some_and(|cost| cost > 0.0) {
+        watch_free_tier(
+            route,
+            config,
+            &engine.name,
+            &format!("reported a cost of ${cost:.4} for one run"),
+        );
+    }
+    cost
+}
+
+/// A free tier that asked for money: flagged in this machine's ledger, which auto mode
+/// ranks down, and the master told once a week with buttons. Best effort.
+pub(crate) fn watch_free_tier(route: &ProjectRoute, config: &AgentConfig, engine: &str, why: &str) {
+    let now = chrono::Utc::now();
+    crate::engines::flag_free_tier(&config.agent, engine, why, now);
+    if let Ok(Some(identity)) = AgentIdentity::load_existing(&config.agent, &route.attachment)
+        && let Err(error) = ferryman_channel::policy::ask_free_tier(
+            route,
+            &identity,
+            engine,
+            &crate::engines::iso_week(now),
+            why,
+        )
+    {
+        tracing::warn!("could not tell the master about {engine}: {error:#}");
+    }
+}
+
+/// An engine that cannot take work now: marked out of credit until its reset when it
+/// gave one, and a free tier that said so flagged.
+pub(crate) fn note_unavailable(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    skip: &crate::engines::Unavailable,
+) {
+    let Some(until) = skip.until else {
+        return;
+    };
+    crate::engines::mark_exhausted(&config.agent, &skip.engine, until, &skip.reason);
+    if config
+        .engines
+        .iter()
+        .any(|spec| spec.name == skip.engine && spec.paid == crate::engines::Paid::FreeTier)
+    {
+        watch_free_tier(
+            route,
+            config,
+            &skip.engine,
+            &format!(
+                "returned a payment or quota error ({})",
+                skip.reason.chars().take(120).collect::<String>()
+            ),
+        );
+    }
+}
+
+/// Why the engine `config` runs may not do this project's background work on this
+/// machine, or `Ok` when it may.
+pub(crate) fn policy_allows(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+) -> std::result::Result<(), String> {
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let machine = ferryman_channel::receipts::machine_label();
+    if !policy.allows_machine(&config.agent, &machine) {
+        return Err(not_here(&config.agent, &machine, &policy));
+    }
+    let engine = config.engine();
+    let ledger = crate::engines::Ledger::load(&config.agent);
+    let candidate = crate::engines::candidates(
+        &config.agent,
+        &machine,
+        std::slice::from_ref(&engine),
+        &ledger,
+        chrono::Utc::now(),
+    )
+    .remove(0);
+    match policy.blocked(&candidate, ferryman_channel::policy::Work::Background) {
+        Some(why) => Err(format!("{} is {why}", engine.name)),
+        None => Ok(()),
+    }
+}
+
+/// Why this machine runs none of a project's self-improve work.
+pub(crate) fn not_here(
+    agent: &str,
+    machine: &str,
+    policy: &ferryman_channel::policy::Policy,
+) -> String {
+    format!(
+        "{agent} on {machine} is not where this project's engine policy runs self-improve ({})",
+        policy.machines.join(", ")
+    )
+}
+
+/// Which engine runs this order next, by the rules for its kind of work.
+///
+/// An improvement order is background work: only on a machine the engine policy names,
+/// within its role's weekly cap, and only on an engine the policy allows, in its order -
+/// never falling back past it. A person's own order runs as it always has, with `never`
+/// honoured only when the policy says it applies to all work.
+fn next_engine(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    task: &Task,
+    tried: &[String],
+) -> std::result::Result<crate::engines::EngineSpec, String> {
+    let ledger = crate::engines::Ledger::load(&config.agent);
+    let now = chrono::Utc::now();
+    let wanted = order_tier(task);
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let machine = ferryman_channel::receipts::machine_label();
+    let here = (config.agent.as_str(), machine.as_str());
+    if crate::improve::is_improvement(task) {
+        if !policy.allows_machine(here.0, here.1) {
+            return Err(not_here(here.0, here.1, &policy));
+        }
+        let role = ferryman_channel::policy::Role::for_order_tier(wanted.as_str());
+        if let Some(why) =
+            ferryman_channel::policy::over_cap(route, &policy, &crate::engines::iso_week(now), role)
+        {
+            return Err(why);
+        }
+        return crate::engines::choose(
+            &config.engines,
+            &ledger,
+            now,
+            &policy,
+            role,
+            wanted,
+            tried,
+            here,
+        );
+    }
+    crate::engines::pick_direct(&config.engines, &ledger, now, wanted, tried, &policy, here)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "no {} engine can run it now ({})",
+                wanted.as_str(),
+                if tried.is_empty() {
+                    "every one is out of credit or below its tier".to_string()
+                } else {
+                    format!("tried {}", tried.join(", "))
+                }
+            )
+        })
 }
 
 /// Ask an engine one question outside any order, in a scratch directory so a CLI
@@ -2957,6 +3178,17 @@ fn count_use(
 ///
 /// Out of credit and unreachable come back as [`crate::engines::Unavailable`].
 pub async fn ask(route: &ProjectRoute, config: &AgentConfig, prompt: &str) -> Result<String> {
+    ask_costed(route, config, prompt)
+        .await
+        .map(|(answer, _)| answer)
+}
+
+/// [`ask`], and what the question cost in dollars.
+pub async fn ask_costed(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    prompt: &str,
+) -> Result<(String, f64)> {
     let (credentials, key) = engine_credentials(route, config)?;
     let scratch = std::env::temp_dir().join(format!(
         "ferryman-ask-{}-{}",
@@ -2976,7 +3208,7 @@ pub async fn ask(route: &ProjectRoute, config: &AgentConfig, prompt: &str) -> Re
     let _ = fs::remove_dir_all(&scratch);
     let run = run?;
     let usage = run.usage.or_else(|| engine_usage(&run.stdout));
-    count_use(route, config, &config.engine(), usage);
+    let cost = count_use(route, config, &config.engine(), usage, reported_cost(&run));
     if !run.ok {
         if let Some(skip) = unavailable(config, &run) {
             return Err(skip.into());
@@ -2987,7 +3219,7 @@ pub async fn ask(route: &ProjectRoute, config: &AgentConfig, prompt: &str) -> Re
             engine_failure_detail(&run)
         )
     }
-    Ok(engine_answer(&run.stdout))
+    Ok((engine_answer(&run.stdout), cost))
 }
 
 #[tracing::instrument(name = "do_work", skip(route, config, identity, task, report), fields(order = %task.order.id, agent = %config.agent))]
@@ -3149,7 +3381,7 @@ async fn do_work(
     // access to this machine's trajectories).
     let usage = run.usage.or_else(|| engine_usage(&run.stdout));
     let engine = config.engine();
-    count_use(route, config, &engine, usage);
+    let cost = count_use(route, config, &engine, usage, reported_cost(&run));
     // Record the full trajectory (prompt digest + output) for replayable review
     // and as a corpus for the benchmark. Best-effort: a trajectory write must
     // never fail the run itself.
@@ -3184,10 +3416,13 @@ async fn do_work(
         return Err(skip.into());
     }
 
+    let machine = ferryman_channel::receipts::machine_label();
     let mut payload = json!({
         "output": engine_answer(&run.stdout),
         "produced_by": config.command,
         "engine": engine.name,
+        "machine": machine,
+        "cost_usd": cost,
         "worktree_branch": branch,
     });
     if let Some(usage) = usage {
@@ -3279,6 +3514,35 @@ async fn do_work(
         "  {id}: submitted revision {revision}, signed by {}",
         config.agent
     ));
+    // Which model on which machine built each improvement, for `ferry improve status`
+    // and the week's report. Best effort, like every record about the work.
+    if crate::improve::is_improvement(task) {
+        let week = task.order.payload["improvement"]["week"]
+            .as_str()
+            .map_or_else(
+                || crate::engines::iso_week(chrono::Utc::now()),
+                str::to_string,
+            );
+        let step = ferryman_channel::policy::Step {
+            step: "build".to_string(),
+            role: Some(
+                ferryman_channel::policy::Role::for_order_tier(order_tier(task).as_str())
+                    .as_str()
+                    .to_string(),
+            ),
+            at: chrono::Utc::now(),
+            agent: config.agent.clone(),
+            machine,
+            engine: Some(engine.name.clone()),
+            model: engine.model.clone().or_else(|| config.model.clone()),
+            cost_usd: Some(cost),
+            order: Some(id.clone()),
+            outcome: format!("submitted r{revision}"),
+        };
+        if let Err(error) = ferryman_channel::policy::record_step(route, identity, &week, step) {
+            report.warn(&format!("  {id}: could not record the step: {error:#}"));
+        }
+    }
     // Record the practice into this agent's own profile, so its specialization
     // grows from what it actually did rather than what it remembers to note.
     record_agent_activity(
@@ -3439,6 +3703,10 @@ pub async fn review_where(
     let identity = AgentIdentity::load_or_create(&config.agent, &route.attachment)?;
     let mut acted = 0;
     let mut skipped_own = 0;
+    // Judging an improvement is background work: only an engine the policy allows, on
+    // a machine it names. Asked once per pass, not per task.
+    let background = policy_allows(route, config);
+    let mut left_for_policy = 0;
     for task in ferryman_channel::list_tasks(route)? {
         // A refuted result on an order that asks for review is still owed a verdict:
         // it is sent back, on its evidence, so the next revision can be done.
@@ -3448,6 +3716,10 @@ pub async fn review_where(
             _ => continue,
         };
         if !wanted(&task) {
+            continue;
+        }
+        if background.is_err() && crate::improve::is_improvement(&task) {
+            left_for_policy += 1;
             continue;
         }
         // Trust boundary: judge only work whose order and result signatures
@@ -3501,6 +3773,14 @@ pub async fn review_where(
         }
         judge(route, config, &identity, &task, revision, report).await?;
         acted += 1;
+    }
+    if left_for_policy > 0
+        && let Err(why) = &background
+    {
+        report.info(&format!(
+            "  left {left_for_policy} improvement result(s) for the engine policy's reviewer: \
+             {why}"
+        ));
     }
     if acted == 0 && skipped_own > 0 {
         report.info(&format!(
@@ -3584,6 +3864,7 @@ async fn judge(
         config,
         &config.engine(),
         run.usage.or_else(|| engine_usage(&run.stdout)),
+        reported_cost(&run),
     );
     if !run.ok {
         if let Some(skip) = unavailable(config, &run) {
@@ -3611,6 +3892,57 @@ fn record_verdict(
     report: &dyn Progress,
 ) -> Result<()> {
     let id = id.to_string();
+    // An improvement is never accepted by an engine. Its verdict is the first of two
+    // keys, recorded signed with the engine that gave it; a keep becomes a
+    // recommendation, and only the master's approval - the second key - accepts it.
+    let gated = ferryman_channel::read_task(route, &id)
+        .is_ok_and(|task| ferryman_channel::gate::gated(&task.order.payload));
+    if gated {
+        let engine = config.engine();
+        let ledger = crate::engines::Ledger::load(&config.agent);
+        let review = ferryman_channel::gate::EngineReview {
+            order_id: id.clone(),
+            revision,
+            reviewer: config.agent.clone(),
+            machine: ferryman_channel::receipts::machine_label(),
+            engine: engine.name.clone(),
+            model: engine.model.clone().or_else(|| config.model.clone()),
+            tier: crate::engines::effective_tier(&engine, &ledger.state(&engine.name))
+                .as_str()
+                .to_string(),
+            paid: engine.paid.as_str().to_string(),
+            host: engine
+                .base_url
+                .as_deref()
+                .and_then(crate::engines::url_host),
+            route: engine.route.clone(),
+            accept: verdict.accept,
+            summary: verdict.reasoning.clone(),
+            reviewed_at: chrono::Utc::now(),
+            signed_by: None,
+            signature: None,
+        };
+        ferryman_channel::gate::record_engine_review(route, identity, review)?;
+        if verdict.accept {
+            let mut recommendation = Recommendation {
+                order_id: id.clone(),
+                revision,
+                reviewer: config.agent.clone(),
+                recommended_at: chrono::Utc::now(),
+                accept: true,
+                reasoning: verdict.reasoning.clone(),
+                signed_by: None,
+                signature: None,
+            };
+            identity.sign_recommendation(&mut recommendation);
+            ferryman_channel::submit_recommendation(route, &recommendation)?;
+            report.info(&format!(
+                "  {id}: {} keeps it - {}; waiting for the master's approval, the second key",
+                engine.name, verdict.reasoning
+            ));
+            return Ok(());
+        }
+    }
     match config.review {
         ReviewMode::Auto => {
             let mut review = Review {
@@ -5400,6 +5732,8 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 
@@ -5634,6 +5968,227 @@ mod tests {
             )
             .map(|spec| spec.name.as_str()),
             Some("liar")
+        );
+    }
+
+    // --- the engine policy, in the worker ---------------------------------------------
+
+    /// Make boss the channel's master and sign `policy` as theirs.
+    fn master_sets_policy(route: &ProjectRoute, policy: ferryman_channel::policy::Policy) {
+        let boss = AgentIdentity::from_seed("boss", [9; 32]);
+        for identity in [&boss, &AgentIdentity::from_seed("wisp", [7; 32])] {
+            ferryman_channel::register_agent(
+                route,
+                &ferryman_channel::AgentRoute {
+                    name: identity.name().into(),
+                    role: "operator".into(),
+                    capabilities: Vec::new(),
+                    public_key: Some(identity.public_key_hex()),
+                    encryption_key: None,
+                },
+            )
+            .unwrap();
+        }
+        ferryman_channel::master::initialize_master(route, &boss, "boss").unwrap();
+        assert!(
+            ferryman_channel::policy::set_policy(
+                &route.communications,
+                &route.project_id,
+                Some(policy),
+                &boss
+            )
+            .unwrap()
+        );
+    }
+
+    /// Issue an open improvement order, signed by boss, the way the improve loop does.
+    fn improvement_order(route: &ProjectRoute, id: &str) {
+        let boss = AgentIdentity::from_seed("boss", [9; 32]);
+        let mut order = order(id);
+        order.project_id = route.project_id.clone();
+        order.issued_by = "boss".into();
+        order.requires_review = true;
+        order.payload = json!({
+            "task": "make it better",
+            "tags": [crate::improve::TAG],
+            "tier": "build",
+            "improvement": { "week": "2026-W40", "title": "better" },
+        });
+        boss.sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order).unwrap();
+    }
+
+    const FREE_AND_SUBSCRIPTION: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+         defer_improvements_while_active = \"false\"\n\
+         engines = [\"claude\", \"nemotron\"]\n\
+         engine.claude.base_url = \"fake://ok:claude did it\"\nengine.claude.model = \"m\"\n\
+         engine.claude.paid = \"subscription\"\n\
+         engine.nemotron.base_url = \"fake://ok:nemotron did it\"\n\
+         engine.nemotron.model = \"nvidia/nemotron\"\nengine.nemotron.paid = \"free-tier\"\n";
+
+    /// The operator put claude first. A person's own order still runs on it; an
+    /// improvement order never does - it goes to the free engine - and a machine the
+    /// policy does not name leaves improvement orders alone entirely.
+    #[tokio::test]
+    async fn improvement_orders_follow_the_policy_and_direct_orders_do_not() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_order_for_wisp(comms.path(), "t-direct", FREE_AND_SUBSCRIPTION);
+        improvement_order(&route, "improve-2026-w40-1");
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 2, "both were done");
+        let direct = ferryman_channel::read_task(&route, "t-direct").unwrap();
+        assert_eq!(
+            direct.results[0].payload["engine"], "claude",
+            "a person's order is theirs to spend a subscription on"
+        );
+        let improved = ferryman_channel::read_task(&route, "improve-2026-w40-1").unwrap();
+        assert_eq!(
+            improved.results[0].payload["engine"], "nemotron",
+            "background work never spends a subscription"
+        );
+        assert_eq!(improved.results[0].payload["cost_usd"], 0.0, "free is free");
+        let steps = ferryman_channel::policy::read_steps(&route, "2026-W40");
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert_eq!(steps[0].step, "build");
+        assert_eq!(steps[0].engine.as_deref(), Some("nemotron"));
+        assert_eq!(steps[0].model.as_deref(), Some("nvidia/nemotron"));
+        assert_eq!(
+            steps[0].machine,
+            ferryman_channel::receipts::machine_label()
+        );
+        assert_eq!(steps[0].order.as_deref(), Some("improve-2026-w40-1"));
+
+        // Only grouchly may do this project's self-improve now: this machine leaves the
+        // next improvement order unclaimed, for grouchly.
+        master_sets_policy(
+            &route,
+            ferryman_channel::policy::Policy {
+                machines: vec!["grouchly-only".into()],
+                ..Default::default()
+            },
+        );
+        improvement_order(&route, "improve-2026-w40-2");
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let waiting = ferryman_channel::read_task(&route, "improve-2026-w40-2").unwrap();
+        assert!(waiting.claims.is_empty(), "not claimed outside where");
+    }
+
+    /// Nothing the policy allows: the improvement order waits unclaimed, and nothing
+    /// falls back to the blocked engine - even though it is up and would do it.
+    #[tokio::test]
+    async fn with_only_blocked_engines_an_improvement_waits_and_never_falls_back() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_order_for_wisp(comms.path(), "t-mine", FREE_AND_SUBSCRIPTION);
+        let mut policy = ferryman_channel::policy::Policy::default();
+        policy.never.push("nemotron".into());
+        master_sets_policy(&route, policy);
+        improvement_order(&route, "improve-2026-w40-1");
+
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        let task = ferryman_channel::read_task(&route, "improve-2026-w40-1").unwrap();
+        assert!(
+            task.claims.is_empty() && task.results.is_empty(),
+            "{task:?}"
+        );
+        let error = next_engine(&route, &config, &task, &[]).unwrap_err();
+        assert!(
+            error.contains("never") && error.contains("subscription"),
+            "{error}"
+        );
+        // A person's own order is not background work: it ran.
+        let mine = ferryman_channel::read_task(&route, "t-mine").unwrap();
+        assert_eq!(mine.results.len(), 1);
+    }
+
+    /// A free tier that asks for money, or says it cost something, is flagged in the
+    /// ledger and the published inventory, ranked down, and the master told once.
+    #[tokio::test]
+    async fn a_free_tier_that_asks_for_money_is_flagged_and_the_master_told_once() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let config_text = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+             pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+             engines = [\"freebie\", \"paid\"]\n\
+             engine.freebie.base_url = \"fake://quota\"\nengine.freebie.model = \"m\"\n\
+             engine.freebie.paid = \"free-tier\"\n\
+             engine.paid.base_url = \"fake://ok:done\"\nengine.paid.model = \"m\"\n\
+             engine.paid.paid = \"prepaid\"\nengine.paid.weekly_usd = \"5\"\n";
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-free", config_text);
+
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        let task = ferryman_channel::read_task(&route, "t-free").unwrap();
+        assert_eq!(task.results[0].payload["engine"], "paid");
+        let ledger = crate::engines::Ledger::load("wisp");
+        let flag = ledger.state("freebie").free_tier_flag(chrono::Utc::now());
+        assert!(
+            flag.as_deref()
+                .is_some_and(|why| why.contains("payment or quota")),
+            "{flag:?}"
+        );
+        let asked: Vec<_> = ferryman_channel::questions::pending(&route)
+            .into_iter()
+            .filter(|q| q.kind == ferryman_channel::questions::POLICY)
+            .collect();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].options[0], "Block freebie");
+        watch_free_tier(&route, &config, "freebie", "returned a payment error again");
+        assert_eq!(
+            ferryman_channel::questions::pending(&route).len(),
+            1,
+            "told once a week, not on every failure"
+        );
+        // Published with the flag, so every machine's auto mode ranks it down.
+        let reports = crate::engines::reports(&config.engines, &ledger, chrono::Utc::now());
+        assert!(
+            reports[0]
+                .billing
+                .as_ref()
+                .is_some_and(|billing| billing.flag.is_some()),
+            "{reports:?}"
+        );
+        // Back from its reset, still flagged: a capped paid engine comes first.
+        let mut back = ledger.clone();
+        back.engines.get_mut("freebie").unwrap().exhausted_until = None;
+        let ranked = crate::engines::choose(
+            &config.engines,
+            &back,
+            chrono::Utc::now(),
+            &ferryman_channel::policy::Policy::default(),
+            ferryman_channel::policy::Role::Build,
+            crate::engines::Tier::Build,
+            &[],
+            ("wisp", "here"),
+        );
+        assert!(
+            ranked.is_ok_and(|spec| spec.name == "paid"),
+            "ranked below a paid engine while flagged"
+        );
+
+        // A free tier whose provider reports a cost is flagged the same way.
+        let costly = crate::engines::EngineSpec {
+            name: "costly".into(),
+            paid: crate::engines::Paid::FreeTier,
+            base_url: Some("fake://paid:done".into()),
+            ..judge_engine("x")
+        };
+        let answer = ask(&route, &config.with_engine(&costly), "hello")
+            .await
+            .unwrap();
+        assert_eq!(answer, "done");
+        assert!(
+            crate::engines::Ledger::load("wisp")
+                .state("costly")
+                .free_tier_flag(chrono::Utc::now())
+                .is_some_and(|why| why.contains("reported a cost"))
         );
     }
 }

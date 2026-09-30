@@ -56,6 +56,8 @@ use ferryman_channel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use ferryman_channel::policy::{Policy, Role, Step};
+
 use crate::{
     Progress,
     agent::AgentConfig,
@@ -800,6 +802,11 @@ pub enum PlanOutcome {
     },
     /// No engine could plan. Not an error: the next run tries again.
     NoEngine(String),
+    /// Nothing the engine policy allows can plan, or its weekly cap is spent. The plan
+    /// waits - never on a blocked engine - and the master is asked once a week.
+    Held(String),
+    /// The engine policy runs this project's self-improve on other machines.
+    NotHere(String),
     Paused(String),
     /// The project is archived: the loop leaves it alone.
     Archived,
@@ -907,20 +914,54 @@ fn parse_questions(text: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-/// Ask the master, through the channel, whether each improvement accepted by review is
-/// one they want to merge. A notice with buttons, never an action: nothing here merges,
-/// pushes or bumps a version. Asked once per order. Returns how many were asked.
+/// Tell the master, through the channel, that an improvement holds both keys - the
+/// review engine's and their own - and is approved, ready to merge. A notice with
+/// buttons, never an action: nothing here merges, pushes or bumps a version.
+///
+/// When the project's engine policy says `auto_merge = "low-risk"`, an improvement
+/// with both keys is first authorized - a signed record - for the worker that built it
+/// to merge on its own if every file it changes is docs, tests or dependency versions
+/// ([`ferryman_channel::automerge`]). The master hears about it only when that worker
+/// held it back - code or config, a conflict, a failed push - or has not acted in a day.
+/// Asked once per order. Returns how many were asked.
 pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usize> {
     let tasks: Vec<Task> = ferryman_channel::list_tasks(route)?
         .into_iter()
-        .filter(|task| is_improvement(task) && task.state() == TaskState::Accepted)
+        .filter(|task| {
+            ferryman_channel::gate::gated(&task.order.payload)
+                && ferryman_channel::gate::approved_for_live(route, task)
+        })
         .collect();
     if tasks.is_empty() {
         return Ok(0);
     }
     let identity = signing_identity(route, config)?;
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let auto = policy.auto_merge == ferryman_channel::policy::AutoMerge::LowRisk;
     let mut asked = 0;
     for task in tasks {
+        let mut why_not_auto = None;
+        if auto {
+            use ferryman_channel::automerge::{self, Stage};
+            let revision = task.latest_revision().unwrap_or_default();
+            match automerge::stage(route, &task.order.id, revision) {
+                Stage::Open => {
+                    automerge::authorize(route, &identity, &task)?;
+                    continue;
+                }
+                Stage::Merged(_) => continue,
+                Stage::Authorized(record)
+                    if Utc::now().signed_duration_since(record.at) < Duration::days(1) =>
+                {
+                    continue;
+                }
+                Stage::Authorized(_) => {
+                    why_not_auto =
+                        Some("the worker that built it has not merged it in a day".to_string());
+                }
+                Stage::Held(record) => why_not_auto = Some(record.note),
+            }
+        }
         let reviewer = task
             .reviews
             .iter()
@@ -933,12 +974,24 @@ pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usiz
                 )
             })
             .unwrap_or_else(|| "review".to_string());
-        let text = format!(
-            "Ready to merge: {}\n\nOrder {} was accepted by {reviewer}. The work is on its own \
-             branch; nothing merges on its own. Merge it when you are happy with it.",
+        let engine = ferryman_channel::gate::gate(route, &task, &policy)
+            .engine
+            .map(|review| review.describe())
+            .unwrap_or_default();
+        let mut text = format!(
+            "Ready to merge: {}\n\nOrder {} holds both keys: the review engine ({engine}) and \
+             {reviewer}. Approved, ready to merge - the work is on its own branch",
             task_title(&task),
             task.order.id
         );
+        match why_not_auto {
+            Some(why) => text.push_str(&format!(
+                ". Auto-merge is on, but fm did not merge this one on its own: {why}. Merge it \
+                 when you are happy with it."
+            )),
+            None => text
+                .push_str(" and nothing merges on its own. Merge it when you are happy with it."),
+        }
         if ferryman_channel::questions::ask(
             route,
             &identity,
@@ -1049,55 +1102,51 @@ fn signing_identity(route: &ProjectRoute, config: &AgentConfig) -> Result<AgentI
     })
 }
 
-/// The engines to ask, best first: judges that are up, then builders (whose answer is
-/// marked unreviewed). Exhausted engines are left out.
-fn askers<'a>(
-    specs: &'a [EngineSpec],
-    ledger: &engines::Ledger,
-    now: DateTime<Utc>,
-    tried: &[String],
-) -> Option<(&'a EngineSpec, bool)> {
-    let left: Vec<EngineSpec> = specs
-        .iter()
-        .filter(|spec| !tried.contains(&spec.name))
-        .cloned()
-        .collect();
-    let chosen = engines::best_up(&left, ledger, now, Tier::Judge)
-        .map(|spec| (spec.name.clone(), false))
-        .or_else(|| {
-            engines::best_up(&left, ledger, now, Tier::Build).map(|spec| (spec.name.clone(), true))
-        })?;
-    specs
-        .iter()
-        .find(|spec| spec.name == chosen.0)
-        .map(|spec| (spec, chosen.1))
+/// What asking for a plan came to.
+enum Asked {
+    /// The answer, the engine, whether it is a judge, and what it cost.
+    Answered(String, Box<EngineSpec>, bool, f64),
+    /// Nothing the engine policy allows could be asked: the work waits.
+    Held(String),
+    /// Every allowed engine was asked and none answered.
+    Failed(String),
 }
 
-/// Ask the best engine available, falling through engines that are out of credit or
-/// fail. Returns the answer, the engine, and whether it was a judge.
+/// Ask the engine the policy puts first for planning, falling through engines that are
+/// out of credit or fail - never to one the policy blocks. A judge plans first; with no
+/// judge allowed and up, a builder does and the plan is marked unreviewed.
 async fn ask_best(
     route: &ProjectRoute,
     config: &AgentConfig,
+    policy: &Policy,
     prompt: &str,
-    judges_only: bool,
     report: &dyn Progress,
-) -> Option<(String, EngineSpec, bool)> {
+) -> Asked {
+    let machine = ferryman_channel::receipts::machine_label();
     let mut tried = Vec::new();
     loop {
         let ledger = engines::Ledger::load(&config.agent);
-        let (engine, unreviewed) = askers(&config.engines, &ledger, Utc::now(), &tried)?;
-        if judges_only && unreviewed {
-            return None;
-        }
-        let engine = engine.clone();
+        let engine = match engines::choose(
+            &config.engines,
+            &ledger,
+            Utc::now(),
+            policy,
+            Role::Plan,
+            Tier::Judge,
+            &tried,
+            (&config.agent, &machine),
+        ) {
+            Ok(engine) => engine,
+            Err(why) if tried.is_empty() => return Asked::Held(why),
+            Err(why) => return Asked::Failed(why),
+        };
         tried.push(engine.name.clone());
-        match crate::agent::ask(route, &config.with_engine(&engine), prompt).await {
-            Ok(answer) => return Some((answer, engine, !unreviewed)),
+        let judge = engines::effective_tier(&engine, &ledger.state(&engine.name)) == Tier::Judge;
+        match crate::agent::ask_costed(route, &config.with_engine(&engine), prompt).await {
+            Ok((answer, cost)) => return Asked::Answered(answer, Box::new(engine), judge, cost),
             Err(error) => {
-                if let Some(skip) = error.downcast_ref::<engines::Unavailable>()
-                    && let Some(until) = skip.until
-                {
-                    engines::mark_exhausted(&config.agent, &skip.engine, until, &skip.reason);
+                if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
+                    crate::agent::note_unavailable(route, config, skip);
                 }
                 report.warn(&format!(
                     "  {}: {} could not answer, trying the next engine: {error:#}",
@@ -1106,6 +1155,151 @@ async fn ask_best(
             }
         }
     }
+}
+
+/// Record one step of this week's loop, signed by this agent. Best effort.
+#[allow(clippy::too_many_arguments)]
+fn note_step(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    week: &str,
+    step: &str,
+    role: Option<Role>,
+    engine: Option<&EngineSpec>,
+    cost: Option<f64>,
+    outcome: &str,
+) {
+    let Ok(identity) = signing_identity(route, config) else {
+        return;
+    };
+    let record = Step {
+        step: step.to_string(),
+        role: role.map(|role| role.as_str().to_string()),
+        at: Utc::now(),
+        agent: config.agent.clone(),
+        machine: ferryman_channel::receipts::machine_label(),
+        engine: engine.map(|engine| engine.name.clone()),
+        model: engine.and_then(|engine| engine.model.clone()),
+        cost_usd: cost,
+        order: None,
+        outcome: outcome.to_string(),
+    };
+    if let Err(error) = ferryman_channel::policy::record_step(route, &identity, week, record) {
+        tracing::warn!("could not record the {step} step: {error:#}");
+    }
+}
+
+/// Background work the policy leaves nothing to do: record why, and ask the master -
+/// once per role per week, however many machines and hours it stays held.
+fn hold(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    role: Role,
+    week: &str,
+    why: &str,
+    report: &dyn Progress,
+) {
+    report.warn(&format!(
+        "  {}: {} work held: {why}",
+        route.project_id,
+        role.as_str()
+    ));
+    match signing_identity(route, config)
+        .and_then(|identity| ferryman_channel::policy::ask_hold(route, &identity, role, week, why))
+    {
+        Ok(true) => {
+            // Recorded with the question, once, not every hour it stays held.
+            note_step(
+                route,
+                config,
+                week,
+                role.as_str(),
+                Some(role),
+                None,
+                None,
+                &format!("held: {why}"),
+            );
+            report.info(&format!(
+                "  {}: asked the master what to do about the held {} work",
+                route.project_id,
+                role.as_str()
+            ));
+        }
+        Ok(false) => {}
+        Err(error) => report.warn(&format!(
+            "  {}: could not ask the master: {error:#}",
+            route.project_id
+        )),
+    }
+}
+
+/// Improvement orders nobody has claimed, when the fleet - as its signed engine
+/// inventories describe it - has no engine the policy allows to build them, on no
+/// machine it names, or the build cap is spent: held, and the master asked once a week.
+///
+/// Workers already leave such orders unclaimed rather than fall back; this is what makes
+/// the wait visible. With no inventory at all nothing is known, and nothing is said.
+fn hold_unbuildable(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    week: &str,
+    now: DateTime<Utc>,
+    report: &dyn Progress,
+) {
+    let waiting: Vec<Tier> = ferryman_channel::list_tasks(route)
+        .unwrap_or_default()
+        .iter()
+        .filter(|task| is_improvement(task))
+        .filter(|task| matches!(task.state(), TaskState::Open | TaskState::Offered { .. }))
+        .map(|task| {
+            task.order.payload["tier"]
+                .as_str()
+                .and_then(|tier| Tier::parse(tier).ok())
+                .unwrap_or(Tier::Build)
+        })
+        .collect();
+    if waiting.is_empty() {
+        return;
+    }
+    let fleet = ferryman_channel::policy::fleet(route, now);
+    if fleet.is_empty() {
+        return;
+    }
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let mut tiers = waiting;
+    tiers.sort();
+    tiers.dedup();
+    for tier in tiers {
+        let role = Role::for_order_tier(tier.as_str());
+        let why = ferryman_channel::policy::over_cap(route, &policy, week, role).or_else(|| {
+            let ranking = ferryman_channel::policy::rank(
+                &policy,
+                role,
+                tier.as_str(),
+                ferryman_channel::policy::Work::Background,
+                &fleet,
+            );
+            ranking
+                .order
+                .is_empty()
+                .then(|| ranking.why_none(role, &fleet))
+        });
+        if let Some(why) = why {
+            hold(route, config, role, week, &why, report);
+        }
+    }
+}
+
+/// This agent and machine, when the project's engine policy lets them run its
+/// self-improve work; otherwise why not.
+fn here(route: &ProjectRoute, config: &AgentConfig, policy: &Policy) -> Result<(), String> {
+    let machine = ferryman_channel::receipts::machine_label();
+    if policy.allows_machine(&config.agent, &machine) {
+        Ok(())
+    } else {
+        Err(crate::agent::not_here(&config.agent, &machine, policy))
+    }
+    .map_err(|why| format!("{}: {why}", route.project_id))
 }
 
 /// Turn this week's evidence into at most `max` ranked improvements, each issued as a
@@ -1158,20 +1352,55 @@ pub async fn plan(
         &week,
     );
     let max = max.max(1);
-    let Some((answer, engine, judged)) = ask_best(
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    if let Err(why) = here(route, config, &policy) {
+        return Ok(PlanOutcome::NotHere(why));
+    }
+    if let Some(why) = ferryman_channel::policy::over_cap(route, &policy, &week, Role::Plan) {
+        hold(route, config, Role::Plan, &week, &why, report);
+        return Ok(PlanOutcome::Held(why));
+    }
+    let (answer, engine, judged, cost) = match ask_best(
         route,
         config,
+        &policy,
         &plan_prompt(&route.project_id, &evidence, max),
-        false,
         report,
     )
     .await
-    else {
-        return Ok(PlanOutcome::NoEngine(
-            engines::all_exhausted(&config.engines, &engines::Ledger::load(&config.agent), now)
-                .unwrap_or_else(|| "no judge- or build-tier engine answered".to_string()),
-        ));
+    {
+        Asked::Answered(answer, engine, judged, cost) => (answer, *engine, judged, cost),
+        Asked::Held(why) => {
+            hold(route, config, Role::Plan, &week, &why, report);
+            return Ok(PlanOutcome::Held(why));
+        }
+        Asked::Failed(why) => {
+            note_step(
+                route,
+                config,
+                &week,
+                "plan",
+                Some(Role::Plan),
+                None,
+                None,
+                &format!("failed: {why}"),
+            );
+            return Ok(PlanOutcome::NoEngine(
+                engines::all_exhausted(&config.engines, &engines::Ledger::load(&config.agent), now)
+                    .unwrap_or(why),
+            ));
+        }
     };
+    note_step(
+        route,
+        config,
+        &week,
+        "plan",
+        Some(Role::Plan),
+        Some(&engine),
+        Some(cost),
+        if judged { "done" } else { "done (unreviewed)" },
+    );
     let improvements = parse_improvements(&answer, max);
     if improvements.is_empty() {
         bail!(
@@ -1326,14 +1555,44 @@ pub async fn review(
             ));
         }
     }
-    let ledger = engines::Ledger::load(&config.agent);
-    let Some(judge) = engines::best_up(&config.engines, &ledger, now, Tier::Judge).cloned() else {
-        report.info(&format!(
-            "  {}: no judge-tier engine is up; review waits",
-            route.project_id
-        ));
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    if let Err(why) = here(route, config, &policy) {
+        report.info(&format!("  {why}; not reviewing here"));
         return Ok(0);
+    }
+    let week = engines::iso_week(now);
+    let waiting = read_plan(route, &week).is_some_and(|plan| plan.unreviewed)
+        || awaiting_improvement_review(route);
+    let ledger = engines::Ledger::load(&config.agent);
+    let machine = ferryman_channel::receipts::machine_label();
+    let chosen = match ferryman_channel::policy::over_cap(route, &policy, &week, Role::Review) {
+        Some(why) => Err(why),
+        None => engines::choose(
+            &config.engines,
+            &ledger,
+            now,
+            &policy,
+            Role::Review,
+            Tier::Judge,
+            &[],
+            (&config.agent, &machine),
+        ),
     };
+    let judge = match chosen {
+        Ok(judge) => judge,
+        Err(why) if waiting => {
+            hold(route, config, Role::Review, &week, &why, report);
+            return Ok(0);
+        }
+        Err(_) => {
+            report.info(&format!(
+                "  {}: no judge-tier engine the policy allows is up; review waits",
+                route.project_id
+            ));
+            return Ok(0);
+        }
+    };
+    let spent_before = ledger.state(&judge.name);
     let mut judged = 0;
     match request_merges(route, config) {
         Ok(0) => {}
@@ -1347,7 +1606,6 @@ pub async fn review(
         )),
     }
 
-    let week = engines::iso_week(now);
     if let Some(mut plan) = read_plan(route, &week).filter(|plan| plan.unreviewed) {
         let prompt = format!(
             "A build-tier engine wrote this week's improvement plan for '{}' while no judge \
@@ -1371,7 +1629,16 @@ pub async fn review(
                 write_plan(route, &plan)?;
                 judged += 1;
             }
-            Err(error) => return Ok(settle(config, &error, judged, route, report)),
+            Err(error) => {
+                return Ok(settle(
+                    config,
+                    &error,
+                    judged,
+                    route,
+                    (&judge, &spent_before, &week),
+                    report,
+                ));
+            }
         }
     }
 
@@ -1380,10 +1647,48 @@ pub async fn review(
             .await
         {
             Ok(count) => judged += count,
-            Err(error) => return Ok(settle(config, &error, judged, route, report)),
+            Err(error) => {
+                return Ok(settle(
+                    config,
+                    &error,
+                    judged,
+                    route,
+                    (&judge, &spent_before, &week),
+                    report,
+                ));
+            }
         }
     }
+    if judged > 0 {
+        note_step(
+            route,
+            config,
+            &week,
+            "review",
+            Some(Role::Review),
+            Some(&judge),
+            Some(spent_since(config, &judge, &spent_before, now)),
+            &format!("judged {judged}"),
+        );
+    }
     Ok(judged)
+}
+
+/// What an engine spent since `before` was read from the ledger, this week.
+fn spent_since(
+    config: &AgentConfig,
+    engine: &EngineSpec,
+    before: &engines::EngineState,
+    now: DateTime<Utc>,
+) -> f64 {
+    let after = engines::Ledger::load(&config.agent).state(&engine.name);
+    if before.week == after.week {
+        (after.spend_usd - before.spend_usd).max(0.0)
+    } else if after.week == engines::iso_week(now) {
+        after.spend_usd
+    } else {
+        0.0
+    }
 }
 
 /// A judge that failed mid-review: mark it if it ran out of credit, say so, keep what
@@ -1393,13 +1698,22 @@ fn settle(
     error: &anyhow::Error,
     judged: usize,
     route: &ProjectRoute,
+    (judge, before, week): (&EngineSpec, &engines::EngineState, &str),
     report: &dyn Progress,
 ) -> usize {
-    if let Some(skip) = error.downcast_ref::<engines::Unavailable>()
-        && let Some(until) = skip.until
-    {
-        engines::mark_exhausted(&config.agent, &skip.engine, until, &skip.reason);
+    if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
+        crate::agent::note_unavailable(route, config, skip);
     }
+    note_step(
+        route,
+        config,
+        week,
+        "review",
+        Some(Role::Review),
+        Some(judge),
+        Some(spent_since(config, judge, before, Utc::now())),
+        &format!("stopped after {judged}: {error:#}"),
+    );
     report.warn(&format!(
         "  {}: review stopped: {error:#}",
         route.project_id
@@ -1533,6 +1847,24 @@ fn percent(part: usize, whole: usize) -> String {
     }
 }
 
+/// What self-improve spent in `week`, per engine and machine, from the signed step
+/// records: (engine, machine, dollars), most first.
+#[must_use]
+pub fn spend_by_engine(route: &ProjectRoute, week: &str) -> Vec<(String, String, f64)> {
+    let mut sums: BTreeMap<(String, String), f64> = BTreeMap::new();
+    for step in ferryman_channel::policy::read_steps(route, week) {
+        if let (Some(engine), Some(cost)) = (step.engine, step.cost_usd) {
+            *sums.entry((engine, step.machine)).or_default() += cost;
+        }
+    }
+    let mut out: Vec<(String, String, f64)> = sums
+        .into_iter()
+        .map(|((engine, machine), usd)| (engine, machine, usd))
+        .collect();
+    out.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
+    out
+}
+
 /// Write `improve/<week>/report.md` for the week `at` falls in, against the week before.
 pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
     let week = engines::iso_week(at);
@@ -1612,14 +1944,22 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
         let advised = task
             .pending_recommendation()
             .is_some_and(|advice| advice.accept);
-        if matches!(state, TaskState::Accepted) || advised {
+        // An improvement is ready only with both keys: the review engine's and the
+        // master's. Anything else is what it always was: accepted.
+        let live = if ferryman_channel::gate::gated(&task.order.payload) {
+            ferryman_channel::gate::approved_for_live(route, task)
+        } else {
+            matches!(state, TaskState::Accepted)
+        };
+        if live || advised {
             ready.push(format!(
                 "- `{}` on `{branch}`{}: {}",
                 task.order.id,
-                if advised {
-                    " (a reviewer recommends it; confirm with 'ferry channel review')"
-                } else {
+                if live {
                     ""
+                } else {
+                    " (the review engine keeps it; waiting for your approval: 'ferry improve \
+                     approve')"
                 },
                 task_title(task)
             ));
@@ -1631,13 +1971,35 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
     let _ = writeln!(md, "\n## Ready to merge\n");
     let _ = writeln!(
         md,
-        "Reviewed and accepted. Nothing here merges by itself; a person merges it.\n"
+        "Approved with both keys - the review engine's and the master's. Nothing here merges \
+         by itself; a person merges it.\n"
     );
     if ready.is_empty() {
         let _ = writeln!(md, "Nothing yet.");
     }
     for line in ready {
         let _ = writeln!(md, "{line}");
+    }
+
+    let _ = writeln!(md, "\n## Who did each step\n");
+    let _ = writeln!(
+        md,
+        "The newest signed record of each step: which engine and model, on which machine.\n"
+    );
+    let steps = ferryman_channel::policy::latest_steps(route, &week);
+    if steps.is_empty() {
+        let _ = writeln!(md, "Nothing recorded.");
+    }
+    for step in &steps {
+        let _ = writeln!(md, "- {}", step.describe());
+    }
+    let _ = writeln!(md, "\n## Self-improve spend per engine\n");
+    let spend = spend_by_engine(route, &week);
+    if spend.is_empty() {
+        let _ = writeln!(md, "Nothing recorded.");
+    }
+    for (engine, machine, usd) in spend {
+        let _ = writeln!(md, "- {engine} on {machine}: ${usd:.2}");
     }
 
     let dir = week_dir(route, &week);
@@ -1689,7 +2051,10 @@ pub async fn run(
         let dir = week_dir(route, &week);
         if !dir.join("evidence.md").is_file() {
             match gather(route, now) {
-                Ok(_) => done.push(format!("{project}: gathered {week}")),
+                Ok(_) => {
+                    note_step(route, config, &week, "gather", None, None, None, "done");
+                    done.push(format!("{project}: gathered {week}"));
+                }
                 Err(error) => report.warn(&format!("{project}: gather failed: {error:#}")),
             }
         }
@@ -1713,13 +2078,7 @@ pub async fn run(
             }
         }
         let plan_unreviewed = read_plan(route, &week).is_some_and(|plan| plan.unreviewed);
-        let judge_up = engines::best_up(
-            &config.engines,
-            &engines::Ledger::load(&config.agent),
-            now,
-            Tier::Judge,
-        )
-        .is_some();
+        hold_unbuildable(route, config, &week, now, report);
         match request_merges(route, config) {
             Ok(0) => {}
             Ok(count) => done.push(format!("{project}: {count} ready to merge, asked")),
@@ -1741,7 +2100,9 @@ pub async fn run(
                 ));
             }
         }
-        if judge_up && (plan_unreviewed || awaiting_improvement_review(route)) {
+        // Review picks its judge through the engine policy, and holds - asking the
+        // master once - when there is work to judge and nothing allowed to judge it.
+        if plan_unreviewed || awaiting_improvement_review(route) {
             match review(route, config, now, report).await {
                 Ok(0) => {}
                 Ok(count) => done.push(format!("{project}: judged {count}")),
@@ -1813,6 +2174,8 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
         }
     }
 
@@ -1911,13 +2274,22 @@ mod tests {
         assert!(parse_questions(PLAN).is_empty(), "questions are optional");
     }
 
-    /// Accepted improvement work is announced to the master as ready to merge, once, and
-    /// nothing is merged.
+    /// An improvement is announced as ready to merge only with both keys - the review
+    /// engine's and the master's - once, and nothing is merged.
     #[test]
     fn accepted_improvements_become_one_merge_notice_each() {
         hermetic();
         let dir = tempfile::tempdir().unwrap();
-        let (route, config) = channel(dir.path(), Vec::new());
+        let (mut route, config) = channel(dir.path(), Vec::new());
+        switch_on(&route);
+        // The route as a worker loads it: the roster, the master included.
+        route.agents.push(ferryman_channel::AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(AgentIdentity::from_seed("josh", [9; 32]).public_key_hex()),
+            encryption_key: None,
+        });
         let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
         let mut order = Order {
             id: "improve-2026-w39-1".into(),
@@ -1966,7 +2338,39 @@ mod tests {
             signature: None,
         };
         wisp.sign_review(&mut review);
-        ferryman_channel::submit_review(&route, &review).unwrap();
+        assert!(
+            ferryman_channel::submit_review(&route, &review).is_err(),
+            "an agent never accepts an improvement"
+        );
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        assert!(
+            ferryman_channel::gate::decide(&route, &order.id, true, None, "josh", &josh).is_err(),
+            "not before the review engine"
+        );
+        ferryman_channel::gate::record_engine_review(
+            &route,
+            &wisp,
+            ferryman_channel::gate::EngineReview {
+                order_id: order.id.clone(),
+                revision: 1,
+                reviewer: "wisp".into(),
+                machine: "grouchly".into(),
+                engine: "deepseek".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                host: None,
+                route: Vec::new(),
+                accept: true,
+                summary: "names the engine in every failure".into(),
+                reviewed_at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(request_merges(&route, &config).unwrap(), 0, "one key");
+        ferryman_channel::gate::decide(&route, &order.id, true, None, "josh", &josh).unwrap();
 
         assert_eq!(request_merges(&route, &config).unwrap(), 1);
         assert_eq!(request_merges(&route, &config).unwrap(), 0, "asked once");
@@ -1977,6 +2381,11 @@ mod tests {
             pending[0]
                 .text
                 .starts_with("Ready to merge: Name the engine")
+        );
+        assert!(
+            pending[0].text.contains("holds both keys"),
+            "{}",
+            pending[0].text
         );
         assert_eq!(
             ferryman_channel::read_task(&route, &order.id)
@@ -2479,6 +2888,146 @@ mod tests {
         assert_eq!(read, text);
     }
 
+    /// Only a subscription judge is configured: planning holds rather than spend it,
+    /// records why once, and asks the master once - however often the loop runs.
+    #[tokio::test]
+    async fn planning_holds_on_a_subscription_and_asks_the_master_once() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let mut claude = engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"));
+        claude.paid = Paid::Subscription;
+        let (route, config) = channel(dir.path(), vec![claude]);
+        switch_on(&route);
+        let now = Utc::now();
+        let week = engines::iso_week(now);
+
+        for _ in 0..3 {
+            let outcome = plan(&route, &config, DEFAULT_MAX, now, &crate::Silent)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&outcome, PlanOutcome::Held(why) if why.contains("subscription")),
+                "{outcome:?}"
+            );
+        }
+        assert!(improvements(&route).is_empty(), "nothing fell back");
+        assert!(read_plan(&route, &week).is_none());
+        let asked = ferryman_channel::questions::pending(&route);
+        assert_eq!(asked.len(), 1, "one question, not one an hour: {asked:?}");
+        assert_eq!(asked[0].kind, ferryman_channel::questions::POLICY);
+        assert_eq!(
+            asked[0].options[0],
+            ferryman_channel::policy::ACCEPT_RECOMMENDED
+        );
+        let steps = ferryman_channel::policy::read_steps(&route, &week);
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        assert!(steps[0].outcome.starts_with("held: "));
+
+        // The master lets it spend the subscription after all: it plans.
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        ferryman_channel::policy::set_policy(
+            &route.communications,
+            "demo",
+            Some(Policy {
+                protect_subscriptions: false,
+                ..Policy::default()
+            }),
+            &josh,
+        )
+        .unwrap();
+        let outcome = plan(&route, &config, DEFAULT_MAX, now, &crate::Silent)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PlanOutcome::Planned { engine, .. } if engine == "claude"),
+            "{outcome:?}"
+        );
+    }
+
+    /// The policy's order decides who plans and who reviews, `never` is never used, and
+    /// each step is recorded with its engine, model and machine.
+    #[tokio::test]
+    async fn the_policy_picks_the_planner_and_the_judge_and_each_step_is_recorded() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let mut nemotron = engine("nemotron", Tier::Build, &format!("fake://ok:{PLAN}"));
+        nemotron.paid = Paid::FreeTier;
+        nemotron.model = Some("nvidia/nemotron-70b".into());
+        let (route, mut config) = channel(
+            dir.path(),
+            vec![
+                engine("claude", Tier::Judge, "fake://ok:should never be asked"),
+                engine("deepseek", Tier::Judge, "fake://ok:keep both"),
+                nemotron,
+            ],
+        );
+        switch_on(&route);
+        let josh = AgentIdentity::from_seed("josh", [9; 32]);
+        let mut policy = Policy::default();
+        policy.move_to_top("deepseek");
+        policy.move_to_top("nemotron");
+        policy.never.push("claude".into());
+        ferryman_channel::policy::set_policy(&route.communications, "demo", Some(policy), &josh)
+            .unwrap();
+        let now = Utc::now();
+        let week = engines::iso_week(now);
+
+        let outcome = plan(&route, &config, 1, now, &crate::Silent).await.unwrap();
+        assert!(
+            matches!(&outcome, PlanOutcome::Planned { engine, unreviewed: true, .. } if engine == "nemotron"),
+            "the operator's first choice plans, marked unreviewed as a builder: {outcome:?}"
+        );
+        // Review is a judge's: deepseek, never claude.
+        assert_eq!(
+            review(&route, &config, now, &crate::Silent).await.unwrap(),
+            1
+        );
+        assert!(
+            fs::read_to_string(week_dir(&route, &week).join("plan-review.md"))
+                .unwrap()
+                .contains("by deepseek")
+        );
+        let steps = ferryman_channel::policy::latest_steps(&route, &week);
+        let plan_step = steps.iter().find(|s| s.step == "plan").unwrap();
+        assert_eq!(plan_step.engine.as_deref(), Some("nemotron"));
+        assert_eq!(plan_step.model.as_deref(), Some("nvidia/nemotron-70b"));
+        assert_eq!(
+            plan_step.machine,
+            ferryman_channel::receipts::machine_label()
+        );
+        assert_eq!(plan_step.cost_usd, Some(0.0), "a free tier costs nothing");
+        let review_step = steps.iter().find(|s| s.step == "review").unwrap();
+        assert_eq!(review_step.engine.as_deref(), Some("deepseek"));
+        let report = fs::read_to_string(self::report(&route, now).unwrap()).unwrap();
+        assert!(report.contains("## Who did each step"), "{report}");
+        assert!(
+            report.contains("plan: nemotron (nvidia/nemotron-70b) on"),
+            "{report}"
+        );
+
+        // A policy that names another machine: this one plans and reviews nothing.
+        let elsewhere = Policy {
+            machines: vec!["grouchly-only".into()],
+            ..Policy::default()
+        };
+        ferryman_channel::policy::set_policy(&route.communications, "demo", Some(elsewhere), &josh)
+            .unwrap();
+        config.engines.truncate(2);
+        let later = now + Duration::days(7);
+        assert!(matches!(
+            plan(&route, &config, 1, later, &crate::Silent)
+                .await
+                .unwrap(),
+            PlanOutcome::NotHere(_)
+        ));
+        assert_eq!(
+            review(&route, &config, later, &crate::Silent)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
     /// A refuted result is never done: not in the report's done count, not a run that
     /// succeeded, and counted on a line of its own.
     #[test]
@@ -2545,5 +3094,437 @@ mod tests {
         assert_eq!(week.done, 1, "{week:?}");
         assert_eq!(week.refuted, 1);
         assert_eq!((week.runs, week.runs_ok), (2, 1));
+    }
+
+    // --- auto-merge: low-risk work, after both keys, by the worker that built it -------
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=tester",
+                "-c",
+                "user.email=tester@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn josh() -> AgentIdentity {
+        AgentIdentity::from_seed("josh", [9; 32])
+    }
+
+    fn wisp() -> AgentIdentity {
+        AgentIdentity::from_seed("wisp", [7; 32])
+    }
+
+    /// A git workspace on `main` - a library, its tests, docs and a lockfile, with the
+    /// channel inside it as on a real machine - josh its master and wisp its worker, and
+    /// the engine policy auto-merging low-risk work when `auto`.
+    fn merge_fixture(dir: &Path, auto: bool) -> (ProjectRoute, AgentConfig) {
+        let (mut route, config) = channel(dir, Vec::new());
+        switch_on(&route);
+        route.agents.push(ferryman_channel::AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(josh().public_key_hex()),
+            encryption_key: None,
+        });
+        let repo = route.workspace.clone();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        fs::write(repo.join(".gitignore"), ".ferryman/\n").unwrap();
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("README.md"), "# demo\n").unwrap();
+        fs::write(repo.join("tests/add.rs"), "#[test]\nfn adds() {}\n").unwrap();
+        fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        if auto {
+            assert!(
+                ferryman_channel::policy::set_policy(
+                    &route.communications,
+                    &route.project_id,
+                    Some(Policy {
+                        auto_merge: ferryman_channel::policy::AutoMerge::LowRisk,
+                        ..Policy::default()
+                    }),
+                    &josh(),
+                )
+                .unwrap()
+            );
+        }
+        (route, config)
+    }
+
+    /// An improvement wisp built on its own branch, changing `files`, with its signed
+    /// result naming the branch tip - and the review engine's key and the master's when
+    /// asked for. Returns the tip.
+    fn built(
+        route: &ProjectRoute,
+        id: &str,
+        files: &[(&str, &str)],
+        engine_key: bool,
+        master_key: bool,
+    ) -> String {
+        let repo = route.workspace.clone();
+        let branch = ferryman_channel::worktree::branch_name(id, "wisp");
+        git(&repo, &["branch", &branch, "main"]);
+        let dir = repo.parent().unwrap().join(format!("wt-{id}"));
+        git(
+            &repo,
+            &["worktree", "add", "-q", dir.to_str().unwrap(), &branch],
+        );
+        for (path, text) in files {
+            let path = dir.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", id]);
+        let tip = git(&dir, &["rev-parse", "HEAD"]);
+        git(
+            &repo,
+            &["worktree", "remove", "--force", dir.to_str().unwrap()],
+        );
+
+        let mut order = Order {
+            id: id.into(),
+            project_id: "demo".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "x", "tags": [TAG], "improvement": { "title": format!("Improve {id}") } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        wisp().sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order).unwrap();
+        ferryman_channel::claim_order(route, id, "wisp").unwrap();
+        let mut result = ferryman_channel::TaskResult {
+            order_id: id.into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({
+                "output": "done",
+                "worktree_head": tip,
+                "evidence": { "recorded_by": "worker", "git": true, "commits": [format!("{} {id}", &tip[..7])] },
+            }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp().sign_result(&mut result);
+        ferryman_channel::submit_result(route, &result).unwrap();
+        if engine_key {
+            ferryman_channel::gate::record_engine_review(
+                route,
+                &wisp(),
+                ferryman_channel::gate::EngineReview {
+                    order_id: id.into(),
+                    revision: 1,
+                    reviewer: "wisp".into(),
+                    machine: "grouchly".into(),
+                    engine: "deepseek".into(),
+                    model: None,
+                    tier: "judge".into(),
+                    paid: "prepaid".into(),
+                    host: None,
+                    route: Vec::new(),
+                    accept: true,
+                    summary: "does what it says".into(),
+                    reviewed_at: Utc::now(),
+                    signed_by: None,
+                    signature: None,
+                },
+            )
+            .unwrap();
+        }
+        if master_key {
+            let decided = ferryman_channel::gate::decide(route, id, true, None, "josh", &josh());
+            assert_eq!(
+                decided.is_ok(),
+                engine_key,
+                "the master's key only after the engine's: {decided:?}"
+            );
+        }
+        tip
+    }
+
+    /// An authorization a peer wrote, whether or not anything earned it.
+    fn forge_authorization(route: &ProjectRoute, id: &str, tip: &str) {
+        ferryman_channel::automerge::record(
+            route,
+            &wisp(),
+            ferryman_channel::automerge::MergeRecord {
+                order_id: id.into(),
+                revision: 1,
+                status: ferryman_channel::automerge::AUTHORIZED.into(),
+                branch: Some(ferryman_channel::worktree::branch_name(id, "wisp")),
+                head: Some(tip.into()),
+                into: None,
+                commit: None,
+                pushed: None,
+                files: Vec::new(),
+                note: "forged".into(),
+                by: "wisp".into(),
+                at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn merges(route: &ProjectRoute, config: &AgentConfig) -> usize {
+        crate::agent::merge_approved(route, config, &wisp(), &crate::Silent)
+    }
+
+    fn is_ancestor(repo: &Path, commit: &str, of: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["merge-base", "--is-ancestor", commit, of])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Docs-only, tests-only and lockfile-only improvements merge on their own once they
+    /// hold both keys and the policy says low-risk: by the worker that built them, beside
+    /// the person's checkout, once each, and with nothing to ask the master.
+    #[test]
+    fn docs_tests_and_lockfile_improvements_merge_on_their_own_after_both_keys() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        // The person is working on another branch: the merge happens beside them.
+        git(&repo, &["checkout", "-q", "-b", "wip"]);
+        let docs = built(
+            &route,
+            "improve-2026-w40-1",
+            &[
+                ("README.md", "# demo\n\nHow to add.\n"),
+                ("docs/guide.md", "Adding numbers.\n"),
+            ],
+            true,
+            true,
+        );
+        let tests = built(
+            &route,
+            "improve-2026-w40-2",
+            &[(
+                "tests/add.rs",
+                "#[test]\nfn adds() {}\n\n#[test]\nfn adds_zero() {}\n",
+            )],
+            true,
+            true,
+        );
+        let lock = built(
+            &route,
+            "improve-2026-w40-3",
+            &[("Cargo.lock", "version = 4\n")],
+            true,
+            true,
+        );
+        assert_eq!(
+            request_merges(&route, &config).unwrap(),
+            0,
+            "authorized for the worker, not asked"
+        );
+        assert_eq!(merges(&route, &config), 3);
+        for tip in [&docs, &tests, &lock] {
+            assert!(is_ancestor(&repo, tip, "main"), "{tip} is on main");
+        }
+        let merged = ferryman_channel::automerge::merged(&route);
+        assert_eq!(merged.len(), 3, "{merged:?}");
+        assert!(
+            merged
+                .iter()
+                .all(|record| record.into.as_deref() == Some("main") && record.pushed.is_none()),
+            "{merged:?}"
+        );
+        assert_eq!(merges(&route, &config), 0, "merged once");
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert!(
+            ferryman_channel::questions::pending(&route).is_empty(),
+            "nothing to ask the master"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "wip",
+            "the checkout is left as it was"
+        );
+    }
+
+    /// A worker that pushes for the project pushes the merged default branch - plainly,
+    /// never forced - and one that does not, does not.
+    #[test]
+    fn a_worker_that_pushes_pushes_the_merge() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, mut config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let remote = dir.path().join("remote.git");
+        git(
+            dir.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "origin", "main"]);
+        config.push = Some("origin".to_string());
+        let tip = built(
+            &route,
+            "improve-2026-w40-9",
+            &[("docs/guide.md", "Adding numbers.\n")],
+            true,
+            true,
+        );
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 1);
+        assert_eq!(
+            git(&remote, &["rev-parse", "main"]),
+            tip,
+            "a fast-forward, pushed"
+        );
+        let merged = ferryman_channel::automerge::merged(&route);
+        assert_eq!(merged[0].pushed.as_deref(), Some("origin"));
+    }
+
+    /// Code alongside docs is not low risk: it stops at "approved, ready to merge" and
+    /// the master is told why.
+    #[test]
+    fn code_with_docs_does_not_merge_on_its_own() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        built(
+            &route,
+            "improve-2026-w40-4",
+            &[
+                ("README.md", "# demo\n\nNow wrapping.\n"),
+                (
+                    "src/lib.rs",
+                    "pub fn add(a: u32, b: u32) -> u32 {\n    a.wrapping_add(b)\n}\n",
+                ),
+            ],
+            true,
+            true,
+        );
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main, "main untouched");
+        let pending = ferryman_channel::questions::pending(&route);
+        assert_eq!(pending.len(), 1, "the master is asked instead");
+        assert!(
+            pending[0]
+                .text
+                .contains("did not merge this one on its own")
+                && pending[0].text.contains("src/lib.rs"),
+            "{}",
+            pending[0].text
+        );
+    }
+
+    /// One key is never enough - not even with an authorization a peer wrote for it -
+    /// and a policy that does not say low-risk merges nothing, keys or not.
+    #[test]
+    fn one_key_or_auto_merge_off_never_merges() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        let docs = [("README.md", "# demo\n\nMore.\n")];
+        let engine_only = built(&route, "improve-2026-w40-5", &docs, true, false);
+        // The master alone cannot even give the key: approval needs the engine's first.
+        let master_only = built(&route, "improve-2026-w40-6", &docs, false, true);
+        forge_authorization(&route, "improve-2026-w40-5", &engine_only);
+        forge_authorization(&route, "improve-2026-w40-6", &master_only);
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), false);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        let both = built(&route, "improve-2026-w40-7", &docs, true, true);
+        forge_authorization(&route, "improve-2026-w40-7", &both);
+        assert_eq!(merges(&route, &config), 0, "auto_merge = none");
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main);
+        assert_eq!(
+            request_merges(&route, &config).unwrap(),
+            1,
+            "the master merges it, as ever"
+        );
+    }
+
+    /// A merge that does not apply cleanly is aborted, leaves main as it was, and falls
+    /// back to the master with the reason.
+    #[test]
+    fn a_failed_merge_falls_back_to_the_master() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        built(
+            &route,
+            "improve-2026-w40-8",
+            &[("README.md", "# demo\n\nFrom the branch.\n")],
+            true,
+            true,
+        );
+        // main moved on meanwhile, in the same lines.
+        fs::write(repo.join("README.md"), "# demo\n\nFrom main.\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "main moves on"]);
+        let main = git(&repo, &["rev-parse", "main"]);
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main);
+        assert!(
+            git(&repo, &["status", "--porcelain", "--untracked-files=no"]).is_empty(),
+            "the conflict was aborted"
+        );
+        match ferryman_channel::automerge::stage(&route, "improve-2026-w40-8", 1) {
+            ferryman_channel::automerge::Stage::Held(record) => {
+                assert!(record.note.contains("the merge failed"), "{}", record.note);
+            }
+            other => panic!("not held: {other:?}"),
+        }
+        let pending = ferryman_channel::questions::pending(&route);
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].text.contains("the merge failed"),
+            "{}",
+            pending[0].text
+        );
     }
 }

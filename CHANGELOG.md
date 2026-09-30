@@ -1,5 +1,91 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Engine policy: which engines do background work, and where.** A master-signed
+  `ENGINE_POLICY` per project (or `--all` of them) says, for each background role -
+  `plan`, `build`, `review`, `chore` - which engines are preferred in which order, which
+  are `never` used, which machines may run self-improve (`where`), optional weekly
+  dollar caps per role, and whether subscriptions are protected (on by default).
+  Selectors match an engine name, a model glob (`nvidia/nemotron*`), a paid class
+  (`paid:free-tier`) or an endpoint host. Unsigned, edited or forged policies are ignored
+  exactly like `SELF_IMPROVE`. Background work is improvement orders and the loop's own
+  planning and review; orders a person gives are untouched unless the policy says
+  `never_applies_to = "all"`.
+- **Auto, when no policy is set.** Local > free tier > capped prepaid > unknown >
+  uncapped prepaid; never a subscription while protected. Ties go to trust, then cost
+  per verified result, then operator order; plan and review prefer a judge. An unmarked
+  `claude` or `codex` CLI counts as a subscription. `ferry engines policy recommend`
+  prints the proposal with one reason per choice ("nemotron first for build: free-tier,
+  12 verified, 0 refuted"); `accept [--all]` signs it.
+- **No fallback.** With nothing the policy allows available, background work waits -
+  never on a blocked engine - the reason is recorded, and the master is asked once per
+  role per week, with buttons on the phone. A worker outside `where` does not claim
+  improvement orders. A free tier that returns a payment or quota error, or reports a
+  cost, is flagged in the ledger and the published inventory, ranked down, and the
+  master told once.
+- **Who did what.** Each improve step (gather, plan, build per order, review) is
+  recorded, signed by the agent that did it, with engine, model, machine and cost.
+  `ferry improve status` and `ferry improve report` show them with spend per engine;
+  `ferry engines` ends with each project's effective policy - each role's engines in
+  order and every blocked engine with the reason.
+- **Everywhere.** `ferry engines policy show | recommend | accept | set | clear`; an
+  Engine policy panel on the dashboard's Teammates page (accept, edit prefer / never /
+  where, back to auto, for one or all projects); Accept recommended, Block and Move to
+  top in Telegram's Engines menu under the `improve` delegation. `ferry improve on`, the
+  dashboard and Telegram offer the recommendation when a project has no policy.
+
+- **Pick two engines, simply.** The dashboard's policy panel opens with two dropdowns -
+  "Improvement engine" (plans and builds) and "Review engine" - each engine shown with
+  its paid class and the recommended one marked, and a "Use recommended" button; the
+  full prefer / never / where editor moved under "Advanced". Telegram's Engines menu
+  picks each with two buttons. CLI: `ferry engines policy set --improve <sel> --review
+  <sel> [--all]`.
+- **Two keys before an improvement goes live.** An improvement is "approved for live"
+  only with both: a signed verdict accepting it from the policy's review engine, on a
+  result whose evidence passes verification and that no verifier refuted; and a signed
+  approval from the master (or their `review` delegate acting on the master's button).
+  Neither alone is enough - `submit_review` refuses an agent's accept, and the master's
+  until the engine's key is there - and a blocked or unavailable review engine holds
+  and asks, never skips. Even with both, only low-risk work under auto-merge (below)
+  merges on its own: the "ready to merge" notice and the report's list now need both keys. `ferry improve pending | approve |
+  send-back`, a "Waiting for your approval" list on the dashboard (diff stat, evidence,
+  the review engine's summary, Approve / Send back), and the same on the phone.
+- **OmniRoute as a first-class engine.** `provider = "omniroute"` (or a base URL on port
+  20128) is recognised. The probe lists its models and combos and each combo's steps;
+  a route is free, subscription or unknown by where it ends, so protection and `never
+  claude` see through the gateway. Its combos and free models are published as engines
+  of their own ("OmniRoute: free-stack") for the dropdowns, a free combo ranks as free
+  tier, and its per-request cost header is counted. `ferry engines policy recommend` and
+  `ferry enable` point out a local OmniRoute nobody uses yet.
+- **Auto-merge low-risk work, only after both keys.** `auto_merge = "none" | "low-risk"`
+  in the engine policy, `none` by default. With `low-risk`, an improvement holding both
+  keys is merged by the worker that built it when every changed file is docs (`*.md`,
+  `docs/**`, license text, Rust comment-only changes), tests (`tests/**`, `*_test.*`,
+  `test_*.*`, `*.spec.*`, Rust changes inside a trailing `#[cfg(test)]` module) or
+  dependency versions (lockfiles changed in place; `Cargo.toml`, `package.json`,
+  `pyproject.toml`, `requirements*.txt`, `go.mod` where only versions change) - read from
+  the branch itself. Code or config still stops at "approved, ready to merge". The loop
+  signs a `merge-authorized` record; the worker re-checks both keys, the reviewed
+  commit and every file, merges (fast-forward, or a merge commit), pushes only if it
+  already pushes for the project and never with force, and records the merge in the
+  ledger and on Telegram. A conflict, a moved branch, a dirty checkout or a refused push
+  falls back to the master with the reason. `ferry engines policy set --auto-merge
+  low-risk [--all]`, a checkbox on the dashboard, a button on the phone.
+
+### Changed
+
+- An engine's accepting verdict on an improvement is recorded as a signed engine
+  review and a recommendation, never as an acceptance; approving is the master's.
+- Improvement orders now go to engines in the policy's order (auto when none is set),
+  not the operator's engine order; a subscription engine no longer takes them unless a
+  policy allows it. Free-tier and local engines count no spend unless the provider
+  reports a cost.
+- Engine inventories carry the endpoint host, whether a weekly cap is set, this week's
+  requests and spend, and any free-tier flag. A worker on an older version sees a newer
+  worker's inventory as unverified until it is upgraded, as with engine trust in 0.5.16.
 ## v0.5.16 - 2026-09-29
 
 fm checks what its workers did instead of trusting what they said, and it gets better on its own: a weekly self-improve loop per repo, engines that fall back when one runs out, delivered and read receipts, and every project from one Telegram chat.
