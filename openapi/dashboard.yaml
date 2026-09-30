@@ -279,8 +279,10 @@ paths:
         The simple choice. `improve` goes first for planning and building, `review` first
         for review - the first of the two keys every improvement needs before it can go
         live. `recommended` uses what auto recommends for both. The rest of the policy is
-        kept. `all` does it in every project the person is master of. The CLI equivalent
-        is `ferry engines policy set --improve <sel> --review <sel>`.
+        kept. `auto_merge` is `none` or `low-risk`: whether fm merges an improvement on its
+        own once it holds both keys, when every changed file is docs, tests or a dependency
+        version bump. `all` does it in every project the person is master of. The CLI
+        equivalent is `ferry engines policy set --improve <sel> --review <sel> --auto-merge <mode>`.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       requestBody:
@@ -293,10 +295,11 @@ paths:
                 improve: {type: string}
                 review: {type: string}
                 recommended: {type: boolean}
+                auto_merge: {type: string, enum: [none, low-risk]}
                 all: {type: boolean}
       responses:
         '200': {description: 'how many changed, and per project: set, already, skipped or error'}
-        '400': {description: nothing picked}
+        '400': {description: nothing picked, or an auto_merge that is neither none nor low-risk}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
   /api/improve/pending:

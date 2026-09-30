@@ -22,8 +22,10 @@
 //! blocked or out, the improve loop holds and asks; it never skips the review and never
 //! approves by itself.
 //!
-//! Even with both keys nothing merges: the improvement becomes "approved, ready to
-//! merge", and merging stays the master's own act.
+//! With both keys the improvement becomes "approved, ready to merge", and merging is the
+//! master's own act - unless the project's engine policy says `auto_merge = "low-risk"`,
+//! and then only docs, tests and dependency bumps merge on their own; see
+//! [`crate::automerge`].
 //!
 //! Audit verification orders are not gated: they change nothing and never go live.
 
@@ -159,7 +161,7 @@ pub fn record_engine_review(
 }
 
 /// The roster to check a signature against: the channel's, and the route's own.
-fn roster(route: &ProjectRoute) -> Vec<AgentRoute> {
+pub(crate) fn roster(route: &ProjectRoute) -> Vec<AgentRoute> {
     let mut all = crate::read_agent_roster(&route.communications).unwrap_or_default();
     for agent in &route.agents {
         if !all
@@ -314,7 +316,8 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// Both keys: approved, ready to merge. Nothing merges on its own.
+    /// Both keys: approved, ready to merge - by the master, or for low-risk work under
+    /// `auto_merge = "low-risk"`, by fm ([`crate::automerge`]).
     #[must_use]
     pub fn approved(&self) -> bool {
         self.engine.is_ok() && self.master.is_ok()
@@ -454,7 +457,7 @@ pub fn waiting(route: &ProjectRoute) -> Vec<Waiting> {
     out
 }
 
-fn title(task: &Task) -> String {
+pub(crate) fn title(task: &Task) -> String {
     task.order.payload["improvement"]["title"]
         .as_str()
         .map(str::to_string)

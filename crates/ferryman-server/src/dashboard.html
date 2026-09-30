@@ -1070,6 +1070,8 @@ function policyPanel(ep) {
         </div>
         <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)}.
           Every improvement needs the review engine's verdict and then yours before it can go live.</div>
+        <label class="s" style="display:inline-flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="ep-automerge" ${p.auto_merge === "low-risk" ? "checked" : ""} ${ep.may_set ? "" : "disabled"} /> Auto-merge docs/tests/deps after both approvals</label>
+        <div class="s" style="color:var(--dim)">Only when every changed file is documentation, tests or a dependency version bump. Anything touching code or config still waits for you.</div>
         <div class="s" id="ep-msg" style="color:var(--dim);margin-top:4px"></div>`;
   return `
     <div class="notice" style="margin-bottom:18px">
@@ -1123,7 +1125,7 @@ function approvalsPanel(pd) {
       </div>`).join("");
   return `
     <div class="panel" style="margin-bottom:18px">
-      <div class="chat-top"><b>Waiting for your approval</b> <span class="s" style="color:var(--dim)">&mdash; improvements need the review engine's verdict, then yours. Nothing merges on its own.</span></div>
+      <div class="chat-top"><b>Waiting for your approval</b> <span class="s" style="color:var(--dim)">&mdash; improvements need the review engine's verdict, then yours. Only docs, tests and dependency bumps may merge on their own, and only when auto-merge is on.</span></div>
       ${rows}
       <div class="s" id="imp-msg" style="color:var(--dim);padding:8px 16px"></div>
     </div>`;
@@ -1173,6 +1175,9 @@ function wirePolicy() {
     if (!improve && !review) { msg("Pick an improvement engine or a review engine."); return; }
     choose(chooseBtn, { improve, review });
   });
+  const autoMerge = $("#ep-automerge");
+  if (autoMerge && !autoMerge.disabled) autoMerge.addEventListener("change", () =>
+    choose(autoMerge, { auto_merge: autoMerge.checked ? "low-risk" : "none" }));
   const useRec = $("#ep-use-rec");
   if (useRec) useRec.addEventListener("click", () => choose(useRec, { recommended: true }));
   const accept = $("#ep-accept");

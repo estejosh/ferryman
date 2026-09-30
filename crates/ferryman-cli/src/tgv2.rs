@@ -760,6 +760,17 @@ impl Bridge {
                 button("Use recommended", self.data(format!("prec:{project}"))),
                 button("Accept recommended", self.data(format!("pacc:{project}"))),
             ],
+            vec![if current.auto_merge == policy::AutoMerge::LowRisk {
+                button(
+                    "Auto-merge docs/tests/deps: on - turn off",
+                    self.data(format!("pam:{project}:none")),
+                )
+            } else {
+                button(
+                    "Auto-merge docs/tests/deps after both approvals",
+                    self.data(format!("pam:{project}:low-risk")),
+                )
+            }],
         ];
         let mut names: Vec<String> = Vec::new();
         for engine in &fleet {
@@ -1103,6 +1114,28 @@ impl Bridge {
                         _ => format!("Recommended engines set for {project}"),
                     },
                     Ok(false) => "Already so".to_string(),
+                    Err(why) => excerpt(&why, 190),
+                };
+                Some(self.engines_view(chat, now))
+            }
+            "pam" => {
+                let outcome = match policy::AutoMerge::parse(&id) {
+                    Ok(mode) => self
+                        .change_policy(&project, |mut current, _| {
+                            current.auto_merge = mode;
+                            Some(current)
+                        })
+                        .map(|changed| (changed, mode)),
+                    Err(error) => Err(format!("{error:#}")),
+                };
+                toast = match outcome {
+                    Ok((true, policy::AutoMerge::LowRisk)) => format!(
+                        "{project}: docs, tests and dependency bumps merge on their own after both approvals"
+                    ),
+                    Ok((true, policy::AutoMerge::None)) => {
+                        format!("{project}: nothing merges on its own")
+                    }
+                    Ok((false, _)) => "Already so".to_string(),
                     Err(why) => excerpt(&why, 190),
                 };
                 Some(self.engines_view(chat, now))
@@ -1564,13 +1597,40 @@ impl Bridge {
                         excerpt(&engine.describe(), 600)
                     ));
                 }
-                lines.push(
+                let auto = policy::effective(&route.communications, &project)
+                    .0
+                    .auto_merge
+                    == policy::AutoMerge::LowRisk;
+                lines.push(if auto {
+                    "Approving is the second key. Then docs, tests and dependency bumps merge \
+                     on their own; anything else becomes approved, ready to merge."
+                        .to_string()
+                } else {
                     "Approving is the second key. Nothing merges on its own: it becomes \
                      approved, ready to merge."
-                        .to_string(),
-                );
+                        .to_string()
+                });
                 let buttons = vec![self.review_buttons(&project, &waiting.order_id, true)];
                 actions.push(send(home, lines.join("\n"), buttons));
+            }
+            // What fm merged on its own - low-risk work, after both keys - said once each.
+            for merged in ferryman_channel::automerge::merged(&route) {
+                let key = format!("m:{project}:{}:{}", merged.order_id, merged.revision);
+                if self.state.posted.contains(&key) {
+                    continue;
+                }
+                self.state.posted.push(key);
+                if !self.state.seeded {
+                    continue;
+                }
+                actions.push(send(
+                    home,
+                    format!(
+                        "{project} - merged on its own after both approvals:\n{}",
+                        excerpt(&merged.describe(), 1500)
+                    ),
+                    Vec::new(),
+                ));
             }
             for question in questions::pending(&route) {
                 let key = format!("q:{project}:{}", question.id);
@@ -1586,7 +1646,7 @@ impl Bridge {
                 let data = self.data(format!("ansx:{project}:{}", question.id));
                 buttons.push(vec![button("Answer in words", data)]);
                 let heading = if question.kind == questions::MERGE {
-                    format!("{project} - ready to merge (nothing merges on its own)")
+                    format!("{project} - ready to merge, waiting for you")
                 } else if question.kind == questions::POLICY {
                     format!("{project} - engine policy")
                 } else {
@@ -2733,6 +2793,36 @@ mod tests {
         assert_eq!(chosen.improvement_engine(), Some("name:nemotron"));
         assert_eq!(chosen.review_engine(), Some("name:deepseek"));
         assert_eq!(setting.unwrap().set_by(), "josh via telegram-grouchly");
+        assert_eq!(
+            chosen.auto_merge,
+            policy::AutoMerge::None,
+            "off unless asked"
+        );
+
+        // The auto-merge toggle, one button.
+        let view = bridge.handle(press(JOSH_TG, GROUP, 90, "engines"), Utc::now());
+        press_labelled(
+            &mut bridge,
+            &view,
+            "Auto-merge docs/tests/deps after both approvals",
+            90,
+        );
+        let (chosen, _) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(chosen.auto_merge, policy::AutoMerge::LowRisk);
+        assert_eq!(
+            chosen.review_engine(),
+            Some("name:deepseek"),
+            "the rest is kept"
+        );
+        let view = bridge.handle(press(JOSH_TG, GROUP, 90, "engines"), Utc::now());
+        press_labelled(
+            &mut bridge,
+            &view,
+            "Auto-merge docs/tests/deps: on - turn off",
+            90,
+        );
+        let (chosen, _) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(chosen.auto_merge, policy::AutoMerge::None);
     }
 
     /// An improvement reaches the phone only after the review engine's key, and the

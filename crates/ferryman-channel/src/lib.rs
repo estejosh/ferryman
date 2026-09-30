@@ -14,6 +14,7 @@ use std::{
 
 pub mod anchor;
 pub mod ask;
+pub mod automerge;
 pub mod contract;
 pub mod conversation;
 pub mod cost;

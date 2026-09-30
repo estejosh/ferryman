@@ -82,6 +82,11 @@ pub(crate) enum PolicyCommand {
         /// `all`: it applies to them too.
         #[arg(long, value_name = "background|all")]
         never_applies_to: Option<String>,
+        /// `none` (the default): you merge every approved improvement. `low-risk`: fm
+        /// merges docs-, tests- and dependency-bump-only improvements on its own, and only
+        /// after both keys - the review engine's and yours.
+        #[arg(long, value_name = "none|low-risk", value_parser = policy::AutoMerge::parse)]
+        auto_merge: Option<policy::AutoMerge>,
     },
     /// Go back to auto, signed.
     Clear {
@@ -138,6 +143,7 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             cap_usd,
             protect_subscriptions,
             never_applies_to,
+            auto_merge,
         } => {
             let roles: Vec<Role> = if roles.is_empty() {
                 Role::ALL.to_vec()
@@ -163,10 +169,11 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 && cap_usd.is_none()
                 && protect_subscriptions.is_none()
                 && scope.is_none()
+                && auto_merge.is_none()
             {
                 bail!(
                     "nothing to set: name --improve, --review, --prefer, --never, --where, \
-                     --cap-usd, --protect-subscriptions or --never-applies-to"
+                     --cap-usd, --protect-subscriptions, --never-applies-to or --auto-merge"
                 );
             }
             sign_each(&which, "set", |_, _, mut current| {
@@ -201,6 +208,9 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 }
                 if let Some(scope) = scope {
                     current.never_applies_to = scope;
+                }
+                if let Some(mode) = auto_merge {
+                    current.auto_merge = mode;
                 }
                 Ok(Some(current))
             })
@@ -440,17 +450,23 @@ mod tests {
             "claude",
             "--where",
             "grouchly",
+            "--auto-merge",
+            "low-risk",
             "--all",
         ])
         .unwrap();
         let PolicyCommand::Set {
-            improve, review, ..
+            improve,
+            review,
+            auto_merge,
+            ..
         } = cli.command
         else {
             panic!("not set")
         };
         assert_eq!(improve.as_deref(), Some("nemotron"));
         assert_eq!(review.as_deref(), Some("deepseek"));
+        assert_eq!(auto_merge, Some(policy::AutoMerge::LowRisk));
     }
 
     /// Josh's own policy, as the docs give it, parses into what it says.

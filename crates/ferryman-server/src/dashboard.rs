@@ -2149,6 +2149,10 @@ struct ChooseBody {
     /// Use what auto recommends for both.
     #[serde(default)]
     recommended: bool,
+    /// `none` or `low-risk`: whether fm merges docs, tests and dependency bumps on its
+    /// own once both keys are there.
+    #[serde(default)]
+    auto_merge: Option<String>,
     #[serde(default)]
     all: bool,
 }
@@ -2162,10 +2166,18 @@ async fn engine_policy_choose(
     Json(body): Json<ChooseBody>,
 ) -> Result<Json<Value>, DashboardError> {
     let current = session_identity(&state, &headers)?;
-    if body.improve.is_none() && body.review.is_none() && !body.recommended {
+    let auto_merge = body
+        .auto_merge
+        .as_deref()
+        .map(ferryman_channel::policy::AutoMerge::parse)
+        .transpose()
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    if body.improve.is_none() && body.review.is_none() && !body.recommended && auto_merge.is_none()
+    {
         return Err((
             StatusCode::BAD_REQUEST,
-            "pick an improvement engine, a review engine, or the recommended ones".to_string(),
+            "pick an improvement engine, a review engine, the recommended ones, or auto-merge"
+                .to_string(),
         ));
     }
     sign_policies(
@@ -2191,6 +2203,9 @@ async fn engine_policy_choose(
             }
             if let Some(review) = body.review.as_deref().filter(|s| !s.trim().is_empty()) {
                 policy.set_review_engine(review);
+            }
+            if let Some(mode) = auto_merge {
+                policy.auto_merge = mode;
             }
             Some(policy)
         },

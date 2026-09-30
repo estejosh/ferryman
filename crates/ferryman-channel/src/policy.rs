@@ -134,6 +134,39 @@ pub enum NeverScope {
     All,
 }
 
+/// What fm may merge on its own once an improvement holds both keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AutoMerge {
+    /// Nothing: every approved improvement waits for the master to merge it.
+    #[default]
+    None,
+    /// Docs, tests and dependency bumps only; anything touching code or config waits.
+    LowRisk,
+}
+
+impl AutoMerge {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "none" | "off" | "no" | "false" => Ok(Self::None),
+            "low-risk" | "lowrisk" | "on" | "yes" | "true" => Ok(Self::LowRisk),
+            other => bail!("auto_merge is none or low-risk, not '{other}'"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::LowRisk => "low-risk",
+        }
+    }
+
+    fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 /// Whether work is the fleet's own or a person's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
@@ -166,6 +199,11 @@ pub struct Policy {
     pub protect_subscriptions: bool,
     #[serde(default)]
     pub never_applies_to: NeverScope,
+    /// What fm merges on its own after both keys: `none` (the default) or `low-risk`
+    /// (docs, tests, dependency bumps). Left out of the signed JSON when `none`, so a
+    /// policy signed before this existed still verifies.
+    #[serde(default, skip_serializing_if = "AutoMerge::is_none")]
+    pub auto_merge: AutoMerge,
 }
 
 impl Default for Policy {
@@ -177,6 +215,7 @@ impl Default for Policy {
             caps_usd: BTreeMap::new(),
             protect_subscriptions: true,
             never_applies_to: NeverScope::Background,
+            auto_merge: AutoMerge::None,
         }
     }
 }
@@ -347,6 +386,15 @@ impl Policy {
         if self.never_applies_to == NeverScope::All {
             lines.push("never applies to people's own orders too".to_string());
         }
+        lines.push(
+            match self.auto_merge {
+                AutoMerge::None => "auto-merge: none - you merge every approved improvement",
+                AutoMerge::LowRisk => {
+                    "auto-merge: docs, tests and dependency bumps after both approvals"
+                }
+            }
+            .to_string(),
+        );
         lines
     }
 }

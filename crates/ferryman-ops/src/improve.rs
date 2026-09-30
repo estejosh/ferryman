@@ -916,8 +916,14 @@ fn parse_questions(text: &str) -> Vec<(String, Vec<String>)> {
 
 /// Tell the master, through the channel, that an improvement holds both keys - the
 /// review engine's and their own - and is approved, ready to merge. A notice with
-/// buttons, never an action: nothing here merges, pushes or bumps a version; merging
-/// stays the master's own act. Asked once per order. Returns how many were asked.
+/// buttons, never an action: nothing here merges, pushes or bumps a version.
+///
+/// When the project's engine policy says `auto_merge = "low-risk"`, an improvement
+/// with both keys is first authorized - a signed record - for the worker that built it
+/// to merge on its own if every file it changes is docs, tests or dependency versions
+/// ([`ferryman_channel::automerge`]). The master hears about it only when that worker
+/// held it back - code or config, a conflict, a failed push - or has not acted in a day.
+/// Asked once per order. Returns how many were asked.
 pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usize> {
     let tasks: Vec<Task> = ferryman_channel::list_tasks(route)?
         .into_iter()
@@ -930,8 +936,32 @@ pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usiz
         return Ok(0);
     }
     let identity = signing_identity(route, config)?;
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let auto = policy.auto_merge == ferryman_channel::policy::AutoMerge::LowRisk;
     let mut asked = 0;
     for task in tasks {
+        let mut why_not_auto = None;
+        if auto {
+            use ferryman_channel::automerge::{self, Stage};
+            let revision = task.latest_revision().unwrap_or_default();
+            match automerge::stage(route, &task.order.id, revision) {
+                Stage::Open => {
+                    automerge::authorize(route, &identity, &task)?;
+                    continue;
+                }
+                Stage::Merged(_) => continue,
+                Stage::Authorized(record)
+                    if Utc::now().signed_duration_since(record.at) < Duration::days(1) =>
+                {
+                    continue;
+                }
+                Stage::Authorized(_) => {
+                    why_not_auto =
+                        Some("the worker that built it has not merged it in a day".to_string());
+                }
+                Stage::Held(record) => why_not_auto = Some(record.note),
+            }
+        }
         let reviewer = task
             .reviews
             .iter()
@@ -944,19 +974,24 @@ pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usiz
                 )
             })
             .unwrap_or_else(|| "review".to_string());
-        let (policy, _) =
-            ferryman_channel::policy::effective(&route.communications, &route.project_id);
         let engine = ferryman_channel::gate::gate(route, &task, &policy)
             .engine
             .map(|review| review.describe())
             .unwrap_or_default();
-        let text = format!(
+        let mut text = format!(
             "Ready to merge: {}\n\nOrder {} holds both keys: the review engine ({engine}) and \
-             {reviewer}. Approved, ready to merge - the work is on its own branch and nothing \
-             merges on its own. Merge it when you are happy with it.",
+             {reviewer}. Approved, ready to merge - the work is on its own branch",
             task_title(&task),
             task.order.id
         );
+        match why_not_auto {
+            Some(why) => text.push_str(&format!(
+                ". Auto-merge is on, but fm did not merge this one on its own: {why}. Merge it \
+                 when you are happy with it."
+            )),
+            None => text
+                .push_str(" and nothing merges on its own. Merge it when you are happy with it."),
+        }
         if ferryman_channel::questions::ask(
             route,
             &identity,
@@ -3059,5 +3094,437 @@ mod tests {
         assert_eq!(week.done, 1, "{week:?}");
         assert_eq!(week.refuted, 1);
         assert_eq!((week.runs, week.runs_ok), (2, 1));
+    }
+
+    // --- auto-merge: low-risk work, after both keys, by the worker that built it -------
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.name=tester",
+                "-c",
+                "user.email=tester@example.com",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn josh() -> AgentIdentity {
+        AgentIdentity::from_seed("josh", [9; 32])
+    }
+
+    fn wisp() -> AgentIdentity {
+        AgentIdentity::from_seed("wisp", [7; 32])
+    }
+
+    /// A git workspace on `main` - a library, its tests, docs and a lockfile, with the
+    /// channel inside it as on a real machine - josh its master and wisp its worker, and
+    /// the engine policy auto-merging low-risk work when `auto`.
+    fn merge_fixture(dir: &Path, auto: bool) -> (ProjectRoute, AgentConfig) {
+        let (mut route, config) = channel(dir, Vec::new());
+        switch_on(&route);
+        route.agents.push(ferryman_channel::AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(josh().public_key_hex()),
+            encryption_key: None,
+        });
+        let repo = route.workspace.clone();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("src")).unwrap();
+        fs::create_dir_all(repo.join("tests")).unwrap();
+        fs::write(repo.join(".gitignore"), ".ferryman/\n").unwrap();
+        fs::write(
+            repo.join("src/lib.rs"),
+            "pub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("README.md"), "# demo\n").unwrap();
+        fs::write(repo.join("tests/add.rs"), "#[test]\nfn adds() {}\n").unwrap();
+        fs::write(repo.join("Cargo.lock"), "version = 3\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "base"]);
+        if auto {
+            assert!(
+                ferryman_channel::policy::set_policy(
+                    &route.communications,
+                    &route.project_id,
+                    Some(Policy {
+                        auto_merge: ferryman_channel::policy::AutoMerge::LowRisk,
+                        ..Policy::default()
+                    }),
+                    &josh(),
+                )
+                .unwrap()
+            );
+        }
+        (route, config)
+    }
+
+    /// An improvement wisp built on its own branch, changing `files`, with its signed
+    /// result naming the branch tip - and the review engine's key and the master's when
+    /// asked for. Returns the tip.
+    fn built(
+        route: &ProjectRoute,
+        id: &str,
+        files: &[(&str, &str)],
+        engine_key: bool,
+        master_key: bool,
+    ) -> String {
+        let repo = route.workspace.clone();
+        let branch = ferryman_channel::worktree::branch_name(id, "wisp");
+        git(&repo, &["branch", &branch, "main"]);
+        let dir = repo.parent().unwrap().join(format!("wt-{id}"));
+        git(
+            &repo,
+            &["worktree", "add", "-q", dir.to_str().unwrap(), &branch],
+        );
+        for (path, text) in files {
+            let path = dir.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, text).unwrap();
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-q", "-m", id]);
+        let tip = git(&dir, &["rev-parse", "HEAD"]);
+        git(
+            &repo,
+            &["worktree", "remove", "--force", dir.to_str().unwrap()],
+        );
+
+        let mut order = Order {
+            id: id.into(),
+            project_id: "demo".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "x", "tags": [TAG], "improvement": { "title": format!("Improve {id}") } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+        };
+        wisp().sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order).unwrap();
+        ferryman_channel::claim_order(route, id, "wisp").unwrap();
+        let mut result = ferryman_channel::TaskResult {
+            order_id: id.into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({
+                "output": "done",
+                "worktree_head": tip,
+                "evidence": { "recorded_by": "worker", "git": true, "commits": [format!("{} {id}", &tip[..7])] },
+            }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp().sign_result(&mut result);
+        ferryman_channel::submit_result(route, &result).unwrap();
+        if engine_key {
+            ferryman_channel::gate::record_engine_review(
+                route,
+                &wisp(),
+                ferryman_channel::gate::EngineReview {
+                    order_id: id.into(),
+                    revision: 1,
+                    reviewer: "wisp".into(),
+                    machine: "grouchly".into(),
+                    engine: "deepseek".into(),
+                    model: None,
+                    tier: "judge".into(),
+                    paid: "prepaid".into(),
+                    host: None,
+                    route: Vec::new(),
+                    accept: true,
+                    summary: "does what it says".into(),
+                    reviewed_at: Utc::now(),
+                    signed_by: None,
+                    signature: None,
+                },
+            )
+            .unwrap();
+        }
+        if master_key {
+            let decided = ferryman_channel::gate::decide(route, id, true, None, "josh", &josh());
+            assert_eq!(
+                decided.is_ok(),
+                engine_key,
+                "the master's key only after the engine's: {decided:?}"
+            );
+        }
+        tip
+    }
+
+    /// An authorization a peer wrote, whether or not anything earned it.
+    fn forge_authorization(route: &ProjectRoute, id: &str, tip: &str) {
+        ferryman_channel::automerge::record(
+            route,
+            &wisp(),
+            ferryman_channel::automerge::MergeRecord {
+                order_id: id.into(),
+                revision: 1,
+                status: ferryman_channel::automerge::AUTHORIZED.into(),
+                branch: Some(ferryman_channel::worktree::branch_name(id, "wisp")),
+                head: Some(tip.into()),
+                into: None,
+                commit: None,
+                pushed: None,
+                files: Vec::new(),
+                note: "forged".into(),
+                by: "wisp".into(),
+                at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn merges(route: &ProjectRoute, config: &AgentConfig) -> usize {
+        crate::agent::merge_approved(route, config, &wisp(), &crate::Silent)
+    }
+
+    fn is_ancestor(repo: &Path, commit: &str, of: &str) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["merge-base", "--is-ancestor", commit, of])
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Docs-only, tests-only and lockfile-only improvements merge on their own once they
+    /// hold both keys and the policy says low-risk: by the worker that built them, beside
+    /// the person's checkout, once each, and with nothing to ask the master.
+    #[test]
+    fn docs_tests_and_lockfile_improvements_merge_on_their_own_after_both_keys() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        // The person is working on another branch: the merge happens beside them.
+        git(&repo, &["checkout", "-q", "-b", "wip"]);
+        let docs = built(
+            &route,
+            "improve-2026-w40-1",
+            &[
+                ("README.md", "# demo\n\nHow to add.\n"),
+                ("docs/guide.md", "Adding numbers.\n"),
+            ],
+            true,
+            true,
+        );
+        let tests = built(
+            &route,
+            "improve-2026-w40-2",
+            &[(
+                "tests/add.rs",
+                "#[test]\nfn adds() {}\n\n#[test]\nfn adds_zero() {}\n",
+            )],
+            true,
+            true,
+        );
+        let lock = built(
+            &route,
+            "improve-2026-w40-3",
+            &[("Cargo.lock", "version = 4\n")],
+            true,
+            true,
+        );
+        assert_eq!(
+            request_merges(&route, &config).unwrap(),
+            0,
+            "authorized for the worker, not asked"
+        );
+        assert_eq!(merges(&route, &config), 3);
+        for tip in [&docs, &tests, &lock] {
+            assert!(is_ancestor(&repo, tip, "main"), "{tip} is on main");
+        }
+        let merged = ferryman_channel::automerge::merged(&route);
+        assert_eq!(merged.len(), 3, "{merged:?}");
+        assert!(
+            merged
+                .iter()
+                .all(|record| record.into.as_deref() == Some("main") && record.pushed.is_none()),
+            "{merged:?}"
+        );
+        assert_eq!(merges(&route, &config), 0, "merged once");
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert!(
+            ferryman_channel::questions::pending(&route).is_empty(),
+            "nothing to ask the master"
+        );
+        assert_eq!(
+            git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "wip",
+            "the checkout is left as it was"
+        );
+    }
+
+    /// A worker that pushes for the project pushes the merged default branch - plainly,
+    /// never forced - and one that does not, does not.
+    #[test]
+    fn a_worker_that_pushes_pushes_the_merge() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, mut config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let remote = dir.path().join("remote.git");
+        git(
+            dir.path(),
+            &["init", "-q", "--bare", remote.to_str().unwrap()],
+        );
+        git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "origin", "main"]);
+        config.push = Some("origin".to_string());
+        let tip = built(
+            &route,
+            "improve-2026-w40-9",
+            &[("docs/guide.md", "Adding numbers.\n")],
+            true,
+            true,
+        );
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 1);
+        assert_eq!(
+            git(&remote, &["rev-parse", "main"]),
+            tip,
+            "a fast-forward, pushed"
+        );
+        let merged = ferryman_channel::automerge::merged(&route);
+        assert_eq!(merged[0].pushed.as_deref(), Some("origin"));
+    }
+
+    /// Code alongside docs is not low risk: it stops at "approved, ready to merge" and
+    /// the master is told why.
+    #[test]
+    fn code_with_docs_does_not_merge_on_its_own() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        built(
+            &route,
+            "improve-2026-w40-4",
+            &[
+                ("README.md", "# demo\n\nNow wrapping.\n"),
+                (
+                    "src/lib.rs",
+                    "pub fn add(a: u32, b: u32) -> u32 {\n    a.wrapping_add(b)\n}\n",
+                ),
+            ],
+            true,
+            true,
+        );
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main, "main untouched");
+        let pending = ferryman_channel::questions::pending(&route);
+        assert_eq!(pending.len(), 1, "the master is asked instead");
+        assert!(
+            pending[0]
+                .text
+                .contains("did not merge this one on its own")
+                && pending[0].text.contains("src/lib.rs"),
+            "{}",
+            pending[0].text
+        );
+    }
+
+    /// One key is never enough - not even with an authorization a peer wrote for it -
+    /// and a policy that does not say low-risk merges nothing, keys or not.
+    #[test]
+    fn one_key_or_auto_merge_off_never_merges() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        let docs = [("README.md", "# demo\n\nMore.\n")];
+        let engine_only = built(&route, "improve-2026-w40-5", &docs, true, false);
+        // The master alone cannot even give the key: approval needs the engine's first.
+        let master_only = built(&route, "improve-2026-w40-6", &docs, false, true);
+        forge_authorization(&route, "improve-2026-w40-5", &engine_only);
+        forge_authorization(&route, "improve-2026-w40-6", &master_only);
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), false);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        let both = built(&route, "improve-2026-w40-7", &docs, true, true);
+        forge_authorization(&route, "improve-2026-w40-7", &both);
+        assert_eq!(merges(&route, &config), 0, "auto_merge = none");
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main);
+        assert_eq!(
+            request_merges(&route, &config).unwrap(),
+            1,
+            "the master merges it, as ever"
+        );
+    }
+
+    /// A merge that does not apply cleanly is aborted, leaves main as it was, and falls
+    /// back to the master with the reason.
+    #[test]
+    fn a_failed_merge_falls_back_to_the_master() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        built(
+            &route,
+            "improve-2026-w40-8",
+            &[("README.md", "# demo\n\nFrom the branch.\n")],
+            true,
+            true,
+        );
+        // main moved on meanwhile, in the same lines.
+        fs::write(repo.join("README.md"), "# demo\n\nFrom main.\n").unwrap();
+        git(&repo, &["commit", "-q", "-am", "main moves on"]);
+        let main = git(&repo, &["rev-parse", "main"]);
+        assert_eq!(request_merges(&route, &config).unwrap(), 0);
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main);
+        assert!(
+            git(&repo, &["status", "--porcelain", "--untracked-files=no"]).is_empty(),
+            "the conflict was aborted"
+        );
+        match ferryman_channel::automerge::stage(&route, "improve-2026-w40-8", 1) {
+            ferryman_channel::automerge::Stage::Held(record) => {
+                assert!(record.note.contains("the merge failed"), "{}", record.note);
+            }
+            other => panic!("not held: {other:?}"),
+        }
+        let pending = ferryman_channel::questions::pending(&route);
+        assert_eq!(pending.len(), 1);
+        assert!(
+            pending[0].text.contains("the merge failed"),
+            "{}",
+            pending[0].text
+        );
     }
 }

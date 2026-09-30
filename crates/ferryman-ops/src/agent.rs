@@ -2355,6 +2355,10 @@ pub async fn work_once(
         }
         return Ok(0);
     }
+    // Low-risk improvements this worker built, with both keys, where the engine policy
+    // lets fm merge them: merged here, in the repository they were built in, before any
+    // new work starts from the default branch.
+    merge_approved(route, config, &identity, report);
     for task in waiting {
         let id = task.order.id.clone();
         // Trust boundary: never act on an order whose signature does not verify.
@@ -2440,6 +2444,54 @@ pub async fn work_once(
         }
     }
     Ok(acted)
+}
+
+/// Merge what [`ferryman_channel::automerge::run`] allows - low-risk improvements this
+/// agent built, holding both keys, in a project whose engine policy says
+/// `auto_merge = "low-risk"` - record each merge in the ledger, and tell the master about
+/// each one it held back instead. Returns how many merged.
+pub fn merge_approved(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    report: &dyn Progress,
+) -> usize {
+    use ferryman_channel::automerge::Outcome;
+    let mut merged = 0;
+    let mut held = false;
+    for outcome in ferryman_channel::automerge::run(route, identity, config.push.as_deref()) {
+        let (kind, record) = match outcome {
+            Outcome::Merged(record) => {
+                merged += 1;
+                report.info(&format!("  {}", record.describe()));
+                ("merge", record)
+            }
+            Outcome::Held(record) => {
+                held = true;
+                report.warn(&format!("  {}", record.describe()));
+                ("merge-held", record)
+            }
+        };
+        if let Err(error) = ferryman_channel::ledger::append_ledger_entry(
+            route,
+            identity,
+            kind,
+            &config.agent,
+            &record.describe(),
+            Some(&record.order_id),
+        ) {
+            report.warn(&format!(
+                "  {}: could not write the ledger: {error:#}",
+                record.order_id
+            ));
+        }
+    }
+    // Held back: the master hears now, with the reason, rather than at the next
+    // improve run.
+    if held && let Err(error) = crate::improve::request_merges(route, config) {
+        report.warn(&format!("  could not ask about merging: {error:#}"));
+    }
+    merged
 }
 
 /// Leave unclaimed improvement orders alone while someone is at this machine.

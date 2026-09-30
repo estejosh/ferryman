@@ -2373,10 +2373,19 @@ fn improve_decide(
     let route = ferryman_channel::route_for(&channel)?;
     let revision = ferryman_channel::gate::decide(&route, id, accept, notes, &master, &identity)?;
     if accept {
-        println!(
-            "{id} r{revision} approved by {master}: both keys are there - approved, ready to \
-             merge. Nothing merges on its own; merge it when you are happy with it."
-        );
+        let (policy, _) = ferryman_channel::policy::effective(&channel, &project);
+        if policy.auto_merge == ferryman_channel::policy::AutoMerge::LowRisk {
+            println!(
+                "{id} r{revision} approved by {master}: both keys are there. Auto-merge is on: if \
+                 every file it changes is docs, tests or a dependency bump, the worker that built \
+                 it merges it; otherwise it waits for you, approved, ready to merge."
+            );
+        } else {
+            println!(
+                "{id} r{revision} approved by {master}: both keys are there - approved, ready to \
+                 merge. Nothing merges on its own; merge it when you are happy with it."
+            );
+        }
     } else {
         println!("{id} r{revision} sent back by {master}");
     }
