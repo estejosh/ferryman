@@ -298,8 +298,8 @@ deploy or release:
 Neither alone is enough: an agent's accept is refused, and so is yours until the
 review engine has given its key. If the review engine is blocked or out of credit the
 loop holds and asks you once; it never skips the review and never approves by itself.
-Even with both keys nothing merges: the improvement becomes "approved, ready to merge",
-and merging stays yours.
+With both keys the improvement becomes "approved, ready to merge", and merging is yours -
+unless you turn on auto-merge for low-risk work, below.
 
 ```sh
 ferry improve pending                        # what waits, with diff stat, evidence and the review engine's verdict
@@ -310,6 +310,46 @@ ferry improve send-back improve-2026-w40-1 --notes "cover the error path"
 The dashboard's Teammates page lists them under "Waiting for your approval" with
 Approve and Send back; Telegram sends each one with the same buttons once the review
 engine has given its key.
+
+### Auto-merge: docs, tests and dependency bumps, after both keys
+
+Off by default. Turn it on per project (or `--all`) and fm merges an improvement on its
+own - but only once it holds **both** keys, and only when every file it changes is low
+risk:
+
+- **docs**: `*.md`, `docs/**`, LICENSE / COPYING / NOTICE / AUTHORS, and Rust changes to
+  comments only;
+- **tests**: `tests/**` (not under `src/`), `*_test.*`, `test_*.*`, `*.spec.*`, `*.test.*`,
+  and Rust changes inside a `#[cfg(test)]` module that runs to the end of its file;
+- **dependencies**: a lockfile changed in place (`Cargo.lock`, `package-lock.json`,
+  `pnpm-lock.yaml`, `yarn.lock`, `go.sum`, `poetry.lock`, `uv.lock`), or a manifest whose only
+  change is dependency versions (`Cargo.toml`, `package.json`, `pyproject.toml`,
+  `requirements*.txt`, `go.mod`).
+
+Anything else - code, config, a new dependency, a feature flag, a git source, the
+package's own version, an executable bit - still stops at "approved, ready to merge"
+for you. So does fm's own repository: self-improve on the ferryman project gets no
+exemption.
+
+```sh
+ferry engines policy set --auto-merge low-risk --all     # or: --auto-merge none
+```
+
+On the dashboard it is the "Auto-merge docs/tests/deps after both approvals" checkbox in
+the policy panel; on the phone, the button of the same name in the Engines menu.
+
+How it happens: the improve loop records a signed `merge-authorized` for each
+improvement with both keys. The worker that built the branch then checks everything
+again itself - the policy, both keys, that the branch is still at the commit that was
+reviewed, and every changed file as git has it - and merges into the default branch in
+its own checkout: a fast-forward when it can, a merge commit otherwise. If the default
+branch is checked out with uncommitted changes, or the merge conflicts, nothing is
+merged. It pushes the default branch only if that worker already pushes for the project
+(`push = "origin"` in `agent.toml`), after checking the remote is not ahead, and never
+with force; a refused push puts the branch back. The merge commit goes into the ledger
+and Telegram says so. Whatever goes wrong, the improvement falls back to you,
+"approved, ready to merge", with the reason. fm cannot see CI, so it does not wait on
+it: the checks the worker ran are in the evidence the review engine judged.
 
 ## OmniRoute: a free gateway as an engine
 

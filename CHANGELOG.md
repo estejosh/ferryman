@@ -49,8 +49,8 @@
   approval from the master (or their `review` delegate acting on the master's button).
   Neither alone is enough - `submit_review` refuses an agent's accept, and the master's
   until the engine's key is there - and a blocked or unavailable review engine holds
-  and asks, never skips. Nothing merges on its own even with both: the "ready to merge"
-  notice and the report's list now need both keys. `ferry improve pending | approve |
+  and asks, never skips. Even with both, only low-risk work under auto-merge (below)
+  merges on its own: the "ready to merge" notice and the report's list now need both keys. `ferry improve pending | approve |
   send-back`, a "Waiting for your approval" list on the dashboard (diff stat, evidence,
   the review engine's summary, Approve / Send back), and the same on the phone.
 - **OmniRoute as a first-class engine.** `provider = "omniroute"` (or a base URL on port
@@ -60,6 +60,20 @@
   of their own ("OmniRoute: free-stack") for the dropdowns, a free combo ranks as free
   tier, and its per-request cost header is counted. `ferry engines policy recommend` and
   `ferry enable` point out a local OmniRoute nobody uses yet.
+- **Auto-merge low-risk work, only after both keys.** `auto_merge = "none" | "low-risk"`
+  in the engine policy, `none` by default. With `low-risk`, an improvement holding both
+  keys is merged by the worker that built it when every changed file is docs (`*.md`,
+  `docs/**`, license text, Rust comment-only changes), tests (`tests/**`, `*_test.*`,
+  `test_*.*`, `*.spec.*`, Rust changes inside a trailing `#[cfg(test)]` module) or
+  dependency versions (lockfiles changed in place; `Cargo.toml`, `package.json`,
+  `pyproject.toml`, `requirements*.txt`, `go.mod` where only versions change) - read from
+  the branch itself. Code or config still stops at "approved, ready to merge". The loop
+  signs a `merge-authorized` record; the worker re-checks both keys, the reviewed
+  commit and every file, merges (fast-forward, or a merge commit), pushes only if it
+  already pushes for the project and never with force, and records the merge in the
+  ledger and on Telegram. A conflict, a moved branch, a dirty checkout or a refused push
+  falls back to the master with the reason. `ferry engines policy set --auto-merge
+  low-risk [--all]`, a checkbox on the dashboard, a button on the phone.
 
 ### Changed
 
