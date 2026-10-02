@@ -77,10 +77,24 @@ pub enum Role {
     Review,
     /// Improvement orders at chore tier.
     Chore,
+    /// The challenger: a judge-tier engine, never the one that built the work, that is
+    /// asked to break it at three critical moments. See [`crate::adversary`].
+    Adversary,
 }
 
 impl Role {
-    pub const ALL: [Role; 4] = [Role::Plan, Role::Build, Role::Review, Role::Chore];
+    pub const ALL: [Role; 5] = [
+        Role::Plan,
+        Role::Build,
+        Role::Review,
+        Role::Chore,
+        Role::Adversary,
+    ];
+
+    /// The four roles that plan, build and judge. The adversary is deliberately left out
+    /// wherever one preference is applied to "every role": the engine that builds is
+    /// exactly the one that must not also be asked to challenge the build.
+    pub const BUILDING: [Role; 4] = [Role::Plan, Role::Build, Role::Review, Role::Chore];
 
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
@@ -88,7 +102,8 @@ impl Role {
             "build" => Ok(Self::Build),
             "review" => Ok(Self::Review),
             "chore" => Ok(Self::Chore),
-            other => bail!("a role is plan, build, review or chore, not '{other}'"),
+            "adversary" => Ok(Self::Adversary),
+            other => bail!("a role is plan, build, review, chore or adversary, not '{other}'"),
         }
     }
 
@@ -99,6 +114,7 @@ impl Role {
             Self::Build => "build",
             Self::Review => "review",
             Self::Chore => "chore",
+            Self::Adversary => "adversary",
         }
     }
 
@@ -106,7 +122,7 @@ impl Role {
     #[must_use]
     pub fn tier(self) -> &'static str {
         match self {
-            Self::Plan | Self::Review => "judge",
+            Self::Plan | Self::Review | Self::Adversary => "judge",
             Self::Build => "build",
             Self::Chore => "chore",
         }
@@ -167,6 +183,47 @@ impl AutoMerge {
     }
 }
 
+/// What the adversary's findings do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AdversaryMode {
+    /// The adversary never runs.
+    Off,
+    /// It runs at its three moments and its findings are shown beside the decision they
+    /// bear on; nothing waits for it, and a Block is a warning.
+    #[default]
+    Advisory,
+    /// A Block stops the thing it challenges: the contract is not locked, the engine
+    /// key is not granted, until the master signs an override.
+    Blocking,
+}
+
+impl AdversaryMode {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "no" | "false" => Ok(Self::Off),
+            "advisory" | "on" | "yes" | "true" => Ok(Self::Advisory),
+            "blocking" | "block" => Ok(Self::Blocking),
+            other => bail!("adversary is off, advisory or blocking, not '{other}'"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Advisory => "advisory",
+            Self::Blocking => "blocking",
+        }
+    }
+
+    /// The default mode is left out of the signed JSON, so a policy signed before the
+    /// adversary existed still verifies.
+    fn is_advisory(&self) -> bool {
+        *self == Self::Advisory
+    }
+}
+
 /// Whether work is the fleet's own or a person's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Work {
@@ -204,6 +261,10 @@ pub struct Policy {
     /// policy signed before this existed still verifies.
     #[serde(default, skip_serializing_if = "AutoMerge::is_none")]
     pub auto_merge: AutoMerge,
+    /// What the adversary's findings do: `off`, `advisory` (the default) or `blocking`.
+    /// Left out of the signed JSON when advisory, like `auto_merge` when none.
+    #[serde(default, skip_serializing_if = "AdversaryMode::is_advisory")]
+    pub adversary: AdversaryMode,
 }
 
 impl Default for Policy {
@@ -216,6 +277,7 @@ impl Default for Policy {
             protect_subscriptions: true,
             never_applies_to: NeverScope::Background,
             auto_merge: AutoMerge::None,
+            adversary: AdversaryMode::Advisory,
         }
     }
 }
@@ -312,7 +374,7 @@ impl Policy {
     pub fn move_to_top(&mut self, engine: &str) {
         let selector = format!("name:{}", engine.trim().to_ascii_lowercase());
         self.never.retain(|s| !s.eq_ignore_ascii_case(&selector));
-        for role in Role::ALL {
+        for role in Role::BUILDING {
             let list = self.prefer.entry(role.as_str().to_string()).or_default();
             list.retain(|s| !s.eq_ignore_ascii_case(&selector));
             list.insert(0, selector.clone());
@@ -345,6 +407,22 @@ impl Policy {
     #[must_use]
     pub fn review_engine(&self) -> Option<&str> {
         self.preferences(Role::Review).first().map(String::as_str)
+    }
+
+    /// The simple choice: `selector` first for the adversary.
+    pub fn set_adversary_engine(&mut self, selector: &str) {
+        self.prefer.insert(
+            Role::Adversary.as_str().to_string(),
+            vec![selector.trim().to_string()],
+        );
+    }
+
+    /// What challenges first, when the policy says.
+    #[must_use]
+    pub fn adversary_engine(&self) -> Option<&str> {
+        self.preferences(Role::Adversary)
+            .first()
+            .map(String::as_str)
     }
 
     /// One line per part, as a person reads it.
@@ -391,6 +469,20 @@ impl Policy {
                 AutoMerge::None => "auto-merge: none - you merge every approved improvement",
                 AutoMerge::LowRisk => {
                     "auto-merge: docs, tests and dependency bumps after both approvals"
+                }
+            }
+            .to_string(),
+        );
+        lines.push(
+            match self.adversary {
+                AdversaryMode::Off => "adversary: off - nothing challenges the work",
+                AdversaryMode::Advisory => {
+                    "adversary: advisory - a second model challenges the work at three moments; \
+                     its findings are shown, nothing waits for it"
+                }
+                AdversaryMode::Blocking => {
+                    "adversary: blocking - a Block finding stops a contract lock or the engine \
+                     key until you override it"
                 }
             }
             .to_string(),
@@ -709,8 +801,8 @@ impl Ranking {
 /// How far an engine at `level` is from the work, `None` when it cannot do it.
 fn fit(role: Role, wanted: u8, level: u8) -> Option<u8> {
     match role {
-        // Review is a judge's work, and only a judge's.
-        Role::Review => (level == 2).then_some(0),
+        // Review is a judge's work, and only a judge's. So is challenging it.
+        Role::Review | Role::Adversary => (level == 2).then_some(0),
         // A judge plans; a builder plans only when no judge can, marked unreviewed.
         Role::Plan => (level >= 1).then(|| 2 - level),
         // Never below the tier; the nearest tier first, so a judge builds last.
@@ -786,6 +878,159 @@ pub fn rank(policy: &Policy, role: Role, tier: &str, work: Work, engines: &[Cand
     ranking
 }
 
+// --- the adversary: someone other than the builder --------------------------------------
+
+/// The model families the adversary's diversity rule tells apart: keywords looked for in
+/// an engine's model, its gateway route, its name, then its endpoint host - in that
+/// order, because the model says whose weights answer and the host only who serves them.
+const FAMILIES: &[(&str, &[&str])] = &[
+    ("anthropic", &["claude", "anthropic"]),
+    ("openai", &["gpt", "openai", "codex", "chatgpt"]),
+    ("google", &["gemini", "gemma", "google"]),
+    ("deepseek", &["deepseek"]),
+    ("meta", &["llama"]),
+    ("qwen", &["qwen", "alibaba", "dashscope"]),
+    ("mistral", &["mistral", "mixtral", "codestral"]),
+    ("nvidia", &["nemotron", "nvidia"]),
+    ("xai", &["grok", "x.ai"]),
+    ("zhipu", &["glm", "zhipu"]),
+    ("moonshot", &["kimi", "moonshot"]),
+];
+
+/// The model family an engine belongs to: `anthropic`, `openai`, `deepseek`, ... or, for
+/// one nothing recognises, its own name - so two unknown engines count as two families
+/// and one engine is always its own.
+#[must_use]
+pub fn family_of(engine: &Candidate) -> String {
+    let model = engine.model.as_deref().unwrap_or("").to_ascii_lowercase();
+    let route = engine.route.join(" ").to_ascii_lowercase();
+    let name = engine.name.to_ascii_lowercase();
+    let host = engine.host.as_deref().unwrap_or("").to_ascii_lowercase();
+    for source in [&model, &route, &name, &host] {
+        if source.is_empty() {
+            continue;
+        }
+        for (family, words) in FAMILIES {
+            if words.iter().any(|word| source.contains(word)) {
+                return (*family).to_string();
+            }
+        }
+    }
+    name
+}
+
+/// Which engine built the work under challenge, as its result's payload names it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Builder {
+    pub engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl Builder {
+    /// The builder a result payload names (`engine`, and `model` when it recorded one).
+    #[must_use]
+    pub fn from_payload(payload: &serde_json::Value) -> Option<Self> {
+        let engine = payload.get("engine")?.as_str()?.trim();
+        (!engine.is_empty()).then(|| Self {
+            engine: engine.to_string(),
+            model: payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        })
+    }
+
+    /// The builder as a candidate, taking what the fleet knows of an engine by that name
+    /// (its host, its route) so its family reads the way the adversary's does.
+    #[must_use]
+    pub fn candidate(&self, engines: &[Candidate]) -> Candidate {
+        let mut found = engines
+            .iter()
+            .find(|engine| engine.name.eq_ignore_ascii_case(&self.engine))
+            .cloned()
+            .unwrap_or_default();
+        found.name.clone_from(&self.engine);
+        if self.model.is_some() {
+            found.model.clone_from(&self.model);
+        }
+        found
+    }
+
+    /// Whether `engine` is the engine that built it: the same name, and the same model
+    /// unless either side did not record one.
+    #[must_use]
+    pub fn is(&self, engine: &Candidate) -> bool {
+        self.engine.eq_ignore_ascii_case(&engine.name)
+            && match (&self.model, &engine.model) {
+                (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                _ => true,
+            }
+    }
+}
+
+/// The allowed adversaries for one piece of work, best first.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Challengers {
+    pub ranking: Ranking,
+    /// Parallel to `ranking.order`: whether that engine is one that built the work. Only
+    /// ever true for the last entries - an engine is used against its own work only when
+    /// nothing else is allowed.
+    pub same_engine: Vec<bool>,
+    /// Parallel to `ranking.order`: whether that engine is of a builder's family.
+    pub same_family: Vec<bool>,
+}
+
+/// Put the engines that did not build the work first, and among those the ones of a
+/// different model family from every builder. Stable: within each group the policy's own
+/// order stands. An engine that built the work is kept, last, rather than dropped, so a
+/// fleet with exactly one allowed judge still gets its challenge - marked as the
+/// builder's own.
+#[must_use]
+pub fn diversify(ranking: Ranking, built_by: &[Builder], engines: &[Candidate]) -> Challengers {
+    let families: Vec<String> = built_by
+        .iter()
+        .map(|builder| family_of(&builder.candidate(engines)))
+        .collect();
+    let mut keyed: Vec<(bool, bool, usize)> = ranking
+        .order
+        .iter()
+        .map(|index| {
+            let engine = &engines[*index];
+            let same_engine = built_by.iter().any(|builder| builder.is(engine));
+            let same_family = families.contains(&family_of(engine));
+            (same_engine, same_family, *index)
+        })
+        .collect();
+    keyed.sort_by_key(|(same_engine, same_family, _)| (*same_engine, *same_family));
+    Challengers {
+        same_engine: keyed.iter().map(|k| k.0).collect(),
+        same_family: keyed.iter().map(|k| k.1).collect(),
+        ranking: Ranking {
+            order: keyed.into_iter().map(|k| k.2).collect(),
+            ..ranking
+        },
+    }
+}
+
+/// Rank `engines` for the adversary's work on something `built_by` built: the same rules
+/// as any background work (`never`, protected subscriptions, `where`, the role's
+/// preference list and caps) - then the diversity rule of [`diversify`].
+#[must_use]
+pub fn rank_adversary(policy: &Policy, built_by: &[Builder], engines: &[Candidate]) -> Challengers {
+    diversify(
+        rank(
+            policy,
+            Role::Adversary,
+            Role::Adversary.tier(),
+            Work::Background,
+            engines,
+        ),
+        built_by,
+        engines,
+    )
+}
+
 /// The policy as it falls on the fleet: per role, who does the work in which order and
 /// who is out of credit; and every engine the policy blocks, with why. For the
 /// dashboard and `--json`.
@@ -852,6 +1097,7 @@ pub fn choices(policy: &Policy, engines: &[Candidate], recommended: &Policy) -> 
     };
     let mut improve = Vec::new();
     let mut review = Vec::new();
+    let mut adversary = Vec::new();
     let mut seen = BTreeSet::new();
     for engine in engines {
         if !seen.insert(engine.name.to_ascii_lowercase()) {
@@ -862,15 +1108,23 @@ pub fn choices(policy: &Policy, engines: &[Candidate], recommended: &Policy) -> 
         }
         if engine.level() == 2 {
             review.push(option(engine, recommended.review_engine()));
+            adversary.push(option(engine, recommended.adversary_engine()));
         }
     }
     serde_json::json!({
         "improve": improve,
         "review": review,
-        "current": { "improve": policy.improvement_engine(), "review": policy.review_engine() },
+        "adversary": adversary,
+        "current": {
+            "improve": policy.improvement_engine(),
+            "review": policy.review_engine(),
+            "adversary": policy.adversary_engine(),
+            "adversary_mode": policy.adversary.as_str(),
+        },
         "recommended": {
             "improve": recommended.improvement_engine(),
             "review": recommended.review_engine(),
+            "adversary": recommended.adversary_engine(),
         },
     })
 }
@@ -983,7 +1237,7 @@ pub fn recommend(engines: &[Candidate], online: &[String]) -> Recommendation {
     let base = Policy::default();
     let mut policy = Policy::default();
     let mut reasons = Vec::new();
-    for role in Role::ALL {
+    for role in Role::BUILDING {
         let ranking = rank(&base, role, role.tier(), Work::Background, &merged);
         let list: Vec<String> = ranking
             .order
@@ -1013,6 +1267,77 @@ pub fn recommend(engines: &[Candidate], online: &[String]) -> Recommendation {
         } else {
             policy.prefer.insert(role.as_str().to_string(), list);
         }
+    }
+    // The adversary: judge tier, the best record, and - the point of it - not the family
+    // of the engine that builds first, so the challenger does not share the builder's
+    // blind spots.
+    let top_build: Vec<Builder> = rank(
+        &base,
+        Role::Build,
+        Role::Build.tier(),
+        Work::Background,
+        &merged,
+    )
+    .order
+    .first()
+    .map(|index| Builder {
+        engine: merged[*index].name.clone(),
+        model: merged[*index].model.clone(),
+    })
+    .into_iter()
+    .collect();
+    let challengers = diversify(
+        rank(
+            &base,
+            Role::Adversary,
+            Role::Adversary.tier(),
+            Work::Background,
+            &merged,
+        ),
+        &top_build,
+        &merged,
+    );
+    let mut adversaries = Vec::new();
+    for (place, index) in challengers.ranking.order.iter().enumerate() {
+        let engine = &merged[*index];
+        adversaries.push(format!("name:{}", engine.name.to_ascii_lowercase()));
+        let versus = match top_build.first() {
+            None => String::new(),
+            Some(builder) if challengers.same_engine[place] => {
+                format!(
+                    "the same engine as {}, the top build engine - used only when nothing \
+                     else is allowed, ",
+                    builder.engine
+                )
+            }
+            Some(builder) if challengers.same_family[place] => format!(
+                "the same family ({}) as {}, the top build engine, ",
+                family_of(engine),
+                builder.engine
+            ),
+            Some(builder) => format!(
+                "a different family ({}) from {}, the top build engine, ",
+                family_of(engine),
+                builder.engine
+            ),
+        };
+        reasons.push(format!(
+            "{} {} for adversary: judge tier, {versus}{}",
+            engine.name,
+            ordinal(place),
+            engine.facts()
+        ));
+    }
+    if adversaries.is_empty() {
+        reasons.push(
+            "nothing for adversary: no allowed judge-tier engine, so nothing would challenge \
+             the work"
+                .to_string(),
+        );
+    } else {
+        policy
+            .prefer
+            .insert(Role::Adversary.as_str().to_string(), adversaries);
     }
     let mut blocked = BTreeSet::new();
     for engine in &merged {
@@ -2082,6 +2407,255 @@ mod tests {
             }
             .check()
             .is_err()
+        );
+    }
+
+    /// A policy signed before the adversary role and mode existed carries neither, and
+    /// still verifies: the new parts are left out of the signed JSON while they are what an
+    /// old policy meant.
+    #[test]
+    fn a_policy_signed_before_the_adversary_existed_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+
+        let mut old = Policy::default();
+        old.never.push("claude".into());
+        old.prefer
+            .insert("build".into(), vec!["name:nemotron".into()]);
+        let shape = serde_json::to_value(&old).unwrap();
+        assert!(shape.get("adversary").is_none(), "{shape}");
+        assert!(shape["prefer"].get("adversary").is_none());
+
+        // Written the way the previous release wrote it: no adversary anywhere.
+        let from_old: Policy = serde_json::from_value(shape.clone()).unwrap();
+        assert_eq!(from_old, old);
+        assert_eq!(from_old.adversary, AdversaryMode::Advisory);
+        assert_eq!(
+            serde_jcs::to_string(&from_old).unwrap(),
+            serde_jcs::to_string(&shape).unwrap(),
+            "the bytes the old signature covered are the bytes now"
+        );
+        let mut signed = PolicySetting {
+            project_id: "demo".into(),
+            policy: Some(from_old),
+            set_at: Utc::now(),
+            signed_by: "josh".into(),
+            signature: String::new(),
+            on_behalf_of: None,
+        };
+        signed.signature = josh.sign_bytes(setting_payload(&signed).as_bytes());
+        crate::atomic_json(&channel.join(ENGINE_POLICY), &signed).unwrap();
+        let read = setting(channel, "demo").expect("the old signature verifies");
+        assert_eq!(read.policy.unwrap().adversary, AdversaryMode::Advisory);
+        assert_eq!(effective(channel, "demo").0, old);
+    }
+
+    #[test]
+    fn the_adversary_role_and_mode_round_trip_through_a_signed_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+
+        let mut policy = Policy {
+            adversary: AdversaryMode::Blocking,
+            ..Policy::default()
+        };
+        policy.set_adversary_engine("name:deepseek");
+        policy.check().unwrap();
+        let shape = serde_json::to_value(&policy).unwrap();
+        assert_eq!(shape["adversary"], "blocking");
+        assert_eq!(shape["prefer"]["adversary"][0], "name:deepseek");
+        assert_eq!(policy.adversary_engine(), Some("name:deepseek"));
+        assert!(
+            policy
+                .describe()
+                .iter()
+                .any(|line| line.contains("adversary") && line.contains("deepseek")),
+            "{:?}",
+            policy.describe()
+        );
+
+        assert!(set_policy(channel, "demo", Some(policy.clone()), &josh).unwrap());
+        let (read, set) = effective(channel, "demo");
+        assert!(set.is_some());
+        assert_eq!(read, policy);
+        assert_eq!(read.adversary, AdversaryMode::Blocking);
+
+        // Off is written too; only the default is left out.
+        let off = Policy {
+            adversary: AdversaryMode::Off,
+            ..Policy::default()
+        };
+        assert_eq!(serde_json::to_value(&off).unwrap()["adversary"], "off");
+        assert!(set_policy(channel, "demo", Some(off.clone()), &josh).unwrap());
+        assert_eq!(effective(channel, "demo").0, off);
+
+        // The role is named like the others, and a mode that does not exist is refused.
+        assert_eq!(Role::parse("adversary").unwrap(), Role::Adversary);
+        assert!(AdversaryMode::parse("sometimes").is_err());
+        assert_eq!(
+            AdversaryMode::parse("Blocking").unwrap(),
+            AdversaryMode::Blocking
+        );
+        assert_eq!(Role::ALL.len(), Role::BUILDING.len() + 1);
+        assert!(!Role::BUILDING.contains(&Role::Adversary));
+    }
+
+    fn judge(name: &str, model: &str, verified: u64) -> Candidate {
+        let mut found = engine(name, "judge", "prepaid");
+        found.model = Some(model.into());
+        found.verified = verified;
+        found
+    }
+
+    fn built_by(engine: &str, model: &str) -> Vec<Builder> {
+        vec![Builder {
+            engine: engine.into(),
+            model: Some(model.into()),
+        }]
+    }
+
+    #[test]
+    fn the_adversary_is_never_the_builder_when_another_engine_is_allowed() {
+        let engines = vec![
+            judge("claude", "claude-sonnet", 20),
+            judge("deepseek", "deepseek-chat", 5),
+            judge("qwen", "qwen-max", 1),
+        ];
+        let policy = Policy::default();
+        let against_claude =
+            rank_adversary(&policy, &built_by("claude", "claude-sonnet"), &engines);
+        let order = names(&against_claude.ranking, &engines);
+        assert_eq!(
+            order,
+            ["deepseek", "qwen", "claude"],
+            "the builder is last, not dropped"
+        );
+        assert_eq!(against_claude.same_engine, [false, false, true]);
+
+        // The policy's own preference does not put the builder back on top.
+        let mut prefers_claude = Policy::default();
+        prefers_claude.set_adversary_engine("name:claude");
+        let still = rank_adversary(
+            &prefers_claude,
+            &built_by("claude", "claude-sonnet"),
+            &engines,
+        );
+        assert_eq!(names(&still.ranking, &engines)[0], "deepseek");
+        // ...but it does decide among the others.
+        prefers_claude.set_adversary_engine("name:qwen");
+        let chosen = rank_adversary(
+            &prefers_claude,
+            &built_by("claude", "claude-sonnet"),
+            &engines,
+        );
+        assert_eq!(names(&chosen.ranking, &engines)[0], "qwen");
+
+        // With no builder known, the order is the policy's own.
+        let alone = rank_adversary(&policy, &[], &engines);
+        assert_eq!(names(&alone.ranking, &engines)[0], "claude");
+        assert!(alone.same_engine.iter().all(|same| !same));
+    }
+
+    #[test]
+    fn the_only_allowed_engine_runs_against_its_own_work_and_says_so() {
+        let engines = vec![judge("deepseek", "deepseek-chat", 3)];
+        let ranked = rank_adversary(
+            &Policy::default(),
+            &built_by("deepseek", "deepseek-chat"),
+            &engines,
+        );
+        assert_eq!(ranked.ranking.order, [0]);
+        assert_eq!(ranked.same_engine, [true]);
+
+        // Another engine that the policy never allows does not count as "another".
+        let engines = vec![
+            judge("deepseek", "deepseek-chat", 3),
+            judge("claude", "claude-sonnet", 3),
+        ];
+        let policy = Policy {
+            never: vec!["name:claude".into()],
+            ..Policy::default()
+        };
+        let ranked = rank_adversary(&policy, &built_by("deepseek", "deepseek-chat"), &engines);
+        assert_eq!(names(&ranked.ranking, &engines), ["deepseek"]);
+        assert_eq!(ranked.same_engine, [true]);
+
+        // A build-tier engine is not an adversary at all.
+        let engines = vec![engine("nemotron", "build", "free-tier")];
+        assert!(
+            rank_adversary(&Policy::default(), &[], &engines)
+                .ranking
+                .order
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_different_model_family_is_preferred_over_the_builders_own() {
+        let engines = vec![
+            judge("deepseek-r1", "deepseek-reasoner", 30),
+            judge("nemotron", "nemotron-ultra", 1),
+            judge("gate", "deepseek/deepseek-v3", 9),
+        ];
+        let ranked = rank_adversary(
+            &Policy::default(),
+            &built_by("deepseek-chat", "deepseek-chat"),
+            &engines,
+        );
+        // Nobody here built it, so only the family decides: the other family first, though
+        // its record is the shortest.
+        assert_eq!(names(&ranked.ranking, &engines)[0], "nemotron");
+        assert_eq!(ranked.same_family, [false, true, true]);
+        assert!(ranked.same_engine.iter().all(|same| !same));
+        assert_eq!(family_of(&engines[0]), "deepseek");
+        assert_eq!(family_of(&engines[1]), "nvidia");
+        // A gateway named neutrally is read by its model, not its name.
+        assert_eq!(family_of(&engines[2]), "deepseek");
+        // An engine nothing recognises is its own family.
+        assert_eq!(family_of(&engine("homebrew", "judge", "local")), "homebrew");
+    }
+
+    #[test]
+    fn the_recommendation_picks_an_adversary_from_another_family_than_the_builder() {
+        let mut nemotron = engine("nemotron", "build", "free-tier");
+        nemotron.model = Some("nemotron-super".into());
+        nemotron.verified = 12;
+        let engines = vec![
+            nemotron,
+            judge("deepseek", "deepseek-chat", 4),
+            judge("claude", "claude-sonnet", 4),
+        ];
+        let proposal = recommend(&engines, &["grouchly".to_string()]);
+        assert!(
+            !proposal.policy.preferences(Role::Adversary).is_empty(),
+            "{:#?}",
+            proposal.policy
+        );
+        let line = proposal
+            .reasons
+            .iter()
+            .find(|reason| reason.contains("for adversary"))
+            .unwrap_or_else(|| panic!("no adversary reason in {:#?}", proposal.reasons));
+        assert!(line.contains("different family"), "{line}");
+        assert!(line.contains("nemotron"), "{line}");
+        assert_eq!(proposal.policy.adversary, AdversaryMode::Advisory);
+        proposal.policy.check().unwrap();
+
+        // Nothing at judge tier: the proposal says so instead of inventing one.
+        let only_builders = vec![engine("nemotron", "build", "free-tier")];
+        let proposal = recommend(&only_builders, &["grouchly".to_string()]);
+        assert!(proposal.policy.preferences(Role::Adversary).is_empty());
+        assert!(
+            proposal
+                .reasons
+                .iter()
+                .any(|reason| reason.starts_with("nothing for adversary")),
+            "{:#?}",
+            proposal.reasons
         );
     }
 

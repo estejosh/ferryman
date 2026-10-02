@@ -1280,6 +1280,18 @@ pub fn authorize(
     let (true, Some(revision)) = (state.approved(), state.revision) else {
         bail!("{} does not hold both keys", task.order.id);
     };
+    // Nothing merges on its own past an adversary Block nobody answered, whatever mode
+    // the adversary is in: a merge no one is watching must not carry one.
+    if let Some(block) =
+        crate::adversary::unresolved_block(route, &policy, &task.order.id, revision)
+    {
+        bail!(
+            "{} r{revision} has an unresolved adversary Block ({}); it is not merged on its \
+             own - the master overrides it or sends the work back",
+            task.order.id,
+            block.finding.describe()
+        );
+    }
     let worker = task
         .results
         .iter()
@@ -1341,6 +1353,9 @@ pub fn run(route: &ProjectRoute, identity: &AgentIdentity, push: Option<&str>) -
         let Some(result) = task.results.iter().find(|r| r.revision == revision) else {
             continue;
         };
+        if crate::adversary::unresolved_block(route, &policy, &task.order.id, revision).is_some() {
+            continue;
+        }
         if !result.agent.eq_ignore_ascii_case(me)
             || !matches!(stage(route, &task.order.id, revision), Stage::Authorized(_))
         {

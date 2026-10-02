@@ -235,6 +235,13 @@ pub fn engine_key(
             refuted.reasons.join("; ")
         ));
     }
+    // The adversary's word, when the policy makes it binding: a Block on this revision
+    // withholds the engine key until the master overrides it. Checked before the review
+    // is read, so a review that already exists cannot carry a Block past the gate.
+    if let Some(why) = crate::adversary::engine_key_refusal(route, policy, &task.order.id, revision)
+    {
+        return Err(why);
+    }
     let reviews = engine_reviews(route, &task.order.id, revision);
     if reviews.is_empty() {
         return Err("the review engine has not reviewed it yet".to_string());
@@ -409,6 +416,12 @@ pub struct Waiting {
     /// The review engine's verdict, when it counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<EngineReview>,
+    /// What the adversary found in this revision before it was called done, when it ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adversary: Option<crate::adversary::AdversaryFinding>,
+    /// The adversary's Block is standing and nobody has overridden it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub adversary_blocked: bool,
     /// `true`: only the master's approval is missing.
     pub ready_for_you: bool,
     pub waiting_for: String,
@@ -441,7 +454,20 @@ pub fn waiting(route: &ProjectRoute) -> Vec<Waiting> {
             continue;
         };
         let found = crate::evidence::classify(&task.order.payload, result);
+        // With the adversary off, what it once said is history and shown nowhere.
+        let adversary = crate::adversary::standing(
+            route,
+            &task.order.id,
+            revision,
+            crate::adversary::Trigger::PreDone,
+        )
+        .filter(|_| policy.adversary != crate::policy::AdversaryMode::Off);
         out.push(Waiting {
+            adversary_blocked: policy.adversary != crate::policy::AdversaryMode::Off
+                && adversary
+                    .as_ref()
+                    .is_some_and(crate::adversary::Standing::unresolved_block),
+            adversary: adversary.map(|standing| standing.finding),
             order_id: task.order.id.clone(),
             title: title(&task),
             revision,

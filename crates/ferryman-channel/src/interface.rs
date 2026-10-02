@@ -626,6 +626,13 @@ pub fn lock(
     if status(route, &contract) == Status::Rejected {
         bail!("{name}@{version} was rejected; propose a new version");
     }
+    // The adversary, in `blocking` mode, can stop a lock its Block finding stands against
+    // until the master signs an override. Enforced here, in the one function every surface
+    // locks through - the CLI, the dashboard and the phone.
+    let (policy, _) = crate::policy::effective(&route.communications, &route.project_id);
+    if let Some(why) = crate::adversary::lock_refusal(route, &policy, &contract) {
+        bail!("{why}");
+    }
     let mut lock = Lock {
         by: master,
         at: Utc::now(),
@@ -647,6 +654,41 @@ pub fn lock(
         .with_context(|| format!("{name}@{version}: the lock was written but does not verify"))?;
     settle_question(route, &locked, LOCK, by, signer);
     Ok(locked)
+}
+
+/// [`lock`], first recording the master's signed override of the adversary's Block when
+/// one stands in the way (`blocking` mode, an unresolved Block). With nothing in the way
+/// it is exactly [`lock`]: an override is never recorded for a lock that needed none.
+pub fn lock_overriding(
+    route: &ProjectRoute,
+    name: &str,
+    version: &str,
+    by: &str,
+    signer: &AgentIdentity,
+    reason: Option<&str>,
+) -> Result<InterfaceContract> {
+    deciding_authority(route, by, signer)?;
+    if let Some(contract) = read_contract(route, name, version) {
+        let (policy, _) = crate::policy::effective(&route.communications, &route.project_id);
+        if crate::adversary::lock_refusal(route, &policy, &contract).is_some()
+            && let Some(standing) = crate::adversary::latest_standing(
+                route,
+                &contract.reference(),
+                crate::adversary::Trigger::ContractLock,
+            )
+        {
+            crate::adversary::override_block(
+                route,
+                &contract.reference(),
+                standing.finding.revision,
+                crate::adversary::Trigger::ContractLock,
+                reason,
+                by,
+                signer,
+            )?;
+        }
+    }
+    lock(route, name, version, by, signer)
 }
 
 /// Decline `name@version`. The contract is not deleted - the fleet should be able to see
@@ -1619,5 +1661,162 @@ mod tests {
         let old = r#"{"id":"t","project_id":"demo","issued_by":"josh","created_at":"2026-01-01T00:00:00Z","payload":{}}"#;
         let parsed: Order = serde_json::from_str(old).unwrap();
         assert!(parsed.interface.is_none() && parsed.touches.is_empty() && !parsed.allow_overlap);
+    }
+
+    // --- the adversary's say over a lock --------------------------------------------
+
+    fn block_on(w: &World, revision: u32) {
+        crate::adversary::record(
+            &w.route,
+            &w.fang,
+            crate::adversary::AdversaryFinding {
+                order_id: "user-api".into(),
+                revision,
+                trigger: crate::adversary::Trigger::ContractLock,
+                subject: "user-api@1".into(),
+                engine: "deepseek".into(),
+                model: None,
+                machine: "grouchly".into(),
+                same_engine: false,
+                verdict: crate::adversary::Verdict::Block,
+                findings: vec![crate::adversary::Issue {
+                    severity: crate::adversary::Severity::High,
+                    title: "the provider returns `username`, the consumer reads `name`".into(),
+                    detail: "the response shape and the consumer disagree".into(),
+                    location: Some("user.name".into()),
+                }],
+                created_at: Utc::now(),
+                signed_by: String::new(),
+                signature: String::new(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn mode(w: &World, adversary: crate::policy::AdversaryMode) {
+        let policy = crate::policy::Policy {
+            adversary,
+            ..crate::policy::Policy::default()
+        };
+        crate::policy::set_policy(&w.route.communications, "demo", Some(policy), &w.josh).unwrap();
+    }
+
+    #[test]
+    fn a_blocking_adversary_stops_the_lock_and_a_signed_override_lets_it_through() {
+        let w = world();
+        propose_user_api(&w);
+        block_on(&w, 0);
+        mode(&w, crate::policy::AdversaryMode::Blocking);
+
+        let error = lock(&w.route, "user-api", "1", "josh", &w.josh)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("blocks locking user-api@1"), "{error}");
+        assert!(error.contains("--override"), "{error}");
+        assert!(
+            !read_contract(&w.route, "user-api", "1")
+                .unwrap()
+                .is_locked(),
+            "nothing was locked"
+        );
+
+        // Only the master (or their delegate) overrides: a teammate's attempt changes nothing.
+        assert!(lock_overriding(&w.route, "user-api", "1", "josh", &w.wisp, None).is_err());
+        assert!(
+            crate::adversary::standing(
+                &w.route,
+                "user-api@1",
+                0,
+                crate::adversary::Trigger::ContractLock
+            )
+            .unwrap()
+            .unresolved_block()
+        );
+
+        let locked = lock_overriding(
+            &w.route,
+            "user-api",
+            "1",
+            "josh",
+            &w.josh,
+            Some("the consumer is being changed"),
+        )
+        .unwrap();
+        assert!(locked.is_locked());
+        let standing = crate::adversary::standing(
+            &w.route,
+            "user-api@1",
+            0,
+            crate::adversary::Trigger::ContractLock,
+        )
+        .unwrap();
+        assert!(!standing.unresolved_block());
+        assert_eq!(
+            standing.overridden.unwrap().reason,
+            "the consumer is being changed"
+        );
+    }
+
+    #[test]
+    fn an_advisory_or_absent_adversary_never_stops_a_lock_and_no_override_is_recorded_for_it() {
+        for adversary in [
+            crate::policy::AdversaryMode::Advisory,
+            crate::policy::AdversaryMode::Off,
+        ] {
+            let w = world();
+            propose_user_api(&w);
+            block_on(&w, 0);
+            mode(&w, adversary);
+            let locked = lock_overriding(&w.route, "user-api", "1", "josh", &w.josh, None).unwrap();
+            assert!(locked.is_locked(), "{adversary:?}");
+            assert!(
+                crate::adversary::standing(
+                    &w.route,
+                    "user-api@1",
+                    0,
+                    crate::adversary::Trigger::ContractLock
+                )
+                .unwrap()
+                .overridden
+                .is_none(),
+                "an override is never recorded for a lock that needed none"
+            );
+        }
+        // Default policy, no finding at all.
+        let w = world();
+        propose_user_api(&w);
+        assert!(
+            lock(&w.route, "user-api", "1", "josh", &w.josh)
+                .unwrap()
+                .is_locked()
+        );
+    }
+
+    #[test]
+    fn a_delegate_with_improve_locks_over_a_block_as_the_master_and_a_narrower_one_cannot() {
+        let w = world();
+        propose_user_api(&w);
+        block_on(&w, 0);
+        mode(&w, crate::policy::AdversaryMode::Blocking);
+
+        delegate(&w, crate::delegation::REVIEW);
+        assert!(
+            lock_overriding(&w.route, "user-api", "1", "josh", &w.bridge, None).is_err(),
+            "review is not what locks a contract"
+        );
+        delegate(&w, crate::delegation::IMPROVE);
+        let locked = lock_overriding(&w.route, "user-api", "1", "josh", &w.bridge, None).unwrap();
+        assert!(locked.is_locked());
+        let standing = crate::adversary::standing(
+            &w.route,
+            "user-api@1",
+            0,
+            crate::adversary::Trigger::ContractLock,
+        )
+        .unwrap();
+        assert_eq!(
+            standing.overridden.unwrap().from(),
+            "josh via telegram-grouchly"
+        );
     }
 }

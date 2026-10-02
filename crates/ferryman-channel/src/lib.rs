@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod adversary;
 pub mod anchor;
 pub mod ask;
 pub mod automerge;
@@ -54,6 +55,7 @@ pub mod secrets;
 pub mod seed;
 pub mod skills;
 pub mod source;
+pub mod tamper;
 pub mod trajectory;
 pub mod worktree;
 

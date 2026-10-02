@@ -31,6 +31,9 @@ pub const POLICY: &str = "engine-policy";
 /// A proposed interface contract, waiting for the master to lock or reject it. Answered
 /// with the contract's Lock / Reject buttons; see [`crate::interface`].
 pub const CONTRACT: &str = "contract";
+/// The adversary blocked a failing order's next attempt. One question per (order,
+/// revision); see [`crate::adversary`].
+pub const ADVERSARY: &str = "adversary";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {
