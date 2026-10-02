@@ -23,6 +23,72 @@ pub fn branch_name(order_id: &str, agent: &str) -> String {
     )
 }
 
+/// The argument that ends git's option parsing. Every git invocation that is handed a
+/// revision, ref or branch derived from anything a peer can write (a result's payload, a
+/// channel file, an order id) puts this before it, so a value such as
+/// `--upload-pack=<command>` is read as a (bad) revision and never as an option.
+pub const END_OF_OPTIONS: &str = "--end-of-options";
+
+/// Whether `value` is a full object id: 40 (SHA-1) or 64 (SHA-256) lowercase hex digits.
+/// The only spelling of a commit that a result's payload may name - not `HEAD`, not
+/// `origin/main`, not an abbreviation, and nothing that begins with `-`.
+#[must_use]
+pub fn is_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Refuse a value that git could read as an option or that cannot be one argument: empty,
+/// leading `-`, NUL or a newline. For revisions and refs this crate derives itself and
+/// still would not like to see turn into a flag.
+fn plain_argument(value: &str, what: &str) -> Result<()> {
+    if value.trim().is_empty() || value.starts_with('-') || value.contains(['\0', '\n', '\r']) {
+        bail!("{what} is not something to hand to git: {value:?}");
+    }
+    Ok(())
+}
+
+/// The commit `id` names in `repo`, when `id` is a full object id ([`is_object_id`]) of a
+/// commit that is here: asked of git as `<id>^{commit}` and accepted only when git gives
+/// back the same id, so an id of a tree or blob, or one that is not here, is `None`.
+#[must_use]
+pub fn commit_of(repo: &Path, id: &str) -> Option<String> {
+    if !is_object_id(id) {
+        return None;
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", "--quiet", END_OF_OPTIONS])
+        .arg(format!("{id}^{{commit}}"))
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let found = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && found == id).then_some(found)
+}
+
+/// Whether `ancestor` (a rev this crate derived) is `of` (a commit id) or one of its
+/// ancestors: that is, `of` descends from `ancestor`.
+#[must_use]
+pub fn descends_from(repo: &Path, ancestor: &str, of: &str) -> bool {
+    if !is_object_id(of) || plain_argument(ancestor, "a base").is_err() {
+        return false;
+    }
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", END_OF_OPTIONS, ancestor, of])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 /// Whether `path` is inside a git working tree.
 pub fn is_git_repo(path: &Path) -> bool {
     let Some(dir) = path.to_str() else {
@@ -254,7 +320,7 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
             .stderr(Stdio::null())
             .status();
         let _ = Command::new("git")
-            .args(["-C", repo_dir, "branch", "-D", &branch])
+            .args(["-C", repo_dir, "branch", "-D", END_OF_OPTIONS, &branch])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -290,11 +356,14 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
 
 /// The commit at the tip of a worktree's branch, to sign into the result.
 pub fn worktree_head(repo: &Path, branch: &str) -> Result<String> {
+    plain_argument(branch, "the branch")?;
     let output = Command::new("git")
         .args([
             "-C",
             repo.to_str().context("repo path is not valid UTF-8")?,
             "rev-parse",
+            "--verify",
+            END_OF_OPTIONS,
             branch,
         ])
         .output()
@@ -471,6 +540,7 @@ pub fn changed_paths(worktree: &Path, base: &str) -> Result<Vec<String>> {
     if base.trim().is_empty() {
         bail!("there is no base commit to compare against");
     }
+    plain_argument(base, "the base commit")?;
     let output = Command::new("git")
         .args([
             "-C",
@@ -481,6 +551,7 @@ pub fn changed_paths(worktree: &Path, base: &str) -> Result<Vec<String>> {
             "--name-only",
             "--no-renames",
             "-z",
+            END_OF_OPTIONS,
             base,
             "HEAD",
         ])
@@ -509,12 +580,15 @@ pub fn changed_paths(worktree: &Path, base: &str) -> Result<Vec<String>> {
 /// push is refused instead of erasing them.
 pub fn push_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
     let dir = repo.to_str().context("repo path is not valid UTF-8")?;
+    plain_argument(remote, "the remote")?;
+    plain_argument(branch, "the branch")?;
     let output = Command::new("git")
         .args([
             "-C",
             dir,
             "push",
             "--force-with-lease",
+            END_OF_OPTIONS,
             remote,
             &format!("{branch}:{branch}"),
         ])
@@ -555,7 +629,7 @@ pub fn remove_worktree(repo: &Path, branch: &str) -> Result<()> {
         }
     }
     let _ = Command::new("git")
-        .args(["-C", repo_dir, "branch", "-D", branch])
+        .args(["-C", repo_dir, "branch", "-D", END_OF_OPTIONS, branch])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -599,7 +673,7 @@ pub fn retire_worktree(repo: &Path, branch: &str, base: &str) -> Result<bool> {
     let kept = has_commits_beyond(repo, branch, base);
     if !kept {
         let _ = Command::new("git")
-            .args(["-C", repo_dir, "branch", "-D", branch])
+            .args(["-C", repo_dir, "branch", "-D", END_OF_OPTIONS, branch])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
@@ -616,12 +690,16 @@ pub fn has_commits_beyond(repo: &Path, branch: &str, base: &str) -> bool {
     let Some(dir) = repo.to_str() else {
         return true;
     };
+    if plain_argument(base, "the base").is_err() || plain_argument(branch, "the branch").is_err() {
+        return true;
+    }
     let output = Command::new("git")
         .args([
             "-C",
             dir,
             "rev-list",
             "--count",
+            END_OF_OPTIONS,
             &format!("{base}..{branch}"),
         ])
         .output();
@@ -998,6 +1076,54 @@ mod tests {
         // output, a wrongly deleted one costs the work.
         let repo = temp_repo();
         assert!(has_commits_beyond(&repo, "no-such-branch", "no-such-base"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn only_a_full_object_id_is_a_commit_a_payload_may_name() {
+        assert!(is_object_id(&"a".repeat(40)) && is_object_id(&"0".repeat(64)));
+        for bad in [
+            "",
+            "abc",
+            "HEAD",
+            "origin/main",
+            "--upload-pack=x",
+            "-h",
+            &"A".repeat(40),
+            &"a".repeat(41),
+            &format!("-{}", "a".repeat(39)),
+        ] {
+            assert!(!is_object_id(bad), "{bad:?}");
+        }
+        let repo = temp_repo();
+        let head = head_of(&repo).unwrap();
+        assert_eq!(commit_of(&repo, &head).as_deref(), Some(head.as_str()));
+        assert_eq!(commit_of(&repo, "HEAD"), None, "a rev is not an id");
+        assert_eq!(commit_of(&repo, &"1".repeat(40)), None, "not in this repo");
+        let tree = Command::new("git")
+            .args(["-C", repo.to_str().unwrap(), "rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        let tree = String::from_utf8_lossy(&tree.stdout).trim().to_string();
+        assert!(is_object_id(&tree));
+        assert_eq!(commit_of(&repo, &tree), None, "a tree is not a commit");
+        assert!(descends_from(&repo, "HEAD", &head));
+        assert!(!descends_from(&repo, "--output=x", &head));
+        assert!(!descends_from(&repo, "HEAD", "HEAD"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_value_that_could_be_an_option_is_refused_before_git_is_run() {
+        let repo = temp_repo();
+        let marker = repo.join("pwned");
+        let evil = format!("--output={}", marker.display());
+        assert!(changed_paths(&repo, &evil).is_err());
+        assert!(!marker.exists());
+        assert!(push_branch(&repo, "--receive-pack=touch x", "main").is_err());
+        assert!(push_branch(&repo, "origin", "-x").is_err());
+        assert!(worktree_head(&repo, "--help").is_err());
+        assert!(has_commits_beyond(&repo, "main", "--help"), "kept, not run");
         let _ = fs::remove_dir_all(&repo);
     }
 }

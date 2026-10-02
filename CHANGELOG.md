@@ -74,6 +74,20 @@
     `weekly_requests` cap; anything else stays blocked, with a warning on every surface.
     Old signed policies still verify. See docs/ENGINE_SETUP.md, "Team preset and swarms".
 
+### Fixed
+
+- **A result's commit can no longer be an argument to git.** The adversary's diff scan,
+  auto-merge and the worktree helpers took `worktree_head` (and other peer- or
+  channel-derived revisions) straight into `git fetch`, `git diff` and `git merge-base`,
+  where a value such as `--upload-pack=<command>` or `--output=<file>` is an option. Only a
+  full object id (40 or 64 lowercase hex digits) is accepted now, verified to be a commit
+  here, and it must be the order branch's tip or descend from the base the order started
+  from; anything else is an Unscanned concern and nothing is fetched. Every git call that
+  takes a revision, ref or remote derived from synced data puts `--end-of-options` before
+  it (or refuses a value that starts with `-`). A gated order with no readable commit in a
+  git workspace is an Unscanned concern, not a clean pass, and a branch read without a
+  named commit is fetched first so a stale local tip is not read instead.
+
 ## v0.5.17 - 2026-09-29
 
 You choose which model does self-improve and on which machine, fm recommends one that spares your subscriptions, and nothing goes live without both an engine review and your approval. OmniRoute works as an engine.

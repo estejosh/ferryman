@@ -42,6 +42,7 @@ use ferryman_channel::{
     interface::{self},
     policy::{AdversaryMode, Builder, Policy, Role, Step},
     questions, tamper,
+    worktree::END_OF_OPTIONS,
 };
 use serde_json::Value;
 
@@ -906,6 +907,7 @@ fn read_diff(workspace: &Path, spec: &str) -> Option<DiffRead> {
             "--no-color",
             "-M",
             "-U3",
+            END_OF_OPTIONS,
             spec,
             "--",
             ".",
@@ -988,21 +990,51 @@ fn git_ok(workspace: &Path, args: &[&str]) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Whether this checkout has `rev` as a commit.
+/// Whether this checkout has `rev` as a commit. Only a full object id is ever asked about:
+/// what a result's payload names is never handed to git as anything else (see
+/// [`ferryman_channel::worktree::commit_of`]).
 fn has_commit(workspace: &Path, rev: &str) -> bool {
-    git_ok(workspace, &["cat-file", "-e", &format!("{rev}^{{commit}}")])
+    ferryman_channel::worktree::commit_of(workspace, rev).is_some()
+}
+
+/// The commit a ref names here, when it names one.
+fn tip_of(workspace: &Path, refname: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--verify", "--quiet", END_OF_OPTIONS])
+        .arg(format!("{refname}^{{commit}}"))
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (output.status.success() && ferryman_channel::worktree::is_object_id(&line)).then_some(line)
 }
 
 /// Fetch `what` from `origin`, quietly, without ever prompting, and give up after
-/// [`FETCH_SECONDS`]. A missing remote or a failed fetch is just `false`.
+/// [`FETCH_SECONDS`]. A missing remote or a failed fetch is just `false`. `what` is a
+/// branch this crate derived from an order id or a full object id; anything else is
+/// refused, and `--end-of-options` stands before it regardless, so a value such as
+/// `--upload-pack=<command>` can never be an option of `git fetch`.
 fn fetch_from_origin(workspace: &Path, what: &str) -> bool {
+    if what.trim().is_empty() || what.starts_with('-') || what.contains(['\0', '\n', '\r']) {
+        return false;
+    }
     if !git_ok(workspace, &["remote", "get-url", "origin"]) {
         return false;
     }
     let Ok(mut child) = Command::new("git")
         .arg("-C")
         .arg(workspace)
-        .args(["fetch", "--quiet", "--no-tags", "origin", what])
+        .args([
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            END_OF_OPTIONS,
+            "origin",
+            what,
+        ])
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -1036,7 +1068,20 @@ enum OrderRead {
     Unreadable(String),
 }
 
-fn read_order(route: &ProjectRoute, result: &TaskResult) -> OrderRead {
+/// What a result's `worktree_head` is allowed to be, said once: `value` is the payload's
+/// text, so it is shown only as printable characters and never longer than a line.
+fn shown(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_ascii_graphic() { c } else { '?' })
+        .take(24)
+        .collect()
+}
+
+/// Read the order's branch. `gated` orders (the ones the adversary exists to check) are
+/// never read as "nothing to scan" when this is a git workspace: a result with no readable
+/// commit is a diff nobody read, and says so.
+fn read_order(route: &ProjectRoute, result: &TaskResult, gated: bool) -> OrderRead {
     let workspace = &route.workspace;
     if !ferryman_channel::worktree::is_git_repo(workspace) {
         return OrderRead::Nothing;
@@ -1051,6 +1096,16 @@ fn read_order(route: &ProjectRoute, result: &TaskResult) -> OrderRead {
         .map(str::trim)
         .filter(|head| !head.is_empty());
     if let Some(head) = named {
+        // The payload is a peer's word. Only a full object id is ever given to git:
+        // not `HEAD`, not `origin/main` (whose diff against the base is empty), not
+        // `--upload-pack=...`. Nothing is fetched for anything else.
+        if !ferryman_channel::worktree::is_object_id(head) {
+            return OrderRead::Unreadable(format!(
+                "the result names {:?} as its commit, which is not a full commit id (40 or 64 \
+                 hex digits), so nothing was fetched and its diff was not read",
+                shown(head)
+            ));
+        }
         // The reviewed commit is the one that counts. Fetch it if it is not here; an older
         // tip of the same branch is a different diff and would clear what it never read.
         if !has_commit(workspace, head) {
@@ -1067,6 +1122,22 @@ fn read_order(route: &ProjectRoute, result: &TaskResult) -> OrderRead {
                  different diff)"
             ));
         }
+        // The commit must be this order's work: the tip of its branch, or a commit that
+        // descends from the base the order started from. Any other commit's diff against
+        // the base is somebody else's, or empty.
+        let on_branch = [
+            format!("refs/heads/{branch}"),
+            format!("refs/remotes/origin/{branch}"),
+        ]
+        .iter()
+        .any(|name| tip_of(workspace, name).as_deref() == Some(head));
+        if !on_branch && !ferryman_channel::worktree::descends_from(workspace, &base, head) {
+            return OrderRead::Unreadable(format!(
+                "the result names commit {short}, which is not the tip of {branch} and does \
+                 not descend from {base}, so it is not this order's work and its diff was \
+                 not read"
+            ));
+        }
         return match diff_to(head) {
             Some(read) => OrderRead::Read(read),
             None => OrderRead::Unreadable(format!(
@@ -1074,14 +1145,24 @@ fn read_order(route: &ProjectRoute, result: &TaskResult) -> OrderRead {
             )),
         };
     }
-    let tips = [branch.clone(), format!("origin/{branch}")];
-    for attempt in 0..2 {
-        if let Some(read) = tips.iter().find_map(|tip| diff_to(tip)) {
-            return OrderRead::Read(read);
-        }
-        if attempt == 0 {
-            fetch_from_origin(workspace, &branch);
-        }
+    // No commit named: the branch itself is read, from origin first - a local branch left
+    // behind is an older diff than the one that was reviewed.
+    let fetched = fetch_from_origin(workspace, &branch);
+    let local = format!("refs/heads/{branch}");
+    let remote = format!("refs/remotes/origin/{branch}");
+    let tips = if fetched {
+        [remote, local]
+    } else {
+        [local, remote]
+    };
+    if let Some(read) = tips.iter().find_map(|tip| diff_to(tip)) {
+        return OrderRead::Read(read);
+    }
+    if gated {
+        return OrderRead::Unreadable(format!(
+            "the result names no commit and {branch} is not readable here or on origin, so \
+             what it changed was not read"
+        ));
     }
     OrderRead::Nothing
 }
@@ -1091,7 +1172,7 @@ fn read_order(route: &ProjectRoute, result: &TaskResult) -> OrderRead {
 /// repository or the diff could not be read.
 #[must_use]
 pub fn order_diff(route: &ProjectRoute, result: &TaskResult) -> Option<String> {
-    match read_order(route, result) {
+    match read_order(route, result, false) {
         OrderRead::Read(read) => Some(read.text),
         _ => None,
     }
@@ -1134,14 +1215,16 @@ impl OrderScan {
 }
 
 /// Read the order's branch and scan it for tampering. A diff too large to read in full, or a
-/// commit that cannot be read at all, is a finding of its own.
+/// commit that cannot be read at all, is a finding of its own - and so, for a `gated`
+/// order in a git workspace, is a result that names no readable commit.
 #[must_use]
 pub fn scan_order(
     route: &ProjectRoute,
     result: &TaskResult,
     required: &[Vec<String>],
+    gated: bool,
 ) -> OrderScan {
-    match read_order(route, result) {
+    match read_order(route, result, gated) {
         OrderRead::Nothing => OrderScan::default(),
         OrderRead::Unreadable(why) => OrderScan {
             diff: None,
@@ -1312,7 +1395,7 @@ pub async fn pre_done_pass(
         {
             continue;
         }
-        let scan = scan_order(route, result, &required_of(&task));
+        let scan = scan_order(route, result, &required_of(&task), true);
         let request = Request {
             subject: task.order.id.clone(),
             order_id: task.order.id.clone(),
@@ -1479,7 +1562,14 @@ pub async fn before_attempt(
     if !asked {
         let result = task.results.iter().find(|r| r.revision == revision);
         let scan = result
-            .map(|result| scan_order(route, result, &required_of(task)))
+            .map(|result| {
+                scan_order(
+                    route,
+                    result,
+                    &required_of(task),
+                    ferryman_channel::gate::gated(&task.order.payload),
+                )
+            })
             .unwrap_or_default();
         let (diff, hits) = (scan.diff.as_deref(), &scan.hits);
         let tampered = scan.tampered();
@@ -3107,7 +3197,7 @@ mod tests {
         // Sorts before tests/double.rs and is bigger than the old global cap on its own.
         let big = "let x = 1;\n".repeat(300_000);
         branch(&route, "t-1", &[("a_big.rs", &big)], &["tests/double.rs"]);
-        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[]);
+        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[], true);
         let kinds = kinds(&scan);
         assert!(
             kinds.contains(&tamper::Kind::DeletedTest),
@@ -3141,7 +3231,7 @@ mod tests {
         let (route, _config) = fixture(dir.path(), Vec::new());
         let big = "let x = 1;\n".repeat(60_000);
         branch(&route, "t-1", &[("src/big.rs", &big)], &[]);
-        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[]);
+        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[], true);
         assert!(scan.unscanned() && !scan.tampered(), "{:?}", scan.hits);
         assert_eq!(scan.floor(), Verdict::Concern);
 
@@ -3149,7 +3239,7 @@ mod tests {
         let (route, _config) = fixture(dir.path(), Vec::new());
         let lock = "name = \"x\"\n".repeat(60_000);
         branch(&route, "t-2", &[("Cargo.lock", &lock)], &[]);
-        let scan = scan_order(&route, &result("t-2", 1, "deepseek", 0), &[]);
+        let scan = scan_order(&route, &result("t-2", 1, "deepseek", 0), &[], true);
         assert!(scan.hits.is_empty(), "{:?}", scan.hits);
         assert_eq!(scan.floor(), Verdict::Pass);
     }
@@ -3164,7 +3254,7 @@ mod tests {
         let mut named = result("t-1", 1, "deepseek", 0);
         named.payload["worktree_head"] = json!("0123456789abcdef0123456789abcdef01234567");
         assert!(order_diff(&route, &named).is_none(), "no stand-in diff");
-        let scan = scan_order(&route, &named, &[]);
+        let scan = scan_order(&route, &named, &[], true);
         assert!(scan.diff.is_none());
         assert!(
             !scan.tampered(),
@@ -3208,7 +3298,7 @@ mod tests {
 
         let mut named = result("t-1", 1, "deepseek", 0);
         named.payload["worktree_head"] = json!(head);
-        let scan = scan_order(&route, &named, &[]);
+        let scan = scan_order(&route, &named, &[], true);
         assert!(
             kinds(&scan).contains(&tamper::Kind::DeletedTest),
             "fetched and read: {:?}",
@@ -3224,6 +3314,130 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
+    }
+
+    #[test]
+    fn a_worktree_head_that_is_not_a_full_commit_id_never_reaches_git_and_is_a_concern() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        let repo = route.workspace.clone();
+        let origin = dir.path().join("origin.git");
+        run_origin(&origin);
+        git(
+            &repo,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        // The branch really does delete a test: only a read of it can say so.
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        let marker = dir.path().join("pwned");
+        let upload_pack = format!("--upload-pack=touch {}", marker.display());
+        for head in [
+            upload_pack.as_str(),
+            "--output=pwned-file",
+            "-h",
+            "HEAD",
+            "origin/main",
+            "main",
+            "refs/heads/main",
+            "abc",
+            "0123456789abcdef0123456789ABCDEF01234567",
+            "0123456789abcdef0123456789abcdef01234567",
+        ] {
+            let mut named = result("t-1", 1, "deepseek", 0);
+            named.payload["worktree_head"] = json!(head);
+            assert!(order_diff(&route, &named).is_none(), "{head}: no diff");
+            let scan = scan_order(&route, &named, &[], true);
+            assert!(scan.diff.is_none(), "{head}");
+            assert!(
+                scan.unscanned() && !scan.tampered(),
+                "{head}: it is a diff nobody read, not a clean one: {:?}",
+                scan.hits
+            );
+            assert_eq!(scan.floor(), Verdict::Concern, "{head}");
+        }
+        assert!(!marker.exists(), "no command ran");
+        assert!(!repo.join("pwned-file").exists());
+        assert!(!fetch_from_origin(&repo, &upload_pack));
+        assert!(!marker.exists());
+        assert!(!has_commit(&repo, "HEAD") && !has_commit(&repo, "--help"));
+    }
+
+    #[test]
+    fn a_commit_that_is_neither_the_order_branch_nor_a_descendant_of_its_base_is_not_read() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        let repo = route.workspace.clone();
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        // An unrelated history: a root commit that shares nothing with `main`.
+        git(&repo, &["checkout", "-q", "--orphan", "stray"]);
+        git(&repo, &["rm", "-rfq", "."]);
+        fs::write(repo.join("other.txt"), "x").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "stray"]);
+        let stray = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["checkout", "-q", "-f", "main"]);
+        let mut named = result("t-1", 1, "deepseek", 0);
+        named.payload["worktree_head"] = json!(stray);
+        let scan = scan_order(&route, &named, &[], true);
+        assert!(scan.diff.is_none(), "{:?}", scan.hits);
+        assert_eq!(scan.floor(), Verdict::Concern);
+        assert!(
+            scan.hits[0].detail.contains("not this order's work"),
+            "{:?}",
+            scan.hits
+        );
+        // The real tip is read, and its deleted test is found.
+        let name = ferryman_channel::worktree::branch_name("t-1", "fang");
+        named.payload["worktree_head"] = json!(git(&repo, &["rev-parse", &name]));
+        let scan = scan_order(&route, &named, &[], true);
+        assert!(kinds(&scan).contains(&tamper::Kind::DeletedTest));
+    }
+
+    #[test]
+    fn a_gated_order_with_no_readable_commit_in_a_git_workspace_is_a_concern_not_a_pass() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        // No head named and no branch anywhere.
+        let result = result("t-9", 1, "deepseek", 0);
+        let scan = scan_order(&route, &result, &[], true);
+        assert!(scan.unscanned(), "{:?}", scan.hits);
+        assert_eq!(scan.floor(), Verdict::Concern);
+        // An order that is not gated has nothing to scan, as before.
+        let scan = scan_order(&route, &result, &[], false);
+        assert!(scan.hits.is_empty());
+        assert_eq!(scan.floor(), Verdict::Pass);
+    }
+
+    #[test]
+    fn with_no_head_named_the_branch_is_fetched_before_a_stale_local_one_is_read() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        let repo = route.workspace.clone();
+        let origin = dir.path().join("origin.git");
+        run_origin(&origin);
+        git(
+            &repo,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        let name = ferryman_channel::worktree::branch_name("t-1", "fang");
+        git(&repo, &["push", "-q", "origin", &name]);
+        // What is local is stale: the branch is back at `main`, and so is its tracking ref.
+        git(&repo, &["branch", "-q", "-f", &name, "main"]);
+        git(
+            &repo,
+            &["update-ref", &format!("refs/remotes/origin/{name}"), "main"],
+        );
+        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[], true);
+        assert!(
+            kinds(&scan).contains(&tamper::Kind::DeletedTest),
+            "the fetched tip was read, not the stale one: {:?}",
+            scan.hits
+        );
     }
 
     #[test]

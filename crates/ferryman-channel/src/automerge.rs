@@ -49,6 +49,7 @@ use serde_json::Value;
 use crate::{
     AgentIdentity, ProjectRoute, SignatureCheck, Task,
     policy::{AutoMerge, Policy},
+    worktree::END_OF_OPTIONS,
 };
 
 /// More changed files than this is not low risk: it is a change nobody can skim.
@@ -813,7 +814,15 @@ fn hunks_of(diff: &str) -> Vec<Hunk> {
 
 /// Every file `tip` changes since it left `base`: what merging it would bring in.
 pub fn changes(repo: &Path, base: &str, tip: &str) -> Result<Vec<FileChange>> {
-    let from = git_text(repo, &["merge-base", base, tip])?;
+    // `tip` is the commit a result's payload names: a full object id, or nothing git is
+    // handed (`--output=<file>` would otherwise be an option of `git diff`).
+    if !crate::worktree::is_object_id(tip) {
+        bail!("{tip:?} is not a full commit id, so what it changes is not read");
+    }
+    if base.trim().is_empty() || base.starts_with('-') {
+        bail!("{base:?} is not a base to compare against");
+    }
+    let from = git_text(repo, &["merge-base", END_OF_OPTIONS, base, tip])?;
     let raw = git_out(
         repo,
         &[
@@ -823,6 +832,7 @@ pub fn changes(repo: &Path, base: &str, tip: &str) -> Result<Vec<FileChange>> {
             "--no-renames",
             "--no-abbrev",
             "--no-ext-diff",
+            END_OF_OPTIONS,
             &from,
             tip,
         ],
@@ -866,6 +876,7 @@ pub fn changes(repo: &Path, base: &str, tip: &str) -> Result<Vec<FileChange>> {
                     "--no-color",
                     "--no-ext-diff",
                     "--no-renames",
+                    END_OF_OPTIONS,
                     &from,
                     tip,
                     "--",
@@ -905,6 +916,7 @@ pub fn default_branch(repo: &Path) -> Option<String> {
             "rev-parse",
             "--verify",
             "--quiet",
+            END_OF_OPTIONS,
             &format!("refs/heads/{name}"),
         ],
     )
@@ -926,7 +938,11 @@ fn checked_out_at(repo: &Path, branch: &str) -> Option<PathBuf> {
 }
 
 fn is_ancestor(repo: &Path, ancestor: &str, of: &str) -> bool {
-    git_out(repo, &["merge-base", "--is-ancestor", ancestor, of]).is_ok()
+    git_out(
+        repo,
+        &["merge-base", "--is-ancestor", END_OF_OPTIONS, ancestor, of],
+    )
+    .is_ok()
 }
 
 /// A merge that happened.
@@ -952,9 +968,17 @@ pub fn merge(
     message: &str,
     push: Option<&str>,
 ) -> Result<Merge> {
+    if !crate::worktree::is_object_id(reviewed) {
+        bail!("the reviewed commit {reviewed:?} is not a full commit id");
+    }
     let tip = git_text(
         repo,
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+        &[
+            "rev-parse",
+            "--verify",
+            END_OF_OPTIONS,
+            &format!("refs/heads/{branch}"),
+        ],
     )?;
     if tip != reviewed {
         bail!(
@@ -964,9 +988,9 @@ pub fn merge(
         );
     }
     let target = format!("refs/heads/{into}");
-    let before = git_text(repo, &["rev-parse", "--verify", &target])?;
+    let before = git_text(repo, &["rev-parse", "--verify", END_OF_OPTIONS, &target])?;
     if let Some(remote) = push {
-        git_out(repo, &["fetch", "--quiet", remote, into])
+        git_out(repo, &["fetch", "--quiet", END_OF_OPTIONS, remote, into])
             .with_context(|| format!("could not fetch {remote} {into}"))?;
         let theirs = git_text(repo, &["rev-parse", "--verify", "FETCH_HEAD"])?;
         if !is_ancestor(repo, &theirs, &before) {
@@ -1006,13 +1030,19 @@ pub fn merge(
     let mut pushed = None;
     if let Some(remote) = push {
         let refspec = format!("{target}:{target}");
-        if let Err(error) = git_out(repo, &["push", "--quiet", remote, &refspec]) {
+        if let Err(error) = git_out(repo, &["push", "--quiet", END_OF_OPTIONS, remote, &refspec]) {
             match &checked_out {
                 Some(dir) => {
-                    let _ = git_out(dir, &["reset", "--quiet", "--keep", &before]);
+                    let _ = git_out(
+                        dir,
+                        &["reset", "--quiet", "--keep", END_OF_OPTIONS, &before],
+                    );
                 }
                 None => {
-                    let _ = git_out(repo, &["update-ref", &target, &before, &commit]);
+                    let _ = git_out(
+                        repo,
+                        &["update-ref", END_OF_OPTIONS, &target, &before, &commit],
+                    );
                 }
             }
             return Err(error.context(format!("{remote} refused {into}; merged nothing")));
@@ -1029,7 +1059,7 @@ pub fn merge(
 
 /// Merge `tip` into what `dir` has checked out. `true` for a fast-forward.
 fn merge_in(dir: &Path, tip: &str, agent: &str, message: &str) -> Result<bool> {
-    if git_out(dir, &["merge", "--ff-only", "--quiet", tip]).is_ok() {
+    if git_out(dir, &["merge", "--ff-only", "--quiet", END_OF_OPTIONS, tip]).is_ok() {
         return Ok(true);
     }
     let name = format!("user.name={agent}");
@@ -1049,6 +1079,7 @@ fn merge_in(dir: &Path, tip: &str, agent: &str, message: &str) -> Result<bool> {
             "--quiet",
             "-m",
             message,
+            END_OF_OPTIONS,
             tip,
         ],
     ) {
@@ -1732,5 +1763,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_commit_that_is_not_a_full_id_is_never_handed_to_git_as_an_option() {
+        let dir =
+            std::env::temp_dir().join(format!("ferryman-automerge-option-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let marker = dir.join("pwned");
+        for tip in [
+            format!("--output={}", marker.display()),
+            "HEAD".to_string(),
+            "origin/main".to_string(),
+            "--help".to_string(),
+        ] {
+            assert!(changes(&dir, "HEAD", &tip).is_err(), "{tip}");
+        }
+        assert!(changes(&dir, "--output=x", &"a".repeat(40)).is_err());
+        assert!(!marker.exists(), "git never saw it as an option");
+        assert!(merge(&dir, "b", "--upload-pack=x", "main", "a", "m", None).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

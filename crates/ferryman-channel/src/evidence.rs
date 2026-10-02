@@ -930,7 +930,16 @@ pub fn check_claimed_commits(evidence: &mut Evidence, dir: &Path, answer: &str) 
     evidence.claimed_commits = claimed_hashes(answer)
         .into_iter()
         .map(|hash| ClaimedCommit {
-            exists: git(dir, &["cat-file", "-e", &format!("{hash}^{{commit}}")]).is_some(),
+            exists: git(
+                dir,
+                &[
+                    "cat-file",
+                    "-e",
+                    crate::worktree::END_OF_OPTIONS,
+                    &format!("{hash}^{{commit}}"),
+                ],
+            )
+            .is_some(),
             hash,
         })
         .collect();
