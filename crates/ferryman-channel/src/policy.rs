@@ -35,6 +35,29 @@
 //! master signed it, by the key the channel knows them by, or their delegate did under an
 //! `improve` delegation. Anything else - unsigned, edited, forged, lifted from another
 //! project - is ignored, and the project runs on auto.
+//!
+//! # Rollback and deletion
+//!
+//! A signed file stays valid for ever, so an old one put back (or the file deleted, or
+//! replaced with garbage) would quietly undo what the master chose since. Each signing
+//! therefore carries a `seq` that is one more than the highest the signer could see, and
+//! each machine keeps, outside the synced channel (in its own state directory), the
+//! highest `seq` it has seen and the last good setting with its signature. A channel file
+//! with a lower `seq`, or no verifying file at all, does not change what this machine
+//! runs: it keeps using the last known good setting (re-verified every time) and raises
+//! one question to the master ([`ask_rollback`]). Signing the policy again - from a
+//! machine that has seen the newest - supersedes everything.
+//!
+//! A delegate's setting lasts as long as its delegation: when the delegation is revoked
+//! or lapses, the setting stops verifying like any other unauthorised file. Delegation is
+//! judged when the file is read, not when it was signed, because a signature-time check
+//! would let a revoked delegate backdate a setting.
+//!
+//! # What a delegate cannot change
+//!
+//! The adversary is the check on the work, so the one who could be checked does not get
+//! to switch it off: changing the adversary mode, or removing the adversary role, needs
+//! the master's own signature ([`set_policy_as`] refuses it for a delegate).
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -2113,6 +2136,15 @@ pub struct PolicySetting {
     /// `improve` delegation from the master.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
+    /// One more than the highest `seq` the signer saw when signing, so a machine can tell
+    /// an older signed policy put back from a newer one. Left out of the file (and the
+    /// signature) when 0, so a policy signed before this existed still verifies.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub seq: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 impl PolicySetting {
@@ -2138,22 +2170,31 @@ fn setting_payload(setting: &PolicySetting) -> String {
     if let Some(principal) = &setting.on_behalf_of {
         payload.push_str(&format!("\nfor:{principal}"));
     }
+    if setting.seq != 0 {
+        payload.push_str(&format!("\nseq:{}", setting.seq));
+    }
     payload
 }
 
-/// The master's engine policy setting for the project in `channel`, when there is one
-/// and it verifies. Anything else is `None`, which means auto.
-#[must_use]
-pub fn setting(channel: &Path, project_id: &str) -> Option<PolicySetting> {
-    let setting: PolicySetting =
-        serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).ok()?).ok()?;
-    let roster = crate::read_agent_roster(channel).ok()?;
-    let master = crate::master::read_master_at(channel, &roster).ok()??;
+/// The file's setting as parsed, genuine or not.
+fn read_file_setting(channel: &Path) -> Option<PolicySetting> {
+    serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).ok()?).ok()
+}
+
+/// Whether `setting` is the master's word for `project_id` in `channel`: signed by them or
+/// by a delegate holding `improve` now, over exactly what it says.
+fn genuine(channel: &Path, project_id: &str, setting: &PolicySetting) -> bool {
+    let Ok(roster) = crate::read_agent_roster(channel) else {
+        return false;
+    };
+    let Ok(Some(master)) = crate::master::read_master_at(channel, &roster) else {
+        return false;
+    };
     let principal = setting
         .on_behalf_of
         .clone()
         .unwrap_or_else(|| setting.signed_by.clone());
-    (setting.project_id == project_id
+    setting.project_id == project_id
         && master.project_id == project_id
         && principal.eq_ignore_ascii_case(&master.master)
         && setting
@@ -2172,10 +2213,187 @@ pub fn setting(channel: &Path, project_id: &str) -> Option<PolicySetting> {
         && crate::check_signature(
             Some(&setting.signed_by),
             Some(&setting.signature),
-            &setting_payload(&setting),
+            &setting_payload(setting),
             &roster,
-        ) == SignatureCheck::Valid)
-        .then_some(setting)
+        ) == SignatureCheck::Valid
+}
+
+/// What this machine remembers of a project's policy, in its own state directory: never
+/// in the synced channel, so nobody who can write the channel can edit it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Seen {
+    /// The highest `seq` this machine has accepted.
+    high: u64,
+    /// The last good setting, with its signature; verified again whenever it is used.
+    setting: Option<PolicySetting>,
+    /// What went wrong with the channel's file, until it is put right.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alert: Option<String>,
+}
+
+fn seen_path(channel: &Path, project_id: &str) -> Option<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let dir = crate::licensing::machine_state_dir()?.join("engine-policy");
+    let channel = std::fs::canonicalize(channel).unwrap_or_else(|_| channel.to_path_buf());
+    let key = hex::encode(Sha256::digest(
+        format!("{}\n{project_id}", channel.display()).as_bytes(),
+    ));
+    Some(dir.join(format!("{}.json", &key[..24])))
+}
+
+fn read_seen(path: &Path) -> Option<Seen> {
+    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+}
+
+/// Best effort: a machine that cannot remember simply has no rollback protection.
+fn write_seen(path: &Path, seen: &Seen) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = crate::atomic_json(path, seen);
+}
+
+/// The setting in force and how it was reached.
+struct Resolved {
+    setting: Option<PolicySetting>,
+    /// The setting is this machine's memory of an earlier one, because the channel's file
+    /// went back or is gone.
+    from_memory: bool,
+    /// The highest `seq` seen, here or in the channel.
+    high: u64,
+}
+
+fn resolve(channel: &Path, project_id: &str) -> Resolved {
+    let file = read_file_setting(channel).filter(|setting| genuine(channel, project_id, setting));
+    let file_seq = file.as_ref().map_or(0, |setting| setting.seq);
+    let path = seen_path(channel, project_id);
+    let Some(memory) = path.as_deref().and_then(read_seen) else {
+        if let (Some(file), Some(path)) = (&file, &path) {
+            write_seen(
+                path,
+                &Seen {
+                    high: file.seq,
+                    setting: Some(file.clone()),
+                    alert: None,
+                },
+            );
+        }
+        return Resolved {
+            setting: file,
+            from_memory: false,
+            high: file_seq,
+        };
+    };
+    let good = memory
+        .setting
+        .clone()
+        .filter(|setting| genuine(channel, project_id, setting));
+    let high = memory.high.max(file_seq);
+    let remember = |seen: Seen| {
+        if let Some(path) = &path
+            && Some(&seen) != Some(&memory)
+        {
+            write_seen(path, &seen);
+        }
+    };
+    match file {
+        Some(file)
+            if file.seq > memory.high
+                || (file.seq == memory.high
+                    && good
+                        .as_ref()
+                        .is_none_or(|good| *good == file || file.set_at >= good.set_at)) =>
+        {
+            remember(Seen {
+                high: file.seq,
+                setting: Some(file.clone()),
+                alert: None,
+            });
+            Resolved {
+                setting: Some(file),
+                from_memory: false,
+                high,
+            }
+        }
+        Some(file) => {
+            remember(Seen {
+                high: memory.high,
+                setting: memory.setting.clone(),
+                alert: Some(format!(
+                    "the channel's engine policy is at sequence {} but this machine has \
+                     already seen sequence {}: an older signed policy was put back",
+                    file.seq, memory.high
+                )),
+            });
+            Resolved {
+                from_memory: good.is_some(),
+                setting: good.or(Some(file)),
+                high,
+            }
+        }
+        None if good.is_some() => {
+            remember(Seen {
+                high: memory.high,
+                setting: memory.setting.clone(),
+                alert: Some(
+                    "the channel's engine policy is gone or no longer verifies".to_string(),
+                ),
+            });
+            Resolved {
+                setting: good,
+                from_memory: true,
+                high,
+            }
+        }
+        None => Resolved {
+            setting: None,
+            from_memory: false,
+            high,
+        },
+    }
+}
+
+/// The master's engine policy setting for the project in `channel`, when there is one
+/// and it verifies. Anything else is `None`, which means auto - unless this machine has
+/// seen a newer one before, in which case that last known good setting stays in force
+/// (see the module documentation on rollback and deletion).
+#[must_use]
+pub fn setting(channel: &Path, project_id: &str) -> Option<PolicySetting> {
+    resolve(channel, project_id).setting
+}
+
+/// What is wrong with the channel's engine policy, when this machine is holding on to an
+/// earlier one because the file went back, vanished or stopped verifying.
+#[must_use]
+pub fn rollback_notice(channel: &Path, project_id: &str) -> Option<String> {
+    resolve(channel, project_id);
+    read_seen(&seen_path(channel, project_id)?)?.alert
+}
+
+/// Ask the master, once per sequence number however many machines notice, what to do
+/// about a policy that went back or vanished. Returns whether it was asked now; `false`
+/// when nothing is wrong or the question already exists. Re-signing the policy (`ferry
+/// engines policy set`, or the dashboard) is the answer: it carries a newer `seq`.
+pub fn ask_rollback(route: &ProjectRoute, identity: &AgentIdentity) -> Result<bool> {
+    let Some(notice) = rollback_notice(&route.communications, &route.project_id) else {
+        return Ok(false);
+    };
+    let high = resolve(&route.communications, &route.project_id).high;
+    crate::questions::ask(
+        route,
+        identity,
+        &format!("engine-policy-rollback-{high}"),
+        crate::questions::POLICY,
+        &format!(
+            "{}'s engine policy looks wrong: {notice}. This machine keeps using the last \
+             policy you signed. If you did not do this, find who can write the channel; to \
+             settle it, sign the engine policy again (dashboard Teammates page, or `ferry \
+             engines policy set`).",
+            route.project_id
+        ),
+        &["Understood".to_string()],
+        None,
+    )
 }
 
 /// The policy in force for a project: the master's, or auto's defaults when they set
@@ -2255,9 +2473,37 @@ pub fn set_policy_as(
             }
         }
     }
-    if setting(channel, project_id).is_some_and(|existing| existing.policy == policy) {
+    let resolved = resolve(channel, project_id);
+    if on_behalf_of.is_some() {
+        let in_force = resolved
+            .setting
+            .as_ref()
+            .and_then(|setting| setting.policy.clone())
+            .unwrap_or_default();
+        let next = policy.clone().unwrap_or_default();
+        if let Some(why) = adversary_change(&in_force, &next) {
+            bail!(
+                "{} signs for {} as a delegate, and {why}: that needs {}'s own signature",
+                signer.name(),
+                on_behalf_of.unwrap_or_default(),
+                on_behalf_of.unwrap_or_default()
+            );
+        }
+    }
+    // Unchanged - unless the channel's file is not the setting in force (it went back, or
+    // is gone), in which case signing the same policy again is what repairs it.
+    if !resolved.from_memory
+        && resolved
+            .setting
+            .as_ref()
+            .is_some_and(|existing| existing.policy == policy)
+    {
         return Ok(false);
     }
+    let seq = resolved
+        .high
+        .max(resolved.setting.as_ref().map_or(0, |setting| setting.seq))
+        + 1;
     let mut setting = PolicySetting {
         project_id: project_id.to_owned(),
         policy,
@@ -2265,6 +2511,7 @@ pub fn set_policy_as(
         signed_by: signer.name().to_owned(),
         signature: String::new(),
         on_behalf_of: on_behalf_of.map(str::to_owned),
+        seq,
     };
     setting.signature = signer.sign_bytes(setting_payload(&setting).as_bytes());
     let path = channel.join(ENGINE_POLICY);
@@ -2476,6 +2723,60 @@ pub fn over_cap(route: &ProjectRoute, policy: &Policy, week: &str, role: Role) -
 
 // --- asking the master --------------------------------------------------------------------
 
+/// Why a delegate may not turn `in_force` into `next`, when the difference is the adversary
+/// being switched off or changed: its mode, or its role removed. Only the master does that.
+fn adversary_change(in_force: &Policy, next: &Policy) -> Option<String> {
+    if in_force.adversary != next.adversary {
+        return Some(format!(
+            "this changes the adversary mode from {} to {}",
+            in_force.adversary.as_str(),
+            next.adversary.as_str()
+        ));
+    }
+    let role = Role::Adversary.as_str();
+    let had = in_force
+        .prefer
+        .get(role)
+        .is_some_and(|list| !list.is_empty());
+    let has = next.prefer.get(role).is_some_and(|list| !list.is_empty());
+    (had && !has).then(|| "this removes the adversary role".to_string())
+}
+
+/// The team preset laid over the policy in force: the preset's `prefer`, `effort`,
+/// `width` and `subscription_roles` replace what `current` has for those roles, and
+/// everything else the master chose stays - `never` and its scope, caps, subscription
+/// protection, auto-merge, the adversary's mode, and `machines` (the preset's online
+/// machines are used only when `current` limits none).
+///
+/// `subscription_roles` is the preset's as the caller built it: pass `current`'s roles into
+/// [`TeamOptions`] unless the person asked for others.
+#[must_use]
+pub fn apply_team(current: &Policy, preset: &Policy) -> Policy {
+    let mut next = current.clone();
+    next.prefer.extend(preset.prefer.clone());
+    next.effort.extend(preset.effort.clone());
+    next.width.extend(preset.width.clone());
+    next.subscription_roles
+        .clone_from(&preset.subscription_roles);
+    if next.machines.is_empty() {
+        next.machines.clone_from(&preset.machines);
+    }
+    next
+}
+
+/// The recommendation laid over the policy in force: its engine preferences replace those
+/// roles' in `current`, and everything else the master chose stays (as for
+/// [`apply_team`]).
+#[must_use]
+pub fn apply_recommendation(current: &Policy, recommended: &Policy) -> Policy {
+    let mut next = current.clone();
+    next.prefer.extend(recommended.prefer.clone());
+    if next.machines.is_empty() {
+        next.machines.clone_from(&recommended.machines);
+    }
+    next
+}
+
 /// Ask the master what to do about held background work: once per role per week,
 /// however many machines and hours it stays held. Returns whether it was asked now.
 pub fn ask_hold(
@@ -2540,7 +2841,7 @@ pub fn ask_free_tier(
 #[must_use]
 pub fn answer_changes(answer: &str, policy: &Policy, recommended: &Policy) -> Option<Policy> {
     if answer.eq_ignore_ascii_case(ACCEPT_RECOMMENDED) {
-        return Some(recommended.clone());
+        return Some(apply_recommendation(policy, recommended));
     }
     let engine = answer.strip_prefix("Block ")?.trim();
     let mut changed = policy.clone();
@@ -2991,8 +3292,9 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         edited.policy.as_mut().unwrap().never.clear();
         crate::atomic_json(&path, &edited).unwrap();
-        assert!(setting(channel, "demo").is_none());
-        assert_eq!(effective(channel, "demo").0, Policy::default());
+        // The edited file does not count, and this machine keeps what the master last
+        // signed rather than dropping to auto.
+        assert_eq!(effective(channel, "demo").0, mine);
 
         // Validly signed, but by a member who is not the master.
         let mut forged = PolicySetting {
@@ -3005,10 +3307,11 @@ mod tests {
             signed_by: "grouchly".into(),
             signature: String::new(),
             on_behalf_of: None,
+            seq: 99,
         };
         forged.signature = grouchly.sign_bytes(setting_payload(&forged).as_bytes());
         crate::atomic_json(&path, &forged).unwrap();
-        assert!(setting(channel, "demo").is_none());
+        assert_eq!(effective(channel, "demo").0, mine);
         // Unsigned.
         forged.signature.clear();
         crate::atomic_json(&path, &forged).unwrap();
@@ -3019,10 +3322,10 @@ mod tests {
         lifted.signed_by = "josh".into();
         lifted.signature = josh.sign_bytes(setting_payload(&lifted).as_bytes());
         crate::atomic_json(&path, &lifted).unwrap();
-        assert!(setting(channel, "demo").is_none());
+        assert_eq!(effective(channel, "demo").0, mine);
         // Garbage.
         std::fs::write(&path, "prefer nemotron").unwrap();
-        assert!(setting(channel, "demo").is_none());
+        assert_eq!(effective(channel, "demo").0, mine);
 
         // The master goes back to auto, signed.
         assert!(set_policy(channel, "demo", Some(mine), &josh).unwrap());
@@ -3083,7 +3386,11 @@ mod tests {
         };
         assert_eq!(
             answer_changes(ACCEPT_RECOMMENDED, &policy, &recommended),
-            Some(recommended.clone())
+            Some(Policy {
+                machines: vec!["grouchly".into()],
+                ..policy.clone()
+            }),
+            "accepting lays the recommendation over the policy; it does not replace it"
         );
         let blocked = answer_changes("Block claude", &policy, &recommended).unwrap();
         assert_eq!(blocked.never, ["name:claude"]);
@@ -3140,6 +3447,7 @@ mod tests {
             signed_by: "josh".into(),
             signature: String::new(),
             on_behalf_of: None,
+            seq: 0,
         };
         signed.signature = josh.sign_bytes(setting_payload(&signed).as_bytes());
         crate::atomic_json(&channel.join(ENGINE_POLICY), &signed).unwrap();
@@ -3900,5 +4208,225 @@ mod tests {
         // No subscription at all: the opt-in does nothing, and says so.
         let none = subscription_warnings(&policy, &fleet_for_team());
         assert_eq!(none.len(), 1, "{none:?}");
+    }
+
+    // --- the preset keeps the master's security settings -----------------------------------
+
+    fn hardened() -> Policy {
+        let mut policy = Policy {
+            never: vec!["name:claude".into()],
+            never_applies_to: NeverScope::All,
+            machines: vec!["grouchly".into()],
+            caps_usd: BTreeMap::from([("build".to_string(), 5.0)]),
+            protect_subscriptions: false,
+            auto_merge: AutoMerge::LowRisk,
+            adversary: AdversaryMode::Blocking,
+            subscription_roles: vec![Role::Chore],
+            ..Policy::default()
+        };
+        policy.set_adversary_engine("name:deepseek");
+        policy
+    }
+
+    #[test]
+    fn accepting_the_team_preset_keeps_what_the_master_set_for_security() {
+        let current = hardened();
+        let options = TeamOptions {
+            subscription_roles: current.subscription_roles.clone(),
+            ..TeamOptions::default()
+        };
+        let preset = team(&fleet_for_team(), &["wisp".into(), "fang".into()], &options).policy;
+        assert_ne!(
+            preset.machines, current.machines,
+            "the preset names its own"
+        );
+        let merged = apply_team(&current, &preset);
+        merged.check().unwrap();
+        // What the preset is for.
+        assert_eq!(list(&merged, Role::Plan), list(&preset, Role::Plan));
+        assert_eq!(list(&merged, Role::Build), list(&preset, Role::Build));
+        assert_eq!(merged.effort, preset.effort);
+        assert_eq!(merged.width, preset.width);
+        // What it must not touch.
+        assert_eq!(merged.never, current.never);
+        assert_eq!(merged.never_applies_to, NeverScope::All);
+        assert_eq!(merged.auto_merge, AutoMerge::LowRisk);
+        assert_eq!(merged.caps_usd, current.caps_usd);
+        assert!(!merged.protect_subscriptions);
+        assert_eq!(merged.adversary, AdversaryMode::Blocking);
+        assert_eq!(merged.machines, ["grouchly"], "an existing where stays");
+        assert_eq!(merged.subscription_roles, [Role::Chore]);
+        assert_eq!(
+            merged.adversary_engine(),
+            preset.adversary_engine().or(current.adversary_engine())
+        );
+
+        // With no where of its own the preset's online machines are used.
+        let open = Policy {
+            machines: Vec::new(),
+            ..current.clone()
+        };
+        assert_eq!(apply_team(&open, &preset).machines, preset.machines);
+        // Subscription roles are the preset's only when the caller passed some.
+        let asked = TeamOptions {
+            subscription_roles: vec![Role::Build],
+            ..TeamOptions::default()
+        };
+        let preset = team(&fleet_for_team(), &[], &asked).policy;
+        assert_eq!(
+            apply_team(&current, &preset).subscription_roles,
+            [Role::Build]
+        );
+    }
+
+    #[test]
+    fn accepting_the_recommendation_keeps_what_the_master_set_for_security() {
+        let current = hardened();
+        let recommended = recommend(&fleet_for_team(), &["wisp".into()]).policy;
+        let merged = answer_changes(ACCEPT_RECOMMENDED, &current, &recommended).unwrap();
+        assert_eq!(list(&merged, Role::Build), list(&recommended, Role::Build));
+        assert_eq!(merged.never, current.never);
+        assert_eq!(merged.caps_usd, current.caps_usd);
+        assert_eq!(merged.auto_merge, AutoMerge::LowRisk);
+        assert_eq!(merged.adversary, AdversaryMode::Blocking);
+        assert_eq!(merged.machines, ["grouchly"]);
+        assert!(!merged.protect_subscriptions);
+    }
+
+    // --- rollback and deletion --------------------------------------------------------------
+
+    #[test]
+    fn an_older_signed_policy_put_back_or_a_deleted_one_does_not_roll_the_machine_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+        let path = channel.join(ENGINE_POLICY);
+
+        let strict = hardened();
+        let lax = Policy::default();
+        assert!(set_policy(channel, "demo", Some(lax.clone()), &josh).unwrap());
+        let old = std::fs::read(&path).unwrap();
+        assert_eq!(setting(channel, "demo").unwrap().seq, 1);
+        assert!(set_policy(channel, "demo", Some(strict.clone()), &josh).unwrap());
+        assert_eq!(setting(channel, "demo").unwrap().seq, 2);
+        assert!(rollback_notice(channel, "demo").is_none());
+        assert!(!ask_rollback(&route, &josh).unwrap(), "nothing to ask yet");
+
+        // The older, genuinely signed file is put back: still the strict policy, and one
+        // question - however often anyone looks.
+        std::fs::write(&path, &old).unwrap();
+        assert_eq!(effective(channel, "demo").0, strict);
+        assert!(rollback_notice(channel, "demo").unwrap().contains("older"));
+        assert!(ask_rollback(&route, &josh).unwrap());
+        assert!(!ask_rollback(&route, &josh).unwrap());
+        assert_eq!(
+            crate::questions::list(&route)
+                .iter()
+                .filter(|(q, _)| q.id.starts_with("engine-policy-rollback-"))
+                .count(),
+            1
+        );
+
+        // Deleted: same.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(effective(channel, "demo").0, strict);
+        assert!(rollback_notice(channel, "demo").is_some());
+
+        // Signing the same policy again repairs the file, with a newer sequence.
+        assert!(set_policy(channel, "demo", Some(strict.clone()), &josh).unwrap());
+        assert_eq!(setting(channel, "demo").unwrap().seq, 3);
+        assert!(rollback_notice(channel, "demo").is_none());
+        assert_eq!(effective(channel, "demo").0, strict);
+        // And going to a laxer policy on purpose still works: that is a newer signing.
+        assert!(set_policy(channel, "demo", Some(lax.clone()), &josh).unwrap());
+        assert_eq!(effective(channel, "demo").0, lax);
+    }
+
+    #[test]
+    fn a_policy_signed_before_seq_existed_is_read_and_the_next_signing_numbers_past_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+        let mut old = PolicySetting {
+            project_id: "demo".into(),
+            policy: Some(hardened()),
+            set_at: Utc::now(),
+            signed_by: "josh".into(),
+            signature: String::new(),
+            on_behalf_of: None,
+            seq: 0,
+        };
+        old.signature = josh.sign_bytes(setting_payload(&old).as_bytes());
+        let wire = serde_json::to_value(&old).unwrap();
+        assert!(
+            wire.get("seq").is_none(),
+            "seq 0 stays off the wire: {wire}"
+        );
+        crate::atomic_json(&channel.join(ENGINE_POLICY), &old).unwrap();
+        assert_eq!(effective(channel, "demo").0, hardened());
+        assert!(set_policy(channel, "demo", Some(Policy::default()), &josh).unwrap());
+        assert_eq!(setting(channel, "demo").unwrap().seq, 1);
+    }
+
+    // --- what a delegate cannot change --------------------------------------------------------
+
+    #[test]
+    fn a_delegate_cannot_change_the_adversary_mode_or_remove_its_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let bridge = person("telegram-grouchly", 3);
+        let route = route(dir.path(), &[&josh, &bridge]);
+        let channel = &route.communications;
+        crate::delegation::grant(
+            channel,
+            "demo",
+            &josh,
+            "telegram-grouchly",
+            &["improve".to_string()],
+            None,
+        )
+        .unwrap();
+        let strict = hardened();
+        assert!(set_policy(channel, "demo", Some(strict.clone()), &josh).unwrap());
+        let as_delegate =
+            |policy: Policy| set_policy_as(channel, "demo", Some(policy), &bridge, Some("josh"));
+
+        let off = Policy {
+            adversary: AdversaryMode::Off,
+            ..strict.clone()
+        };
+        let error = as_delegate(off).unwrap_err().to_string();
+        assert!(
+            error.contains("adversary mode") && error.contains("josh's own signature"),
+            "{error}"
+        );
+        let mut no_role = strict.clone();
+        no_role.prefer.remove("adversary");
+        let error = as_delegate(no_role).unwrap_err().to_string();
+        assert!(error.contains("removes the adversary role"), "{error}");
+        assert!(
+            as_delegate_auto(channel, &bridge).is_err(),
+            "auto drops it too"
+        );
+        assert_eq!(effective(channel, "demo").0, strict, "nothing changed");
+
+        // Anything else is still the delegate's to change.
+        let mut other = strict.clone();
+        other.never.push("name:grok".into());
+        assert!(as_delegate(other.clone()).unwrap());
+        assert_eq!(effective(channel, "demo").0, other);
+        // The master changes the mode in their own name.
+        let off = Policy {
+            adversary: AdversaryMode::Off,
+            ..other
+        };
+        assert!(set_policy(channel, "demo", Some(off.clone()), &josh).unwrap());
+        assert_eq!(effective(channel, "demo").0, off);
+    }
+
+    fn as_delegate_auto(channel: &Path, bridge: &AgentIdentity) -> Result<bool> {
+        set_policy_as(channel, "demo", None, bridge, Some("josh"))
     }
 }

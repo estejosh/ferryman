@@ -871,10 +871,14 @@ impl Bridge {
             .ok_or_else(|| format!("{project} is not here"))?;
         let (current, _) = policy::effective(&route.communications, &route.project_id);
         let options = policy::TeamOptions {
-            subscription_roles: current.subscription_roles,
+            subscription_roles: current.subscription_roles.clone(),
             ..policy::TeamOptions::default()
         };
-        let proposal = policy::team_for(route, now, &options);
+        let mut proposal = policy::team_for(route, now, &options);
+        // What accepting signs is the preset laid over the policy in force: the master's
+        // `never`, caps, auto-merge, adversary mode and `where` are theirs to change, not
+        // the preset's.
+        proposal.policy = policy::apply_team(&current, &proposal.policy);
         let warnings = policy::subscription_warnings(&proposal.policy, &policy::fleet(route, now));
         Ok((proposal, warnings))
     }
@@ -1214,7 +1218,9 @@ impl Bridge {
             "pacc" | "pblk" | "ptop" => {
                 let engine = id.clone();
                 let outcome = match verb.as_str() {
-                    "pacc" => self.change_policy(&project, |_, recommended| Some(recommended)),
+                    "pacc" => self.change_policy(&project, |current, recommended| {
+                        Some(policy::apply_recommendation(&current, &recommended))
+                    }),
                     "pblk" => self.change_policy(&project, |mut current, _| {
                         current.block(&engine).then_some(current)
                     }),
@@ -3182,6 +3188,55 @@ mod tests {
         assert_eq!(set.width_for(policy::Role::Chore), Some(4));
         assert_eq!(set.effort_for(policy::Role::Plan), policy::Effort::High);
         assert!(set.subscription_roles.is_empty(), "subscriptions stay out");
+    }
+
+    /// The preset is for engines, effort and width. Accepting it from the phone must not
+    /// quietly drop what the master chose for security: `never`, caps, auto-merge and the
+    /// adversary's mode.
+    #[test]
+    fn accepting_the_team_preset_from_the_phone_keeps_the_masters_security_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        three_engines(&ferryman);
+        let mine = policy::Policy {
+            never: vec!["name:claude".into()],
+            caps_usd: std::collections::BTreeMap::from([("build".to_string(), 5.0)]),
+            auto_merge: policy::AutoMerge::LowRisk,
+            adversary: policy::AdversaryMode::Blocking,
+            protect_subscriptions: true,
+            ..policy::Policy::default()
+        };
+        policy::set_policy(
+            &ferryman.communications,
+            "ferryman",
+            Some(mine.clone()),
+            &josh(),
+        )
+        .unwrap();
+        delegate(&ferryman, &["improve"]);
+        let view = bridge.handle(press(JOSH_TG, GROUP, 100, "engines"), Utc::now());
+        let proposal = press_labelled(&mut bridge, &view, "Use team preset", 100);
+        let shown = texts(&proposal).join("\n");
+        assert!(
+            shown.contains("never: name:claude"),
+            "the card shows what is signed: {shown}"
+        );
+        let accepted = press_labelled(&mut bridge, &proposal, "Accept team preset", 100);
+        assert!(
+            matches!(&accepted[0], Action::Answer { text, .. } if text.starts_with("Team preset signed")),
+            "{accepted:?}"
+        );
+        let (set, setting) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(setting.unwrap().set_by(), "josh via telegram-grouchly");
+        assert_eq!(
+            set.width_for(policy::Role::Build),
+            Some(3),
+            "the preset applied"
+        );
+        assert_eq!(set.never, mine.never);
+        assert_eq!(set.caps_usd, mine.caps_usd);
+        assert_eq!(set.auto_merge, policy::AutoMerge::LowRisk);
+        assert_eq!(set.adversary, policy::AdversaryMode::Blocking);
     }
 
     /// Held work's question arrives with buttons; "Accept recommended" answers it and

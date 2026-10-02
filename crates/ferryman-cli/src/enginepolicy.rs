@@ -302,8 +302,44 @@ fn options_flags(options: &TeamOptions) -> String {
     flags
 }
 
+/// The options for one project: the roles opened to a capped subscription are the ones the
+/// policy in force has, unless the person named some (`--allow-subscriptions-for`).
+fn keeping_roles(
+    options: &TeamOptions,
+    explicit: bool,
+    channel: &Path,
+    project: &str,
+) -> TeamOptions {
+    let mut options = options.clone();
+    if !explicit {
+        options.subscription_roles = policy::effective(channel, project).0.subscription_roles;
+    }
+    options
+}
+
+/// The team preset for one project as it would be signed: laid over the policy in force,
+/// so the master's `never`, caps, auto-merge, adversary mode and `where` stay.
+fn team_signed(
+    channel: &Path,
+    project: &str,
+    options: &TeamOptions,
+    explicit: bool,
+) -> policy::Recommendation {
+    let options = keeping_roles(options, explicit, channel, project);
+    let mut proposal = team_proposal(channel, &options);
+    let in_force = policy::effective(channel, project).0;
+    proposal.policy = policy::apply_team(&in_force, &proposal.policy);
+    proposal
+}
+
 /// `ferry engines policy team`: show the proposal for each project; with `accept`, sign it.
-fn team(which: &ImproveProject, options: &TeamOptions, accept: bool, as_json: bool) -> Result<()> {
+fn team(
+    which: &ImproveProject,
+    options: &TeamOptions,
+    explicit: bool,
+    accept: bool,
+    as_json: bool,
+) -> Result<()> {
     if accept && as_json {
         bail!(
             "--accept and --json do not combine: read the proposal, then accept it without --json"
@@ -311,7 +347,7 @@ fn team(which: &ImproveProject, options: &TeamOptions, accept: bool, as_json: bo
     }
     let mut out: Vec<Value> = Vec::new();
     for (project, channel, _) in projects(which)? {
-        let proposal = team_proposal(&channel, options);
+        let proposal = team_signed(&channel, &project, options, explicit);
         let warnings = policy::subscription_warnings(&proposal.policy, &fleet(&channel));
         if as_json {
             out.push(json!({
@@ -348,9 +384,15 @@ fn team(which: &ImproveProject, options: &TeamOptions, accept: bool, as_json: bo
     }
     if accept {
         let options = options.clone();
-        sign_each(which, "set to the team preset", move |_, channel, _| {
-            Ok(Some(team_proposal(channel, &options).policy))
-        })?;
+        sign_each(
+            which,
+            "set to the team preset",
+            move |project, channel, _| {
+                Ok(Some(
+                    team_signed(channel, project, &options, explicit).policy,
+                ))
+            },
+        )?;
     }
     Ok(())
 }
@@ -365,9 +407,16 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             }
             Ok(())
         }
-        PolicyCommand::Accept { which } => sign_each(&which, "accepted", |_, channel, _| {
-            Ok(Some(recommendation(channel).policy))
-        }),
+        PolicyCommand::Accept { which } => {
+            sign_each(&which, "accepted", |_, channel, current| {
+                // Laid over the policy in force: accepting engine preferences keeps the
+                // master's `never`, caps, auto-merge and adversary mode.
+                Ok(Some(policy::apply_recommendation(
+                    &current,
+                    &recommendation(channel).policy,
+                )))
+            })
+        }
         PolicyCommand::Team {
             which,
             allow_subscriptions_for,
@@ -377,7 +426,13 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             json,
         } => {
             let options = team_options(&allow_subscriptions_for, &width, &effort)?;
-            team(&which, &options, accept, json)
+            team(
+                &which,
+                &options,
+                !allow_subscriptions_for.is_empty(),
+                accept,
+                json,
+            )
         }
         PolicyCommand::Set {
             which,

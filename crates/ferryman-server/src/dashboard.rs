@@ -2153,7 +2153,18 @@ async fn engine_policy_accept(
         &current,
         params.project.as_deref(),
         body.all,
-        |route| Some(ferryman_channel::policy::recommend_for(route, chrono::Utc::now()).policy),
+        |route| {
+            // Laid over the policy in force: accepting engine preferences must not drop the
+            // master's `never`, caps, auto-merge or adversary mode.
+            let (in_force, _) =
+                ferryman_channel::policy::effective(&route.communications, &route.project_id);
+            let recommended =
+                ferryman_channel::policy::recommend_for(route, chrono::Utc::now()).policy;
+            Some(ferryman_channel::policy::apply_recommendation(
+                &in_force,
+                &recommended,
+            ))
+        },
     )
 }
 
@@ -2267,18 +2278,21 @@ async fn engine_policy_choose(
 /// reason per choice, and the warnings for any subscription it opens.
 fn team_json_for(
     route: &ferryman_channel::ProjectRoute,
+    current: &ferryman_channel::policy::Policy,
     options: &ferryman_channel::policy::TeamOptions,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     use ferryman_channel::policy;
     let proposal = policy::team_for(route, now, options);
+    // What accepting signs: the preset laid over the policy in force.
+    let signed = policy::apply_team(current, &proposal.policy);
     let fleet = policy::fleet(route, now);
     json!({
-        "policy": proposal.policy,
-        "describe": proposal.policy.describe(),
+        "policy": signed,
+        "describe": signed.describe(),
         "reasons": proposal.reasons,
-        "warnings": policy::subscription_warnings(&proposal.policy, &fleet),
-        "effective": policy::view(&proposal.policy, &fleet),
+        "warnings": policy::subscription_warnings(&signed, &fleet),
+        "effective": policy::view(&signed, &fleet),
     })
 }
 
@@ -2293,7 +2307,7 @@ fn team_json(
         subscription_roles: current.subscription_roles.clone(),
         ..Default::default()
     };
-    team_json_for(route, &options, now)
+    team_json_for(route, current, &options, now)
 }
 
 #[derive(Deserialize, Default)]
@@ -2367,7 +2381,12 @@ async fn engine_policy_team_get(
         let effort = policy::Effort::parse(&value).map_err(|error| bad(format!("{error:#}")))?;
         options.effort.insert(role, effort);
     }
-    Ok(Json(team_json_for(&route, &options, chrono::Utc::now())))
+    Ok(Json(team_json_for(
+        &route,
+        &current,
+        &options,
+        chrono::Utc::now(),
+    )))
 }
 
 #[derive(Deserialize, Default)]
@@ -2414,11 +2433,14 @@ async fn engine_policy_team_accept(
                 subscription_roles: body
                     .subscription_roles
                     .clone()
-                    .unwrap_or(in_force.subscription_roles),
+                    .unwrap_or_else(|| in_force.subscription_roles.clone()),
                 width: body.width.clone(),
                 effort: body.effort.clone(),
             };
-            Some(ferryman_channel::policy::team_for(route, chrono::Utc::now(), &options).policy)
+            let preset =
+                ferryman_channel::policy::team_for(route, chrono::Utc::now(), &options).policy;
+            // Laid over the policy in force, so the master's security settings stay.
+            Some(ferryman_channel::policy::apply_team(&in_force, &preset))
         },
     )
 }

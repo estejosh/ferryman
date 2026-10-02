@@ -2093,6 +2093,16 @@ pub async fn run(
             continue;
         }
         let project = &route.project_id;
+        // An engine policy that went back or vanished from the channel: this machine keeps
+        // the last one the master signed, and the master is asked once.
+        if let Ok(identity) = signing_identity(route, config)
+            && let Ok(true) = ferryman_channel::policy::ask_rollback(route, &identity)
+        {
+            report.warn(&format!(
+                "{project}: the engine policy in the channel went back or vanished; \
+                 keeping the last one signed, and asked the master"
+            ));
+        }
         let dir = week_dir(route, &week);
         if !dir.join("evidence.md").is_file() {
             match gather(route, now) {
