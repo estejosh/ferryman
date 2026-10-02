@@ -351,6 +351,67 @@ and Telegram says so. Whatever goes wrong, the improvement falls back to you,
 "approved, ready to merge", with the reason. fm cannot see CI, so it does not wait on
 it: the checks the worker ran are in the evidence the review engine judged.
 
+## The adversary: a second model that argues with the builders
+
+Builders (cheap or medium models) build. The **adversary** is a separate model that
+challenges their work, and only at three moments, so it costs a few calls, not a second
+copy of every step:
+
+1. **Before an interface contract locks.** Once the provider has produced a result (or at
+   once, when there is none yet) it reads the shapes, the provider's result and the
+   consumer's order, after a deterministic check that the result fits the shape. Its
+   verdict is shown next to Lock and Reject - in `ferry contract show`, the dashboard's
+   Contracts page and the Telegram contract card.
+2. **When the same order fails twice.** Before the third attempt a deterministic scan of
+   the order branch's diff looks for test tampering (tests deleted or disabled, assertions
+   removed or made trivial, forced passes like `|| true`, loosened tolerances, tests moved
+   out of the checked paths, edits to the check itself); then the adversary gets both
+   failures' check output, the diff and the scan, and asks whether the builder is fixing
+   the bug or hiding the symptom. A Block - or any High
+   tamper hit, even in `advisory` mode - sends the task back as ChangesRequested with the
+   finding text, which the next attempt's prompt carries. The master is asked once.
+3. **Before an improvement is called done.** It runs before the review engine's key is
+   produced. The finding is shown beside the two keys: `ferry improve pending`, the
+   dashboard's review card, the Telegram review card.
+
+It answers with a verdict - `pass`, `concern` or `block` - and findings, each with a
+severity. Output that cannot be parsed is a `concern` carrying the raw tail, never a
+silent pass. Each finding is a signed file in `<channel>/adversary/` (one per subject,
+revision and moment, so asking again changes nothing), and the engine, model, machine and
+cost go into the ledger like any improvement step.
+
+**Modes**, set with `--adversary`:
+
+- `advisory` (the default): findings are shown; nothing waits on them. (The one exception
+  is a High tamper hit at moment 2, which always sends the task back.)
+- `blocking`: a Block binds. A contract cannot be locked, the review engine's key cannot
+  be granted for that revision, and auto-merge never happens for it - until the master
+  signs an **override** (with a reason). Contracts need the `improve` delegation to
+  override from the phone; the other two need `review`.
+- `off`: it is never asked, and nothing about it is shown.
+
+**Who challenges.** The adversary is a role in the engine policy and follows the same
+rules as background work: blocked engines and machines are skipped and paid engines need
+a cap. It is never the engine that built the work unless that is the only one allowed -
+then it runs and the finding says `same engine`. Among the rest, a different model family
+(deepseek, qwen, llama, gemma, claude, gpt...) is preferred over the builder's own.
+`recommend()` picks one for you with a one-line reason.
+
+```sh
+# adversary = deepseek, blocking
+ferry engines policy set --role adversary --prefer deepseek --adversary blocking
+
+ferry adversary list                      # every finding, newest first
+ferry adversary show improve-2026-w40-1   # one order (or: user-api@1)
+ferry adversary override user-api@1 --reason "the consumer ships a fix first"
+ferry contract lock user-api@1 --override "the consumer ships a fix first"
+```
+
+`ferry adversary check` asks about everything waiting now; the improve loop does it on
+its own schedule. On the dashboard the policy panel has the adversary engine and mode,
+and a Block carries an Override button for the master; on the phone it is an "Override
+the Block" button, shown only for a Block.
+
 ## OmniRoute: a free gateway as an engine
 
 [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (MIT) is a self-hosted AI

@@ -27,6 +27,23 @@
   `--allow-overlap`, recording why and moving on. After the commit the result records
   `touched_files`, with a reviewer note (not a refutation) for any outside the declared
   globs.
+- **Adversary gates.** A separate model challenges the builders' work at three moments:
+  before an interface contract locks, when the same order fails twice, and before an
+  improvement is called done. New engine-policy role `adversary` (old signed policies
+  still verify) and mode `--adversary off|advisory|blocking` (default `advisory`).
+  It is never the builder's own engine unless that is the only one allowed (then the
+  finding says `same engine`), prefers a different model family, and `recommend()` picks
+  one with a reason. Findings are signed files in `<channel>/adversary/`, one per subject,
+  revision and moment, and the cost goes in the ledger; unparseable output is a `concern`,
+  never a silent pass. A deterministic test-tampering scan of the order branch's diff runs
+  before the adversary at the second failure, and a Block or any High hit sends the task
+  back with the finding in the next attempt's prompt (the master is asked once). In
+  `blocking` mode a Block stops Lock, the review engine's key and auto-merge until the
+  master signs an override. `ferry adversary show | list | override | check`; findings in
+  `ferry improve status/report`, the review and contract output, the dashboard (policy,
+  review cards, Contracts, `GET /api/adversary`, `POST /api/adversary/override`) and
+  Telegram cards (an Override button only for a Block, under the `improve` / `review`
+  delegation scopes). See docs/ENGINE_SETUP.md.
 
 ## v0.5.17 - 2026-09-29
 
