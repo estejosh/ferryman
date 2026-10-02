@@ -1248,12 +1248,14 @@ pub fn scan_order(
 }
 
 /// Whether nothing is left for `me` to ask at (subject, revision, trigger): this agent has
-/// already run, or an eligible adversary's finding already stands there. Each eligible
-/// adversary may run its own pass ([`data::done`] is per signer), but a moment that has a
-/// finding that counts is not paid for again by every worker in the fleet.
+/// already recorded a finding for it - and only that. Every eligible adversary runs its own
+/// pass ([`data::done`] is per signer), so one adversary's Pass does not stand in for
+/// another's look: an eligible Block from any of them dominates, and an adversary that
+/// would have blocked is not silenced by whoever got there first. (An agent that would not
+/// be heard - it built the work, or the master's adversary policy does not allow it - is
+/// stopped earlier, by [`data::eligibility`], before anything is paid for.)
 fn settled(route: &ProjectRoute, subject: &str, revision: u32, trigger: Trigger, me: &str) -> bool {
     data::done(route, subject, revision, trigger, me)
-        || data::standing(route, subject, revision, trigger).is_some()
 }
 
 // --- moment 1: before a contract locks --------------------------------------------------------
@@ -1528,8 +1530,8 @@ pub async fn before_attempt(
     };
     let id = task.order.id.clone();
     let revision = repeat.latest;
-    // One paid look per failed attempt: when this agent has run, or an eligible adversary's
-    // finding already stands, nothing is asked again.
+    // One paid look per failed attempt per adversary: when this agent has already run,
+    // nothing is asked again. Every other eligible adversary still runs its own.
     let me = signing_identity(route, config).ok();
     let asked = me.as_ref().is_some_and(|identity| {
         settled(
@@ -3107,6 +3109,96 @@ mod tests {
             "the adversary challenged it before `where` stopped the judge"
         );
         assert!(data::read(&route, "t-n2-1", 1, Trigger::PreDone, "wisp").is_some());
+    }
+
+    #[test]
+    fn every_eligible_adversary_runs_and_an_eligible_block_dominates() {
+        use ferryman_channel::AgentIdentity;
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine("qwen", "qwen-max", &says("block", HIGH))],
+        );
+        // A second adversary, which has already passed this work.
+        let scout = AgentIdentity::from_seed("scout", [11; 32]);
+        let mut route = route;
+        let agent = ferryman_channel::AgentRoute {
+            name: "scout".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(scout.public_key_hex()),
+            encryption_key: None,
+        };
+        ferryman_channel::register_agent(&route, &agent).unwrap();
+        route.agents.push(agent);
+        let report = |name: &str| ferryman_channel::receipts::EngineReport {
+            name: name.into(),
+            kind: "http".into(),
+            model: None,
+            tier: "judge".into(),
+            paid: "prepaid".into(),
+            state: "up".into(),
+            until: None,
+            reason: None,
+            latency_ms: None,
+            balance: None,
+            checked_at: None,
+            trust: None,
+            billing: None,
+            class: None,
+        };
+        ferryman_channel::receipts::refresh_engines(
+            &route,
+            &scout,
+            "scout-machine",
+            "0.0.0",
+            vec![report("qwen")],
+            Utc::now(),
+        )
+        .unwrap();
+        awaiting(&route, "t-n3-1", "deepseek");
+        let mut passed = finding("t-n3-1", Verdict::Pass);
+        passed.engine = "qwen".into();
+        data::record(&route, &scout, passed).unwrap();
+        assert!(
+            data::standing(&route, "t-n3-1", 1, Trigger::PreDone).is_some(),
+            "scout's Pass counts"
+        );
+
+        // wisp is eligible too, so it runs - one adversary's Pass is not another's look.
+        let policy = policy_of(&route);
+        assert_eq!(
+            futures_lite_block(pass(&route, &config, &policy, Utc::now(), &crate::Silent)),
+            1
+        );
+        assert!(data::read(&route, "t-n3-1", 1, Trigger::PreDone, "wisp").is_some());
+        let standing = data::standing(&route, "t-n3-1", 1, Trigger::PreDone).unwrap();
+        assert_eq!(standing.verdict(), Verdict::Block, "the Block dominates");
+        // Asked once each: running again records nothing new.
+        assert_eq!(
+            futures_lite_block(pass(&route, &config, &policy, Utc::now(), &crate::Silent)),
+            0
+        );
+    }
+
+    fn finding(subject: &str, verdict: Verdict) -> AdversaryFinding {
+        AdversaryFinding {
+            order_id: subject.into(),
+            revision: 1,
+            trigger: Trigger::PreDone,
+            subject: subject.into(),
+            engine: "qwen".into(),
+            model: None,
+            machine: "fixture-machine".into(),
+            same_engine: false,
+            verdict,
+            findings: Vec::new(),
+            created_at: Utc::now(),
+            result_digest: String::new(),
+            signed_by: String::new(),
+            signature: String::new(),
+        }
     }
 
     // --- moment 1: before a contract locks -----------------------------------------------------

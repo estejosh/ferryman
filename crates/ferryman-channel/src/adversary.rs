@@ -33,9 +33,14 @@
 //!   (for a contract, any provider order's result agent);
 //! - its signer published a valid signed engine inventory that lists the engine the
 //!   finding names, so the engine named is one a machine of the fleet really has;
-//! - nothing in the engine policy decides it: its `where`, `never` and caps do not apply to
-//!   the adversary (see [`crate::policy::ADVERSARY_POLICY`]), because a delegate can sign
-//!   the engine policy and must not be able to starve the check on its own work;
+//! - the master's adversary policy ([`crate::policy::ADVERSARY_POLICY`]) allows it: when it
+//!   names `agents`, the signer is one of them; when it names none, the signer's signed
+//!   inventory lists an engine that matches the adversary's preference selectors (any
+//!   engine, when it has none) and that the adversary's own `never` does not name - so with
+//!   no allowlist the trust is "any member running an allowed adversary engine", and an
+//!   allowlist narrows it to the agents the master picked. The engine policy's `where`,
+//!   `never` and caps play no part: a delegate signs those and must not be able to starve
+//!   the check on its own work;
 //! - its revision is a real one: an order's existing result, a contract's existing provider
 //!   result - or 0, "the shapes on their own", while no provider has a result.
 //!
@@ -87,7 +92,7 @@ use crate::{
     AgentIdentity, ProjectRoute, SignatureCheck, Task, TaskResult, check_signature, delegation,
     interface::{self, InterfaceContract},
     is_safe_component,
-    policy::{AdversaryMode, Builder, Policy},
+    policy::{AdversaryMode, Builder, Candidate, Policy},
 };
 
 const DIR: &str = "adversary";
@@ -682,6 +687,8 @@ struct Facts {
     /// and the key that signed it) and the digest of the result itself.
     results: Vec<Built>,
     inventories: Vec<crate::receipts::EngineInventory>,
+    /// The policy in force: only its adversary terms are read here.
+    policy: Policy,
 }
 
 impl Facts {
@@ -693,10 +700,12 @@ impl Facts {
             .filter(|(_, check)| *check == SignatureCheck::Valid)
             .map(|(inventory, _)| inventory)
             .collect();
+        let (policy, _) = crate::policy::effective(&route.communications, &route.project_id);
         Self {
             contract,
             results,
             inventories,
+            policy,
         }
     }
 
@@ -760,19 +769,58 @@ impl Facts {
                 "{signer} has published no valid signed engine inventory"
             ));
         };
+        let candidates: Vec<Candidate> = inventory
+            .engines
+            .iter()
+            .enumerate()
+            .map(|(index, report)| {
+                Candidate::from_report(&inventory.agent, &inventory.machine, index, report)
+            })
+            .collect();
         if let Some(engine) = engine
             && !scan
-            && !inventory
-                .engines
-                .iter()
-                .any(|listed| listed.name.eq_ignore_ascii_case(engine))
         {
-            return Err(format!(
-                "{signer}'s signed engine inventory does not list {engine}"
-            ));
+            let Some(listed) = candidates
+                .iter()
+                .find(|listed| listed.name.eq_ignore_ascii_case(engine))
+            else {
+                return Err(format!(
+                    "{signer}'s signed engine inventory does not list {engine}"
+                ));
+            };
+            if !self.policy.adversary_allows(listed) {
+                return Err(format!(
+                    "{engine} is an engine the master's adversary policy says the adversary \
+                     never uses"
+                ));
+            }
         }
-        // The engine policy's `where` does not apply here: it is the delegate-signable half
-        // of the policy, and the adversary's own allowlist is the master's alone.
+        // Who may be an adversary at all is the master's word (ADVERSARY_POLICY), not just
+        // "a member with an inventory": the agents they named, or - when they named none -
+        // a member running an engine the adversary's preferences and `never` allow. The scan
+        // asks no model and can only block, so it is a floor for anyone.
+        if !scan {
+            let agents = &self.policy.adversary_agents;
+            if agents.is_empty() {
+                if !candidates.iter().any(|engine| {
+                    self.policy.adversary_allows(engine) && self.policy.adversary_prefers(engine)
+                }) {
+                    return Err(format!(
+                        "{signer} runs no engine the master's adversary policy allows (its \
+                         preferences and `never`), and it names no adversary agents"
+                    ));
+                }
+            } else if !agents
+                .iter()
+                .any(|agent| agent.eq_ignore_ascii_case(signer))
+            {
+                return Err(format!(
+                    "{signer} is not one of the agents the master's adversary policy allows as \
+                     an adversary ({})",
+                    agents.join(", ")
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -876,7 +924,8 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<Built>) {
 
 /// Whether `signer`, asked to challenge `subject` at `revision` for `trigger` with `engine`
 /// (when it is known), would be heard: it did not build the work, its signed inventory
-/// lists the engine, and the revision is real.
+/// lists the engine, the master's adversary policy allows it (the agents named there, or an
+/// engine its preferences and `never` allow), and the revision is real.
 /// Asked before any engine is paid for, so no money goes on a finding that would be ignored.
 pub fn eligibility(
     route: &ProjectRoute,
@@ -3720,5 +3769,153 @@ mod tests {
         assert!(standing(&f.route, "t-n5", 1, Trigger::PreDone).is_some());
         let digest = current_digest(&f.route, "t-n5", 1);
         assert_eq!(digest.len(), 64);
+    }
+
+    // --- whose word counts: the master's adversary policy --------------------------------
+
+    fn sign_policy(f: &Fleet, policy: Policy) {
+        crate::policy::set_policy(&f.route.communications, "demo", Some(policy), &f.boss).unwrap();
+    }
+
+    #[test]
+    fn with_an_allowlist_only_the_agents_the_master_named_are_adversaries() {
+        let f = Fleet::new();
+        f.work("t-n3a", 1);
+        let mut named = policy(AdversaryMode::Advisory);
+        named.adversary_agents = vec!["bridge".into()];
+        sign_policy(&f, named);
+        record(
+            &f.route,
+            &f.wisp,
+            finding("t-n3a", 1, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        record(
+            &f.route,
+            &f.bridge,
+            finding("t-n3a", 1, Trigger::PreDone, Verdict::Block),
+        )
+        .unwrap();
+        let seen = survey(&f.route, "t-n3a");
+        assert_eq!(seen.standings.len(), 1, "{:?}", seen.ignored);
+        assert_eq!(seen.standings[0].finding.signed_by, "bridge");
+        assert_eq!(seen.ignored.len(), 1);
+        assert_eq!(seen.ignored[0].finding.signed_by, "wisp");
+        assert!(
+            seen.ignored[0].reason.contains("not one of the agents"),
+            "{}",
+            seen.ignored[0].reason
+        );
+        // Asked before an engine is paid for, too.
+        assert!(eligibility(&f.route, "t-n3a", 1, Trigger::PreDone, "wisp", None).is_err());
+        assert!(
+            eligibility(
+                &f.route,
+                "t-n3a",
+                1,
+                Trigger::PreDone,
+                "bridge",
+                Some("glm")
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn with_no_allowlist_a_signer_needs_an_engine_the_adversary_preferences_allow() {
+        let f = Fleet::new();
+        f.work("t-n3b", 1);
+        // wisp runs deepseek only; bridge runs deepseek and glm.
+        let mut wants_glm = policy(AdversaryMode::Advisory);
+        wants_glm.set_adversary_engine("name:glm");
+        sign_policy(&f, wants_glm);
+        record(
+            &f.route,
+            &f.wisp,
+            finding("t-n3b", 1, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        record(
+            &f.route,
+            &f.bridge,
+            finding("t-n3b", 1, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        let seen = survey(&f.route, "t-n3b");
+        assert_eq!(seen.standings.len(), 1, "{:?}", seen.ignored);
+        assert_eq!(seen.standings[0].finding.signed_by, "bridge");
+        assert!(
+            seen.ignored[0]
+                .reason
+                .contains("runs no engine the master's adversary policy allows"),
+            "{}",
+            seen.ignored[0].reason
+        );
+        assert!(eligibility(&f.route, "t-n3b", 1, Trigger::PreDone, "wisp", None).is_err());
+        assert!(eligibility(&f.route, "t-n3b", 1, Trigger::PreDone, "bridge", None).is_ok());
+        // With no preference at all, any member running any allowed engine is an adversary.
+        sign_policy(&f, policy(AdversaryMode::Advisory));
+        assert!(eligibility(&f.route, "t-n3b", 1, Trigger::PreDone, "wisp", None).is_ok());
+    }
+
+    #[test]
+    fn an_engine_the_adversary_never_uses_does_not_make_a_finding_count() {
+        let f = Fleet::new();
+        f.work("t-n3c", 1);
+        f.work("t-n3d", 1);
+        let mut never = policy(AdversaryMode::Advisory);
+        never.adversary_never = vec!["name:deepseek".into()];
+        sign_policy(&f, never);
+        // wisp has only deepseek: nothing it runs is allowed.
+        record(
+            &f.route,
+            &f.wisp,
+            finding("t-n3c", 1, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        assert!(survey(&f.route, "t-n3c").standings.is_empty());
+        // bridge has glm too, but a finding that names deepseek is not one the master allows.
+        record(
+            &f.route,
+            &f.bridge,
+            finding("t-n3c", 1, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        let seen = survey(&f.route, "t-n3c");
+        assert!(seen.standings.is_empty(), "{:?}", seen.standings);
+        assert!(
+            seen.ignored
+                .iter()
+                .any(|ignored| ignored.reason.contains("never uses")),
+            "{:?}",
+            seen.ignored
+        );
+        let mut on_glm = finding("t-n3d", 1, Trigger::PreDone, Verdict::Pass);
+        on_glm.engine = "glm".into();
+        record(&f.route, &f.bridge, on_glm).unwrap();
+        assert_eq!(survey(&f.route, "t-n3d").standings.len(), 1);
+    }
+
+    #[test]
+    fn the_tamper_scan_floor_does_not_need_to_be_on_the_allowlist() {
+        let f = Fleet::new();
+        f.work("t-n3e", 2);
+        let mut named = policy(AdversaryMode::Blocking);
+        named.adversary_agents = vec!["bridge".into()];
+        sign_policy(&f, named);
+        let mut scan = finding("t-n3e", 2, Trigger::RepeatFailure, Verdict::Block);
+        scan.engine = TAMPER_SCAN.into();
+        record(&f.route, &f.wisp, scan).unwrap();
+        let seen = survey(&f.route, "t-n3e");
+        assert_eq!(seen.standings.len(), 1, "{:?}", seen.ignored);
+        assert_eq!(seen.standings[0].verdict(), Verdict::Block);
+        // A model's word from the same agent is not heard.
+        record(
+            &f.route,
+            &f.wisp,
+            finding("t-n3e", 2, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        assert!(standing(&f.route, "t-n3e", 2, Trigger::PreDone).is_none());
     }
 }

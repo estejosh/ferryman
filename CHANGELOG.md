@@ -116,6 +116,18 @@
   write the master's file); the dashboard shows the terms to everyone and changes them
   only for the master; Telegram shows them and never signs them. Putting the engine policy
   back to auto leaves the adversary's policy as signed.
+- **Any member with an inventory is no longer an adversary.** A finding counted from any
+  signer that was not the builder and had published an engine inventory listing the engine
+  it named, and one adversary's Pass stopped every other adversary from running - so a
+  member the master never meant to give a vote could satisfy `blocking`. A signer now
+  counts only when the master's adversary policy allows it: it is one of the named
+  `adversary_agents`, or - with no list - its signed inventory lists an engine matching the
+  adversary's preference selectors and not named by the adversary's own `never` (so the
+  trust is "any member running an allowed adversary engine"; documented in
+  `docs/ENGINE_SETUP.md`). The not-the-builder rule stands, and the deterministic tamper
+  scan stays a floor anyone can record, as a Block only. Every eligible adversary now runs
+  its own pass - an agent is settled only by its own finding - and a Block from any of them
+  dominates.
 
 ## v0.5.17 - 2026-09-29
 

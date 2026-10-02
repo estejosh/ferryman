@@ -2587,6 +2587,21 @@ impl Policy {
         self.clone().with_adversary(&in_force.adversary_terms())
     }
 
+    /// Whether the master lets the adversary use `engine`: it is not one the adversary's
+    /// own `never` names.
+    #[must_use]
+    pub fn adversary_allows(&self, engine: &Candidate) -> bool {
+        !self.adversary_never.iter().any(|s| matches(s, engine))
+    }
+
+    /// Whether `engine` matches the adversary's preference selectors; with none named,
+    /// every engine does.
+    #[must_use]
+    pub fn adversary_prefers(&self, engine: &Candidate) -> bool {
+        let prefer = self.preferences(Role::Adversary);
+        prefer.is_empty() || prefer.iter().any(|s| matches(s, engine))
+    }
+
     /// The policy the adversary is ranked and capped under: its own `never`, and no
     /// `where` - the engine policy's `never` and `where` cannot starve it.
     fn adversary_view(&self) -> Policy {

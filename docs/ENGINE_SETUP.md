@@ -284,6 +284,38 @@ page and the Telegram Engines menu show the same thing and can accept, block or 
 an engine to the top. `ferry improve status` and `ferry improve report` say which
 engine and model, on which machine, did each step, and what each engine spent.
 
+## Mixed fleets and what a fresh machine trusts
+
+The signed files that decide what the fleet may do - `ENGINE_POLICY`, `ADVERSARY_POLICY`
+and the engine inventories - are only as protected as the oldest machine that reads them
+and the newest thing a machine has already seen. Know the edges.
+
+- **A fresh machine trusts the first valid file it sees.** Rollback protection lives in
+  each machine's own state directory, not in the channel: the highest sequence number it
+  has seen and the last good policy. A machine that has never read the channel has none,
+  so whatever genuine signed file is there when it first syncs is what it runs - including
+  an older one somebody put back, or no `ADVERSARY_POLICY` at all (the defaults: advisory).
+  Before a new machine takes work, let it finish syncing and read `ferry engines policy
+  show`; keep the channel's Syncthing folder shared with devices you trust to write it.
+- **A v0.5.17 machine reads the v1 view and has no memory.** It verifies the engine policy's
+  v1 signature and obeys what it knows (`prefer` for the four building roles, `never`,
+  `where`, caps, subscription protection, auto-merge); it ignores effort, width,
+  subscription roles, `class:` selectors and the whole adversary, and it has no sequence
+  number, so it cannot tell an older signed policy put back from the current one. It never
+  runs the adversary and does not wait for it, so `blocking` binds only the machines on
+  this release - a v0.5.17 worker can still hand over the review key for work an adversary
+  blocked. Upgrade every machine before relying on `blocking`.
+- **A policy signed by v0.5.17 has only the v1 signature.** A machine on this release
+  accepts it (sequence 0) but it has no rollback protection beyond what that machine saw
+  first, and it cannot carry the newer parts. When the fleet has members that sign v2
+  (their inventories carry a v2 signature) and the policy in force is still a v1-only file,
+  `ferry engines policy show` and the dashboard say so. Signing the policy again from a
+  current `ferry` (`ferry engines policy set ...`, or the dashboard) replaces it with one
+  that has a sequence number and a v2 signature. Do that once the fleet is upgraded.
+- **The adversary's policy is master-only on every machine that knows it.** A delegate
+  cannot sign it, and a machine remembers the last one it saw; but a machine that does not
+  know the file (v0.5.17) ignores it, and a fresh machine has nothing to remember.
+
 ## Team preset and swarms: plan on high, build on medium, swarm the cheap work
 
 A strong model should plan and review, a few mid-size models should build in
@@ -592,14 +624,25 @@ still on v0.5.17 does not know the file and never runs the adversary.
 
 **Whose finding counts.** A finding is only heard when its signer did not build the work
 it judges, published a valid signed engine inventory that lists the engine the finding
-names. A finding is one signed
-file per signer (`adversary/<subject>-r<revision>-<moment>.<signer>.json`, and the file
-name must name the signer), so nobody can pre-empt or overwrite another adversary's word;
-several adversaries add up, and a Block from any of them stands. A finding that does not
-count is ignored and shown as `ignored: <reason>` in `ferry adversary show` and under
-`ignored` in the dashboard's `/api/adversary`. Findings count only on a revision that
-exists, and every gate decides on the revision under decision, never on the newest
-finding.
+names, and is an adversary the master allows (`ADVERSARY_POLICY`). If the master named
+`adversary_agents` (`--adversary-agents`), only those agents count. If the list is empty,
+the trust is **any member running an allowed adversary engine**: a member counts when its
+signed inventory lists an engine that matches the adversary's preference selectors (any
+engine, when there are none) and that the adversary's own `never` does not name. Anyone
+else's finding is ignored - and so is a Pass from a member you did not mean to give a vote
+to, so name the agents when the roster holds people or machines you do not fully trust.
+(The deterministic tamper scan is the one floor anybody on the roster may record, and it
+can only block.) Every eligible adversary runs its own pass - one adversary's Pass does
+not stand in for another's look - and a Block from any of them dominates. A finding is
+one signed file per signer, so nobody can pre-empt or overwrite another adversary's word.
+It also names the result it judged (a hash of that result's order, revision and
+signature): at a contract lock and before an improvement is called done it counts only
+for that exact result, so deleting an older provider result, which renumbers a contract's
+rounds, cannot let an old Pass cover a newer result. Several adversaries add up. A finding
+that does not count is ignored and shown as `ignored: <reason>` in `ferry adversary show`
+and under `ignored` in the dashboard's `/api/adversary`. Findings count only on a
+revision that exists, and every gate decides on the revision under decision, never on the
+newest finding.
 
 **Overrides name what you read.** Locking and overriding are bound to what the master was
 looking at, so a proposal or a finding that changed in between is not acted on: the CLI
