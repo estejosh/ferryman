@@ -1079,8 +1079,30 @@ function improvePanel(imp) {
    builds and reviews), in what order, never which, and on which machines. Signed by the
    master; with none signed the fleet runs on auto - local and free first, subscriptions
    never. The master can accept what auto recommends, or edit the lists. */
-const POLICY_ROLES = ["plan", "build", "review", "chore"];
+const POLICY_ROLES = ["plan", "build", "review", "chore", "adversary"];
+/* The roles that build and judge: what "prefer" in the edit box applies to. The adversary
+   is chosen on its own, so it is never swept up in an edit meant for the others. */
+const POLICY_BUILD_ROLES = ["plan", "build", "review", "chore"];
+let lastPolicy = {};
+const ADVERSARY_MODES = {
+  off: "Off - nothing is challenged",
+  advisory: "Advisory - findings are shown beside the review keys, never in the way",
+  blocking: "Blocking - a Block stops the contract lock and the review engine's key until you override it",
+};
+function adversaryText(x) {
+  /* One finding as a few lines: the headline, the worst issues, and what was done about a Block. */
+  if (!x) return "";
+  const issues = (x.findings || []).slice().sort((a, b) =>
+    ["high", "medium", "low"].indexOf(a.severity) - ["high", "medium", "low"].indexOf(b.severity)).slice(0, 3);
+  const tone = x.verdict === "block" ? "bad" : x.verdict === "concern" ? "warn" : "good";
+  return `<div class="adversary"><span class="badge ${tone}">adversary: ${esc(x.status)}</span> ` +
+    `<span class="m">${esc(x.headline)}${x.same_engine ? " - the engine that built it was the only one allowed" : ""}</span>` +
+    (x.override ? `<div class="m">overridden by ${esc(x.override.by)}${x.override.reason ? `: ${esc(x.override.reason)}` : ""}</div>` : "") +
+    issues.map((i) => `<div class="m"><b>[${esc(i.severity)}]</b> ${esc(i.title)}${i.location ? ` (${esc(i.location)})` : ""}: ${esc(i.detail)}</div>`).join("") +
+    `</div>`;
+}
 function policyPanel(ep) {
+  lastPolicy = ep.policy || {};
   const when = (at) => esc(String(at || "").slice(0, 16).replace("T", " "));
   const roles = (ep.effective && ep.effective.roles) || {};
   const line = (e) => `${esc(e.engine)} on ${esc(e.machine)}`;
@@ -1112,11 +1134,16 @@ function policyPanel(ep) {
             <select id="ep-improve" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.improve, cur.improve)}</select></label>
           <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Review engine</span>
             <select id="ep-review" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.review, cur.review)}</select></label>
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Adversary engine</span>
+            <select id="ep-adversary" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.adversary, cur.adversary)}</select></label>
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Adversary mode</span>
+            <select id="ep-adv-mode" ${ep.may_set ? "" : "disabled"}>${Object.entries(ADVERSARY_MODES).map(([mode, text]) =>
+              `<option value="${mode}"${mode === (ep.adversary_mode || "advisory") ? " selected" : ""}>${esc(text)}</option>`).join("")}</select></label>
           ${ep.may_set ? `<button class="btn primary" id="ep-choose">Save</button><button class="btn" id="ep-use-rec">Use recommended</button>
           <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="ep-all" /> for all my projects</label>` : ""}
         </div>
-        <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)}.
-          Every improvement needs the review engine's verdict and then yours before it can go live.</div>
+        <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)} &middot; adversary: ${nameOf(recd.adversary)}.
+          Every improvement needs the review engine's verdict and then yours before it can go live. The adversary is a different engine that challenges work before a contract locks, when an order fails twice, and before an improvement is called done.</div>
         <label class="s" style="display:inline-flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="ep-automerge" ${p.auto_merge === "low-risk" ? "checked" : ""} ${ep.may_set ? "" : "disabled"} /> Auto-merge docs/tests/deps after both approvals</label>
         <div class="s" style="color:var(--dim)">Only when every changed file is documentation, tests or a dependency version bump. Anything touching code or config still waits for you.</div>
         <div class="s" id="ep-msg" style="color:var(--dim);margin-top:4px"></div>`;
@@ -1165,10 +1192,14 @@ function approvalsPanel(pd) {
         <div style="min-width:0"><div class="t">${esc(w.order_id)} r${w.revision} &mdash; ${esc(w.title)}</div>
           <div class="m">by ${esc(w.worker)}${w.diff_stat ? ` &middot; ${esc(w.diff_stat)}` : ""} &middot; evidence: ${esc(w.evidence)}</div>
           ${w.engine ? `<div class="m">review engine: ${esc(w.engine.engine)}${w.engine.model ? ` (${esc(w.engine.model)})` : ""} on ${esc(w.engine.machine)} &mdash; ${esc(w.engine.summary)}</div>` : ""}
+          ${adversaryText(w.adversary)}
           <div class="m">${esc(w.waiting_for)}</div></div>
         <div class="r" style="white-space:nowrap">${pd.may_decide && w.ready_for_you
           ? `<button class="btn primary" data-imp-approve="${esc(w.order_id)}">Approve</button> <button class="btn" data-imp-back="${esc(w.order_id)}">Send back</button>`
-          : `<span class="badge">${w.ready_for_you ? "waiting for the master" : "waiting for the review engine"}</span>`}</div>
+          : `<span class="badge">${w.ready_for_you ? "waiting for the master" : "waiting for the review engine"}</span>`}
+          ${pd.may_decide && w.adversary_blocked
+            ? `<div style="margin-top:6px"><button class="btn" data-adv-override="${esc(w.order_id)}" data-adv-trigger="pre-done" data-adv-revision="${w.revision}">Override the Block</button></div>`
+            : ""}</div>
       </div>`).join("");
   return `
     <div class="panel" style="margin-bottom:18px">
@@ -1198,6 +1229,30 @@ function wireApprovals() {
       const notes = window.prompt("What should change?");
       if (notes && notes.trim()) decide(b, b.dataset.impBack, false, notes.trim());
     }));
+  wireOverrides(msg);
+}
+
+/* The master goes ahead despite the adversary's Block: a signed override, never a quiet
+   dismissal. `report` shows what happened; the page is redrawn on success. */
+function wireOverrides(report) {
+  document.querySelectorAll("[data-adv-override]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const reason = window.prompt("Why go ahead despite the adversary's Block? (kept in the signed override)");
+      if (reason === null) return;
+      b.disabled = true;
+      try {
+        const r = await api("/api/adversary/override", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            subject: b.dataset.advOverride, trigger: b.dataset.advTrigger,
+            revision: b.dataset.advRevision ? Number(b.dataset.advRevision) : null,
+            reason: reason.trim() || null,
+          }),
+        });
+        report(`${r.subject} r${r.revision}: Block overridden by ${r.overridden_by}.`);
+        await render();
+      } catch (err) { report(err.message || err); b.disabled = false; }
+    }));
 }
 
 function wirePolicy() {
@@ -1219,8 +1274,10 @@ function wirePolicy() {
   if (chooseBtn) chooseBtn.addEventListener("click", () => {
     const improve = $("#ep-improve").value || null;
     const review = $("#ep-review").value || null;
-    if (!improve && !review) { msg("Pick an improvement engine or a review engine."); return; }
-    choose(chooseBtn, { improve, review });
+    const adversary_engine = ($("#ep-adversary") && $("#ep-adversary").value) || null;
+    const adversary = ($("#ep-adv-mode") && $("#ep-adv-mode").value) || null;
+    if (!improve && !review && !adversary_engine && !adversary) { msg("Pick an engine or an adversary mode."); return; }
+    choose(chooseBtn, { improve, review, adversary_engine, adversary });
   });
   const autoMerge = $("#ep-automerge");
   if (autoMerge && !autoMerge.disabled) autoMerge.addEventListener("change", () =>
@@ -1255,11 +1312,15 @@ function wirePolicy() {
     save.disabled = true;
     const prefer = list("#ep-prefer");
     const policy = {
-      prefer: prefer.length ? Object.fromEntries(POLICY_ROLES.map((r) => [r, prefer])) : {},
+      prefer: prefer.length ? Object.fromEntries(POLICY_BUILD_ROLES.map((r) => [r, prefer])) : {},
       never: list("#ep-never"),
       where: list("#ep-where"),
       protect_subscriptions: !!($("#ep-protect") && $("#ep-protect").checked),
     };
+    // Signing this edit must not quietly undo the adversary's own choices.
+    if ((lastPolicy.prefer || {}).adversary) policy.prefer.adversary = lastPolicy.prefer.adversary;
+    if (lastPolicy.adversary) policy.adversary = lastPolicy.adversary;
+    if (lastPolicy.auto_merge) policy.auto_merge = lastPolicy.auto_merge;
     try {
       const r = await api("/api/engine-policy", {
         method: "POST", headers: { "content-type": "application/json" },
@@ -1895,6 +1956,11 @@ pages.contracts = async () => {
             </span>` : ""}
         </div>
         ${c.description ? `<p>${esc(c.description)}</p>` : ""}
+        ${(c.adversary || []).map(adversaryText).join("")}
+        ${d.may_decide && c.status === "proposed" && (c.adversary || []).some((x) => x.unresolved_block)
+          ? `<div style="margin-top:6px"><button class="btn" data-contract-override="${esc(c.reference)}">Override the Block and lock</button>
+              ${c.lock_refusal ? `<span class="s" style="color:var(--dim)">Locking is refused while it stands: adversary mode is blocking.</span>` : ""}</div>`
+          : ""}
         <dl class="kv">
           ${c.request ? `<dt>Request</dt><dd><pre class="mono">${esc(shapeText(c.request))}</pre></dd>` : ""}
           <dt>Response</dt><dd><pre class="mono">${esc(shapeText(c.response))}</pre></dd>
@@ -1919,6 +1985,23 @@ function wireContracts() {
   }));
   decide("data-contract-lock", "lock");
   decide("data-contract-reject", "reject");
+  // Lock over the adversary's Block: the master signs the override and the lock together.
+  $$("[data-contract-override]").forEach((b) => b.addEventListener("click", async () => {
+    const reason = window.prompt("Why lock despite the adversary's Block? (kept in the signed override)");
+    if (reason === null) return;
+    b.disabled = true;
+    try {
+      await api(`/api/contracts/${encodeURIComponent(b.getAttribute("data-contract-override"))}/lock`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ override: true, reason: reason.trim() || null }),
+      });
+      await render();
+    } catch (err) {
+      const msg = b.closest(".row").querySelector(".contract-msg");
+      msg.textContent = String(err.message || err).slice(0, 200);
+      b.disabled = false;
+    }
+  }));
 }
 
 // The vault is the one page with no backend behind it. It says so, and shows
