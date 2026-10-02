@@ -653,6 +653,9 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
         let (policy, setting) = policy::effective(&channel, &project);
         let adversary = policy::adversary_setting(&channel, &project);
         let engines = fleet(&channel);
+        let mixed = ferryman_channel::route_for(&channel)
+            .ok()
+            .and_then(|route| policy::mixed_fleet_warning(&route));
         if as_json {
             out.push(json!({
                 "project": project,
@@ -664,6 +667,7 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
                 "policy": policy,
                 "effective": policy::view(&policy, &engines),
                 "warnings": policy::subscription_warnings(&policy, &engines),
+                "mixed_fleet_warning": mixed,
             }));
             continue;
         }
@@ -672,6 +676,9 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
             println!("  {line}");
         }
         println!("  {}", adversary_source(adversary.as_ref()));
+        if let Some(warning) = &mixed {
+            println!("  warning: {warning}");
+        }
         if engines.is_empty() {
             println!("  no worker has published its engines here yet");
         } else {

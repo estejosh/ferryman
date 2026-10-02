@@ -2028,6 +2028,8 @@ async fn engine_policy_get(
         // and what is wrong with the subscriptions the policy opens.
         "team": team_json(&route, &current, now),
         "warnings": policy::subscription_warnings(&current, &fleet),
+        // A v1-only policy file while a member that signs v2 is on the roster.
+        "mixed_fleet_warning": policy::mixed_fleet_warning(&route),
         "efforts": policy::Effort::ALL.iter().map(|e| e.as_str()).collect::<Vec<_>>(),
         "self_improve": ferryman_channel::ferry::self_improve_enabled(channel, &route.project_id),
         // What the adversary's findings do here: off, advisory or blocking. The policy's
@@ -5745,6 +5747,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(before["adversary"]["master_only"], true, "{before}");
+        assert_eq!(before["mixed_fleet_warning"], Value::Null, "{before}");
         assert_eq!(before["adversary"]["set_by"], Value::Null);
 
         let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;

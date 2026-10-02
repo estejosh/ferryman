@@ -2944,6 +2944,43 @@ pub fn effective(channel: &Path, project_id: &str) -> (Policy, Option<PolicySett
     )
 }
 
+/// A warning for a mixed fleet: the policy in force is a v1-only file - signed by v0.5.17,
+/// with no sequence number and no v2 signature - while a member that signs v2 is on the
+/// roster (its signed inventory carries a v2 signature). Such a file has no rollback
+/// protection beyond what each machine saw first, and cannot carry the newer parts; signing
+/// it again from a current `ferry` fixes both. `None` when the policy is auto, has a v2
+/// signature, or nobody here signs v2.
+#[must_use]
+pub fn mixed_fleet_warning(route: &ProjectRoute) -> Option<String> {
+    let setting = setting(&route.communications, &route.project_id)?;
+    if setting.signature_v2.is_some() {
+        return None;
+    }
+    let mut capable: Vec<String> = crate::receipts::list_engines(route)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(inventory, check)| {
+            *check == SignatureCheck::Valid && inventory.signature_v2.is_some()
+        })
+        .map(|(inventory, _)| inventory.agent)
+        .collect();
+    capable.sort();
+    capable.dedup();
+    if capable.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "the engine policy in force is a v1-only file (signed by v0.5.17: no sequence number, \
+         no v2 signature) and {} run a release that signs v2. A v1-only file has no rollback \
+         protection - an older signed policy can be put back and a machine with nothing \
+         remembered takes it - and cannot carry effort, width or the newer parts. Sign it \
+         again from a current ferry (`ferry engines policy set`, or the dashboard) once the \
+         fleet is upgraded; see \"Mixed fleets and what a fresh machine trusts\" in \
+         docs/ENGINE_SETUP.md",
+        capable.join(", ")
+    ))
+}
+
 /// Whether the master has set a policy of their own (not auto) for the project.
 #[must_use]
 pub fn is_set(channel: &Path, project_id: &str) -> bool {
@@ -3059,10 +3096,12 @@ pub fn set_policy_as(
     // The engine policy proper: nothing about the adversary in it.
     let policy = policy.map(|policy| policy.without_adversary());
     // Unchanged - unless the channel's file is not the setting in force (it went back, or
-    // is gone), in which case signing the same policy again is what repairs it.
+    // is gone), or is a v1-only file signed by v0.5.17 (no sequence number, no v2
+    // signature): signing the same policy again is what repairs or upgrades it.
     if !resolved.from_memory
         && resolved.setting.as_ref().is_some_and(|existing| {
-            existing.policy.clone().map(|p| p.without_adversary()) == policy
+            existing.signature_v2.is_some()
+                && existing.policy.clone().map(|p| p.without_adversary()) == policy
         })
     {
         return Ok(changed);
@@ -5634,6 +5673,80 @@ mod tests {
         crate::atomic_json(&channel.join(ENGINE_POLICY), &downgraded).unwrap();
         assert_eq!(effective(channel, "demo").0, strict, "not the downgrade");
         assert!(rollback_notice(channel, "demo").is_some());
+    }
+
+    #[test]
+    fn a_v1_only_policy_is_warned_about_when_a_member_that_signs_v2_is_on_the_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        let (josh, grouchly) = (person("josh", 1), person("grouchly", 2));
+        let route = route(dir.path(), &[&josh, &grouchly]);
+        let channel = &route.communications;
+        let mut old = OldPolicySetting {
+            project_id: "demo".into(),
+            policy: Some(OldPolicy {
+                prefer: BTreeMap::new(),
+                never: vec!["name:claude".into()],
+                machines: Vec::new(),
+                caps_usd: BTreeMap::new(),
+                protect_subscriptions: true,
+                never_applies_to: NeverScope::Background,
+                auto_merge: AutoMerge::None,
+            }),
+            set_at: Utc::now(),
+            signed_by: "josh".into(),
+            signature: String::new(),
+            on_behalf_of: None,
+        };
+        old.signature = josh.sign_bytes(old_payload(&old).as_bytes());
+        crate::atomic_json(&channel.join(ENGINE_POLICY), &old).unwrap();
+        assert!(setting(channel, "demo").is_some_and(|read| read.signature_v2.is_none()));
+        assert!(
+            mixed_fleet_warning(&route).is_none(),
+            "nobody here signs v2 yet"
+        );
+
+        // A member that signs inventories as this release does joins the fleet.
+        crate::receipts::refresh_engines(
+            &route,
+            &grouchly,
+            "grouchly-machine",
+            "0.5.18",
+            vec![crate::receipts::EngineReport {
+                name: "deepseek".into(),
+                kind: "http".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                state: "up".into(),
+                until: None,
+                reason: None,
+                latency_ms: None,
+                balance: None,
+                checked_at: None,
+                trust: None,
+                billing: None,
+                class: None,
+            }],
+            Utc::now(),
+        )
+        .unwrap();
+        let warning = mixed_fleet_warning(&route).expect("a v1-only policy in a mixed fleet");
+        assert!(warning.contains("v1-only"), "{warning}");
+        assert!(
+            warning.contains("grouchly"),
+            "names who signs v2: {warning}"
+        );
+        assert!(
+            warning.contains("Mixed fleets"),
+            "points at the docs: {warning}"
+        );
+
+        // Signing it again from a current ferry gives it a sequence number and a v2
+        // signature, and the warning goes.
+        let (read, _) = effective(channel, "demo");
+        assert!(set_policy(channel, "demo", Some(read.clone()), &josh).unwrap());
+        assert!(setting(channel, "demo").is_some_and(|read| read.signature_v2.is_some()));
+        assert!(mixed_fleet_warning(&route).is_none());
     }
 
     #[test]

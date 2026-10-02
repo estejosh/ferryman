@@ -1180,7 +1180,7 @@ function policyPanel(ep) {
       <td><label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" data-ep-subs="${role}" ${r.subscriptions ? "checked" : ""} ${dis} /> may use a subscription</label></td>
       <td>${first.class ? esc(first.class) : ""}</td></tr>`;
   }).join("");
-  const subsWarn = (ep.warnings || []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+  const subsWarn = (ep.warnings || []).concat(ep.mixed_fleet_warning ? [ep.mixed_fleet_warning] : []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
   const teamPanel = `
         <div style="margin-top:14px"><b>Plan on high, build on medium, swarm the cheap work</b></div>
         <div class="s" style="color:var(--dim);margin-top:4px">Effort is how hard a role thinks; width is how many of its orders run at once across your machines. A subscription is used for background work only for a role you tick, and only an engine with a weekly request cap.</div>

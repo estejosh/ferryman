@@ -128,6 +128,15 @@
   scan stays a floor anyone can record, as a Block only. Every eligible adversary now runs
   its own pass - an agent is settled only by its own finding - and a Block from any of them
   dominates.
+- **A mixed fleet says what it trusts.** `docs/ENGINE_SETUP.md` has a new section, "Mixed
+  fleets and what a fresh machine trusts": rollback protection is per machine, so a fresh
+  machine takes the first valid file it sees; a v0.5.17 machine reads only the v1 view, has
+  no memory and never runs or waits for the adversary (so `blocking` binds only machines on
+  this release); a policy signed by v0.5.17 has no sequence number. `ferry engines policy
+  show` (and `--json`) and the dashboard now warn when the policy in force is such a
+  v1-only file while a member whose inventory carries a v2 signature is on the roster, and
+  signing the same policy again now upgrades a v1-only file instead of reporting "already
+  so".
 
 ## v0.5.17 - 2026-09-29
 
