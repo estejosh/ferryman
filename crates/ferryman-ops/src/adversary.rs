@@ -564,6 +564,11 @@ pub enum Outcome {
     Held(String),
     /// Every allowed engine was asked and none answered.
     Failed(String),
+    /// This agent's word on the subject would not count - it built the work, has no signed
+    /// engine inventory listing the engine, is outside the policy's `where`, or the revision
+    /// is not a real one - so nothing was paid for. Why, in the words `ferry adversary show`
+    /// uses for an ignored finding.
+    Ineligible(String),
     /// Asked, and recorded.
     Recorded(Box<AdversaryFinding>),
 }
@@ -639,18 +644,36 @@ pub async fn challenge(
     if policy.adversary == AdversaryMode::Off {
         return Outcome::Off;
     }
-    if let Some(existing) = data::read(route, &request.subject, request.revision, request.trigger) {
+    let identity = match signing_identity(route, config) {
+        Ok(identity) => identity,
+        Err(error) => return Outcome::Failed(format!("{error:#}")),
+    };
+    if let Some(existing) = data::read(
+        route,
+        &request.subject,
+        request.revision,
+        request.trigger,
+        identity.name(),
+    ) {
         return Outcome::Existing(Box::new(existing));
+    }
+    // Whether this agent would be heard at all, before any engine is paid for: a finding
+    // that would be ignored is money spent on nothing.
+    if let Err(why) = data::eligibility(
+        route,
+        &request.subject,
+        request.revision,
+        request.trigger,
+        identity.name(),
+        None,
+    ) {
+        return Outcome::Ineligible(why);
     }
     let week = engines::iso_week(now);
     if let Some(why) = ferryman_channel::policy::over_cap(route, policy, &week, Role::Adversary) {
         hold(route, config, &week, &why, report);
         return Outcome::Held(why);
     }
-    let identity = match signing_identity(route, config) {
-        Ok(identity) => identity,
-        Err(error) => return Outcome::Failed(format!("{error:#}")),
-    };
     let mut tried: Vec<String> = Vec::new();
     loop {
         let (engine, same_engine) = match choose(config, policy, &request.built_by, &tried, now) {
@@ -673,6 +696,22 @@ pub async fn challenge(
             }
         };
         tried.push(engine.name.clone());
+        // The finding names its engine, and counts only if this agent's signed inventory
+        // lists it: an engine that is not there is not one to ask.
+        if let Err(why) = data::eligibility(
+            route,
+            &request.subject,
+            request.revision,
+            request.trigger,
+            identity.name(),
+            Some(&engine.name),
+        ) {
+            report.warn(&format!(
+                "  {}: not asking {} about {}: {why}",
+                route.project_id, engine.name, request.subject
+            ));
+            continue;
+        }
         let effort = policy.effort_for(Role::Adversary);
         let asked = crate::agent::ask_costed(
             route,
@@ -764,8 +803,14 @@ fn record(
         report.info(&line);
     }
     // Read back what was written, so the caller sees what every machine will see.
-    let stored =
-        data::read(route, &finding.subject, finding.revision, finding.trigger).unwrap_or(finding);
+    let stored = data::read(
+        route,
+        &finding.subject,
+        finding.revision,
+        finding.trigger,
+        identity.name(),
+    )
+    .unwrap_or(finding);
     Outcome::Recorded(Box::new(stored))
 }
 
@@ -819,6 +864,15 @@ pub fn order_diff(route: &ProjectRoute, result: &TaskResult) -> Option<String> {
     })
 }
 
+/// Whether nothing is left for `me` to ask at (subject, revision, trigger): this agent has
+/// already run, or an eligible adversary's finding already stands there. Each eligible
+/// adversary may run its own pass ([`data::done`] is per signer), but a moment that has a
+/// finding that counts is not paid for again by every worker in the fleet.
+fn settled(route: &ProjectRoute, subject: &str, revision: u32, trigger: Trigger, me: &str) -> bool {
+    data::done(route, subject, revision, trigger, me)
+        || data::standing(route, subject, revision, trigger).is_some()
+}
+
 // --- moment 1: before a contract locks --------------------------------------------------------
 
 fn precheck_issues(context: &ContractContext) -> Vec<Issue> {
@@ -848,13 +902,22 @@ pub async fn contract_pass(
     let Ok(pending) = interface::pending_locks(route) else {
         return 0;
     };
+    let Ok(identity) = signing_identity(route, config) else {
+        return 0;
+    };
     let mut challenged = 0;
     for contract in pending {
         let Ok(context) = data::contract_context(route, &contract) else {
             continue;
         };
         let reference = contract.reference();
-        if data::done(route, &reference, context.revision, Trigger::ContractLock) {
+        if settled(
+            route,
+            &reference,
+            context.revision,
+            Trigger::ContractLock,
+            identity.name(),
+        ) {
             continue;
         }
         let request = Request {
@@ -874,7 +937,11 @@ pub async fn contract_pass(
         };
         match challenge(route, config, policy, request, now, report).await {
             Outcome::Recorded(_) => challenged += 1,
-            Outcome::Held(_) | Outcome::Failed(_) | Outcome::Off | Outcome::Existing(_) => {}
+            Outcome::Held(_)
+            | Outcome::Failed(_)
+            | Outcome::Ineligible(_)
+            | Outcome::Off
+            | Outcome::Existing(_) => {}
         }
     }
     challenged
@@ -897,6 +964,9 @@ pub async fn pre_done_pass(
     now: DateTime<Utc>,
     report: &dyn Progress,
 ) -> usize {
+    let Ok(identity) = signing_identity(route, config) else {
+        return 0;
+    };
     let mut challenged = 0;
     for task in ferryman_channel::list_tasks(route).unwrap_or_default() {
         if !ferryman_channel::gate::gated(&task.order.payload) {
@@ -909,7 +979,14 @@ pub async fn pre_done_pass(
             continue;
         };
         if ferryman_channel::evidence::blocking_reason(&task.order.payload, result).is_some()
-            || data::done(route, &task.order.id, revision, Trigger::PreDone)
+            || task.contract_refusal(route, revision).is_some()
+            || settled(
+                route,
+                &task.order.id,
+                revision,
+                Trigger::PreDone,
+                identity.name(),
+            )
         {
             continue;
         }
@@ -956,8 +1033,9 @@ pub fn may_judge(route: &ProjectRoute, policy: &Policy, task: &Task) -> bool {
     if ferryman_channel::evidence::blocking_reason(&task.order.payload, result).is_some() {
         return true;
     }
-    data::standing(route, &task.order.id, result.revision, Trigger::PreDone)
-        .is_some_and(|standing| !standing.unresolved_block())
+    // The one question the engine key asks too: an eligible adversary's finding on exactly
+    // this revision that holds nothing back, or the master's waiver.
+    data::engine_key_refusal(route, policy, &task.order.id, result.revision).is_none()
 }
 
 /// Every moment the improve loop's review pass owns: contracts waiting for a lock, and
@@ -1043,51 +1121,65 @@ pub async fn before_attempt(
     };
     let id = task.order.id.clone();
     let revision = repeat.latest;
-    let finding = match data::read(route, &id, revision, Trigger::RepeatFailure) {
-        Some(existing) => existing,
-        None => {
-            let result = task.results.iter().find(|r| r.revision == revision);
-            let diff = result.and_then(|result| order_diff(route, result));
-            let hits = diff
-                .as_deref()
-                .map(|diff| tamper::scan(diff, &required_of(task)))
-                .unwrap_or_default();
-            let tampered = tamper::has_high(&hits);
-            let request = Request {
-                subject: id.clone(),
-                order_id: id.clone(),
-                revision,
-                trigger: Trigger::RepeatFailure,
-                built_by: repeat
-                    .failures
-                    .iter()
-                    .filter_map(|failed| failed.builder.clone())
-                    .collect(),
-                prompt: repeat_prompt(task, &repeat, &hits, diff.as_deref()),
-                known: hits.iter().map(tamper::Hit::issue).collect(),
-                floor: if tampered {
-                    Verdict::Block
-                } else {
-                    Verdict::Pass
-                },
-            };
-            match challenge(route, config, &policy, request, now, report).await {
-                Outcome::Recorded(finding) | Outcome::Existing(finding) => *finding,
-                Outcome::Off => return Gate::Proceed,
-                Outcome::Held(why) | Outcome::Failed(why) if tampered => {
-                    // No engine could be asked, but the scan found what it found.
-                    match scan_only(route, config, &id, revision, &hits, &why, report) {
-                        Some(finding) => finding,
-                        None => return Gate::Proceed,
-                    }
-                }
-                Outcome::Held(_) | Outcome::Failed(_) => return Gate::Proceed,
+    // One paid look per failed attempt: when this agent has run, or an eligible adversary's
+    // finding already stands, nothing is asked again.
+    let me = signing_identity(route, config).ok();
+    let asked = me.as_ref().is_some_and(|identity| {
+        settled(
+            route,
+            &id,
+            revision,
+            Trigger::RepeatFailure,
+            identity.name(),
+        )
+    });
+    if !asked {
+        let result = task.results.iter().find(|r| r.revision == revision);
+        let diff = result.and_then(|result| order_diff(route, result));
+        let hits = diff
+            .as_deref()
+            .map(|diff| tamper::scan(diff, &required_of(task)))
+            .unwrap_or_default();
+        let tampered = tamper::has_high(&hits);
+        let request = Request {
+            subject: id.clone(),
+            order_id: id.clone(),
+            revision,
+            trigger: Trigger::RepeatFailure,
+            built_by: repeat
+                .failures
+                .iter()
+                .filter_map(|failed| failed.builder.clone())
+                .collect(),
+            prompt: repeat_prompt(task, &repeat, &hits, diff.as_deref()),
+            known: hits.iter().map(tamper::Hit::issue).collect(),
+            floor: if tampered {
+                Verdict::Block
+            } else {
+                Verdict::Pass
+            },
+        };
+        match challenge(route, config, &policy, request, now, report).await {
+            Outcome::Off => return Gate::Proceed,
+            Outcome::Held(why) | Outcome::Failed(why) | Outcome::Ineligible(why) if tampered => {
+                // No engine could be asked, but the scan found what it found.
+                scan_only(route, config, &id, revision, &hits, &why, report);
             }
+            Outcome::Recorded(_)
+            | Outcome::Existing(_)
+            | Outcome::Held(_)
+            | Outcome::Failed(_)
+            | Outcome::Ineligible(_) => {}
         }
+    }
+    // What counts is what an eligible adversary said about exactly this failed attempt.
+    let Some(standing) = data::standing(route, &id, revision, Trigger::RepeatFailure) else {
+        return Gate::Proceed;
     };
-    if finding.verdict != Verdict::Block {
+    if standing.verdict() != Verdict::Block {
         return Gate::Proceed;
     }
+    let finding = standing.finding.clone();
     if let Ok(identity) = signing_identity(route, config) {
         match block_question(route, &identity, &finding) {
             Ok(true) => report.info(&format!(
@@ -1139,7 +1231,7 @@ fn scan_only(
         revision,
         trigger: Trigger::RepeatFailure,
         subject: id.to_string(),
-        engine: "tamper-scan".to_string(),
+        engine: data::TAMPER_SCAN.to_string(),
         model: None,
         machine: ferryman_channel::receipts::machine_label(),
         same_engine: false,
@@ -1176,6 +1268,9 @@ pub struct Summary {
     pub passes: usize,
     /// Blocks nobody has overridden: `t-1 r2 (pre-done)`.
     pub unresolved: Vec<String>,
+    /// Genuine findings that do not count (their signer built the work, has no signed
+    /// inventory listing the engine, ...): see `ferry adversary show`.
+    pub ignored: usize,
 }
 
 /// Count the project's genuine findings and list the Blocks still standing.
@@ -1186,26 +1281,26 @@ pub fn summary(route: &ProjectRoute) -> Summary {
         mode: policy.adversary.as_str().to_string(),
         ..Summary::default()
     };
-    for finding in data::list(route) {
-        summary.findings += 1;
-        match finding.verdict {
-            Verdict::Pass => summary.passes += 1,
-            Verdict::Concern => summary.concerns += 1,
-            Verdict::Block => {
-                summary.blocks += 1;
-                if data::standing(route, &finding.subject, finding.revision, finding.trigger)
-                    .is_some_and(|standing| standing.unresolved_block())
-                {
-                    summary.unresolved.push(format!(
-                        "{} r{} ({})",
-                        finding.subject,
-                        finding.revision,
-                        finding.trigger.as_str()
-                    ));
-                }
+    let survey = data::list_standings(route);
+    for standing in &survey.standings {
+        for voice in &standing.voices {
+            summary.findings += 1;
+            match voice.finding.verdict {
+                Verdict::Pass => summary.passes += 1,
+                Verdict::Concern => summary.concerns += 1,
+                Verdict::Block => summary.blocks += 1,
             }
         }
+        if standing.unresolved_block() {
+            summary.unresolved.push(format!(
+                "{} r{} ({})",
+                standing.finding.subject,
+                standing.finding.revision,
+                standing.finding.trigger.as_str()
+            ));
+        }
     }
+    summary.ignored = survey.ignored.len();
     summary
 }
 
@@ -1221,21 +1316,17 @@ pub fn report_section(route: &ProjectRoute) -> String {
         "Mode: {}. {} finding(s): {} block, {} concern, {} pass.\n",
         summary.mode, summary.findings, summary.blocks, summary.concerns, summary.passes
     );
-    let mut findings = data::list(route);
-    findings.sort_by_key(|finding| std::cmp::Reverse(finding.created_at));
-    if findings.is_empty() {
+    let survey = data::list_standings(route);
+    if survey.standings.is_empty() {
         let _ = writeln!(md, "Nothing has been challenged yet.");
     }
-    for finding in findings.iter().take(15) {
-        let standing = data::standing(route, &finding.subject, finding.revision, finding.trigger);
-        let status =
-            standing
-                .as_ref()
-                .map_or_else(String::new, |standing| match &standing.overridden {
-                    Some(over) => format!(" - overridden by {}", over.from()),
-                    None if standing.unresolved_block() => " - unresolved".to_string(),
-                    None => String::new(),
-                });
+    for standing in survey.standings.iter().take(15) {
+        let finding = &standing.finding;
+        let status = match &standing.overridden {
+            Some(over) => format!(" - overridden by {}", over.from()),
+            None if standing.unresolved_block() => " - unresolved".to_string(),
+            None => String::new(),
+        };
         let _ = writeln!(
             md,
             "- `{}` r{}, {}: {}{status}",
@@ -1243,6 +1334,13 @@ pub fn report_section(route: &ProjectRoute) -> String {
             finding.revision,
             finding.trigger.label(),
             finding.describe()
+        );
+    }
+    if !survey.ignored.is_empty() {
+        let _ = writeln!(
+            md,
+            "\n{} finding(s) were ignored because their signer could not be heard (see `ferry adversary show`).",
+            survey.ignored.len()
         );
     }
     md
@@ -1302,6 +1400,44 @@ mod tests {
         AgentIdentity::from_seed("wisp", [7; 32])
     }
 
+    /// The agent that builds the work in these tests. `wisp`, whose key the config holds,
+    /// plays the adversary - the signer of a finding is never the builder of what it judges.
+    fn fang() -> AgentIdentity {
+        AgentIdentity::from_seed("fang", [5; 32])
+    }
+
+    /// Publish wisp's signed engine inventory, listing `names`.
+    fn publish_engines(route: &ProjectRoute, names: &[String]) {
+        let reports = names
+            .iter()
+            .map(|name| ferryman_channel::receipts::EngineReport {
+                name: name.clone(),
+                kind: "http".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                state: "up".into(),
+                until: None,
+                reason: None,
+                latency_ms: None,
+                balance: None,
+                checked_at: None,
+                trust: None,
+                billing: None,
+                class: None,
+            })
+            .collect();
+        ferryman_channel::receipts::refresh_engines(
+            route,
+            &wisp(),
+            "fixture-machine",
+            "0.0.0",
+            reports,
+            Utc::now(),
+        )
+        .unwrap();
+    }
+
     /// A channel whose master is josh and whose worker wisp has its key here, running
     /// `engines`; the workspace is a git repository on `main` holding a library and a test.
     fn fixture(dir: &Path, engines: Vec<EngineSpec>) -> (ProjectRoute, AgentConfig) {
@@ -1328,7 +1464,7 @@ mod tests {
         )
         .unwrap();
         let mut route = ferryman_channel::route_for(&workspace).unwrap();
-        for (who, role) in [(wisp(), "worker"), (josh(), "operator")] {
+        for (who, role) in [(wisp(), "worker"), (fang(), "worker"), (josh(), "operator")] {
             let agent = ferryman_channel::AgentRoute {
                 name: who.name().into(),
                 role: role.into(),
@@ -1340,6 +1476,13 @@ mod tests {
             route.agents.push(agent);
         }
         ferryman_channel::master::initialize_master(&route, &josh(), "josh").unwrap();
+        publish_engines(
+            &route,
+            &engines
+                .iter()
+                .map(|engine| engine.name.clone())
+                .collect::<Vec<_>>(),
+        );
         let mut config = AgentConfig::load(&attachment).unwrap();
         config.engines = engines;
 
@@ -1433,7 +1576,7 @@ mod tests {
     fn result(id: &str, revision: u32, builder: &str, exit: i32) -> ferryman_channel::TaskResult {
         let mut result = ferryman_channel::TaskResult {
             order_id: id.into(),
-            agent: "wisp".into(),
+            agent: "fang".into(),
             revision,
             submitted_at: Utc::now(),
             payload: json!({
@@ -1449,7 +1592,7 @@ mod tests {
             signed_by: None,
             signature: None,
         };
-        wisp().sign_result(&mut result);
+        fang().sign_result(&mut result);
         result
     }
 
@@ -1471,7 +1614,7 @@ mod tests {
     /// An order that has failed `revisions` times, built each time by `builder`.
     fn failed(route: &ProjectRoute, id: &str, builder: &str, revisions: u32) -> Task {
         ferryman_channel::issue_order(route, &order(id)).unwrap();
-        ferryman_channel::claim_order(route, id, "wisp").unwrap();
+        ferryman_channel::claim_order(route, id, "fang").unwrap();
         for revision in 1..=revisions {
             ferryman_channel::submit_result(route, &result(id, revision, builder, 101)).unwrap();
             send_back(route, id, revision);
@@ -1482,7 +1625,7 @@ mod tests {
     /// The order's branch: `files` written, `removed` deleted, one commit on `main`.
     fn branch(route: &ProjectRoute, id: &str, files: &[(&str, &str)], removed: &[&str]) {
         let repo = route.workspace.clone();
-        let name = ferryman_channel::worktree::branch_name(id, "wisp");
+        let name = ferryman_channel::worktree::branch_name(id, "fang");
         git(&repo, &["checkout", "-q", "-b", &name, "main"]);
         for (path, text) in files {
             fs::write(repo.join(path), text).unwrap();
@@ -1624,6 +1767,7 @@ mod tests {
             dir.path(),
             vec![engine("deepseek", "deepseek-chat", &says("pass", ""))],
         );
+        awaiting(&route, "t-1", "deepseek");
         let outcome = futures_lite_block(challenge(
             &route,
             &config,
@@ -1662,6 +1806,7 @@ mod tests {
             dir.path(),
             vec![engine("qwen", "qwen-max", &says("pass", ""))],
         );
+        awaiting(&route, "t-1", "deepseek");
         let mut policy = policy_of(&route);
         policy.never.push("name:qwen".into());
         let outcome = futures_lite_block(challenge(
@@ -1682,7 +1827,7 @@ mod tests {
             &crate::Silent,
         ));
         assert!(matches!(outcome, Outcome::Held(_)), "{outcome:?}");
-        assert!(data::read(&route, "t-1", 1, Trigger::PreDone).is_none());
+        assert!(data::read(&route, "t-1", 1, Trigger::PreDone, "wisp").is_none());
         // The master was asked once about the held work.
         let pending = ferryman_channel::questions::pending(&route);
         assert_eq!(pending.len(), 1, "{pending:?}");
@@ -1721,6 +1866,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let reply = says("concern", HIGH).replace("fake://ok:", "fake://paid:");
         let (route, config) = fixture(dir.path(), vec![engine("qwen", "qwen-max", &reply)]);
+        awaiting(&route, "t-1", "deepseek");
         let now = Utc::now();
         let outcome = futures_lite_block(challenge(
             &route,
@@ -1743,7 +1889,7 @@ mod tests {
         assert!(!finding.machine.is_empty());
         assert_eq!(finding.findings[0].title, "the fix special-cases the test");
         // On disk, readable by anyone on the roster.
-        assert!(data::read(&route, "t-1", 1, Trigger::PreDone).is_some());
+        assert!(data::read(&route, "t-1", 1, Trigger::PreDone, "wisp").is_some());
 
         // The ledger-side record: an adversary step with the engine, model, machine, cost.
         let steps = ferryman_channel::policy::read_steps(&route, &engines::iso_week(now));
@@ -1774,6 +1920,7 @@ mod tests {
             dir.path(),
             vec![engine("qwen", "qwen-max", &says("block", HIGH))],
         );
+        awaiting(&route, "t-1", "deepseek");
         let run = |config: &AgentConfig| {
             futures_lite_block(challenge(
                 &route,
@@ -1787,7 +1934,8 @@ mod tests {
         let first = run(&config);
         assert!(matches!(first, Outcome::Recorded(_)));
         let path_before = fs::read(
-            ferryman_channel::adversary::finding_path(&route, "t-1", 1, Trigger::PreDone).unwrap(),
+            ferryman_channel::adversary::finding_path(&route, "t-1", 1, Trigger::PreDone, "wisp")
+                .unwrap(),
         )
         .unwrap();
         // Even a different answer from a different engine changes nothing.
@@ -1797,7 +1945,8 @@ mod tests {
         assert!(matches!(second, Outcome::Existing(_)), "{second:?}");
         assert_eq!(second.finding().unwrap().verdict, Verdict::Block);
         let path_after = fs::read(
-            ferryman_channel::adversary::finding_path(&route, "t-1", 1, Trigger::PreDone).unwrap(),
+            ferryman_channel::adversary::finding_path(&route, "t-1", 1, Trigger::PreDone, "wisp")
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(path_before, path_after);
@@ -1861,6 +2010,7 @@ mod tests {
                 "fake://ok:Looks fine to me, ship it.",
             )],
         );
+        awaiting(&route, "t-1", "deepseek");
         let outcome = futures_lite_block(challenge(
             &route,
             &config,
@@ -1888,6 +2038,7 @@ mod tests {
             dir.path(),
             vec![engine("qwen", "qwen-max", &says("pass", ""))],
         );
+        awaiting(&route, "t-1", "deepseek");
         let mut request = simple("t-1", Trigger::PreDone);
         request.floor = Verdict::Block;
         request.known = vec![Issue {
@@ -1912,6 +2063,133 @@ mod tests {
         );
     }
 
+    // --- whose word counts, settled before anything is paid for --------------------------------
+
+    #[test]
+    fn an_agent_that_built_the_work_asks_no_engine_and_writes_nothing() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine("qwen", "qwen-max", &says("block", HIGH))],
+        );
+        // wisp, who runs the adversary here, built this one itself.
+        ferryman_channel::issue_order(&route, &order("t-own")).unwrap();
+        let mut mine = result("t-own", 1, "deepseek", 0);
+        mine.agent = "wisp".into();
+        mine.signed_by = None;
+        mine.signature = None;
+        wisp().sign_result(&mut mine);
+        ferryman_channel::submit_result(&route, &mine).unwrap();
+        let outcome = futures_lite_block(challenge(
+            &route,
+            &config,
+            &policy_of(&route),
+            simple("t-own", Trigger::PreDone),
+            Utc::now(),
+            &crate::Silent,
+        ));
+        match &outcome {
+            Outcome::Ineligible(why) => {
+                assert!(why.contains("built the work it judged"), "{why}");
+            }
+            other => panic!("not ineligible: {other:?}"),
+        }
+        assert!(data::list(&route).is_empty(), "nothing was written");
+        assert_eq!(
+            futures_lite_block(pass(
+                &route,
+                &config,
+                &policy_of(&route),
+                Utc::now(),
+                &crate::Silent
+            )),
+            0,
+            "and the pass asks no one"
+        );
+    }
+
+    #[test]
+    fn an_engine_the_agents_signed_inventory_does_not_list_is_not_asked() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine("qwen", "qwen-max", &says("block", HIGH))],
+        );
+        // The inventory the fleet can verify lists some other engine than the one configured.
+        fs::remove_file(route.communications.join("engines").join("wisp.json")).unwrap();
+        publish_engines(&route, &["gpt".to_string()]);
+        awaiting(&route, "t-1", "deepseek");
+        let outcome = futures_lite_block(challenge(
+            &route,
+            &config,
+            &policy_of(&route),
+            simple("t-1", Trigger::PreDone),
+            Utc::now(),
+            &crate::Silent,
+        ));
+        assert!(matches!(outcome, Outcome::Failed(_)), "{outcome:?}");
+        assert!(
+            data::list(&route).is_empty(),
+            "no finding that would be ignored"
+        );
+    }
+
+    #[test]
+    fn a_revision_that_does_not_exist_is_not_challenged() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine("qwen", "qwen-max", &says("pass", ""))],
+        );
+        awaiting(&route, "t-1", "deepseek");
+        let mut request = simple("t-1", Trigger::PreDone);
+        request.revision = 999;
+        let outcome = futures_lite_block(challenge(
+            &route,
+            &config,
+            &policy_of(&route),
+            request,
+            Utc::now(),
+            &crate::Silent,
+        ));
+        match &outcome {
+            Outcome::Ineligible(why) => assert!(why.contains("no result r999"), "{why}"),
+            other => panic!("not ineligible: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_waiver_lets_the_judge_through_when_no_adversary_could_read_the_work() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(dir.path(), Vec::new());
+        set_mode(&route, AdversaryMode::Blocking);
+        let task = awaiting(&route, "t-1", "deepseek");
+        let policy = policy_of(&route);
+        assert_eq!(
+            futures_lite_block(pass(&route, &config, &policy, Utc::now(), &crate::Silent)),
+            0,
+            "there is no engine to ask"
+        );
+        assert!(!may_judge(&route, &policy, &task), "blocking fails closed");
+        let seen = data::finding_seen(&route, "t-1", 1, Trigger::PreDone);
+        assert_eq!(seen, data::NO_FINDING);
+        data::waive(
+            &route,
+            "t-1",
+            1,
+            Trigger::PreDone,
+            &seen,
+            Some("no adversary is available"),
+            "josh",
+            &josh(),
+        )
+        .unwrap();
+        assert!(may_judge(&route, &policy, &task), "the master waived it");
+    }
     // --- moment 2: the order has failed twice --------------------------------------------------
 
     #[test]
@@ -1960,7 +2238,8 @@ mod tests {
             &crate::Silent,
         ));
         assert_eq!(gate, Gate::Proceed);
-        let finding = data::read(&route, "t-1", 2, Trigger::RepeatFailure).expect("challenged");
+        let finding =
+            data::read(&route, "t-1", 2, Trigger::RepeatFailure, "wisp").expect("challenged");
         assert_eq!(finding.verdict, Verdict::Pass);
         assert!(
             ferryman_channel::questions::pending(&route).is_empty(),
@@ -2084,7 +2363,7 @@ mod tests {
             &crate::Silent,
         ));
         assert_eq!(gate, Gate::Proceed);
-        let finding = data::read(&route, "t-1", 2, Trigger::RepeatFailure).unwrap();
+        let finding = data::read(&route, "t-1", 2, Trigger::RepeatFailure, "wisp").unwrap();
         assert_eq!(
             finding.verdict,
             Verdict::Block,
@@ -2118,7 +2397,8 @@ mod tests {
             &crate::Silent,
         ));
         assert_eq!(gate, Gate::Proceed);
-        let finding = data::read(&route, "t-1", 2, Trigger::RepeatFailure).expect("the scan's own");
+        let finding =
+            data::read(&route, "t-1", 2, Trigger::RepeatFailure, "wisp").expect("the scan's own");
         assert_eq!(finding.engine, "tamper-scan");
         assert_eq!(finding.verdict, Verdict::Block);
         assert!(
@@ -2170,7 +2450,7 @@ mod tests {
 
     fn awaiting(route: &ProjectRoute, id: &str, builder: &str) -> Task {
         ferryman_channel::issue_order(route, &order(id)).unwrap();
-        ferryman_channel::claim_order(route, id, "wisp").unwrap();
+        ferryman_channel::claim_order(route, id, "fang").unwrap();
         ferryman_channel::submit_result(route, &result(id, 1, builder, 0)).unwrap();
         ferryman_channel::read_task(route, id).unwrap()
     }
@@ -2192,7 +2472,7 @@ mod tests {
             &crate::Silent,
         ));
         assert_eq!(challenged, 1);
-        let finding = data::read(&route, "t-1", 1, Trigger::PreDone).unwrap();
+        let finding = data::read(&route, "t-1", 1, Trigger::PreDone, "wisp").unwrap();
         assert_eq!(finding.verdict, Verdict::Concern);
         assert_eq!(finding.engine, "qwen");
         assert_eq!(
@@ -2259,11 +2539,13 @@ mod tests {
             "a Block nobody overrode"
         );
 
+        let seen = data::finding_seen(&route, "t-1", 1, Trigger::PreDone);
         data::override_block(
             &route,
             "t-1",
             1,
             Trigger::PreDone,
+            &seen,
             Some("accepted"),
             "josh",
             &josh(),
@@ -2337,14 +2619,14 @@ mod tests {
         if let Some(response) = response {
             let mut result = ferryman_channel::TaskResult {
                 order_id: "back".into(),
-                agent: "wisp".into(),
+                agent: "fang".into(),
                 revision: 1,
                 submitted_at: Utc::now(),
                 payload: json!({ "engine": "deepseek", "response": response }),
                 signed_by: None,
                 signature: None,
             };
-            wisp().sign_result(&mut result);
+            fang().sign_result(&mut result);
             ferryman_channel::submit_result(route, &result).unwrap();
         }
     }
@@ -2370,26 +2652,26 @@ mod tests {
             ))
         };
         assert_eq!(run(), 1);
-        let first =
-            data::read(&route, "user-api@1", 0, Trigger::ContractLock).expect("shapes alone");
+        let first = data::read(&route, "user-api@1", 0, Trigger::ContractLock, "wisp")
+            .expect("shapes alone");
         assert_eq!(first.verdict, Verdict::Pass);
         assert_eq!(run(), 0, "once");
 
         // The provider returns a result: the contract is read again, at that revision.
         let mut result = ferryman_channel::TaskResult {
             order_id: "back".into(),
-            agent: "wisp".into(),
+            agent: "fang".into(),
             revision: 1,
             submitted_at: Utc::now(),
             payload: json!({ "engine": "deepseek", "response": { "id": 7, "name": "ada" } }),
             signed_by: None,
             signature: None,
         };
-        wisp().sign_result(&mut result);
-        ferryman_channel::claim_order(&route, "back", "wisp").unwrap();
+        fang().sign_result(&mut result);
+        ferryman_channel::claim_order(&route, "back", "fang").unwrap();
         ferryman_channel::submit_result(&route, &result).unwrap();
         assert_eq!(run(), 1);
-        assert!(data::read(&route, "user-api@1", 1, Trigger::ContractLock).is_some());
+        assert!(data::read(&route, "user-api@1", 1, Trigger::ContractLock, "wisp").is_some());
         assert_eq!(run(), 0);
     }
 
@@ -2413,7 +2695,7 @@ mod tests {
             )),
             1
         );
-        let finding = data::read(&route, "user-api@1", 1, Trigger::ContractLock).unwrap();
+        let finding = data::read(&route, "user-api@1", 1, Trigger::ContractLock, "wisp").unwrap();
         assert_eq!(finding.verdict, Verdict::Block, "the shape check is a fact");
         assert!(
             finding
@@ -2426,14 +2708,16 @@ mod tests {
         assert_eq!(finding.engine, "qwen");
         // Blocking mode: the lock is refused until the master overrides.
         set_mode(&route, AdversaryMode::Blocking);
-        let error = ferryman_channel::interface::lock(&route, "user-api", "1", "josh", &josh())
-            .unwrap_err()
-            .to_string();
+        let seen = ferryman_channel::interface::current_digest(&route, "user-api", "1").unwrap();
+        let error =
+            ferryman_channel::interface::lock(&route, "user-api", "1", &seen, "josh", &josh())
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("blocks locking"), "{error}");
         // Advisory: it locks.
         set_mode(&route, AdversaryMode::Advisory);
         assert!(
-            ferryman_channel::interface::lock(&route, "user-api", "1", "josh", &josh())
+            ferryman_channel::interface::lock(&route, "user-api", "1", &seen, "josh", &josh())
                 .unwrap()
                 .is_locked()
         );

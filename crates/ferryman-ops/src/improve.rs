@@ -954,12 +954,22 @@ pub fn request_merges(route: &ProjectRoute, config: &AgentConfig) -> Result<usiz
                 "the adversary blocked it ({})",
                 block.finding.describe()
             ));
+        } else if auto
+            && let Some(why) =
+                ferryman_channel::adversary::merge_refusal(route, &policy, &task.order.id, revision)
+        {
+            // `blocking` mode never merges past a revision no eligible adversary read.
+            why_not_auto = Some(why);
         } else if auto {
             use ferryman_channel::automerge::{self, Stage};
             match automerge::stage(route, &task.order.id, revision) {
                 Stage::Open => {
-                    automerge::authorize(route, &identity, &task)?;
-                    continue;
+                    match automerge::authorize(route, &identity, &task) {
+                        Ok(_) => continue,
+                        // Refused (the order's contract, the adversary): the master decides,
+                        // and is told why, rather than the whole pass failing.
+                        Err(error) => why_not_auto = Some(format!("{error:#}")),
+                    }
                 }
                 Stage::Merged(_) => continue,
                 Stage::Authorized(record)
@@ -3196,6 +3206,11 @@ mod tests {
         AgentIdentity::from_seed("wisp", [7; 32])
     }
 
+    /// The adversary: an agent that did not build the work, whose signed inventory lists qwen.
+    fn fang() -> AgentIdentity {
+        AgentIdentity::from_seed("fang", [5; 32])
+    }
+
     /// A git workspace on `main` - a library, its tests, docs and a lockfile, with the
     /// channel inside it as on a real machine - josh its master and wisp its worker, and
     /// the engine policy auto-merging low-risk work when `auto`.
@@ -3209,6 +3224,39 @@ mod tests {
             public_key: Some(josh().public_key_hex()),
             encryption_key: None,
         });
+        let adversary = ferryman_channel::AgentRoute {
+            name: "fang".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(fang().public_key_hex()),
+            encryption_key: None,
+        };
+        ferryman_channel::register_agent(&route, &adversary).unwrap();
+        route.agents.push(adversary);
+        ferryman_channel::receipts::refresh_engines(
+            &route,
+            &fang(),
+            "grouchly",
+            "0.0.0",
+            vec![ferryman_channel::receipts::EngineReport {
+                name: "qwen".into(),
+                kind: "http".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                state: "up".into(),
+                until: None,
+                reason: None,
+                latency_ms: None,
+                balance: None,
+                checked_at: None,
+                trust: None,
+                billing: None,
+                class: None,
+            }],
+            Utc::now(),
+        )
+        .unwrap();
         let repo = route.workspace.clone();
         git(&repo, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(repo.join("src")).unwrap();
@@ -3251,6 +3299,18 @@ mod tests {
         engine_key: bool,
         master_key: bool,
     ) -> String {
+        built_with(route, id, files, engine_key, master_key, None)
+    }
+
+    /// [`built`] for an order that requires its result to carry what `result_contract` says.
+    fn built_with(
+        route: &ProjectRoute,
+        id: &str,
+        files: &[(&str, &str)],
+        engine_key: bool,
+        master_key: bool,
+        result_contract: Option<ferryman_channel::contract::ResultContract>,
+    ) -> String {
         let repo = route.workspace.clone();
         let branch = ferryman_channel::worktree::branch_name(id, "wisp");
         git(&repo, &["branch", &branch, "main"]);
@@ -3284,7 +3344,7 @@ mod tests {
             depends_on: Vec::new(),
             signed_by: None,
             signature: None,
-            result_contract: None,
+            result_contract,
             interface: None,
             touches: Vec::new(),
             allow_overlap: false,
@@ -3622,7 +3682,7 @@ mod tests {
         );
         adversary::record(
             &route,
-            &wisp(),
+            &fang(),
             AdversaryFinding {
                 order_id: id.into(),
                 revision: 1,
@@ -3677,11 +3737,13 @@ mod tests {
         assert!(adversary::unresolved_block(&route, &policy, id, 1).is_some());
 
         // The master overrides it: now it is an ordinary low-risk merge.
+        let seen = adversary::finding_seen(&route, id, 1, Trigger::PreDone);
         adversary::override_block(
             &route,
             id,
             1,
             Trigger::PreDone,
+            &seen,
             Some("docs only"),
             "josh",
             &josh(),
@@ -3690,6 +3752,123 @@ mod tests {
         assert!(adversary::unresolved_block(&route, &policy, id, 1).is_none());
         assert_eq!(merges(&route, &config), 1);
         assert_ne!(git(&repo, &["rev-parse", "main"]), main, "merged");
+    }
+
+    /// A result that breaks its order's contract is not merged on its own, whatever else
+    /// says yes: the master's click is refused, the engine's key does not count, and an
+    /// authorization a peer wrote for it merges nothing.
+    #[test]
+    fn auto_merge_never_carries_a_result_that_breaks_its_orders_contract() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let repo = route.workspace.clone();
+        let main = git(&repo, &["rev-parse", "main"]);
+        let id = "improve-2026-w40-12";
+        let tip = built_with(
+            &route,
+            id,
+            &[("README.md", "# demo\n\nMore.\n")],
+            false,
+            false,
+            Some(ferryman_channel::contract::ResultContract {
+                required: vec!["summary".into()],
+                schema: None,
+            }),
+        );
+        ferryman_channel::gate::record_engine_review(
+            &route,
+            &wisp(),
+            ferryman_channel::gate::EngineReview {
+                order_id: id.into(),
+                revision: 1,
+                reviewer: "wisp".into(),
+                machine: "grouchly".into(),
+                engine: "deepseek".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                host: None,
+                route: Vec::new(),
+                accept: true,
+                summary: "does what it says".into(),
+                reviewed_at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+        let error =
+            ferryman_channel::gate::decide(&route, id, true, None, "josh", &josh()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("breaks the order's contract")
+                || format!("{error:#}").contains("review engine has not reviewed it"),
+            "{error:#}"
+        );
+        forge_authorization(&route, id, &tip);
+        let tasks = ferryman_channel::list_tasks(&route).unwrap();
+        assert!(ferryman_channel::automerge::authorize(&route, &wisp(), &tasks[0]).is_err());
+        assert_eq!(merges(&route, &config), 0);
+        assert_eq!(git(&repo, &["rev-parse", "main"]), main, "main untouched");
+    }
+    /// In `blocking` mode auto-merge fails closed: both keys are not enough until an eligible
+    /// adversary - one that did not build the work - has read exactly this revision. The
+    /// builder's own Pass does not count.
+    #[test]
+    fn auto_merge_in_blocking_mode_waits_for_an_adversary_that_did_not_build_the_work() {
+        use ferryman_channel::adversary::{self, AdversaryFinding, Trigger, Verdict};
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = merge_fixture(dir.path(), true);
+        let id = "improve-2026-w40-11";
+        built(
+            &route,
+            id,
+            &[("README.md", "# demo\n\nMore.\n")],
+            true,
+            true,
+        );
+        assert!(
+            ferryman_channel::policy::set_policy(
+                &route.communications,
+                &route.project_id,
+                Some(Policy {
+                    auto_merge: ferryman_channel::policy::AutoMerge::LowRisk,
+                    adversary: ferryman_channel::policy::AdversaryMode::Blocking,
+                    ..Policy::default()
+                }),
+                &josh(),
+            )
+            .unwrap()
+        );
+        let pass = |engine: &str| AdversaryFinding {
+            order_id: id.into(),
+            revision: 1,
+            trigger: Trigger::PreDone,
+            subject: id.into(),
+            engine: engine.into(),
+            model: None,
+            machine: "grouchly".into(),
+            same_engine: false,
+            verdict: Verdict::Pass,
+            findings: Vec::new(),
+            created_at: Utc::now(),
+            signed_by: String::new(),
+            signature: String::new(),
+        };
+        let tasks = ferryman_channel::list_tasks(&route).unwrap();
+        // No adversary has read it: nothing is authorized, and nothing merges.
+        let error = ferryman_channel::automerge::authorize(&route, &wisp(), &tasks[0])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not hold both keys"), "{error}");
+        assert_eq!(merges(&route, &config), 0);
+        // The builder's own Pass is not an adversary's.
+        adversary::record(&route, &wisp(), pass("qwen")).unwrap();
+        assert!(ferryman_channel::automerge::authorize(&route, &wisp(), &tasks[0]).is_err());
+        // An agent that did not build it, with a signed inventory listing the engine, reads it.
+        adversary::record(&route, &fang(), pass("qwen")).unwrap();
+        assert!(ferryman_channel::automerge::authorize(&route, &wisp(), &tasks[0]).is_ok());
     }
 
     /// With the adversary off, a Block on file means nothing to auto-merge.
@@ -3709,7 +3888,7 @@ mod tests {
         );
         adversary::record(
             &route,
-            &wisp(),
+            &fang(),
             AdversaryFinding {
                 order_id: id.into(),
                 revision: 1,

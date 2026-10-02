@@ -4137,6 +4137,19 @@ async fn judge(
         };
         return record_verdict(route, config, identity, &id, revision, &verdict, report);
     }
+    // The order's contract is as deterministic as the evidence: a result that lacks what the
+    // order requires, or whose response does not fit the locked interface it provides, is
+    // sent back without a model - and could not be accepted by any path if a model said so.
+    if let Some(why) = task.contract_refusal(route, revision) {
+        let verdict = Verdict {
+            accept: false,
+            reasoning: format!(
+                "Sent back on the order's contract, not a model's opinion - {why}. Change the \
+                 result so it carries what the contract asks for."
+            ),
+        };
+        return record_verdict(route, config, identity, &id, revision, &verdict, report);
+    }
     let (credentials, key) = engine_credentials(route, config)?;
     // The reviewer sees the same peer roster, so it too can flag when another
     // agent was better suited to the work it is judging.
@@ -5935,7 +5948,8 @@ mod tests {
         assert_eq!(holds[0].at, before, "an unchanged reason is not rewritten");
 
         // Locked: the hold is cleared and the order is claimed.
-        ferryman_channel::interface::lock(&route, "user-api", "1", "boss", &boss()).unwrap();
+        let seen = ferryman_channel::interface::current_digest(&route, "user-api", "1").unwrap();
+        ferryman_channel::interface::lock(&route, "user-api", "1", &seen, "boss", &boss()).unwrap();
         work_once(&route, &config, &crate::Silent).await.unwrap();
         let task = ferryman_channel::read_task(&route, "t-ui").unwrap();
         assert_eq!(task.claims.len(), 1, "it runs once the contract is locked");
@@ -6092,7 +6106,8 @@ mod tests {
         );
 
         propose_user_api(&route);
-        ferryman_channel::interface::lock(&route, "user-api", "1", "boss", &boss()).unwrap();
+        let seen = ferryman_channel::interface::current_digest(&route, "user-api", "1").unwrap();
+        ferryman_channel::interface::lock(&route, "user-api", "1", &seen, "boss", &boss()).unwrap();
         let text = contract_prompt(&route, &consumer);
         assert!(text.contains("user-api@1"), "{text}");
         assert!(text.contains("\"integer\""), "{text}");
@@ -6628,6 +6643,69 @@ mod tests {
         );
     }
 
+    /// The automatic review (`review = "auto"`) holds a result to its order's contract
+    /// before a model is asked: a judge that would accept anything cannot accept a result
+    /// that lacks what the order requires, and it is sent back with the contract's words.
+    /// The same judge does accept the result that carries it.
+    #[tokio::test]
+    async fn the_automatic_review_cannot_accept_a_result_that_breaks_its_orders_contract() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-seed", LIAR);
+        let boss = AgentIdentity::from_seed("boss", [9; 32]);
+        for id in ["t-short", "t-whole"] {
+            let mut order = order(id);
+            order.project_id = route.project_id.clone();
+            order.issued_by = "boss".into();
+            order.assigned_to = None;
+            order.requires_review = true;
+            order.result_contract = Some(ferryman_channel::contract::ResultContract {
+                required: vec!["summary".into()],
+                schema: None,
+            });
+            boss.sign_order(&mut order);
+            ferryman_channel::issue_order(&route, &order).unwrap();
+            ferryman_channel::claim_order(&route, id, "boss").unwrap();
+            let mut result = ferryman_channel::TaskResult {
+                order_id: id.into(),
+                agent: "boss".into(),
+                revision: 1,
+                submitted_at: chrono::Utc::now(),
+                payload: if id == "t-whole" {
+                    json!({ "output": "done", "summary": "added the retry" })
+                } else {
+                    json!({ "output": "done" })
+                },
+                signed_by: None,
+                signature: None,
+            };
+            boss.sign_result(&mut result);
+            ferryman_channel::submit_result(&route, &result).unwrap();
+        }
+        let reviewer = config.with_engine(&judge_engine(
+            r#"{"accept": true, "reasoning": "looks right"}"#,
+        ));
+        let judged = review_where(&route, &reviewer, &crate::Silent, |task| {
+            task.order.id.starts_with("t-s") || task.order.id.starts_with("t-w")
+        })
+        .await
+        .unwrap();
+        assert_eq!(judged, 2);
+
+        let short = ferryman_channel::read_task(&route, "t-short").unwrap();
+        assert!(!short.reviews[0].accepted, "{:?}", short.reviews);
+        let notes = short.reviews[0].notes.as_deref().unwrap();
+        assert!(
+            notes.contains("order's contract") && notes.contains("summary"),
+            "{notes}"
+        );
+        assert_eq!(
+            short.state(),
+            ferryman_channel::TaskState::ChangesRequested { revision: 2 }
+        );
+        let whole = ferryman_channel::read_task(&route, "t-whole").unwrap();
+        assert!(whole.reviews[0].accepted, "{:?}", whole.reviews);
+    }
     #[tokio::test]
     async fn a_demoted_engine_gets_build_work_back_only_by_passing_the_canary() {
         use crate::engines::{self, Tier};
