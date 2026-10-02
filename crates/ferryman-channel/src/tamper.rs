@@ -44,6 +44,9 @@ pub enum Kind {
     LoosenedTolerance,
     MovedTests,
     CheckConfig,
+    /// Part of the diff was too large to read, or could not be read. A fact about the scan
+    /// rather than the diff: what it did not read, it did not clear.
+    Unscanned,
 }
 
 impl Kind {
@@ -58,6 +61,7 @@ impl Kind {
             Self::LoosenedTolerance => "a tolerance was loosened",
             Self::MovedTests => "tests were moved out of the checked paths",
             Self::CheckConfig => "the check itself was changed",
+            Self::Unscanned => "part of the diff was not scanned",
         }
     }
 }
@@ -141,6 +145,17 @@ impl FileDiff {
             .flat_map(|hunk| hunk.lines.iter())
             .filter(|(mark, _)| *mark == '+')
             .map(|(_, line)| line.as_str())
+    }
+
+    /// Whether this is test code, by its path or by the Rust test module around the change.
+    /// Stricter than [`Self::looks_like_tests`]: a function's *name* is not evidence here,
+    /// or a production `fn test_connection` would make its file a test file.
+    fn in_test_code(&self) -> bool {
+        is_test_source(&self.path)
+            || self.hunks.iter().any(|hunk| {
+                marks_test_module(&hunk.header)
+                    || hunk.lines.iter().any(|(_, line)| marks_test_module(line))
+            })
     }
 
     /// Whether anything in the file's diff - a line, or a hunk header's function context -
@@ -233,6 +248,64 @@ pub fn is_test_path(path: &str) -> bool {
         || name.ends_with("tests.cs")
 }
 
+/// Directories that hold what tests read - fixtures, snapshots, data - rather than tests.
+const FIXTURE_DIRS: &[&str] = &[
+    "fixtures",
+    "fixture",
+    "__fixtures__",
+    "testdata",
+    "test_data",
+    "__snapshots__",
+    "snapshots",
+    "__mocks__",
+    "golden",
+    "data",
+    "resources",
+    "assets",
+];
+
+/// File extensions of code that can hold a test.
+const CODE_EXTS: &[&str] = &[
+    "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "go", "java", "kt", "kts", "scala", "cs",
+    "rb", "php", "c", "cc", "cpp", "h", "hpp", "swift", "ex", "exs", "lua", "dart", "zig", "sh",
+    "bash", "ps1", "bats",
+];
+
+/// Whether a path is a test *file*: a test path holding code. A fixture, a snapshot or a
+/// data file under `tests/` or `testdata/` is read by tests and is not one, so deleting it
+/// is not deleting a test.
+#[must_use]
+pub fn is_test_source(path: &str) -> bool {
+    if !is_test_path(path) {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    let name = file_name(&lower);
+    let code = name
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| CODE_EXTS.contains(&ext));
+    code && !lower.split('/').any(|part| FIXTURE_DIRS.contains(&part))
+}
+
+/// A line that opens or marks Rust test code, the one place a function's name alone
+/// does not say whether it is a test.
+fn marks_test_module(line: &str) -> bool {
+    let line = line.trim();
+    line.contains("#[cfg(test)]") || line.contains("mod tests") || is_test_attribute(line)
+}
+
+/// Whether `text` holds `word` as a whole word: not part of a longer identifier.
+fn has_word(text: &str, word: &str) -> bool {
+    let bytes = text.as_bytes();
+    let ident = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    text.match_indices(word).any(|(at, found)| {
+        let before = at == 0 || !ident(bytes[at - 1]);
+        let end = at + found.len();
+        let after = end >= bytes.len() || !ident(bytes[end]);
+        before && after
+    })
+}
+
 fn is_docs(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     ["md", "txt", "rst", "adoc", "markdown"]
@@ -293,7 +366,8 @@ fn test_decl(line: &str) -> Option<String> {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            if name.starts_with("test") || name.ends_with("_test") {
+            // `test_x`, `x_test`: a name that says so, not `testnet_config`.
+            if name == "test" || name.starts_with("test_") || name.ends_with("_test") {
                 return Some(name);
             }
         }
@@ -304,7 +378,7 @@ fn test_decl(line: &str) -> Option<String> {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_')
                 .collect();
-            if name.starts_with("test") {
+            if name == "test" || name.starts_with("test_") {
                 return Some(name);
             }
         }
@@ -397,10 +471,13 @@ fn names(list: &[String]) -> String {
 
 /// The names of the test functions `lines` declare: those named like tests, and those an
 /// attribute (`#[test]`) marks - read from the function line that follows it.
-fn declared(lines: &[&str]) -> Vec<String> {
+///
+/// A function is read as a test by its name only in test code (`in_tests`): a name is no
+/// proof outside it. An attribute (`#[test]`) is proof anywhere.
+fn declared(lines: &[&str], in_tests: bool) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        let found = test_decl(line).or_else(|| {
+        let found = test_decl(line).filter(|_| in_tests).or_else(|| {
             if !is_test_attribute(line) {
                 return None;
             }
@@ -434,7 +511,8 @@ fn deleted_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
         .map(|file| file_name(&file.path))
         .collect();
     for file in files {
-        if file.deleted && is_test_path(&file.path) && !is_docs(&file.path) {
+        // A fixture or data file under a test directory is not a test file.
+        if file.deleted && is_test_source(&file.path) && !is_docs(&file.path) {
             if added_elsewhere.contains(file_name(&file.path)) {
                 continue;
             }
@@ -451,8 +529,9 @@ fn deleted_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
         }
         let removed: Vec<&str> = file.removed().collect();
         let added: Vec<&str> = file.added_lines().collect();
-        let gone = declared(&removed);
-        let back = declared(&added);
+        let in_tests = file.in_test_code();
+        let gone = declared(&removed, in_tests);
+        let back = declared(&added, in_tests);
         // A moved or renamed test comes back under the same or another name: only the
         // surplus counts, and an annotation (`#[test]`) with no function line is read the
         // same way.
@@ -534,12 +613,75 @@ const DISABLERS: &[&str] = &[
     "xit(",
     "xdescribe(",
     "xtest(",
-    ".only(",
-    "t.skip(",
-    "t.skipf(",
-    "@disabled",
-    "@ignore",
 ];
+
+/// Markers that mean "this test is off" only inside test code: `.only(`, `@Ignore` and the
+/// like are ordinary words and calls elsewhere.
+const TEST_CODE_DISABLERS: &[&str] = &[".only(", "t.skip(", "t.skipf(", "@disabled", "@ignore"];
+
+/// Whether the text of `line` before byte `at` leaves `at` in code: not inside a string
+/// literal and not after a comment marker. Cheap and line-local, so it can be fooled by a
+/// multi-line string or block comment; it exists to stop `"#[ignore]"` in a message or
+/// `// it.skip(` in a comment from reading as a test being switched off.
+fn in_code(line: &str, at: usize, rust: bool) -> bool {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut previous = '\0';
+    for (index, c) in line.char_indices() {
+        if index >= at {
+            break;
+        }
+        if let Some(open) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == open {
+                quote = None;
+            }
+        } else {
+            match c {
+                '"' | '`' => quote = Some(c),
+                // A lifetime or a char literal in Rust, a string everywhere else.
+                '\'' if !rust => quote = Some(c),
+                '/' if previous == '/' => return false,
+                '#' => {
+                    let next = line[index + 1..].chars().next();
+                    if !matches!(next, Some('[' | '!')) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+        previous = c;
+    }
+    quote.is_none() && !line.trim_start().starts_with("/*") && !line.trim_start().starts_with("* ")
+}
+
+/// The first marker in `lower` (a lower-cased line) that switches a test off, where it is
+/// code. `@`-annotations must end on a word boundary, so `@ignored_for_now` is not `@ignore`.
+fn disabling_marker(lower: &str, in_tests: bool, rust: bool) -> Option<&'static str> {
+    let bytes = lower.as_bytes();
+    let markers: Vec<&'static str> = if in_tests {
+        DISABLERS
+            .iter()
+            .chain(TEST_CODE_DISABLERS)
+            .copied()
+            .collect()
+    } else {
+        DISABLERS.to_vec()
+    };
+    markers.into_iter().find(|marker| {
+        lower.match_indices(marker).any(|(at, _)| {
+            let end = at + marker.len();
+            let boundary = !marker.starts_with('@')
+                || end >= bytes.len()
+                || !(bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_');
+            boundary && in_code(lower, at, rust)
+        })
+    })
+}
 
 /// Assertions that cannot fail.
 const TRIVIAL: &[&str] = &[
@@ -567,13 +709,15 @@ fn disabled_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
             .collect();
         let mut disabled: Vec<String> = Vec::new();
         let mut trivial: Vec<String> = Vec::new();
+        let in_tests = file.looks_like_tests();
+        let rust = file.path.to_ascii_lowercase().ends_with(".rs");
         for line in file.added_lines() {
             let lower = line.trim().to_ascii_lowercase();
             // A line that was already there and only moved is not new.
             if removed.contains(&lower) {
                 continue;
             }
-            if DISABLERS.iter().any(|marker| lower.contains(marker)) {
+            if disabling_marker(&lower, in_tests, rust).is_some() {
                 disabled.push(line.trim().to_string());
             } else if TRIVIAL.iter().any(|marker| lower.starts_with(marker)) {
                 trivial.push(line.trim().to_string());
@@ -607,10 +751,103 @@ fn disabled_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
 }
 
 /// Words that make a command line a check rather than something else.
+///
+/// Whole words, not substrings: `ci` is `npm ci`, not the middle of `specific`. The broad
+/// words that decide nothing alone (`build`, `make`, `go`) are there only in the phrases
+/// that run a check.
 const CHECK_WORDS: &[&str] = &[
-    "test", "check", "lint", "clippy", "pytest", "jest", "mocha", "vitest", "cargo", "npm", "yarn",
-    "pnpm", "make", "tox", "go ", "build", "ci", "fmt", "verify",
+    "test",
+    "tests",
+    "check",
+    "lint",
+    "clippy",
+    "pytest",
+    "unittest",
+    "jest",
+    "mocha",
+    "vitest",
+    "nextest",
+    "cargo",
+    "npm",
+    "yarn",
+    "pnpm",
+    "tox",
+    "ci",
+    "fmt",
+    "verify",
+    "go test",
+    "go vet",
+    "make test",
+    "make check",
+    "make lint",
+    "make ci",
 ];
+
+/// The words that say a step *is* a test or a check, narrower than [`CHECK_WORDS`]: an
+/// install or a cache step is not one, however many times it says `npm`.
+const STEP_CHECK_WORDS: &[&str] = &[
+    "test", "tests", "check", "lint", "clippy", "pytest", "unittest", "jest", "mocha", "vitest",
+    "nextest", "tox", "fmt", "verify", "go vet",
+];
+
+fn is_check_line(lower: &str) -> bool {
+    CHECK_WORDS.iter().any(|word| has_word(lower, word))
+}
+
+/// The lines of the YAML step that the line at `at` in `lines` belongs to, as far as the
+/// hunk shows them: the nearest `- ` item above it that is less indented, down to the next
+/// item or less-indented line.
+fn step_lines(lines: &[(char, String)], at: usize) -> Vec<String> {
+    let indent = |text: &str| text.len() - text.trim_start().len();
+    let mine = indent(&lines[at].1);
+    let mut start = at;
+    while start > 0 {
+        let above = &lines[start - 1].1;
+        if above.trim().is_empty() {
+            break;
+        }
+        let level = indent(above);
+        if level < mine {
+            if above.trim_start().starts_with("- ") {
+                start -= 1;
+            }
+            break;
+        }
+        start -= 1;
+    }
+    let mut end = at + 1;
+    while end < lines.len() {
+        let below = &lines[end].1;
+        if below.trim().is_empty() || indent(below) < mine {
+            break;
+        }
+        end += 1;
+    }
+    lines[start..end]
+        .iter()
+        .map(|(_, text)| text.trim().trim_start_matches("- ").to_ascii_lowercase())
+        .collect()
+}
+
+/// Whether `continue-on-error: true`, added at `at` in a hunk, sits on a step that runs
+/// tests or checks. A step the hunk shows to be something else - a cache, a checkout, an
+/// install - is not a check made unable to fail. A step the hunk does not show enough of to
+/// tell is read as a check: the safe way to be wrong.
+fn continue_on_error_is_on_a_check(lines: &[(char, String)], at: usize) -> bool {
+    let step = step_lines(lines, at);
+    let described: Vec<&String> = step
+        .iter()
+        .filter(|line| {
+            ["run:", "uses:", "name:"]
+                .iter()
+                .any(|key| line.starts_with(key))
+        })
+        .collect();
+    described.is_empty()
+        || described
+            .iter()
+            .any(|line| STEP_CHECK_WORDS.iter().any(|word| has_word(line, word)))
+}
 
 fn forced_passes(files: &[FileDiff], hits: &mut Vec<Hit>) {
     for file in files {
@@ -622,17 +859,30 @@ fn forced_passes(files: &[FileDiff], hits: &mut Vec<Hit>) {
             .map(|l| l.trim().to_ascii_lowercase())
             .collect();
         let mut forced: Vec<String> = Vec::new();
-        for line in file.added_lines() {
-            let lower = line.trim().to_ascii_lowercase();
-            if removed.contains(&lower) {
-                continue;
-            }
-            let checks = CHECK_WORDS.iter().any(|word| lower.contains(word));
-            let bypass = ["|| true", "|| exit 0", "; exit 0", "&& exit 0", "|| :"]
+        for hunk in &file.hunks {
+            // The file as the change leaves it: what a step looks like now, not what it was.
+            let current: Vec<(char, String)> = hunk
+                .lines
                 .iter()
-                .any(|marker| lower.contains(marker));
-            if (bypass && checks) || lower.starts_with("continue-on-error: true") {
-                forced.push(line.trim().to_string());
+                .filter(|(mark, _)| *mark != '-')
+                .cloned()
+                .collect();
+            for (at, (mark, line)) in current.iter().enumerate() {
+                if *mark != '+' {
+                    continue;
+                }
+                let lower = line.trim().to_ascii_lowercase();
+                if removed.contains(&lower) {
+                    continue;
+                }
+                let bypass = ["|| true", "|| exit 0", "; exit 0", "&& exit 0", "|| :"]
+                    .iter()
+                    .any(|marker| lower.contains(marker));
+                let forced_step = lower.starts_with("continue-on-error: true")
+                    && continue_on_error_is_on_a_check(&current, at);
+                if (bypass && is_check_line(&lower)) || forced_step {
+                    forced.push(line.trim().to_string());
+                }
             }
         }
         if !forced.is_empty() {
@@ -805,11 +1055,17 @@ fn loosened_tolerances(files: &[FileDiff], hits: &mut Vec<Hit>) {
 }
 
 /// Test-runner options that narrow what is run.
-const NARROWERS: &[&str] = &[
+const NARROWER_FLAGS: &[&str] = &[
     "--ignore",
+    "--ignore-glob",
     "--deselect",
     "--no-run",
     "--exclude",
+    "--skip",
+];
+
+/// Settings and expressions that narrow what a runner collects, found anywhere on a line.
+const NARROWER_SETTINGS: &[&str] = &[
     "norecursedirs",
     "testpathignorepatterns",
     "modulepathignorepatterns",
@@ -819,10 +1075,80 @@ const NARROWERS: &[&str] = &[
     "-m 'not",
 ];
 
+/// The commands that run tests. A narrowing flag on one of them narrows the tests.
+const RUNNERS: &[&str] = &[
+    "cargo test",
+    "cargo nextest",
+    "npm test",
+    "npm run test",
+    "yarn test",
+    "pnpm test",
+    "pytest",
+    "py.test",
+    "go test",
+    "jest",
+    "vitest",
+    "mocha",
+    "tox",
+    "nosetests",
+    "rspec",
+    "phpunit",
+    "dotnet test",
+    "mvn test",
+    "gradle test",
+    "ctest",
+    "make test",
+    "make check",
+    "bats",
+    "playwright test",
+    "cypress run",
+];
+
+/// The files that configure a test runner, where a setting that narrows the tests is as
+/// serious as a flag on the command.
+fn is_runner_config(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = file_name(&lower);
+    matches!(
+        name,
+        "pytest.ini" | "tox.ini" | "setup.cfg" | "pyproject.toml" | "package.json"
+    ) || name.starts_with("jest.config")
+        || name.starts_with("vitest.config")
+}
+
+fn is_runner_line(lower: &str) -> bool {
+    RUNNERS.iter().any(|runner| has_word(lower, runner))
+}
+
+/// The narrowing option on a (lower-cased) line. A flag counts as a whole argument -
+/// `--ignore`, `--ignore=dir` - so `npm ci --ignore-scripts` is not `--ignore`.
+fn narrower(lower: &str) -> Option<&'static str> {
+    let args: Vec<&str> = lower
+        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | '[' | ']'))
+        .collect();
+    NARROWER_FLAGS
+        .iter()
+        .find(|flag| {
+            let flag: &str = flag;
+            args.iter().any(|arg| {
+                *arg == flag
+                    || arg
+                        .strip_prefix(flag)
+                        .is_some_and(|rest| rest.starts_with('='))
+            })
+        })
+        .or_else(|| {
+            NARROWER_SETTINGS
+                .iter()
+                .find(|setting| lower.contains(*setting))
+        })
+        .copied()
+}
+
 fn moved_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
     for file in files {
         // A test file renamed to somewhere the checks do not look.
-        if file.renamed && is_test_path(&file.old_path) && !is_test_path(&file.path) {
+        if file.renamed && is_test_source(&file.old_path) && !is_test_path(&file.path) {
             hits.push(Hit {
                 kind: Kind::MovedTests,
                 severity: Severity::High,
@@ -838,7 +1164,7 @@ fn moved_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
     // file's name reappears outside the test paths.
     for gone in files
         .iter()
-        .filter(|file| file.deleted && is_test_path(&file.path))
+        .filter(|file| file.deleted && is_test_source(&file.path))
     {
         if let Some(back) = files.iter().find(|file| {
             file.added
@@ -870,11 +1196,15 @@ fn moved_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
             if removed.contains(&lower) {
                 continue;
             }
-            if let Some(marker) = NARROWERS.iter().find(|marker| lower.contains(*marker)) {
-                let checks = CHECK_WORDS.iter().any(|word| lower.contains(word));
+            if let Some(marker) = narrower(&lower) {
+                // On the command that runs the tests, or in the runner's own configuration,
+                // it narrows the tests. On any other command (`cargo clippy --exclude`) it
+                // narrows something else, and is worth a mention, not a Block.
+                let narrows_tests = is_runner_line(&lower)
+                    || (is_runner_config(&file.path) && NARROWER_SETTINGS.contains(&marker));
                 hits.push(Hit {
                     kind: Kind::MovedTests,
-                    severity: if checks {
+                    severity: if narrows_tests {
                         Severity::High
                     } else {
                         Severity::Medium
@@ -892,6 +1222,68 @@ fn moved_tests(files: &[FileDiff], hits: &mut Vec<Hit>) {
 /// which is how a check is recognised on a line however its flags change.
 fn command_head(argv: &[String]) -> String {
     argv.iter().take(2).cloned().collect::<Vec<_>>().join(" ")
+}
+
+/// Arguments that run fewer tests than the command did without them.
+const NARROWING_ARGS: &[&str] = &[
+    "--lib",
+    "--bins",
+    "--bin",
+    "--doc",
+    "--test",
+    "--package",
+    "--filter",
+    "--grep",
+    "-k",
+    "-m",
+];
+
+/// Arguments that make a command cover more; losing one narrows it.
+const WIDENING_ARGS: &[&str] = &["--workspace", "--all", "--all-targets", "--all-features"];
+
+/// Whether `new`, the rewrite of the check line `old`, is a weaker check, and how: it can
+/// no longer fail, it carries an argument that runs fewer tests, or it lost one that ran
+/// more. `None` for any other edit, such as adding `--locked`.
+fn weakened(old: &str, new: &str) -> Option<String> {
+    let (old, new) = (old.to_ascii_lowercase(), new.to_ascii_lowercase());
+    let bypasses = ["|| true", "|| exit 0", "; exit 0", "&& exit 0", "|| :"];
+    if let Some(marker) = bypasses
+        .iter()
+        .find(|marker| new.contains(**marker) && !old.contains(**marker))
+    {
+        return Some(format!("it can no longer fail: `{marker}`"));
+    }
+    let args = |line: &str| -> Vec<String> {
+        line.split_whitespace()
+            .map(|arg| {
+                arg.trim_matches(|c| matches!(c, '"' | '\'' | ','))
+                    .to_string()
+            })
+            .collect()
+    };
+    let (before, after) = (args(&old), args(&new));
+    let cargo = after
+        .first()
+        .is_some_and(|program| program.ends_with("cargo"))
+        || after.iter().any(|arg| arg == "cargo");
+    for arg in &after {
+        if before.contains(arg) {
+            continue;
+        }
+        let name = arg.split('=').next().unwrap_or(arg);
+        if NARROWER_FLAGS.contains(&name)
+            || NARROWING_ARGS.contains(&name)
+            || (cargo && name == "-p")
+        {
+            return Some(format!("it now runs only part of the tests: `{arg}`"));
+        }
+    }
+    for wide in WIDENING_ARGS {
+        if before.iter().any(|arg| arg == wide) && !after.iter().any(|arg| arg == wide) {
+            return Some(format!("it no longer runs everything: `{wide}` is gone"));
+        }
+    }
+    None
 }
 
 fn check_config(files: &[FileDiff], required: &[Vec<String>], hits: &mut Vec<Hit>) {
@@ -918,23 +1310,33 @@ fn check_config(files: &[FileDiff], required: &[Vec<String>], hits: &mut Vec<Hit
                 if same {
                     continue;
                 }
-                let rewritten = added.iter().find(|new| new.contains(&head));
+                let rewrites: Vec<&&str> = added.iter().filter(|new| new.contains(&head)).collect();
+                let detail = if rewrites.is_empty() {
+                    format!(
+                        "the line that runs the required check `{head}` was removed: `{}`",
+                        old.trim()
+                    )
+                } else {
+                    // Edited is not weakened: adding `--locked` leaves the check as strong
+                    // as it was. Only a rewrite that narrows it, or lets it fail, counts.
+                    let Some((new, why)) = rewrites
+                        .iter()
+                        .find_map(|new| weakened(old, new).map(|why| (**new, why)))
+                    else {
+                        continue;
+                    };
+                    format!(
+                        "the line that runs the required check `{head}` was rewritten and \
+                         weakened ({why}): `{}` became `{}`",
+                        old.trim(),
+                        new.trim()
+                    )
+                };
                 hits.push(Hit {
                     kind: Kind::CheckConfig,
                     severity: Severity::High,
                     file: file.path.clone(),
-                    detail: match rewritten {
-                        Some(new) => format!(
-                            "the line that runs the required check `{head}` was rewritten: \
-                             `{}` became `{}`",
-                            old.trim(),
-                            new.trim()
-                        ),
-                        None => format!(
-                            "the line that runs the required check `{head}` was removed: `{}`",
-                            old.trim()
-                        ),
-                    },
+                    detail,
                 });
                 break;
             }
@@ -1452,6 +1854,250 @@ mod tests {
             "latest/a.rs",
         ] {
             assert!(!is_test_path(path), "{path}");
+        }
+    }
+
+    // --- honest work the scan must leave alone ------------------------------------------
+
+    fn deleted_file(path: &str, body: &str) -> String {
+        let lines = body.lines().count();
+        let removed: String = body.lines().map(|line| format!("-{line}\n")).collect();
+        format!(
+            "diff --git a/{path} b/{path}\ndeleted file mode 100644\nindex 111..000\n--- a/{path}\n+++ /dev/null\n@@ -1,{lines} +0,0 @@\n{removed}"
+        )
+    }
+
+    #[test]
+    fn production_code_named_like_a_test_is_not_a_deleted_test() {
+        // `testnet_config` starts with "test"; it is configuration, not a test.
+        let production = modify(
+            "src/network.rs",
+            "@@ -1,6 +1,2 @@\n-pub fn testnet_config() -> Config {\n-    Config::testnet()\n-}\n-fn latest_test_vector() {}\n pub fn main() {}\n",
+        );
+        assert!(
+            scan(&production, &[]).is_empty(),
+            "{:?}",
+            scan(&production, &[])
+        );
+        // Nor is a `test_connection` helper in a production file.
+        let helper = modify(
+            "src/db.rs",
+            "@@ -1,4 +1,1 @@\n-pub fn test_connection() -> bool {\n-    true\n-}\n pub fn open() {}\n",
+        );
+        assert!(!kinds(&scan(&helper, &[])).contains(&Kind::DeletedTest));
+        // A removed python helper in an application file is not a deleted test either.
+        let python = modify(
+            "app/util.py",
+            "@@ -1,3 +1,1 @@\n-def test_mode():\n-    return False\n x = 1\n",
+        );
+        assert!(!kinds(&scan(&python, &[])).contains(&Kind::DeletedTest));
+        // The real thing, in the same files' test counterparts, still is.
+        let real = modify(
+            "tests/test_util.py",
+            "@@ -1,3 +1,1 @@\n-def test_mode():\n-    return False\n x = 1\n",
+        );
+        assert!(kinds(&scan(&real, &[])).contains(&Kind::DeletedTest));
+    }
+
+    #[test]
+    fn deleting_fixtures_and_data_under_test_directories_is_not_deleting_a_test_file() {
+        for path in [
+            "tests/fixtures/users.json",
+            "testdata/golden/out.txt",
+            "e2e/snapshots/login.snap",
+            "spec/data/sample.yml",
+            "tests/assets/logo.svg",
+            "tests/fixtures/helpers.rs",
+        ] {
+            let diff = deleted_file(path, "{\"a\": 1}\n{\"b\": 2}");
+            assert!(
+                scan(&diff, &[]).is_empty(),
+                "{path}: {:?}",
+                scan(&diff, &[])
+            );
+        }
+        // A real test file in a test directory still is one.
+        for path in ["e2e/login.spec.ts", "spec/user_spec.rb", "tests/api.rs"] {
+            let diff = deleted_file(path, "fn helper() {}");
+            let hits = scan(&diff, &[]);
+            assert_eq!(kinds(&hits), [Kind::DeletedTest], "{path}: {hits:?}");
+        }
+        assert!(is_test_source("tests/api.rs"));
+        assert!(!is_test_source("tests/fixtures/api.rs"));
+        assert!(!is_test_source("tests/data.json"));
+    }
+
+    #[test]
+    fn a_narrowing_flag_is_high_only_on_the_command_that_runs_the_tests() {
+        let ci = |line: &str| {
+            modify(
+                ".github/workflows/ci.yml",
+                &format!("@@ -5,3 +5,3 @@\n-      - run: x\n+      - run: {line}\n"),
+            )
+        };
+        // Not narrowers at all.
+        for line in ["npm ci --ignore-scripts", "pnpm install --ignore-engines"] {
+            assert!(
+                !kinds(&scan(&ci(line), &[])).contains(&Kind::MovedTests),
+                "{line}"
+            );
+        }
+        // A narrower on a command that is not the test runner is worth a mention only.
+        let clippy = scan(&ci("cargo clippy --workspace --exclude xtask"), &[]);
+        let hit = clippy.iter().find(|h| h.kind == Kind::MovedTests).unwrap();
+        assert_eq!(hit.severity, Severity::Medium, "{clippy:?}");
+        // On the runner it is the real thing.
+        for line in [
+            "cargo test --workspace --exclude xtask",
+            "pytest --ignore=tests/slow",
+            "pytest -k \"not slow\"",
+            "go test ./... --skip Flaky",
+        ] {
+            let hits = scan(&ci(line), &[]);
+            let hit = hits
+                .iter()
+                .find(|h| h.kind == Kind::MovedTests)
+                .unwrap_or_else(|| panic!("{line}: {hits:?}"));
+            assert_eq!(hit.severity, Severity::High, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_forced_pass_needs_a_check_as_a_whole_word_and_a_step_that_runs_one() {
+        // `specific` holds the letters "ci"; `make clean` and `go run` are not checks.
+        for (path, line) in [
+            ("scripts/setup.sh", "echo \"the specific thing\" || true"),
+            ("scripts/setup.sh", "make clean || true"),
+            ("scripts/gen.sh", "go run ./cmd/gen || true"),
+            ("scripts/gen.sh", "docker build . || true"),
+        ] {
+            let diff = modify(path, &format!("@@ -1,2 +1,3 @@\n a\n+{line}\n b\n"));
+            assert!(
+                !kinds(&scan(&diff, &[])).contains(&Kind::ForcedPass),
+                "{line}: {:?}",
+                scan(&diff, &[])
+            );
+        }
+        // `continue-on-error` on a step that caches, or checks out, or installs.
+        for step in [
+            "      - uses: actions/cache@v4\n+        continue-on-error: true\n         with:\n",
+            "      - name: Install tools\n         run: npm ci\n+        continue-on-error: true\n",
+            "      - name: Upload coverage\n         uses: codecov/codecov-action@v4\n+        continue-on-error: true\n",
+        ] {
+            let diff = modify(
+                ".github/workflows/ci.yml",
+                &format!("@@ -10,3 +10,4 @@\n{step}"),
+            );
+            assert!(
+                !kinds(&scan(&diff, &[])).contains(&Kind::ForcedPass),
+                "{step}: {:?}",
+                scan(&diff, &[])
+            );
+        }
+        // On a step that runs the tests, it is the real thing.
+        for step in [
+            "      - run: cargo test --workspace\n+        continue-on-error: true\n",
+            "      - name: Run tests\n+        continue-on-error: true\n         run: make all\n",
+            "      - name: Lint\n         run: cargo clippy\n+        continue-on-error: true\n",
+        ] {
+            let diff = modify(
+                ".github/workflows/ci.yml",
+                &format!("@@ -10,3 +10,4 @@\n{step}"),
+            );
+            assert!(
+                kinds(&scan(&diff, &[])).contains(&Kind::ForcedPass),
+                "{step}: {:?}",
+                scan(&diff, &[])
+            );
+        }
+    }
+
+    #[test]
+    fn editing_a_required_check_is_not_weakening_it() {
+        let rewrite = |new: &str| {
+            modify(
+                ".github/workflows/ci.yml",
+                &format!(
+                    "@@ -5,3 +5,3 @@\n-      - run: cargo test --workspace\n+      - run: {new}\n"
+                ),
+            )
+        };
+        // Stricter or just different: no hit.
+        for new in [
+            "cargo test --workspace --locked",
+            "cargo test --workspace --all-features",
+            "cargo test --workspace -- --nocapture",
+        ] {
+            assert!(
+                !kinds(&scan(&rewrite(new), &cargo_test())).contains(&Kind::CheckConfig),
+                "{new}"
+            );
+        }
+        // Weaker: a hit that says how.
+        for (new, how) in [
+            ("cargo test --workspace || true", "can no longer fail"),
+            ("cargo test --locked", "no longer runs everything"),
+            ("cargo test --workspace --lib", "only part of the tests"),
+            (
+                "cargo test --workspace -p ferryman-ops",
+                "only part of the tests",
+            ),
+            (
+                "cargo test --workspace --exclude xtask",
+                "only part of the tests",
+            ),
+        ] {
+            let hits = scan(&rewrite(new), &cargo_test());
+            let hit = hits
+                .iter()
+                .find(|h| h.kind == Kind::CheckConfig)
+                .unwrap_or_else(|| panic!("{new}: {hits:?}"));
+            assert_eq!(hit.severity, Severity::High);
+            assert!(hit.detail.contains(how), "{new}: {}", hit.detail);
+        }
+    }
+
+    #[test]
+    fn disabling_markers_count_in_test_code_and_not_in_strings_comments_or_plain_code() {
+        // Not tests being switched off.
+        for (path, line) in [
+            ("src/lib.rs", "    let first = items.only(3);"),
+            ("src/Main.java", "    @Ignore"),
+            ("src/lib.rs", "    println!(\"#[ignore] is set\");"),
+            ("src/lib.rs", "    // #[ignore] this when it flakes"),
+            ("web/a.test.js", "// it.skip('works', () => {})"),
+            ("web/a.test.js", "const note = \"describe.only( is rude\";"),
+            ("tests/test_a.py", "# @pytest.mark.skip(reason='later')"),
+            ("tests/test_a.py", "msg = \"use @pytest.mark.skip here\""),
+            ("src/FooTest.java", "    @IgnoredColumns"),
+        ] {
+            let diff = modify(
+                path,
+                &format!("@@ -1,2 +1,3 @@\n context\n+{line}\n more\n"),
+            );
+            assert!(
+                !kinds(&scan(&diff, &[])).contains(&Kind::DisabledTest),
+                "{line} in {path}: {:?}",
+                scan(&diff, &[])
+            );
+        }
+        // The real ones, in the places they mean something.
+        for (path, line) in [
+            ("src/lib.rs", "    #[ignore]"),
+            ("web/a.test.js", "describe.only('focus', () => {})"),
+            ("src/FooTest.java", "    @Disabled(\"later\")"),
+            ("src/FooTest.java", "    @Ignore"),
+            ("tests/test_a.py", "@pytest.mark.skip(reason=\"later\")"),
+        ] {
+            let diff = modify(
+                path,
+                &format!("@@ -1,2 +1,3 @@\n context\n+{line}\n more\n"),
+            );
+            assert!(
+                kinds(&scan(&diff, &[])).contains(&Kind::DisabledTest),
+                "{line} in {path}: {:?}",
+                scan(&diff, &[])
+            );
         }
     }
 }
