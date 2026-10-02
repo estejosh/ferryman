@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+Smart router, part 1: every engine now says what it can do, every order can say what it needs, and a deterministic classifier (with a cheap model as a fallback) works out the needs of orders that did not say.
+
+### Added
+
+- **Engine capability profiles.** Each engine has `modalities` (`text`, `code`, `vision`,
+  `image`, `video`, `audio-in`, `audio-out`, `embed`, plus any value a newer peer
+  publishes), `strengths`, `context_k`, `cost` and `local`. Declare them in `agent.toml`
+  (`engine.<name>.modalities`, `strengths`, `context_k`, `cost_per_call_usd`,
+  `cost_per_mtok_in_usd`, `cost_per_mtok_out_usd`, `local`); anything you leave out is
+  guessed from the engine's name, model, command and base URL, and a declared value always
+  beats a guess. An engine with no cost is *unpriced*, not free. Profiles are published in
+  the signed v2 engine inventory (the v1 signature is unchanged, so v0.5.17 peers still
+  verify the inventory), shown as a modalities column and `can:` line in `ferry engines`,
+  and as a "Can do" column and capabilities panel in the dashboard.
+- **`needs` on orders.** `ferry channel order --kind <kind> --needs <modalities>
+  --size <small|medium|large> --min-context-k <n>` states what an order needs. It is
+  signed with the order; orders that do not use it are byte-for-byte unchanged.
+- **Order classifier.** Explicit needs first, then deterministic rules over the task text,
+  attachments, file types and size (each rule has a confidence), then - only when the rules
+  are not sure - a model fallback. The result records its source (`explicit`, `rules`,
+  `model`), confidence and reasons.
+- **Model-assisted fallback.** The cheapest text engine answers, local preferred; a
+  subscription engine is used only when the policy's `subscription_roles` includes `chore`.
+  The verdict is cached per order id in a local, unsigned file under
+  `routing/classify/` (a synced file would have two writers); failures are retried after
+  an hour and never block the order.
+- **`ferry route classify <order>`** shows the needs, source, confidence and the reasons.
+- The dashboard shows each task's needs and, in the drawer, how they were decided.
+- **Docs:** a capability and routing section in `docs/ENGINE_SETUP.md`, including
+  ComfyUI, whisper and TTS engines as clearly marked examples.
+
 ## v0.5.18 - 2026-10-02
 
 A second model of your choice challenges the work at three moments - before a contract locks, when an order fails twice, and before an improvement is done - and in blocking mode nothing goes live until it has. Orders can share signed interface contracts and declare the files they touch, and a team preset runs cheap models in parallel swarms, including Claude Sonnet and Haiku when you opt a role in with a weekly cap.

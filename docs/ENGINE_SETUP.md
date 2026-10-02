@@ -678,6 +678,177 @@ its own schedule. On the dashboard the policy panel has the adversary engine and
 and a Block carries an Override button for the master; on the phone it is an "Override
 the Block" button, shown only for a Block.
 
+## What an engine can do, and what an order needs: capabilities and the work profile
+
+The smart router sends each piece of work to the cheapest engine that will most likely
+do it well. To do that it has to know two things: what each engine can do, and what
+each order needs. This section is the first half of that - the profiles. (Choosing
+between engines from them comes next; nothing here changes which engine runs an order.)
+
+### The engine's capability profile
+
+Every engine has a profile, published in the signed engine inventory and shown by
+`ferry engines` (the modalities column, and a `can:` line under each engine) and on the
+dashboard's Engines page:
+
+| Field | Meaning |
+| --- | --- |
+| `modalities` | What it takes in or makes: `text`; `code` (edits files in a worktree - only a `cli` engine can have it, so a declared `code` on an `http` engine is dropped); `vision` (reads images); `image`, `video` (generates or edits); `audio_in` (speech to text); `audio_out` (text to speech); `embed`. |
+| `strengths` | Free tags: `code`, `reasoning`, `docs`, `tests`, `review`, `translation`, `long-context`, `math`. |
+| `context_k` | The context window in thousands of tokens. |
+| `cost` | `per_call_usd`, `per_mtok_in_usd`, `per_mtok_out_usd`. Local, free-tier and subscription engines are zero (a subscription is zero marginal cost; its scarcity is the weekly cap's job). A prepaid engine nobody priced is **unknown**, not zero. |
+| `local` | Nothing leaves the machine or the private network. |
+
+**Your word wins, field by field.** Say any of it in `agent.toml` and that field is
+used as written - a declared `modalities` replaces the guessed list, it does not add to
+it. Whatever you leave out is guessed:
+
+```toml
+engine.vision.base_url = "http://localhost:1234/v1"
+engine.vision.model = "qwen2.5-vl-72b-instruct"
+engine.vision.modalities = ["text","vision"]        # or: text, vision
+engine.vision.strengths = ["docs","review"]
+engine.vision.context_k = "32"
+engine.vision.cost_per_call_usd = "0"
+engine.vision.cost_per_mtok_in_usd = "0"
+engine.vision.cost_per_mtok_out_usd = "0"
+engine.vision.local = "true"
+```
+
+**What is guessed**, from the engine's name, model and command, its kind, its endpoint
+and how it is paid for. Every rule below is a unit test:
+
+- A `cli` engine gets `text` and `code`; an `http` engine gets `text`.
+- `vl`, `vision` or `llava` in the name means `vision`. A `claude`, `gemini` or
+  `gpt-4o`/`gpt-4.1`/`gpt-5` CLI sees images too; an HTTP endpoint is not assumed to
+  from a family name alone.
+- `whisper` means `audio_in`; `tts`, `kokoro` or `piper` means `audio_out`.
+- `flux`, `sdxl`, `stable-diffusion` or `comfyui` means `image`; `wan`, `hunyuan-video`
+  or `ltx` means `video`; `embed` means `embed`. An engine named like one of these does
+  *only* that until you say otherwise: it is not also assumed to chat or edit code.
+- `coder`, `codestral`, `devstral`, `codellama` or `codex` is a `code` strength;
+  `reasoner`, `r1`, `o1`, `o3`, `qwq` or `thinking` is `reasoning`; `math` and
+  `translation`/`nllb` likewise. A context of 200k or more adds `long-context`.
+- Only a window written in the name (`-128k`, `-1m`) is guessed for `context_k`; a wrong
+  guess would shut an engine out of work it could do, so unknown stays unknown.
+- `local` is true when the endpoint's host is `localhost`, a `.local`/`.lan` name, a
+  loopback, private (10/8, 172.16/12, 192.168/16), link-local or Tailscale-range
+  (100.64/10) address, when it is `paid = "local"`, or when it is a media CLI with no
+  endpoint that nobody marked as paid. An agent CLI such as `claude` or `codex` is not
+  local: it calls out.
+
+The profile rides in the signed inventory as a v2-only field, like `class`: a v0.5.17
+peer still verifies the rest of the inventory, and a forged or stripped profile does not
+verify on a new one. A worker older than profiles publishes none, and `ferry engines`
+shows a guess for it marked `?`.
+
+### Media engines are ordinary cli engines
+
+Nothing special is needed for pictures, sound or video: an engine is a command that
+takes a prompt, and its modalities say what it makes. **The three below are examples
+only** - the command lines, flags, file names and model names are placeholders for
+whatever you have installed; check each tool's own documentation, and use `{prompt}`
+where your runner takes the work. None of them ships with Ferryman.
+
+```toml
+engines = ["claude", "comfy", "whisper", "speak"]
+
+# EXAMPLE ONLY: a ComfyUI workflow runner. "run-comfy-workflow" stands for a script of
+# yours that submits a workflow to a ComfyUI server and writes the image into the order's
+# worktree. The names say image, so it is guessed `image` only; declared here anyway.
+engine.comfy.command = "run-comfy-workflow"
+engine.comfy.args = ["--workflow","flux-dev.json","--prompt","{prompt}"]
+engine.comfy.model = "flux-dev"
+engine.comfy.modalities = ["image"]
+engine.comfy.paid = "local"
+
+# EXAMPLE ONLY: speech to text with a whisper CLI that prints a transcript. The model
+# name says whisper, so `audio_in` is guessed.
+engine.whisper.command = "whisper-cli"
+engine.whisper.args = ["--model","large-v3","--output-txt","{prompt}"]
+engine.whisper.model = "whisper-large-v3"
+engine.whisper.paid = "local"
+
+# EXAMPLE ONLY: text to speech with a piper-style CLI. `kokoro` or `tts` in the name
+# would be guessed `audio_out` as well.
+engine.speak.command = "piper-say"
+engine.speak.args = ["--voice","en_US-lessac","--text","{prompt}"]
+engine.speak.model = "piper-en-us"
+engine.speak.paid = "local"
+```
+
+`ferry engines` then lists them as `image`, `audio_in` and `audio_out`, and the router
+will never offer them text work or a chat engine an image job.
+
+### What an order needs
+
+`ferry route classify <order>` shows what an order needs and where that read came from.
+The profile has four parts: the **modalities** an engine must have, the **kind** of work
+(`code-change`, `docs`, `tests`, `review`, `plan`, `chore`, `research`, `translate`,
+`transcribe`, `image`, `video`, `audio` or `other`), its **size** (`small`, `medium`,
+`large`) and the **context** it wants (`min_context_k`). It is decided in this order,
+and the source is always recorded - `explicit`, `rules` or `model`:
+
+1. **Explicit.** Say it when you issue the order; it is signed into the order, so it
+   cannot be changed afterwards, and it wins over everything below:
+
+   ```sh
+   ferry channel order --id t-9 --task-file brief.md --kind docs --size small
+   ferry channel order --id t-10 --task "what is wrong in this screenshot?" \
+       --needs vision --kind review   # (--needs takes modalities)
+   ```
+
+   `--kind`, `--needs` (modalities, comma-separated or repeated), `--size` and
+   `--min-context-k` are all optional and independent: leave one out and the rules fill
+   it in. Orders issued without any of them are byte-for-byte what they always were and
+   verify as before.
+
+2. **Rules** - deterministic, no model. They read:
+   - *attachments and file types*: an order payload may carry `attachments` (or `files`,
+     `images`), each a path or URL or `{"path":..., "mime":...}`. Images need `vision`,
+     audio `audio_in`, video `video`; a media file named in the task text counts too;
+   - *the `touches` globs*: only docs (`docs/**`, `*.md`, `README*`) is `docs`, only
+     tests (`tests/**`, `*_test.rs`, `*.spec.ts`) is `tests`, any code leans
+     `code-change`;
+   - *verbs in the task text*: transcribe, translate, summarize, review, plan,
+     research, "generate an image", "render a video", "text to speech", "add unit
+     tests", "update the README", fix/implement/refactor, bump/tidy, and so on - the
+     table is `RULES` in `ferryman_channel::work`, one tested example each;
+   - *the order's tier*: `"tier": "chore"` is `chore`;
+   - *size*: about four characters a token over the task text plus attached text files
+     (measured by file size, never read), and how many files it means to touch; the
+     context wanted is that plus room to answer.
+
+   Evidence combines per kind; two kinds that both fire (`fix the typo in the README`)
+   lower the confidence. Code and tests need `code`, so only a `cli` engine can take
+   them; transcribe needs `audio_in`; image, video and audio jobs need only their media
+   modality; everything else needs `text`.
+
+3. **A model, only when the rules are unsure** (confidence under 0.55). One call to the
+   cheapest text engine, asking for a small JSON label. Which engine obeys the same
+   rules as any background work: the engine policy's `never` list, its `where`, weekly
+   caps, `protect_subscriptions` and `subscription_roles`; local engines go first, then
+   free tier, then by price. **A subscription engine is never used for this unless the
+   policy's `subscription_roles` includes `chore` and the engine has a weekly request
+   cap.** The reply can only choose among the known kinds and sizes (an invented kind
+   is refused), the order text is sent fenced as data with an instruction not to follow
+   it, and a model's stated confidence is capped. If nothing may be asked or the answer
+   is no use, the rules' best read is used and the reason is recorded.
+
+   The answer is cached per order id on the machine that asked, in
+   `<project attachment>/routing/classify/<order id>.json`. It is **local and not
+   signed**: it is advice derived from an order that is already signed, it is cheap to
+   redo, and keeping it off the synced channel means no second writer and nothing for a
+   peer to forge. Two machines may each pay for one call; an explicit `--kind` on the
+   order is how you make every machine agree. An unusable answer is remembered for an
+   hour so a model that cannot follow the format is not asked on every pass.
+
+`ferry route classify <order>` never calls an engine by itself: it prints the rules'
+read, or the cached model answer, with the reasons. `--model` asks now, as a worker
+would. `--json` prints the classification. The dashboard shows the same on each order
+card (kind, size, any modality beyond text; unsure ones are marked) and, with the
+reasons, in the order's detail.
+
 ## OmniRoute: a free gateway as an engine
 
 [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (MIT) is a self-hosted AI

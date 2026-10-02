@@ -155,8 +155,10 @@ paths:
         Whether the project's master has switched the weekly self-improvement loop
         (`ferry improve`) on, who signed that and when, the latest week the loop wrote
         anything for, and each worker's signed engine inventory (tier, how it is paid,
-        up, down or out of credit until when; never a credential). `may_set` is true
-        only when the person signed in is the master.
+        up, down or out of credit until when; never a credential). Each engine also
+        carries its `capabilities` (modalities, strengths, context_k, cost, local) when
+        its worker publishes a v2 inventory. `may_set` is true only when the person
+        signed in is the master.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
