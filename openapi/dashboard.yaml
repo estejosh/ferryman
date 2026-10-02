@@ -216,10 +216,14 @@ paths:
         the reason. `recommended` is what auto would sign, with one reason per choice.
         `may_set` is true only for the signed-in master. `adversary_mode` is what the adversary's findings do here: `off`, `advisory` (the
         default) or `blocking`; `effective.roles.adversary` is who challenges, in order.
+        Each role in `effective.roles` carries its `effort`, `width` (orders at once, null
+        for no cap) and whether subscriptions are allowed for it; each engine its size
+        `class`. `team` is the team preset as it would be signed now, with reasons, and
+        `warnings` lists any subscription the policy opens that has no weekly cap.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
-        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, self_improve, adversary_mode and may_set'}
+        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, team, warnings, efforts, self_improve, adversary_mode and may_set'}
         '401': {description: no active session}
     post:
       summary: The master signs an engine policy, or goes back to auto
@@ -308,6 +312,82 @@ paths:
       responses:
         '200': {description: 'how many changed, and per project: set, already, skipped or error'}
         '400': {description: nothing picked, an auto_merge that is neither none nor low-risk, or an adversary mode that is not off, advisory or blocking}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/engine-policy/team:
+    get:
+      summary: What the team preset would sign, with a reason per choice
+      description: >
+        "Plan on high, build on medium, swarm the cheap work": a large judge plans and
+        reviews at high effort, one at a time; mid-size engines build at medium effort,
+        three at once; the smallest do chores at low effort, four at once; the adversary
+        is a large judge of another model family than the top builder. Built from the
+        engines the fleet published. Subscriptions stay out of background work except for
+        the roles in `subscription_roles`, and then only an engine with a `weekly_requests`
+        cap. Nothing is signed. `subscription_roles` (comma-separated roles; absent keeps
+        the policy in force's), `width` (`build=4,chore=2`) and `effort` (`build=high`) try
+        other choices. The CLI equivalent is `ferry engines policy team`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+        - {name: subscription_roles, in: query, required: false, schema: {type: string}}
+        - {name: width, in: query, required: false, schema: {type: string}}
+        - {name: effort, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'policy, describe, reasons, warnings and effective'}
+        '400': {description: a role, width or effort that means nothing}
+        '401': {description: no active session}
+    post:
+      summary: The master signs the team preset
+      description: >
+        Signs the team preset as the project's policy, computed from each project's own
+        fleet, with the same optional choices as the GET. `all` does it in every project
+        the person is master of. The CLI equivalent is `ferry engines policy team
+        --accept`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subscription_roles: {type: array, items: {type: string, enum: [plan, build, review, chore, adversary]}}
+                width: {type: object, additionalProperties: {type: integer, minimum: 1, maximum: 255}}
+                effort: {type: object, additionalProperties: {type: string, enum: [low, medium, high]}}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: a width of 0, or a role or effort that means nothing}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/engine-policy/settings:
+    post:
+      summary: The master sets effort, width and subscription roles per role
+      description: >
+        `effort` is how hard a role thinks (`low`, `medium`, `high`); `width` is the most
+        orders of the role claimed at once across the fleet, with `null` removing the cap;
+        `subscription_roles` lists the roles whose background work may use a subscription,
+        and only one with a `weekly_requests` cap (`[]` clears it). The rest of the policy
+        is kept. `all` does it in every project the person is master of. The CLI equivalent
+        is `ferry engines policy set --effort role=level --width role=n
+        --allow-subscriptions-for role,...`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effort: {type: object, additionalProperties: {type: string, enum: [low, medium, high]}}
+                width: {type: object, additionalProperties: {type: integer, nullable: true, minimum: 1, maximum: 255}}
+                subscription_roles: {type: array, items: {type: string, enum: [plan, build, review, chore, adversary]}}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: nothing to set, a width of 0, or a role or effort that means nothing}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
   /api/improve/pending:

@@ -1084,6 +1084,7 @@ const POLICY_ROLES = ["plan", "build", "review", "chore", "adversary"];
    is chosen on its own, so it is never swept up in an edit meant for the others. */
 const POLICY_BUILD_ROLES = ["plan", "build", "review", "chore"];
 let lastPolicy = {};
+let lastRoles = {};
 const ADVERSARY_MODES = {
   off: "Off - nothing is challenged",
   advisory: "Advisory - findings are shown beside the review keys, never in the way",
@@ -1147,12 +1148,39 @@ function policyPanel(ep) {
         <label class="s" style="display:inline-flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="ep-automerge" ${p.auto_merge === "low-risk" ? "checked" : ""} ${ep.may_set ? "" : "disabled"} /> Auto-merge docs/tests/deps after both approvals</label>
         <div class="s" style="color:var(--dim)">Only when every changed file is documentation, tests or a dependency version bump. Anything touching code or config still waits for you.</div>
         <div class="s" id="ep-msg" style="color:var(--dim);margin-top:4px"></div>`;
+  /* Effort, width and subscriptions per role, and the team preset. Effort is how hard a
+     role thinks; width is how many of its orders the fleet runs at once; a subscription is
+     used for a role only when you tick it here and the engine has a weekly request cap. */
+  lastRoles = roles;
+  const efforts = ep.efforts || ["low", "medium", "high"];
+  const dis = ep.may_set ? "" : "disabled";
+  const roleRows = POLICY_ROLES.map((role) => {
+    const r = roles[role] || {};
+    const first = (r.order || [])[0] || {};
+    return `<tr><td>${role}</td>
+      <td><select data-ep-effort="${role}" ${dis}>${efforts.map((e) =>
+        `<option value="${e}"${e === r.effort ? " selected" : ""}>${e}${e === r.effort && !r.effort_set ? " (default)" : ""}</option>`).join("")}</select></td>
+      <td><input type="number" min="1" max="255" data-ep-width="${role}" value="${r.width == null ? "" : esc(r.width)}" placeholder="no cap" style="width:84px" ${dis} /></td>
+      <td><label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" data-ep-subs="${role}" ${r.subscriptions ? "checked" : ""} ${dis} /> may use a subscription</label></td>
+      <td>${first.class ? esc(first.class) : ""}</td></tr>`;
+  }).join("");
+  const subsWarn = (ep.warnings || []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+  const teamPanel = `
+        <div style="margin-top:14px"><b>Plan on high, build on medium, swarm the cheap work</b></div>
+        <div class="s" style="color:var(--dim);margin-top:4px">Effort is how hard a role thinks; width is how many of its orders run at once across your machines. A subscription is used for background work only for a role you tick, and only an engine with a weekly request cap.</div>
+        <div style="margin-top:8px;overflow-x:auto"><table class="grid"><thead><tr><th>Role</th><th>Effort</th><th>Width</th><th>Subscriptions</th><th>First engine's size</th></tr></thead><tbody>${roleRows}</tbody></table></div>
+        <div id="ep-subs-warn" class="s" style="margin-top:6px">${subsWarn}</div>
+        ${ep.may_set ? `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">
+          <button class="btn primary" id="ep-settings">Save effort, width and subscriptions</button>
+          <button class="btn" id="ep-team">Team preset</button></div>` : `<div style="margin-top:8px"><button class="btn" id="ep-team">Team preset</button></div>`}
+        <div id="ep-team-box" style="margin-top:8px"></div>`;
   return `
     <div class="notice" style="margin-bottom:18px">
       <div style="flex:1;min-width:0">
         <b>Engine policy:</b> ${source}.
         ${ep.auto && ep.self_improve ? `<div style="margin-top:6px"><span class="badge warn">Self-improve is on with no engine policy of its own.</span> Pick the engines below, or use the recommended ones.</div>` : ""}
         ${simple}
+        ${teamPanel}
         <details style="margin-top:12px"><summary>Advanced</summary>
         <div class="s" style="color:var(--dim);margin-top:6px">Which AI does background work here - planning, building and reviewing self-improvements - and on which machines. Orders you give yourself are never restricted by it.</div>
         <div style="margin-top:10px">${(ep.describe || []).map(esc).join("<br>")}</div>
@@ -1270,6 +1298,72 @@ function wirePolicy() {
       await render();
     } catch (err) { msg(err.message || err); btn.disabled = false; }
   };
+  /* The roles ticked for subscriptions, as the page shows them now. */
+  const subsRoles = () => Array.from(document.querySelectorAll("[data-ep-subs]"))
+    .filter((c) => c.checked).map((c) => c.dataset.epSubs);
+  /* The team preset as it would be signed with those roles, with its reasons and warnings. */
+  const showTeam = async () => {
+    const box = $("#ep-team-box");
+    if (!box) return;
+    try {
+      const t = await api(`/api/engine-policy/team?subscription_roles=${encodeURIComponent(subsRoles().join(","))}`);
+      const warn = (t.warnings || []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+      box.innerHTML = `<div class="k">Team preset &mdash; nothing is signed until you accept</div>
+        <div style="margin-top:4px">${(t.describe || []).map(esc).join("<br>")}</div>
+        <ul style="margin:6px 0 0 18px">${(t.reasons || []).map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
+        ${warn}
+        ${lastPolicy && $("#ep-settings") ? `<div style="margin-top:8px"><button class="btn primary" id="ep-team-accept">Accept the team preset</button></div>` : ""}`;
+      const go = $("#ep-team-accept");
+      if (go) go.addEventListener("click", async () => {
+        go.disabled = true;
+        try {
+          const r = await api("/api/engine-policy/team", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ subscription_roles: subsRoles(), all: all() }),
+          });
+          msg(`Team preset signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
+          await render();
+        } catch (err) { msg(err.message || err); go.disabled = false; }
+      });
+    } catch (err) { msg(err.message || err); }
+  };
+  const teamBtn = $("#ep-team");
+  if (teamBtn) teamBtn.addEventListener("click", showTeam);
+  /* Ticking a role for subscriptions shows at once what it would and would not use. */
+  document.querySelectorAll("[data-ep-subs]").forEach((c) => c.addEventListener("change", async () => {
+    const warn = $("#ep-subs-warn");
+    if (!warn) return;
+    try {
+      const t = await api(`/api/engine-policy/team?subscription_roles=${encodeURIComponent(subsRoles().join(","))}`);
+      warn.innerHTML = (t.warnings || []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+    } catch (_) { /* the warning is advice; saving still checks */ }
+  }));
+  const settingsBtn = $("#ep-settings");
+  if (settingsBtn) settingsBtn.addEventListener("click", async () => {
+    /* Only what changed: a role left at its default effort stays unset in the policy. */
+    const effort = {};
+    document.querySelectorAll("[data-ep-effort]").forEach((s) => {
+      const r = lastRoles[s.dataset.epEffort] || {};
+      if (s.value !== r.effort || r.effort_set) effort[s.dataset.epEffort] = s.value;
+    });
+    const width = {};
+    document.querySelectorAll("[data-ep-width]").forEach((i) => {
+      const r = lastRoles[i.dataset.epWidth] || {};
+      const value = i.value.trim() === "" ? null : Number(i.value);
+      if (value !== null && (!Number.isInteger(value) || value < 1 || value > 255)) { width.bad = true; return; }
+      if (value !== (r.width == null ? null : r.width)) width[i.dataset.epWidth] = value;
+    });
+    if (width.bad) { msg("Width is a whole number from 1 to 255, or empty for no cap."); return; }
+    settingsBtn.disabled = true;
+    try {
+      const r = await api("/api/engine-policy/settings", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ effort, width, subscription_roles: subsRoles(), all: all() }),
+      });
+      msg(`Signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
+      await render();
+    } catch (err) { msg(err.message || err); settingsBtn.disabled = false; }
+  });
   const chooseBtn = $("#ep-choose");
   if (chooseBtn) chooseBtn.addEventListener("click", () => {
     const improve = $("#ep-improve").value || null;

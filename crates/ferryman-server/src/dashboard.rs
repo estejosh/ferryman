@@ -419,6 +419,11 @@ pub fn router(state: DashboardState) -> Router {
         )
         .route("/api/engine-policy/accept", post(engine_policy_accept))
         .route("/api/engine-policy/choose", post(engine_policy_choose))
+        .route(
+            "/api/engine-policy/team",
+            get(engine_policy_team_get).post(engine_policy_team_accept),
+        )
+        .route("/api/engine-policy/settings", post(engine_policy_settings))
         .route("/api/improve/pending", get(improve_pending))
         .route("/api/improve/decide", post(improve_decide))
         .route(
@@ -2017,6 +2022,12 @@ async fn engine_policy_get(
         "effective": policy::view(&current, &fleet),
         "choices": policy::choices(&current, &fleet, &recommended.policy),
         "recommended": { "policy": recommended.policy, "reasons": recommended.reasons },
+        // The team preset - plan on high, build on medium, swarm the cheap work - as it
+        // would be signed now, keeping the roles already opened to a capped subscription;
+        // and what is wrong with the subscriptions the policy opens.
+        "team": team_json(&route, &current, now),
+        "warnings": policy::subscription_warnings(&current, &fleet),
+        "efforts": policy::Effort::ALL.iter().map(|e| e.as_str()).collect::<Vec<_>>(),
         "self_improve": ferryman_channel::ferry::self_improve_enabled(channel, &route.project_id),
         // What the adversary's findings do here: off, advisory or blocking. The policy's
         // own JSON leaves it out while it is the default.
@@ -2246,6 +2257,231 @@ async fn engine_policy_choose(
             }
             if let Some(mode) = adversary {
                 policy.adversary = mode;
+            }
+            Some(policy)
+        },
+    )
+}
+
+/// The team preset for `route` as the dashboard shows it: the policy it would sign, one
+/// reason per choice, and the warnings for any subscription it opens.
+fn team_json_for(
+    route: &ferryman_channel::ProjectRoute,
+    options: &ferryman_channel::policy::TeamOptions,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    use ferryman_channel::policy;
+    let proposal = policy::team_for(route, now, options);
+    let fleet = policy::fleet(route, now);
+    json!({
+        "policy": proposal.policy,
+        "describe": proposal.policy.describe(),
+        "reasons": proposal.reasons,
+        "warnings": policy::subscription_warnings(&proposal.policy, &fleet),
+        "effective": policy::view(&proposal.policy, &fleet),
+    })
+}
+
+/// [`team_json_for`] with the preset's own width and effort, keeping the roles the policy
+/// in force has opened to a capped subscription.
+fn team_json(
+    route: &ferryman_channel::ProjectRoute,
+    current: &ferryman_channel::policy::Policy,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    let options = ferryman_channel::policy::TeamOptions {
+        subscription_roles: current.subscription_roles.clone(),
+        ..Default::default()
+    };
+    team_json_for(route, &options, now)
+}
+
+#[derive(Deserialize, Default)]
+struct TeamParams {
+    project: Option<String>,
+    /// Roles opened to a capped subscription, comma-separated: `build,chore`. Absent keeps
+    /// what the policy in force says.
+    subscription_roles: Option<String>,
+    /// Widths that replace the preset's: `build=4,chore=2`.
+    width: Option<String>,
+    /// Efforts that replace the preset's: `build=high`.
+    effort: Option<String>,
+}
+
+/// `build=4,chore=2`: each part a role and a value.
+fn role_pairs(list: &str) -> Result<Vec<(ferryman_channel::policy::Role, String)>, String> {
+    list.split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            let (role, value) = part
+                .split_once('=')
+                .or_else(|| part.split_once(':'))
+                .ok_or_else(|| format!("'{part}' is not role=value"))?;
+            let role = ferryman_channel::policy::Role::parse(role.trim())
+                .map_err(|error| format!("{error:#}"))?;
+            Ok((role, value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn role_list(list: &str) -> Result<Vec<ferryman_channel::policy::Role>, String> {
+    let mut roles = Vec::new();
+    for part in list.split(',').filter(|part| !part.trim().is_empty()) {
+        let role = ferryman_channel::policy::Role::parse(part.trim())
+            .map_err(|error| format!("{error:#}"))?;
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    roles.sort();
+    Ok(roles)
+}
+
+/// GET /api/engine-policy/team - what the team preset would sign for this project: plan
+/// on high, build on medium, swarm the cheap work, with one reason per choice. Nothing is
+/// signed. `subscription_roles`, `width` and `effort` try other choices.
+async fn engine_policy_team_get(
+    State(state): State<DashboardState>,
+    Query(params): Query<TeamParams>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::policy;
+    let route = state.route_for(params.project.as_deref());
+    let bad = |why: String| (StatusCode::BAD_REQUEST, why);
+    let (current, _) = policy::effective(&route.communications, &route.project_id);
+    let mut options = policy::TeamOptions {
+        subscription_roles: current.subscription_roles.clone(),
+        ..Default::default()
+    };
+    if let Some(roles) = &params.subscription_roles {
+        options.subscription_roles = role_list(roles).map_err(bad)?;
+    }
+    for (role, value) in role_pairs(params.width.as_deref().unwrap_or("")).map_err(bad)? {
+        let width = value
+            .parse::<u8>()
+            .ok()
+            .filter(|width| *width > 0)
+            .ok_or_else(|| bad(format!("width for {} is 1 to 255", role.as_str())))?;
+        options.width.insert(role, width);
+    }
+    for (role, value) in role_pairs(params.effort.as_deref().unwrap_or("")).map_err(bad)? {
+        let effort = policy::Effort::parse(&value).map_err(|error| bad(format!("{error:#}")))?;
+        options.effort.insert(role, effort);
+    }
+    Ok(Json(team_json_for(&route, &options, chrono::Utc::now())))
+}
+
+#[derive(Deserialize, Default)]
+struct TeamBody {
+    /// Roles opened to a capped subscription; absent keeps the policy in force's.
+    #[serde(default)]
+    subscription_roles: Option<Vec<ferryman_channel::policy::Role>>,
+    #[serde(default)]
+    width: std::collections::BTreeMap<ferryman_channel::policy::Role, u8>,
+    #[serde(default)]
+    effort: std::collections::BTreeMap<
+        ferryman_channel::policy::Role,
+        ferryman_channel::policy::Effort,
+    >,
+    #[serde(default)]
+    all: bool,
+}
+
+/// POST /api/engine-policy/team - the master signs the team preset as the project's
+/// policy, each project from its own fleet; `all` does it for every project they are
+/// master of.
+async fn engine_policy_team_accept(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<TeamBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    if body.width.values().any(|width| *width == 0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a width of 0 would stop the role; use 1 or more".to_string(),
+        ));
+    }
+    sign_policies(
+        &state,
+        &current,
+        params.project.as_deref(),
+        body.all,
+        |route| {
+            let (in_force, _) =
+                ferryman_channel::policy::effective(&route.communications, &route.project_id);
+            let options = ferryman_channel::policy::TeamOptions {
+                subscription_roles: body
+                    .subscription_roles
+                    .clone()
+                    .unwrap_or(in_force.subscription_roles),
+                width: body.width.clone(),
+                effort: body.effort.clone(),
+            };
+            Some(ferryman_channel::policy::team_for(route, chrono::Utc::now(), &options).policy)
+        },
+    )
+}
+
+#[derive(Deserialize, Default)]
+struct SettingsBody {
+    /// Effort per role: `{"build": "medium"}`.
+    #[serde(default)]
+    effort: std::collections::BTreeMap<
+        ferryman_channel::policy::Role,
+        ferryman_channel::policy::Effort,
+    >,
+    /// Orders at once per role: `{"build": 3}`; `null` removes the cap.
+    #[serde(default)]
+    width: std::collections::BTreeMap<ferryman_channel::policy::Role, Option<u8>>,
+    /// Roles whose background work may use a subscription with a weekly cap; `[]` clears.
+    #[serde(default)]
+    subscription_roles: Option<Vec<ferryman_channel::policy::Role>>,
+    #[serde(default)]
+    all: bool,
+}
+
+/// POST /api/engine-policy/settings - effort, width and subscription_roles per role,
+/// signed by the master. Everything else in the policy stays.
+async fn engine_policy_settings(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<SettingsBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    if body.effort.is_empty() && body.width.is_empty() && body.subscription_roles.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "set an effort, a width or the roles that may use a subscription".to_string(),
+        ));
+    }
+    if body.width.values().any(|width| *width == Some(0)) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a width of 0 would stop the role; use 1 or more, or null for no cap".to_string(),
+        ));
+    }
+    sign_policies(
+        &state,
+        &current,
+        params.project.as_deref(),
+        body.all,
+        |route| {
+            let (mut policy, _) =
+                ferryman_channel::policy::effective(&route.communications, &route.project_id);
+            policy.effort.extend(body.effort.clone());
+            for (role, width) in &body.width {
+                match width {
+                    Some(width) => policy.width.insert(*role, *width),
+                    None => policy.width.remove(role),
+                };
+            }
+            if let Some(roles) = &body.subscription_roles {
+                let mut roles = roles.clone();
+                roles.sort();
+                roles.dedup();
+                policy.subscription_roles = roles;
             }
             Some(policy)
         },
@@ -4472,6 +4708,7 @@ mod tests {
             "/api/cost/rates",
             "/api/improve",
             "/api/engine-policy",
+            "/api/engine-policy/team",
             "/api/improve/pending",
         ] {
             let response = app
@@ -4493,6 +4730,8 @@ mod tests {
             ("/api/tasks/task-1/review", r#"{"accept":true}"#),
             ("/api/memory/suggest", r#"{"text":"anonymous"}"#),
             ("/api/cost/plan", r#"{"goal":"x"}"#),
+            ("/api/engine-policy/team", "{}"),
+            ("/api/engine-policy/settings", r#"{"width":{"build":9}}"#),
         ] {
             let response = post(&app, path, body, None).await;
             assert_eq!(
@@ -5463,6 +5702,138 @@ mod tests {
         assert_eq!(cleared.status(), StatusCode::OK);
         let back = get_json(&app, "/api/engine-policy", Some(&token)).await;
         assert_eq!(back["auto"], true, "{back}");
+    }
+
+    /// The team preset from the browser: proposed with reasons to anyone signed in,
+    /// tried with other widths, efforts and subscription roles, signed only by the master;
+    /// and effort, width and subscription roles set one role at a time.
+    #[tokio::test]
+    async fn the_team_preset_and_the_per_role_settings_are_signed_only_by_the_master() {
+        use ferryman_channel::policy::{Effort, Role};
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(view["team"]["policy"]["effort"]["plan"], "high", "{view}");
+        assert_eq!(view["team"]["policy"]["width"]["build"], 3);
+        assert_eq!(view["team"]["policy"]["width"]["chore"], 4);
+        assert!(view["team"]["reasons"].is_array(), "{view}");
+        assert_eq!(view["effective"]["roles"]["build"]["effort"], "medium");
+        assert_eq!(view["effective"]["roles"]["chore"]["effort"], "low");
+        assert_eq!(view["warnings"].as_array().unwrap().len(), 0);
+
+        // Other choices, tried without signing anything.
+        let tried = get_json(
+            &app,
+            "/api/engine-policy/team?width=build=5&effort=build:high&subscription_roles=build,chore",
+            Some(&token),
+        )
+        .await;
+        assert_eq!(tried["policy"]["width"]["build"], 5, "{tried}");
+        assert_eq!(tried["policy"]["effort"]["build"], "high");
+        assert_eq!(
+            tried["policy"]["subscription_roles"],
+            json!(["build", "chore"])
+        );
+        assert!(
+            tried["warnings"][0]
+                .as_str()
+                .unwrap()
+                .contains("weekly_requests"),
+            "no capped subscription is published: {tried}"
+        );
+        for bad in [
+            "width=build=0",
+            "width=build=lots",
+            "effort=build=extreme",
+            "subscription_roles=builder",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/engine-policy/team?{bad}"))
+                        .header("x-ferryman-dashboard-token", &token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        assert!(
+            ferryman_channel::policy::setting(&route.communications, &route.project_id).is_none(),
+            "proposing signs nothing"
+        );
+
+        // Nobody is master yet: refused.
+        let team_body = r#"{"width":{"build":4},"subscription_roles":["build"]}"#;
+        let refused = post(&app, "/api/engine-policy/team", team_body, Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let refused = post(
+            &app,
+            "/api/engine-policy/settings",
+            r#"{"effort":{"build":"high"}}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let zero = post(
+            &app,
+            "/api/engine-policy/team",
+            r#"{"width":{"build":0}}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(zero.status(), StatusCode::BAD_REQUEST);
+        let signed = post(&app, "/api/engine-policy/team", team_body, Some(&token)).await;
+        assert_eq!(signed.status(), StatusCode::OK);
+        let (policy, setting) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        assert_eq!(setting.unwrap().set_by(), "alice");
+        assert_eq!(policy.width_for(Role::Build), Some(4));
+        assert_eq!(policy.width_for(Role::Chore), Some(4));
+        assert_eq!(policy.effort_for(Role::Plan), Effort::High);
+        assert_eq!(policy.subscription_roles, [Role::Build]);
+
+        // Per-role settings change only what they name.
+        let set = post(
+            &app,
+            "/api/engine-policy/settings",
+            r#"{"effort":{"chore":"medium"},"width":{"build":null,"plan":2},"subscription_roles":[]}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::OK);
+        let (policy, _) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        assert_eq!(policy.effort_for(Role::Chore), Effort::Medium);
+        assert_eq!(policy.effort_for(Role::Plan), Effort::High, "kept");
+        assert_eq!(policy.width_for(Role::Build), None, "null removes the cap");
+        assert_eq!(policy.width_for(Role::Plan), Some(2));
+        assert_eq!(policy.width_for(Role::Chore), Some(4), "kept");
+        assert!(policy.subscription_roles.is_empty());
+        for bad in [
+            "{}",
+            r#"{"width":{"build":0}}"#,
+            r#"{"effort":{"build":"extreme"}}"#,
+            r#"{"width":{"builder":2}}"#,
+        ] {
+            let response = post(&app, "/api/engine-policy/settings", bad, Some(&token)).await;
+            assert!(
+                response.status().is_client_error(),
+                "{bad}: {}",
+                response.status()
+            );
+        }
+        let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(view["effective"]["roles"]["plan"]["width"], 2, "{view}");
     }
 
     /// The simple choice from the browser, and the improvements waiting for the master:
