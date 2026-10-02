@@ -127,13 +127,25 @@ impl InterfaceRef {
     }
 }
 
+/// Whether `part` can be a contract's name or version: a safe path component that holds no
+/// `@` and does not end in `.lock`. A version `1.lock` would store its contract at
+/// `x@1.lock.json`, the very path of `x@1`'s lock sidecar, so the two could overwrite or
+/// impersonate each other.
+#[must_use]
+pub fn contract_part_ok(part: &str) -> bool {
+    is_safe_component(part) && !part.contains('@') && !part.to_ascii_lowercase().ends_with(".lock")
+}
+
 /// Split `name@version`, refusing anything that could not be a file name.
 pub fn parse_ref(text: &str) -> Result<(String, String)> {
     let Some((name, version)) = text.trim().split_once('@') else {
         bail!("'{text}' is not name@version");
     };
-    if !is_safe_component(name) || !is_safe_component(version) {
-        bail!("'{text}': the name and the version use letters, digits, '.', '-' and '_' only");
+    if !contract_part_ok(name) || !contract_part_ok(version) {
+        bail!(
+            "'{text}': the name and the version use letters, digits, '.', '-' and '_' only, \
+             and neither ends in '.lock'"
+        );
     }
     Ok((name.to_string(), version.to_string()))
 }
@@ -273,7 +285,7 @@ fn lock_path(route: &ProjectRoute, name: &str, version: &str) -> PathBuf {
 
 /// The proposer's contract, when it verifies. Without the lock.
 fn read_proposal(route: &ProjectRoute, name: &str, version: &str) -> Option<InterfaceContract> {
-    if !is_safe_component(name) || !is_safe_component(version) {
+    if !contract_part_ok(name) || !contract_part_ok(version) {
         return None;
     }
     let mut contract: InterfaceContract =
@@ -521,8 +533,11 @@ pub fn propose(
     request: Option<Shape>,
     response: Shape,
 ) -> Result<InterfaceContract> {
-    if !is_safe_component(name) || !is_safe_component(version) {
-        bail!("a contract's name and version use letters, digits, '.', '-' and '_' only");
+    if !contract_part_ok(name) || !contract_part_ok(version) {
+        bail!(
+            "a contract's name and version use letters, digits, '.', '-' and '_' only, and \
+             neither ends in '.lock' (that is the name of a lock's file)"
+        );
     }
     let path = contract_path(route, name, version);
     if path.exists() {
@@ -1817,6 +1832,48 @@ mod tests {
         assert_eq!(
             standing.overridden.unwrap().from(),
             "josh via telegram-grouchly"
+        );
+    }
+
+    #[test]
+    fn a_version_ending_in_lock_cannot_collide_with_another_contracts_lock_sidecar() {
+        let w = world();
+        propose_user_api(&w);
+        lock(&w.route, "user-api", "1", "josh", &w.josh).unwrap();
+        for (name, version) in [
+            ("user-api", "1.lock"),
+            ("user-api", "1.LOCK"),
+            ("user-api.lock", "1"),
+            ("a@b", "1"),
+        ] {
+            assert!(
+                propose(&w.route, &w.wisp, name, version, "x", None, user_response()).is_err(),
+                "{name}@{version}"
+            );
+        }
+        assert!(InterfaceRef::parse("user-api@1.lock:provides").is_err());
+
+        // A signed contract planted at the lock sidecar's path is not read as a contract.
+        let mut planted = InterfaceContract {
+            name: "user-api".into(),
+            version: "1.lock".into(),
+            description: String::new(),
+            request: None,
+            response: user_response(),
+            proposed_by: "wisp".into(),
+            proposed_at: Utc::now(),
+            signature: String::new(),
+            lock: None,
+        };
+        planted.signature = w
+            .wisp
+            .sign_bytes(contract_payload("demo", &planted).as_bytes());
+        crate::atomic_json(&lock_path(&w.route, "user-api", "1"), &planted).unwrap();
+        assert!(read_contract(&w.route, "user-api", "1.lock").is_none());
+        assert!(
+            list_contracts(&w.route)
+                .iter()
+                .all(|contract| contract.version != "1.lock")
         );
     }
 }
