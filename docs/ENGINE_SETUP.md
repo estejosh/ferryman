@@ -283,6 +283,186 @@ the channel; one anybody else signed or edited is ignored. The dashboard's Teamm
 page and the Telegram Engines menu show the same thing and can accept, block or move
 an engine to the top. `ferry improve status` and `ferry improve report` say which
 engine and model, on which machine, did each step, and what each engine spent.
+
+## Team preset and swarms: plan on high, build on medium, swarm the cheap work
+
+A strong model should plan and review, a few mid-size models should build in
+parallel, and the smallest models should do the chores. Three things in the engine
+policy make that a setting rather than a habit.
+
+**Effort per role.** The policy says how hard each role thinks: `plan`, `review` and
+`adversary` default to `high`, `build` to `medium`, `chore` to `low`. Set it with
+`ferry engines policy set --effort build=medium --effort chore=low`. An engine acts on
+it only where you say how:
+
+- `{effort}` in an engine's `args` is filled with `low`, `medium` or `high`, the way
+  `{model}` is.
+- `engine.<name>.effort_args` lists extra arguments per level, spliced in before the
+  prompt: `{"low":[...],"medium":[...],"high":[...]}`.
+- An HTTP engine is sent a `reasoning_effort` field only with
+  `engine.<name>.supports_effort = "true"` (the default is off, because a server that
+  does not know the field may refuse the request).
+
+An engine with none of these ignores effort, and its step record leaves effort out
+rather than claiming one. The flags below are **examples**: check your own CLI's
+documentation before using one.
+
+```toml
+# Example only: codex takes a reasoning effort as a config override.
+engine.codex.args = ["exec","--full-auto","-c","model_reasoning_effort={effort}","{prompt}"]
+# Example only: "--reasoning" stands for whatever flag your CLI has.
+engine.mycli.effort_args = {"low":["--reasoning","low"],"medium":["--reasoning","medium"],"high":["--reasoning","high"]}
+# Example only: an OpenAI-compatible endpoint that accepts reasoning_effort.
+engine.gateway.supports_effort = "true"
+```
+
+The effort each step used is recorded beside its engine, model and machine in
+`ferry improve status` and `ferry improve report`.
+
+**Model size class.** Each engine has a class, `small`, `medium` or `large`, shown by
+`ferry engines`, published in the signed inventory and usable as a selector
+(`class:small`). Declare it with `engine.<name>.class = "medium"`; your word wins.
+Without one fm guesses from the model name: `haiku`, `mini`, `nano`, `small`,
+`flash-lite` and a size under 10B are small; `opus`, `pro`, `ultra`, `large`,
+`reasoner`, `r1` and 70B or more are large; everything else (`sonnet`, `flash`,
+`deepseek-chat`, a mid-size nemotron) is medium. A model with an active-parameter
+count (`a12b`) is sized by that. The guess is a default, not a measurement: declare
+the class of anything it gets wrong.
+
+**Swarm width.** `max_parallel` in `agent.toml` is how many orders one work pass
+claims and runs at once; `1`, the default, is one after another, exactly as before.
+With more, each order runs in its own git worktree (turn `worktree` on, or they would
+share one checkout). Orders whose `touches` overlap are never run together, on this
+machine or across the fleet. The policy's `width` caps how many improvement orders of a
+role the whole fleet may have claimed at once, counted from the current claims (a stale
+claim does not count): `ferry engines policy set --width build=3 --width chore=4`, and
+`--width build=none` removes the cap. Both caps are soft: two machines claiming in the
+same instant can each get in, and a weekly request cap can be overshot by up to the
+number of orders in flight. An engine that runs out of credit mid-swarm lets the orders
+already in flight finish or fail as usual, and new claims skip it.
+
+### The team preset
+
+```sh
+ferry engines policy team [PROJECT | --all]                 # the proposal, one reason per choice
+ferry engines policy team --accept                         # sign it as the master
+ferry engines policy team --allow-subscriptions-for build,chore --width build=4 --effort build=high
+```
+
+From the engines the fleet published it proposes:
+
+| Role | Engine | Effort | Width |
+|---|---|---|---|
+| plan | a large, judge-tier engine | high | 1 |
+| build | medium-class engines | medium | 3 |
+| chore | the smallest engines | low | 4 |
+| review | a large judge | high | |
+| adversary | a large judge of a different model family than the top builder, advisory | high | |
+
+Within a size class the order is auto's: local, free tier, capped prepaid, then the
+rest. An engine of the wrong size stays in the list after the right ones as a
+fallback, so a fleet without the ideal engine still has someone to ask. `--accept`
+signs the proposal with the master's signature, like every other policy change. The
+dashboard's Engine policy panel has a Team preset button that shows the proposal with
+its reasons and an Accept button, selectors for effort and width per role and a
+checkbox per role for subscriptions; Telegram's Engines menu has a "Use team preset"
+button under the improvement and review pickers, with the same proposal and an Accept
+button. `ferry engines` and `ferry improve status` show each role's effort, width and
+the class of the engine first in line.
+
+**Subscriptions are still off by default.** A swarm is exactly what drains a Claude or
+Codex limit, so the proposal never uses a subscription unless you name the role:
+`--allow-subscriptions-for build,chore` (the policy's `subscription_roles`). Even then
+it uses only an engine with a `weekly_requests` cap, so the swarm stops at a number you
+chose. A subscription engine with no cap stays blocked for the role, and the proposal,
+the CLI and the dashboard say so.
+
+Example (a), the free default: nemotron's free tier and DeepSeek build, a local model
+does chores, and nothing touches a subscription. Add the `env`, `base_url` and `key`
+lines from the example above for the nemotron and deepseek engines.
+
+```toml
+agent = "grouchly-team"
+command = "ferryman-cline"
+max_parallel = "3"
+worktree = "true"
+engines = ["nemotron", "deepseek", "reasoner", "local"]
+
+engine.nemotron.kind = "cli"
+engine.nemotron.model = "nvidia/nemotron-3-super-120b-a12b"
+engine.nemotron.tier = "build"
+engine.nemotron.paid = "free-tier"
+engine.nemotron.weekly_requests = "400"
+
+engine.deepseek.kind = "cli"
+engine.deepseek.model = "deepseek-chat"
+engine.deepseek.tier = "build"
+engine.deepseek.paid = "prepaid"
+engine.deepseek.weekly_usd = "5"
+
+# The judge: plans, reviews and challenges. Class large from its name (reasoner).
+engine.reasoner.kind = "http"
+engine.reasoner.base_url = "https://api.deepseek.com"
+engine.reasoner.model = "deepseek-reasoner"
+engine.reasoner.key = "secret:DEEPSEEK_API_KEY"
+engine.reasoner.tier = "judge"
+engine.reasoner.paid = "prepaid"
+engine.reasoner.supports_effort = "true"
+
+# Chores on a small local model.
+engine.local.kind = "http"
+engine.local.base_url = "http://localhost:11434/v1"
+engine.local.model = "qwen2.5-coder:7b"
+engine.local.tier = "chore"
+```
+
+```sh
+ferry engines policy team --all            # read the proposal and its reasons
+ferry engines policy team --all --accept
+```
+
+Example (b), opting in: Claude Sonnet builds and Claude Haiku does chores, both on a
+subscription, both with a weekly cap, and only for those two roles. The planner,
+reviewer and adversary stay on engines that are not a subscription. Use the model names
+your CLI accepts; the selectors below are globs, so no version is hard-coded.
+
+```toml
+agent = "grouchly-claude"
+command = "claude"
+max_parallel = "3"
+worktree = "true"
+engines = ["claude-sonnet", "claude-haiku"]
+
+engine.claude-sonnet.kind = "cli"
+engine.claude-sonnet.args = ["-p","--model","{model}","{prompt}"]
+engine.claude-sonnet.model = "sonnet"
+engine.claude-sonnet.class = "medium"
+engine.claude-sonnet.tier = "build"
+engine.claude-sonnet.paid = "subscription"
+engine.claude-sonnet.weekly_requests = "200"
+
+engine.claude-haiku.kind = "cli"
+engine.claude-haiku.args = ["-p","--model","{model}","{prompt}"]
+engine.claude-haiku.model = "haiku"
+engine.claude-haiku.class = "small"
+engine.claude-haiku.tier = "chore"
+engine.claude-haiku.paid = "subscription"
+engine.claude-haiku.weekly_requests = "500"
+```
+
+```sh
+ferry engines policy team --allow-subscriptions-for build,chore
+ferry engines policy team --allow-subscriptions-for build,chore --accept
+# or by hand, from the same selectors:
+ferry engines policy set --role build --prefer "claude-sonnet*"
+ferry engines policy set --role chore --prefer "claude-haiku*"
+ferry engines policy set --allow-subscriptions-for build,chore
+```
+
+The caps are yours to choose: set `weekly_requests` to what you can spare, not to what
+the plan allows. Once reached, the engine is exhausted until Monday 00:00 UTC and the
+swarm moves to the next engine in the list or waits.
+
 ## Two keys before an improvement goes live
 
 Every improvement the loop builds needs **two** keys before it may go live - merge,

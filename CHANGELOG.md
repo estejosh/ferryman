@@ -44,6 +44,35 @@
   review cards, Contracts, `GET /api/adversary`, `POST /api/adversary/override`) and
   Telegram cards (an Override button only for a Block, under the `improve` / `review`
   delegation scopes). See docs/ENGINE_SETUP.md.
+- **Plan on high, build on medium, swarm the cheap work.**
+  - *Effort per role.* The engine policy gains `effort` (defaults: plan, review and
+    adversary high, build medium, chore low). `{effort}` is filled in an engine's `args`
+    like `{model}`; `engine.<name>.effort_args` adds arguments per level; an HTTP engine
+    gets a `reasoning_effort` field only with `supports_effort = "true"`. The effort used
+    is recorded on each step beside engine, model and machine. `ferry engines policy set
+    --effort role=level`.
+  - *Model size class.* `engine.<name>.class = small|medium|large`; without one, a tested
+    guess from the model name. Shown by `ferry engines`, published in the signed
+    inventory, usable as a `class:small` selector.
+  - *Swarm width.* `max_parallel` in `agent.toml` (default 1, exactly as before): a work
+    pass claims up to that many orders and runs them at once, each in its own worktree,
+    never two with overlapping `touches`, and honouring contract and adversary holds. The
+    policy's `width` caps how many improvement orders of a role the fleet has claimed at
+    once, counted from current non-stale claims (`--width role=n`). The engine ledger,
+    step log, agent profiles and worktree creation are serialised so concurrent orders
+    lose no update; an engine that reports quota mid-swarm lets in-flight orders finish and
+    new claims skip it.
+  - *Team preset.* `ferry engines policy team [PROJECT | --all] [--accept]` proposes, from
+    the fleet's signed inventories and with a reason per choice, a large judge to plan and
+    review (high effort, width 1), mid-size engines to build (medium, width 3), the
+    smallest to do chores (low, width 4) and a large judge of another family than the top
+    builder as the advisory adversary. The dashboard's Engine policy panel and the Telegram
+    Engines menu show it with an Accept button; the dashboard also has effort and width per
+    role (`POST /api/engine-policy/team`, `/settings`).
+  - *Subscriptions stay off.* New `subscription_roles` (`--allow-subscriptions-for
+    build,chore`) lets a role use a subscription, and only an engine with a
+    `weekly_requests` cap; anything else stays blocked, with a warning on every surface.
+    Old signed policies still verify. See docs/ENGINE_SETUP.md, "Team preset and swarms".
 
 ## v0.5.17 - 2026-09-29
 
