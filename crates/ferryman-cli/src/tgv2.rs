@@ -3627,6 +3627,7 @@ mod tests {
                 location: Some("user.name".into()),
             }],
             created_at: Utc::now(),
+            result_digest: String::new(),
             signed_by: String::new(),
             signature: String::new(),
         }

@@ -96,6 +96,12 @@
   first). The deterministic tamper-scan floor now also counts at the pre-done moment, as a
   Block only, so a diff that deletes tests blocks the review key even when no engine could
   be asked.
+- **A finding counts for the result it judged, not for a revision number.** A contract's
+  "round" is an ordinal over its verified provider results, so deleting an older result
+  renumbered the rounds and an old Pass at round 2 then covered a different, newer result.
+  A finding now carries a signed `result_digest` (a hash of the result's order, revision
+  and signature); a contract-lock or pre-done finding counts only when it names the result
+  that is at that revision now. Rounds are for display and file names only.
 
 ## v0.5.17 - 2026-09-29
 

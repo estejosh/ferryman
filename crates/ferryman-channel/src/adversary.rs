@@ -82,7 +82,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AgentIdentity, ProjectRoute, SignatureCheck, Task, check_signature, delegation,
+    AgentIdentity, ProjectRoute, SignatureCheck, Task, TaskResult, check_signature, delegation,
     interface::{self, InterfaceContract},
     is_safe_component,
     policy::{AdversaryMode, Builder, Policy},
@@ -242,10 +242,35 @@ pub struct AdversaryFinding {
     #[serde(default)]
     pub findings: Vec<Issue>,
     pub created_at: DateTime<Utc>,
+    /// Which result this challenged, exactly: [`result_digest`] of the signed result that
+    /// was under decision when the finding was asked for. A revision is only a number - a
+    /// contract's "round" is an ordinal that shifts when an older provider result stops
+    /// verifying - so a finding counts at a contract lock or before an improvement is
+    /// called done only when this still names the result now at that revision. Left out of
+    /// the signed JSON when empty, so a finding signed without one is read as it was.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub result_digest: String,
     #[serde(default)]
     pub signed_by: String,
     #[serde(default)]
     pub signature: String,
+}
+
+/// A digest of one signed result - its order, revision and signature - which is what a
+/// finding names so it cannot be applied to a different result that happens to sit at the
+/// same revision number. Empty for a result that is not signed.
+#[must_use]
+pub fn result_digest(result: &TaskResult) -> String {
+    match result.signature.as_deref().filter(|sig| !sig.is_empty()) {
+        Some(signature) => hex::encode(Sha256::digest(
+            format!(
+                "ferryman-result-v1\n{}\n{}\n{signature}",
+                result.order_id, result.revision
+            )
+            .as_bytes(),
+        )),
+        None => String::new(),
+    }
 }
 
 impl AdversaryFinding {
@@ -521,6 +546,12 @@ pub fn record(
     ) {
         return Ok(false);
     }
+    if finding.result_digest.is_empty()
+        && matches!(finding.trigger, Trigger::ContractLock | Trigger::PreDone)
+    {
+        // A caller that did not say which result it judged judged the one there now.
+        finding.result_digest = current_digest(route, &finding.subject, finding.revision);
+    }
     finding.signed_by = identity.name().to_string();
     finding.signature = String::new();
     finding.signature = identity.sign_bytes(finding.payload(&route.project_id).as_bytes());
@@ -534,6 +565,18 @@ pub fn record(
     .context("a path-safe subject and signer have a path")?;
     crate::atomic_json(&path, &finding).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
+}
+
+/// The digest of the verified result `subject` has at `revision` now, or empty when there is
+/// none (a contract reviewed on its own, or a revision that does not exist).
+#[must_use]
+pub fn current_digest(route: &ProjectRoute, subject: &str, revision: u32) -> String {
+    subject_results(route, subject)
+        .1
+        .into_iter()
+        .find(|built| built.revision == revision)
+        .map(|built| built.digest)
+        .unwrap_or_default()
 }
 
 /// Every genuine finding, newest first (at most [`MAX_LISTED`]). For display only: a gate
@@ -598,14 +641,22 @@ impl Ignored {
     }
 }
 
+/// One verified result of a subject, as one of the people who built it.
+#[derive(Debug, Clone)]
+struct Built {
+    revision: u32,
+    who: String,
+    digest: String,
+}
+
 /// What decides whether a finding counts, for one subject: who built it, which revisions
 /// exist, what the fleet's signed inventories say each machine can run, and the policy's
 /// `where`.
 struct Facts {
     contract: bool,
-    /// The revisions of verified results, with who built each: the agent a result names
-    /// and the key that signed it.
-    results: Vec<(u32, String)>,
+    /// The revisions of verified results, with who built each (the agent a result names
+    /// and the key that signed it) and the digest of the result itself.
+    results: Vec<Built>,
     inventories: Vec<crate::receipts::EngineInventory>,
     policy: Policy,
 }
@@ -637,8 +688,9 @@ impl Facts {
         revision: u32,
         trigger: Trigger,
         verdict: Verdict,
+        digest: Option<&str>,
     ) -> std::result::Result<(), String> {
-        let real = self.results.iter().any(|(r, _)| *r == revision)
+        let real = self.results.iter().any(|built| built.revision == revision)
             || (self.contract && revision == 0 && self.results.is_empty());
         if !real {
             return Err(if self.contract {
@@ -647,6 +699,24 @@ impl Facts {
                 format!("{subject} has no result r{revision} to challenge")
             });
         }
+        // A contract lock and a pre-done review are decisions about one result. The finding
+        // must name the result that is at that revision now: a revision is only a number
+        // (a contract's rounds shift when an older provider result stops verifying), so
+        // without this an old Pass could cover a newer result.
+        if let Some(named) = digest
+            && matches!(trigger, Trigger::ContractLock | Trigger::PreDone)
+        {
+            let now = self
+                .results
+                .iter()
+                .find(|built| built.revision == revision)
+                .map_or("", |built| built.digest.as_str());
+            if named != now || (named.is_empty() && !self.results.is_empty()) {
+                return Err(format!(
+                    "{subject} r{revision} was judged as a different result than the one there now"
+                ));
+            }
+        }
         // The scan asks no model and can only block, so the agent that is about to retry
         // - or the one about to put an improvement before the review engine - may record
         // what it found in the diff, whoever built it, with no engine inventory to list.
@@ -654,10 +724,9 @@ impl Facts {
         let scan = engine == Some(TAMPER_SCAN)
             && matches!(trigger, Trigger::RepeatFailure | Trigger::PreDone)
             && verdict == Verdict::Block;
-        let built = self
-            .results
-            .iter()
-            .any(|(r, who)| who.eq_ignore_ascii_case(signer) && (self.contract || *r == revision));
+        let built = self.results.iter().any(|built| {
+            built.who.eq_ignore_ascii_case(signer) && (self.contract || built.revision == revision)
+        });
         if built && !scan {
             return Err(format!("{signer} built the work it judged"));
         }
@@ -698,25 +767,35 @@ impl Facts {
             finding.revision,
             finding.trigger,
             finding.verdict,
+            Some(&finding.result_digest),
         )
     }
 }
 
 /// The verified results of `subject`'s orders - an order's own, or a contract's providers' -
-/// as (revision, who built it). Whether `subject` is a contract comes first.
-fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<(u32, String)>) {
+/// as (revision, who built it, digest). Whether `subject` is a contract comes first.
+fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<Built>) {
     let roster = crate::gate::roster(route);
-    let built = |task: &Task| -> Vec<(u32, String)> {
+    let built = |task: &Task| -> Vec<Built> {
         let mut out = Vec::new();
         for result in &task.results {
             if crate::verify_result(result, &roster) != SignatureCheck::Valid {
                 continue;
             }
-            out.push((result.revision, result.agent.clone()));
+            let digest = result_digest(result);
+            out.push(Built {
+                revision: result.revision,
+                who: result.agent.clone(),
+                digest: digest.clone(),
+            });
             if let Some(signer) = &result.signed_by
                 && !signer.eq_ignore_ascii_case(&result.agent)
             {
-                out.push((result.revision, signer.clone()));
+                out.push(Built {
+                    revision: result.revision,
+                    who: signer.clone(),
+                    digest,
+                });
             }
         }
         out
@@ -729,7 +808,7 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<(u32, Stri
             // A contract's revisions are rounds: its verified provider results across every
             // provider order, numbered 1.. in submission order (the same numbering
             // `contract_context` uses), so two providers' revision 1s are two rounds.
-            let mut verified: Vec<(DateTime<Utc>, String, u32, Vec<String>)> = Vec::new();
+            let mut verified: Vec<(DateTime<Utc>, String, u32, Vec<String>, String)> = Vec::new();
             for order in &providers {
                 let Ok(task) = crate::read_task(route, &order.id) else {
                     continue;
@@ -744,14 +823,26 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<(u32, Stri
                     {
                         who.push(signer.clone());
                     }
-                    verified.push((result.submitted_at, order.id.clone(), result.revision, who));
+                    verified.push((
+                        result.submitted_at,
+                        order.id.clone(),
+                        result.revision,
+                        who,
+                        result_digest(result),
+                    ));
                 }
             }
             verified.sort_by(|x, y| (x.0, &x.1, x.2).cmp(&(y.0, &y.1, y.2)));
             let results = verified
                 .into_iter()
                 .zip(1_u32..)
-                .flat_map(|((_, _, _, who), round)| who.into_iter().map(move |w| (round, w)))
+                .flat_map(|((_, _, _, who, digest), round)| {
+                    who.into_iter().map(move |w| Built {
+                        revision: round,
+                        who: w,
+                        digest: digest.clone(),
+                    })
+                })
                 .collect();
             (true, results)
         }
@@ -776,7 +867,15 @@ pub fn eligibility(
     signer: &str,
     engine: Option<&str>,
 ) -> std::result::Result<(), String> {
-    Facts::load(route, subject).check(subject, signer, engine, revision, trigger, Verdict::Pass)
+    Facts::load(route, subject).check(
+        subject,
+        signer,
+        engine,
+        revision,
+        trigger,
+        Verdict::Pass,
+        None,
+    )
 }
 
 // --- what the findings add up to -------------------------------------------------------------
@@ -1034,7 +1133,7 @@ pub fn contract_revision(route: &ProjectRoute, contract: &InterfaceContract) -> 
     subject_results(route, &contract.reference())
         .1
         .iter()
-        .map(|(revision, _)| *revision)
+        .map(|built| built.revision)
         .max()
         .unwrap_or(0)
 }
@@ -1649,6 +1748,8 @@ pub struct ContractContext {
     pub revision: u32,
     /// The newest provider result's payload, when one has a result.
     pub provider_result: Option<Value>,
+    /// [`result_digest`] of that result: what a finding about this round must name.
+    pub result_digest: String,
     /// What built the provider's result.
     pub builders: Vec<Builder>,
     /// What the consumer orders ask for, in their own words.
@@ -1674,6 +1775,7 @@ pub fn contract_context(
             .unwrap_or_default(),
         revision: 0,
         provider_result: None,
+        result_digest: String::new(),
         builders: Vec::new(),
         consumers: Vec::new(),
         precheck: Vec::new(),
@@ -1685,7 +1787,7 @@ pub fn contract_context(
     // uses - so every (provider order, revision) is reviewed once and the lock gate always
     // reads the newest review.
     let roster = crate::gate::roster(route);
-    let mut newest: Option<(chrono::DateTime<chrono::Utc>, String, u32, Value)> = None;
+    let mut newest: Option<(chrono::DateTime<chrono::Utc>, String, u32, Value, String)> = None;
     let mut round = 0_u32;
     for order in &orders.providers {
         let Ok(task) = crate::read_task(route, &order.id) else {
@@ -1705,13 +1807,20 @@ pub fn contract_context(
             let key = (result.submitted_at, order.id.clone(), result.revision);
             if newest
                 .as_ref()
-                .is_none_or(|(at, id, revision, _)| key > (*at, id.clone(), *revision))
+                .is_none_or(|(at, id, revision, _, _)| key > (*at, id.clone(), *revision))
             {
-                newest = Some((key.0, key.1, key.2, result.payload.clone()));
+                newest = Some((
+                    key.0,
+                    key.1,
+                    key.2,
+                    result.payload.clone(),
+                    result_digest(result),
+                ));
             }
         }
     }
-    if let Some((_, order_id, _, payload)) = newest {
+    if let Some((_, order_id, _, payload, digest)) = newest {
+        context.result_digest = digest;
         context.revision = round;
         context.order_id = order_id;
         context.precheck = match payload.get("response") {
@@ -2045,6 +2154,7 @@ mod tests {
                 },
             ],
             created_at: Utc::now(),
+            result_digest: String::new(),
             signed_by: String::new(),
             signature: String::new(),
         }
@@ -3514,5 +3624,93 @@ mod tests {
         assert_eq!((three.order_id.as_str(), three.revision), ("back", 3));
         assert_eq!(three.provider_result.as_ref().unwrap()["engine"], "third");
         assert_eq!(contract_revision(&f.route, &proposed), 3);
+    }
+
+    #[test]
+    fn deleting_an_older_result_does_not_let_an_old_pass_cover_a_newer_one() {
+        let f = Fleet::new();
+        let proposed = contract(&f);
+        let blocking = policy(AdversaryMode::Blocking);
+        for id in ["pa", "pb", "pc"] {
+            f.issue(id, Some(interface::Side::Provides));
+        }
+        let start = Utc::now();
+        let submit = |id: &str, seconds: i64| {
+            let mut result = TaskResult {
+                order_id: id.into(),
+                agent: "fang".into(),
+                revision: 1,
+                submitted_at: start + chrono::Duration::seconds(seconds),
+                payload: json!({ "engine": id, "response": { "id": 1, "name": "x" } }),
+                signed_by: None,
+                signature: None,
+            };
+            f.fang.sign_result(&mut result);
+            crate::submit_result(&f.route, &result).unwrap()
+        };
+        let first = submit("pa", 1);
+        submit("pb", 2);
+        assert_eq!(contract_revision(&f.route, &proposed), 2);
+
+        // The adversary passes the second round (pb's result).
+        let at_two = contract_context(&f.route, &proposed).unwrap();
+        assert_eq!(at_two.revision, 2);
+        let mut pass = finding("user-api@1", 2, Trigger::ContractLock, Verdict::Pass);
+        pass.result_digest = at_two.result_digest.clone();
+        assert!(record(&f.route, &f.wisp, pass).unwrap());
+        assert!(lock_refusal(&f.route, &blocking, &proposed).is_none());
+
+        // A third provider result arrives: a new round, so nothing has read it yet.
+        submit("pc", 3);
+        assert_eq!(contract_revision(&f.route, &proposed), 3);
+        assert!(lock_refusal(&f.route, &blocking, &proposed).is_some());
+
+        // The first provider's result is deleted: the rounds renumber, and round 2 is now
+        // the third provider's result - which the old Pass never saw.
+        std::fs::remove_file(first).unwrap();
+        assert_eq!(contract_revision(&f.route, &proposed), 2);
+        let now = contract_context(&f.route, &proposed).unwrap();
+        assert_eq!(now.revision, 2);
+        assert_ne!(now.result_digest, at_two.result_digest);
+        let why = lock_refusal(&f.route, &blocking, &proposed)
+            .expect("a Pass about a different result must not cover this one");
+        assert!(why.contains("no adversary has read"), "{why}");
+        let seen = survey(&f.route, "user-api@1");
+        assert!(seen.standings.is_empty(), "{:?}", seen.standings);
+        assert_eq!(seen.ignored.len(), 1);
+        assert!(
+            seen.ignored[0].reason.contains("a different result"),
+            "{}",
+            seen.ignored[0].reason
+        );
+
+        // Reading the result that is there now counts.
+        let mut again = finding("user-api@1", 2, Trigger::ContractLock, Verdict::Pass);
+        again.result_digest = now.result_digest;
+        assert!(record(&f.route, &f.bridge, again).unwrap());
+        assert!(lock_refusal(&f.route, &blocking, &proposed).is_none());
+    }
+
+    #[test]
+    fn a_pre_done_finding_counts_only_for_the_result_it_names() {
+        let f = Fleet::new();
+        f.work("t-n5", 1);
+        let mut named = finding("t-n5", 1, Trigger::PreDone, Verdict::Pass);
+        named.result_digest = "0".repeat(64);
+        record(&f.route, &f.wisp, named).unwrap();
+        assert!(
+            standing(&f.route, "t-n5", 1, Trigger::PreDone).is_none(),
+            "a finding that names some other result is not this result's review"
+        );
+        // One that names nothing is read as being about the result there at the time.
+        record(
+            &f.route,
+            &f.bridge,
+            finding("t-n5", 1, Trigger::PreDone, Verdict::Pass),
+        )
+        .unwrap();
+        assert!(standing(&f.route, "t-n5", 1, Trigger::PreDone).is_some());
+        let digest = current_digest(&f.route, "t-n5", 1);
+        assert_eq!(digest.len(), 64);
     }
 }

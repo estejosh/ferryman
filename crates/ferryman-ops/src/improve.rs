@@ -3700,6 +3700,7 @@ mod tests {
                     location: None,
                 }],
                 created_at: Utc::now(),
+                result_digest: String::new(),
                 signed_by: String::new(),
                 signature: String::new(),
             },
@@ -3853,6 +3854,7 @@ mod tests {
             verdict: Verdict::Pass,
             findings: Vec::new(),
             created_at: Utc::now(),
+            result_digest: String::new(),
             signed_by: String::new(),
             signature: String::new(),
         };
@@ -3901,6 +3903,7 @@ mod tests {
                 verdict: Verdict::Block,
                 findings: Vec::new(),
                 created_at: Utc::now(),
+                result_digest: String::new(),
                 signed_by: String::new(),
                 signature: String::new(),
             },

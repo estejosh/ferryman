@@ -6327,6 +6327,7 @@ mod tests {
                 location: None,
             }],
             created_at: Utc::now(),
+            result_digest: String::new(),
             signed_by: String::new(),
             signature: String::new(),
         };

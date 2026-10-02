@@ -498,6 +498,9 @@ pub struct Request {
     pub subject: String,
     pub order_id: String,
     pub revision: u32,
+    /// The digest of the result being judged ([`data::result_digest`]; empty for a contract
+    /// reviewed on its own): signed into the finding so it counts for that result only.
+    pub result_digest: String,
     pub trigger: Trigger,
     pub built_by: Vec<Builder>,
     pub prompt: String,
@@ -720,6 +723,7 @@ pub async fn challenge(
             verdict: reply.verdict.max(request.floor),
             findings,
             created_at: Utc::now(),
+            result_digest: request.result_digest.clone(),
             signed_by: String::new(),
             signature: String::new(),
         };
@@ -1303,6 +1307,7 @@ pub async fn contract_pass(
             subject: reference,
             order_id: context.order_id.clone(),
             revision: context.revision,
+            result_digest: context.result_digest.clone(),
             trigger: Trigger::ContractLock,
             built_by: context.builders.clone(),
             prompt: contract_prompt(&context),
@@ -1374,6 +1379,7 @@ pub async fn pre_done_pass(
             subject: task.order.id.clone(),
             order_id: task.order.id.clone(),
             revision,
+            result_digest: data::result_digest(result),
             trigger: Trigger::PreDone,
             built_by: Builder::from_payload(&result.payload).into_iter().collect(),
             prompt: pre_done_prompt(&task, result, &scan.hits, scan.diff.as_deref()),
@@ -1393,6 +1399,7 @@ pub async fn pre_done_pass(
                     &task.order.id,
                     revision,
                     Trigger::PreDone,
+                    &data::result_digest(result),
                     &scan.hits,
                     &why,
                     report,
@@ -1551,6 +1558,7 @@ pub async fn before_attempt(
             subject: id.clone(),
             order_id: id.clone(),
             revision,
+            result_digest: result.map(data::result_digest).unwrap_or_default(),
             trigger: Trigger::RepeatFailure,
             built_by: repeat
                 .failures
@@ -1571,6 +1579,7 @@ pub async fn before_attempt(
                     &id,
                     revision,
                     Trigger::RepeatFailure,
+                    &result.map(data::result_digest).unwrap_or_default(),
                     hits,
                     &why,
                     report,
@@ -1627,6 +1636,7 @@ fn scan_only(
     id: &str,
     revision: u32,
     trigger: Trigger,
+    result_digest: &str,
     hits: &[tamper::Hit],
     why: &str,
     report: &dyn Progress,
@@ -1651,6 +1661,7 @@ fn scan_only(
         verdict: Verdict::Block,
         findings,
         created_at: Utc::now(),
+        result_digest: result_digest.to_string(),
         signed_by: String::new(),
         signature: String::new(),
     };
@@ -2234,6 +2245,7 @@ mod tests {
                 subject: "t-1".into(),
                 order_id: "t-1".into(),
                 revision: 1,
+                result_digest: String::new(),
                 trigger: Trigger::PreDone,
                 built_by: vec![Builder {
                     engine: "deepseek".into(),
@@ -2275,6 +2287,7 @@ mod tests {
                 subject: "t-1".into(),
                 order_id: "t-1".into(),
                 revision: 1,
+                result_digest: String::new(),
                 trigger: Trigger::PreDone,
                 built_by: Vec::new(),
                 prompt: "challenge it".into(),
@@ -2307,6 +2320,7 @@ mod tests {
             subject: subject.into(),
             order_id: subject.into(),
             revision: 1,
+            result_digest: String::new(),
             trigger,
             built_by: vec![Builder {
                 engine: "deepseek".into(),

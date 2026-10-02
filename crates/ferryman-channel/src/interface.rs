@@ -1816,6 +1816,7 @@ mod tests {
                     location: Some("user.name".into()),
                 }],
                 created_at: Utc::now(),
+                result_digest: String::new(),
                 signed_by: String::new(),
                 signature: String::new(),
             },
@@ -2146,6 +2147,7 @@ mod tests {
             verdict: crate::adversary::Verdict::Pass,
             findings: Vec::new(),
             created_at: Utc::now(),
+            result_digest: String::new(),
             signed_by: String::new(),
             signature: String::new(),
         };
