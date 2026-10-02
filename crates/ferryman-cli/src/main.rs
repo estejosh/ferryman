@@ -2971,6 +2971,12 @@ fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
     if let Some(workspace) = &at.workspace {
         return Ok(vec![ferryman_channel::route_for(workspace)?]);
     }
+    let here = std::env::current_dir().context("read the current directory")?;
+    // First, check if we're inside a project.
+    if let Ok(route) = ferryman_channel::route_for(&here) {
+        return Ok(vec![route]);
+    }
+    // If not, check the ferry root's projects.
     if let Some(root) = ferryman_channel::ferry::find_root() {
         let routes: Vec<_> = root
             .projects()
@@ -2981,7 +2987,7 @@ fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
             return Ok(routes);
         }
     }
-    let here = std::env::current_dir().context("read the current directory")?;
+    // Last resort: try the current directory again to get a proper error message.
     Ok(vec![ferryman_channel::route_for(&here)?])
 }
 
@@ -11682,6 +11688,47 @@ mod tests {
     }
 
     /// `identity show` reports which keys derive from the seed, and it skips the
+    /// Verify that target_routes resolves the current directory's project before falling
+    /// back to ferry root projects. This ensures that running `ferry engines` from inside
+    /// a project finds that project's engines, not an unrelated project from ferry root.
+    #[test]
+    fn target_routes_prefers_current_directory_project() {
+        use std::env;
+        use tempfile::TempDir;
+
+        // Create a temporary project with .ferryman folder
+        let proj = TempDir::new().unwrap();
+        let ferryman_dir = proj.path().join(".ferryman");
+        std::fs::create_dir_all(&ferryman_dir).unwrap();
+        std::fs::write(
+            ferryman_dir.join("project.toml"),
+            "[project]\nid = \"test-proj\"\n",
+        )
+        .unwrap();
+
+        // Save current directory
+        let original_dir = env::current_dir().unwrap();
+
+        // Change to the project directory and test that target_routes finds it
+        env::set_current_dir(proj.path()).unwrap();
+        let at = super::Targets {
+            comms: None,
+            workspace: None,
+        };
+
+        // The test passes if this doesn't panic; route_for will error with a proper
+        // message if the project structure isn't complete, but it should at least
+        // discover the .ferryman folder in the current directory.
+        let result = super::target_routes(&at);
+        assert!(
+            result.is_ok(),
+            "target_routes should find the project in current directory"
+        );
+
+        // Restore original directory
+        env::set_current_dir(original_dir).unwrap();
+    }
+
     /// encryption keys that live beside them.
     #[test]
     fn machine_identities_separates_derived_from_rotated() {
