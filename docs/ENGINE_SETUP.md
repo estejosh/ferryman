@@ -283,6 +283,218 @@ the channel; one anybody else signed or edited is ignored. The dashboard's Teamm
 page and the Telegram Engines menu show the same thing and can accept, block or move
 an engine to the top. `ferry improve status` and `ferry improve report` say which
 engine and model, on which machine, did each step, and what each engine spent.
+
+## Mixed fleets and what a fresh machine trusts
+
+The signed files that decide what the fleet may do - `ENGINE_POLICY`, `ADVERSARY_POLICY`
+and the engine inventories - are only as protected as the oldest machine that reads them
+and the newest thing a machine has already seen. Know the edges.
+
+- **A fresh machine trusts the first valid file it sees.** Rollback protection lives in
+  each machine's own state directory, not in the channel: the highest sequence number it
+  has seen and the last good policy. A machine that has never read the channel has none,
+  so whatever genuine signed file is there when it first syncs is what it runs - including
+  an older one somebody put back, or no `ADVERSARY_POLICY` at all (the defaults: advisory).
+  Before a new machine takes work, let it finish syncing and read `ferry engines policy
+  show`; keep the channel's Syncthing folder shared with devices you trust to write it.
+- **A v0.5.17 machine reads the v1 view and has no memory.** It verifies the engine policy's
+  v1 signature and obeys what it knows (`prefer` for the four building roles, `never`,
+  `where`, caps, subscription protection, auto-merge); it ignores effort, width,
+  subscription roles, `class:` selectors and the whole adversary, and it has no sequence
+  number, so it cannot tell an older signed policy put back from the current one. It never
+  runs the adversary and does not wait for it, so `blocking` binds only the machines on
+  this release - a v0.5.17 worker can still hand over the review key for work an adversary
+  blocked. Upgrade every machine before relying on `blocking`.
+- **A policy signed by v0.5.17 has only the v1 signature.** A machine on this release
+  accepts it (sequence 0) but it has no rollback protection beyond what that machine saw
+  first, and it cannot carry the newer parts. When the fleet has members that sign v2
+  (their inventories carry a v2 signature) and the policy in force is still a v1-only file,
+  `ferry engines policy show` and the dashboard say so. Signing the policy again from a
+  current `ferry` (`ferry engines policy set ...`, or the dashboard) replaces it with one
+  that has a sequence number and a v2 signature. Do that once the fleet is upgraded.
+- **The adversary's policy is master-only on every machine that knows it.** A delegate
+  cannot sign it, and a machine remembers the last one it saw; but a machine that does not
+  know the file (v0.5.17) ignores it, and a fresh machine has nothing to remember.
+
+## Team preset and swarms: plan on high, build on medium, swarm the cheap work
+
+A strong model should plan and review, a few mid-size models should build in
+parallel, and the smallest models should do the chores. Three things in the engine
+policy make that a setting rather than a habit.
+
+**Effort per role.** The policy says how hard each role thinks: `plan`, `review` and
+`adversary` default to `high`, `build` to `medium`, `chore` to `low`. Set it with
+`ferry engines policy set --effort build=medium --effort chore=low`. An engine acts on
+it only where you say how:
+
+- `{effort}` in an engine's `args` is filled with `low`, `medium` or `high`, the way
+  `{model}` is.
+- `engine.<name>.effort_args` lists extra arguments per level, spliced in before the
+  prompt: `{"low":[...],"medium":[...],"high":[...]}`.
+- An HTTP engine is sent a `reasoning_effort` field only with
+  `engine.<name>.supports_effort = "true"` (the default is off, because a server that
+  does not know the field may refuse the request).
+
+An engine with none of these ignores effort, and its step record leaves effort out
+rather than claiming one. The flags below are **examples**: check your own CLI's
+documentation before using one.
+
+```toml
+# Example only: codex takes a reasoning effort as a config override.
+engine.codex.args = ["exec","--full-auto","-c","model_reasoning_effort={effort}","{prompt}"]
+# Example only: "--reasoning" stands for whatever flag your CLI has.
+engine.mycli.effort_args = {"low":["--reasoning","low"],"medium":["--reasoning","medium"],"high":["--reasoning","high"]}
+# Example only: an OpenAI-compatible endpoint that accepts reasoning_effort.
+engine.gateway.supports_effort = "true"
+```
+
+The effort each step used is recorded beside its engine, model and machine in
+`ferry improve status` and `ferry improve report`.
+
+**Model size class.** Each engine has a class, `small`, `medium` or `large`, shown by
+`ferry engines`, published in the signed inventory and usable as a selector
+(`class:small`). Declare it with `engine.<name>.class = "medium"`; your word wins.
+Without one fm guesses from the model name: `haiku`, `mini`, `nano`, `small`,
+`flash-lite` and a size under 10B are small; `opus`, `pro`, `ultra`, `large`,
+`reasoner`, `r1` and 70B or more are large; everything else (`sonnet`, `flash`,
+`deepseek-chat`, a mid-size nemotron) is medium. A model with an active-parameter
+count (`a12b`) is sized by that. The guess is a default, not a measurement: declare
+the class of anything it gets wrong.
+
+**Swarm width.** `max_parallel` in `agent.toml` is how many orders one work pass
+claims and runs at once; `1`, the default, is one after another, exactly as before.
+With more, each order runs in its own git worktree (turn `worktree` on, or they would
+share one checkout). Orders whose `touches` overlap are never run together, on this
+machine or across the fleet. The policy's `width` caps how many improvement orders of a
+role the whole fleet may have claimed at once, counted from the current claims (a stale
+claim does not count): `ferry engines policy set --width build=3 --width chore=4`, and
+`--width build=none` removes the cap. Both caps are soft: two machines claiming in the
+same instant can each get in, and a weekly request cap can be overshot by up to the
+number of orders in flight. An engine that runs out of credit mid-swarm lets the orders
+already in flight finish or fail as usual, and new claims skip it.
+
+### The team preset
+
+```sh
+ferry engines policy team [PROJECT | --all]                 # the proposal, one reason per choice
+ferry engines policy team --accept                         # sign it as the master
+ferry engines policy team --allow-subscriptions-for build,chore --width build=4 --effort build=high
+```
+
+From the engines the fleet published it proposes:
+
+| Role | Engine | Effort | Width |
+|---|---|---|---|
+| plan | a large, judge-tier engine | high | 1 |
+| build | medium-class engines | medium | 3 |
+| chore | the smallest engines | low | 4 |
+| review | a large judge | high | |
+| adversary | a large judge of a different model family than the top builder, advisory | high | |
+
+Within a size class the order is auto's: local, free tier, capped prepaid, then the
+rest. An engine of the wrong size stays in the list after the right ones as a
+fallback, so a fleet without the ideal engine still has someone to ask. `--accept`
+signs the proposal with the master's signature, like every other policy change. The
+dashboard's Engine policy panel has a Team preset button that shows the proposal with
+its reasons and an Accept button, selectors for effort and width per role and a
+checkbox per role for subscriptions; Telegram's Engines menu has a "Use team preset"
+button under the improvement and review pickers, with the same proposal and an Accept
+button. `ferry engines` and `ferry improve status` show each role's effort, width and
+the class of the engine first in line.
+
+**Subscriptions are still off by default.** A swarm is exactly what drains a Claude or
+Codex limit, so the proposal never uses a subscription unless you name the role:
+`--allow-subscriptions-for build,chore` (the policy's `subscription_roles`). Even then
+it uses only an engine with a `weekly_requests` cap, so the swarm stops at a number you
+chose. A subscription engine with no cap stays blocked for the role, and the proposal,
+the CLI and the dashboard say so.
+
+Example (a), the free default: nemotron's free tier and DeepSeek build, a local model
+does chores, and nothing touches a subscription. Add the `env`, `base_url` and `key`
+lines from the example above for the nemotron and deepseek engines.
+
+```toml
+agent = "grouchly-team"
+command = "ferryman-cline"
+max_parallel = "3"
+worktree = "true"
+engines = ["nemotron", "deepseek", "reasoner", "local"]
+
+engine.nemotron.kind = "cli"
+engine.nemotron.model = "nvidia/nemotron-3-super-120b-a12b"
+engine.nemotron.tier = "build"
+engine.nemotron.paid = "free-tier"
+engine.nemotron.weekly_requests = "400"
+
+engine.deepseek.kind = "cli"
+engine.deepseek.model = "deepseek-chat"
+engine.deepseek.tier = "build"
+engine.deepseek.paid = "prepaid"
+engine.deepseek.weekly_usd = "5"
+
+# The judge: plans, reviews and challenges. Class large from its name (reasoner).
+engine.reasoner.kind = "http"
+engine.reasoner.base_url = "https://api.deepseek.com"
+engine.reasoner.model = "deepseek-reasoner"
+engine.reasoner.key = "secret:DEEPSEEK_API_KEY"
+engine.reasoner.tier = "judge"
+engine.reasoner.paid = "prepaid"
+engine.reasoner.supports_effort = "true"
+
+# Chores on a small local model.
+engine.local.kind = "http"
+engine.local.base_url = "http://localhost:11434/v1"
+engine.local.model = "qwen2.5-coder:7b"
+engine.local.tier = "chore"
+```
+
+```sh
+ferry engines policy team --all            # read the proposal and its reasons
+ferry engines policy team --all --accept
+```
+
+Example (b), opting in: Claude Sonnet builds and Claude Haiku does chores, both on a
+subscription, both with a weekly cap, and only for those two roles. The planner,
+reviewer and adversary stay on engines that are not a subscription. Use the model names
+your CLI accepts; the selectors below are globs, so no version is hard-coded.
+
+```toml
+agent = "grouchly-claude"
+command = "claude"
+max_parallel = "3"
+worktree = "true"
+engines = ["claude-sonnet", "claude-haiku"]
+
+engine.claude-sonnet.kind = "cli"
+engine.claude-sonnet.args = ["-p","--model","{model}","{prompt}"]
+engine.claude-sonnet.model = "sonnet"
+engine.claude-sonnet.class = "medium"
+engine.claude-sonnet.tier = "build"
+engine.claude-sonnet.paid = "subscription"
+engine.claude-sonnet.weekly_requests = "200"
+
+engine.claude-haiku.kind = "cli"
+engine.claude-haiku.args = ["-p","--model","{model}","{prompt}"]
+engine.claude-haiku.model = "haiku"
+engine.claude-haiku.class = "small"
+engine.claude-haiku.tier = "chore"
+engine.claude-haiku.paid = "subscription"
+engine.claude-haiku.weekly_requests = "500"
+```
+
+```sh
+ferry engines policy team --allow-subscriptions-for build,chore
+ferry engines policy team --allow-subscriptions-for build,chore --accept
+# or by hand, from the same selectors:
+ferry engines policy set --role build --prefer "claude-sonnet*"
+ferry engines policy set --role chore --prefer "claude-haiku*"
+ferry engines policy set --allow-subscriptions-for build,chore
+```
+
+The caps are yours to choose: set `weekly_requests` to what you can spare, not to what
+the plan allows. Once reached, the engine is exhausted until Monday 00:00 UTC and the
+swarm moves to the next engine in the list or waits.
+
 ## Two keys before an improvement goes live
 
 Every improvement the loop builds needs **two** keys before it may go live - merge,
@@ -350,6 +562,121 @@ with force; a refused push puts the branch back. The merge commit goes into the 
 and Telegram says so. Whatever goes wrong, the improvement falls back to you,
 "approved, ready to merge", with the reason. fm cannot see CI, so it does not wait on
 it: the checks the worker ran are in the evidence the review engine judged.
+
+## The adversary: a second model that argues with the builders
+
+Builders (cheap or medium models) build. The **adversary** is a separate model that
+challenges their work, and only at three moments, so it costs a few calls, not a second
+copy of every step:
+
+1. **Before an interface contract locks.** Once the provider has produced a result (or at
+   once, when there is none yet) it reads the shapes, the provider's result and the
+   consumer's order, after a deterministic check that the result fits the shape. Its
+   verdict is shown next to Lock and Reject - in `ferry contract show`, the dashboard's
+   Contracts page and the Telegram contract card.
+2. **When the same order fails twice.** Before the third attempt a deterministic scan of
+   the order branch's diff looks for test tampering (tests deleted or disabled, assertions
+   removed or made trivial, forced passes like `|| true`, loosened tolerances, tests moved
+   out of the checked paths, edits to the check itself); then the adversary gets both
+   failures' check output, the diff and the scan, and asks whether the builder is fixing
+   the bug or hiding the symptom. A Block - or any High
+   tamper hit, even in `advisory` mode - sends the task back as ChangesRequested with the
+   finding text, which the next attempt's prompt carries. The master is asked once.
+3. **Before an improvement is called done.** It runs before the review engine's key is
+   produced. The finding is shown beside the two keys: `ferry improve pending`, the
+   dashboard's review card, the Telegram review card.
+
+It answers with a verdict - `pass`, `concern` or `block` - and findings, each with a
+severity. Only a reply that ends with one fenced `json` block holding a `verdict` and a
+`findings` list is read; anything else records nothing (it is not a finding, so it cannot
+satisfy `blocking`) and the next allowed engine is asked. Each finding is a signed file,
+`<channel>/adversary/<subject>-r<revision>-<moment>/<signer>.finding.json` (one per signer, subject,
+revision and moment, so asking again changes nothing; a master's override sits beside it as
+`<signer>.override.json` and a waiver as `waiver.json`, and a signer's name has no `.` so none
+of them can be mistaken for another), and the engine, model, machine and
+cost go into the ledger like any improvement step.
+
+**Modes**, set with `--adversary`:
+
+- `advisory` (the default): findings are shown; nothing waits on them. (The one exception
+  is a High tamper hit at moment 2, which always sends the task back.)
+- `blocking`: a Block binds, and it fails closed. A contract cannot be locked, the review
+  engine's key cannot be granted for that revision, and auto-merge never happens for it,
+  until the master signs an **override** (with a reason) - or, when no eligible adversary
+  has read exactly that revision at all (see below), a signed **waiver** (the same
+  command, with `--finding none`). Contracts need the `improve` delegation to override
+  from the phone; the other two need `review`.
+- `off`: it is never asked, and nothing about it is shown.
+
+**The adversary's policy is the master's alone.** Everything about the adversary -
+its mode, which engines it prefers (`--role adversary --prefer`), the engines it never
+uses (`--adversary-never`), the agents allowed to judge (`--adversary-agents`) and its
+weekly cap (`--role adversary --cap-usd`) - is its own signed file,
+`<channel>/ADVERSARY_POLICY`, and not part of `ENGINE_POLICY`. It is honoured only when the
+master signed it with their own key: there is no delegation for it, so the phone, a
+dashboard session acting under a delegation, or anyone else who holds `improve` can
+neither loosen it nor take its judges or its budget away. Like the engine policy it
+carries a sequence number and every machine remembers the highest it has seen and the last
+good one, so putting an older copy back, or deleting the file, changes nothing and asks
+the master once. The engine policy's `never`, `where` and caps do not apply to the
+adversary, and anything an `ENGINE_POLICY` file says about it is ignored. The dashboard
+shows the adversary's terms to everyone and changes them only for the master; Telegram
+shows them and never changes them (accepting a preset there leaves them as they are).
+Putting the engine policy back to auto leaves the adversary's policy as signed. A machine
+still on v0.5.17 does not know the file and never runs the adversary.
+
+**Whose finding counts.** A finding is only heard when its signer did not build the work
+it judges, published a valid signed engine inventory that lists the engine the finding
+names, and is an adversary the master allows (`ADVERSARY_POLICY`). If the master named
+`adversary_agents` (`--adversary-agents`), only those agents count. If the list is empty,
+the trust is **any member running an allowed adversary engine**: a member counts when its
+signed inventory lists an engine that matches the adversary's preference selectors (any
+engine, when there are none) and that the adversary's own `never` does not name. Anyone
+else's finding is ignored - and so is a Pass from a member you did not mean to give a vote
+to, so name the agents when the roster holds people or machines you do not fully trust.
+(The deterministic tamper scan is the one floor anybody on the roster may record, and it
+can only block.) Every eligible adversary runs its own pass - one adversary's Pass does
+not stand in for another's look - and a Block from any of them dominates. A finding is
+one signed file per signer, so nobody can pre-empt or overwrite another adversary's word.
+It also names the result it judged (a hash of that result's order, revision and
+signature): at a contract lock and before an improvement is called done it counts only
+for that exact result, so deleting an older provider result, which renumbers a contract's
+rounds, cannot let an old Pass cover a newer result. Several adversaries add up. A finding
+that does not count is ignored and shown as `ignored: <reason>` in `ferry adversary show`
+and under `ignored` in the dashboard's `/api/adversary`. Findings count only on a
+revision that exists, and every gate decides on the revision under decision, never on the
+newest finding.
+
+**Overrides name what you read.** Locking and overriding are bound to what the master was
+looking at, so a proposal or a finding that changed in between is not acted on: the CLI
+shows the contract's digest and asks you to confirm at a terminal (or take
+`--digest <prefix of at least 8>` from `ferry contract show`, plus `--finding <digest|none>`
+with `--override`); the dashboard sends the digests `/api/contracts` gave; Telegram's
+buttons carry them. A mismatch is refused with "the contract changed since you looked".
+
+**Who challenges.** The adversary ranks engines by the same rules as background work -
+subscriptions protected, paid engines need a cap - but under its own `never` and its own
+cap, and with no `where` list. It is never the engine that built the work unless that is the only one allowed -
+then it runs and the finding says `same engine`. Among the rest, a different model family
+(deepseek, qwen, llama, gemma, claude, gpt...) is preferred over the builder's own.
+`recommend()` picks one for you with a one-line reason.
+
+```sh
+# adversary = deepseek, blocking
+ferry engines policy set --role adversary --prefer deepseek --adversary blocking
+
+ferry adversary list                      # every finding, newest first
+ferry adversary show improve-2026-w40-1   # one order (or: user-api@1)
+ferry adversary override user-api@1 --reason "the consumer ships a fix first"  # shows the finding, asks to confirm
+ferry adversary override user-api@1 --finding 0123456789abcdef --reason "..."   # or name the finding you read
+ferry contract lock user-api@1 --override "the consumer ships a fix first"      # shows the digest, asks to confirm
+ferry contract lock user-api@1 --digest 89abcdef --override "..." --finding none # no prompt: name what you read
+```
+
+`ferry adversary check` asks about everything waiting now; the improve loop does it on
+its own schedule. On the dashboard the policy panel has the adversary engine and mode,
+and a Block carries an Override button for the master; on the phone it is an "Override
+the Block" button, shown only for a Block.
 
 ## OmniRoute: a free gateway as an engine
 

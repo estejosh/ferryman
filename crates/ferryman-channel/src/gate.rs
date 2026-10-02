@@ -225,6 +225,12 @@ pub fn engine_key(
     if let Some(why) = crate::evidence::blocking_reason(&task.order.payload, result) {
         return Err(format!("the result does not pass verification - {why}"));
     }
+    // The order's contract is part of verification: a result that does not carry what the
+    // order requires, or whose response does not fit the locked interface it provides, has
+    // no engine key however the review engine voted.
+    if let Some(why) = task.contract_refusal(route, revision) {
+        return Err(why);
+    }
     if let Some(refuted) = crate::evidence::read_verifications(route, &task.order.id)
         .iter()
         .find(|record| record.revision == revision && record.status == "refuted")
@@ -234,6 +240,13 @@ pub fn engine_key(
             refuted.verifier,
             refuted.reasons.join("; ")
         ));
+    }
+    // The adversary's word, when the policy makes it binding: a Block on this revision
+    // withholds the engine key until the master overrides it. Checked before the review
+    // is read, so a review that already exists cannot carry a Block past the gate.
+    if let Some(why) = crate::adversary::engine_key_refusal(route, policy, &task.order.id, revision)
+    {
+        return Err(why);
     }
     let reviews = engine_reviews(route, &task.order.id, revision);
     if reviews.is_empty() {
@@ -250,7 +263,9 @@ pub fn engine_key(
                 "{} is not where the policy runs it",
                 review.machine
             ))
-        } else if let Some(blocked) = policy.blocked(&engine, Work::Background) {
+        } else if let Some(blocked) =
+            policy.blocked_for(&engine, Work::Background, Some(Role::Review))
+        {
             Some(format!("{} is {blocked}", review.engine))
         } else if !listed.is_empty() && policy.preference(Role::Review, &engine).is_none() {
             Some(format!(
@@ -409,6 +424,12 @@ pub struct Waiting {
     /// The review engine's verdict, when it counts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<EngineReview>,
+    /// What the adversary found in this revision before it was called done, when it ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adversary: Option<crate::adversary::AdversaryFinding>,
+    /// The adversary's Block is standing and nobody has overridden it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub adversary_blocked: bool,
     /// `true`: only the master's approval is missing.
     pub ready_for_you: bool,
     pub waiting_for: String,
@@ -441,7 +462,20 @@ pub fn waiting(route: &ProjectRoute) -> Vec<Waiting> {
             continue;
         };
         let found = crate::evidence::classify(&task.order.payload, result);
+        // With the adversary off, what it once said is history and shown nowhere.
+        let adversary = crate::adversary::standing(
+            route,
+            &task.order.id,
+            revision,
+            crate::adversary::Trigger::PreDone,
+        )
+        .filter(|_| policy.adversary != crate::policy::AdversaryMode::Off);
         out.push(Waiting {
+            adversary_blocked: policy.adversary != crate::policy::AdversaryMode::Off
+                && adversary
+                    .as_ref()
+                    .is_some_and(crate::adversary::Standing::unresolved_block),
+            adversary: adversary.map(|standing| standing.finding),
             order_id: task.order.id.clone(),
             title: title(&task),
             revision,
@@ -576,6 +610,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         wisp().sign_order(&mut order);
         crate::issue_order(route, &order).unwrap();
@@ -756,6 +793,110 @@ mod tests {
             engine_key(&route, &task(&route, "improve-1"), &Policy::default(), 1).unwrap_err();
         assert!(why.contains("does not pass verification"), "{why}");
         assert!(decide(&route, "improve-1", true, None, "josh", &josh()).is_err());
+    }
+
+    /// An improvement order that requires its result to carry `summary`, done by wisp at
+    /// revision 1 with `payload` (evidence of a commit is added).
+    fn contracted(route: &ProjectRoute, id: &str, payload: Value) {
+        let mut order = Order {
+            id: id.into(),
+            project_id: "demo".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "make it better", "tags": [TAG], "improvement": { "title": "Better" } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: Some(crate::contract::ResultContract {
+                required: vec!["summary".into()],
+                schema: None,
+            }),
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
+        };
+        wisp().sign_order(&mut order);
+        crate::issue_order(route, &order).unwrap();
+        crate::claim_order(route, id, "wisp").unwrap();
+        let mut payload = payload;
+        payload["output"] = json!("done: committed abc1234");
+        payload["evidence"] = json!({ "recorded_by": "worker", "git": true, "commits": ["abc1234 better"], "diff_stat": "1 file changed" });
+        let mut result = TaskResult {
+            order_id: id.into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload,
+            signed_by: None,
+            signature: None,
+        };
+        wisp().sign_result(&mut result);
+        crate::submit_result(route, &result).unwrap();
+    }
+
+    /// The order's contract is part of verification wherever work is accepted: a result
+    /// that lacks what the order requires gets no engine key however the engine voted, and
+    /// neither the master's click nor any reviewer's accepting verdict is taken - while the
+    /// same order's result that carries it goes through.
+    #[test]
+    fn a_result_that_breaks_the_orders_contract_is_accepted_by_no_key_and_no_reviewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route(dir.path());
+        contracted(&route, "improve-1", json!({}));
+        engine_review(&route, "improve-1", "deepseek", "prepaid", true);
+
+        let why =
+            engine_key(&route, &task(&route, "improve-1"), &Policy::default(), 1).unwrap_err();
+        assert!(why.contains("breaks the order's contract"), "{why}");
+        assert!(why.contains("summary"), "{why}");
+
+        // The master's key is refused (the engine key is not there either), and so is a
+        // plain accepting review from any reviewer, however they reach it.
+        assert!(decide(&route, "improve-1", true, None, "josh", &josh()).is_err());
+        let error = accept_as(&route, "improve-1", "josh", &josh()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("breaks the order's contract"),
+            "{error:#}"
+        );
+        assert!(
+            task(&route, "improve-1").reviews.is_empty(),
+            "nothing written"
+        );
+        assert!(!approved_for_live(&route, &task(&route, "improve-1")));
+
+        // Sending it back is never refused: the contract only guards acceptance.
+        let mut back = Review {
+            order_id: "improve-1".into(),
+            revision: 1,
+            reviewer: "josh".into(),
+            reviewed_at: Utc::now(),
+            accepted: false,
+            notes: Some("add the summary".into()),
+            signed_by: None,
+            signature: None,
+        };
+        josh().sign_review(&mut back);
+        crate::submit_review(&route, &back).unwrap();
+
+        // The result that carries what the order asked for is held to nothing more.
+        contracted(
+            &route,
+            "improve-2",
+            json!({ "summary": "a small, tested change" }),
+        );
+        engine_review(&route, "improve-2", "deepseek", "prepaid", true);
+        assert!(
+            engine_key(&route, &task(&route, "improve-2"), &Policy::default(), 1).is_ok(),
+            "{:?}",
+            engine_key(&route, &task(&route, "improve-2"), &Policy::default(), 1)
+        );
+        assert_eq!(
+            decide(&route, "improve-2", true, None, "josh", &josh()).unwrap(),
+            1
+        );
     }
 
     #[test]

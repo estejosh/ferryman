@@ -709,6 +709,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         signer.sign_order(&mut order);
         order

@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod adversary;
 pub mod anchor;
 pub mod ask;
 pub mod automerge;
@@ -28,6 +29,8 @@ pub mod evidence;
 pub mod ferry;
 pub mod gate;
 pub mod head;
+pub mod hold;
+pub mod interface;
 pub mod interrupt;
 pub mod invite;
 pub mod keys;
@@ -40,6 +43,7 @@ pub mod marvin;
 pub mod master;
 pub mod memory;
 pub mod migration;
+pub mod overlap;
 pub mod owner;
 pub mod policy;
 pub mod portable_auth;
@@ -51,6 +55,7 @@ pub mod secrets;
 pub mod seed;
 pub mod skills;
 pub mod source;
+pub mod tamper;
 pub mod trajectory;
 pub mod worktree;
 
@@ -642,6 +647,21 @@ fn unix_ms_to_system_time(value: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(value)
 }
 
+/// Held while one of this agent's own files is read, changed and written back.
+///
+/// A worker that runs several orders at once (`max_parallel`) has several of them
+/// finishing together, each wanting to add a step to the same signed step log or a line to
+/// the same profile. Each of those is read-modify-write on a file with one writer - this
+/// agent - so a lock inside the process is the whole of the contention, and without it the
+/// last writer silently drops the others' lines.
+pub fn own_files_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panic while holding it leaves nothing half-written that the next writer cannot
+    // read past, so a poisoned lock is still a lock.
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -753,6 +773,19 @@ pub struct Order {
     /// deliverables rejected mechanically rather than reviewed by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<crate::contract::ResultContract>,
+    /// The interface contract this order provides or consumes. A worker does not start
+    /// the order until that contract is locked by the master; see [`interface`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<interface::InterfaceRef>,
+    /// Repo-relative globs of the files this order expects to edit. Advisory: it lets the
+    /// fleet notice two orders heading for the same files before they meet at merge. See
+    /// [`overlap`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touches: Vec<String>,
+    /// Claim this order even though its `touches` overlap an order someone is already
+    /// working on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_overlap: bool,
 }
 
 /// An agent staking a claim on an open order.
@@ -1001,6 +1034,34 @@ impl Task {
             .map(|claim| claim.claimed_at)
     }
 
+    /// Whether somebody is plausibly still reworking an order that was sent back for
+    /// changes: its holder has a live claim (a sign of life inside the stale window), or
+    /// the review that sent it back is itself newer than that window - the worker has not
+    /// had time to notice yet. A claim that went quiet long ago on a verdict nobody acted
+    /// on is not "in play": it must not keep other orders off those files forever.
+    #[must_use]
+    pub(crate) fn rework_in_play(&self, now: DateTime<Utc>) -> bool {
+        let sent_back = self
+            .latest_revision()
+            .and_then(|revision| {
+                self.reviews
+                    .iter()
+                    .find(|review| review.revision == revision && !review.accepted)
+            })
+            .map(|review| review.reviewed_at);
+        if sent_back.is_some_and(|at| !lapsed(at, now)) {
+            return true;
+        }
+        let Some(holder) = self.holder() else {
+            return false;
+        };
+        self.held_by_claim(holder)
+            && self
+                .heartbeat_for(holder)
+                .map_or_else(|| self.claimed_at(holder), |beat| Some(beat.at))
+                .is_none_or(|since| !lapsed(since, now))
+    }
+
     /// The holder's heartbeat, if one was written under the holder's own name.
     fn heartbeat_for(&self, agent: &str) -> Option<&Heartbeat> {
         self.heartbeats
@@ -1050,6 +1111,63 @@ impl Task {
         let contract = self.order.result_contract.as_ref()?;
         let latest = self.results.iter().max_by_key(|r| r.revision)?;
         Some(contract.violations(&latest.payload))
+    }
+
+    /// [`Task::contract_violations`], and also what the order's interface contract asks
+    /// of it: a provider's result must carry a `response` that fits the locked
+    /// contract's response shape (see [`interface::provider_violations`]).
+    ///
+    /// This is the check anything that accepts a result uses. It needs the route because
+    /// the contract lives in the channel, not in the order: an order names `user-api@1`,
+    /// and what `user-api@1` says is read, and verified, at the moment of the check.
+    #[must_use]
+    pub fn contract_violations_in(&self, route: &ProjectRoute) -> Option<Vec<String>> {
+        self.contract_violations_at(route, self.latest_revision()?)
+    }
+
+    /// [`Task::contract_violations_in`] for the result at exactly `revision`: what a gate
+    /// deciding on that revision must hold it to, whatever newer results exist.
+    /// `None` when there is no such result or nothing to satisfy.
+    #[must_use]
+    pub fn contract_violations_at(
+        &self,
+        route: &ProjectRoute,
+        revision: u32,
+    ) -> Option<Vec<String>> {
+        let result = self.results.iter().find(|r| r.revision == revision)?;
+        let mut found = self
+            .order
+            .result_contract
+            .as_ref()
+            .map(|contract| contract.violations(&result.payload));
+        if let Some(reference) = &self.order.interface
+            && reference.side == interface::Side::Provides
+        {
+            found
+                .get_or_insert_with(Vec::new)
+                .extend(interface::provider_violations(
+                    route,
+                    reference,
+                    &result.payload,
+                ));
+        }
+        found
+    }
+
+    /// Why the result at `revision` may not be accepted on the order's contract, when it
+    /// may not: it lacks a key the order's result contract requires, or its `response`
+    /// does not fit the locked interface contract it provides. The one question every
+    /// path that accepts work asks - the review, the engine key, auto-merge, the review
+    /// engine - so none of them can accept what the contract refuses.
+    #[must_use]
+    pub fn contract_refusal(&self, route: &ProjectRoute, revision: u32) -> Option<String> {
+        let violations = self.contract_violations_at(route, revision)?;
+        (!violations.is_empty()).then(|| {
+            format!(
+                "the result r{revision} breaks the order's contract: {}",
+                violations.join("; ")
+            )
+        })
     }
 
     /// A proposed verdict on the newest result that no human has settled yet.
@@ -1442,6 +1560,16 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
         if let Some(result) = task.results.iter().find(|r| r.revision == review.revision)
             && let Some(why) = crate::evidence::blocking_reason(&task.order.payload, result)
         {
+            bail!(
+                "revision {} of {} cannot be accepted: {why}",
+                review.revision,
+                review.order_id
+            )
+        }
+        // And the order's contract - the keys it requires, the locked interface it provides -
+        // is held here too, whichever surface the accepting verdict comes from: the dashboard,
+        // the phone, the CLI or a review engine acting as reviewer.
+        if let Some(why) = task.contract_refusal(route, review.revision) {
             bail!(
                 "revision {} of {} cannot be accepted: {why}",
                 review.revision,
@@ -2112,6 +2240,26 @@ fn order_payload(order: &Order) -> String {
             "\ncontract:{}",
             serde_json::to_string(&contract.required).unwrap_or_else(|_| "[]".to_string())
         ));
+        // The typed schema is signed in too, but only when there is one, so a contract
+        // without it keeps the exact bytes it always had.
+        if let Some(schema) = &contract.schema {
+            payload.push_str(&format!(
+                "\nschema:{}",
+                serde_jcs::to_string(schema).unwrap_or_default()
+            ));
+        }
+    }
+    if let Some(interface) = &order.interface {
+        payload.push_str(&format!("\ninterface:{}", interface.describe()));
+    }
+    if !order.touches.is_empty() {
+        payload.push_str(&format!(
+            "\ntouches:{}",
+            serde_json::to_string(&order.touches).unwrap_or_else(|_| "[]".to_string())
+        ));
+    }
+    if order.allow_overlap {
+        payload.push_str("\noverlap:allow");
     }
     if order.requires_approval {
         payload.push_str("\napproval:true");
@@ -9186,6 +9334,9 @@ mod work_over_files_tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         }
     }
 

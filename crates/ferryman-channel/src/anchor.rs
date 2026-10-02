@@ -1691,6 +1691,9 @@ mod paused_work {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         }
     }
 

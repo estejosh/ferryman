@@ -278,7 +278,22 @@ pub struct AgentConfig {
     /// improve loop) for later or for another machine. Orders a person gave directly are
     /// never deferred by this. On unless set to "false".
     pub defer_improvements_while_active: bool,
+    /// How many orders one work pass runs at once, each in its own worktree. 1 - the
+    /// default - runs them one after another, exactly as a worker always has.
+    pub max_parallel: usize,
+    /// How hard the engine this config is running now is asked to think, set by
+    /// [`Self::with_engine_effort`]. `None` asks nothing.
+    pub effort: Option<ferryman_channel::policy::Effort>,
 }
+
+/// The most orders one worker may run at once, whatever `max_parallel` says.
+pub const MAX_PARALLEL: usize = 16;
+
+/// Test hook: every directory an order was run in, so a test can see that orders run
+/// together each had a worktree of their own.
+#[cfg(test)]
+pub(crate) static SEEN_WORKDIRS: std::sync::Mutex<Vec<(String, PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
 
 impl AgentConfig {
     /// Where the config lives: beside the attachment, never inside the synced folder.
@@ -361,10 +376,23 @@ impl AgentConfig {
     /// This config, running `engine` instead of whatever it would have run.
     #[must_use]
     pub fn with_engine(&self, engine: &crate::engines::EngineSpec) -> Self {
+        self.with_engine_effort(engine, None)
+    }
+
+    /// [`Self::with_engine`], asking the engine to think at `effort`: `{effort}` and the
+    /// engine's `effort_args` go into a CLI's arguments, and an HTTP engine that supports
+    /// it is sent a reasoning effort.
+    #[must_use]
+    pub fn with_engine_effort(
+        &self,
+        engine: &crate::engines::EngineSpec,
+        effort: Option<ferryman_channel::policy::Effort>,
+    ) -> Self {
         let mut config = self.clone();
+        config.effort = effort;
         if engine.kind == crate::engines::Kind::Cli {
             config.command.clone_from(&engine.command);
-            config.args = engine.cli_args();
+            config.args = engine.cli_args_at(effort);
         } else {
             config.command.clone_from(&engine.name);
         }
@@ -373,6 +401,13 @@ impl AgentConfig {
         }
         config.active = Some(engine.clone());
         config
+    }
+
+    /// The effort this config's engine was asked to think at, when that engine acts on
+    /// one - the effort that is recorded beside the engine, model and machine.
+    #[must_use]
+    pub fn applied_effort(&self) -> Option<ferryman_channel::policy::Effort> {
+        self.effort.filter(|_| self.engine().applies_effort())
     }
 
     /// The engine this config runs: the active one, or the first configured.
@@ -519,6 +554,15 @@ impl AgentConfig {
                 percent @ 0..=100 => u8::try_from(percent).unwrap_or(100),
                 other => bail!("busy_cpu_percent is a percentage, 0 to 100, not {other}"),
             },
+            max_parallel: match usize::try_from(number("max_parallel", 1)?) {
+                Ok(n @ 1..=MAX_PARALLEL) => n,
+                _ => bail!(
+                    "max_parallel is how many orders run at once, 1 to {MAX_PARALLEL} - \
+                     not '{}'",
+                    fields.get("max_parallel").map_or("", String::as_str)
+                ),
+            },
+            effort: None,
             claim_window: match fields.get("claim_window").map(String::as_str) {
                 None | Some("") => None,
                 Some(value) => Some(crate::governor::Window::parse(value)?),
@@ -748,6 +792,25 @@ defer_improvements_while_active = "true"
 # Let this worker run the weekly improvement loop (ferry improve run) itself, at
 # most hourly. Off by default; n8n or cron can run it instead.
 # improve = "true"
+
+# How many orders one work pass runs at once. 1 (the default) is one after another,
+# exactly as before. With more, the pass claims up to that many orders and runs them
+# together, each in its own git worktree (turn `worktree` on, or they share one
+# checkout). Orders whose `touches` overlap are never run together, and the engine
+# policy's `width` caps how many of a role the whole fleet has claimed at once.
+# max_parallel = "3"
+
+# How hard an engine is asked to think comes from the engine policy, per role. An
+# engine acts on it where its arguments say so - `{{effort}}` reads low, medium or high -
+# or where it lists extra arguments per level. Examples only; check your CLI's own
+# flag before using one:
+#   engine.main.args = ["exec","-c","model_reasoning_effort={{effort}}","{{prompt}}"]
+#   engine.main.effort_args = {{"low":["--think","low"],"high":["--think","high"]}}
+# An HTTP engine is sent a reasoning_effort field only when it says it takes one:
+#   engine.nvidia.supports_effort = "true"
+# And a size class (small, medium, large) is guessed from the model's name unless
+# you say it:
+#   engine.nvidia.class = "medium"
 "#,
             review = review.as_str(),
             sandbox = sandbox.unwrap_or(""),
@@ -791,7 +854,8 @@ async fn run_engine(
             // Written once, removed when the request is done: an HTTP engine has no
             // child process, but the claim still needs a live heartbeat.
             let heartbeat = heartbeat.inspect(TaskHeartbeat::write);
-            let run = crate::engines::chat(engine, key, prompt, config.timeout).await;
+            let run =
+                crate::engines::chat(engine, key, prompt, config.timeout, config.effort).await;
             drop(heartbeat);
             Ok(AgentRun {
                 stdout: run.text,
@@ -1697,6 +1761,108 @@ fn record_agent_activity(
     let _ = ferryman_channel::memory::append_agent_profile(&bank, agent, &line, identity);
 }
 
+/// What the engine is told about the shapes its order is held to: the locked interface
+/// contract the order provides or consumes, and the typed result schema it must fit.
+/// Empty for an order with neither.
+fn contract_prompt(route: &ProjectRoute, order: &ferryman_channel::Order) -> String {
+    let mut text = String::new();
+    if let Some(block) = ferryman_channel::interface::prompt_block(route, order) {
+        text.push_str(&block);
+        text.push('\n');
+    }
+    if let Some(schema) = order
+        .result_contract
+        .as_ref()
+        .and_then(|contract| contract.schema.as_ref())
+    {
+        text.push_str(&format!(
+            "RESULT SHAPE - your result is checked against this mechanically. End your answer \
+             with a fenced ```json block holding an object whose keys are the result's keys:\n{}\n\n",
+            serde_json::to_string_pretty(schema).unwrap_or_default()
+        ));
+    }
+    text
+}
+
+/// Whether the order's result is checked field by field, so the worker should lift the
+/// fields out of the engine's answer: a typed result schema, or an interface it provides.
+fn wants_result_fields(order: &ferryman_channel::Order) -> bool {
+    order
+        .result_contract
+        .as_ref()
+        .is_some_and(|contract| contract.schema.is_some())
+        || order
+            .interface
+            .as_ref()
+            .is_some_and(|reference| reference.side == ferryman_channel::interface::Side::Provides)
+}
+
+/// The JSON object an answer ends with: the last fenced block that parses as an object,
+/// or the whole answer when that is itself one.
+fn answer_object(answer: &str) -> Option<serde_json::Map<String, Value>> {
+    let as_object = |text: &str| match serde_json::from_str::<Value>(text.trim()) {
+        Ok(Value::Object(object)) => Some(object),
+        _ => None,
+    };
+    let fenced = answer
+        .split("```")
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .filter_map(|(_, block)| {
+            // The language tag, if there is one, is the run of letters before the body.
+            as_object(block.trim_start_matches(|c: char| c.is_ascii_alphabetic()))
+        })
+        .last();
+    fenced.or_else(|| as_object(answer))
+}
+
+/// Lift the engine's JSON object into the result payload, so a typed schema or an interface
+/// contract can be checked against real fields. Never overwrites a key the worker already
+/// wrote (`output`, `engine`, `cost_usd`, ...): those are the worker's own record, and an
+/// engine does not get to restate them. Nor does it get to *supply* one the worker has not
+/// written yet: see [`worker_owned`].
+fn merge_result_fields(payload: &mut Value, answer: &str) {
+    let Some(fields) = answer_object(answer) else {
+        return;
+    };
+    let Some(target) = payload.as_object_mut() else {
+        return;
+    };
+    for (key, value) in fields {
+        if worker_owned(&key) {
+            continue;
+        }
+        target.entry(key).or_insert(value);
+    }
+}
+
+/// Result keys that are the worker's own record - what ran, where, at what cost, and what
+/// git says it did - and that an engine's answer must never supply, whether or not the
+/// worker has written them by the time the answer is merged. The worker sets some of them
+/// only later (`worktree_head`, `committed`, `pushed`) or only sometimes (`usage`, `model`,
+/// `effort`), and a key it left out is not a gap an engine may fill: a forged
+/// `worktree_head` would read as provenance.
+const WORKER_OWNED_KEYS: &[&str] = &[
+    "output",
+    "produced_by",
+    "engine",
+    "machine",
+    "cost_usd",
+    "usage",
+    "model",
+    "effort",
+    "evidence",
+    "committed",
+    "branch_kept",
+    "pushed",
+    "push_failed",
+];
+
+fn worker_owned(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    key.starts_with("worktree_") || WORKER_OWNED_KEYS.contains(&key.as_str())
+}
+
 /// The prompt for a first attempt or revision, without task-matched skills.
 /// Kept as the test-facing entry point; the worker uses
 /// [`work_prompt_with_skills`].
@@ -2269,6 +2435,25 @@ pub struct Plan {
     pub would_do: Vec<(String, String)>,
 }
 
+/// Why this worker should not start `order` yet, when it should not: its interface
+/// contract is missing or not locked, or its `touches` overlap an order someone has
+/// claimed. `None` means it is free to claim.
+///
+/// A failure to read the channel here is not a reason to refuse work: the checks are
+/// advisory, and a worker that stopped on every unreadable directory would be worse than
+/// one that occasionally started something it could have waited for.
+fn start_hold(route: &ProjectRoute, order: &ferryman_channel::Order) -> Option<String> {
+    ferryman_channel::interface::hold_reason(route, order)
+        .or_else(|| {
+            ferryman_channel::overlap::claim_hold(route, order)
+                .ok()
+                .flatten()
+        })
+        // The fleet's width for the order's role, counted from the claims in the channel
+        // now - which include any this worker took a moment ago in the same pass.
+        .or_else(|| ferryman_channel::policy::width_hold_in(route, order))
+}
+
 /// Resolve the same things the worker resolves, and report them.
 pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
     let waiting = ferryman_channel::work_for(route, &config.agent)?;
@@ -2278,6 +2463,9 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
             let id = task.order.id.clone();
             match task.state() {
                 TaskState::Open | TaskState::Offered { .. } => {
+                    if let Some(reason) = start_hold(route, &task.order) {
+                        return Some((id, format!("hold off: {reason}")));
+                    }
                     Some((id, "claim it, then run the agent".to_string()))
                 }
                 TaskState::Claimed { .. } => {
@@ -2359,6 +2547,34 @@ pub async fn work_once(
     // lets fm merge them: merged here, in the repository they were built in, before any
     // new work starts from the default branch.
     merge_approved(route, config, &identity, report);
+    // Claimed, or already ours, and not yet run. With `max_parallel` 1 it never holds
+    // more than the order just claimed, which is run before the next is looked at.
+    let mut batch: Vec<Task> = Vec::new();
+    // How many may be claimed ahead of running: what the config allows, but one when the
+    // orders would have to share a checkout.
+    let width = effective_parallel(route, config);
+    // An error while collecting a batch must not strand the orders already claimed for it:
+    // they are run (and so completed or failed in the ordinary way) before the error goes
+    // on, and the one being claimed when it happened is let go of.
+    macro_rules! or_settle {
+        ($result:expr, $held:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(error) => {
+                    settle_batch_after_error(
+                        route,
+                        config,
+                        &identity,
+                        std::mem::take(&mut batch),
+                        $held,
+                        report,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        };
+    }
     for task in waiting {
         let id = task.order.id.clone();
         // Trust boundary: never act on an order whose signature does not verify.
@@ -2375,6 +2591,21 @@ pub async fn work_once(
             // Without it an order addressed to a machine that never ran looks exactly like
             // one being worked on.
             TaskState::Open | TaskState::Offered { .. } => {
+                // Not yet, and the reason is written down where everyone can read it: an
+                // interface contract the order builds to that the master has not locked,
+                // or another agent already working on the same files. Declined, not
+                // claimed - holding a claim on work nobody is doing would be the lie.
+                if let Some(reason) = start_hold(route, &task.order) {
+                    match ferryman_channel::hold::record(route, &identity, &id, &reason) {
+                        Ok(true) => report.info(&format!("  {id}: holding off, {reason}")),
+                        Ok(false) => {}
+                        Err(error) => report.warn(&format!(
+                            "  {id}: holding off, {reason} (could not record it: {error:#})"
+                        )),
+                    }
+                    continue;
+                }
+                ferryman_channel::hold::clear(route, &id, &config.agent);
                 // Nothing here can run an order of this tier right now - or, for an
                 // improvement order, nothing the engine policy allows, or this machine is
                 // not one it names: leave it for a machine that can, rather than claim it
@@ -2382,11 +2613,14 @@ pub async fn work_once(
                 if next_engine(route, config, &task, &[]).is_err() {
                     continue;
                 }
-                ferryman_channel::claim_order(route, &id, &config.agent)?;
+                or_settle!(
+                    ferryman_channel::claim_order(route, &id, &config.agent),
+                    None
+                );
                 // Re-read: another machine's claim may have arrived while this one was
                 // being written, and the older claim wins. Acting on a stale read is
                 // how two agents end up doing the same task.
-                let task = ferryman_channel::read_task(route, &id)?;
+                let task = or_settle!(ferryman_channel::read_task(route, &id), Some(&id));
                 if task.holder() != Some(config.agent.as_str()) {
                     report.info(&format!(
                         "  {id}: {} claimed it first, backing off",
@@ -2403,16 +2637,12 @@ pub async fn work_once(
                 // entries for claims it never held. A log that records what a machine
                 // attempted, in a chain whose whole value is recording what happened, is
                 // worse than no entry: it is evidence for something untrue.
-                ferryman_channel::ledger::append_ledger_entry(
-                    route,
-                    &identity,
-                    "claim",
-                    &config.agent,
-                    &format!("claimed order {id}"),
-                    Some(&id),
-                )?;
-                if attempt(route, config, &identity, &task, report).await {
-                    acted += 1;
+                or_settle!(append_claim_entry(route, &identity, config, &id), Some(&id));
+                batch.push(task);
+                if batch.len() >= width {
+                    acted +=
+                        run_batch(route, config, &identity, std::mem::take(&mut batch), report)
+                            .await;
                 }
             }
             // clippy would fold this `if` into a match guard. A guard cannot hold an
@@ -2421,30 +2651,217 @@ pub async fn work_once(
             TaskState::Claimed { .. }
             | TaskState::ChangesRequested { .. }
             | TaskState::Stale { .. } => {
-                if attempt(route, config, &identity, &task, report).await {
-                    acted += 1;
+                batch.push(task);
+                if batch.len() >= width {
+                    acted +=
+                        run_batch(route, config, &identity, std::mem::take(&mut batch), report)
+                            .await;
                 }
             }
             // The operator ended this one. The only thing left to do is stop holding it,
             // so the channel does not show a claim on work nobody will ever finish. No
             // agent is started, no revision is owed, and the order is not seen again.
             TaskState::Killed { by, .. } => {
-                ferryman_channel::interrupt::abandon_claim(route, &id, &config.agent)?;
-                ferryman_channel::ledger::append_ledger_entry(
-                    route,
-                    &identity,
-                    "interrupt",
-                    &config.agent,
-                    &format!("let go of {id}: killed by {by}"),
-                    Some(&id),
-                )?;
+                or_settle!(
+                    ferryman_channel::interrupt::abandon_claim(route, &id, &config.agent),
+                    None
+                );
+                or_settle!(
+                    ferryman_channel::ledger::append_ledger_entry(
+                        route,
+                        &identity,
+                        "interrupt",
+                        &config.agent,
+                        &format!("let go of {id}: killed by {by}"),
+                        Some(&id),
+                    ),
+                    None
+                );
                 report.warn(&format!("  {id}: killed by {by}; dropped the claim"));
             }
             _ => {}
         }
     }
+    acted += run_batch(route, config, &identity, batch, report).await;
     Ok(acted)
 }
+
+/// Run the orders a pass has claimed: one on its own as [`attempt`] always has, or - when
+/// `max_parallel` let the pass claim several - all of them together, each in its own
+/// worktree. They are claimed one at a time before any of them runs, so the file-overlap
+/// and width checks see every earlier claim of this pass, and orders that would collide
+/// are never in the batch together. An engine that runs out of credit while they run
+/// fails only its own order over to the next engine; the others carry on. Returns how
+/// many did work.
+async fn run_batch(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    batch: Vec<Task>,
+    report: &dyn Progress,
+) -> usize {
+    match batch.as_slice() {
+        [] => 0,
+        [task] => usize::from(attempt_isolated(route, config, identity, task, false, report).await),
+        // Orders that cannot each have a checkout of their own never run together,
+        // whatever `max_parallel` says: two engines editing one working tree trample each
+        // other. This is the same rule `work_once` applies when it sizes the batch.
+        tasks if !isolated_checkouts(route, config) => {
+            report.info(&format!(
+                "  {} orders share this checkout (no worktree), so they run one at a time",
+                tasks.len()
+            ));
+            let mut done = 0;
+            for task in tasks {
+                done += usize::from(
+                    attempt_isolated(route, config, identity, task, false, report).await,
+                );
+            }
+            done
+        }
+        tasks => {
+            report.info(&format!("  running {} orders at once", tasks.len()));
+            futures_util::future::join_all(
+                tasks
+                    .iter()
+                    .map(|task| attempt_isolated(route, config, identity, task, true, report)),
+            )
+            .await
+            .into_iter()
+            .filter(|done| *done)
+            .count()
+        }
+    }
+}
+
+/// An order that was to run beside others has no worktree of its own to run in. Never a
+/// failed attempt: see [`attempt`].
+#[derive(Debug)]
+struct SharedCheckout(String);
+
+impl std::fmt::Display for SharedCheckout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "would share a checkout with the orders running beside it: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for SharedCheckout {}
+
+/// Whether each order of a batch can have a git worktree of its own: worktrees are on and
+/// the workspace is a git repository.
+fn isolated_checkouts(route: &ProjectRoute, config: &AgentConfig) -> bool {
+    config.worktree && ferryman_channel::worktree::is_git_repo(&route.workspace)
+}
+
+/// How many orders a pass may run at once: `max_parallel`, but one when they would have to
+/// share a checkout.
+fn effective_parallel(route: &ProjectRoute, config: &AgentConfig) -> usize {
+    if isolated_checkouts(route, config) {
+        config.max_parallel.max(1)
+    } else {
+        1
+    }
+}
+
+/// [`attempt`], with a panic inside it failing that one order rather than unwinding the
+/// pass and every other order running beside it. The panic is recorded as a failed attempt
+/// (so backoff applies, as for any failure) and reported; the order stays claimed, as after
+/// any other failure.
+async fn attempt_isolated(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    task: &Task,
+    concurrent: bool,
+    report: &dyn Progress,
+) -> bool {
+    use futures_util::FutureExt as _;
+    let id = &task.order.id;
+    let started = worker_uptime();
+    match std::panic::AssertUnwindSafe(attempt(route, config, identity, task, concurrent, report))
+        .catch_unwind()
+        .await
+    {
+        Ok(done) => done,
+        Err(panic) => {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "no message".to_string());
+            let failures = attempt_ledger()
+                .lock()
+                .map(|mut ledger| ledger.failed(&route.project_id, id, started))
+                .unwrap_or(MAX_TASK_ATTEMPTS);
+            report.warn(&format!(
+                "  {id}: attempt {failures} of {MAX_TASK_ATTEMPTS} panicked: {what}; the other \
+                 orders carry on"
+            ));
+            false
+        }
+    }
+}
+
+/// Run what a pass had claimed when an error stopped it collecting more, so no claim waits
+/// on a run that is never going to happen, and let go of the order that was being claimed
+/// (it never made the batch). Best effort: the error being propagated is the one that
+/// matters.
+async fn settle_batch_after_error(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    batch: Vec<Task>,
+    unbatched: Option<&str>,
+    report: &dyn Progress,
+) {
+    if let Some(id) = unbatched
+        && let Err(error) = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent)
+    {
+        report.warn(&format!("  {id}: could not let go of the claim: {error:#}"));
+    }
+    if !batch.is_empty() {
+        report.warn(&format!(
+            "  an error stopped the pass; running the {} order(s) it had already claimed first",
+            batch.len()
+        ));
+        run_batch(route, config, identity, batch, report).await;
+    }
+}
+
+/// The ledger entry for a confirmed claim.
+fn append_claim_entry(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    config: &AgentConfig,
+    id: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_CLAIM_ENTRY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .any(|failing| failing == id)
+    {
+        bail!("injected: could not write the claim entry for {id}");
+    }
+    ferryman_channel::ledger::append_ledger_entry(
+        route,
+        identity,
+        "claim",
+        &config.agent,
+        &format!("claimed order {id}"),
+        Some(id),
+    )
+    .map(|_| ())
+}
+
+/// Orders whose claim entry fails to be written, for tests of a pass that errors part-way.
+#[cfg(test)]
+static FAIL_CLAIM_ENTRY: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Merge what [`ferryman_channel::automerge::run`] allows - low-risk improvements this
 /// agent built, holding both keys, in a project whose engine policy says
@@ -2858,6 +3275,7 @@ async fn attempt(
     config: &AgentConfig,
     identity: &AgentIdentity,
     task: &Task,
+    concurrent: bool,
     report: &dyn Progress,
 ) -> bool {
     let id = &task.order.id;
@@ -2878,6 +3296,18 @@ async fn attempt(
         Attempt::Now => {}
     }
 
+    // An order that has failed twice meets the adversary before a third try: is the work
+    // fixing the cause or hiding the symptom? A Block rides into the next prompt (see
+    // `do_work`) and is put to the master once; only the master taking the order over
+    // stops the attempt.
+    if let crate::adversary::Gate::Hold(why) =
+        crate::adversary::before_attempt(route, config, task, chrono::Utc::now(), report).await
+    {
+        report.warn(&format!("  {id}: {why}; not attempting it"));
+        let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
+        return false;
+    }
+
     // Engine fallback. An engine that is out of credit, or cannot run here, is not a
     // failed attempt: it is marked, and the same order goes straight to the next engine
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
@@ -2896,8 +3326,24 @@ async fn attempt(
             }
         };
         tried.push(engine.name.clone());
-        let effective = config.with_engine(&engine);
-        match do_work(route, &effective, identity, task, report).await {
+        // How hard this order's role is asked to think, by the engine policy.
+        let (policy, _) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        let effort = policy.effort_for(ferryman_channel::policy::Role::for_order_tier(
+            order_tier(task).as_str(),
+        ));
+        let effective = config.with_engine_effort(&engine, Some(effort));
+        match do_work(route, &effective, identity, task, concurrent, report).await {
+            // No checkout of its own while others run beside it: not a failure and not
+            // the engine's doing. Let go of the claim so a pass that runs it alone (or
+            // another machine) takes it, rather than run it in the others' checkout.
+            Err(error) if error.downcast_ref::<SharedCheckout>().is_some() => {
+                report.warn(&format!(
+                    "  {id}: {error:#}; letting go of it so it runs on its own, not beside the others"
+                ));
+                let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
+                return false;
+            }
             Err(error)
                 if error
                     .downcast_ref::<crate::engines::Unavailable>()
@@ -3101,7 +3547,11 @@ pub(crate) fn policy_allows(
         chrono::Utc::now(),
     )
     .remove(0);
-    match policy.blocked(&candidate, ferryman_channel::policy::Work::Background) {
+    match policy.blocked_for(
+        &candidate,
+        ferryman_channel::policy::Work::Background,
+        Some(ferryman_channel::policy::Role::Review),
+    ) {
         Some(why) => Err(format!("{} is {why}", engine.name)),
         None => Ok(()),
     }
@@ -3228,6 +3678,7 @@ async fn do_work(
     config: &AgentConfig,
     identity: &AgentIdentity,
     task: &Task,
+    concurrent: bool,
     report: &dyn Progress,
 ) -> Result<()> {
     use ferryman_channel::interrupt::InterruptAction;
@@ -3306,11 +3757,28 @@ async fn do_work(
                 workdir = dir;
                 used_worktree = true;
             }
+            // Beside other orders it must not fall back to the shared checkout: two
+            // engines editing one working tree trample each other. Alone, in place is
+            // what it has always done.
+            Err(e) if concurrent => {
+                return Err(
+                    SharedCheckout(format!("its worktree could not be made: {e:#}")).into(),
+                );
+            }
             Err(e) => report.warn(&format!(
                 "  {id}: worktree unavailable, running in place: {e}"
             )),
         }
     }
+    if concurrent && !used_worktree {
+        return Err(SharedCheckout("it has no worktree to run in".to_string()).into());
+    }
+
+    #[cfg(test)]
+    SEEN_WORKDIRS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((id.clone(), workdir.clone()));
 
     // Task-matched skills: load the team's shared SKILL.md expertise and inject
     // only the skills whose description overlaps this task.
@@ -3331,10 +3799,17 @@ async fn do_work(
     // And the roster of the other agents, so it knows who else is available, what
     // they are practiced at, and can say so when one of them is a better fit.
     let roster_text = peer_roster_block(route, &config.agent, &task_text);
+    // The interface this order builds to, and the shape its result must take, are the
+    // standing facts of the task rather than expertise: they ride just ahead of the skills.
+    let contract_text = contract_prompt(route, &task.order);
+    // What the adversary found when it blocked this order's next attempt, if it did.
+    let adversary_text = ferryman_channel::adversary::attempt_notice(route, id)
+        .map(|notice| format!("{notice}\n"))
+        .unwrap_or_default();
     let mut prompt = work_prompt_with_skills(
         config,
         task,
-        &format!("{profile_text}{roster_text}{skills_text}"),
+        &format!("{profile_text}{roster_text}{contract_text}{adversary_text}{skills_text}"),
     );
     if let Some(note) = steer {
         prompt = format!(
@@ -3433,6 +3908,14 @@ async fn do_work(
     }
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
+    }
+    // Beside the engine, model and machine: how hard it was asked to think, when it
+    // acts on that.
+    if let Some(effort) = config.applied_effort() {
+        payload["effort"] = json!(effort.as_str());
+    }
+    if run.ok && wants_result_fields(&task.order) {
+        merge_result_fields(&mut payload, &engine_answer(&run.stdout));
     }
     if run.ok {
         // Recorded here, by the worker, before anything is committed or torn down - and
@@ -3537,6 +4020,9 @@ async fn do_work(
             model: engine.model.clone().or_else(|| config.model.clone()),
             cost_usd: Some(cost),
             order: Some(id.clone()),
+            effort: config
+                .applied_effort()
+                .map(|effort| effort.as_str().to_string()),
             outcome: format!("submitted r{revision}"),
         };
         if let Err(error) = ferryman_channel::policy::record_step(route, identity, &week, step) {
@@ -3602,6 +4088,43 @@ async fn collect_evidence(
     found
 }
 
+/// Record in the result's evidence which files the branch actually changed, read from git
+/// after the commit, and say - as a note for reviewers - when some fall outside the globs
+/// the order declared in `touches`.
+///
+/// Deliberately not a finding. `touches` is the issuer's estimate, a sound change may need
+/// one more file than anyone guessed, and the evidence classifier never reads the note: it
+/// cannot make a result unverified or refuted. It exists so a reviewer who is about to
+/// accept work sees that it wandered, instead of finding out at merge.
+fn record_touched(
+    workdir: &Path,
+    base_commit: &str,
+    task: &Task,
+    payload: &mut Value,
+    report: &dyn Progress,
+) {
+    let id = &task.order.id;
+    // Only a result that carries the worker's evidence has anywhere to put it.
+    let Some(mut evidence) = payload.get("evidence").and_then(|value| {
+        serde_json::from_value::<ferryman_channel::evidence::Evidence>(value.clone()).ok()
+    }) else {
+        return;
+    };
+    match ferryman_channel::worktree::changed_paths(workdir, base_commit) {
+        Ok(changed) => {
+            evidence.record_touched(&task.order.touches, &changed);
+            if let Some(note) = ferryman_channel::overlap::scope_note(&task.order.touches, &changed)
+            {
+                report.warn(&format!("  {id}: {note}"));
+            }
+            payload["evidence"] = json!(evidence);
+        }
+        Err(error) => report.warn(&format!(
+            "  {id}: could not list the files the commit changed: {error:#}"
+        )),
+    }
+}
+
 /// Commit the worktree, retire it, and publish the branch when it is worth keeping.
 ///
 /// The push is keyed off whether the branch has work, not off whether this worker
@@ -3644,6 +4167,7 @@ fn settle_worktree(
         Ok(None) => {}
         Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
     }
+    record_touched(workdir, base_commit, task, payload, report);
 
     if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, branch) {
         payload["worktree_head"] = json!(head);
@@ -3835,6 +4359,19 @@ async fn judge(
             reasoning: format!(
                 "Sent back on the worker's own evidence, not a model's opinion - {why}. Do \
                  the work in the workspace and commit it: a claim alone is not accepted."
+            ),
+        };
+        return record_verdict(route, config, identity, &id, revision, &verdict, report);
+    }
+    // The order's contract is as deterministic as the evidence: a result that lacks what the
+    // order requires, or whose response does not fit the locked interface it provides, is
+    // sent back without a model - and could not be accepted by any path if a model said so.
+    if let Some(why) = task.contract_refusal(route, revision) {
+        let verdict = Verdict {
+            accept: false,
+            reasoning: format!(
+                "Sent back on the order's contract, not a model's opinion - {why}. Change the \
+                 result so it carries what the contract asks for."
             ),
         };
         return record_verdict(route, config, identity, &id, revision, &verdict, report);
@@ -4742,6 +5279,9 @@ mod tests {
                 signed_by: None,
                 signature: None,
                 result_contract: None,
+                interface: None,
+                touches: Vec::new(),
+                allow_overlap: false,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -4823,6 +5363,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         }
     }
 
@@ -5131,6 +5674,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         assert_eq!(
             commit_subject("t-4f2a", &order),
@@ -5295,6 +5841,9 @@ mod tests {
                 signed_by: None,
                 signature: None,
                 result_contract: None,
+                interface: None,
+                touches: Vec::new(),
+                allow_overlap: false,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -5491,6 +6040,17 @@ mod tests {
         order_id: &str,
         config: &str,
     ) -> (ProjectRoute, AgentConfig) {
+        channel_with_shaped_order_for_wisp(comms, order_id, config, |_| {})
+    }
+
+    /// [`channel_with_order_for_wisp`], with `shape` free to change the order (its
+    /// `interface`, `touches`, ...) before the issuer signs it.
+    fn channel_with_shaped_order_for_wisp(
+        comms: &Path,
+        order_id: &str,
+        config: &str,
+        shape: impl FnOnce(&mut Order),
+    ) -> (ProjectRoute, AgentConfig) {
         let workspace = comms.join("demo-ferryman");
         enabled_channel(&workspace, "demo");
         std::fs::write(AgentConfig::path(&workspace.join(".ferryman")), config).unwrap();
@@ -5513,10 +6073,376 @@ mod tests {
         order.issued_by = "boss".into();
         order.assigned_to = Some("wisp".into());
         order.requires_review = false;
+        shape(&mut order);
         boss.sign_order(&mut order);
         ferryman_channel::issue_order(&route, &order).unwrap();
         let config = AgentConfig::load(&route.attachment).unwrap();
         (route, config)
+    }
+
+    /// A worker config that runs an engine which does not exist: the order is claimed and
+    /// handed over, and nothing runs. What a test sees is whether it was claimed.
+    const NO_ENGINE: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n";
+
+    fn boss() -> AgentIdentity {
+        AgentIdentity::from_seed("boss", [9; 32])
+    }
+
+    fn user_api() -> ferryman_channel::interface::InterfaceRef {
+        ferryman_channel::interface::InterfaceRef {
+            name: "user-api".into(),
+            version: "1".into(),
+            side: ferryman_channel::interface::Side::Consumes,
+        }
+    }
+
+    fn propose_user_api(route: &ProjectRoute) {
+        let shape = ferryman_channel::contract::Shape::parse(&json!({
+            "type": "object",
+            "required": ["user"],
+            "properties": { "user": { "type": "object", "required": ["id"],
+                "properties": { "id": { "type": "integer" } } } }
+        }))
+        .unwrap();
+        ferryman_channel::interface::propose(
+            route,
+            &boss(),
+            "user-api",
+            "1",
+            "GET /users/:id",
+            None,
+            shape,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_contract_is_not_locked_is_held_and_then_runs() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(comms.path(), "t-ui", NO_ENGINE, |order| {
+                order.interface = Some(user_api());
+            });
+        ferryman_channel::master::initialize_master(&route, &boss(), "boss").unwrap();
+
+        // No contract at all: held, with the reason where everyone can read it.
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let task = ferryman_channel::read_task(&route, "t-ui").unwrap();
+        assert!(task.claims.is_empty(), "nothing is claimed while it waits");
+        let holds = ferryman_channel::hold::read(&route, "t-ui");
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert_eq!(holds[0].agent, "wisp");
+        assert!(
+            holds[0]
+                .reason
+                .contains("waiting for contract user-api@1 to be locked"),
+            "{}",
+            holds[0].reason
+        );
+        let plan = plan(&route, &config).unwrap();
+        assert!(
+            plan.would_do[0]
+                .1
+                .starts_with("hold off: waiting for contract"),
+            "{:?}",
+            plan.would_do
+        );
+
+        // Proposed but not locked is still waiting, and the record says what changed.
+        propose_user_api(&route);
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert!(
+            ferryman_channel::read_task(&route, "t-ui")
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        let holds = ferryman_channel::hold::read(&route, "t-ui");
+        assert_eq!(holds.len(), 1);
+        assert!(
+            holds[0].reason.contains("proposed, waiting for the master"),
+            "{}",
+            holds[0].reason
+        );
+        // A pass that finds the same reason does not rewrite the record.
+        let before = holds[0].at;
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let holds = ferryman_channel::hold::read(&route, "t-ui");
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].at, before, "an unchanged reason is not rewritten");
+
+        // Locked: the hold is cleared and the order is claimed.
+        let seen = ferryman_channel::interface::current_digest(&route, "user-api", "1").unwrap();
+        ferryman_channel::interface::lock(&route, "user-api", "1", &seen, "boss", &boss()).unwrap();
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let task = ferryman_channel::read_task(&route, "t-ui").unwrap();
+        assert_eq!(task.claims.len(), 1, "it runs once the contract is locked");
+        assert!(ferryman_channel::hold::read(&route, "t-ui").is_empty());
+    }
+
+    /// An order for wisp that touches `touches`, and another order - for fang, who has
+    /// claimed it - that touches `other`.
+    fn channel_with_a_claimed_neighbour(
+        comms: &Path,
+        touches: &[&str],
+        allow_overlap: bool,
+        other: &[&str],
+    ) -> (ProjectRoute, AgentConfig) {
+        let touches: Vec<String> = touches.iter().map(|glob| glob.to_string()).collect();
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(comms, "t-mine", NO_ENGINE, |order| {
+                order.touches = touches;
+                order.allow_overlap = allow_overlap;
+            });
+        let mut neighbour = order("t-neighbour");
+        neighbour.project_id = route.project_id.clone();
+        neighbour.issued_by = "boss".into();
+        neighbour.assigned_to = Some("fang".into());
+        neighbour.requires_review = false;
+        neighbour.touches = other.iter().map(|glob| glob.to_string()).collect();
+        boss().sign_order(&mut neighbour);
+        ferryman_channel::issue_order(&route, &neighbour).unwrap();
+        ferryman_channel::claim_order(&route, "t-neighbour", "fang").unwrap();
+        (route, config)
+    }
+
+    #[tokio::test]
+    async fn a_worker_does_not_claim_an_order_that_overlaps_one_being_worked_on() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_a_claimed_neighbour(comms.path(), &["src/api/**"], false, &["src/**"]);
+
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        let task = ferryman_channel::read_task(&route, "t-mine").unwrap();
+        assert!(task.claims.is_empty(), "held back, not claimed");
+        let holds = ferryman_channel::hold::read(&route, "t-mine");
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert!(
+            holds[0].reason.contains("t-neighbour") && holds[0].reason.contains("fang"),
+            "{}",
+            holds[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_overlap_and_unrelated_files_are_claimed_regardless() {
+        hermetic_machine();
+        let allowed = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_a_claimed_neighbour(allowed.path(), &["src/api/**"], true, &["src/**"]);
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(
+            ferryman_channel::read_task(&route, "t-mine")
+                .unwrap()
+                .claims
+                .len(),
+            1,
+            "allow_overlap means the issuer accepted the risk"
+        );
+        assert!(ferryman_channel::hold::read(&route, "t-mine").is_empty());
+
+        let apart = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_a_claimed_neighbour(
+            apart.path(),
+            &["src/apiv2/**"],
+            false,
+            &["src/api/**"],
+        );
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(
+            ferryman_channel::read_task(&route, "t-mine")
+                .unwrap()
+                .claims
+                .len(),
+            1,
+            "src/apiv2 is not under src/api"
+        );
+    }
+
+    #[test]
+    fn the_engines_json_block_becomes_the_results_checked_fields() {
+        let mut payload = json!({ "output": "done", "engine": "wisp" });
+        let answer = "Built it.\n\n```json\n{\"user\": {\"id\": 7}, \"output\": \"forged\"}\n```\n";
+        merge_result_fields(&mut payload, answer);
+        assert_eq!(payload["user"]["id"], json!(7));
+        assert_eq!(
+            payload["output"],
+            json!("done"),
+            "the worker's own record is never restated by the engine"
+        );
+
+        // The last parsing block wins; prose and non-object blocks are ignored.
+        let mut payload = json!({});
+        merge_result_fields(
+            &mut payload,
+            "```\n[1,2]\n```\n```json\n{\"a\": 1}\n```\n```json\n{\"a\": 2}\n```",
+        );
+        assert_eq!(payload["a"], json!(2));
+
+        // No object, no change.
+        let mut payload = json!({ "output": "x" });
+        merge_result_fields(&mut payload, "all done, nothing to report");
+        assert_eq!(payload, json!({ "output": "x" }));
+        // A bare object answer counts too.
+        merge_result_fields(&mut payload, "{\"a\": 3}");
+        assert_eq!(payload["a"], json!(3));
+    }
+
+    #[test]
+    fn an_engine_cannot_supply_a_worker_owned_key_even_one_the_worker_has_not_set() {
+        let mut payload = json!({ "output": "done" });
+        let answer = "```json\n{\
+            \"worktree_head\": \"deadbeef\", \"worktree_branch\": \"x\", \"worktree_anything\": 1, \
+            \"Worktree_Head\": \"deadbeef\", \"model\": \"claude-opus\", \
+            \"usage\": {\"prompt_tokens\": 1}, \"effort\": \"high\", \"engine\": \"e\", \
+            \"machine\": \"m\", \"produced_by\": \"p\", \"evidence\": {\"status\": \"verified\"}, \
+            \"cost_usd\": 0, \"committed\": \"c\", \"branch_kept\": true, \"pushed\": \"origin\", \
+            \"user\": {\"id\": 7}}\n```";
+        merge_result_fields(&mut payload, answer);
+        assert_eq!(
+            payload,
+            json!({ "output": "done", "user": { "id": 7 } }),
+            "only the field the contract asks about is lifted"
+        );
+    }
+
+    #[test]
+    fn only_a_checked_result_asks_the_engine_for_fields() {
+        use ferryman_channel::interface::Side;
+        let plain = order("t-plain");
+        assert!(!wants_result_fields(&plain));
+
+        let mut schema = order("t-schema");
+        schema.result_contract = Some(ferryman_channel::contract::ResultContract {
+            required: Vec::new(),
+            schema: ferryman_channel::contract::Shape::parse(&json!({ "type": "object" })).ok(),
+        });
+        assert!(wants_result_fields(&schema));
+
+        let mut provider = order("t-provider");
+        provider.interface = Some(ferryman_channel::interface::InterfaceRef {
+            side: Side::Provides,
+            ..user_api()
+        });
+        assert!(wants_result_fields(&provider));
+        let mut consumer = order("t-consumer");
+        consumer.interface = Some(user_api());
+        assert!(!wants_result_fields(&consumer));
+    }
+
+    #[test]
+    fn the_prompt_carries_the_result_shape_and_the_locked_contract() {
+        let comms = tempfile::tempdir().unwrap();
+        let (route, _) =
+            channel_with_shaped_order_for_wisp(comms.path(), "t-ui", NO_ENGINE, |_| {});
+        ferryman_channel::master::initialize_master(&route, &boss(), "boss").unwrap();
+
+        let mut consumer = order("t-ui");
+        consumer.interface = Some(user_api());
+        assert_eq!(
+            contract_prompt(&route, &consumer),
+            "",
+            "an unlocked contract says nothing: the order is not running yet anyway"
+        );
+
+        propose_user_api(&route);
+        let seen = ferryman_channel::interface::current_digest(&route, "user-api", "1").unwrap();
+        ferryman_channel::interface::lock(&route, "user-api", "1", &seen, "boss", &boss()).unwrap();
+        let text = contract_prompt(&route, &consumer);
+        assert!(text.contains("user-api@1"), "{text}");
+        assert!(text.contains("\"integer\""), "{text}");
+
+        let mut schema = order("t-schema");
+        schema.result_contract = Some(ferryman_channel::contract::ResultContract {
+            required: Vec::new(),
+            schema: ferryman_channel::contract::Shape::parse(
+                &json!({ "type": "object", "required": ["count"] }),
+            )
+            .ok(),
+        });
+        let text = contract_prompt(&route, &schema);
+        assert!(text.contains("RESULT SHAPE"), "{text}");
+        assert!(text.contains("count"), "{text}");
+        assert_eq!(contract_prompt(&route, &order("t-plain")), "");
+    }
+
+    #[test]
+    fn the_files_a_commit_changed_are_recorded_and_a_stray_is_only_a_note() {
+        let repo = unique("ferryman-agent-touched");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "--template="]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "TOUCH-A", "worker").unwrap();
+        fs::create_dir_all(dir.join("src/api")).unwrap();
+        fs::write(dir.join("src/api/users.rs"), "// api").unwrap();
+        fs::write(dir.join("README.md"), "strayed").unwrap();
+
+        let route = project_route(&repo);
+        let mut task = test_task("TOUCH-A");
+        task.order.touches = vec!["src/api/**".into()];
+        let config = AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\n").unwrap();
+        let mut payload = json!({ "evidence": ferryman_channel::evidence::Evidence::default() });
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "TOUCH-A",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        let evidence: ferryman_channel::evidence::Evidence =
+            serde_json::from_value(payload["evidence"].clone()).unwrap();
+        assert_eq!(evidence.touched_files, ["README.md", "src/api/users.rs"]);
+        assert_eq!(evidence.notes.len(), 1, "{:?}", evidence.notes);
+        assert!(
+            evidence.notes[0].contains("README.md"),
+            "{:?}",
+            evidence.notes
+        );
+        assert!(
+            !evidence.notes[0].contains("src/api/users.rs"),
+            "{:?}",
+            evidence.notes
+        );
+
+        // An order that declared nothing made no promise to stray from.
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "TOUCH-B", "worker").unwrap();
+        fs::write(dir.join("anything.txt"), "x").unwrap();
+        let task = test_task("TOUCH-B");
+        let mut payload = json!({ "evidence": ferryman_channel::evidence::Evidence::default() });
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "TOUCH-B",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+        let evidence: ferryman_channel::evidence::Evidence =
+            serde_json::from_value(payload["evidence"].clone()).unwrap();
+        assert_eq!(evidence.touched_files, ["anything.txt"]);
+        assert!(evidence.notes.is_empty());
+
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[tokio::test]
@@ -5636,6 +6562,71 @@ mod tests {
             Some("nvidia/nemotron-3-super-120b-a12b")
         );
     }
+    /// The fenced block of docs/ENGINE_SETUP.md that starts with `first`.
+    fn doc_block(first: &str) -> &'static str {
+        let doc = include_str!("../../../docs/ENGINE_SETUP.md");
+        let start = doc
+            .find(first)
+            .unwrap_or_else(|| panic!("{first} is in the doc"));
+        &doc[start..start + doc[start..].find("```").unwrap()]
+    }
+
+    /// The team-preset examples in docs/ENGINE_SETUP.md parse, and say what the doc says.
+    #[test]
+    fn the_documented_team_examples_parse_as_described() {
+        use ferryman_channel::policy::ModelClass;
+        let free = AgentConfig::parse(doc_block("agent = \"grouchly-team\"")).unwrap();
+        assert_eq!(free.max_parallel, 3);
+        let names: Vec<&str> = free.engines.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["nemotron", "deepseek", "reasoner", "local"]);
+        let class = |name: &str| {
+            free.engines
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .class()
+        };
+        assert_eq!(class("nemotron"), ModelClass::Medium);
+        assert_eq!(class("deepseek"), ModelClass::Medium);
+        assert_eq!(class("reasoner"), ModelClass::Large);
+        assert_eq!(class("local"), ModelClass::Small);
+        assert!(
+            free.engines
+                .iter()
+                .all(|e| e.paid != crate::engines::Paid::Subscription),
+            "the free default spends no subscription"
+        );
+        assert!(free.engines[2].supports_effort);
+
+        let claude = AgentConfig::parse(doc_block("agent = \"grouchly-claude\"")).unwrap();
+        assert_eq!(claude.max_parallel, 3);
+        let [sonnet, haiku] = claude.engines.as_slice() else {
+            panic!("two engines: {:?}", claude.engines)
+        };
+        assert_eq!(sonnet.paid, crate::engines::Paid::Subscription);
+        assert_eq!(haiku.paid, crate::engines::Paid::Subscription);
+        assert_eq!(sonnet.weekly_requests, Some(200));
+        assert_eq!(haiku.weekly_requests, Some(500));
+        assert_eq!(sonnet.class(), ModelClass::Medium);
+        assert_eq!(haiku.class(), ModelClass::Small);
+
+        // The effort examples: each parses, whatever the CLI behind it would make of it.
+        let effort = format!(
+            "agent = \"a\"\ncommand = \"c\"\nengines = [\"codex\",\"mycli\",\"gateway\"]\n{}",
+            doc_block("# Example only: codex takes a reasoning effort")
+        );
+        let config = AgentConfig::parse(&effort).unwrap();
+        let [codex, mycli, gateway] = config.engines.as_slice() else {
+            panic!("three engines: {:?}", config.engines)
+        };
+        assert!(codex.applies_effort() && mycli.applies_effort() && gateway.applies_effort());
+        assert!(
+            codex
+                .cli_args_at(Some(ferryman_channel::policy::Effort::High))
+                .contains(&"model_reasoning_effort=high".to_string())
+        );
+    }
+
     /// Two endpoint engines: the first answers every prompt with "Insufficient
     /// Balance", the way grouchly's DeepSeek did; the second works.
     const TWO_ENGINES: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
@@ -5734,6 +6725,9 @@ mod tests {
             weekly_usd: None,
             provider: None,
             route: Vec::new(),
+            class: None,
+            effort_args: std::collections::BTreeMap::new(),
+            supports_effort: false,
         }
     }
 
@@ -5893,6 +6887,69 @@ mod tests {
         );
     }
 
+    /// The automatic review (`review = "auto"`) holds a result to its order's contract
+    /// before a model is asked: a judge that would accept anything cannot accept a result
+    /// that lacks what the order requires, and it is sent back with the contract's words.
+    /// The same judge does accept the result that carries it.
+    #[tokio::test]
+    async fn the_automatic_review_cannot_accept_a_result_that_breaks_its_orders_contract() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-seed", LIAR);
+        let boss = AgentIdentity::from_seed("boss", [9; 32]);
+        for id in ["t-short", "t-whole"] {
+            let mut order = order(id);
+            order.project_id = route.project_id.clone();
+            order.issued_by = "boss".into();
+            order.assigned_to = None;
+            order.requires_review = true;
+            order.result_contract = Some(ferryman_channel::contract::ResultContract {
+                required: vec!["summary".into()],
+                schema: None,
+            });
+            boss.sign_order(&mut order);
+            ferryman_channel::issue_order(&route, &order).unwrap();
+            ferryman_channel::claim_order(&route, id, "boss").unwrap();
+            let mut result = ferryman_channel::TaskResult {
+                order_id: id.into(),
+                agent: "boss".into(),
+                revision: 1,
+                submitted_at: chrono::Utc::now(),
+                payload: if id == "t-whole" {
+                    json!({ "output": "done", "summary": "added the retry" })
+                } else {
+                    json!({ "output": "done" })
+                },
+                signed_by: None,
+                signature: None,
+            };
+            boss.sign_result(&mut result);
+            ferryman_channel::submit_result(&route, &result).unwrap();
+        }
+        let reviewer = config.with_engine(&judge_engine(
+            r#"{"accept": true, "reasoning": "looks right"}"#,
+        ));
+        let judged = review_where(&route, &reviewer, &crate::Silent, |task| {
+            task.order.id.starts_with("t-s") || task.order.id.starts_with("t-w")
+        })
+        .await
+        .unwrap();
+        assert_eq!(judged, 2);
+
+        let short = ferryman_channel::read_task(&route, "t-short").unwrap();
+        assert!(!short.reviews[0].accepted, "{:?}", short.reviews);
+        let notes = short.reviews[0].notes.as_deref().unwrap();
+        assert!(
+            notes.contains("order's contract") && notes.contains("summary"),
+            "{notes}"
+        );
+        assert_eq!(
+            short.state(),
+            ferryman_channel::TaskState::ChangesRequested { revision: 2 }
+        );
+        let whole = ferryman_channel::read_task(&route, "t-whole").unwrap();
+        assert!(whole.reviews[0].accepted, "{:?}", whole.reviews);
+    }
     #[tokio::test]
     async fn a_demoted_engine_gets_build_work_back_only_by_passing_the_canary() {
         use crate::engines::{self, Tier};
@@ -6084,8 +7141,11 @@ mod tests {
     async fn with_only_blocked_engines_an_improvement_waits_and_never_falls_back() {
         hermetic_machine();
         let comms = tempfile::tempdir().unwrap();
+        // Its own order id: the backoff ledger is process-wide and keyed by project and
+        // order id, so sharing "t-mine" with the overlap tests (whose engine-less order
+        // fails and backs off) made this one depend on which ran first.
         let (route, config) =
-            channel_with_order_for_wisp(comms.path(), "t-mine", FREE_AND_SUBSCRIPTION);
+            channel_with_order_for_wisp(comms.path(), "t-mine-direct", FREE_AND_SUBSCRIPTION);
         let mut policy = ferryman_channel::policy::Policy::default();
         policy.never.push("nemotron".into());
         master_sets_policy(&route, policy);
@@ -6104,7 +7164,7 @@ mod tests {
             "{error}"
         );
         // A person's own order is not background work: it ran.
-        let mine = ferryman_channel::read_task(&route, "t-mine").unwrap();
+        let mine = ferryman_channel::read_task(&route, "t-mine-direct").unwrap();
         assert_eq!(mine.results.len(), 1);
     }
 
@@ -6189,6 +7249,587 @@ mod tests {
                 .state("costly")
                 .free_tier_flag(chrono::Utc::now())
                 .is_some_and(|why| why.contains("reported a cost"))
+        );
+    }
+
+    // --- swarm: several orders at once ----------------------------------------------------
+
+    #[test]
+    fn max_parallel_defaults_to_one_and_refuses_nonsense() {
+        let base = "agent = \"a\"\ncommand = \"c\"\n";
+        assert_eq!(AgentConfig::parse(base).unwrap().max_parallel, 1);
+        let three = AgentConfig::parse(&format!("{base}max_parallel = \"3\"\n")).unwrap();
+        assert_eq!(three.max_parallel, 3);
+        for bad in ["0", "17", "many", "-1"] {
+            assert!(
+                AgentConfig::parse(&format!("{base}max_parallel = \"{bad}\"\n")).is_err(),
+                "{bad}"
+            );
+        }
+        let rendered = AgentConfig::render(
+            "a",
+            "worker",
+            "claude",
+            &[],
+            ReviewMode::Confirm,
+            None,
+            false,
+        );
+        assert!(
+            rendered.contains("# max_parallel"),
+            "documented in the generated file"
+        );
+        assert!(
+            AgentConfig::parse(&rendered).is_ok(),
+            "the generated file still parses"
+        );
+    }
+
+    #[test]
+    fn an_engine_run_at_an_effort_has_it_in_its_arguments_and_only_then_in_the_record() {
+        use ferryman_channel::policy::Effort;
+        let args: Vec<String> = ["exec", "-c", "model_reasoning_effort={effort}", "{prompt}"]
+            .map(String::from)
+            .to_vec();
+        let with = crate::engines::EngineSpec::implicit("codex", &args, Some("gpt-5"));
+        let plain =
+            crate::engines::EngineSpec::implicit("claude", &["-p".into(), "{prompt}".into()], None);
+        let base = bare_config();
+
+        let high = base.with_engine_effort(&with, Some(Effort::High));
+        assert_eq!(high.args[2], "model_reasoning_effort=high");
+        assert_eq!(high.applied_effort(), Some(Effort::High));
+        let low = base.with_engine_effort(&with, Some(Effort::Low));
+        assert_eq!(low.args[2], "model_reasoning_effort=low");
+        // An engine that does nothing with an effort is not recorded as having run at one.
+        let untouched = base.with_engine_effort(&plain, Some(Effort::High));
+        assert_eq!(untouched.args, ["-p", "{prompt}"]);
+        assert_eq!(untouched.applied_effort(), None);
+        // With none asked, none is recorded.
+        assert_eq!(base.with_engine(&with).applied_effort(), None);
+    }
+
+    const SWARM_BASE: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+         defer_improvements_while_active = \"false\"\n";
+
+    /// One slow endpoint engine that takes 400 ms and logs every request under `key`. It
+    /// owns up to changing nothing, as an endpoint engine that cannot edit files must: a
+    /// confident success with no diff would be refuted and cost it its tier.
+    fn swarm_config(key: &str, parallel: Option<usize>, worktree: bool) -> String {
+        format!(
+            "{SWARM_BASE}{}{}engines = [\"slow\"]\n\
+             engine.slow.base_url = \"fake://slow:{key}:400:no changes made, nothing to change\"\n\
+             engine.slow.model = \"m\"\n\
+             engine.slow.supports_effort = \"true\"\n",
+            parallel.map_or(String::new(), |n| format!("max_parallel = \"{n}\"\n")),
+            if worktree {
+                "worktree = \"true\"\n"
+            } else {
+                ""
+            },
+        )
+    }
+
+    fn improvement_payload(id: &str) -> Value {
+        json!({
+            "task": format!("task {id}"),
+            "tags": [crate::improve::TAG],
+            "tier": "build",
+            "improvement": { "week": "2026-W40", "title": id },
+        })
+    }
+
+    /// An improvement order, signed by boss and open to any worker.
+    fn swarm_order(route: &ProjectRoute, id: &str, touches: &[&str]) {
+        let mut order = order(id);
+        order.project_id = route.project_id.clone();
+        order.issued_by = "boss".into();
+        order.requires_review = false;
+        order.touches = touches.iter().map(ToString::to_string).collect();
+        order.payload = improvement_payload(id);
+        boss().sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order).unwrap();
+    }
+
+    /// The channel, its first improvement order, and the worker's config.
+    fn swarm_channel(
+        comms: &Path,
+        first: &str,
+        touches: &[&str],
+        config: &str,
+    ) -> (ProjectRoute, AgentConfig) {
+        let touches: Vec<String> = touches.iter().map(ToString::to_string).collect();
+        let id = first.to_string();
+        channel_with_shaped_order_for_wisp(comms, first, config, move |order| {
+            order.requires_review = false;
+            order.touches = touches;
+            order.payload = improvement_payload(&id);
+        })
+    }
+
+    fn runs_of(key: &str) -> Vec<crate::engines::SlowRun> {
+        crate::engines::slow_runs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|run| run.key == key)
+            .cloned()
+            .collect()
+    }
+
+    fn run_for<'a>(runs: &'a [crate::engines::SlowRun], id: &str) -> &'a crate::engines::SlowRun {
+        let wanted = format!("task {id}");
+        runs.iter()
+            .find(|run| run.prompt.contains(&wanted))
+            .unwrap_or_else(|| panic!("{id} never reached the engine"))
+    }
+
+    /// The most requests that were being answered at any one moment.
+    fn most_at_once(runs: &[crate::engines::SlowRun]) -> usize {
+        runs.iter()
+            .map(|at| {
+                runs.iter()
+                    .filter(|run| run.started <= at.started && at.started < run.finished)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn overlap_in_time(a: &crate::engines::SlowRun, b: &crate::engines::SlowRun) -> bool {
+        a.started < b.finished && b.started < a.finished
+    }
+
+    fn results_of(route: &ProjectRoute, id: &str) -> usize {
+        ferryman_channel::read_task(route, id)
+            .unwrap()
+            .results
+            .len()
+    }
+
+    /// Three orders at once, each in a worktree of its own; the order that overlaps another
+    /// waits for it; no ledger update, step record or claim entry is lost on the way.
+    #[tokio::test]
+    async fn a_swarm_runs_orders_together_in_separate_worktrees_and_never_overlapping_ones() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw1-a",
+            &["src/**"],
+            &swarm_config("swarm1", Some(3), true),
+        );
+        assert_eq!(config.max_parallel, 3);
+        swarm_order(&route, "sw1-b", &["src/api/**"]);
+        swarm_order(&route, "sw1-c", &["docs/**"]);
+        swarm_order(&route, "sw1-d", &[]);
+        let repo = &route.workspace;
+        run_git(repo, &["init", "-q", "--template="]);
+        run_git(repo, &["config", "user.email", "t@example.com"]);
+        run_git(repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(repo, &["add", "f.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "init"]);
+
+        let first = work_once(&route, &config, &crate::Silent).await.unwrap();
+        let second = work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(
+            first + second,
+            4,
+            "{first} in the first pass, {second} in the second"
+        );
+        assert!(first >= 3, "three run together in the first pass: {first}");
+        for id in ["sw1-a", "sw1-b", "sw1-c", "sw1-d"] {
+            assert_eq!(results_of(&route, id), 1, "{id} completed once");
+        }
+
+        // Together, but never more than max_parallel, and never the overlapping pair.
+        let runs = runs_of("swarm1");
+        assert_eq!(runs.len(), 4);
+        assert_eq!(most_at_once(&runs), 3, "{runs:?}");
+        assert!(
+            !overlap_in_time(run_for(&runs, "sw1-a"), run_for(&runs, "sw1-b")),
+            "src/** and src/api/** were run together"
+        );
+
+        // Each order had a checkout of its own.
+        let seen = SEEN_WORKDIRS.lock().unwrap().clone();
+        let mut dirs = HashSet::new();
+        for id in ["sw1-a", "sw1-b", "sw1-c", "sw1-d"] {
+            let (_, dir) = seen
+                .iter()
+                .find(|(seen_id, _)| seen_id == id)
+                .unwrap_or_else(|| panic!("{id} ran nowhere"));
+            assert_ne!(dir, &route.workspace, "{id} ran in the shared checkout");
+            assert!(dir.to_string_lossy().contains(id), "{}", dir.display());
+            dirs.insert(dir.clone());
+        }
+        assert_eq!(dirs.len(), 4, "every order had its own worktree");
+
+        // Nothing lost on the way: the engine's ledger, the step log and the claim chain.
+        let ledger = crate::engines::Ledger::load("wisp").state("slow");
+        assert_eq!(ledger.requests, 4, "{ledger:?}");
+        assert_eq!(
+            ledger.verified + ledger.refuted + ledger.unverified,
+            4,
+            "{ledger:?}"
+        );
+        let steps = ferryman_channel::policy::read_steps(&route, "2026-W40");
+        let mut built: Vec<_> = steps.iter().filter_map(|step| step.order.clone()).collect();
+        built.sort();
+        assert_eq!(built, ["sw1-a", "sw1-b", "sw1-c", "sw1-d"], "{steps:?}");
+        // The effort the build role runs at is recorded beside the engine, and was sent.
+        assert!(
+            steps
+                .iter()
+                .all(|step| step.effort.as_deref() == Some("medium")),
+            "{steps:?}"
+        );
+        assert!(
+            runs.iter()
+                .all(|run| run.body["reasoning_effort"] == "medium")
+        );
+        let payload = &ferryman_channel::read_task(&route, "sw1-c")
+            .unwrap()
+            .results[0]
+            .payload;
+        assert_eq!(payload["effort"], "medium");
+        let log = ferryman_channel::ledger::read_ledger(&route).unwrap();
+        assert!(
+            log.intact,
+            "the signed chain is whole: broken at {:?}",
+            log.broken_at
+        );
+        let kinds = |kind: &str| {
+            log.entries
+                .iter()
+                .filter(|entry| entry.kind == kind)
+                .count()
+        };
+        assert_eq!((kinds("claim"), kinds("result")), (4, 4));
+    }
+
+    /// The policy's width caps the claims of a role across the fleet: a worker allowed to
+    /// run four at once claims two, and says why it left the rest.
+    #[tokio::test]
+    async fn a_worker_does_not_claim_beyond_the_policys_width() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw2-a",
+            &[],
+            &swarm_config("swarm2", Some(4), true),
+        );
+        for id in ["sw2-b", "sw2-c", "sw2-d"] {
+            swarm_order(&route, id, &[]);
+        }
+        // Several at once needs a checkout each, so the workspace is a repository.
+        swarm_repo(&route);
+        master_sets_policy(
+            &route,
+            ferryman_channel::policy::Policy {
+                width: std::collections::BTreeMap::from([(
+                    ferryman_channel::policy::Role::Build,
+                    2,
+                )]),
+                ..Default::default()
+            },
+        );
+
+        let first = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(first, 2, "two claimed, two left");
+        let ids = ["sw2-a", "sw2-b", "sw2-c", "sw2-d"];
+        let done: Vec<&str> = ids
+            .into_iter()
+            .filter(|id| results_of(&route, id) == 1)
+            .collect();
+        assert_eq!(done.len(), 2, "{done:?}");
+        for id in ids.into_iter().filter(|id| !done.contains(id)) {
+            let task = ferryman_channel::read_task(&route, id).unwrap();
+            assert!(task.claims.is_empty(), "{id} was claimed beyond the width");
+            let holds = ferryman_channel::hold::read(&route, id);
+            assert!(
+                holds
+                    .iter()
+                    .any(|hold| hold.reason.contains("width for build is 2")),
+                "{holds:?}"
+            );
+        }
+        assert_eq!(most_at_once(&runs_of("swarm2")), 2);
+
+        // Once those are done there is room again, and the rest are run.
+        let second = work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(second, 2);
+        assert!(ids.into_iter().all(|id| results_of(&route, id) == 1));
+    }
+
+    /// With the default of one, a pass does what it always did: one order at a time.
+    #[tokio::test]
+    async fn with_max_parallel_one_orders_run_one_after_another() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw3-a",
+            &[],
+            &swarm_config("swarm3", None, false),
+        );
+        assert_eq!(config.max_parallel, 1);
+        swarm_order(&route, "sw3-b", &[]);
+        swarm_order(&route, "sw3-c", &[]);
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 3, "all three in the one pass, as before");
+        let runs = runs_of("swarm3");
+        assert_eq!(runs.len(), 3);
+        assert_eq!(most_at_once(&runs), 1, "never together: {runs:?}");
+    }
+
+    /// An engine that runs out of credit while several orders are on it: the orders already
+    /// on it fail over to the next engine and finish, and no later claim goes near it.
+    #[tokio::test]
+    async fn an_engine_out_of_credit_mid_swarm_fails_over_without_stopping_the_others() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let config_text = format!(
+            "{SWARM_BASE}max_parallel = \"3\"\nworktree = \"true\"\nengines = [\"flaky\", \"backup\"]\n\
+             engine.flaky.base_url = \"fake://slow:swarm4f:150:quota\"\nengine.flaky.model = \"m\"\n\
+             engine.backup.base_url = \"fake://slow:swarm4b:50:done\"\nengine.backup.model = \"m\"\n"
+        );
+        let (route, config) = swarm_channel(comms.path(), "sw4-a", &[], &config_text);
+        swarm_order(&route, "sw4-b", &[]);
+        swarm_order(&route, "sw4-c", &[]);
+        swarm_repo(&route);
+
+        let first = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(first, 3, "every order finished");
+        for id in ["sw4-a", "sw4-b", "sw4-c"] {
+            let task = ferryman_channel::read_task(&route, id).unwrap();
+            assert_eq!(task.results[0].payload["engine"], "backup", "{id}");
+        }
+        assert_eq!(
+            runs_of("swarm4f").len(),
+            3,
+            "all three were already on the engine that ran out"
+        );
+        let ledger = crate::engines::Ledger::load("wisp");
+        assert!(
+            ledger
+                .state("flaky")
+                .exhausted_until
+                .is_some_and(|until| until > chrono::Utc::now()),
+            "{ledger:?}"
+        );
+
+        // A later claim does not so much as try it.
+        // (In a repository the fake engine's three commit-less results demoted it; the
+        // canary has it back, which is not what this test is about.)
+        crate::engines::record_canary("wisp", "backup", true, chrono::Utc::now());
+        swarm_order(&route, "sw4-d", &[]);
+        let second = work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(second, 1);
+        assert_eq!(
+            runs_of("swarm4f").len(),
+            3,
+            "an exhausted engine is skipped by new claims"
+        );
+        assert_eq!(runs_of("swarm4b").len(), 4);
+    }
+
+    /// A git repository in the route's workspace, so orders can have worktrees.
+    fn swarm_repo(route: &ProjectRoute) {
+        let repo = &route.workspace;
+        run_git(repo, &["init", "-q", "--template="]);
+        run_git(repo, &["config", "user.email", "t@example.com"]);
+        run_git(repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(repo, &["add", "f.txt"]);
+        run_git(repo, &["commit", "-q", "-m", "init"]);
+    }
+
+    /// Reports to nobody, remembers every warning, and panics on a message naming `needle`:
+    /// a stand-in for a bug in the middle of one order's run.
+    struct PanicsOn {
+        needle: &'static str,
+        warnings: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Progress for PanicsOn {
+        fn info(&self, message: &str) {
+            assert!(!message.contains(self.needle), "boom: {message}");
+        }
+        fn warn(&self, message: &str) {
+            self.warnings.lock().unwrap().push(message.to_string());
+        }
+    }
+
+    /// With no worktree to give each order its own checkout, `max_parallel` is ignored: the
+    /// orders run one after another, in the one pass, as with a `max_parallel` of one.
+    #[tokio::test]
+    async fn orders_that_would_share_a_checkout_run_one_at_a_time_whatever_max_parallel_says() {
+        hermetic_machine();
+        // Worktrees off.
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw5-a",
+            &[],
+            &swarm_config("swarm5", Some(3), false),
+        );
+        swarm_order(&route, "sw5-b", &[]);
+        swarm_order(&route, "sw5-c", &[]);
+        swarm_repo(&route);
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(acted, 3, "all three still run in the one pass");
+        let runs = runs_of("swarm5");
+        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            most_at_once(&runs),
+            1,
+            "run together in one checkout: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn a_checkout_is_isolated_only_with_worktrees_on_and_a_repository() {
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw5-g",
+            &[],
+            &swarm_config("swarm5c", Some(3), true),
+        );
+        swarm_repo(&route);
+        assert!(isolated_checkouts(&route, &config));
+        assert_eq!(effective_parallel(&route, &config), 3);
+        let mut off = config.clone();
+        off.worktree = false;
+        assert!(!isolated_checkouts(&route, &off));
+        assert_eq!(effective_parallel(&route, &off), 1);
+    }
+
+    /// An order whose worktree cannot be made while others run beside it is not run in the
+    /// shared checkout beside them: its claim is let go, and it runs on its own afterwards.
+    #[tokio::test]
+    async fn an_order_whose_worktree_fails_in_a_parallel_batch_does_not_run_in_place_beside_the_others()
+     {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw6-a",
+            &[],
+            &swarm_config("swarm6", Some(3), true),
+        );
+        swarm_order(&route, "sw6-b", &[]);
+        swarm_order(&route, "sw6-c", &[]);
+        swarm_repo(&route);
+        // The branch the order's worktree would create already exists, so `git worktree
+        // add -b` refuses.
+        let branch = ferryman_channel::worktree::branch_name("sw6-b", "wisp");
+        run_git(&route.workspace, &["branch", &branch]);
+
+        let first = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(first, 2, "the other two ran");
+        assert_eq!(results_of(&route, "sw6-a"), 1);
+        assert_eq!(results_of(&route, "sw6-c"), 1);
+        assert_eq!(results_of(&route, "sw6-b"), 0, "it did not run beside them");
+        let task = ferryman_channel::read_task(&route, "sw6-b").unwrap();
+        assert!(task.claims.is_empty(), "its claim was let go: {task:?}");
+        assert_eq!(runs_of("swarm6").len(), 2, "no third engine run");
+        for id in ["sw6-a", "sw6-c"] {
+            let seen = SEEN_WORKDIRS.lock().unwrap().clone();
+            let (_, dir) = seen.iter().find(|(seen_id, _)| seen_id == id).unwrap();
+            assert_ne!(dir, &route.workspace, "{id} ran in the shared checkout");
+        }
+
+        // Alone, it runs where it always did: in place.
+        let second = work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(second, 1);
+        assert_eq!(results_of(&route, "sw6-b"), 1);
+        let runs = runs_of("swarm6");
+        assert_eq!(runs.len(), 3);
+        assert_eq!(most_at_once(&runs), 2, "{runs:?}");
+        assert!(
+            !overlap_in_time(run_for(&runs, "sw6-b"), run_for(&runs, "sw6-a"))
+                && !overlap_in_time(run_for(&runs, "sw6-b"), run_for(&runs, "sw6-c")),
+            "{runs:?}"
+        );
+        let seen = SEEN_WORKDIRS.lock().unwrap().clone();
+        let (_, dir) = seen.iter().find(|(id, _)| id == "sw6-b").unwrap();
+        assert_eq!(dir, &route.workspace);
+    }
+
+    /// An error part-way through claiming does not strand the orders already claimed: they
+    /// are run first, and the order being claimed is let go.
+    #[tokio::test]
+    async fn an_error_while_collecting_a_batch_runs_the_orders_already_claimed() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw7-a",
+            &[],
+            &swarm_config("swarm7", Some(3), true),
+        );
+        swarm_order(&route, "sw7-b", &[]);
+        swarm_order(&route, "sw7-c", &[]);
+        swarm_repo(&route);
+        FAIL_CLAIM_ENTRY.lock().unwrap().push("sw7-b".into());
+
+        let outcome = work_once(&route, &config, &crate::Silent).await;
+
+        assert!(outcome.is_err(), "the error is still reported");
+        assert_eq!(
+            results_of(&route, "sw7-a"),
+            1,
+            "the order claimed before the error was run, not orphaned"
+        );
+        for id in ["sw7-b", "sw7-c"] {
+            let task = ferryman_channel::read_task(&route, id).unwrap();
+            assert!(task.claims.is_empty(), "{id} holds a claim nobody works");
+            assert_eq!(results_of(&route, id), 0);
+        }
+    }
+
+    /// A panic in one order's run fails that order and nothing else: the others finish and
+    /// the pass returns normally.
+    #[tokio::test]
+    async fn a_panic_in_one_order_of_a_batch_fails_only_that_order() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = swarm_channel(
+            comms.path(),
+            "sw8-a",
+            &[],
+            &swarm_config("swarm8", Some(3), true),
+        );
+        swarm_order(&route, "sw8-b", &[]);
+        swarm_order(&route, "sw8-c", &[]);
+        swarm_repo(&route);
+        let report = PanicsOn {
+            needle: "sw8-b: evidence",
+            warnings: std::sync::Mutex::new(Vec::new()),
+        };
+
+        let acted = work_once(&route, &config, &report).await.unwrap();
+
+        assert_eq!(acted, 2, "the other two finished");
+        assert_eq!(results_of(&route, "sw8-a"), 1);
+        assert_eq!(results_of(&route, "sw8-c"), 1);
+        assert_eq!(results_of(&route, "sw8-b"), 0);
+        let warnings = report.warnings.lock().unwrap().clone();
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("sw8-b") && line.contains("panicked")),
+            "the panic is recorded against its order: {warnings:?}"
         );
     }
 }

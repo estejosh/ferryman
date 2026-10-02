@@ -161,6 +161,7 @@ pub async fn run_bench(
             };
             let contract = ferryman_channel::contract::ResultContract {
                 required: task.require.clone(),
+                schema: None,
             };
             let missing = contract.violations(&payload);
             let contract_ok = missing.is_empty();

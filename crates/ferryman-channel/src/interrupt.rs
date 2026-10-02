@@ -479,6 +479,9 @@ mod tests {
             requires_approval: false,
             depends_on: Vec::new(),
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
             signed_by: None,
             signature: None,
         };

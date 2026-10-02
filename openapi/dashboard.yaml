@@ -214,11 +214,16 @@ paths:
         first, subscriptions never). `effective` is how it falls on the engines the
         fleet published - each role's engines in order, and every blocked engine with
         the reason. `recommended` is what auto would sign, with one reason per choice.
-        `may_set` is true only for the signed-in master.
+        `may_set` is true only for the signed-in master. `adversary_mode` is what the adversary's findings do here: `off`, `advisory` (the
+        default) or `blocking`; `effective.roles.adversary` is who challenges, in order.
+        Each role in `effective.roles` carries its `effort`, `width` (orders at once, null
+        for no cap) and whether subscriptions are allowed for it; each engine its size
+        `class`. `team` is the team preset as it would be signed now, with reasons, and
+        `warnings` lists any subscription the policy opens that has no weekly cap.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
-        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, self_improve and may_set'}
+        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, team, warnings, efforts, self_improve, adversary_mode and may_set'}
         '401': {description: no active session}
     post:
       summary: The master signs an engine policy, or goes back to auto
@@ -281,8 +286,13 @@ paths:
         live. `recommended` uses what auto recommends for both. The rest of the policy is
         kept. `auto_merge` is `none` or `low-risk`: whether fm merges an improvement on its
         own once it holds both keys, when every changed file is docs, tests or a dependency
-        version bump. `all` does it in every project the person is master of. The CLI
-        equivalent is `ferry engines policy set --improve <sel> --review <sel> --auto-merge <mode>`.
+        version bump. `adversary_engine` goes first for the adversary role, who challenges
+        the builders' work at three moments (before a contract locks, when an order fails
+        twice, before an improvement is called done); `adversary` is `off`, `advisory` (the
+        default) or `blocking`, what its Block verdicts do. `all` does it in every project
+        the person is master of. The CLI equivalent is `ferry engines policy set --improve
+        <sel> --review <sel> --auto-merge <mode>`, and for the adversary `ferry engines
+        policy set --role adversary --prefer <sel> --adversary <mode>`.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       requestBody:
@@ -294,12 +304,90 @@ paths:
               properties:
                 improve: {type: string}
                 review: {type: string}
+                adversary_engine: {type: string}
+                adversary: {type: string, enum: [off, advisory, blocking]}
                 recommended: {type: boolean}
                 auto_merge: {type: string, enum: [none, low-risk]}
                 all: {type: boolean}
       responses:
         '200': {description: 'how many changed, and per project: set, already, skipped or error'}
-        '400': {description: nothing picked, or an auto_merge that is neither none nor low-risk}
+        '400': {description: nothing picked, an auto_merge that is neither none nor low-risk, or an adversary mode that is not off, advisory or blocking}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/engine-policy/team:
+    get:
+      summary: What the team preset would sign, with a reason per choice
+      description: >
+        "Plan on high, build on medium, swarm the cheap work": a large judge plans and
+        reviews at high effort, one at a time; mid-size engines build at medium effort,
+        three at once; the smallest do chores at low effort, four at once; the adversary
+        is a large judge of another model family than the top builder. Built from the
+        engines the fleet published. Subscriptions stay out of background work except for
+        the roles in `subscription_roles`, and then only an engine with a `weekly_requests`
+        cap. Nothing is signed. `subscription_roles` (comma-separated roles; absent keeps
+        the policy in force's), `width` (`build=4,chore=2`) and `effort` (`build=high`) try
+        other choices. The CLI equivalent is `ferry engines policy team`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+        - {name: subscription_roles, in: query, required: false, schema: {type: string}}
+        - {name: width, in: query, required: false, schema: {type: string}}
+        - {name: effort, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'policy, describe, reasons, warnings and effective'}
+        '400': {description: a role, width or effort that means nothing}
+        '401': {description: no active session}
+    post:
+      summary: The master signs the team preset
+      description: >
+        Signs the team preset as the project's policy, computed from each project's own
+        fleet, with the same optional choices as the GET. `all` does it in every project
+        the person is master of. The CLI equivalent is `ferry engines policy team
+        --accept`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                subscription_roles: {type: array, items: {type: string, enum: [plan, build, review, chore, adversary]}}
+                width: {type: object, additionalProperties: {type: integer, minimum: 1, maximum: 255}}
+                effort: {type: object, additionalProperties: {type: string, enum: [low, medium, high]}}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: a width of 0, or a role or effort that means nothing}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/engine-policy/settings:
+    post:
+      summary: The master sets effort, width and subscription roles per role
+      description: >
+        `effort` is how hard a role thinks (`low`, `medium`, `high`); `width` is the most
+        orders of the role claimed at once across the fleet, with `null` removing the cap;
+        `subscription_roles` lists the roles whose background work may use a subscription,
+        and only one with a `weekly_requests` cap (`[]` clears it). The rest of the policy
+        is kept. `all` does it in every project the person is master of. The CLI equivalent
+        is `ferry engines policy set --effort role=level --width role=n
+        --allow-subscriptions-for role,...`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                effort: {type: object, additionalProperties: {type: string, enum: [low, medium, high]}}
+                width: {type: object, additionalProperties: {type: integer, nullable: true, minimum: 1, maximum: 255}}
+                subscription_roles: {type: array, items: {type: string, enum: [plan, build, review, chore, adversary]}}
+                all: {type: boolean}
+      responses:
+        '200': {description: 'how many changed, and per project: set, already, skipped or error'}
+        '400': {description: nothing to set, a width of 0, or a role or effort that means nothing}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
   /api/improve/pending:
@@ -308,8 +396,11 @@ paths:
       description: >
         Every improvement whose newest result is not yet approved for live: its diff stat,
         what its evidence says, the review engine's verdict when it has given the first key,
-        and whether only the master's approval is missing (`ready_for_you`). `may_decide` is
-        true only for the signed-in master.
+        and whether only the master's approval is missing (`ready_for_you`). Each card also
+        carries the adversary's finding beside the two keys (`adversary`: its verdict,
+        findings and any override, null when it has not read the work or is off) and
+        `adversary_blocked`, true while an unresolved Block stands. `may_decide` is true
+        only for the signed-in master.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
@@ -402,6 +493,127 @@ paths:
         '200': {description: 'how many delegations were revoked'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/contracts:
+    get:
+      summary: Every interface contract in the project
+      description: >
+        Each contract with its status (`proposed`, `locked` or `rejected`), its request and
+        response shapes, who proposed and locked it, and the orders on each side with the
+        reason a worker is holding any of them. Forged, unsigned and edited-after-lock files
+        are not listed. `may_decide` is true only for the signed-in master. Each contract
+        carries what the adversary found (`adversary`, one standing finding per moment it
+        has read it, empty when the adversary is off) and `lock_refusal`, the reason Lock
+        is refused while an unresolved Block stands, or no eligible adversary has read the
+        contract at all, in `blocking` mode (null otherwise). `digest` is the contract as it
+        reads now and `finding_digest` the adversary's word on it (`none` when no eligible
+        adversary has read it): a Lock must send the first, an override both, so what is
+        locked or overridden is what this response showed. `adversary_mode` is `off`,
+        `advisory` or `blocking`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'the project, its master, may_decide, adversary_mode, and the contracts'}
+        '401': {description: no active session}
+  /api/contracts/{reference}/lock:
+    post:
+      summary: The master locks a proposed contract
+      description: >
+        Freezes `name@version` with a signature of the signed-in master (or a delegate
+        holding the improve scope). A locked contract never changes; a change is a new
+        version. Also answers the question Telegram asked, so its buttons go away. With the
+        adversary on `blocking`, an unresolved Block (or no eligible finding) refuses this
+        with 403 until the master overrides or waives it; `override` signs that and locks in
+        one step. The body must name what the master looked at: `digest` (the contract's,
+        at least 8 characters) and, with `override`, `finding` (the adversary's word, or
+        `none`), both from GET /api/contracts. A contract or finding that changed since is
+        refused with 403, "the contract changed since you looked".
+      parameters:
+        - {name: reference, in: path, required: true, schema: {type: string}}
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [digest]
+              properties:
+                digest: {type: string, description: 'the contract digest from GET /api/contracts'}
+                override: {type: boolean}
+                finding: {type: string, description: 'with override: the finding_digest from GET /api/contracts, or none'}
+                reason: {type: string}
+      responses:
+        '200': {description: the contract, now locked}
+        '400': {description: not a name@version reference, or no digest (or no finding with override)}
+        '401': {description: no active session}
+        '403': {description: read-only, not the master, the contract or finding changed since you looked, or an unresolved adversary Block in blocking mode}
+        '404': {description: no genuine contract by that name}
+        '409': {description: already locked or rejected}
+  /api/contracts/{reference}/reject:
+    post:
+      summary: The master rejects a proposed contract
+      description: >
+        Declines `name@version`. The proposer's way forward is a new version.
+      parameters:
+        - {name: reference, in: path, required: true, schema: {type: string}}
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: the contract, now rejected}
+        '400': {description: not a name@version reference}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: no genuine contract by that name}
+        '409': {description: already locked or rejected}
+  /api/adversary:
+    get:
+      summary: What the adversary found in this project
+      description: >
+        The adversary is a separate model that challenges the builders' work at three
+        moments: before an interface contract locks, when the same order fails twice, and
+        before an improvement is called done. Returns the mode (`off`, `advisory` or
+        `blocking`), the engine first in line, and every genuine finding newest first (its
+        subject, revision, trigger, verdict, findings, engine, `same_engine` and any
+        override) and its `digest`. Forged and unsigned findings are not listed. A finding
+        that does not count - from the agent that built the work, from a machine with no
+        signed engine inventory, one the policy's `machines` does not allow - is listed
+        under `ignored` with its `reason`. `may_override` is true only for the signed-in
+        master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'project, mode, engine, may_override, findings and ignored'}
+  /api/adversary/override:
+    post:
+      summary: The master goes ahead despite the adversary's Block
+      description: >
+        Signed with the session's key. For a contract it records the override, after which
+        Lock goes through; for an improvement it lets the review engine's key be granted
+        and auto-merge proceed. Only a genuine Block can be overridden, and the override is
+        for that revision only (the revision under decision when none is given). `finding` is
+        required: the finding's `digest` as the page showed it, or `none` to waive a decision
+        no eligible adversary has read; if what stands changed since, this is refused. The CLI
+        equivalent is `ferry adversary override`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, trigger, finding]
+              properties:
+                subject: {type: string, description: 'an order id, or a contract as name@version'}
+                trigger: {type: string, enum: [contract-lock, repeat-failure, pre-done]}
+                revision: {type: integer}
+                reason: {type: string}
+                finding: {type: string, description: 'the finding digest the master saw, or none'}
+      responses:
+        '200': {description: 'subject, revision, trigger, overridden_by and reason'}
+        '400': {description: not a trigger, or no finding named}
+        '401': {description: no active session}
+        '403': {description: read-only, not the master, the finding changed since you looked, or there is no Block to override}
+        '404': {description: the subject has no such moment to decide}
   /api/master/claim-all:
     post:
       summary: The signed-in person becomes master of every project with none

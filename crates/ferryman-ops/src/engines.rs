@@ -34,7 +34,12 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Utc};
-use ferryman_channel::{ProjectRoute, receipts::EngineReport, trajectory::TokenUsage};
+use ferryman_channel::{
+    ProjectRoute,
+    policy::{Effort, ModelClass},
+    receipts::EngineReport,
+    trajectory::TokenUsage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -155,7 +160,9 @@ pub struct EngineSpec {
     pub paid: Paid,
     /// The CLI to run. Empty for an HTTP engine.
     pub command: String,
-    /// The CLI's arguments. `{prompt}`, `{model}` and `{base_url}` are filled in.
+    /// The CLI's arguments. `{prompt}`, `{model}`, `{base_url}` and `{effort}` are filled
+    /// in; `{effort}` reads `low`, `medium` or `high`, as the engine policy asks of the
+    /// role the engine is doing.
     pub args: Vec<String>,
     pub model: Option<String>,
     /// An OpenAI-compatible base URL, e.g. `https://integrate.api.nvidia.com/v1`. For an
@@ -174,6 +181,16 @@ pub struct EngineSpec {
     pub provider: Option<String>,
     /// For a gateway engine: the provider/models its route ends at, as its probe found.
     pub route: Vec<String>,
+    /// The size class its operator declares (`engine.<name>.class = "small"`). It wins
+    /// over [`guess_class`](ferryman_channel::policy::guess_class) on the model's name.
+    pub class: Option<ModelClass>,
+    /// Extra arguments per effort level, for a CLI whose effort flag is not one `{effort}`
+    /// can express, e.g. `engine.<name>.effort_args = {"low":["-c","x=low"],...}`. They go
+    /// in just before the argument that holds `{prompt}`. Keys are `low`, `medium`, `high`.
+    pub effort_args: BTreeMap<String, Vec<String>>,
+    /// An HTTP engine takes a `reasoning_effort` field (`engine.<name>.supports_effort =
+    /// "true"`). Off by default: an endpoint that does not know the field may refuse it.
+    pub supports_effort: bool,
 }
 
 impl EngineSpec {
@@ -196,20 +213,62 @@ impl EngineSpec {
             weekly_usd: None,
             provider: None,
             route: Vec::new(),
+            class: None,
+            effort_args: BTreeMap::new(),
+            supports_effort: false,
         }
     }
 
-    /// The CLI arguments with this engine's model and endpoint filled in. `{prompt}` is
-    /// left for the runner, which fills it last.
+    /// The CLI arguments with this engine's model and endpoint filled in, and no effort
+    /// asked: `{effort}` reads `medium` and `effort_args` add nothing. `{prompt}` is left
+    /// for the runner, which fills it last.
     #[must_use]
     pub fn cli_args(&self) -> Vec<String> {
-        self.args
-            .iter()
-            .map(|arg| {
-                arg.replace("{model}", self.model.as_deref().unwrap_or(""))
-                    .replace("{base_url}", self.base_url.as_deref().unwrap_or(""))
-            })
-            .collect()
+        self.cli_args_at(None)
+    }
+
+    /// [`Self::cli_args`] for work asked to run at `effort`: `{effort}` is filled in like
+    /// `{model}`, and the engine's `effort_args` for that level go in just before the
+    /// argument that holds `{prompt}` (at the end when none does).
+    #[must_use]
+    pub fn cli_args_at(&self, effort: Option<Effort>) -> Vec<String> {
+        let level = effort.unwrap_or(Effort::Medium);
+        let fill = |arg: &String| {
+            arg.replace("{model}", self.model.as_deref().unwrap_or(""))
+                .replace("{base_url}", self.base_url.as_deref().unwrap_or(""))
+                .replace("{effort}", level.as_str())
+        };
+        let mut args: Vec<String> = self.args.iter().map(fill).collect();
+        if effort.is_some()
+            && let Some(extra) = self.effort_args.get(level.as_str())
+        {
+            let at = self
+                .args
+                .iter()
+                .position(|arg| arg.contains("{prompt}"))
+                .unwrap_or(args.len());
+            args.splice(at..at, extra.iter().map(fill));
+        }
+        args
+    }
+
+    /// Whether anything in this engine's setup acts on an effort: `{effort}` in its
+    /// arguments, `effort_args`, or an HTTP engine that `supports_effort`. What is
+    /// recorded as the effort a step ran at is only ever an effort that was applied.
+    #[must_use]
+    pub fn applies_effort(&self) -> bool {
+        self.supports_effort
+            || !self.effort_args.is_empty()
+            || self.args.iter().any(|arg| arg.contains("{effort}"))
+    }
+
+    /// Its size class: the operator's word, else guessed from its model's name (or its
+    /// own name, with no model).
+    #[must_use]
+    pub fn class(&self) -> ModelClass {
+        self.class.unwrap_or_else(|| {
+            ferryman_channel::policy::guess_class(self.model.as_deref().unwrap_or(&self.name))
+        })
     }
 }
 
@@ -337,6 +396,35 @@ pub fn parse_engines(
                     .with_context(|| format!("engine.{name}.weekly_usd must be a number"))
             })
             .transpose()?;
+        let class = get("class")
+            .map(|value| ModelClass::parse(&value).with_context(|| format!("engine.{name}.class")))
+            .transpose()?;
+        let effort_args = match get("effort_args") {
+            None => BTreeMap::new(),
+            Some(raw) => {
+                let parsed = serde_json::from_str::<BTreeMap<String, Vec<String>>>(&raw)
+                    .with_context(|| {
+                        format!(
+                            "engine.{name}.effort_args must be a JSON object of level: [args], \
+                             e.g. {{\"low\":[\"--effort\",\"low\"]}}"
+                        )
+                    })?;
+                let mut by_level = BTreeMap::new();
+                for (level, extra) in parsed {
+                    let level = Effort::parse(&level)
+                        .with_context(|| format!("engine.{name}.effort_args"))?;
+                    by_level.insert(level.as_str().to_string(), extra);
+                }
+                by_level
+            }
+        };
+        let supports_effort = match get("supports_effort").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => {
+                bail!("engine.{name}.supports_effort must be true or false, not '{other}'")
+            }
+        };
         let spec_model = get("model").or_else(|| {
             (kind == Kind::Cli && own_command.is_none())
                 .then(|| model.map(str::to_string))
@@ -368,6 +456,9 @@ pub fn parse_engines(
             weekly_usd,
             provider,
             route: Vec::new(),
+            class,
+            effort_args,
+            supports_effort,
             name,
         });
     }
@@ -485,11 +576,20 @@ pub fn ledger_path(agent: &str) -> Option<PathBuf> {
     let name = ferryman_channel::canonical_agent_name(agent);
     #[cfg(test)]
     {
-        // Tests never touch the real machine's ledger, and threads never share one.
-        let thread = format!("{:?}", std::thread::current().id())
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect::<String>();
+        // Tests never touch the real machine's ledger, and threads never share one -
+        // except threads named `shared-ledger-*`, which a test starts to put several
+        // writers on one file.
+        let thread = if std::thread::current()
+            .name()
+            .is_some_and(|name| name.starts_with("shared-ledger"))
+        {
+            "shared".to_string()
+        } else {
+            format!("{:?}", std::thread::current().id())
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect::<String>()
+        };
         Some(
             std::env::temp_dir()
                 .join(format!("ferryman-ops-engines-{}", std::process::id()))
@@ -539,6 +639,14 @@ impl Ledger {
 /// Change an agent's ledger. Best effort: the ledger informs choices, it never blocks
 /// work.
 pub fn update(agent: &str, change: impl FnOnce(&mut Ledger)) {
+    // Read, change, write back as one step. A worker running several orders at once has
+    // several finishing together, and each one counts its own request and its own
+    // verification: two of them reading the same file and writing back their own copy
+    // would lose one of the counts.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut ledger = Ledger::load(agent);
     change(&mut ledger);
     if let Err(error) = ledger.save(agent) {
@@ -810,6 +918,20 @@ pub fn choose(
                 )
             }
         })
+}
+
+/// The effort the engine policy asked `role` to run at, as it is recorded beside the
+/// engine that ran it - and only when that engine acts on an effort at all, so a record
+/// never claims an effort that was not applied.
+#[must_use]
+pub fn effort_used(
+    route: &ProjectRoute,
+    role: ferryman_channel::policy::Role,
+    engine: Option<&EngineSpec>,
+) -> Option<String> {
+    engine.filter(|engine| engine.applies_effort())?;
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    Some(policy.effort_for(role).as_str().to_string())
 }
 
 /// The engine to run next for a person's own order: [`pick`], except that a policy whose
@@ -1266,23 +1388,38 @@ fn client(timeout: Duration) -> Result<reqwest::Client> {
         .context("build the HTTP client")
 }
 
-/// Ask an HTTP engine one prompt.
+/// The request an HTTP engine is sent. `reasoning_effort` is added only when the engine
+/// says it `supports_effort` and an effort was asked for: nothing changes for an engine
+/// that has not opted in.
+#[must_use]
+pub fn chat_body(spec: &EngineSpec, prompt: &str, effort: Option<Effort>) -> Value {
+    let mut body = json!({
+        "model": spec.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": false,
+    });
+    if spec.supports_effort
+        && let Some(effort) = effort
+    {
+        body["reasoning_effort"] = json!(effort.as_str());
+    }
+    body
+}
+
+/// Ask an HTTP engine one prompt, at `effort` when it takes one.
 pub async fn chat(
     spec: &EngineSpec,
     key: Option<&str>,
     prompt: &str,
     timeout: Duration,
+    effort: Option<Effort>,
 ) -> ChatRun {
     let base = spec.base_url.as_deref().unwrap_or_default();
     #[cfg(test)]
     if let Some(canned) = base.strip_prefix("fake://") {
-        return fake_chat(canned);
+        return fake_chat(canned, prompt, &chat_body(spec, prompt, effort)).await;
     }
-    let body = json!({
-        "model": spec.model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": false,
-    });
+    let body = chat_body(spec, prompt, effort);
     let run = async {
         let mut request = client(timeout)?
             .post(format!("{base}/chat/completions"))
@@ -1387,10 +1524,60 @@ fn chat_reply(body: &str) -> ChatRun {
     }
 }
 
-/// Canned replies for tests: `fake://ok:<answer>`, `fake://quota`, `fake://down`, and
-/// `fake://paid:<answer>`, an answer whose provider says it cost a cent.
+/// One request a `fake://slow:` engine answered: which test's key, what it was asked, the
+/// request body it was sent, and when it started and finished.
 #[cfg(test)]
-fn fake_chat(canned: &str) -> ChatRun {
+#[derive(Debug, Clone)]
+pub(crate) struct SlowRun {
+    pub key: String,
+    pub prompt: String,
+    pub body: Value,
+    pub started: Instant,
+    pub finished: Instant,
+}
+
+#[cfg(test)]
+pub(crate) fn slow_runs() -> &'static std::sync::Mutex<Vec<SlowRun>> {
+    static RUNS: std::sync::Mutex<Vec<SlowRun>> = std::sync::Mutex::new(Vec::new());
+    &RUNS
+}
+
+/// Canned replies for tests: `fake://ok:<answer>`, `fake://quota`, `fake://down`,
+/// `fake://paid:<answer>`, an answer whose provider says it cost a cent, and
+/// `fake://slow:<key>:<millis>:<answer>`, an answer that takes its time and is logged in
+/// [`slow_runs`] under `<key>`, so a test can see which requests overlapped (an answer of
+/// `quota` is the out-of-credit error, after the same wait).
+#[cfg(test)]
+async fn fake_chat(canned: &str, prompt: &str, body: &Value) -> ChatRun {
+    if let Some(rest) = canned.strip_prefix("slow:") {
+        let mut parts = rest.splitn(3, ':');
+        let key = parts.next().unwrap_or_default().to_string();
+        let millis: u64 = parts.next().and_then(|m| m.parse().ok()).unwrap_or(0);
+        let answer = parts.next().unwrap_or_default().to_string();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(millis)).await;
+        slow_runs()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(SlowRun {
+                key,
+                prompt: prompt.to_string(),
+                body: body.clone(),
+                started,
+                finished: Instant::now(),
+            });
+        if answer == "quota" {
+            return ChatRun {
+                detail: "HTTP 402: Insufficient Balance".to_string(),
+                ..ChatRun::default()
+            };
+        }
+        return ChatRun {
+            ok: true,
+            text: answer,
+            ..ChatRun::default()
+        };
+    }
     if let Some(answer) = canned.strip_prefix("paid:") {
         return ChatRun {
             ok: true,
@@ -1708,6 +1895,7 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
                 checked_at: state.checked_at,
                 trust: trust(&state),
                 billing: Some(billing(spec, &state, now)),
+                class: Some(spec.class().as_str().to_string()),
             }
         })
         .collect()
@@ -1723,6 +1911,7 @@ fn billing(
     ferryman_channel::receipts::EngineBilling {
         host: spec.base_url.as_deref().and_then(url_host),
         capped: spec.weekly_usd.is_some() || spec.weekly_requests.is_some(),
+        weekly_requests: spec.weekly_requests,
         week: iso_week(now),
         requests: if this_week { state.requests } else { 0 },
         spend_usd: if this_week { state.spend_usd } else { 0.0 },
@@ -1767,6 +1956,9 @@ mod tests {
             weekly_usd: None,
             provider: None,
             route: Vec::new(),
+            class: None,
+            effort_args: BTreeMap::new(),
+            supports_effort: false,
         }
     }
 
@@ -2206,5 +2398,250 @@ engine.local.tier = "chore"
         assert_eq!(state.refuted, 4);
         assert!(!state.note(Status::Refuted, now + chrono::Duration::hours(2)));
         assert!(!state.demoted(), "a fresh window after the canary");
+    }
+
+    // --- effort, class and concurrent writers ---------------------------------------------
+
+    fn cli(args: &[&str]) -> EngineSpec {
+        let mut spec = EngineSpec::implicit(
+            "codex",
+            &args.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            Some("gpt-5-mini"),
+        );
+        spec.name = "codex".into();
+        spec
+    }
+
+    #[test]
+    fn effort_fills_its_placeholder_like_the_model_and_adds_the_engines_own_args() {
+        let spec = cli(&[
+            "exec",
+            "-c",
+            "model_reasoning_effort={effort}",
+            "-m",
+            "{model}",
+            "{prompt}",
+        ]);
+        assert_eq!(
+            spec.cli_args_at(Some(Effort::High)),
+            [
+                "exec",
+                "-c",
+                "model_reasoning_effort=high",
+                "-m",
+                "gpt-5-mini",
+                "{prompt}"
+            ]
+        );
+        assert_eq!(
+            spec.cli_args_at(Some(Effort::Low))[2],
+            "model_reasoning_effort=low"
+        );
+        // No effort asked: the placeholder reads medium, as the plain `cli_args` always has.
+        assert_eq!(spec.cli_args()[2], "model_reasoning_effort=medium");
+        assert!(spec.applies_effort());
+
+        // Per-level args go in just before the prompt, and only when an effort was asked.
+        let mut flagged = cli(&["run", "--auto", "{prompt}"]);
+        flagged.effort_args = BTreeMap::from([
+            (
+                "high".to_string(),
+                vec!["--think".to_string(), "{effort}".to_string()],
+            ),
+            ("low".to_string(), vec!["--quick".to_string()]),
+        ]);
+        assert_eq!(
+            flagged.cli_args_at(Some(Effort::High)),
+            ["run", "--auto", "--think", "high", "{prompt}"]
+        );
+        assert_eq!(
+            flagged.cli_args_at(Some(Effort::Low)),
+            ["run", "--auto", "--quick", "{prompt}"]
+        );
+        assert_eq!(
+            flagged.cli_args_at(Some(Effort::Medium)),
+            ["run", "--auto", "{prompt}"],
+            "a level with no extra args adds none"
+        );
+        assert_eq!(flagged.cli_args(), ["run", "--auto", "{prompt}"]);
+        assert!(flagged.applies_effort());
+        // Without a prompt placeholder they follow the rest.
+        let mut bare = cli(&["go"]);
+        bare.effort_args = BTreeMap::from([("high".to_string(), vec!["--hard".to_string()])]);
+        assert_eq!(bare.cli_args_at(Some(Effort::High)), ["go", "--hard"]);
+
+        // An engine that says nothing about effort is untouched by it, and says so.
+        let plain = cli(&["-p", "{prompt}"]);
+        assert_eq!(plain.cli_args_at(Some(Effort::High)), plain.cli_args());
+        assert!(!plain.applies_effort());
+    }
+
+    #[test]
+    fn an_http_engine_is_sent_a_reasoning_effort_only_when_it_says_it_takes_one() {
+        let mut spec = http("nvidia", Tier::Build, "https://example.invalid/v1");
+        let body = chat_body(&spec, "hi", Some(Effort::High));
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "off by default: {body}"
+        );
+        assert_eq!(body["messages"][0]["content"], "hi");
+        spec.supports_effort = true;
+        assert_eq!(
+            chat_body(&spec, "hi", Some(Effort::High))["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            chat_body(&spec, "hi", Some(Effort::Low))["reasoning_effort"],
+            "low"
+        );
+        assert!(
+            chat_body(&spec, "hi", None)
+                .get("reasoning_effort")
+                .is_none(),
+            "no effort asked, none sent"
+        );
+        assert!(spec.applies_effort());
+        assert_eq!(
+            chat_body(
+                &http("x", Tier::Build, "https://example.invalid/v1"),
+                "hi",
+                None
+            ),
+            json!({ "model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": false }),
+            "an engine that has not opted in is sent exactly what it always was"
+        );
+    }
+
+    #[test]
+    fn effort_class_and_the_effort_flags_are_read_from_agent_toml() {
+        let parsed = parse_engines(
+            &fields(
+                "engines = [\"codex\", \"mini\"]\n\
+                 engine.codex.command = \"codex\"\n\
+                 engine.codex.args = [\"exec\",\"-c\",\"model_reasoning_effort={effort}\",\"{prompt}\"]\n\
+                 engine.codex.model = \"gpt-5\"\n\
+                 engine.codex.class = \"large\"\n\
+                 engine.mini.base_url = \"https://example.invalid/v1\"\n\
+                 engine.mini.model = \"gpt-5-mini\"\n\
+                 engine.mini.supports_effort = \"true\"\n\
+                 engine.mini.effort_args = {\"HIGH\":[\"--hard\"]}\n",
+            ),
+            "claude",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed[0].class, Some(ModelClass::Large));
+        assert_eq!(parsed[0].class(), ModelClass::Large, "declared");
+        assert!(!parsed[0].supports_effort && parsed[0].effort_args.is_empty());
+        assert_eq!(parsed[1].class, None);
+        assert_eq!(
+            parsed[1].class(),
+            ModelClass::Small,
+            "guessed from gpt-5-mini"
+        );
+        assert!(parsed[1].supports_effort);
+        assert_eq!(
+            parsed[1].effort_args["high"],
+            ["--hard"],
+            "levels are folded"
+        );
+        // A declared class beats the guess whichever way it points.
+        let mut sonnet = cli(&["{prompt}"]);
+        sonnet.model = Some("claude-sonnet-4".into());
+        assert_eq!(sonnet.class(), ModelClass::Medium);
+        sonnet.class = Some(ModelClass::Small);
+        assert_eq!(sonnet.class(), ModelClass::Small);
+
+        let refuse = |extra: &str| {
+            parse_engines(
+                &fields(&format!(
+                    "engines = [\"e\"]\nengine.e.command = \"c\"\n{extra}\n"
+                )),
+                "c",
+                &[],
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert!(refuse("engine.e.class = \"huge\"").contains("engine.e.class"));
+        assert!(refuse("engine.e.effort_args = {\"extreme\":[]}").contains("effort_args"));
+        assert!(refuse("engine.e.effort_args = [1]").contains("effort_args"));
+        assert!(refuse("engine.e.supports_effort = \"maybe\"").contains("supports_effort"));
+    }
+
+    #[test]
+    fn the_inventory_carries_the_class_and_the_weekly_request_cap() {
+        let mut spec = cli(&["{prompt}"]);
+        spec.paid = Paid::Subscription;
+        spec.weekly_requests = Some(200);
+        spec.model = Some("claude-haiku-4".into());
+        let reports = reports(&[spec.clone()], &Ledger::default(), monday_noon());
+        assert_eq!(reports[0].class.as_deref(), Some("small"));
+        assert_eq!(
+            reports[0].billing.as_ref().unwrap().weekly_requests,
+            Some(200)
+        );
+        let candidate = ferryman_channel::policy::Candidate::from_report("a", "m", 0, &reports[0]);
+        assert_eq!(candidate.class(), ModelClass::Small);
+        assert_eq!(candidate.weekly_requests, Some(200));
+        // A line from a worker older than classes has none, and the fleet guesses.
+        let mut old = reports[0].clone();
+        old.class = None;
+        old.billing = None;
+        let candidate = ferryman_channel::policy::Candidate::from_report("a", "m", 0, &old);
+        assert_eq!(
+            candidate.class(),
+            ModelClass::Small,
+            "guessed from the model"
+        );
+        assert_eq!(candidate.weekly_requests, None);
+        let published = serde_json::to_value(&old).unwrap();
+        assert!(
+            published.get("class").is_none(),
+            "left out when unknown: {published}"
+        );
+    }
+
+    /// Several threads each count requests against the same engine in one ledger: every
+    /// count lands. Each thread's name starts `shared-ledger`, which the test ledger path
+    /// takes to mean one shared file rather than one per thread.
+    #[test]
+    fn concurrent_writers_lose_no_ledger_update() {
+        let now = monday_noon();
+        let agent = format!("swarm-ledger-{}", std::process::id());
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let agent = agent.clone();
+                std::thread::Builder::new()
+                    .name(format!("shared-ledger-{n}"))
+                    .spawn(move || {
+                        for _ in 0..25 {
+                            record_use(&agent, "swarm", 0.01, now);
+                        }
+                        record_verification(
+                            &agent,
+                            "swarm",
+                            ferryman_channel::evidence::Status::Verified,
+                            now,
+                        );
+                    })
+                    .unwrap()
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let ledger = std::thread::Builder::new()
+            .name("shared-ledger-reader".into())
+            .spawn(move || Ledger::load(&agent))
+            .unwrap()
+            .join()
+            .unwrap();
+        let state = ledger.state("swarm");
+        assert_eq!(state.requests, 200, "{state:?}");
+        assert_eq!(state.verified, 8, "{state:?}");
+        assert!((state.spend_usd - 2.0).abs() < 1e-6, "{state:?}");
     }
 }

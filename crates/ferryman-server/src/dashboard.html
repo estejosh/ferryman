@@ -397,6 +397,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
     <div class="nav" id="nav-main">
       <button data-page="home" aria-current="page">Home</button>
       <button data-page="tasks">Tasks <span class="pill num" id="count-tasks">0</span></button>
+      <button data-page="contracts">Contracts</button>
       <button data-page="review">Needs review <span class="pill num" id="count-review">0</span></button>
       <button data-page="agents">Agents <span class="pill num" id="count-agents">0</span></button>
       <button data-page="release">Release</button>
@@ -778,6 +779,7 @@ async function showTask(id) {
       ${(d.depends_on || []).length ? `<dt>Depends on</dt><dd class="mono">${esc((d.depends_on||[]).join(", "))}</dd>` : ""}
       ${d.requires_approval ? `<dt>Approval</dt><dd><span class="badge warn">Master must accept</span></dd>` : ""}
     </dl>
+    ${taskContractDetail(d)}
     <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:0 0 8px">The order</h3>
     <pre class="out">${esc(d.order || d.payload?.task || "—")}</pre>
     ${latest ? `
@@ -845,11 +847,56 @@ function taskRow(t) {
       <div class="r">
         ${t.holder ? `<span class="badge">${esc(t.holder)}</span>` : ""}
         ${t.engine ? `<span class="badge">${esc(t.engine)}</span>` : ""}
+        ${contractBadges(t)}
         ${sigBadge(t.sig)}
         ${stageBadge(t.stage)}
         <span class="badge ${st.tone}">${esc(st.word)}</span>
       </div>
     </div>`;
+}
+
+// What an order card says about the interface it builds to and the files it touches: the
+// contract it provides or consumes, a warning when another open or claimed order is heading
+// for the same files, and why a worker is holding it back, when one is. The warning is
+// advisory - it never hides or blocks the order - and says what it overlaps on hover.
+function contractBadges(t) {
+  const out = [];
+  if (t.interface) {
+    out.push(`<span class="badge accent" title="This order ${esc(t.interface.side)} the contract">${esc(t.interface.name)}@${esc(t.interface.version)} ${esc(t.interface.side)}</span>`);
+  }
+  const overlaps = t.overlaps || [];
+  if (overlaps.length) {
+    const why = overlaps.map((o) => `${o.order_id} (${o.state}${o.holder ? " by " + o.holder : ""}): ${(o.pairs || []).map((p) => p.join(" ~ ")).join(", ")}`).join("\n");
+    out.push(`<span class="badge warn" title="${esc(why)}">overlaps ${overlaps.length} order${overlaps.length > 1 ? "s" : ""}</span>`);
+  }
+  const holds = t.holds || [];
+  if (holds.length) {
+    out.push(`<span class="badge warn" title="${esc(holds.map((h) => h.agent + ": " + h.reason).join("\n"))}">held</span>`);
+  }
+  return out.join("");
+}
+
+// The detail the card has no room for, shown in the drawer: the files the order declared,
+// overlapping orders, why it is held, and the notes the worker left for the reviewer.
+function taskContractDetail(d) {
+  const order = d.order || {};
+  const rows = [];
+  if (order.interface) {
+    rows.push(`<dt>Interface</dt><dd class="mono">${esc(order.interface.name)}@${esc(order.interface.version)} <span style="color:var(--faint)">${esc(order.interface.side)}</span></dd>`);
+  }
+  if ((order.touches || []).length) {
+    rows.push(`<dt>Touches</dt><dd class="mono">${esc(order.touches.join(", "))}${order.allow_overlap ? ` <span class="badge">overlap allowed</span>` : ""}</dd>`);
+  }
+  (d.overlaps || []).forEach((o) => {
+    rows.push(`<dt>Overlaps</dt><dd><span class="mono">${esc(o.order_id)}</span> <span class="badge warn">${esc(o.state)}${o.holder ? " by " + esc(o.holder) : ""}</span> <span class="mono" style="color:var(--faint)">${esc((o.pairs || []).map((p) => p.join(" ~ ")).join(", "))}</span></dd>`);
+  });
+  (d.holds || []).forEach((h) => {
+    rows.push(`<dt>Held</dt><dd>${esc(h.agent)} is holding off: ${esc(h.reason)}</dd>`);
+  });
+  (d.notes || []).forEach((n) => {
+    rows.push(`<dt>Note r${esc(n.revision)}</dt><dd>${esc(n.note)}</dd>`);
+  });
+  return rows.length ? `<dl class="kv">${rows.join("")}</dl>` : "";
 }
 
 // How far an unfinished order has got, from signed receipts: sent, delivered, read,
@@ -1032,8 +1079,46 @@ function improvePanel(imp) {
    builds and reviews), in what order, never which, and on which machines. Signed by the
    master; with none signed the fleet runs on auto - local and free first, subscriptions
    never. The master can accept what auto recommends, or edit the lists. */
-const POLICY_ROLES = ["plan", "build", "review", "chore"];
+const POLICY_ROLES = ["plan", "build", "review", "chore", "adversary"];
+/* The roles that build and judge: what "prefer" in the edit box applies to. The adversary
+   is chosen on its own, so it is never swept up in an edit meant for the others. */
+const POLICY_BUILD_ROLES = ["plan", "build", "review", "chore"];
+let lastPolicy = {};
+let lastRoles = {};
+const ADVERSARY_MODES = {
+  off: "Off - nothing is challenged",
+  advisory: "Advisory - findings are shown beside the review keys, never in the way",
+  blocking: "Blocking - a Block stops the contract lock and the review engine's key until you override it",
+};
+function adversaryText(x) {
+  /* One finding as a few lines: the headline, the worst issues, and what was done about a Block. */
+  if (!x) return "";
+  const issues = (x.findings || []).slice().sort((a, b) =>
+    ["high", "medium", "low"].indexOf(a.severity) - ["high", "medium", "low"].indexOf(b.severity)).slice(0, 3);
+  const tone = x.verdict === "block" ? "bad" : x.verdict === "concern" ? "warn" : "good";
+  return `<div class="adversary"><span class="badge ${tone}">adversary: ${esc(x.status)}</span> ` +
+    `<span class="m">${esc(x.headline)}${x.same_engine ? " - the engine that built it was the only one allowed" : ""}</span>` +
+    (x.override ? `<div class="m">overridden by ${esc(x.override.by)}${x.override.reason ? `: ${esc(x.override.reason)}` : ""}</div>` : "") +
+    issues.map((i) => `<div class="m"><b>[${esc(i.severity)}]</b> ${esc(i.title)}${i.location ? ` (${esc(i.location)})` : ""}: ${esc(i.detail)}</div>`).join("") +
+    `</div>`;
+}
+/* The adversary's terms live in their own file, signed by the master alone: everyone sees
+   them here, only the master changes them. */
+function adversaryTerms(ep) {
+  const a = ep.adversary || {};
+  const who = a.set_by
+    ? `signed by ${esc(a.set_by)}, ${esc(String(a.set_at || "").slice(0, 16).replace("T", " "))} UTC`
+    : "none signed &mdash; advisory, automatic choice, no allowlist, no cap";
+  const judges = (a.agents || []).length
+    ? esc(a.agents.join(", ")) + " only"
+    : "any member whose signed inventory lists an engine the adversary may use";
+  return `Adversary policy: ${who}. Judges: ${judges}.` +
+    ((a.never || []).length ? ` Never: ${esc(a.never.join(", "))}.` : "") +
+    (a.cap_usd !== null && a.cap_usd !== undefined ? ` Cap: $${Number(a.cap_usd).toFixed(2)} a week.` : "") +
+    ` Only the master signs it${ep.may_set ? "" : " &mdash; you can read it here, not change it"}.`;
+}
 function policyPanel(ep) {
+  lastPolicy = ep.policy || {};
   const when = (at) => esc(String(at || "").slice(0, 16).replace("T", " "));
   const roles = (ep.effective && ep.effective.roles) || {};
   const line = (e) => `${esc(e.engine)} on ${esc(e.machine)}`;
@@ -1065,20 +1150,53 @@ function policyPanel(ep) {
             <select id="ep-improve" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.improve, cur.improve)}</select></label>
           <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Review engine</span>
             <select id="ep-review" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.review, cur.review)}</select></label>
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Adversary engine</span>
+            <select id="ep-adversary" ${ep.may_set ? "" : "disabled"}><option value="">auto</option>${opt(ch.adversary, cur.adversary)}</select></label>
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Adversary mode</span>
+            <select id="ep-adv-mode" ${ep.may_set ? "" : "disabled"}>${Object.entries(ADVERSARY_MODES).map(([mode, text]) =>
+              `<option value="${mode}"${mode === (ep.adversary_mode || "advisory") ? " selected" : ""}>${esc(text)}</option>`).join("")}</select></label>
           ${ep.may_set ? `<button class="btn primary" id="ep-choose">Save</button><button class="btn" id="ep-use-rec">Use recommended</button>
           <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="ep-all" /> for all my projects</label>` : ""}
         </div>
-        <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)}.
-          Every improvement needs the review engine's verdict and then yours before it can go live.</div>
+        <div class="s" style="margin-top:6px" id="ep-adversary-terms">${adversaryTerms(ep)}</div>
+        <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)} &middot; adversary: ${nameOf(recd.adversary)}.
+          Every improvement needs the review engine's verdict and then yours before it can go live. The adversary is a different engine that challenges work before a contract locks, when an order fails twice, and before an improvement is called done.</div>
         <label class="s" style="display:inline-flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="ep-automerge" ${p.auto_merge === "low-risk" ? "checked" : ""} ${ep.may_set ? "" : "disabled"} /> Auto-merge docs/tests/deps after both approvals</label>
         <div class="s" style="color:var(--dim)">Only when every changed file is documentation, tests or a dependency version bump. Anything touching code or config still waits for you.</div>
         <div class="s" id="ep-msg" style="color:var(--dim);margin-top:4px"></div>`;
+  /* Effort, width and subscriptions per role, and the team preset. Effort is how hard a
+     role thinks; width is how many of its orders the fleet runs at once; a subscription is
+     used for a role only when you tick it here and the engine has a weekly request cap. */
+  lastRoles = roles;
+  const efforts = ep.efforts || ["low", "medium", "high"];
+  const dis = ep.may_set ? "" : "disabled";
+  const roleRows = POLICY_ROLES.map((role) => {
+    const r = roles[role] || {};
+    const first = (r.order || [])[0] || {};
+    return `<tr><td>${role}</td>
+      <td><select data-ep-effort="${role}" ${dis}>${efforts.map((e) =>
+        `<option value="${e}"${e === r.effort ? " selected" : ""}>${e}${e === r.effort && !r.effort_set ? " (default)" : ""}</option>`).join("")}</select></td>
+      <td><input type="number" min="1" max="255" data-ep-width="${role}" value="${r.width == null ? "" : esc(r.width)}" placeholder="no cap" style="width:84px" ${dis} /></td>
+      <td><label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" data-ep-subs="${role}" ${r.subscriptions ? "checked" : ""} ${dis} /> may use a subscription</label></td>
+      <td>${first.class ? esc(first.class) : ""}</td></tr>`;
+  }).join("");
+  const subsWarn = (ep.warnings || []).concat(ep.mixed_fleet_warning ? [ep.mixed_fleet_warning] : []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+  const teamPanel = `
+        <div style="margin-top:14px"><b>Plan on high, build on medium, swarm the cheap work</b></div>
+        <div class="s" style="color:var(--dim);margin-top:4px">Effort is how hard a role thinks; width is how many of its orders run at once across your machines. A subscription is used for background work only for a role you tick, and only an engine with a weekly request cap.</div>
+        <div style="margin-top:8px;overflow-x:auto"><table class="grid"><thead><tr><th>Role</th><th>Effort</th><th>Width</th><th>Subscriptions</th><th>First engine's size</th></tr></thead><tbody>${roleRows}</tbody></table></div>
+        <div id="ep-subs-warn" class="s" style="margin-top:6px">${subsWarn}</div>
+        ${ep.may_set ? `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:8px">
+          <button class="btn primary" id="ep-settings">Save effort, width and subscriptions</button>
+          <button class="btn" id="ep-team">Team preset</button></div>` : `<div style="margin-top:8px"><button class="btn" id="ep-team">Team preset</button></div>`}
+        <div id="ep-team-box" style="margin-top:8px"></div>`;
   return `
     <div class="notice" style="margin-bottom:18px">
       <div style="flex:1;min-width:0">
         <b>Engine policy:</b> ${source}.
         ${ep.auto && ep.self_improve ? `<div style="margin-top:6px"><span class="badge warn">Self-improve is on with no engine policy of its own.</span> Pick the engines below, or use the recommended ones.</div>` : ""}
         ${simple}
+        ${teamPanel}
         <details style="margin-top:12px"><summary>Advanced</summary>
         <div class="s" style="color:var(--dim);margin-top:6px">Which AI does background work here - planning, building and reviewing self-improvements - and on which machines. Orders you give yourself are never restricted by it.</div>
         <div style="margin-top:10px">${(ep.describe || []).map(esc).join("<br>")}</div>
@@ -1118,10 +1236,14 @@ function approvalsPanel(pd) {
         <div style="min-width:0"><div class="t">${esc(w.order_id)} r${w.revision} &mdash; ${esc(w.title)}</div>
           <div class="m">by ${esc(w.worker)}${w.diff_stat ? ` &middot; ${esc(w.diff_stat)}` : ""} &middot; evidence: ${esc(w.evidence)}</div>
           ${w.engine ? `<div class="m">review engine: ${esc(w.engine.engine)}${w.engine.model ? ` (${esc(w.engine.model)})` : ""} on ${esc(w.engine.machine)} &mdash; ${esc(w.engine.summary)}</div>` : ""}
+          ${adversaryText(w.adversary)}
           <div class="m">${esc(w.waiting_for)}</div></div>
         <div class="r" style="white-space:nowrap">${pd.may_decide && w.ready_for_you
           ? `<button class="btn primary" data-imp-approve="${esc(w.order_id)}">Approve</button> <button class="btn" data-imp-back="${esc(w.order_id)}">Send back</button>`
-          : `<span class="badge">${w.ready_for_you ? "waiting for the master" : "waiting for the review engine"}</span>`}</div>
+          : `<span class="badge">${w.ready_for_you ? "waiting for the master" : "waiting for the review engine"}</span>`}
+          ${pd.may_decide && w.adversary_blocked
+            ? `<div style="margin-top:6px"><button class="btn" data-adv-override="${esc(w.order_id)}" data-adv-trigger="pre-done" data-adv-revision="${w.revision}" data-adv-finding="${esc(w.adversary && w.adversary.digest ? w.adversary.digest : "none")}">Override the Block</button></div>`
+            : ""}</div>
       </div>`).join("");
   return `
     <div class="panel" style="margin-bottom:18px">
@@ -1151,6 +1273,31 @@ function wireApprovals() {
       const notes = window.prompt("What should change?");
       if (notes && notes.trim()) decide(b, b.dataset.impBack, false, notes.trim());
     }));
+  wireOverrides(msg);
+}
+
+/* The master goes ahead despite the adversary's Block: a signed override, never a quiet
+   dismissal. `report` shows what happened; the page is redrawn on success. */
+function wireOverrides(report) {
+  document.querySelectorAll("[data-adv-override]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      const reason = window.prompt("Why go ahead despite the adversary's Block? (kept in the signed override)");
+      if (reason === null) return;
+      b.disabled = true;
+      try {
+        const r = await api("/api/adversary/override", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            subject: b.dataset.advOverride, trigger: b.dataset.advTrigger,
+            revision: b.dataset.advRevision ? Number(b.dataset.advRevision) : null,
+            reason: reason.trim() || null,
+            finding: b.dataset.advFinding || "",
+          }),
+        });
+        report(`${r.subject} r${r.revision}: Block overridden by ${r.overridden_by}.`);
+        await render();
+      } catch (err) { report(err.message || err); b.disabled = false; }
+    }));
 }
 
 function wirePolicy() {
@@ -1168,12 +1315,80 @@ function wirePolicy() {
       await render();
     } catch (err) { msg(err.message || err); btn.disabled = false; }
   };
+  /* The roles ticked for subscriptions, as the page shows them now. */
+  const subsRoles = () => Array.from(document.querySelectorAll("[data-ep-subs]"))
+    .filter((c) => c.checked).map((c) => c.dataset.epSubs);
+  /* The team preset as it would be signed with those roles, with its reasons and warnings. */
+  const showTeam = async () => {
+    const box = $("#ep-team-box");
+    if (!box) return;
+    try {
+      const t = await api(`/api/engine-policy/team?subscription_roles=${encodeURIComponent(subsRoles().join(","))}`);
+      const warn = (t.warnings || []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+      box.innerHTML = `<div class="k">Team preset &mdash; nothing is signed until you accept</div>
+        <div style="margin-top:4px">${(t.describe || []).map(esc).join("<br>")}</div>
+        <ul style="margin:6px 0 0 18px">${(t.reasons || []).map((r) => `<li>${esc(r)}</li>`).join("")}</ul>
+        ${warn}
+        ${lastPolicy && $("#ep-settings") ? `<div style="margin-top:8px"><button class="btn primary" id="ep-team-accept">Accept the team preset</button></div>` : ""}`;
+      const go = $("#ep-team-accept");
+      if (go) go.addEventListener("click", async () => {
+        go.disabled = true;
+        try {
+          const r = await api("/api/engine-policy/team", {
+            method: "POST", headers: { "content-type": "application/json" },
+            body: JSON.stringify({ subscription_roles: subsRoles(), all: all() }),
+          });
+          msg(`Team preset signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
+          await render();
+        } catch (err) { msg(err.message || err); go.disabled = false; }
+      });
+    } catch (err) { msg(err.message || err); }
+  };
+  const teamBtn = $("#ep-team");
+  if (teamBtn) teamBtn.addEventListener("click", showTeam);
+  /* Ticking a role for subscriptions shows at once what it would and would not use. */
+  document.querySelectorAll("[data-ep-subs]").forEach((c) => c.addEventListener("change", async () => {
+    const warn = $("#ep-subs-warn");
+    if (!warn) return;
+    try {
+      const t = await api(`/api/engine-policy/team?subscription_roles=${encodeURIComponent(subsRoles().join(","))}`);
+      warn.innerHTML = (t.warnings || []).map((w) => `<div><span class="badge warn">${esc(w)}</span></div>`).join("");
+    } catch (_) { /* the warning is advice; saving still checks */ }
+  }));
+  const settingsBtn = $("#ep-settings");
+  if (settingsBtn) settingsBtn.addEventListener("click", async () => {
+    /* Only what changed: a role left at its default effort stays unset in the policy. */
+    const effort = {};
+    document.querySelectorAll("[data-ep-effort]").forEach((s) => {
+      const r = lastRoles[s.dataset.epEffort] || {};
+      if (s.value !== r.effort || r.effort_set) effort[s.dataset.epEffort] = s.value;
+    });
+    const width = {};
+    document.querySelectorAll("[data-ep-width]").forEach((i) => {
+      const r = lastRoles[i.dataset.epWidth] || {};
+      const value = i.value.trim() === "" ? null : Number(i.value);
+      if (value !== null && (!Number.isInteger(value) || value < 1 || value > 255)) { width.bad = true; return; }
+      if (value !== (r.width == null ? null : r.width)) width[i.dataset.epWidth] = value;
+    });
+    if (width.bad) { msg("Width is a whole number from 1 to 255, or empty for no cap."); return; }
+    settingsBtn.disabled = true;
+    try {
+      const r = await api("/api/engine-policy/settings", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ effort, width, subscription_roles: subsRoles(), all: all() }),
+      });
+      msg(`Signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
+      await render();
+    } catch (err) { msg(err.message || err); settingsBtn.disabled = false; }
+  });
   const chooseBtn = $("#ep-choose");
   if (chooseBtn) chooseBtn.addEventListener("click", () => {
     const improve = $("#ep-improve").value || null;
     const review = $("#ep-review").value || null;
-    if (!improve && !review) { msg("Pick an improvement engine or a review engine."); return; }
-    choose(chooseBtn, { improve, review });
+    const adversary_engine = ($("#ep-adversary") && $("#ep-adversary").value) || null;
+    const adversary = ($("#ep-adv-mode") && $("#ep-adv-mode").value) || null;
+    if (!improve && !review && !adversary_engine && !adversary) { msg("Pick an engine or an adversary mode."); return; }
+    choose(chooseBtn, { improve, review, adversary_engine, adversary });
   });
   const autoMerge = $("#ep-automerge");
   if (autoMerge && !autoMerge.disabled) autoMerge.addEventListener("change", () =>
@@ -1208,11 +1423,20 @@ function wirePolicy() {
     save.disabled = true;
     const prefer = list("#ep-prefer");
     const policy = {
-      prefer: prefer.length ? Object.fromEntries(POLICY_ROLES.map((r) => [r, prefer])) : {},
+      prefer: prefer.length ? Object.fromEntries(POLICY_BUILD_ROLES.map((r) => [r, prefer])) : {},
       never: list("#ep-never"),
       where: list("#ep-where"),
       protect_subscriptions: !!($("#ep-protect") && $("#ep-protect").checked),
     };
+    // Signing this edit must not quietly undo the adversary's own choices.
+    if ((lastPolicy.prefer || {}).adversary) policy.prefer.adversary = lastPolicy.prefer.adversary;
+    if (lastPolicy.adversary) policy.adversary = lastPolicy.adversary;
+    if (lastPolicy.adversary_never) policy.adversary_never = lastPolicy.adversary_never;
+    if (lastPolicy.adversary_agents) policy.adversary_agents = lastPolicy.adversary_agents;
+    if ((lastPolicy.caps_usd || {}).adversary !== undefined) {
+      policy.caps_usd = Object.assign({}, policy.caps_usd, { adversary: lastPolicy.caps_usd.adversary });
+    }
+    if (lastPolicy.auto_merge) policy.auto_merge = lastPolicy.auto_merge;
     try {
       const r = await api("/api/engine-policy", {
         method: "POST", headers: { "content-type": "application/json" },
@@ -1794,6 +2018,112 @@ pages.fleet = async () => {
     </div>`;
 };
 
+// A JSON shape written the way a person reads it: the type first, then each property on
+// its own line, `*` marking the ones that are required.
+function shapeText(shape, indent) {
+  if (!shape) return "any";
+  indent = indent || "";
+  const kind = shape.type || "any";
+  const allowed = (shape.enum || []).length ? ` (one of ${shape.enum.map((v) => JSON.stringify(v)).join(", ")})` : "";
+  if (kind === "array") return `array of ${shapeText(shape.items, indent)}${allowed}`;
+  const props = Object.entries(shape.properties || {});
+  if (kind !== "object" || !props.length) return `${kind}${allowed}`;
+  const need = new Set(shape.required || []);
+  const pad = indent + "  ";
+  return `object${allowed} {\n${props.map(([k, v]) =>
+    `${pad}${k}${need.has(k) ? "*" : ""}: ${shapeText(v, pad)}`).join("\n")}\n${indent}}`;
+}
+
+function contractOrders(label, orders) {
+  if (!orders.length) return `<dt>${esc(label)}</dt><dd style="color:var(--faint)">no order yet</dd>`;
+  return `<dt>${esc(label)}</dt><dd>${orders.map((o) => {
+    const word = String((o.state || {}).status || "").replace(/_/g, " ");
+    const held = (o.holds || []).map((h) => `<div style="color:var(--faint)">${esc(h.agent)} is holding off: ${esc(h.reason)}</div>`).join("");
+    return `<div><span class="mono">${esc(o.id)}</span> <span class="badge">${esc(word)}</span>${o.holder ? ` <span class="badge">${esc(o.holder)}</span>` : ""}${(o.touches || []).length ? ` <span class="mono" style="color:var(--faint)">${esc(o.touches.join(", "))}</span>` : ""}${held}</div>`;
+  }).join("")}</dd>`;
+}
+
+// Interface contracts: the request and response two orders agree on, frozen by the master.
+// Proposed contracts wait here for the Lock button, which only the signed-in master gets;
+// a locked contract never changes, and a change is a new version.
+pages.contracts = async () => {
+  const d = await api("/api/contracts");
+  const all = d.contracts || [];
+  const list = all.filter((c) => matches(`${c.reference} ${c.description} ${c.status} ${c.proposed_by}`));
+  const pending = all.filter((c) => c.status === "proposed").length;
+  const tone = { proposed: "warn", locked: "good", rejected: "bad" };
+  return `
+    <div class="head">
+      <div><h1>Contracts</h1><p>The shapes orders agree on before they start. A worker will not begin an order whose contract is not locked${d.master ? `; ${esc(d.master)} locks them` : ""}.</p></div>
+    </div>
+    ${pending ? `<div class="notice"><b>${pending} waiting for a lock</b><div>${d.may_decide
+      ? "Read the shapes below, then lock or reject each one."
+      : "Only the master can lock a contract."}</div></div>` : ""}
+    <div class="panel">${list.length ? list.map((c) => `
+      <div class="row" style="display:block">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="t mono">${esc(c.reference)}</span>
+          <span class="badge ${tone[c.status] || ""}">${esc(c.status)}</span>
+          <span style="color:var(--faint)">proposed by ${esc(c.proposed_by)} ${esc(ago(c.proposed_at))}${c.locked_by ? `, locked by ${esc(c.locked_by)} ${esc(ago(c.locked_at))}` : ""}</span>
+          ${d.may_decide && c.status === "proposed" ? `
+            <span style="margin-left:auto">
+              <button class="btn" data-contract-lock="${esc(c.reference)}" data-digest="${esc(c.digest)}">Lock</button>
+              <button class="btn" data-contract-reject="${esc(c.reference)}">Reject</button>
+            </span>` : ""}
+        </div>
+        ${c.description ? `<p>${esc(c.description)}</p>` : ""}
+        ${(c.adversary || []).map(adversaryText).join("")}
+        ${d.may_decide && c.status === "proposed" && c.lock_refusal
+          ? `<div style="margin-top:6px"><button class="btn" data-contract-override="${esc(c.reference)}" data-digest="${esc(c.digest)}" data-finding="${esc(c.finding_digest)}">${c.finding_digest === "none" ? "No adversary has read it - lock anyway" : "Override the Block and lock"}</button>
+              <span class="s" style="color:var(--dim)">${esc(c.lock_refusal)}</span></div>`
+          : ""}
+        <dl class="kv">
+          ${c.request ? `<dt>Request</dt><dd><pre class="mono">${esc(shapeText(c.request))}</pre></dd>` : ""}
+          <dt>Response</dt><dd><pre class="mono">${esc(shapeText(c.response))}</pre></dd>
+          ${contractOrders("Provided by", c.providers || [])}
+          ${contractOrders("Consumed by", c.consumers || [])}
+        </dl>
+        <div class="contract-msg" style="color:var(--faint)"></div>
+      </div>`).join("") : `<div class="empty">No contract has been proposed. Propose one with <span class="mono">ferry contract propose &lt;file.json&gt;</span>.</div>`}</div>`;
+};
+
+function wireContracts() {
+  const decide = (attr, verb) => $$(`[${attr}]`).forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      // A lock names the contract as this page showed it; it is refused if that changed.
+      const opts = verb === "lock"
+        ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ digest: b.dataset.digest || "" }) }
+        : { method: "POST" };
+      await api(`/api/contracts/${encodeURIComponent(b.getAttribute(attr))}/${verb}`, opts);
+      await render();
+    } catch (err) {
+      const msg = b.closest(".row").querySelector(".contract-msg");
+      msg.textContent = String(err.message || err).slice(0, 200);
+      b.disabled = false;
+    }
+  }));
+  decide("data-contract-lock", "lock");
+  decide("data-contract-reject", "reject");
+  // Lock over the adversary's Block: the master signs the override and the lock together.
+  $$("[data-contract-override]").forEach((b) => b.addEventListener("click", async () => {
+    const reason = window.prompt("Why lock despite the adversary's Block? (kept in the signed override)");
+    if (reason === null) return;
+    b.disabled = true;
+    try {
+      await api(`/api/contracts/${encodeURIComponent(b.getAttribute("data-contract-override"))}/lock`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ override: true, reason: reason.trim() || null, digest: b.dataset.digest || "", finding: b.dataset.finding || "" }),
+      });
+      await render();
+    } catch (err) {
+      const msg = b.closest(".row").querySelector(".contract-msg");
+      msg.textContent = String(err.message || err).slice(0, 200);
+      b.disabled = false;
+    }
+  }));
+}
+
 // The vault is the one page with no backend behind it. It says so, and shows
 // nothing — an invented count here would be a lie told in the operator's own
 // dashboard, which is the last place one belongs.
@@ -2235,6 +2565,7 @@ async function render() {
   wireRelease();
   wireTeammates();
   wireAgents();
+  wireContracts();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {

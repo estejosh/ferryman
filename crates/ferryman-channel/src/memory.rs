@@ -374,6 +374,9 @@ pub fn append_agent_profile(
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
+    // Append and sign as one step: a second order finishing at the same moment must sign
+    // a profile that has both lines in it.
+    let _lock = crate::own_files_lock();
     {
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()

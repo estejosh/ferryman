@@ -1,5 +1,154 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Typed result schemas.** `--result-schema <file.json>` gives an order a shape its result
+  must have: `type` (string, number, integer, boolean, array, object, null, any),
+  `required`, `properties`, `items` and `enum`, nested. Violations are path-qualified
+  (`result.user.id: expected integer, got string`) and go through the existing contract
+  violation path, so they block acceptance. Orders without a schema are unchanged.
+- **Interface contracts.** A signed `contracts/<name>@<version>.json` that any member can
+  propose and the master (or an `improve` delegate) locks with a separate signature.
+  A locked contract never changes - a change is a new version - and a forged, unsigned or
+  edited-after-lock file is ignored. Orders say `--interface name@version:provides|consumes`;
+  a worker will not start one whose contract is missing or not locked and records why
+  ("waiting for contract user-api@1 to be locked"). Consumers get the locked shapes in
+  their engine prompt; a provider's result is validated against the locked response. The
+  master is asked once, however often it is proposed, with Lock / Reject buttons in
+  Telegram. `ferry contract propose | lock | reject | show | list`; a Contracts page on the
+  dashboard with status, shapes, the orders on each side and a Lock button for the master.
+  `interface::pending_locks` and `interface::orders_for_interface` expose what is waiting
+  to be locked, and which orders depend on it, to a reviewer.
+- **File-overlap locks.** `--touches <glob>...` and `--allow-overlap` on an order.
+  Issuing warns about overlapping open or claimed orders, the dashboard marks them, and a
+  worker will not claim an order that overlaps one currently claimed unless
+  `--allow-overlap`, recording why and moving on. After the commit the result records
+  `touched_files`, with a reviewer note (not a refutation) for any outside the declared
+  globs.
+- **Adversary gates.** A separate model challenges the builders' work at three moments:
+  before an interface contract locks, when the same order fails twice, and before an
+  improvement is called done. New engine-policy role `adversary` (old signed policies
+  still verify) and mode `--adversary off|advisory|blocking` (default `advisory`).
+  It is never the builder's own engine unless that is the only one allowed (then the
+  finding says `same engine`), prefers a different model family, and `recommend()` picks
+  one with a reason. Findings are signed files in `<channel>/adversary/`, one per subject,
+  revision and moment, and the cost goes in the ledger; unparseable output is a `concern`,
+  never a silent pass. A deterministic test-tampering scan of the order branch's diff runs
+  before the adversary at the second failure, and a Block or any High hit sends the task
+  back with the finding in the next attempt's prompt (the master is asked once). In
+  `blocking` mode a Block stops Lock, the review engine's key and auto-merge until the
+  master signs an override. `ferry adversary show | list | override | check`; findings in
+  `ferry improve status/report`, the review and contract output, the dashboard (policy,
+  review cards, Contracts, `GET /api/adversary`, `POST /api/adversary/override`) and
+  Telegram cards (an Override button only for a Block, under the `improve` / `review`
+  delegation scopes). See docs/ENGINE_SETUP.md.
+- **Plan on high, build on medium, swarm the cheap work.**
+  - *Effort per role.* The engine policy gains `effort` (defaults: plan, review and
+    adversary high, build medium, chore low). `{effort}` is filled in an engine's `args`
+    like `{model}`; `engine.<name>.effort_args` adds arguments per level; an HTTP engine
+    gets a `reasoning_effort` field only with `supports_effort = "true"`. The effort used
+    is recorded on each step beside engine, model and machine. `ferry engines policy set
+    --effort role=level`.
+  - *Model size class.* `engine.<name>.class = small|medium|large`; without one, a tested
+    guess from the model name. Shown by `ferry engines`, published in the signed
+    inventory, usable as a `class:small` selector.
+  - *Swarm width.* `max_parallel` in `agent.toml` (default 1, exactly as before): a work
+    pass claims up to that many orders and runs them at once, each in its own worktree,
+    never two with overlapping `touches`, and honouring contract and adversary holds. The
+    policy's `width` caps how many improvement orders of a role the fleet has claimed at
+    once, counted from current non-stale claims (`--width role=n`). The engine ledger,
+    step log, agent profiles and worktree creation are serialised so concurrent orders
+    lose no update; an engine that reports quota mid-swarm lets in-flight orders finish and
+    new claims skip it.
+  - *Team preset.* `ferry engines policy team [PROJECT | --all] [--accept]` proposes, from
+    the fleet's signed inventories and with a reason per choice, a large judge to plan and
+    review (high effort, width 1), mid-size engines to build (medium, width 3), the
+    smallest to do chores (low, width 4) and a large judge of another family than the top
+    builder as the advisory adversary. The dashboard's Engine policy panel and the Telegram
+    Engines menu show it with an Accept button; the dashboard also has effort and width per
+    role (`POST /api/engine-policy/team`, `/settings`).
+  - *Subscriptions stay off.* New `subscription_roles` (`--allow-subscriptions-for
+    build,chore`) lets a role use a subscription, and only an engine with a
+    `weekly_requests` cap; anything else stays blocked, with a warning on every surface.
+    Old signed policies still verify. See docs/ENGINE_SETUP.md, "Team preset and swarms".
+
+### Fixed
+
+- **A result's commit can no longer be an argument to git.** The adversary's diff scan,
+  auto-merge and the worktree helpers took `worktree_head` (and other peer- or
+  channel-derived revisions) straight into `git fetch`, `git diff` and `git merge-base`,
+  where a value such as `--upload-pack=<command>` or `--output=<file>` is an option. Only a
+  full object id (40 or 64 lowercase hex digits) is accepted now, verified to be a commit
+  here, and it must be the order branch's tip or descend from the base the order started
+  from; anything else is an Unscanned concern and nothing is fetched. Every git call that
+  takes a revision, ref or remote derived from synced data puts `--end-of-options` before
+  it (or refuses a value that starts with `-`). A gated order with no readable commit in a
+  git workspace is an Unscanned concern, not a clean pass, and a branch read without a
+  named commit is fetched first so a stale local tip is not read instead.
+- **An unreadable adversary reply is no longer a finding.** A reply with no readable
+  verdict used to be recorded as a signed Concern, which is an eligible word that satisfies
+  `blocking` mode for a revision the adversary never judged; and "the last JSON object
+  wins" let a `{"verdict": "pass"}` echoed from a diff decide. Only the one fenced `json`
+  block at the very end of the reply, with a `verdict` and `findings`, is read; anything
+  else records nothing and is a failure the next pass retries (the next engine is asked
+  first). The deterministic tamper-scan floor now also counts at the pre-done moment, as a
+  Block only, so a diff that deletes tests blocks the review key even when no engine could
+  be asked.
+- **A finding counts for the result it judged, not for a revision number.** A contract's
+  "round" is an ordinal over its verified provider results, so deleting an older result
+  renumbered the rounds and an old Pass at round 2 then covered a different, newer result.
+  A finding now carries a signed `result_digest` (a hash of the result's order, revision
+  and signature); a contract-lock or pre-done finding counts only when it names the result
+  that is at that revision now. Rounds are for display and file names only.
+- **The adversary's policy is the master's alone.** Its mode, engine preferences, `never`,
+  allowed agents and weekly cap used to live in `ENGINE_POLICY`, which a delegate holding
+  `improve` can sign - so the one who could be checked could switch the check off, name
+  its judge, starve it with a `never`, `where` or a $0 cap, or have its findings ignored.
+  They are now a separate `ADVERSARY_POLICY` file honoured only under the master's own
+  signature (no delegation), with the same `seq`, per-machine high-water mark and
+  last-known-good protection as the engine policy and its own rollback question. An
+  `ENGINE_POLICY` file's adversary fields are dropped on reading, the engine policy's
+  `never`, `where` and caps no longer apply to the adversary, and the review pass runs the
+  adversary before the `where` check. `ferry engines policy set` gains
+  `--adversary-agents` and `--adversary-never` (they, `--adversary` and `--role adversary`
+  write the master's file); the dashboard shows the terms to everyone and changes them
+  only for the master; Telegram shows them and never signs them. Putting the engine policy
+  back to auto leaves the adversary's policy as signed.
+- **Any member with an inventory is no longer an adversary.** A finding counted from any
+  signer that was not the builder and had published an engine inventory listing the engine
+  it named, and one adversary's Pass stopped every other adversary from running - so a
+  member the master never meant to give a vote could satisfy `blocking`. A signer now
+  counts only when the master's adversary policy allows it: it is one of the named
+  `adversary_agents`, or - with no list - its signed inventory lists an engine matching the
+  adversary's preference selectors and not named by the adversary's own `never` (so the
+  trust is "any member running an allowed adversary engine"; documented in
+  `docs/ENGINE_SETUP.md`). The not-the-builder rule stands, and the deterministic tamper
+  scan stays a floor anyone can record, as a Block only. Every eligible adversary now runs
+  its own pass - an agent is settled only by its own finding - and a Block from any of them
+  dominates.
+- **A mixed fleet says what it trusts.** `docs/ENGINE_SETUP.md` has a new section, "Mixed
+  fleets and what a fresh machine trusts": rollback protection is per machine, so a fresh
+  machine takes the first valid file it sees; a v0.5.17 machine reads only the v1 view, has
+  no memory and never runs or waits for the adversary (so `blocking` binds only machines on
+  this release); a policy signed by v0.5.17 has no sequence number. `ferry engines policy
+  show` (and `--json`) and the dashboard now warn when the policy in force is such a
+  v1-only file while a member whose inventory carries a v2 signature is on the roster, and
+  signing the same policy again now upgrades a v1-only file instead of reporting "already
+  so".
+- **The adversary's files cannot collide, and its displays are not capped.** A finding is
+  now `adversary/<subject>-r<revision>-<moment>/<signer>.finding.json`, a master's override
+  `<signer>.override.json` and a waiver `waiver.json` in the same directory; a signer's name
+  must be a path-safe component with no `.`, so no name can be mistaken for another kind of
+  file (the old layout reserved the word `override` by hand). `ferry adversary list`, the
+  dashboard, the Telegram view, the summary and the weekly report take their subjects from a
+  listing of those directory names rather than from the 500 newest findings, so an old
+  Block cannot fall off a display. A worker keeps off the files of a sent-back order only
+  while its rework is in play (a live claim, or a verdict newer than the stale window), so
+  an abandoned rework no longer holds them for ever. The file-overlap matcher refuses a glob
+  or path over 1024 bytes: it overlaps everything and matches nothing.
+
 ## v0.5.17 - 2026-09-29
 
 You choose which model does self-improve and on which machine, fm recommends one that spares your subscriptions, and nothing goes live without both an engine review and your approval. OmniRoute works as an engine.

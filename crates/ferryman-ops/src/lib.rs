@@ -15,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod adversary;
 pub mod agent;
 pub mod console;
 pub mod doctor;

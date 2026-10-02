@@ -274,6 +274,56 @@ machine name, which the roster will not recognise, and every reader will report
 Addressed orders (`--to`) have nothing to race over. Open ones are settled by oldest
 claim, computed identically on every machine, so nobody has to be the authority.
 
+### Two orders that must agree: interface contracts and file locks
+
+When one order builds something another order uses (an API and the screen that calls it),
+agree the shape first, in a signed file, instead of hoping both sides guessed the same.
+The master locks it; neither side starts until then; the provider's result is checked
+against it. A worked example - the backend provides `user-api@1`, the frontend consumes
+it:
+
+```sh
+# 1. Anyone on the channel proposes the contract. user-api.json holds
+#    {"name": "user-api", "version": "1", "description": "...", "response": <shape>}
+ferry contract propose user-api.json --agent orchestrator
+# a shape: {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer"},
+#           "email": {"type": "string"}, "role": {"enum": ["admin", "member"]}}}
+
+# 2. Issue both orders now. They wait, and say why ("waiting for contract user-api@1
+#    to be locked") in `ferry channel tasks` and on the Contracts page.
+ferry channel order --agent orchestrator --id t-api --to fang \
+  --task "implement GET /users/{id}" \
+  --interface user-api@1:provides --touches 'src/api/**' 'tests/api/**'
+ferry channel order --agent orchestrator --id t-ui --to wisp \
+  --task "show the user on the profile page" \
+  --interface user-api@1:consumes --touches 'web/src/profile/**'
+
+# 3. The master locks it: the Contracts page in the dashboard, the Lock button in
+#    Telegram (one question, however many times it is proposed), or
+ferry contract lock user-api@1                  # shows the digest and asks you to confirm
+ferry contract lock user-api@1 --digest 89abcdef # or name the digest `ferry contract show` printed
+```
+
+A lock is bound to the contract the master looked at: if the proposal was replaced since,
+the lock is refused ("the contract changed since you looked") and nothing is locked.
+
+Once locked, the consumer's engine prompt carries the locked shapes, and the provider's
+result is held to the response shape - `result.user.id: expected integer, got string` is
+a contract violation, which blocks acceptance like any other. A locked contract is
+immutable; a change is `user-api@2`. A contract whose signature, lock or contents do not
+verify (forged, unsigned, edited after locking) is ignored, so the orders keep waiting.
+
+`--touches` lists the repo-relative globs an order expects to edit. Issuing an order whose
+globs overlap an open or claimed one prints a warning, the dashboard marks both cards, and
+a worker will not claim an order while an overlapping one is being worked on (it records
+why and takes other work) unless the order says `--allow-overlap`. The comparison is
+conservative and on whole path segments: `src/api/**` overlaps `src/api/x.rs` but not
+`src/apiv2/x.rs`. A worker keeps off a sent-back order's files only while someone is on
+the rework (a live claim, or a verdict newer than the stale window). A glob or path over 1024
+bytes counts as overlapping everything and matching nothing. After the commit, the result records `touched_files`, and a reviewer note
+says so when any fall outside the declared globs - a note, never a refutation. A single
+order can also carry its own result shape with `--result-schema file.json`.
+
 ## Checking your work
 
 ```sh

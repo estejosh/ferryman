@@ -124,7 +124,18 @@ pub struct GitRecoveryTarget {
     pub work_root: PathBuf,
 }
 impl GitRecoveryTarget {
+    /// The repository and branch come from project policy text; neither may be read by
+    /// git as an option (`--upload-pack=...` as a "repository").
+    fn check_arguments(&self) -> Result<()> {
+        for (what, value) in [("repository", &self.repository), ("branch", &self.branch)] {
+            if value.trim().is_empty() || value.starts_with('-') || value.contains(['\0', '\n']) {
+                bail!("the private Git {what} {value:?} is not something to hand to git");
+            }
+        }
+        Ok(())
+    }
     async fn checkout(&self) -> Result<PathBuf> {
+        self.check_arguments()?;
         tokio::fs::create_dir_all(&self.work_root).await?;
         let directory = self.work_root.join(Uuid::new_v4().to_string());
         git(
@@ -189,6 +200,7 @@ impl RecoveryTarget for GitRecoveryTarget {
         "private_git"
     }
     async fn availability(&self) -> Result<()> {
+        self.check_arguments()?;
         git(&self.work_root, &["ls-remote", &self.repository])
             .await
             .map(|_| ())
@@ -262,5 +274,26 @@ mod tests {
             .unwrap();
         target.verify_remote_hash(&receipt).await.unwrap();
         assert_eq!(target.download_pack(&hash).await.unwrap(), bundle);
+    }
+
+    #[tokio::test]
+    async fn a_repository_or_branch_that_git_would_read_as_an_option_is_refused() {
+        let root = std::env::temp_dir().join(format!("bridge-git-option-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("pwned");
+        let evil = GitRecoveryTarget {
+            repository: format!("--upload-pack=touch {}", marker.display()),
+            branch: "bridge/recovery".into(),
+            work_root: root.join("work"),
+        };
+        assert!(evil.availability().await.is_err());
+        assert!(evil.checkout().await.is_err());
+        let evil_branch = GitRecoveryTarget {
+            repository: root.join("r.git").to_string_lossy().into_owned(),
+            branch: "--orphan=x".into(),
+            work_root: root.join("work"),
+        };
+        assert!(evil_branch.checkout().await.is_err());
+        assert!(!marker.exists());
     }
 }

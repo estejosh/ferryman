@@ -739,6 +739,10 @@ pub struct EngineReport {
     /// `None` from a worker older than the engine policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<EngineBilling>,
+    /// The engine's size class, `small`, `medium` or `large`: what its operator declared,
+    /// else guessed from its model's name. `None` from a worker older than classes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 /// How one engine is billed, as far as the worker running it can tell. Never a
@@ -752,6 +756,10 @@ pub struct EngineBilling {
     /// A weekly request or dollar cap is set in agent.toml.
     #[serde(default)]
     pub capped: bool,
+    /// The weekly request cap, when agent.toml sets one. Published because a project's
+    /// `subscription_roles` honours a subscription only when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_requests: Option<u64>,
     /// The ISO week the counts are for.
     #[serde(default)]
     pub week: String,
@@ -847,13 +855,64 @@ pub struct EngineInventory {
     pub engines: Vec<EngineReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
+    /// Signs the v1 view of the inventory: the engines without the fields v0.5.17 did not
+    /// know (`class`, `billing.weekly_requests`). That is exactly what an older verifier
+    /// recomputes after it deserializes and drops what it does not know, so a new
+    /// inventory still verifies on an old peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Signs the whole inventory, new fields included. A verifier that knows it requires
+    /// it whenever a v2-only field is present, so those fields cannot be forged or
+    /// stripped-and-replaced under the v1 signature alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_v2: Option<String>,
 }
 
+impl EngineInventory {
+    /// Whether any field a v0.5.17 verifier would drop is set.
+    fn has_v2_fields(&self) -> bool {
+        self.engines.iter().any(|e| {
+            e.class.is_some()
+                || e.billing
+                    .as_ref()
+                    .is_some_and(|b| b.weekly_requests.is_some())
+        })
+    }
+}
+
+/// The engines as v0.5.17 serializes them: without `class` and `weekly_requests`.
+fn engines_v1_json(engines: &[EngineReport]) -> String {
+    let mut value = serde_json::to_value(engines).unwrap_or_default();
+    if let Some(list) = value.as_array_mut() {
+        for engine in list {
+            let Some(engine) = engine.as_object_mut() else {
+                continue;
+            };
+            engine.remove("class");
+            if let Some(billing) = engine.get_mut("billing").and_then(|b| b.as_object_mut()) {
+                billing.remove("weekly_requests");
+            }
+        }
+    }
+    serde_jcs::to_string(&value).unwrap_or_default()
+}
+
+/// What `signature` covers: byte for byte what v0.5.17 signed.
 fn engines_payload(inventory: &EngineInventory) -> String {
     format!(
         "ferryman-engines-v1\n{}\n{}\n{}\n{}\n{}",
+        inventory.agent,
+        inventory.machine,
+        inventory.updated_at.to_rfc3339(),
+        inventory.ferry_version,
+        engines_v1_json(&inventory.engines),
+    )
+}
+
+/// What `signature_v2` covers: every field of every engine.
+fn engines_payload_v2(inventory: &EngineInventory) -> String {
+    format!(
+        "ferryman-engines-v2\n{}\n{}\n{}\n{}\n{}",
         inventory.agent,
         inventory.machine,
         inventory.updated_at.to_rfc3339(),
@@ -872,13 +931,30 @@ fn engines_path(route: &ProjectRoute, agent: &str) -> PathBuf {
 /// Who says this is what their worker can run, checkably.
 #[must_use]
 pub fn verify_engines(inventory: &EngineInventory, roster: &[AgentRoute]) -> SignatureCheck {
-    verify_as(
+    let v1 = verify_as(
         &inventory.agent,
         inventory.signed_by.as_ref(),
         inventory.signature.as_ref(),
         &engines_payload(inventory),
         roster,
-    )
+    );
+    if !inventory.has_v2_fields() {
+        return v1;
+    }
+    // A v2-only field is present: the v1 signature does not cover it, so it counts only
+    // with a valid v2 signature over the whole inventory.
+    let v2 = verify_as(
+        &inventory.agent,
+        inventory.signed_by.as_ref(),
+        inventory.signature_v2.as_ref(),
+        &engines_payload_v2(inventory),
+        roster,
+    );
+    if v1 == SignatureCheck::Valid && v2 == SignatureCheck::Valid {
+        SignatureCheck::Valid
+    } else {
+        SignatureCheck::Invalid
+    }
 }
 
 /// Publish this worker's engines, signed. Returns whether anything was written.
@@ -929,8 +1005,10 @@ pub fn refresh_engines(
         engines,
         signed_by: Some(agent.to_string()),
         signature: None,
+        signature_v2: None,
     };
     inventory.signature = Some(identity.sign_bytes(engines_payload(&inventory).as_bytes()));
+    inventory.signature_v2 = Some(identity.sign_bytes(engines_payload_v2(&inventory).as_bytes()));
     write_task_file(&path, &inventory)?;
     Ok(true)
 }
@@ -1051,6 +1129,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         by.sign_order(&mut order);
         issue_order(route, &order).unwrap();
@@ -1418,6 +1499,7 @@ mod tests {
             checked_at: Some(Utc::now()),
             trust: None,
             billing: None,
+            class: None,
         }
     }
 
@@ -1522,5 +1604,227 @@ mod tests {
             verify_engines(&forged, &route.agents),
             SignatureCheck::Invalid
         );
+    }
+
+    // The shapes v0.5.17 had, copied here so the test does not follow the live structs.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldEngineBilling {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+        #[serde(default)]
+        capped: bool,
+        #[serde(default)]
+        week: String,
+        #[serde(default)]
+        requests: u64,
+        #[serde(default)]
+        spend_usd: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        flag: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        route: Vec<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldEngineReport {
+        name: String,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        tier: String,
+        paid: String,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        balance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checked_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trust: Option<EngineTrust>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        billing: Option<OldEngineBilling>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldEngineInventory {
+        agent: String,
+        machine: String,
+        updated_at: DateTime<Utc>,
+        ferry_version: String,
+        engines: Vec<OldEngineReport>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    }
+
+    /// What a v0.5.17 peer does with an engines file: read it into its own struct, drop
+    /// what it does not know, and check the signature over what it re-serializes.
+    fn old_peer_accepts(text: &str, roster: &[AgentRoute]) -> bool {
+        let Ok(old) = serde_json::from_str::<OldEngineInventory>(text) else {
+            return false;
+        };
+        let payload = format!(
+            "ferryman-engines-v1\n{}\n{}\n{}\n{}\n{}",
+            old.agent,
+            old.machine,
+            old.updated_at.to_rfc3339(),
+            old.ferry_version,
+            serde_jcs::to_string(&old.engines).unwrap_or_default(),
+        );
+        verify_as(
+            &old.agent,
+            old.signed_by.as_ref(),
+            old.signature.as_ref(),
+            &payload,
+            roster,
+        ) == SignatureCheck::Valid
+    }
+
+    fn upgraded_engine() -> EngineReport {
+        let mut upgraded = engine("up");
+        upgraded.class = Some("small".into());
+        upgraded.billing = Some(EngineBilling {
+            host: Some("integrate.api.nvidia.com".into()),
+            capped: true,
+            weekly_requests: Some(500),
+            week: "2026-W40".into(),
+            requests: 12,
+            spend_usd: 0.25,
+            flag: None,
+            route: vec!["a/b".into()],
+        });
+        upgraded
+    }
+
+    #[test]
+    fn an_upgraded_inventory_still_verifies_on_a_v0_5_17_peer_and_its_new_fields_cannot_be_forged()
+    {
+        let (_t, route, fang, _, _) = channel();
+        refresh_engines(
+            &route,
+            &fang,
+            "grouchly",
+            "0.5.18",
+            vec![upgraded_engine()],
+            Utc::now(),
+        )
+        .unwrap();
+        let path = engines_path(&route, "fang");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"class\"") && text.contains("weekly_requests"));
+        assert!(
+            old_peer_accepts(&text, &route.agents),
+            "the old verifier must not skip an upgraded worker's inventory"
+        );
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        assert_eq!(listed[0].0.engines[0].class.as_deref(), Some("small"));
+
+        // Forging the new fields under the v1 signature alone does not verify.
+        let original: EngineInventory = serde_json::from_str(&text).unwrap();
+        let mut forged_class = original.clone();
+        forged_class.engines[0].class = Some("large".into());
+        assert_eq!(
+            verify_engines(&forged_class, &route.agents),
+            SignatureCheck::Invalid
+        );
+        let mut forged_cap = original.clone();
+        forged_cap.engines[0]
+            .billing
+            .as_mut()
+            .unwrap()
+            .weekly_requests = Some(1_000_000);
+        assert_eq!(
+            verify_engines(&forged_cap, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Dropping the v2 signature while keeping the fields does not verify either.
+        let mut stripped = original.clone();
+        stripped.signature_v2 = None;
+        assert_eq!(
+            verify_engines(&stripped, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Adding a field to a v1-only inventory is a forgery too.
+        let mut v1_only = original.clone();
+        v1_only.engines[0].class = None;
+        v1_only.engines[0].billing.as_mut().unwrap().weekly_requests = None;
+        v1_only.signature_v2 = None;
+        assert_eq!(
+            verify_engines(&v1_only, &route.agents),
+            SignatureCheck::Valid
+        );
+        v1_only.engines[0].class = Some("large".into());
+        assert_eq!(
+            verify_engines(&v1_only, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // The v1 view tampered (a state change) fails on the old peer and the new one.
+        let mut tampered = original;
+        tampered.engines[0].state = "exhausted".into();
+        assert!(!old_peer_accepts(
+            &serde_json::to_string(&tampered).unwrap(),
+            &route.agents
+        ));
+        assert_eq!(
+            verify_engines(&tampered, &route.agents),
+            SignatureCheck::Invalid
+        );
+    }
+
+    #[test]
+    fn an_old_workers_inventory_verifies_on_a_new_peer_without_a_v2_signature() {
+        let (_t, route, fang, _, _) = channel();
+        let engines = vec![OldEngineReport {
+            name: "nvidia".into(),
+            kind: "http".into(),
+            model: None,
+            tier: "build".into(),
+            paid: "free-tier".into(),
+            state: "up".into(),
+            until: None,
+            reason: None,
+            latency_ms: None,
+            balance: None,
+            checked_at: None,
+            trust: None,
+            billing: Some(OldEngineBilling {
+                host: None,
+                capped: false,
+                week: "2026-W39".into(),
+                requests: 1,
+                spend_usd: 0.0,
+                flag: None,
+                route: Vec::new(),
+            }),
+        }];
+        let mut old = OldEngineInventory {
+            agent: "fang".into(),
+            machine: "grouchly".into(),
+            updated_at: Utc::now(),
+            ferry_version: "0.5.17".into(),
+            engines,
+            signed_by: Some("fang".into()),
+            signature: None,
+        };
+        let payload = format!(
+            "ferryman-engines-v1\n{}\n{}\n{}\n{}\n{}",
+            old.agent,
+            old.machine,
+            old.updated_at.to_rfc3339(),
+            old.ferry_version,
+            serde_jcs::to_string(&old.engines).unwrap(),
+        );
+        old.signature = Some(fang.sign_bytes(payload.as_bytes()));
+        let new: EngineInventory =
+            serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert!(new.signature_v2.is_none());
+        assert_eq!(verify_engines(&new, &route.agents), SignatureCheck::Valid);
     }
 }

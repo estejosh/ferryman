@@ -77,6 +77,8 @@ const TAIL_CHARS: usize = 1200;
 const MAX_COMMITS: usize = 50;
 /// How many uncommitted paths are listed.
 const MAX_PATHS: usize = 50;
+/// How many committed paths are listed.
+const MAX_TOUCHED: usize = 200;
 
 /// What the evidence says about the claim.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +187,16 @@ pub struct Evidence {
     /// Paths changed during the run and not committed by the engine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uncommitted: Vec<String>,
+    /// Every path the worker's commit changed, read from git after the commit. Where
+    /// `uncommitted` is what the engine left lying about, this is what actually went
+    /// into the branch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touched_files: Vec<String>,
+    /// Things a reviewer may want to know that are NOT findings: nothing here counts for
+    /// or against the result, and [`judge`] never reads it. Today: that the commit
+    /// strayed outside the files its order said it would touch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checks: Vec<CheckRun>,
     /// Commit hashes the answer names, looked up in the workspace by the worker.
@@ -201,6 +213,18 @@ pub struct Evidence {
     pub reasons: Vec<String>,
 }
 impl Evidence {
+    /// Record what the commit changed, and note - for reviewers, not as a finding - when
+    /// some of it falls outside the globs the order declared in `touches`. An order that
+    /// declared nothing is never noted: it made no promise to stray from.
+    pub fn record_touched(&mut self, touches: &[String], changed: &[String]) {
+        if let Some(note) = crate::overlap::scope_note(touches, changed)
+            && !self.notes.contains(&note)
+        {
+            self.notes.push(note);
+        }
+        self.touched_files = changed.iter().take(MAX_TOUCHED).cloned().collect();
+    }
+
     /// Whether the run left anything behind: a commit, or a changed path.
     #[must_use]
     pub fn changed(&self) -> bool {
@@ -245,6 +269,9 @@ impl Evidence {
         let mut line = format!("{}: {}", self.status.as_str(), parts.join("; "));
         if !self.reasons.is_empty() {
             line.push_str(&format!(" - {}", self.reasons.join("; ")));
+        }
+        for note in &self.notes {
+            line.push_str(&format!(" [{note}]"));
         }
         line
     }
@@ -903,7 +930,16 @@ pub fn check_claimed_commits(evidence: &mut Evidence, dir: &Path, answer: &str) 
     evidence.claimed_commits = claimed_hashes(answer)
         .into_iter()
         .map(|hash| ClaimedCommit {
-            exists: git(dir, &["cat-file", "-e", &format!("{hash}^{{commit}}")]).is_some(),
+            exists: git(
+                dir,
+                &[
+                    "cat-file",
+                    "-e",
+                    crate::worktree::END_OF_OPTIONS,
+                    &format!("{hash}^{{commit}}"),
+                ],
+            )
+            .is_some(),
             hash,
         })
         .collect();
@@ -1832,6 +1868,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         by.sign_order(&mut order);
         crate::issue_order(route, &order).unwrap();
@@ -1959,5 +1998,57 @@ mod tests {
             SignatureCheck::Invalid
         );
         assert!(record(&route, &task, 9, &operator).unwrap().is_none());
+    }
+
+    #[test]
+    fn touched_files_are_recorded_and_a_stray_is_a_note_never_a_refutation() {
+        let touches = vec!["src/api/**".to_string()];
+        let changed = vec!["src/api/users.rs".to_string(), "docs/x.md".to_string()];
+        let mut evidence = Evidence {
+            git: true,
+            commits: vec!["abc1234 add users".into()],
+            ..Evidence::default()
+        };
+        judge(&mut evidence, &improvement(&[]), "added the endpoint");
+        let before = (evidence.status, evidence.reasons.clone());
+        assert_eq!(before.0, Status::Verified);
+
+        evidence.record_touched(&touches, &changed);
+        assert_eq!(evidence.touched_files, changed);
+        assert_eq!(evidence.notes.len(), 1);
+        assert!(
+            evidence.notes[0].contains("not a refutation"),
+            "{:?}",
+            evidence.notes
+        );
+        assert!(
+            evidence.notes[0].contains("docs/x.md"),
+            "{:?}",
+            evidence.notes
+        );
+        assert!(evidence.describe().contains("docs/x.md"));
+
+        // Judged again - which is what every reader does - nothing changes: the note is
+        // not an input to the verdict.
+        judge(&mut evidence, &improvement(&[]), "added the endpoint");
+        assert_eq!((evidence.status, evidence.reasons.clone()), before);
+
+        // Recording twice does not repeat the note, and staying inside adds none.
+        evidence.record_touched(&touches, &changed);
+        assert_eq!(evidence.notes.len(), 1);
+        let mut inside = Evidence::default();
+        inside.record_touched(&touches, &["src/api/a.rs".to_string()]);
+        assert!(inside.notes.is_empty());
+        assert_eq!(inside.touched_files, vec!["src/api/a.rs"]);
+        // An order that declared nothing is never noted.
+        let mut none = Evidence::default();
+        none.record_touched(&[], &changed);
+        assert!(none.notes.is_empty());
+
+        // And the new fields travel in the signed result without disturbing older readers.
+        let wire = serde_json::to_value(&evidence).unwrap();
+        assert!(wire["touched_files"].is_array() && wire["notes"].is_array());
+        let bare = serde_json::to_value(Evidence::default()).unwrap();
+        assert!(bare.get("touched_files").is_none() && bare.get("notes").is_none());
     }
 }
