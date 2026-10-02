@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+mod adversary;
 mod enginepolicy;
 mod gitanchor;
 mod license;
@@ -451,6 +452,16 @@ enum Command {
     Contract {
         #[command(subcommand)]
         command: ContractCommand,
+    },
+    /// The adversary: a second, different engine that challenges work at three moments -
+    /// before a contract locks, when an order has failed twice, and before an improvement
+    /// is called done. Read what it found, ask it now, or sign an override of a Block.
+    ///
+    /// Which engine challenges and whether a Block binds are in the engine policy:
+    /// `ferry engines policy set --role adversary --prefer deepseek --adversary blocking`.
+    Adversary {
+        #[command(subcommand)]
+        command: adversary::AdversaryCommand,
     },
     /// Server mode: messaging through a server. `channel` does the same with none.
     Communications {
@@ -977,11 +988,17 @@ enum ContractCommand {
         agent: Option<String>,
     },
     /// Lock a proposed contract. Only the master signs this.
+    ///
+    /// With the engine policy's `adversary = blocking`, a Block from the adversary stops the
+    /// lock until you sign an override: `--override "why"` records it and locks.
     Lock {
         /// `name@version`, e.g. user-api@1.
         reference: String,
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Lock despite the adversary's Block, and say why. Signed as the master.
+        #[arg(long = "override", value_name = "WHY")]
+        override_reason: Option<String>,
     },
     /// Decline a proposed contract. Only the master signs this.
     Reject {
@@ -2494,6 +2511,18 @@ fn improve_pending(as_json: bool) -> Result<()> {
                 if let Some(engine) = &waiting.engine {
                     println!("    review engine: {}", engine.describe());
                 }
+                if let Some(finding) = &waiting.adversary {
+                    for line in finding.lines(3) {
+                        println!("    {line}");
+                    }
+                    if waiting.adversary_blocked {
+                        println!(
+                            "    the review engine's key waits for you to override this Block: \
+                             ferry adversary override {} --workspace <project>",
+                            waiting.order_id
+                        );
+                    }
+                }
                 if waiting.ready_for_you {
                     println!(
                         "    ferry improve approve {} --project {}   |   ferry improve send-back {} --notes \"...\"",
@@ -2727,6 +2756,7 @@ fn improve_status(as_json: bool) -> Result<()> {
                     ferryman_channel::policy::setting(channel, project).as_ref()
                 ),
                 "who": who,
+                "adversary": route.as_ref().map(ferryman_ops::adversary::summary),
                 "spend": spend
                     .iter()
                     .map(|(engine, machine, usd)| json!({ "engine": engine, "machine": machine, "usd": usd }))
@@ -2785,6 +2815,9 @@ fn improve_status(as_json: bool) -> Result<()> {
             {
                 println!("{:<24} {}", "", step.describe());
             }
+        }
+        if let Some(line) = adversary::status_line(&row["adversary"]) {
+            println!("{:<24} {line}", "");
         }
         let spend: Vec<String> = row["spend"]
             .as_array()
@@ -3156,6 +3189,11 @@ async fn improve_command(command: ImproveCommand) -> Result<()> {
                 }
                 for (engine, machine, usd) in improve::spend_by_engine(&route, &week) {
                     println!("  spent: {engine} on {machine} ${usd:.2}");
+                }
+                if let Some(line) =
+                    adversary::status_line(&json!(ferryman_ops::adversary::summary(&route)))
+                {
+                    println!("  {line}");
                 }
             }
         }
@@ -3665,6 +3703,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Team { command } => team_command(command).await?,
         Command::Contract { command } => contract_command(command)?,
+        Command::Adversary { command } => adversary::command(command).await?,
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -7100,12 +7139,23 @@ fn contract_command(command: ContractCommand) -> Result<()> {
         ContractCommand::Lock {
             reference,
             workspace,
+            override_reason,
         } => {
             let route = here(workspace)?;
             let (name, version) = interface::parse_ref(&reference)?;
             let (master, identity) =
                 mastered_signer(&route.communications, &route.attachment, None)?;
-            let locked = interface::lock(&route, &name, &version, &master, &identity)?;
+            let locked = match &override_reason {
+                Some(why) => interface::lock_overriding(
+                    &route,
+                    &name,
+                    &version,
+                    &master,
+                    &identity,
+                    Some(why.as_str()),
+                )?,
+                None => interface::lock(&route, &name, &version, &master, &identity)?,
+            };
             println!(
                 "locked {} as {master}: it will not change; a change is a new version",
                 locked.reference()
@@ -7148,6 +7198,10 @@ fn contract_command(command: ContractCommand) -> Result<()> {
                         "contract": contract,
                         "status": status,
                         "orders": orders,
+                        "adversary": adversary::standings(&route, &contract.reference())
+                            .iter()
+                            .map(ferryman_channel::adversary::Standing::view)
+                            .collect::<Vec<_>>(),
                     }))?
                 );
                 return Ok(());
@@ -7164,6 +7218,11 @@ fn contract_command(command: ContractCommand) -> Result<()> {
             println!();
             if !contract.description.trim().is_empty() {
                 println!("  {}", contract.description.trim());
+            }
+            for standing in adversary::standings(&route, &contract.reference()) {
+                for line in adversary::lines(&standing, 4) {
+                    println!("  {line}");
+                }
             }
             if let Some(request) = &contract.request {
                 println!("request:\n{}", serde_json::to_string_pretty(request)?);
@@ -7207,12 +7266,15 @@ fn contract_command(command: ContractCommand) -> Result<()> {
                 let orders =
                     interface::orders_for_interface(&route, &contract.name, &contract.version)?;
                 println!(
-                    "{:<24} {:<9} by {:<12} {} provider(s), {} consumer(s)",
+                    "{:<24} {:<9} by {:<12} {} provider(s), {} consumer(s){}",
                     contract.reference(),
                     interface::status(&route, contract).as_str(),
                     contract.proposed_by,
                     orders.providers.len(),
-                    orders.consumers.len()
+                    orders.consumers.len(),
+                    adversary::headline(&route, &contract.reference())
+                        .map(|line| format!("  [{line}]"))
+                        .unwrap_or_default()
                 );
             }
         }

@@ -1224,6 +1224,14 @@ impl Bridge {
                     verb == "ok",
                 );
             }
+            "aov" | "clk" | "cov" | "crj" => {
+                return self.on_adversary(
+                    &callback.id,
+                    chat,
+                    message_id,
+                    (verb.as_str(), &project, &id, &extra),
+                );
+            }
             "ans" | "ansx" => {
                 return self.on_answer(
                     &callback.id,
@@ -1575,11 +1583,16 @@ impl Bridge {
                     .find(|r| r.revision == revision)
                     .map(|r| excerpt(&result_text(&r.payload), EXCERPT_CHARS))
                     .unwrap_or_default();
-                let buttons = vec![self.review_buttons(&project, &task.order.id, true)];
+                let mut buttons = vec![self.review_buttons(&project, &task.order.id, true)];
+                let (adversary, blocked) = adversary_card(&route, &task.order.id, revision);
+                if blocked {
+                    let data = self.data(format!("aov:{project}:{}:{revision}", task.order.id));
+                    buttons.push(vec![button("Override the Block", data)]);
+                }
                 actions.push(send(
                     home,
                     format!(
-                        "{} in {project} needs you - r{revision} by {by}:\n{}\n\n{result}",
+                        "{} in {project} needs you - r{revision} by {by}:\n{}\n\n{result}{adversary}",
                         task.order.id,
                         excerpt(&title(&task), 200)
                     ),
@@ -1613,6 +1626,10 @@ impl Bridge {
                         excerpt(&engine.describe(), 600)
                     ));
                 }
+                // The adversary's word sits beside the two keys; a Block gets its own button.
+                if let Some(finding) = &waiting.adversary {
+                    lines.extend(finding_lines(finding));
+                }
                 let auto = policy::effective(&route.communications, &project)
                     .0
                     .auto_merge
@@ -1626,7 +1643,14 @@ impl Bridge {
                      approved, ready to merge."
                         .to_string()
                 });
-                let buttons = vec![self.review_buttons(&project, &waiting.order_id, true)];
+                let mut buttons = vec![self.review_buttons(&project, &waiting.order_id, true)];
+                if waiting.adversary_blocked {
+                    let data = self.data(format!(
+                        "aov:{project}:{}:{}",
+                        waiting.order_id, waiting.revision
+                    ));
+                    buttons.push(vec![button("Override the Block", data)]);
+                }
                 actions.push(send(home, lines.join("\n"), buttons));
             }
             // What fm merged on its own - low-risk work, after both keys - said once each.
@@ -1676,9 +1700,212 @@ impl Bridge {
                     buttons,
                 ));
             }
+            actions.extend(self.adversary_cards(&route, &project, home));
         }
         actions
     }
+
+    /// What the adversary found, put on the phone once each. A contract still waiting for
+    /// its lock gets the finding with Lock and Reject beside it (the contract's own card
+    /// went out before the adversary had read it), and an Override only for a Block; an
+    /// improvement's Block gets an Override too, since in `blocking` mode no review card is
+    /// posted while it stands. Other findings on improvements ride on the review card.
+    fn adversary_cards(&mut self, route: &ProjectRoute, project: &str, home: i64) -> Vec<Action> {
+        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        use ferryman_channel::interface;
+        let (policy, _) = policy::effective(&route.communications, project);
+        if policy.adversary == policy::AdversaryMode::Off {
+            return Vec::new();
+        }
+        let mut actions = Vec::new();
+        for finding in found::list(route) {
+            let block = finding.verdict == Verdict::Block;
+            let (buttons, text) = match finding.trigger {
+                Trigger::ContractLock => {
+                    let pending = interface::parse_ref(&finding.subject)
+                        .ok()
+                        .and_then(|(name, version)| {
+                            interface::read_contract(route, &name, &version)
+                        })
+                        .is_some_and(|contract| {
+                            interface::status(route, &contract) == interface::Status::Proposed
+                        });
+                    if !pending {
+                        continue;
+                    }
+                    let subject = finding.subject.clone();
+                    let mut rows: Vec<Row> = vec![vec![
+                        button("Lock", self.data(format!("clk:{project}:{subject}"))),
+                        button("Reject", self.data(format!("crj:{project}:{subject}"))),
+                    ]];
+                    if block {
+                        rows.push(vec![button(
+                            "Override the Block and lock",
+                            self.data(format!("cov:{project}:{subject}")),
+                        )]);
+                    }
+                    (
+                        rows,
+                        format!("{project} - the adversary read contract {subject}"),
+                    )
+                }
+                Trigger::PreDone => {
+                    // Advisory: the review card carries the Override itself.
+                    if policy.adversary != policy::AdversaryMode::Blocking {
+                        continue;
+                    }
+                    let standing =
+                        found::standing(route, &finding.subject, finding.revision, finding.trigger);
+                    if !standing.is_some_and(|standing| standing.unresolved_block()) {
+                        continue;
+                    }
+                    let data = self.data(format!(
+                        "aov:{project}:{}:{}",
+                        finding.subject, finding.revision
+                    ));
+                    (
+                        vec![vec![button("Override the Block", data)]],
+                        format!(
+                            "{project} - the adversary blocked {} r{}",
+                            finding.subject, finding.revision
+                        ),
+                    )
+                }
+                Trigger::RepeatFailure => continue,
+            };
+            let key = format!("a:{project}:{}", finding.stem());
+            if self.state.posted.contains(&key) {
+                continue;
+            }
+            self.state.posted.push(key);
+            if !self.state.seeded {
+                continue;
+            }
+            let body: Vec<String> = finding_lines(&finding);
+            actions.push(send(home, format!("{text}\n{}", body.join("\n")), buttons));
+        }
+        actions
+    }
+
+    /// The buttons on an adversary card, each signed for the master under the bridge's
+    /// delegation: Lock or Reject a contract, Override a Block (and lock, for a contract).
+    /// Overriding takes the scope for that moment - `improve` for a contract, `review` for
+    /// an improvement - exactly as it does anywhere else.
+    fn on_adversary(
+        &mut self,
+        callback_id: &str,
+        chat: i64,
+        message_id: Option<i64>,
+        (verb, project, id, extra): (&str, &str, &str, &str),
+    ) -> Vec<Action> {
+        use ferryman_channel::adversary::{self as found, Trigger};
+        use ferryman_channel::interface;
+        let Some(route) = self.route(project).cloned() else {
+            return vec![toast(callback_id, format!("{project} is not here"))];
+        };
+        let principal = match self.principal(&route) {
+            Ok(principal) => principal,
+            Err(why) => {
+                return vec![
+                    toast(callback_id, "Not delegated"),
+                    send(chat, why, Vec::new()),
+                ];
+            }
+        };
+        let why = "overridden from Telegram";
+        let outcome: Result<String> = match verb {
+            "aov" => extra
+                .parse::<u32>()
+                .context("which revision?")
+                .and_then(|revision| {
+                    found::override_block(
+                        &route,
+                        id,
+                        revision,
+                        Trigger::PreDone,
+                        Some(why),
+                        &principal,
+                        &self.agent,
+                    )
+                    .map(|given| {
+                        format!(
+                            "{id} r{revision}: the adversary's Block is overridden by {}. The \
+                             review engine's key can be granted now.",
+                            given.from()
+                        )
+                    })
+                }),
+            _ => interface::parse_ref(id).and_then(|(name, version)| match verb {
+                "clk" => interface::lock(&route, &name, &version, &principal, &self.agent)
+                    .map(|_| format!("{id} locked by {}.", self.by(&principal))),
+                "cov" => interface::lock_overriding(
+                    &route,
+                    &name,
+                    &version,
+                    &principal,
+                    &self.agent,
+                    Some(why),
+                )
+                .map(|_| {
+                    format!(
+                        "{id} locked by {}, over the adversary's Block.",
+                        self.by(&principal)
+                    )
+                }),
+                _ => interface::reject(&route, &name, &version, &principal, &self.agent)
+                    .map(|_| format!("{id} rejected by {}.", self.by(&principal))),
+            }),
+        };
+        match outcome {
+            Ok(text) => {
+                let mut actions = vec![toast(callback_id, "Done")];
+                actions.push(match message_id {
+                    Some(message_id) => Action::Edit {
+                        chat,
+                        message_id,
+                        text,
+                        buttons: vec![menu_row()],
+                    },
+                    None => send(chat, text, Vec::new()),
+                });
+                actions
+            }
+            Err(error) => vec![
+                toast(callback_id, excerpt(&format!("{error:#}"), 190)),
+                send(chat, format!("{error:#}"), Vec::new()),
+            ],
+        }
+    }
+}
+
+/// The adversary's finding as card lines: the headline, then its worst issues.
+fn finding_lines(finding: &ferryman_channel::adversary::AdversaryFinding) -> Vec<String> {
+    finding
+        .lines(3)
+        .iter()
+        .map(|line| excerpt(line, 400))
+        .collect()
+}
+
+/// A review card's adversary paragraph (empty when it has nothing to say) for `order` at
+/// `revision`, and whether a Block still stands there.
+fn adversary_card(route: &ProjectRoute, order: &str, revision: u32) -> (String, bool) {
+    use ferryman_channel::adversary as found;
+    let (policy, _) = policy::effective(&route.communications, &route.project_id);
+    if policy.adversary == policy::AdversaryMode::Off {
+        return (String::new(), false);
+    }
+    let Some(standing) = found::standing(route, order, revision, found::Trigger::PreDone) else {
+        return (String::new(), false);
+    };
+    let mut lines = finding_lines(&standing.finding);
+    if let Some(over) = &standing.overridden {
+        lines.push(format!("The Block was overridden by {}.", over.from()));
+    }
+    (
+        format!("\n\n{}", lines.join("\n")),
+        standing.unresolved_block(),
+    )
 }
 
 /// Lock or reject the interface contract a question is about, as the master, signed by the
@@ -3076,5 +3303,366 @@ mod tests {
     fn approvers_parse_from_a_list() {
         assert_eq!(parse_ids(" 42, 7 ,").unwrap(), vec![42, 7]);
         assert!(parse_ids("josh").is_err());
+    }
+
+    // --- the adversary on the phone -----------------------------------------------------------
+
+    fn adversary_finding(
+        subject: &str,
+        revision: u32,
+        trigger: ferryman_channel::adversary::Trigger,
+        verdict: ferryman_channel::adversary::Verdict,
+    ) -> ferryman_channel::adversary::AdversaryFinding {
+        use ferryman_channel::adversary::{AdversaryFinding, Issue, Severity};
+        AdversaryFinding {
+            order_id: subject.split('@').next().unwrap_or_default().to_string(),
+            revision,
+            trigger,
+            subject: subject.to_string(),
+            engine: "deepseek".into(),
+            model: None,
+            machine: "grouchly".into(),
+            same_engine: false,
+            verdict,
+            findings: vec![Issue {
+                severity: Severity::High,
+                title: "the consumer reads `name`, the provider sends `username`".into(),
+                detail: "the two halves disagree".into(),
+                location: Some("user.name".into()),
+            }],
+            created_at: Utc::now(),
+            signed_by: String::new(),
+            signature: String::new(),
+        }
+    }
+
+    fn set_adversary(route: &ProjectRoute, mode: ferryman_channel::policy::AdversaryMode) {
+        ferryman_channel::policy::set_policy(
+            &route.communications,
+            &route.project_id,
+            Some(Policy {
+                adversary: mode,
+                ..Policy::default()
+            }),
+            &josh(),
+        )
+        .unwrap();
+    }
+
+    fn proposed_user_api(route: &ProjectRoute) {
+        let shape = ferryman_channel::contract::Shape::parse(&json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": { "id": { "type": "integer" } }
+        }))
+        .unwrap();
+        ferryman_channel::interface::propose(route, &wisp(), "user-api", "1", "users", None, shape)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_contract_finding_comes_beside_lock_and_reject_with_an_override_only_for_a_block() {
+        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        use ferryman_channel::interface;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        let _ = bridge.tick(Utc::now());
+        proposed_user_api(&ferryman);
+        let first = bridge.tick(Utc::now());
+        assert_eq!(texts(&first).len(), 1, "the contract's own card: {first:?}");
+
+        // A Concern: the finding is shown with Lock and Reject, and nothing to override.
+        found::record(
+            &ferryman,
+            &wisp(),
+            adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Concern),
+        )
+        .unwrap();
+        let concern = bridge.tick(Utc::now());
+        let shown = texts(&concern).join("\n");
+        assert!(
+            shown.contains("the adversary read contract user-api@1"),
+            "{shown}"
+        );
+        assert!(shown.contains("concern by deepseek"), "{shown}");
+        assert!(shown.contains("the consumer reads `name`"), "{shown}");
+        let labels: Vec<String> = buttons(&concern)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Lock", "Reject"]);
+        assert!(
+            bridge.tick(Utc::now()).is_empty(),
+            "each finding is posted once"
+        );
+
+        // A Block: an Override beside them, and only then.
+        found::record(
+            &ferryman,
+            &wisp(),
+            adversary_finding("user-api@1", 1, Trigger::ContractLock, Verdict::Block),
+        )
+        .unwrap();
+        let block = bridge.tick(Utc::now());
+        let labels: Vec<String> = buttons(&block)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Lock", "Reject", "Override the Block and lock"]);
+        assert!(texts(&block).join("\n").contains("block by deepseek"));
+
+        // Blocking mode: Lock is refused with the reason; the override locks, signed for josh.
+        set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Blocking);
+        let refused = press_labelled(&mut bridge, &block, "Lock", 120);
+        assert!(
+            refused.iter().any(|action| matches!(action,
+                Action::Answer { text, .. } if text.contains("blocks locking user-api@1"))),
+            "{refused:?}"
+        );
+        assert!(interface::locked(&ferryman, "user-api", "1").is_none());
+        let overridden = press_labelled(&mut bridge, &block, "Override the Block and lock", 121);
+        assert!(
+            texts(&overridden)
+                .iter()
+                .any(|t| t
+                    .contains("locked by josh via telegram-grouchly, over the adversary's Block")),
+            "{overridden:?}"
+        );
+        let locked = interface::locked(&ferryman, "user-api", "1").expect("locked");
+        assert_eq!(locked.lock.unwrap().signed_by, "telegram-grouchly");
+        let standing = found::standing(&ferryman, "user-api@1", 1, Trigger::ContractLock).unwrap();
+        assert_eq!(
+            standing.overridden.unwrap().from(),
+            "josh via telegram-grouchly"
+        );
+    }
+
+    #[test]
+    fn a_contract_override_needs_the_improve_delegation_and_off_shows_nothing() {
+        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        use ferryman_channel::interface;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["review"]);
+        let _ = bridge.tick(Utc::now());
+        proposed_user_api(&ferryman);
+        let _ = bridge.tick(Utc::now());
+        found::record(
+            &ferryman,
+            &wisp(),
+            adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
+        )
+        .unwrap();
+        set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Blocking);
+        let block = bridge.tick(Utc::now());
+        let refused = press_labelled(&mut bridge, &block, "Override the Block and lock", 122);
+        assert!(
+            refused
+                .iter()
+                .any(|action| matches!(action, Action::Answer { text, .. } if !text.is_empty())),
+            "{refused:?}"
+        );
+        assert!(interface::locked(&ferryman, "user-api", "1").is_none());
+        assert!(
+            found::standing(&ferryman, "user-api@1", 0, Trigger::ContractLock)
+                .unwrap()
+                .unresolved_block()
+        );
+
+        // With the adversary off, a finding on file is not put on the phone.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = self::bridge(dir.path());
+        set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Off);
+        let _ = bridge.tick(Utc::now());
+        proposed_user_api(&ferryman);
+        let _ = bridge.tick(Utc::now());
+        found::record(
+            &ferryman,
+            &wisp(),
+            adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
+        )
+        .unwrap();
+        assert!(bridge.tick(Utc::now()).is_empty());
+    }
+
+    /// An improvement the worker finished, waiting for the review engine.
+    fn finished_improvement(route: &ProjectRoute, id: &str) {
+        let mut order = ferryman_channel::Order {
+            id: id.into(),
+            project_id: "ferryman".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "better", "tags": ["improvement"], "improvement": { "title": "Better errors" } }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
+        };
+        wisp().sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order).unwrap();
+        ferryman_channel::claim_order(route, id, "wisp").unwrap();
+        let mut result = ferryman_channel::TaskResult {
+            order_id: id.into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "done", "evidence": { "recorded_by": "worker", "git": true, "commits": ["abc1234 better"], "diff_stat": "2 files changed" } }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp().sign_result(&mut result);
+        ferryman_channel::submit_result(route, &result).unwrap();
+    }
+
+    fn engine_key(route: &ProjectRoute, id: &str) {
+        ferryman_channel::gate::record_engine_review(
+            route,
+            &wisp(),
+            ferryman_channel::gate::EngineReview {
+                order_id: id.into(),
+                revision: 1,
+                reviewer: "wisp".into(),
+                machine: "grouchly".into(),
+                engine: "deepseek".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                host: None,
+                route: Vec::new(),
+                accept: true,
+                summary: "clear and tested".into(),
+                reviewed_at: Utc::now(),
+                signed_by: None,
+                signature: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_review_card_shows_the_adversary_beside_the_two_keys_and_a_block_can_be_overridden() {
+        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["review"]);
+        let _ = bridge.tick(Utc::now());
+        finished_improvement(&ferryman, "improve-2026-w40-1");
+        found::record(
+            &ferryman,
+            &wisp(),
+            adversary_finding("improve-2026-w40-1", 1, Trigger::PreDone, Verdict::Block),
+        )
+        .unwrap();
+        engine_key(&ferryman, "improve-2026-w40-1");
+
+        // Advisory: both keys are there, so the card is too - with the finding and an
+        // Override, and Approve still works.
+        let posted = bridge.tick(Utc::now());
+        let said = texts(&posted).join("\n");
+        assert!(said.contains("waiting for your approval"), "{said}");
+        assert!(
+            said.contains("clear and tested"),
+            "the engine's key: {said}"
+        );
+        assert!(said.contains("adversary BLOCK"), "{said}");
+        assert!(said.contains("the consumer reads `name`"), "{said}");
+        let labels: Vec<String> = buttons(&posted)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(
+            labels,
+            ["Approve", "Send back", "Details", "Override the Block"]
+        );
+        let overridden = press_labelled(&mut bridge, &posted, "Override the Block", 123);
+        assert!(
+            texts(&overridden)
+                .iter()
+                .any(|t| t.contains("overridden by josh via telegram-grouchly")),
+            "{overridden:?}"
+        );
+        assert!(
+            !found::standing(&ferryman, "improve-2026-w40-1", 1, Trigger::PreDone)
+                .unwrap()
+                .unresolved_block()
+        );
+    }
+
+    #[test]
+    fn in_blocking_mode_a_standing_block_has_its_own_card_because_no_review_card_can_come() {
+        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Blocking);
+        let _ = bridge.tick(Utc::now());
+        finished_improvement(&ferryman, "improve-2026-w40-2");
+        found::record(
+            &ferryman,
+            &wisp(),
+            adversary_finding("improve-2026-w40-2", 1, Trigger::PreDone, Verdict::Block),
+        )
+        .unwrap();
+        engine_key(&ferryman, "improve-2026-w40-2");
+        let task = ferryman_channel::read_task(&ferryman, "improve-2026-w40-2").unwrap();
+        assert!(
+            ferryman_channel::gate::gate(
+                &ferryman,
+                &task,
+                &policy::effective(&ferryman.communications, "ferryman").0
+            )
+            .engine
+            .as_ref()
+            .is_err_and(|why| why.contains("adversary")),
+            "blocking: the engine's key does not count while the Block stands"
+        );
+        let posted = bridge.tick(Utc::now());
+        let said = texts(&posted).join("\n");
+        assert!(
+            said.contains("the adversary blocked improve-2026-w40-2 r1"),
+            "{said}"
+        );
+        assert!(!said.contains("waiting for your approval"), "{said}");
+        let labels: Vec<String> = buttons(&posted)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Override the Block"]);
+
+        // `improve` is not the scope that approves a result: refused, still standing.
+        let refused = press_labelled(&mut bridge, &posted, "Override the Block", 124);
+        assert!(
+            refused
+                .iter()
+                .any(|action| matches!(action, Action::Answer { text, .. } if !text.is_empty() && text != "Done")),
+            "{refused:?}"
+        );
+        assert!(
+            found::standing(&ferryman, "improve-2026-w40-2", 1, Trigger::PreDone)
+                .unwrap()
+                .unresolved_block()
+        );
+        delegate(&ferryman, &["improve", "review"]);
+        press_labelled(&mut bridge, &posted, "Override the Block", 125);
+        assert!(
+            !found::standing(&ferryman, "improve-2026-w40-2", 1, Trigger::PreDone)
+                .unwrap()
+                .unresolved_block()
+        );
+        // And with the Block answered, the review card comes.
+        let after = bridge.tick(Utc::now());
+        assert!(
+            texts(&after)
+                .join("\n")
+                .contains("waiting for your approval"),
+            "{after:?}"
+        );
     }
 }

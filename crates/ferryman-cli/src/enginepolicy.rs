@@ -60,7 +60,8 @@ pub(crate) enum PolicyCommand {
         /// improvement needs before it can go live.
         #[arg(long, value_name = "SELECTOR")]
         review: Option<String>,
-        /// plan, build, review or chore; repeat for several. Default: all four.
+        /// plan, build, review, chore or adversary; repeat for several. Default: the first
+        /// four (the adversary is chosen on its own).
         #[arg(long = "role", value_name = "ROLE")]
         roles: Vec<String>,
         /// Most preferred first; repeat. Replaces the role's list.
@@ -87,6 +88,14 @@ pub(crate) enum PolicyCommand {
         /// after both keys - the review engine's and yours.
         #[arg(long, value_name = "none|low-risk", value_parser = policy::AutoMerge::parse)]
         auto_merge: Option<policy::AutoMerge>,
+        /// What the adversary's findings do: `off`, `advisory` (the default: shown beside
+        /// the review keys, never in the way) or `blocking` (a Block stops the contract
+        /// lock and the engine key until you sign an override). Which engine challenges is
+        /// `--role adversary --prefer <engine>`.
+        ///
+        ///   ferry engines policy set --role adversary --prefer deepseek --adversary blocking
+        #[arg(long, value_name = "off|advisory|blocking", value_parser = policy::AdversaryMode::parse)]
+        adversary: Option<policy::AdversaryMode>,
     },
     /// Go back to auto, signed.
     Clear {
@@ -144,9 +153,12 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             protect_subscriptions,
             never_applies_to,
             auto_merge,
+            adversary,
         } => {
+            // The adversary is never a default: `--prefer deepseek` with no `--role` sets
+            // the four roles that build and judge, and leaves who challenges them alone.
             let roles: Vec<Role> = if roles.is_empty() {
-                Role::ALL.to_vec()
+                Role::BUILDING.to_vec()
             } else {
                 roles
                     .iter()
@@ -170,10 +182,12 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 && protect_subscriptions.is_none()
                 && scope.is_none()
                 && auto_merge.is_none()
+                && adversary.is_none()
             {
                 bail!(
                     "nothing to set: name --improve, --review, --prefer, --never, --where, \
-                     --cap-usd, --protect-subscriptions, --never-applies-to or --auto-merge"
+                     --cap-usd, --protect-subscriptions, --never-applies-to, --auto-merge or \
+                     --adversary"
                 );
             }
             sign_each(&which, "set", |_, _, mut current| {
@@ -211,6 +225,9 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 }
                 if let Some(mode) = auto_merge {
                     current.auto_merge = mode;
+                }
+                if let Some(mode) = adversary {
+                    current.adversary = mode;
                 }
                 Ok(Some(current))
             })
@@ -503,5 +520,42 @@ mod tests {
     #[test]
     fn the_source_line_says_who_set_it_or_that_it_is_auto() {
         assert!(source(None).starts_with("auto"));
+    }
+
+    #[test]
+    fn the_adversary_role_and_mode_parse_and_the_default_roles_leave_it_out() {
+        let cli = Cli::try_parse_from([
+            "policy",
+            "set",
+            "--role",
+            "adversary",
+            "--prefer",
+            "deepseek",
+            "--adversary",
+            "blocking",
+        ])
+        .unwrap();
+        let PolicyCommand::Set {
+            roles,
+            prefer,
+            adversary,
+            ..
+        } = cli.command
+        else {
+            panic!("not set")
+        };
+        assert_eq!(roles, ["adversary"]);
+        assert_eq!(prefer, ["deepseek"]);
+        assert_eq!(adversary, Some(policy::AdversaryMode::Blocking));
+        assert!(Role::parse(&roles[0]).is_ok());
+        for mode in ["off", "advisory", "blocking"] {
+            assert!(
+                Cli::try_parse_from(["policy", "set", "--adversary", mode]).is_ok(),
+                "{mode}"
+            );
+        }
+        assert!(Cli::try_parse_from(["policy", "set", "--adversary", "sometimes"]).is_err());
+        // Without --role the building roles are set; who challenges is its own choice.
+        assert!(!Role::BUILDING.contains(&Role::Adversary));
     }
 }
