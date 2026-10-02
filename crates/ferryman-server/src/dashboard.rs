@@ -2779,13 +2779,18 @@ async fn contracts_get(
                 ferryman_channel::adversary::Trigger::ALL
                     .iter()
                     .filter_map(|trigger| {
-                        ferryman_channel::adversary::latest_standing(&route, &reference, *trigger)
+                        ferryman_channel::adversary::decision_standing(&route, &reference, *trigger)
                     })
                     .map(|standing| standing.view())
                     .collect()
             };
         items.push(json!({
             "adversary": adversary,
+            // What a Lock or an override must name, so it lands on what this screen shows:
+            // the contract's digest, and the adversary's word on it (`none` when no
+            // eligible adversary has read it).
+            "digest": ferryman_channel::interface::digest(&route.project_id, &contract),
+            "finding_digest": ferryman_channel::adversary::lock_finding_seen(&route, &contract),
             "lock_refusal": ferryman_channel::adversary::lock_refusal(&route, &policy, &contract),
             "reference": contract.reference(),
             "name": contract.name,
@@ -2818,6 +2823,13 @@ struct LockBody {
     overriding: bool,
     #[serde(default)]
     reason: Option<String>,
+    /// The contract's digest as the page showed it (`/api/contracts` `digest`); a lock is
+    /// refused unless it is still what this names.
+    #[serde(default)]
+    digest: String,
+    /// For an override: the adversary's word as the page showed it (`finding_digest`).
+    #[serde(default)]
+    finding: String,
 }
 
 /// The contract a request names, checked for what a decision needs: it exists and is
@@ -2856,8 +2868,9 @@ async fn contract_lock(
     let current = session_identity(&state, &headers)?;
     let route = with_current_roster(&state.route_for(params.project.as_deref()));
     let contract = undecided_contract(&route, &reference)?;
-    // The body is optional: a plain Lock sends none (or an empty one), an override sends
-    // `{"override": true, "reason": "..."}`.
+    // The body names what the master looked at: `{"digest": "<contract digest>"}`, and for
+    // an override also `"override": true, "finding": "<finding_digest>", "reason": "..."`.
+    // A lock that does not say what it is locking is refused.
     let body: LockBody = if body.iter().all(u8::is_ascii_whitespace) {
         LockBody::default()
     } else {
@@ -2865,11 +2878,30 @@ async fn contract_lock(
             (
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "the body is {{\"override\": true, \"reason\": \"...\"}} or nothing: {error}"
+                    "the body is {{\"digest\": \"...\", \"override\": true, \"finding\": \"...\", \
+                     \"reason\": \"...\"}}: {error}"
                 ),
             )
         })?
     };
+    if body.digest.trim().len() < ferryman_channel::interface::DIGEST_MIN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "say which contract you looked at: send its `digest` (at least {} characters) \
+                 from GET /api/contracts",
+                ferryman_channel::interface::DIGEST_MIN
+            ),
+        ));
+    }
+    if body.overriding && body.finding.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "say which finding you are overriding: send its `finding_digest` (or `none`) from \
+             GET /api/contracts"
+                .to_string(),
+        ));
+    }
     // With the engine policy's adversary on `blocking`, a Block stops this until the
     // master overrides it: the same refusal the CLI and the phone give. `override` signs
     // that and locks in one step.
@@ -2878,6 +2910,8 @@ async fn contract_lock(
             &route,
             &contract.name,
             &contract.version,
+            &body.digest,
+            body.finding.trim(),
             current.name(),
             &current,
             Some(
@@ -2892,6 +2926,7 @@ async fn contract_lock(
             &route,
             &contract.name,
             &contract.version,
+            &body.digest,
             current.name(),
             &current,
         )
@@ -2972,25 +3007,16 @@ async fn adversary_get(
             .zip(master.as_ref())
             .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
     let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
-    let mut standings: Vec<ferryman_channel::adversary::Standing> =
-        ferryman_channel::adversary::list(&route)
-            .into_iter()
-            .filter_map(|finding| {
-                ferryman_channel::adversary::standing(
-                    &route,
-                    &finding.subject,
-                    finding.revision,
-                    finding.trigger,
-                )
-            })
-            .collect();
-    standings.sort_by_key(|standing| std::cmp::Reverse(standing.finding.created_at));
+    // What counts (newest first), and what was ignored with why: a finding from the agent
+    // that built the work, from a machine with no inventory, and the like.
+    let survey = ferryman_channel::adversary::list_standings(&route);
     Ok(Json(json!({
         "project": route.project_id,
         "mode": policy.adversary.as_str(),
         "engine": policy.adversary_engine(),
         "may_override": may_override,
-        "findings": standings.iter().map(ferryman_channel::adversary::Standing::view).collect::<Vec<_>>(),
+        "findings": survey.standings.iter().map(ferryman_channel::adversary::Standing::view).collect::<Vec<_>>(),
+        "ignored": survey.ignored.iter().map(ferryman_channel::adversary::Ignored::view).collect::<Vec<_>>(),
     })))
 }
 
@@ -3000,11 +3026,15 @@ struct OverrideBody {
     subject: String,
     /// `contract-lock`, `repeat-failure` or `pre-done`.
     trigger: String,
-    /// The revision the Block is on; defaults to the newest finding at that moment.
+    /// The revision the Block is on; defaults to the revision under decision.
     #[serde(default)]
     revision: Option<u32>,
     #[serde(default)]
     reason: Option<String>,
+    /// The adversary's word as the page showed it (the finding's `digest`): the override
+    /// is refused unless that is still what stands. Required.
+    #[serde(default)]
+    finding: String,
 }
 
 /// POST /api/adversary/override - the master goes ahead despite the adversary's Block,
@@ -3023,18 +3053,29 @@ async fn adversary_override(
         .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
     let revision = match body.revision {
         Some(revision) => revision,
-        None => ferryman_channel::adversary::latest(&route, &body.subject, trigger)
-            .map(|finding| finding.revision)
+        None => ferryman_channel::adversary::decision_revision(&route, &body.subject, trigger)
             .ok_or((
                 StatusCode::NOT_FOUND,
-                format!("the adversary has not read {} at that moment", body.subject),
+                format!(
+                    "{} has no {} moment to decide",
+                    body.subject,
+                    trigger.label()
+                ),
             ))?,
     };
-    let given = ferryman_channel::adversary::override_block(
+    if body.finding.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "say which finding you are overriding: send its `finding` digest (or `none`)"
+                .to_string(),
+        ));
+    }
+    let given = ferryman_channel::adversary::override_or_waive(
         &route,
         &body.subject,
         revision,
         trigger,
+        body.finding.trim(),
         body.reason
             .as_deref()
             .filter(|reason| !reason.trim().is_empty())
@@ -6072,6 +6113,14 @@ mod tests {
         assert_eq!(contract["status"], "proposed");
         assert_eq!(contract["proposed_by"], "alice");
         assert_eq!(contract["response"]["required"][0], "id");
+        // The page names the contract by its digest, so a lock lands on what it showed.
+        let digest = contract["digest"].as_str().unwrap().to_string();
+        assert_eq!(
+            digest,
+            interface::current_digest(&fresh, "user-api", "1").unwrap(),
+            "{page}"
+        );
+        assert_eq!(contract["finding_digest"], "none", "{page}");
         assert_eq!(contract["providers"][0]["id"], "t-api");
         assert_eq!(contract["consumers"][0]["id"], "t-ui");
         assert!(
@@ -6119,8 +6168,9 @@ mod tests {
         let bob = bob["token"].as_str().unwrap();
         let theirs = get_json(&app, "/api/contracts", Some(bob)).await;
         assert_eq!(theirs["may_decide"], false, "{theirs}");
+        let named = json!({ "digest": digest }).to_string();
         assert_eq!(
-            post(&app, "/api/contracts/user-api@1/lock", "", Some(bob))
+            post(&app, "/api/contracts/user-api@1/lock", &named, Some(bob))
                 .await
                 .status(),
             StatusCode::FORBIDDEN
@@ -6135,7 +6185,34 @@ mod tests {
 
         // The master locks it; the question that asked is answered; it cannot be decided
         // again, either way.
-        let locked = post(&app, "/api/contracts/user-api@1/lock", "", Some(&token)).await;
+        // A lock that does not say what it locks is refused, and so is one that names a
+        // contract that is not the one on screen; neither locks anything.
+        let unnamed = post(&app, "/api/contracts/user-api@1/lock", "", Some(&token)).await;
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+        let short = post(
+            &app,
+            "/api/contracts/user-api@1/lock",
+            r#"{"digest":"abc"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(short.status(), StatusCode::BAD_REQUEST);
+        let stale = post(
+            &app,
+            "/api/contracts/user-api@1/lock",
+            r#"{"digest":"0000000000000000"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let body = stale.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            String::from_utf8_lossy(&body).contains("changed since you looked"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        assert!(interface::locked(&fresh, "user-api", "1").is_none());
+        let locked = post(&app, "/api/contracts/user-api@1/lock", &named, Some(&token)).await;
         assert_eq!(locked.status(), StatusCode::OK);
         assert!(interface::locked(&fresh, "user-api", "1").is_some());
         assert!(ferryman_channel::questions::pending(&fresh).is_empty());
@@ -6205,6 +6282,34 @@ mod tests {
         )
         .unwrap();
         let fresh = with_current_roster(&route);
+        // What makes wisp an adversary whose word counts: a signed inventory that lists the
+        // engine it challenged with.
+        let publish_inventory = || {
+            ferryman_channel::receipts::refresh_engines(
+                &fresh,
+                &wisp,
+                "grouchly",
+                "0.0.0",
+                vec![ferryman_channel::receipts::EngineReport {
+                    name: "deepseek".into(),
+                    kind: "http".into(),
+                    model: None,
+                    tier: "judge".into(),
+                    paid: "prepaid".into(),
+                    state: "up".into(),
+                    until: None,
+                    reason: None,
+                    latency_ms: None,
+                    balance: None,
+                    checked_at: None,
+                    trust: None,
+                    billing: None,
+                    class: None,
+                }],
+                Utc::now(),
+            )
+            .unwrap();
+        };
         let finding = |subject: &str| AdversaryFinding {
             order_id: subject.split('@').next().unwrap_or_default().to_string(),
             revision: 0,
@@ -6260,12 +6365,37 @@ mod tests {
         assert_eq!(view["choices"]["current"]["adversary"], "name:deepseek");
         assert_eq!(view["choices"]["current"]["adversary_mode"], "blocking");
 
-        // A Block on a proposed contract is shown, and Lock is refused with the reason.
+        // A Block from an agent with no signed engine inventory does not count: the page
+        // lists it as ignored, and blocking mode holds the lock for want of any finding that
+        // does - it is not a way past the adversary either.
         propose("1");
         ferryman_channel::adversary::record(&fresh, &wisp, finding("user-api@1")).unwrap();
         let page = get_json(&app, "/api/contracts", Some(&token)).await;
+        let contract = &page["contracts"][0];
+        assert_eq!(contract["adversary"].as_array().unwrap().len(), 0, "{page}");
+        assert_eq!(contract["finding_digest"], "none", "{page}");
+        assert!(contract["lock_refusal"].is_string(), "{page}");
+        let listed = get_json(&app, "/api/adversary", Some(&token)).await;
+        assert_eq!(listed["findings"].as_array().unwrap().len(), 0, "{listed}");
+        assert_eq!(listed["ignored"][0]["subject"], "user-api@1", "{listed}");
+        assert!(
+            listed["ignored"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("inventory"),
+            "{listed}"
+        );
+
+        // With the inventory published, the same finding counts: the Block is shown, and
+        // Lock is refused with the reason.
+        publish_inventory();
+        let page = get_json(&app, "/api/contracts", Some(&token)).await;
         assert_eq!(page["adversary_mode"], "blocking", "{page}");
         let contract = &page["contracts"][0];
+        let digest = contract["digest"].as_str().unwrap().to_string();
+        let seen = contract["finding_digest"].as_str().unwrap().to_string();
+        assert_ne!(seen, "none", "{page}");
+        let named = json!({ "digest": digest }).to_string();
         assert_eq!(contract["adversary"][0]["verdict"], "block", "{page}");
         assert_eq!(contract["adversary"][0]["unresolved_block"], true);
         assert!(
@@ -6275,7 +6405,7 @@ mod tests {
                 .contains("blocks locking user-api@1"),
             "{page}"
         );
-        let refused = post(&app, "/api/contracts/user-api@1/lock", "", Some(&token)).await;
+        let refused = post(&app, "/api/contracts/user-api@1/lock", &named, Some(&token)).await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
         let body = refused.into_body().collect().await.unwrap().to_bytes();
         assert!(
@@ -6298,15 +6428,49 @@ mod tests {
         let unread = post(
             &app,
             "/api/adversary/override",
-            r#"{"subject":"other-api@1","trigger":"contract-lock"}"#,
+            r#"{"subject":"other-api@1","trigger":"contract-lock","finding":"none"}"#,
             Some(&token),
         )
         .await;
         assert_eq!(unread.status(), StatusCode::NOT_FOUND);
+        // An override has to name the finding the master read: none at all, or one that is
+        // not what stands (the adversary said something else since), is refused.
+        let unnamed = post(
+            &app,
+            "/api/adversary/override",
+            r#"{"subject":"user-api@1","trigger":"contract-lock"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
+        let stale = post(
+            &app,
+            "/api/adversary/override",
+            r#"{"subject":"user-api@1","trigger":"contract-lock","finding":"0000000000000000"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::FORBIDDEN);
+        let blocked = post(
+            &app,
+            "/api/contracts/user-api@1/lock",
+            &json!({ "digest": digest, "override": true, "finding": "0000000000000000" })
+                .to_string(),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(interface::locked(&fresh, "user-api", "1").is_none());
         let overridden = post(
             &app,
             "/api/adversary/override",
-            r#"{"subject":"user-api@1","trigger":"contract-lock","reason":"the consumer is being fixed"}"#,
+            &json!({
+                "subject": "user-api@1",
+                "trigger": "contract-lock",
+                "reason": "the consumer is being fixed",
+                "finding": seen,
+            })
+            .to_string(),
             Some(&token),
         )
         .await;
@@ -6321,18 +6485,42 @@ mod tests {
             listed["findings"][0]["override"]["reason"],
             "the consumer is being fixed"
         );
-        let locked = post(&app, "/api/contracts/user-api@1/lock", "", Some(&token)).await;
+        let locked = post(&app, "/api/contracts/user-api@1/lock", &named, Some(&token)).await;
         assert_eq!(locked.status(), StatusCode::OK);
 
         // Or in one step: lock with an override.
         propose("2");
         ferryman_channel::adversary::record(&fresh, &wisp, finding("user-api@2")).unwrap();
-        let refused = post(&app, "/api/contracts/user-api@2/lock", "{}", Some(&token)).await;
+        let page = get_json(&app, "/api/contracts", Some(&token)).await;
+        let second = page["contracts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|contract| contract["reference"] == "user-api@2")
+            .unwrap();
+        let named = json!({ "digest": second["digest"] }).to_string();
+        let refused = post(&app, "/api/contracts/user-api@2/lock", &named, Some(&token)).await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        // The override without the finding it overrides is not accepted.
+        let unnamed = post(
+            &app,
+            "/api/contracts/user-api@2/lock",
+            &json!({ "digest": second["digest"], "override": true, "reason": "ship it" })
+                .to_string(),
+            Some(&token),
+        )
+        .await;
+        assert_eq!(unnamed.status(), StatusCode::BAD_REQUEST);
         let locked = post(
             &app,
             "/api/contracts/user-api@2/lock",
-            r#"{"override":true,"reason":"ship it"}"#,
+            &json!({
+                "digest": second["digest"],
+                "override": true,
+                "finding": second["finding_digest"],
+                "reason": "ship it",
+            })
+            .to_string(),
             Some(&token),
         )
         .await;
@@ -6359,7 +6547,8 @@ mod tests {
             .unwrap();
         assert_eq!(third["adversary"].as_array().unwrap().len(), 0, "{page}");
         assert!(third["lock_refusal"].is_null());
-        let locked = post(&app, "/api/contracts/user-api@3/lock", "", Some(&token)).await;
+        let named = json!({ "digest": third["digest"] }).to_string();
+        let locked = post(&app, "/api/contracts/user-api@3/lock", &named, Some(&token)).await;
         assert_eq!(locked.status(), StatusCode::OK);
     }
 

@@ -300,8 +300,12 @@ ferry channel order --agent orchestrator --id t-ui --to wisp \
 
 # 3. The master locks it: the Contracts page in the dashboard, the Lock button in
 #    Telegram (one question, however many times it is proposed), or
-ferry contract lock user-api@1
+ferry contract lock user-api@1                  # shows the digest and asks you to confirm
+ferry contract lock user-api@1 --digest 89abcdef # or name the digest `ferry contract show` printed
 ```
+
+A lock is bound to the contract the master looked at: if the proposal was replaced since,
+the lock is refused ("the contract changed since you looked") and nothing is locked.
 
 Once locked, the consumer's engine prompt carries the locked shapes, and the provider's
 result is held to the response shape - `result.user.id: expected integer, got string` is

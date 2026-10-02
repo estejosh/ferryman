@@ -382,6 +382,18 @@ impl Bridge {
         format!("k:{}", self.state.keys.len() - 1)
     }
 
+    /// The Override button for an improvement's Block: it names the finding on the card
+    /// (`<revision>.<digest prefix>`), so pressing it after the finding changed is refused
+    /// rather than applied to something the master did not read.
+    fn override_data(&mut self, route: &ProjectRoute, order: &str, revision: u32) -> String {
+        let seen = found_seen(route, order, revision);
+        self.data(format!(
+            "aov:{}:{order}:{revision}.{}",
+            route.project_id,
+            digest_prefix(&seen)
+        ))
+    }
+
     fn resolve(&self, data: &str) -> String {
         data.strip_prefix("k:")
             .and_then(|index| index.parse::<usize>().ok())
@@ -1654,7 +1666,7 @@ impl Bridge {
                 let mut buttons = vec![self.review_buttons(&project, &task.order.id, true)];
                 let (adversary, blocked) = adversary_card(&route, &task.order.id, revision);
                 if blocked {
-                    let data = self.data(format!("aov:{project}:{}:{revision}", task.order.id));
+                    let data = self.override_data(&route, &task.order.id, revision);
                     buttons.push(vec![button("Override the Block", data)]);
                 }
                 actions.push(send(
@@ -1713,10 +1725,7 @@ impl Bridge {
                 });
                 let mut buttons = vec![self.review_buttons(&project, &waiting.order_id, true)];
                 if waiting.adversary_blocked {
-                    let data = self.data(format!(
-                        "aov:{project}:{}:{}",
-                        waiting.order_id, waiting.revision
-                    ));
+                    let data = self.override_data(&route, &waiting.order_id, waiting.revision);
                     buttons.push(vec![button("Override the Block", data)]);
                 }
                 actions.push(send(home, lines.join("\n"), buttons));
@@ -1779,69 +1788,80 @@ impl Bridge {
     /// improvement's Block gets an Override too, since in `blocking` mode no review card is
     /// posted while it stands. Other findings on improvements ride on the review card.
     fn adversary_cards(&mut self, route: &ProjectRoute, project: &str, home: i64) -> Vec<Action> {
-        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        use ferryman_channel::adversary::{self as found, Trigger};
         use ferryman_channel::interface;
         let (policy, _) = policy::effective(&route.communications, project);
         if policy.adversary == policy::AdversaryMode::Off {
             return Vec::new();
         }
         let mut actions = Vec::new();
-        for finding in found::list(route) {
-            let block = finding.verdict == Verdict::Block;
-            let (buttons, text) = match finding.trigger {
-                Trigger::ContractLock => {
-                    let pending = interface::parse_ref(&finding.subject)
-                        .ok()
-                        .and_then(|(name, version)| {
-                            interface::read_contract(route, &name, &version)
-                        })
-                        .is_some_and(|contract| {
-                            interface::status(route, &contract) == interface::Status::Proposed
-                        });
-                    if !pending {
-                        continue;
+        // Only what counts: a finding by someone who built the work, or has no signed
+        // inventory listing its engine, never puts a card on the phone.
+        for standing in found::list_standings(route).standings {
+            let finding = &standing.finding;
+            let block = standing.unresolved_block();
+            let seen = standing.digest();
+            let (buttons, text) =
+                match finding.trigger {
+                    Trigger::ContractLock => {
+                        let Some(contract) = interface::parse_ref(&finding.subject).ok().and_then(
+                            |(name, version)| interface::read_contract(route, &name, &version),
+                        ) else {
+                            continue;
+                        };
+                        // Only the finding on the revision the lock is decided on, while pending.
+                        if interface::status(route, &contract) != interface::Status::Proposed
+                            || found::contract_revision(route, &contract) != finding.revision
+                        {
+                            continue;
+                        }
+                        let subject = finding.subject.clone();
+                        let contract_digest = interface::digest(&route.project_id, &contract);
+                        let looked = digest_prefix(&contract_digest);
+                        let mut rows: Vec<Row> = vec![vec![
+                            button(
+                                "Lock",
+                                self.data(format!("clk:{project}:{subject}:{looked}")),
+                            ),
+                            button("Reject", self.data(format!("crj:{project}:{subject}"))),
+                        ]];
+                        if block {
+                            rows.push(vec![button(
+                                "Override the Block and lock",
+                                self.data(format!(
+                                    "cov:{project}:{subject}:{looked}.{}",
+                                    digest_prefix(&seen)
+                                )),
+                            )]);
+                        }
+                        (
+                            rows,
+                            format!("{project} - the adversary read contract {subject}"),
+                        )
                     }
-                    let subject = finding.subject.clone();
-                    let mut rows: Vec<Row> = vec![vec![
-                        button("Lock", self.data(format!("clk:{project}:{subject}"))),
-                        button("Reject", self.data(format!("crj:{project}:{subject}"))),
-                    ]];
-                    if block {
-                        rows.push(vec![button(
-                            "Override the Block and lock",
-                            self.data(format!("cov:{project}:{subject}")),
-                        )]);
+                    Trigger::PreDone => {
+                        // Advisory: the review card carries the Override itself.
+                        if policy.adversary != policy::AdversaryMode::Blocking || !block {
+                            continue;
+                        }
+                        let data = self.data(format!(
+                            "aov:{project}:{}:{}.{}",
+                            finding.subject,
+                            finding.revision,
+                            digest_prefix(&seen)
+                        ));
+                        (
+                            vec![vec![button("Override the Block", data)]],
+                            format!(
+                                "{project} - the adversary blocked {} r{}",
+                                finding.subject, finding.revision
+                            ),
+                        )
                     }
-                    (
-                        rows,
-                        format!("{project} - the adversary read contract {subject}"),
-                    )
-                }
-                Trigger::PreDone => {
-                    // Advisory: the review card carries the Override itself.
-                    if policy.adversary != policy::AdversaryMode::Blocking {
-                        continue;
-                    }
-                    let standing =
-                        found::standing(route, &finding.subject, finding.revision, finding.trigger);
-                    if !standing.is_some_and(|standing| standing.unresolved_block()) {
-                        continue;
-                    }
-                    let data = self.data(format!(
-                        "aov:{project}:{}:{}",
-                        finding.subject, finding.revision
-                    ));
-                    (
-                        vec![vec![button("Override the Block", data)]],
-                        format!(
-                            "{project} - the adversary blocked {} r{}",
-                            finding.subject, finding.revision
-                        ),
-                    )
-                }
-                Trigger::RepeatFailure => continue,
-            };
-            let key = format!("a:{project}:{}", finding.stem());
+                    Trigger::RepeatFailure => continue,
+                };
+            // A different finding on the same revision is a new card, with its own buttons.
+            let key = format!("a:{project}:{}:{}", finding.stem(), digest_prefix(&seen));
             if self.state.posted.contains(&key) {
                 continue;
             }
@@ -1849,10 +1869,34 @@ impl Bridge {
             if !self.state.seeded {
                 continue;
             }
-            let body: Vec<String> = finding_lines(&finding);
+            let body: Vec<String> = finding_lines(finding);
             actions.push(send(home, format!("{text}\n{}", body.join("\n")), buttons));
         }
         actions
+    }
+    /// Refuse a digest prefix that does not name exactly one contract in the project: a
+    /// button carries a prefix, not the whole digest, and a prefix that two contracts share
+    /// could be pressed against the wrong one.
+    fn named_contract(route: &ProjectRoute, name: &str, version: &str, prefix: &str) -> Result<()> {
+        use ferryman_channel::interface;
+        let prefix = prefix.trim().to_ascii_lowercase();
+        if prefix.len() < interface::DIGEST_MIN {
+            bail!("the contract changed since you looked: this button names no contract");
+        }
+        let sharing = interface::list_contracts(route)
+            .into_iter()
+            .filter(|contract| interface::digest(&route.project_id, contract).starts_with(&prefix))
+            .count();
+        let named = interface::read_contract(route, name, version).is_some_and(|contract| {
+            interface::digest(&route.project_id, &contract).starts_with(&prefix)
+        });
+        match (named, sharing) {
+            (true, 1) => Ok(()),
+            (true, _) => bail!("that button's digest names more than one contract; use the CLI"),
+            (false, _) => bail!(
+                "the contract changed since you looked: {name}@{version} is not what that card showed"
+            ),
+        }
     }
 
     /// The buttons on an adversary card, each signed for the master under the bridge's
@@ -1882,44 +1926,60 @@ impl Bridge {
         };
         let why = "overridden from Telegram";
         let outcome: Result<String> = match verb {
+            // `<revision>.<finding digest prefix or none>`: the finding on the card.
             "aov" => extra
-                .parse::<u32>()
-                .context("which revision?")
-                .and_then(|revision| {
-                    found::override_block(
+                .split_once('.')
+                .context("this button is from before overrides named what you read; ask again")
+                .and_then(|(revision, finding)| {
+                    let revision = revision.parse::<u32>().context("which revision?")?;
+                    found::override_or_waive(
                         &route,
                         id,
                         revision,
                         Trigger::PreDone,
+                        finding,
                         Some(why),
                         &principal,
                         &self.agent,
                     )
                     .map(|given| {
                         format!(
-                            "{id} r{revision}: the adversary's Block is overridden by {}. The \
+                            "{id} r{revision}: the adversary is answered, signed by {}. The \
                              review engine's key can be granted now.",
                             given.from()
                         )
                     })
                 }),
             _ => interface::parse_ref(id).and_then(|(name, version)| match verb {
-                "clk" => interface::lock(&route, &name, &version, &principal, &self.agent)
+                // `<contract digest prefix>`: the contract on the card.
+                "clk" => Self::named_contract(&route, &name, &version, extra)
+                    .and_then(|()| {
+                        interface::lock(&route, &name, &version, extra, &principal, &self.agent)
+                    })
                     .map(|_| format!("{id} locked by {}.", self.by(&principal))),
-                "cov" => interface::lock_overriding(
-                    &route,
-                    &name,
-                    &version,
-                    &principal,
-                    &self.agent,
-                    Some(why),
-                )
-                .map(|_| {
-                    format!(
-                        "{id} locked by {}, over the adversary's Block.",
-                        self.by(&principal)
-                    )
-                }),
+                // `<contract digest prefix>.<finding digest prefix or none>`.
+                "cov" => extra
+                    .split_once('.')
+                    .context("this button is from before overrides named what you read; ask again")
+                    .and_then(|(contract, finding)| {
+                        Self::named_contract(&route, &name, &version, contract)?;
+                        interface::lock_overriding(
+                            &route,
+                            &name,
+                            &version,
+                            contract,
+                            finding,
+                            &principal,
+                            &self.agent,
+                            Some(why),
+                        )
+                    })
+                    .map(|_| {
+                        format!(
+                            "{id} locked by {}, over the adversary's Block.",
+                            self.by(&principal)
+                        )
+                    }),
                 _ => interface::reject(&route, &name, &version, &principal, &self.agent)
                     .map(|_| format!("{id} rejected by {}.", self.by(&principal))),
             }),
@@ -1944,6 +2004,21 @@ impl Bridge {
             ],
         }
     }
+}
+
+/// The first 16 characters of a digest - what a button carries - or `none` whole.
+fn digest_prefix(digest: &str) -> &str {
+    digest.get(..16).unwrap_or(digest)
+}
+
+/// What the adversary's word on `order` r`revision` comes to, as an override must name it.
+fn found_seen(route: &ProjectRoute, order: &str, revision: u32) -> String {
+    ferryman_channel::adversary::finding_seen(
+        route,
+        order,
+        revision,
+        ferryman_channel::adversary::Trigger::PreDone,
+    )
 }
 
 /// The adversary's finding as card lines: the headline, then its worst issues.
@@ -1991,7 +2066,17 @@ fn decide_contract(
         bail!("that contract is gone, or no longer verifies");
     };
     if choice.eq_ignore_ascii_case(interface::LOCK) {
-        interface::lock(route, &contract.name, &contract.version, principal, signer)?;
+        // The question's id names the contract it was asked about (a digest prefix is in
+        // it), so the contract found by it is the one the master was shown.
+        let looked = interface::digest(&route.project_id, &contract);
+        interface::lock(
+            route,
+            &contract.name,
+            &contract.version,
+            &looked,
+            principal,
+            signer,
+        )?;
     } else if choice.eq_ignore_ascii_case(interface::REJECT) {
         interface::reject(route, &contract.name, &contract.version, principal, signer)?;
     } else {
@@ -2385,6 +2470,56 @@ mod tests {
         person("wisp", 3)
     }
 
+    /// An adversary: not the builder, and (once it has published an inventory) allowed to
+    /// say what counts.
+    fn scout() -> AgentIdentity {
+        person("scout", 7)
+    }
+
+    /// A second adversary, on another machine.
+    fn ranger() -> AgentIdentity {
+        person("ranger", 8)
+    }
+
+    /// Publish `who`'s signed engine inventory: deepseek, on `machine`. Asking twice is
+    /// harmless: the first inventory stands.
+    fn inventory(route: &ProjectRoute, who: &AgentIdentity, machine: &str) {
+        let _ = ferryman_channel::receipts::refresh_engines(
+            route,
+            who,
+            machine,
+            "0.0.0",
+            vec![ferryman_channel::receipts::EngineReport {
+                name: "deepseek".into(),
+                kind: "http".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                state: "up".into(),
+                until: None,
+                reason: None,
+                latency_ms: None,
+                balance: None,
+                checked_at: None,
+                trust: None,
+                billing: None,
+                class: None,
+            }],
+            Utc::now(),
+        );
+    }
+
+    /// Record `finding` as `scout`, whose inventory is published first.
+    fn scout_says(route: &ProjectRoute, finding: ferryman_channel::adversary::AdversaryFinding) {
+        inventory(route, &scout(), "grouchly");
+        ferryman_channel::adversary::record(route, &scout(), finding).unwrap();
+    }
+
+    /// Record `finding` as `ranger`, a second adversary.
+    fn ranger_says(route: &ProjectRoute, finding: ferryman_channel::adversary::AdversaryFinding) {
+        inventory(route, &ranger(), "beastly");
+        ferryman_channel::adversary::record(route, &ranger(), finding).unwrap();
+    }
     /// A channel mastered by josh, with the bridge and a worker on its roster.
     fn project(dir: &Path, id: &str) -> ProjectRoute {
         let communications = dir.join(format!("{id}-ferryman"));
@@ -2399,7 +2534,7 @@ mod tests {
             git_visibility: String::new(),
             agents: Vec::new(),
         };
-        for member in [josh(), person(BRIDGE, 2), wisp()] {
+        for member in [josh(), person(BRIDGE, 2), wisp(), scout(), ranger()] {
             let agent = AgentRoute {
                 name: member.name().into(),
                 role: "operator".into(),
@@ -3534,12 +3669,10 @@ mod tests {
         assert_eq!(texts(&first).len(), 1, "the contract's own card: {first:?}");
 
         // A Concern: the finding is shown with Lock and Reject, and nothing to override.
-        found::record(
+        scout_says(
             &ferryman,
-            &wisp(),
             adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Concern),
-        )
-        .unwrap();
+        );
         let concern = bridge.tick(Utc::now());
         let shown = texts(&concern).join("\n");
         assert!(
@@ -3559,12 +3692,12 @@ mod tests {
         );
 
         // A Block: an Override beside them, and only then.
-        found::record(
+        // (A second adversary: one signer says one thing per moment, and a contract nobody has
+        // built yet has only its shapes, revision 0.)
+        ranger_says(
             &ferryman,
-            &wisp(),
-            adversary_finding("user-api@1", 1, Trigger::ContractLock, Verdict::Block),
-        )
-        .unwrap();
+            adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
+        );
         let block = bridge.tick(Utc::now());
         let labels: Vec<String> = buttons(&block)
             .into_iter()
@@ -3592,7 +3725,7 @@ mod tests {
         );
         let locked = interface::locked(&ferryman, "user-api", "1").expect("locked");
         assert_eq!(locked.lock.unwrap().signed_by, "telegram-grouchly");
-        let standing = found::standing(&ferryman, "user-api@1", 1, Trigger::ContractLock).unwrap();
+        let standing = found::standing(&ferryman, "user-api@1", 0, Trigger::ContractLock).unwrap();
         assert_eq!(
             standing.overridden.unwrap().from(),
             "josh via telegram-grouchly"
@@ -3609,12 +3742,10 @@ mod tests {
         let _ = bridge.tick(Utc::now());
         proposed_user_api(&ferryman);
         let _ = bridge.tick(Utc::now());
-        found::record(
+        scout_says(
             &ferryman,
-            &wisp(),
             adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
-        )
-        .unwrap();
+        );
         set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Blocking);
         let block = bridge.tick(Utc::now());
         let refused = press_labelled(&mut bridge, &block, "Override the Block and lock", 122);
@@ -3638,13 +3769,176 @@ mod tests {
         let _ = bridge.tick(Utc::now());
         proposed_user_api(&ferryman);
         let _ = bridge.tick(Utc::now());
-        found::record(
+        scout_says(
             &ferryman,
-            &wisp(),
             adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
-        )
-        .unwrap();
+        );
         assert!(bridge.tick(Utc::now()).is_empty());
+    }
+
+    /// The text of every toast and message in `actions`, in one string.
+    fn said(actions: &[Action]) -> String {
+        actions
+            .iter()
+            .map(|action| match action {
+                Action::Send { text, .. }
+                | Action::Edit { text, .. }
+                | Action::Answer { text, .. } => text.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// A lock button decides on the contract its card showed: a button whose digest is not
+    /// the contract's (the proposal was replaced after the card was posted), or that names
+    /// none, locks nothing - and the one that names it does.
+    #[test]
+    fn a_lock_button_names_the_contract_it_was_shown_and_goes_stale_when_it_changes() {
+        use ferryman_channel::interface;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        let _ = bridge.tick(Utc::now());
+        proposed_user_api(&ferryman);
+        let digest = interface::current_digest(&ferryman, "user-api", "1").unwrap();
+
+        for data in [
+            "clk:ferryman:user-api@1:0000000000000000".to_string(),
+            "clk:ferryman:user-api@1:".to_string(),
+            format!("clk:ferryman:user-api@1:{}", &digest[..4]),
+        ] {
+            let refused = bridge.handle(press(JOSH_TG, GROUP, 150, &data), Utc::now());
+            assert!(
+                said(&refused).contains("changed since you looked"),
+                "{data}: {refused:?}"
+            );
+            assert!(
+                interface::locked(&ferryman, "user-api", "1").is_none(),
+                "{data}"
+            );
+        }
+        let locked = bridge.handle(
+            press(
+                JOSH_TG,
+                GROUP,
+                151,
+                &format!("clk:ferryman:user-api@1:{}", &digest[..16]),
+            ),
+            Utc::now(),
+        );
+        assert!(
+            said(&locked).contains("user-api@1 locked by josh"),
+            "{locked:?}"
+        );
+        assert!(interface::locked(&ferryman, "user-api", "1").is_some());
+    }
+
+    /// An override button names the adversary's word as its card showed it: when another
+    /// adversary speaks after the card went out, pressing it overrides and locks nothing,
+    /// and the card posted for the new word works.
+    #[test]
+    fn an_override_button_goes_stale_when_another_adversary_speaks_after_its_card() {
+        use ferryman_channel::adversary::{self as found, Trigger, Verdict};
+        use ferryman_channel::interface;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Blocking);
+        let _ = bridge.tick(Utc::now());
+        proposed_user_api(&ferryman);
+        let _ = bridge.tick(Utc::now());
+        scout_says(
+            &ferryman,
+            adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
+        );
+        let card = bridge.tick(Utc::now());
+        ranger_says(
+            &ferryman,
+            adversary_finding("user-api@1", 0, Trigger::ContractLock, Verdict::Block),
+        );
+        let stale = press_labelled(&mut bridge, &card, "Override the Block and lock", 160);
+        assert!(
+            said(&stale).contains("changed since you looked"),
+            "{stale:?}"
+        );
+        assert!(interface::locked(&ferryman, "user-api", "1").is_none());
+        assert!(
+            found::standing(&ferryman, "user-api@1", 0, Trigger::ContractLock)
+                .unwrap()
+                .unresolved_block(),
+            "a refused override overrides nothing"
+        );
+
+        let fresh = bridge.tick(Utc::now());
+        assert!(!fresh.is_empty(), "the new word gets its own card");
+        press_labelled(&mut bridge, &fresh, "Override the Block and lock", 161);
+        assert!(interface::locked(&ferryman, "user-api", "1").is_some());
+    }
+
+    /// The phone's Approve is held to the order's contract like every other way to accept:
+    /// a result that lacks what the order requires is refused with the reason, and the
+    /// revision that carries it is approved.
+    #[test]
+    fn approving_from_the_phone_a_result_that_breaks_the_orders_contract_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["review"]);
+        let _ = bridge.tick(Utc::now());
+        let mut order = ferryman_channel::Order {
+            id: "t-ctr".into(),
+            project_id: "ferryman".into(),
+            issued_by: "wisp".into(),
+            assigned_to: None,
+            created_at: Utc::now(),
+            payload: json!({ "task": "write the summary" }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: Some(ferryman_channel::contract::ResultContract {
+                required: vec!["summary".into()],
+                schema: None,
+            }),
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
+        };
+        wisp().sign_order(&mut order);
+        ferryman_channel::issue_order(&ferryman, &order).unwrap();
+        ferryman_channel::claim_order(&ferryman, "t-ctr", "wisp").unwrap();
+        let submit = |revision: u32, payload: Value| {
+            let mut result = ferryman_channel::TaskResult {
+                order_id: "t-ctr".into(),
+                agent: "wisp".into(),
+                revision,
+                submitted_at: Utc::now(),
+                payload,
+                signed_by: None,
+                signature: None,
+            };
+            wisp().sign_result(&mut result);
+            ferryman_channel::submit_result(&ferryman, &result).unwrap();
+        };
+        submit(1, json!({ "output": "done" }));
+        let refused = bridge.handle(press(JOSH_TG, GROUP, 170, "ok:ferryman:t-ctr"), Utc::now());
+        let shown = said(&refused);
+        assert!(shown.contains("Could not approve t-ctr"), "{shown}");
+        assert!(shown.contains("breaks the order's contract"), "{shown}");
+        assert!(
+            ferryman_channel::read_task(&ferryman, "t-ctr")
+                .unwrap()
+                .reviews
+                .is_empty(),
+            "nothing was recorded"
+        );
+
+        submit(2, json!({ "output": "done", "summary": "wrote it" }));
+        let approved = bridge.handle(press(JOSH_TG, GROUP, 171, "ok:ferryman:t-ctr"), Utc::now());
+        assert!(
+            said(&approved).contains("t-ctr r2 approved"),
+            "{approved:?}"
+        );
     }
 
     /// An improvement the worker finished, waiting for the review engine.
@@ -3715,12 +4009,10 @@ mod tests {
         delegate(&ferryman, &["review"]);
         let _ = bridge.tick(Utc::now());
         finished_improvement(&ferryman, "improve-2026-w40-1");
-        found::record(
+        scout_says(
             &ferryman,
-            &wisp(),
             adversary_finding("improve-2026-w40-1", 1, Trigger::PreDone, Verdict::Block),
-        )
-        .unwrap();
+        );
         engine_key(&ferryman, "improve-2026-w40-1");
 
         // Advisory: both keys are there, so the card is too - with the finding and an
@@ -3746,7 +4038,7 @@ mod tests {
         assert!(
             texts(&overridden)
                 .iter()
-                .any(|t| t.contains("overridden by josh via telegram-grouchly")),
+                .any(|t| t.contains("answered, signed by josh via telegram-grouchly")),
             "{overridden:?}"
         );
         assert!(
@@ -3765,12 +4057,10 @@ mod tests {
         set_adversary(&ferryman, ferryman_channel::policy::AdversaryMode::Blocking);
         let _ = bridge.tick(Utc::now());
         finished_improvement(&ferryman, "improve-2026-w40-2");
-        found::record(
+        scout_says(
             &ferryman,
-            &wisp(),
             adversary_finding("improve-2026-w40-2", 1, Trigger::PreDone, Verdict::Block),
-        )
-        .unwrap();
+        );
         engine_key(&ferryman, "improve-2026-w40-2");
         let task = ferryman_channel::read_task(&ferryman, "improve-2026-w40-2").unwrap();
         assert!(

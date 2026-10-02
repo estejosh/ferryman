@@ -1226,7 +1226,7 @@ function approvalsPanel(pd) {
           ? `<button class="btn primary" data-imp-approve="${esc(w.order_id)}">Approve</button> <button class="btn" data-imp-back="${esc(w.order_id)}">Send back</button>`
           : `<span class="badge">${w.ready_for_you ? "waiting for the master" : "waiting for the review engine"}</span>`}
           ${pd.may_decide && w.adversary_blocked
-            ? `<div style="margin-top:6px"><button class="btn" data-adv-override="${esc(w.order_id)}" data-adv-trigger="pre-done" data-adv-revision="${w.revision}">Override the Block</button></div>`
+            ? `<div style="margin-top:6px"><button class="btn" data-adv-override="${esc(w.order_id)}" data-adv-trigger="pre-done" data-adv-revision="${w.revision}" data-adv-finding="${esc(w.adversary && w.adversary.digest ? w.adversary.digest : "none")}">Override the Block</button></div>`
             : ""}</div>
       </div>`).join("");
   return `
@@ -1275,6 +1275,7 @@ function wireOverrides(report) {
             subject: b.dataset.advOverride, trigger: b.dataset.advTrigger,
             revision: b.dataset.advRevision ? Number(b.dataset.advRevision) : null,
             reason: reason.trim() || null,
+            finding: b.dataset.advFinding || "",
           }),
         });
         report(`${r.subject} r${r.revision}: Block overridden by ${r.overridden_by}.`);
@@ -2045,15 +2046,15 @@ pages.contracts = async () => {
           <span style="color:var(--faint)">proposed by ${esc(c.proposed_by)} ${esc(ago(c.proposed_at))}${c.locked_by ? `, locked by ${esc(c.locked_by)} ${esc(ago(c.locked_at))}` : ""}</span>
           ${d.may_decide && c.status === "proposed" ? `
             <span style="margin-left:auto">
-              <button class="btn" data-contract-lock="${esc(c.reference)}">Lock</button>
+              <button class="btn" data-contract-lock="${esc(c.reference)}" data-digest="${esc(c.digest)}">Lock</button>
               <button class="btn" data-contract-reject="${esc(c.reference)}">Reject</button>
             </span>` : ""}
         </div>
         ${c.description ? `<p>${esc(c.description)}</p>` : ""}
         ${(c.adversary || []).map(adversaryText).join("")}
-        ${d.may_decide && c.status === "proposed" && (c.adversary || []).some((x) => x.unresolved_block)
-          ? `<div style="margin-top:6px"><button class="btn" data-contract-override="${esc(c.reference)}">Override the Block and lock</button>
-              ${c.lock_refusal ? `<span class="s" style="color:var(--dim)">Locking is refused while it stands: adversary mode is blocking.</span>` : ""}</div>`
+        ${d.may_decide && c.status === "proposed" && c.lock_refusal
+          ? `<div style="margin-top:6px"><button class="btn" data-contract-override="${esc(c.reference)}" data-digest="${esc(c.digest)}" data-finding="${esc(c.finding_digest)}">${c.finding_digest === "none" ? "No adversary has read it - lock anyway" : "Override the Block and lock"}</button>
+              <span class="s" style="color:var(--dim)">${esc(c.lock_refusal)}</span></div>`
           : ""}
         <dl class="kv">
           ${c.request ? `<dt>Request</dt><dd><pre class="mono">${esc(shapeText(c.request))}</pre></dd>` : ""}
@@ -2069,7 +2070,11 @@ function wireContracts() {
   const decide = (attr, verb) => $$(`[${attr}]`).forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
     try {
-      await api(`/api/contracts/${encodeURIComponent(b.getAttribute(attr))}/${verb}`, { method: "POST" });
+      // A lock names the contract as this page showed it; it is refused if that changed.
+      const opts = verb === "lock"
+        ? { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ digest: b.dataset.digest || "" }) }
+        : { method: "POST" };
+      await api(`/api/contracts/${encodeURIComponent(b.getAttribute(attr))}/${verb}`, opts);
       await render();
     } catch (err) {
       const msg = b.closest(".row").querySelector(".contract-msg");
@@ -2087,7 +2092,7 @@ function wireContracts() {
     try {
       await api(`/api/contracts/${encodeURIComponent(b.getAttribute("data-contract-override"))}/lock`, {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ override: true, reason: reason.trim() || null }),
+        body: JSON.stringify({ override: true, reason: reason.trim() || null, digest: b.dataset.digest || "", finding: b.dataset.finding || "" }),
       });
       await render();
     } catch (err) {

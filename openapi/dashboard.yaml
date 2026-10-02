@@ -503,8 +503,12 @@ paths:
         are not listed. `may_decide` is true only for the signed-in master. Each contract
         carries what the adversary found (`adversary`, one standing finding per moment it
         has read it, empty when the adversary is off) and `lock_refusal`, the reason Lock
-        is refused while an unresolved Block stands in `blocking` mode (null otherwise).
-        `adversary_mode` is `off`, `advisory` or `blocking`.
+        is refused while an unresolved Block stands, or no eligible adversary has read the
+        contract at all, in `blocking` mode (null otherwise). `digest` is the contract as it
+        reads now and `finding_digest` the adversary's word on it (`none` when no eligible
+        adversary has read it): a Lock must send the first, an override both, so what is
+        locked or overridden is what this response showed. `adversary_mode` is `off`,
+        `advisory` or `blocking`.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
@@ -517,25 +521,32 @@ paths:
         Freezes `name@version` with a signature of the signed-in master (or a delegate
         holding the improve scope). A locked contract never changes; a change is a new
         version. Also answers the question Telegram asked, so its buttons go away. With the
-        adversary on `blocking`, an unresolved Block refuses this with 403 until the master
-        overrides it; `override` signs that and locks in one step (the body is optional).
+        adversary on `blocking`, an unresolved Block (or no eligible finding) refuses this
+        with 403 until the master overrides or waives it; `override` signs that and locks in
+        one step. The body must name what the master looked at: `digest` (the contract's,
+        at least 8 characters) and, with `override`, `finding` (the adversary's word, or
+        `none`), both from GET /api/contracts. A contract or finding that changed since is
+        refused with 403, "the contract changed since you looked".
       parameters:
         - {name: reference, in: path, required: true, schema: {type: string}}
         - {name: project, in: query, required: false, schema: {type: string}}
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
+              required: [digest]
               properties:
+                digest: {type: string, description: 'the contract digest from GET /api/contracts'}
                 override: {type: boolean}
+                finding: {type: string, description: 'with override: the finding_digest from GET /api/contracts, or none'}
                 reason: {type: string}
       responses:
         '200': {description: the contract, now locked}
-        '400': {description: not a name@version reference}
+        '400': {description: not a name@version reference, or no digest (or no finding with override)}
         '401': {description: no active session}
-        '403': {description: read-only, not the master, or an unresolved adversary Block in blocking mode}
+        '403': {description: read-only, not the master, the contract or finding changed since you looked, or an unresolved adversary Block in blocking mode}
         '404': {description: no genuine contract by that name}
         '409': {description: already locked or rejected}
   /api/contracts/{reference}/reject:
@@ -562,12 +573,15 @@ paths:
         before an improvement is called done. Returns the mode (`off`, `advisory` or
         `blocking`), the engine first in line, and every genuine finding newest first (its
         subject, revision, trigger, verdict, findings, engine, `same_engine` and any
-        override). Forged and unsigned findings are not listed. `may_override` is true only
-        for the signed-in master.
+        override) and its `digest`. Forged and unsigned findings are not listed. A finding
+        that does not count - from the agent that built the work, from a machine with no
+        signed engine inventory, one the policy's `machines` does not allow - is listed
+        under `ignored` with its `reason`. `may_override` is true only for the signed-in
+        master.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
-        '200': {description: 'project, mode, engine, may_override and findings'}
+        '200': {description: 'project, mode, engine, may_override, findings and ignored'}
   /api/adversary/override:
     post:
       summary: The master goes ahead despite the adversary's Block
@@ -575,7 +589,10 @@ paths:
         Signed with the session's key. For a contract it records the override, after which
         Lock goes through; for an improvement it lets the review engine's key be granted
         and auto-merge proceed. Only a genuine Block can be overridden, and the override is
-        for that revision only. The CLI equivalent is `ferry adversary override`.
+        for that revision only (the revision under decision when none is given). `finding` is
+        required: the finding's `digest` as the page showed it, or `none` to waive a decision
+        no eligible adversary has read; if what stands changed since, this is refused. The CLI
+        equivalent is `ferry adversary override`.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       requestBody:
@@ -584,18 +601,19 @@ paths:
           application/json:
             schema:
               type: object
-              required: [subject, trigger]
+              required: [subject, trigger, finding]
               properties:
                 subject: {type: string, description: 'an order id, or a contract as name@version'}
                 trigger: {type: string, enum: [contract-lock, repeat-failure, pre-done]}
                 revision: {type: integer}
                 reason: {type: string}
+                finding: {type: string, description: 'the finding digest the master saw, or none'}
       responses:
         '200': {description: 'subject, revision, trigger, overridden_by and reason'}
-        '400': {description: not a trigger}
+        '400': {description: not a trigger, or no finding named}
         '401': {description: no active session}
-        '403': {description: read-only, not the master, or there is no Block to override}
-        '404': {description: the adversary has not read that subject at that moment}
+        '403': {description: read-only, not the master, the finding changed since you looked, or there is no Block to override}
+        '404': {description: the subject has no such moment to decide}
   /api/master/claim-all:
     post:
       summary: The signed-in person becomes master of every project with none

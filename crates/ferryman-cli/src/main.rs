@@ -999,6 +999,15 @@ enum ContractCommand {
         /// Lock despite the adversary's Block, and say why. Signed as the master.
         #[arg(long = "override", value_name = "WHY")]
         override_reason: Option<String>,
+        /// The contract you read: the digest `ferry contract show` prints (at least 8
+        /// characters). Without it the contract is shown and you are asked to confirm; the
+        /// lock is refused if the contract is not the one you read.
+        #[arg(long, value_name = "DIGEST")]
+        digest: Option<String>,
+        /// With --override and --digest: the adversary finding you read (the digest
+        /// `ferry adversary show` prints, or `none` when no adversary has read it).
+        #[arg(long, value_name = "DIGEST")]
+        finding: Option<String>,
     },
     /// Decline a proposed contract. Only the master signs this.
     Reject {
@@ -7165,21 +7174,87 @@ fn contract_command(command: ContractCommand) -> Result<()> {
             reference,
             workspace,
             override_reason,
+            digest,
+            finding,
         } => {
             let route = here(workspace)?;
             let (name, version) = interface::parse_ref(&reference)?;
             let (master, identity) =
                 mastered_signer(&route.communications, &route.attachment, None)?;
+            let Some(contract) = interface::read_contract(&route, &name, &version) else {
+                bail!(
+                    "there is no genuine contract {reference} in {} (a forged, unsigned or \
+                     edited-after-lock file does not count)",
+                    route.project_id
+                );
+            };
+            // What the master looked at is what gets locked: the digest they name, or - at a
+            // terminal - the one shown here and confirmed.
+            let now = interface::digest(&route.project_id, &contract);
+            let finding_now = ferryman_channel::adversary::lock_finding_seen(&route, &contract);
+            let (expected, expected_finding) = match digest.as_deref() {
+                Some(named) => {
+                    let finding = match (&override_reason, finding.as_deref()) {
+                        (Some(_), Some(named)) => named.trim().to_string(),
+                        (Some(_), None) => bail!(
+                            "--override with --digest also needs --finding <digest|none>: the \
+                             adversary's word as you read it (`ferry adversary show {reference}`)"
+                        ),
+                        (None, _) => String::new(),
+                    };
+                    (named.trim().to_string(), finding)
+                }
+                None => {
+                    println!(
+                        "{} proposed by {}",
+                        contract.reference(),
+                        contract.proposed_by
+                    );
+                    if !contract.description.trim().is_empty() {
+                        println!("  {}", contract.description.trim());
+                    }
+                    if let Some(request) = &contract.request {
+                        println!("request:\n{}", serde_json::to_string_pretty(request)?);
+                    }
+                    println!(
+                        "response:\n{}",
+                        serde_json::to_string_pretty(&contract.response)?
+                    );
+                    for standing in adversary::standings(&route, &contract.reference()) {
+                        for line in adversary::lines(&standing, 4) {
+                            println!("  {line}");
+                        }
+                    }
+                    println!("digest: {}", now.get(..16).unwrap_or(&now));
+                    let looked = adversary::looked_at(
+                        None,
+                        &now,
+                        &format!(
+                            "Lock {}{}?",
+                            contract.reference(),
+                            if override_reason.is_some() {
+                                ", overriding the adversary"
+                            } else {
+                                ""
+                            }
+                        ),
+                        "--digest",
+                    )?;
+                    (looked, finding_now)
+                }
+            };
             let locked = match &override_reason {
                 Some(why) => interface::lock_overriding(
                     &route,
                     &name,
                     &version,
+                    &expected,
+                    &expected_finding,
                     &master,
                     &identity,
                     Some(why.as_str()),
                 )?,
-                None => interface::lock(&route, &name, &version, &master, &identity)?,
+                None => interface::lock(&route, &name, &version, &expected, &master, &identity)?,
             };
             println!(
                 "locked {} as {master}: it will not change; a change is a new version",
@@ -7222,6 +7297,9 @@ fn contract_command(command: ContractCommand) -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "contract": contract,
                         "status": status,
+                        "digest": interface::digest(&route.project_id, &contract),
+                        "finding_digest":
+                            ferryman_channel::adversary::lock_finding_seen(&route, &contract),
                         "orders": orders,
                         "adversary": adversary::standings(&route, &contract.reference())
                             .iter()
@@ -7244,6 +7322,8 @@ fn contract_command(command: ContractCommand) -> Result<()> {
             if !contract.description.trim().is_empty() {
                 println!("  {}", contract.description.trim());
             }
+            let digest = interface::digest(&route.project_id, &contract);
+            println!("  digest: {}", digest.get(..16).unwrap_or(&digest));
             for standing in adversary::standings(&route, &contract.reference()) {
                 for line in adversary::lines(&standing, 4) {
                     println!("  {line}");

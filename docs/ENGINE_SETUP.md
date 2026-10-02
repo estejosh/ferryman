@@ -564,11 +564,35 @@ cost go into the ledger like any improvement step.
 
 - `advisory` (the default): findings are shown; nothing waits on them. (The one exception
   is a High tamper hit at moment 2, which always sends the task back.)
-- `blocking`: a Block binds. A contract cannot be locked, the review engine's key cannot
-  be granted for that revision, and auto-merge never happens for it - until the master
-  signs an **override** (with a reason). Contracts need the `improve` delegation to
-  override from the phone; the other two need `review`.
+- `blocking`: a Block binds, and it fails closed. A contract cannot be locked, the review
+  engine's key cannot be granted for that revision, and auto-merge never happens for it,
+  until the master signs an **override** (with a reason) - or, when no eligible adversary
+  has read exactly that revision at all (see below), a signed **waiver** (the same
+  command, with `--finding none`). Contracts need the `improve` delegation to override
+  from the phone; the other two need `review`.
 - `off`: it is never asked, and nothing about it is shown.
+
+Changing the adversary's mode, or removing the adversary role, is the master's own signed
+act: a delegate (the phone, a dashboard session acting under a delegation) cannot loosen
+it.
+
+**Whose finding counts.** A finding is only heard when its signer did not build the work
+it judges, published a valid signed engine inventory that lists the engine the finding
+names, and is on a machine the policy's `machines` list allows. A finding is one signed
+file per signer (`adversary/<subject>-r<revision>-<moment>.<signer>.json`, and the file
+name must name the signer), so nobody can pre-empt or overwrite another adversary's word;
+several adversaries add up, and a Block from any of them stands. A finding that does not
+count is ignored and shown as `ignored: <reason>` in `ferry adversary show` and under
+`ignored` in the dashboard's `/api/adversary`. Findings count only on a revision that
+exists, and every gate decides on the revision under decision, never on the newest
+finding.
+
+**Overrides name what you read.** Locking and overriding are bound to what the master was
+looking at, so a proposal or a finding that changed in between is not acted on: the CLI
+shows the contract's digest and asks you to confirm at a terminal (or take
+`--digest <prefix of at least 8>` from `ferry contract show`, plus `--finding <digest|none>`
+with `--override`); the dashboard sends the digests `/api/contracts` gave; Telegram's
+buttons carry them. A mismatch is refused with "the contract changed since you looked".
 
 **Who challenges.** The adversary is a role in the engine policy and follows the same
 rules as background work: blocked engines and machines are skipped and paid engines need
@@ -583,8 +607,10 @@ ferry engines policy set --role adversary --prefer deepseek --adversary blocking
 
 ferry adversary list                      # every finding, newest first
 ferry adversary show improve-2026-w40-1   # one order (or: user-api@1)
-ferry adversary override user-api@1 --reason "the consumer ships a fix first"
-ferry contract lock user-api@1 --override "the consumer ships a fix first"
+ferry adversary override user-api@1 --reason "the consumer ships a fix first"  # shows the finding, asks to confirm
+ferry adversary override user-api@1 --finding 0123456789abcdef --reason "..."   # or name the finding you read
+ferry contract lock user-api@1 --override "the consumer ships a fix first"      # shows the digest, asks to confirm
+ferry contract lock user-api@1 --digest 89abcdef --override "..." --finding none # no prompt: name what you read
 ```
 
 `ferry adversary check` asks about everything waiting now; the improve loop does it on
