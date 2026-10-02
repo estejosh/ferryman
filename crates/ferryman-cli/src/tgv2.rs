@@ -780,6 +780,10 @@ impl Bridge {
                     self.data(format!("pam:{project}:low-risk")),
                 )
             }],
+            vec![button(
+                "Use team preset",
+                self.data(format!("ptm:{project}")),
+            )],
         ];
         let mut names: Vec<String> = Vec::new();
         for engine in &fleet {
@@ -853,6 +857,50 @@ impl Bridge {
             format!("Pick {project}'s improvement engine: it plans and builds self-improvements.")
         };
         (text, rows)
+    }
+
+    /// The team preset for `project`: plan on high, build on medium, swarm the cheap work.
+    /// Roles already opened to a capped subscription stay open; nothing else is assumed.
+    fn team_proposal(
+        &self,
+        project: &str,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<(policy::Recommendation, Vec<String>), String> {
+        let route = self
+            .route(project)
+            .ok_or_else(|| format!("{project} is not here"))?;
+        let (current, _) = policy::effective(&route.communications, &route.project_id);
+        let options = policy::TeamOptions {
+            subscription_roles: current.subscription_roles,
+            ..policy::TeamOptions::default()
+        };
+        let proposal = policy::team_for(route, now, &options);
+        let warnings = policy::subscription_warnings(&proposal.policy, &policy::fleet(route, now));
+        Ok((proposal, warnings))
+    }
+
+    /// What the team preset would sign, with a reason per choice and an Accept button.
+    fn team_view(&mut self, project: &str, now: DateTime<Utc>) -> (String, Vec<Row>) {
+        let (proposal, warnings) = match self.team_proposal(project, now) {
+            Ok(found) => found,
+            Err(why) => return (why, vec![menu_row()]),
+        };
+        let mut lines = vec![format!(
+            "Team preset for {project}: plan on high, build on medium, swarm the cheap work. \
+             Nothing changes until you accept."
+        )];
+        lines.extend(proposal.policy.describe());
+        lines.push("Why:".to_string());
+        lines.extend(proposal.reasons.iter().map(|reason| format!("- {reason}")));
+        lines.extend(warnings.iter().map(|warning| format!("Warning: {warning}")));
+        let rows = vec![
+            vec![button(
+                "Accept team preset",
+                self.data(format!("ptma:{project}")),
+            )],
+            vec![button("Back to engines", "engines")],
+        ];
+        (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
     }
 
     /// Change a project's engine policy as its master, signed by the bridge under the
@@ -1122,6 +1170,20 @@ impl Bridge {
                         "sre" => format!("{engine} reviews {project}"),
                         _ => format!("Recommended engines set for {project}"),
                     },
+                    Ok(false) => "Already so".to_string(),
+                    Err(why) => excerpt(&why, 190),
+                };
+                Some(self.engines_view(chat, now))
+            }
+            "ptm" => Some(self.team_view(&project, now)),
+            "ptma" => {
+                // The proposal is made again from the channel as it is now, and the
+                // policy's own checks run before it is signed.
+                let outcome = self.team_proposal(&project, now).and_then(|(proposal, _)| {
+                    self.change_policy(&project, move |_, _| Some(proposal.policy))
+                });
+                toast = match outcome {
+                    Ok(true) => format!("Team preset signed for {project}"),
                     Ok(false) => "Already so".to_string(),
                     Err(why) => excerpt(&why, 190),
                 };
@@ -2953,6 +3015,7 @@ mod tests {
             checked_at: None,
             trust: None,
             billing: None,
+            class: None,
         };
         let now = Utc::now();
         ferryman_channel::receipts::refresh_engines(
@@ -3004,6 +3067,7 @@ mod tests {
                 checked_at: None,
                 trust: None,
                 billing: None,
+                class: None,
             };
         ferryman_channel::receipts::refresh_engines(
             route,
@@ -3076,6 +3140,48 @@ mod tests {
             now_in_force.preferences(policy::Role::Build),
             ["name:nemotron", "name:deepseek"]
         );
+    }
+
+    /// "Use team preset" shows what the preset would sign, with a reason per choice, and
+    /// changes nothing until Accept - which needs the improve delegation like every other
+    /// policy button.
+    #[test]
+    fn the_team_preset_is_shown_with_reasons_and_signed_only_on_accept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        three_engines(&ferryman);
+        let view = bridge.handle(press(JOSH_TG, GROUP, 100, "engines"), Utc::now());
+        let proposal = press_labelled(&mut bridge, &view, "Use team preset", 100);
+        let shown = texts(&proposal).join("\n");
+        assert!(shown.contains("Team preset for ferryman"), "{shown}");
+        assert!(shown.contains("Why:"), "{shown}");
+        assert!(shown.contains("build: effort medium, width 3"), "{shown}");
+        assert!(shown.contains("up to 3 at once"), "{shown}");
+        assert!(
+            policy::setting(&ferryman.communications, "ferryman").is_none(),
+            "looking signs nothing"
+        );
+
+        // Not delegated: refused, nothing signed.
+        let refused = press_labelled(&mut bridge, &proposal, "Accept team preset", 100);
+        assert!(
+            matches!(&refused[0], Action::Answer { text, .. } if text.contains("delegated")),
+            "{refused:?}"
+        );
+        assert!(policy::setting(&ferryman.communications, "ferryman").is_none());
+
+        delegate(&ferryman, &["improve"]);
+        let accepted = press_labelled(&mut bridge, &proposal, "Accept team preset", 100);
+        assert!(
+            matches!(&accepted[0], Action::Answer { text, .. } if text.starts_with("Team preset signed")),
+            "{accepted:?}"
+        );
+        let (set, setting) = policy::effective(&ferryman.communications, "ferryman");
+        assert_eq!(setting.unwrap().set_by(), "josh via telegram-grouchly");
+        assert_eq!(set.width_for(policy::Role::Build), Some(3));
+        assert_eq!(set.width_for(policy::Role::Chore), Some(4));
+        assert_eq!(set.effort_for(policy::Role::Plan), policy::Effort::High);
+        assert!(set.subscription_roles.is_empty(), "subscriptions stay out");
     }
 
     /// Held work's question arrives with buttons; "Accept recommended" answers it and

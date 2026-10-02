@@ -2755,6 +2755,15 @@ fn improve_status(as_json: bool) -> Result<()> {
                 "engine_policy": enginepolicy::source(
                     ferryman_channel::policy::setting(channel, project).as_ref()
                 ),
+                // Effort, width and the size class first in line, per role.
+                "roles": route.as_ref().map_or_else(Vec::new, |route| {
+                    let (policy, _) = ferryman_channel::policy::effective(
+                        &route.communications,
+                        &route.project_id,
+                    );
+                    let fleet = ferryman_channel::policy::fleet(route, chrono::Utc::now());
+                    ferryman_channel::policy::role_lines(&policy, &fleet)
+                }),
                 "who": who,
                 "adversary": route.as_ref().map(ferryman_ops::adversary::summary),
                 "spend": spend
@@ -2809,6 +2818,9 @@ fn improve_status(as_json: bool) -> Result<()> {
                 "",
                 row["engine_policy"].as_str().unwrap_or_default()
             );
+            for line in row["roles"].as_array().into_iter().flatten() {
+                println!("{:<24}   {}", "", line.as_str().unwrap_or_default());
+            }
         }
         for step in row["who"].as_array().into_iter().flatten() {
             if let Ok(step) = serde_json::from_value::<ferryman_channel::policy::Step>(step.clone())
@@ -3058,10 +3070,19 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                 .latency_ms
                 .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
                 .unwrap_or_default();
+            // The size class its worker declared, else guessed from the model's name.
+            let class = engine.class.clone().unwrap_or_else(|| {
+                ferryman_channel::policy::guess_class(
+                    engine.model.as_deref().unwrap_or(&engine.name),
+                )
+                .as_str()
+                .to_string()
+            });
             println!(
-                "  {:<12} {:<6} {:<12} {:<30} {:<36} {:>7} {}",
+                "  {:<12} {:<6} {:<6} {:<12} {:<30} {:<36} {:>7} {}",
                 engine.name,
                 engine.tier,
+                class,
                 engine.paid,
                 state,
                 engine.model.as_deref().unwrap_or("-"),
@@ -3112,6 +3133,10 @@ fn print_policies(at: &Targets) -> Result<()> {
         }];
         lines.extend(policy.describe());
         lines.extend(ferryman_channel::policy::summary(&policy, &fleet));
+        lines.extend(ferryman_channel::policy::role_lines(&policy, &fleet));
+        lines.extend(ferryman_channel::policy::subscription_warnings(
+            &policy, &fleet,
+        ));
         match blocks.iter_mut().find(|(_, shown)| *shown == lines) {
             Some((projects, _)) => projects.push(route.project_id.clone()),
             None => blocks.push((vec![route.project_id.clone()], lines)),
@@ -3124,8 +3149,8 @@ fn print_policies(at: &Targets) -> Result<()> {
         }
     }
     println!(
-        "\nChange it: ferry engines policy recommend | accept | set --prefer <engine> --never \
-         <engine> --where <machine> [--all]"
+        "\nChange it: ferry engines policy recommend | team | accept | set --prefer <engine> \
+         --never <engine> --where <machine> --effort role=level --width role=n [--all]"
     );
     Ok(())
 }

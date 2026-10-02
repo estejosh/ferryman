@@ -6303,6 +6303,71 @@ mod tests {
             Some("nvidia/nemotron-3-super-120b-a12b")
         );
     }
+    /// The fenced block of docs/ENGINE_SETUP.md that starts with `first`.
+    fn doc_block(first: &str) -> &'static str {
+        let doc = include_str!("../../../docs/ENGINE_SETUP.md");
+        let start = doc
+            .find(first)
+            .unwrap_or_else(|| panic!("{first} is in the doc"));
+        &doc[start..start + doc[start..].find("```").unwrap()]
+    }
+
+    /// The team-preset examples in docs/ENGINE_SETUP.md parse, and say what the doc says.
+    #[test]
+    fn the_documented_team_examples_parse_as_described() {
+        use ferryman_channel::policy::ModelClass;
+        let free = AgentConfig::parse(doc_block("agent = \"grouchly-team\"")).unwrap();
+        assert_eq!(free.max_parallel, 3);
+        let names: Vec<&str> = free.engines.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["nemotron", "deepseek", "reasoner", "local"]);
+        let class = |name: &str| {
+            free.engines
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap()
+                .class()
+        };
+        assert_eq!(class("nemotron"), ModelClass::Medium);
+        assert_eq!(class("deepseek"), ModelClass::Medium);
+        assert_eq!(class("reasoner"), ModelClass::Large);
+        assert_eq!(class("local"), ModelClass::Small);
+        assert!(
+            free.engines
+                .iter()
+                .all(|e| e.paid != crate::engines::Paid::Subscription),
+            "the free default spends no subscription"
+        );
+        assert!(free.engines[2].supports_effort);
+
+        let claude = AgentConfig::parse(doc_block("agent = \"grouchly-claude\"")).unwrap();
+        assert_eq!(claude.max_parallel, 3);
+        let [sonnet, haiku] = claude.engines.as_slice() else {
+            panic!("two engines: {:?}", claude.engines)
+        };
+        assert_eq!(sonnet.paid, crate::engines::Paid::Subscription);
+        assert_eq!(haiku.paid, crate::engines::Paid::Subscription);
+        assert_eq!(sonnet.weekly_requests, Some(200));
+        assert_eq!(haiku.weekly_requests, Some(500));
+        assert_eq!(sonnet.class(), ModelClass::Medium);
+        assert_eq!(haiku.class(), ModelClass::Small);
+
+        // The effort examples: each parses, whatever the CLI behind it would make of it.
+        let effort = format!(
+            "agent = \"a\"\ncommand = \"c\"\nengines = [\"codex\",\"mycli\",\"gateway\"]\n{}",
+            doc_block("# Example only: codex takes a reasoning effort")
+        );
+        let config = AgentConfig::parse(&effort).unwrap();
+        let [codex, mycli, gateway] = config.engines.as_slice() else {
+            panic!("three engines: {:?}", config.engines)
+        };
+        assert!(codex.applies_effort() && mycli.applies_effort() && gateway.applies_effort());
+        assert!(
+            codex
+                .cli_args_at(Some(ferryman_channel::policy::Effort::High))
+                .contains(&"model_reasoning_effort=high".to_string())
+        );
+    }
+
     /// Two endpoint engines: the first answers every prompt with "Insufficient
     /// Balance", the way grouchly's DeepSeek did; the second works.
     const TWO_ENGINES: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
@@ -6893,8 +6958,8 @@ mod tests {
             "documented in the generated file"
         );
         assert!(
-            AgentConfig::parse(&rendered.replace("command = \"claude\"", "command = \"claude\""))
-                .is_ok()
+            AgentConfig::parse(&rendered).is_ok(),
+            "the generated file still parses"
         );
     }
 

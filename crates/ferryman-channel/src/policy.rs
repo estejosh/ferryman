@@ -324,7 +324,7 @@ impl ModelClass {
 pub fn guess_class(model: &str) -> ModelClass {
     let lower = model.to_ascii_lowercase();
     let tokens: Vec<&str> = lower
-        .split(|c: char| matches!(c, '-' | '_' | '/' | ':' | ' ' | '@'))
+        .split(['-', '_', '/', ':', ' ', '@'])
         .filter(|token| !token.is_empty())
         .collect();
     // `70b`, `1.5b`; and `a12b`, the active parameters of a mixture of experts.
@@ -1899,6 +1899,47 @@ pub fn team(engines: &[Candidate], online: &[String], options: &TeamOptions) -> 
 #[must_use]
 pub fn team_for(route: &ProjectRoute, now: DateTime<Utc>, options: &TeamOptions) -> Recommendation {
     team(&fleet(route, now), &online(route, now), options)
+}
+
+/// Warnings for the roles `policy.subscription_roles` opens to subscriptions: a
+/// subscription engine with no `weekly_requests` cap stays blocked (a swarm could drain
+/// it), and a role that lists the opt-in while the fleet has no capped subscription gets
+/// nothing from it. One line each, for the CLI, the dashboard and the phone.
+#[must_use]
+pub fn subscription_warnings(policy: &Policy, engines: &[Candidate]) -> Vec<String> {
+    if policy.subscription_roles.is_empty() {
+        return Vec::new();
+    }
+    let merged = merge_engines(engines);
+    let roles: Vec<&str> = policy
+        .subscription_roles
+        .iter()
+        .map(|role| role.as_str())
+        .collect();
+    let roles = roles.join(", ");
+    let mut lines = Vec::new();
+    let mut capped = false;
+    for engine in &merged {
+        if engine.paid_class() != "subscription" {
+            continue;
+        }
+        if engine.weekly_requests.is_some() {
+            capped = true;
+        } else {
+            lines.push(format!(
+                "{} is a subscription with no weekly_requests cap, so it stays out of {roles}: \
+                 set weekly_requests on its engine in agent.toml to let a swarm use it",
+                engine.name
+            ));
+        }
+    }
+    if !capped {
+        lines.push(format!(
+            "subscription_roles lists {roles}, but no subscription engine with a weekly_requests \
+             cap is published, so it changes nothing yet"
+        ));
+    }
+    lines
 }
 
 // --- width: how many orders at once -------------------------------------------------------
@@ -3836,5 +3877,28 @@ mod tests {
             "{}",
             with.describe()
         );
+    }
+
+    #[test]
+    fn a_subscription_opt_in_warns_when_the_engine_has_no_weekly_cap() {
+        let mut sonnet = sized("claude-sonnet", "claude-sonnet-4", "build", "subscription");
+        let policy = Policy {
+            subscription_roles: vec![Role::Build, Role::Chore],
+            ..Policy::default()
+        };
+        assert!(subscription_warnings(&Policy::default(), &[sonnet.clone()]).is_empty());
+        let uncapped = subscription_warnings(&policy, &[sonnet.clone()]);
+        assert!(
+            uncapped
+                .iter()
+                .any(|line| line.contains("claude-sonnet") && line.contains("build, chore")),
+            "{uncapped:?}"
+        );
+        assert!(uncapped.iter().any(|line| line.contains("changes nothing")));
+        sonnet.weekly_requests = Some(200);
+        assert!(subscription_warnings(&policy, &[sonnet]).is_empty());
+        // No subscription at all: the opt-in does nothing, and says so.
+        let none = subscription_warnings(&policy, &fleet_for_team());
+        assert_eq!(none.len(), 1, "{none:?}");
     }
 }

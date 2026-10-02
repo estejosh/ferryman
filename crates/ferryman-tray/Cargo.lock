@@ -951,6 +951,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "ferryman-channel",
+ "futures-util",
  "hostname",
  "opentelemetry",
  "opentelemetry-otlp",

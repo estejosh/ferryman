@@ -5,12 +5,13 @@
 //! Setting it takes the master's signature, exactly as `ferry improve on` does, and the
 //! signed file travels with the channel to every machine.
 
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use chrono::Utc;
-use ferryman_channel::policy::{self, NeverScope, Policy, Role};
+use ferryman_channel::policy::{self, Effort, NeverScope, Policy, Role, TeamOptions};
 use serde_json::{Value, json};
 
 use super::{
@@ -41,6 +42,38 @@ pub(crate) enum PolicyCommand {
     Accept {
         #[command(flatten)]
         which: ImproveProject,
+    },
+    /// The team preset - plan on high, build on medium, swarm the cheap work - proposed
+    /// from the engines the fleet published, with one reason per choice. Nothing is
+    /// signed unless you add `--accept`.
+    ///
+    /// A large judge plans and reviews at high effort; mid-size engines build at medium,
+    /// three at once; the smallest do chores at low effort, four at once; the adversary
+    /// is a large judge of another model family than the top builder. Subscriptions stay
+    /// out of background work unless you name the role in `--allow-subscriptions-for`, and
+    /// then only an engine with a `weekly_requests` cap is used.
+    ///
+    ///   ferry engines policy team myproject --allow-subscriptions-for build,chore --width build=4
+    ///   ferry engines policy team --all --accept
+    Team {
+        #[command(flatten)]
+        which: ImproveProject,
+        /// Roles whose background work may use a capped subscription: plan, build,
+        /// review, chore or adversary, comma-separated.
+        #[arg(long, value_name = "ROLES", value_delimiter = ',')]
+        allow_subscriptions_for: Vec<String>,
+        /// Orders at once for a role, instead of the preset's: `build=3`; repeat.
+        #[arg(long, value_name = "ROLE=N")]
+        width: Vec<String>,
+        /// Effort for a role, instead of the preset's: `build=medium` (low, medium or
+        /// high); repeat.
+        #[arg(long, value_name = "ROLE=LEVEL")]
+        effort: Vec<String>,
+        /// Sign the proposal as the project's policy.
+        #[arg(long)]
+        accept: bool,
+        #[arg(long)]
+        json: bool,
     },
     /// Change the policy, signed as the project's master. Only what you name changes.
     ///
@@ -96,6 +129,20 @@ pub(crate) enum PolicyCommand {
         ///   ferry engines policy set --role adversary --prefer deepseek --adversary blocking
         #[arg(long, value_name = "off|advisory|blocking", value_parser = policy::AdversaryMode::parse)]
         adversary: Option<policy::AdversaryMode>,
+        /// How hard a role thinks: `build=medium`, `plan=high`, `chore=low`; repeat. The
+        /// engine's `{effort}` argument, `effort_args` or reasoning field gets it.
+        #[arg(long, value_name = "ROLE=LEVEL")]
+        effort: Vec<String>,
+        /// The most orders of a role claimed at once across the fleet: `build=3`; repeat.
+        /// `build=none` removes the cap.
+        #[arg(long, value_name = "ROLE=N")]
+        width: Vec<String>,
+        /// Roles whose background work may use a subscription - only one with a
+        /// `weekly_requests` cap, comma-separated; `none` clears the list.
+        ///
+        ///   ferry engines policy set --allow-subscriptions-for build,chore
+        #[arg(long, value_name = "ROLES", value_delimiter = ',')]
+        allow_subscriptions_for: Vec<String>,
     },
     /// Go back to auto, signed.
     Clear {
@@ -128,6 +175,186 @@ pub(crate) fn recommendation(channel: &Path) -> policy::Recommendation {
     }
 }
 
+/// The team preset for the project in `channel`.
+pub(crate) fn team_proposal(channel: &Path, options: &TeamOptions) -> policy::Recommendation {
+    match ferryman_channel::route_for(channel) {
+        Ok(route) => policy::team_for(&route, Utc::now(), options),
+        Err(_) => policy::team(&[], &[], options),
+    }
+}
+
+/// `--allow-subscriptions-for build,chore`: the roles, or `Some([])` for `none`. `None`
+/// when the flag is absent.
+fn parse_roles(flag: &str, values: &[String]) -> Result<Option<Vec<Role>>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut roles: Vec<Role> = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        let role = Role::parse(value).map_err(|error| anyhow::anyhow!("{flag}: {error}"))?;
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    roles.sort();
+    Ok(Some(roles))
+}
+
+/// `build=medium`, `plan=high`: role and value, split once at `=`.
+fn pairs<'a>(flag: &str, values: &'a [String]) -> Result<Vec<(Role, &'a str)>> {
+    values
+        .iter()
+        .map(|value| {
+            let (role, setting) = value
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("{flag} wants ROLE=VALUE, not '{value}'"))?;
+            let role =
+                Role::parse(role.trim()).map_err(|error| anyhow::anyhow!("{flag}: {error}"))?;
+            Ok((role, setting.trim()))
+        })
+        .collect()
+}
+
+fn parse_efforts(values: &[String]) -> Result<BTreeMap<Role, Effort>> {
+    pairs("--effort", values)?
+        .into_iter()
+        .map(|(role, level)| {
+            Effort::parse(level)
+                .map(|effort| (role, effort))
+                .map_err(|error| anyhow::anyhow!("--effort {}: {error}", role.as_str()))
+        })
+        .collect()
+}
+
+/// `build=3` is a cap; `build=none` is `None`, no cap.
+fn parse_widths(values: &[String]) -> Result<BTreeMap<Role, Option<u8>>> {
+    pairs("--width", values)?
+        .into_iter()
+        .map(|(role, width)| {
+            if matches!(width.to_ascii_lowercase().as_str(), "none" | "unlimited") {
+                return Ok((role, None));
+            }
+            match width.parse::<u8>() {
+                Ok(0) => bail!(
+                    "--width {}=0 would stop the role; use a number from 1, or none for no cap",
+                    role.as_str()
+                ),
+                Ok(width) => Ok((role, Some(width))),
+                Err(_) => bail!(
+                    "--width {} wants a number from 1 to 255, or none, not '{width}'",
+                    role.as_str()
+                ),
+            }
+        })
+        .collect()
+}
+
+/// What `ferry engines policy team` was asked for, as [`TeamOptions`].
+fn team_options(
+    subscription_roles: &[String],
+    width: &[String],
+    effort: &[String],
+) -> Result<TeamOptions> {
+    let mut widths = BTreeMap::new();
+    for (role, width) in parse_widths(width)? {
+        match width {
+            Some(width) => widths.insert(role, width),
+            None => bail!(
+                "--width {}=none: the team preset always caps a role; set it afterwards with \
+                 `ferry engines policy set --width {}=none`",
+                role.as_str(),
+                role.as_str()
+            ),
+        };
+    }
+    Ok(TeamOptions {
+        subscription_roles: parse_roles("--allow-subscriptions-for", subscription_roles)?
+            .unwrap_or_default(),
+        width: widths,
+        effort: parse_efforts(effort)?,
+    })
+}
+
+/// The options as the flags that make them, to print under a proposal.
+fn options_flags(options: &TeamOptions) -> String {
+    let mut flags = String::new();
+    if !options.subscription_roles.is_empty() {
+        flags.push_str(&format!(
+            " --allow-subscriptions-for {}",
+            options
+                .subscription_roles
+                .iter()
+                .map(|role| role.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    for (role, width) in &options.width {
+        flags.push_str(&format!(" --width {}={width}", role.as_str()));
+    }
+    for (role, effort) in &options.effort {
+        flags.push_str(&format!(" --effort {}={}", role.as_str(), effort.as_str()));
+    }
+    flags
+}
+
+/// `ferry engines policy team`: show the proposal for each project; with `accept`, sign it.
+fn team(which: &ImproveProject, options: &TeamOptions, accept: bool, as_json: bool) -> Result<()> {
+    if accept && as_json {
+        bail!(
+            "--accept and --json do not combine: read the proposal, then accept it without --json"
+        );
+    }
+    let mut out: Vec<Value> = Vec::new();
+    for (project, channel, _) in projects(which)? {
+        let proposal = team_proposal(&channel, options);
+        let warnings = policy::subscription_warnings(&proposal.policy, &fleet(&channel));
+        if as_json {
+            out.push(json!({
+                "project": project,
+                "policy": proposal.policy,
+                "reasons": proposal.reasons,
+                "warnings": warnings,
+            }));
+            continue;
+        }
+        println!(
+            "{project}: team preset{}",
+            if accept { "" } else { " (proposal)" }
+        );
+        for line in proposal.policy.describe() {
+            println!("  {line}");
+        }
+        println!("  why:");
+        for reason in &proposal.reasons {
+            println!("    - {reason}");
+        }
+        for warning in &warnings {
+            println!("  warning: {warning}");
+        }
+        if !accept {
+            println!(
+                "  accept it: ferry engines policy team {project} --accept{}",
+                options_flags(options)
+            );
+        }
+    }
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    }
+    if accept {
+        let options = options.clone();
+        sign_each(which, "set to the team preset", move |_, channel, _| {
+            Ok(Some(team_proposal(channel, &options).policy))
+        })?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
     match command {
         PolicyCommand::Show { which, json } => show(&which, json),
@@ -141,6 +368,17 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
         PolicyCommand::Accept { which } => sign_each(&which, "accepted", |_, channel, _| {
             Ok(Some(recommendation(channel).policy))
         }),
+        PolicyCommand::Team {
+            which,
+            allow_subscriptions_for,
+            width,
+            effort,
+            accept,
+            json,
+        } => {
+            let options = team_options(&allow_subscriptions_for, &width, &effort)?;
+            team(&which, &options, accept, json)
+        }
         PolicyCommand::Set {
             which,
             improve,
@@ -154,7 +392,14 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             never_applies_to,
             auto_merge,
             adversary,
+            effort,
+            width,
+            allow_subscriptions_for,
         } => {
+            let efforts = parse_efforts(&effort)?;
+            let widths = parse_widths(&width)?;
+            let subscription_roles =
+                parse_roles("--allow-subscriptions-for", &allow_subscriptions_for)?;
             // The adversary is never a default: `--prefer deepseek` with no `--role` sets
             // the four roles that build and judge, and leaves who challenges them alone.
             let roles: Vec<Role> = if roles.is_empty() {
@@ -183,11 +428,14 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 && scope.is_none()
                 && auto_merge.is_none()
                 && adversary.is_none()
+                && efforts.is_empty()
+                && widths.is_empty()
+                && subscription_roles.is_none()
             {
                 bail!(
                     "nothing to set: name --improve, --review, --prefer, --never, --where, \
-                     --cap-usd, --protect-subscriptions, --never-applies-to, --auto-merge or \
-                     --adversary"
+                     --cap-usd, --protect-subscriptions, --never-applies-to, --auto-merge, \
+                     --adversary, --effort, --width or --allow-subscriptions-for"
                 );
             }
             sign_each(&which, "set", |_, _, mut current| {
@@ -228,6 +476,16 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 }
                 if let Some(mode) = adversary {
                     current.adversary = mode;
+                }
+                current.effort.extend(efforts.clone());
+                for (role, width) in &widths {
+                    match width {
+                        Some(width) => current.width.insert(*role, *width),
+                        None => current.width.remove(role),
+                    };
+                }
+                if let Some(roles) = &subscription_roles {
+                    current.subscription_roles.clone_from(roles);
                 }
                 Ok(Some(current))
             })
@@ -304,6 +562,7 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
                 "set_at": setting.as_ref().map(|s| s.set_at),
                 "policy": policy,
                 "effective": policy::view(&policy, &engines),
+                "warnings": policy::subscription_warnings(&policy, &engines),
             }));
             continue;
         }
@@ -317,6 +576,13 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
             println!("  now, over the engines the fleet published:");
             for line in policy::summary(&policy, &engines) {
                 println!("    {line}");
+            }
+            println!("  effort, width and size class per role:");
+            for line in policy::role_lines(&policy, &engines) {
+                println!("    {line}");
+            }
+            for warning in policy::subscription_warnings(&policy, &engines) {
+                println!("  warning: {warning}");
             }
         }
     }
@@ -557,5 +823,107 @@ mod tests {
         assert!(Cli::try_parse_from(["policy", "set", "--adversary", "sometimes"]).is_err());
         // Without --role the building roles are set; who challenges is its own choice.
         assert!(!Role::BUILDING.contains(&Role::Adversary));
+    }
+
+    #[test]
+    fn the_team_command_and_the_effort_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "policy",
+            "team",
+            "ferryman",
+            "--allow-subscriptions-for",
+            "build,chore",
+            "--width",
+            "build=4",
+            "--effort",
+            "plan=high",
+            "--accept",
+        ])
+        .unwrap();
+        let PolicyCommand::Team {
+            allow_subscriptions_for,
+            width,
+            effort,
+            accept,
+            json,
+            ..
+        } = cli.command
+        else {
+            panic!("not team")
+        };
+        assert!(accept && !json);
+        assert_eq!(allow_subscriptions_for, ["build", "chore"]);
+        let options = team_options(&allow_subscriptions_for, &width, &effort).unwrap();
+        assert_eq!(options.subscription_roles, [Role::Build, Role::Chore]);
+        assert_eq!(options.width, BTreeMap::from([(Role::Build, 4)]));
+        assert_eq!(options.effort, BTreeMap::from([(Role::Plan, Effort::High)]));
+        assert_eq!(
+            options_flags(&options),
+            " --allow-subscriptions-for build,chore --width build=4 --effort plan=high"
+        );
+        assert!(Cli::try_parse_from(["policy", "team", "--all"]).is_ok());
+        assert!(Cli::try_parse_from(["policy", "team", "--json"]).is_ok());
+
+        let cli = Cli::try_parse_from([
+            "policy",
+            "set",
+            "--effort",
+            "build=medium",
+            "--width",
+            "chore=4",
+            "--allow-subscriptions-for",
+            "none",
+        ])
+        .unwrap();
+        let PolicyCommand::Set {
+            effort,
+            width,
+            allow_subscriptions_for,
+            ..
+        } = cli.command
+        else {
+            panic!("not set")
+        };
+        assert_eq!(
+            parse_efforts(&effort).unwrap(),
+            BTreeMap::from([(Role::Build, Effort::Medium)])
+        );
+        assert_eq!(
+            parse_widths(&width).unwrap(),
+            BTreeMap::from([(Role::Chore, Some(4))])
+        );
+        assert_eq!(
+            parse_roles("--allow-subscriptions-for", &allow_subscriptions_for).unwrap(),
+            Some(Vec::new()),
+            "none clears the list"
+        );
+        assert_eq!(
+            parse_roles("--x", &[]).unwrap(),
+            None,
+            "absent changes nothing"
+        );
+    }
+
+    #[test]
+    fn nonsense_effort_and_width_are_refused_with_a_reason() {
+        let one = |value: &str| vec![value.to_string()];
+        assert!(parse_efforts(&one("build")).is_err(), "no =");
+        assert!(parse_efforts(&one("builder=low")).is_err(), "no such role");
+        assert!(
+            parse_efforts(&one("build=extreme")).is_err(),
+            "no such level"
+        );
+        assert!(parse_widths(&one("build=0")).is_err(), "0 stops the role");
+        assert!(parse_widths(&one("build=300")).is_err(), "over a byte");
+        assert!(parse_widths(&one("build=many")).is_err());
+        assert_eq!(
+            parse_widths(&one("build=none")).unwrap(),
+            BTreeMap::from([(Role::Build, None)])
+        );
+        assert!(
+            team_options(&[], &one("build=none"), &[]).is_err(),
+            "the preset always caps"
+        );
+        assert!(parse_roles("--x", &one("builder")).is_err());
     }
 }
