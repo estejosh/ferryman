@@ -16,6 +16,7 @@ pub mod adversary;
 pub mod anchor;
 pub mod ask;
 pub mod automerge;
+pub mod capability;
 pub mod contract;
 pub mod conversation;
 pub mod cost;
@@ -57,6 +58,7 @@ pub mod skills;
 pub mod source;
 pub mod tamper;
 pub mod trajectory;
+pub mod work;
 pub mod worktree;
 
 use portable_auth::{
@@ -782,6 +784,12 @@ pub struct Order {
     /// [`overlap`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub touches: Vec<String>,
+    /// What the issuer says the work needs (`--kind`, `--needs`, `--size`): the smart
+    /// router's first word on it, ahead of anything the classifier would guess. Signed
+    /// into the order when present; an order without it keeps the exact bytes it had.
+    /// See [`work`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<work::ExplicitNeeds>,
     /// Claim this order even though its `touches` overlap an order someone is already
     /// working on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2256,6 +2264,15 @@ fn order_payload(order: &Order) -> String {
         payload.push_str(&format!(
             "\ntouches:{}",
             serde_json::to_string(&order.touches).unwrap_or_else(|_| "[]".to_string())
+        ));
+    }
+    // Explicit needs are bound only when something is set, like `touches`: an order with
+    // none keeps the bytes it always had, and one with them cannot have them stripped or
+    // changed after issue.
+    if let Some(needs) = order.needs.as_ref().filter(|needs| !needs.is_empty()) {
+        payload.push_str(&format!(
+            "\nneeds:{}",
+            serde_jcs::to_string(needs).unwrap_or_default()
         ));
     }
     if order.allow_overlap {
@@ -9336,6 +9353,7 @@ mod work_over_files_tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         }
     }
@@ -10031,6 +10049,65 @@ mod work_over_files_tests {
         };
         wisp.sign_review(&mut v);
         assert_eq!(verify_review(&v, &roster), SignatureCheck::Valid);
+    }
+
+    #[test]
+    fn explicit_needs_are_signed_into_the_order_and_old_orders_keep_their_bytes() {
+        use work::{ExplicitNeeds, Size, WorkKind};
+        let keys = tempfile::tempdir().unwrap();
+        let wisp = AgentIdentity::load_or_create("wisp", keys.path()).unwrap();
+        let roster = vec![AgentRoute {
+            name: "wisp".into(),
+            role: "orchestrator".into(),
+            capabilities: vec![],
+            public_key: Some(wisp.public_key_hex()),
+            encryption_key: None,
+        }];
+
+        // An order with no needs signs exactly the bytes it always did.
+        let plain = order("t-1", None, false);
+        let mut empty = plain.clone();
+        empty.needs = Some(ExplicitNeeds::default());
+        assert_eq!(order_payload(&plain), order_payload(&empty));
+        assert!(!order_payload(&plain).contains("needs:"));
+        let mut signed_plain = plain.clone();
+        wisp.sign_order(&mut signed_plain);
+        // ...and an order file written before `needs` existed still reads and verifies.
+        let mut old_file = serde_json::to_value(&signed_plain).unwrap();
+        assert!(
+            old_file.get("needs").is_none(),
+            "an unset needs is not written"
+        );
+        old_file.as_object_mut().unwrap().remove("touches");
+        let old: Order = serde_json::from_value(old_file).unwrap();
+        assert_eq!(verify_order(&old, &roster), SignatureCheck::Valid);
+
+        // With needs, they are part of what is signed.
+        let mut with = plain;
+        with.needs = Some(ExplicitNeeds {
+            kind: Some(WorkKind::Docs),
+            size: Some(Size::Small),
+            ..ExplicitNeeds::default()
+        });
+        assert!(order_payload(&with).contains("\nneeds:{\"kind\":\"docs\",\"size\":\"small\"}"));
+        wisp.sign_order(&mut with);
+        assert_eq!(verify_order(&with, &roster), SignatureCheck::Valid);
+        let again: Order = serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(verify_order(&again, &roster), SignatureCheck::Valid);
+
+        // Changed, added or stripped after issue, they no longer verify.
+        let mut changed = with.clone();
+        changed.needs.as_mut().unwrap().kind = Some(WorkKind::CodeChange);
+        assert_eq!(verify_order(&changed, &roster), SignatureCheck::Invalid);
+        let mut stripped = with.clone();
+        stripped.needs = None;
+        assert_eq!(verify_order(&stripped, &roster), SignatureCheck::Invalid);
+        let mut added = signed_plain;
+        added.needs = Some(ExplicitNeeds {
+            kind: Some(WorkKind::Docs),
+            ..ExplicitNeeds::default()
+        });
+        assert_eq!(verify_order(&added, &roster), SignatureCheck::Invalid);
     }
 
     #[test]

@@ -864,6 +864,9 @@ pub struct Candidate {
     /// For a gateway engine (OmniRoute): the provider/models its route ends at. A
     /// selector that names any of them matches, so `never claude` holds through it.
     pub route: Vec<String>,
+    /// What it can do: what its worker published, else guessed from its name, kind and
+    /// how it is paid (see [`crate::capability`]). Empty for a hand-built candidate.
+    pub capabilities: crate::capability::Capabilities,
 }
 
 impl Candidate {
@@ -872,6 +875,7 @@ impl Candidate {
         let trust = report.trust.clone().unwrap_or_default();
         let billing = report.billing.clone().unwrap_or_default();
         Self {
+            capabilities: crate::capability::Capabilities::for_report(report).0,
             agent: agent.to_string(),
             machine: machine.to_string(),
             order,
@@ -4665,6 +4669,7 @@ mod tests {
                 result_contract: None,
                 interface: None,
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             },
             claims: claimed
@@ -5726,6 +5731,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             }],
             Utc::now(),
         )

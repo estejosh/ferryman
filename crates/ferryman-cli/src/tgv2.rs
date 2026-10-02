@@ -502,6 +502,7 @@ impl Bridge {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         self.agent.sign_order(&mut order);
@@ -2515,6 +2516,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             }],
             Utc::now(),
         );
@@ -2807,6 +2809,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         josh().sign_order(&mut order);
@@ -3123,6 +3126,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         josh().sign_order(&mut order);
@@ -3168,6 +3172,7 @@ mod tests {
             trust: None,
             billing: None,
             class: None,
+            capabilities: None,
         };
         let now = Utc::now();
         ferryman_channel::receipts::refresh_engines(
@@ -3220,6 +3225,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             };
         ferryman_channel::receipts::refresh_engines(
             route,
@@ -3544,6 +3550,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);
@@ -3924,6 +3931,7 @@ mod tests {
             }),
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);
@@ -3980,6 +3988,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);

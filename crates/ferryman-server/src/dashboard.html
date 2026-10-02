@@ -873,7 +873,19 @@ function contractBadges(t) {
   if (holds.length) {
     out.push(`<span class="badge warn" title="${esc(holds.map((h) => h.agent + ": " + h.reason).join("\n"))}">held</span>`);
   }
+  out.push(workBadge(t.work));
   return out.join("");
+}
+
+// What the smart router reads an order as needing: its kind and size, and any modality
+// beyond text (vision, audio, ...). The hover says whether the order itself, the rules or a
+// model said so, and how sure that is. An unsure one is marked: a worker will ask a model.
+function workBadge(w) {
+  if (!w) return "";
+  const extra = (w.modalities || []).filter((m) => m !== "text" && m !== "code");
+  const label = [w.kind, w.size].concat(extra).join(" · ");
+  const why = `needs: ${(w.modalities || []).join(", ")}\nread from: ${w.source}, confidence ${Number(w.confidence).toFixed(2)}${w.sure ? "" : " (unsure: a worker asks a model)"}`;
+  return `<span class="badge${w.sure ? "" : " warn"}" title="${esc(why)}">${esc(label)}${w.sure ? "" : " ?"}</span>`;
 }
 
 // The detail the card has no room for, shown in the drawer: the files the order declared,
@@ -883,6 +895,12 @@ function taskContractDetail(d) {
   const rows = [];
   if (order.interface) {
     rows.push(`<dt>Interface</dt><dd class="mono">${esc(order.interface.name)}@${esc(order.interface.version)} <span style="color:var(--faint)">${esc(order.interface.side)}</span></dd>`);
+  }
+  const cl = d.classification;
+  if (cl && cl.needs) {
+    const n = cl.needs;
+    const reasons = (cl.reasons || []).map((r) => `<div style="color:var(--faint)">${esc(r)}</div>`).join("");
+    rows.push(`<dt>Needs</dt><dd><span class="mono">${esc(n.kind)}, ${esc(n.size)}, ${esc((n.modalities || []).join("+"))}, ${esc(String(n.min_context_k))}k context</span> <span class="badge">${esc(cl.source)} ${Number(cl.confidence).toFixed(2)}</span>${order.needs ? ` <span class="badge accent">signed into the order</span>` : ""}${reasons}</dd>`);
   }
   if ((order.touches || []).length) {
     rows.push(`<dt>Touches</dt><dd class="mono">${esc(order.touches.join(", "))}${order.allow_overlap ? ` <span class="badge">overlap allowed</span>` : ""}</dd>`);
@@ -1044,6 +1062,27 @@ function scopeLabel(grant) {
   return p.length ? p.join(", ") : "every project";
 }
 
+/* What an engine can do - the modalities it takes (text, code, vision, image, video,
+   audio_in, audio_out, embed), what it is good at, its window, its price and whether it is
+   local - as its worker published it, signed. A worker that predates capability profiles
+   publishes none. */
+function costText(cost) {
+  if (!cost) return "price unknown";
+  if (!cost.per_call_usd && !cost.per_mtok_in_usd && !cost.per_mtok_out_usd) return "free";
+  return `$${cost.per_call_usd || 0}/call, $${cost.per_mtok_in_usd || 0} in / $${cost.per_mtok_out_usd || 0} out per Mtok`;
+}
+function capsCell(e) {
+  const c = e.capabilities;
+  if (!c) return `<span class="badge" title="This worker predates capability profiles">&mdash;</span>`;
+  const tip = [
+    (c.strengths || []).length ? "strengths: " + c.strengths.join(", ") : "",
+    c.context_k ? c.context_k + "k context" : "",
+    costText(c.cost),
+    c.local ? "local: nothing leaves the machine" : "",
+  ].filter(Boolean).join("\n");
+  return `<span title="${esc(tip)}">${esc((c.modalities || []).join("+") || "none")}</span>${c.local ? ` <span class="badge good">local</span>` : ""}`;
+}
+
 /* Self-improve: the master's signed per-project switch for the weekly loop, and what
    each worker can run right now - its signed engine inventory, never a credential. */
 function improvePanel(imp) {
@@ -1056,7 +1095,7 @@ function improvePanel(imp) {
   for (const w of (imp.engines || [])) {
     for (const e of (w.engines || [])) {
       const st = e.state === "exhausted" && e.until ? `out of credit until ${when(e.until)} UTC` : esc(e.state);
-      rows.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td>${esc(e.name)}</td><td>${esc(e.tier)}</td><td>${esc(e.paid)}</td>` +
+      rows.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td>${esc(e.name)}</td><td>${esc(e.tier)}</td><td>${capsCell(e)}</td><td>${esc(e.paid)}</td>` +
         `<td title="${esc(e.reason || "")}">${st}</td><td>${e.latency_ms != null ? (e.latency_ms / 1000).toFixed(1) + "s" : ""}</td><td>${esc(e.balance || "")}</td>` +
         `<td>${e.billing && e.billing.spend_usd ? "$" + Number(e.billing.spend_usd).toFixed(2) : ""}${e.billing && e.billing.flag ? ` <span class="badge warn" title="${esc(e.billing.flag)}">free tier flagged</span>` : ""}</td></tr>`);
     }
@@ -1069,7 +1108,7 @@ function improvePanel(imp) {
         <div class="s" style="color:var(--dim);margin-top:6px">When on, each week the best available AI plans a few improvements to this project from what the channel recorded, and they are built as reviewed orders on their own branches. Nothing merges without you. Only the master can switch it.</div>
         ${imp.may_set ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn${imp.enabled ? "" : " primary"}" id="tm-improve" data-enabled="${imp.enabled ? "0" : "1"}">${imp.enabled ? "Turn self-improve off" : "Turn self-improve on"}</button><button class="btn" id="tm-improve-all">On for all my repos</button><span class="s" id="tm-improve-msg" style="color:var(--dim)"></span></div>` : ""}
         ${rows.length
-          ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Worker</th><th>Engine</th><th>Tier</th><th>Paid</th><th>State</th><th>Latency</th><th>Balance</th><th>This week</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
+          ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Worker</th><th>Engine</th><th>Tier</th><th>Can do</th><th>Paid</th><th>State</th><th>Latency</th><th>Balance</th><th>This week</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
           : `<div class="s" style="color:var(--dim);margin-top:6px">No worker has published which AI engines it can run yet.</div>`}
       </div>
     </div>`;
@@ -1946,6 +1985,22 @@ pages.learnings = async () => {
 pages.engines = async () => {
   const d = await api("/api/stats");
   const rows = d.engines || d.rows || (Array.isArray(d) ? d : []);
+  // What each worker says its engines can do: the signed inventory the router reads.
+  let fleet = [];
+  try { fleet = (await api("/api/improve")).engines || []; } catch (_) { fleet = []; }
+  const caps = [];
+  for (const w of fleet) {
+    for (const e of (w.engines || [])) {
+      const c = e.capabilities;
+      caps.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td class="lead">${esc(e.name)}</td>` +
+        (c
+          ? `<td>${esc((c.modalities || []).join("+") || "none")}</td><td>${esc((c.strengths || []).join(", ") || "—")}</td>` +
+            `<td class="num">${c.context_k ? esc(String(c.context_k)) + "k" : "—"}</td><td>${esc(costText(c.cost))}</td>` +
+            `<td>${c.local ? `<span class="badge good">local</span>` : "—"}</td>`
+          : `<td colspan="5"><span class="badge">this worker predates capability profiles</span></td>`) +
+        `</tr>`);
+    }
+  }
 
   // An engine that reported nothing has NOT cost nothing.
   //
@@ -1984,6 +2039,15 @@ pages.engines = async () => {
           </tr>`; }).join("")
           : `<tr><td colspan="7"><div class="empty">No runs recorded yet.</div></td></tr>`}
         </tbody>
+      </table>
+    </div>
+    <div class="head" style="margin-top:28px">
+      <div><h2>What each engine can do</h2><p>What the smart router matches work against: the modalities an engine takes, what it is good at, its context window, its price and whether it runs locally. Declared in agent.toml where an operator said so, otherwise guessed from the model's name; each worker publishes it signed.</p></div>
+    </div>
+    <div class="panel scroll">
+      <table class="grid">
+        <thead><tr><th>Worker</th><th>Engine</th><th>Modalities</th><th>Strengths</th><th>Context</th><th>Cost</th><th>Where</th></tr></thead>
+        <tbody>${caps.length ? caps.join("") : `<tr><td colspan="7"><div class="empty">No worker has published its engines yet.</div></td></tr>`}</tbody>
       </table>
     </div>`;
 };

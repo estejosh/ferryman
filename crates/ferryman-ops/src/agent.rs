@@ -5281,6 +5281,7 @@ mod tests {
                 result_contract: None,
                 interface: None,
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             },
             claims: Vec::new(),
@@ -5365,6 +5366,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         }
     }
@@ -5676,6 +5678,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         assert_eq!(
@@ -5843,6 +5846,7 @@ mod tests {
                 result_contract: None,
                 interface: None,
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             },
             claims: Vec::new(),
@@ -6728,6 +6732,7 @@ mod tests {
             class: None,
             effort_args: std::collections::BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
     }
 

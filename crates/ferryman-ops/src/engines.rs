@@ -191,6 +191,10 @@ pub struct EngineSpec {
     /// An HTTP engine takes a `reasoning_effort` field (`engine.<name>.supports_effort =
     /// "true"`). Off by default: an endpoint that does not know the field may refuse it.
     pub supports_effort: bool,
+    /// What the operator says the engine can do (`engine.<name>.modalities`, `strengths`,
+    /// `context_k`, `cost_per_call_usd`, `cost_per_mtok_in_usd`, `cost_per_mtok_out_usd`,
+    /// `local`). Whatever is left out is guessed; see [`capabilities`].
+    pub declared: ferryman_channel::capability::Declared,
 }
 
 impl EngineSpec {
@@ -216,7 +220,14 @@ impl EngineSpec {
             class: None,
             effort_args: BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
+    }
+
+    /// What this engine can do: [`capabilities`].
+    #[must_use]
+    pub fn capabilities(&self) -> ferryman_channel::capability::Capabilities {
+        capabilities(self)
     }
 
     /// The CLI arguments with this engine's model and endpoint filled in, and no effort
@@ -270,6 +281,108 @@ impl EngineSpec {
             ferryman_channel::policy::guess_class(self.model.as_deref().unwrap_or(&self.name))
         })
     }
+}
+
+/// What an engine can do: modalities, strengths, context window, cost and whether it is
+/// local. What the operator declared in `agent.toml` wins, field by field; the rest is
+/// guessed from the engine's name, model, command, kind, endpoint and how it is paid
+/// for. This is what the signed engine inventory publishes (see [`reports`]) and what the
+/// smart router reads. The rules and their limits are in
+/// [`ferryman_channel::capability`].
+#[must_use]
+pub fn capabilities(spec: &EngineSpec) -> ferryman_channel::capability::Capabilities {
+    ferryman_channel::capability::resolve(
+        &spec.declared,
+        &ferryman_channel::capability::Basis {
+            name: &spec.name,
+            model: spec.model.as_deref(),
+            command: &spec.command,
+            cli: spec.kind == Kind::Cli,
+            base_url: spec.base_url.as_deref(),
+            paid: spec.paid.as_str(),
+        },
+    )
+}
+
+/// Read what an operator declared an engine can do. All of it is optional: lists are a
+/// JSON array or words separated by commas, prices are dollars, and a typo is refused so
+/// it cannot silently leave an engine unable (or newly able) to take work.
+fn parse_declared(
+    name: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<ferryman_channel::capability::Declared> {
+    use ferryman_channel::capability::{Cost, Declared, Modality, check_context_k};
+    let modalities = match get("modalities") {
+        Some(raw) => {
+            Modality::parse_list(&raw).with_context(|| format!("engine.{name}.modalities"))?
+        }
+        None => Vec::new(),
+    };
+    let strengths = match get("strengths") {
+        Some(raw) => {
+            let words: Vec<String> = if raw.trim_start().starts_with('[') {
+                serde_json::from_str(&raw).with_context(|| {
+                    format!("engine.{name}.strengths must be a JSON array of words")
+                })?
+            } else {
+                raw.split(',').map(str::to_string).collect()
+            };
+            let mut tags: Vec<String> = words
+                .iter()
+                .map(|word| word.trim().to_ascii_lowercase())
+                .filter(|word| !word.is_empty())
+                .collect();
+            tags.sort();
+            tags.dedup();
+            tags
+        }
+        None => Vec::new(),
+    };
+    let context_k = get("context_k")
+        .map(|value| {
+            let k = value.parse::<u32>().with_context(|| {
+                format!("engine.{name}.context_k must be a whole number of thousands of tokens")
+            })?;
+            check_context_k(k).with_context(|| format!("engine.{name}.context_k"))?;
+            Ok::<_, anyhow::Error>(k)
+        })
+        .transpose()?;
+    let price = |field: &str| -> Result<Option<f64>> {
+        get(field)
+            .map(|value| {
+                let dollars = value
+                    .parse::<f64>()
+                    .with_context(|| format!("engine.{name}.{field} must be a number"))?;
+                if !dollars.is_finite() || dollars < 0.0 {
+                    bail!("engine.{name}.{field} must be zero or more dollars")
+                }
+                Ok(dollars)
+            })
+            .transpose()
+    };
+    let (per_call, per_in, per_out) = (
+        price("cost_per_call_usd")?,
+        price("cost_per_mtok_in_usd")?,
+        price("cost_per_mtok_out_usd")?,
+    );
+    let cost = (per_call.is_some() || per_in.is_some() || per_out.is_some()).then(|| Cost {
+        per_call_usd: per_call.unwrap_or(0.0),
+        per_mtok_in_usd: per_in.unwrap_or(0.0),
+        per_mtok_out_usd: per_out.unwrap_or(0.0),
+    });
+    let local = match get("local").as_deref() {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => bail!("engine.{name}.local must be true or false, not '{other}'"),
+    };
+    Ok(Declared {
+        modalities,
+        strengths,
+        context_k,
+        cost,
+        local,
+    })
 }
 
 /// A short name for a command: its file name, lowercased, without `.exe`.
@@ -425,6 +538,7 @@ pub fn parse_engines(
                 bail!("engine.{name}.supports_effort must be true or false, not '{other}'")
             }
         };
+        let declared = parse_declared(&name, &get)?;
         let spec_model = get("model").or_else(|| {
             (kind == Kind::Cli && own_command.is_none())
                 .then(|| model.map(str::to_string))
@@ -459,6 +573,7 @@ pub fn parse_engines(
             class,
             effort_args,
             supports_effort,
+            declared,
             name,
         });
     }
@@ -1896,6 +2011,7 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
                 trust: trust(&state),
                 billing: Some(billing(spec, &state, now)),
                 class: Some(spec.class().as_str().to_string()),
+                capabilities: Some(capabilities(spec)),
             }
         })
         .collect()
@@ -1959,6 +2075,7 @@ mod tests {
             class: None,
             effort_args: BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
     }
 

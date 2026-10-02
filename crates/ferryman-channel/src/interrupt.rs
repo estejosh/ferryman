@@ -481,6 +481,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
             signed_by: None,
             signature: None,

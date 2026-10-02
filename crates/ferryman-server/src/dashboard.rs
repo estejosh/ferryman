@@ -3363,6 +3363,10 @@ async fn tasks(
                 "contract_missing": task.contract_violations_in(&current).unwrap_or_default(),
                 "interface": task.order.interface,
                 "touches": task.order.touches,
+                "needs": task.order.needs,
+                // What the order needs, as the router reads it: kind, size, modalities,
+                // and whether the order, the rules or a model said so.
+                "work": work_view(&ferryman_channel::work::classify_cached(&task.order, &route)),
                 "allow_overlap": task.order.allow_overlap,
                 "overlaps": overlaps.get(&task.order.id).cloned().unwrap_or_default(),
                 "holds": ferryman_channel::hold::read(&current, &task.order.id),
@@ -3370,6 +3374,18 @@ async fn tasks(
         })
         .collect();
     Ok(Json(items))
+}
+
+/// The part of a classification an order card has room for.
+fn work_view(classification: &ferryman_channel::work::Classification) -> Value {
+    json!({
+        "kind": classification.needs.kind.as_str(),
+        "size": classification.needs.size.as_str(),
+        "modalities": classification.needs.modalities,
+        "source": classification.source.as_str(),
+        "confidence": classification.confidence,
+        "sure": classification.is_sure(),
+    })
 }
 
 /// GET /api/tasks/{id} — full detail for one task.
@@ -3425,11 +3441,14 @@ async fn task_detail(
             "depends_on": task.order.depends_on,
             "interface": task.order.interface,
             "touches": task.order.touches,
+            "needs": task.order.needs,
             "allow_overlap": task.order.allow_overlap,
             "payload": task.order.payload,
             "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
         },
         "holds": ferryman_channel::hold::read(&current, &task.order.id),
+        // The full classification, with the reasons, as `ferry route classify` shows it.
+        "classification": ferryman_channel::work::classify_cached(&task.order, &route),
         "overlaps": ferryman_channel::overlap::overlap_map(
             &current,
             &ferryman_channel::list_tasks(&route).unwrap_or_default(),
@@ -4669,6 +4688,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         }
     }
@@ -6346,6 +6366,7 @@ mod tests {
                     trust: None,
                     billing: None,
                     class: None,
+                    capabilities: None,
                 }],
                 Utc::now(),
             )

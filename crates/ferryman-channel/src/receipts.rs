@@ -743,6 +743,12 @@ pub struct EngineReport {
     /// else guessed from its model's name. `None` from a worker older than classes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    /// What the engine can do: modalities, strengths, context window, cost and whether it
+    /// is local - the operator's declared values, else guessed from the model and kind
+    /// (see [`crate::capability`]). `None` from a worker older than capability profiles.
+    /// A v2-only field, like `class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::capability::Capabilities>,
 }
 
 /// How one engine is billed, as far as the worker running it can tell. Never a
@@ -856,7 +862,7 @@ pub struct EngineInventory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     /// Signs the v1 view of the inventory: the engines without the fields v0.5.17 did not
-    /// know (`class`, `billing.weekly_requests`). That is exactly what an older verifier
+    /// know (`class`, `capabilities`, `billing.weekly_requests`). That is exactly what an older verifier
     /// recomputes after it deserializes and drops what it does not know, so a new
     /// inventory still verifies on an old peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -873,6 +879,7 @@ impl EngineInventory {
     fn has_v2_fields(&self) -> bool {
         self.engines.iter().any(|e| {
             e.class.is_some()
+                || e.capabilities.is_some()
                 || e.billing
                     .as_ref()
                     .is_some_and(|b| b.weekly_requests.is_some())
@@ -880,7 +887,8 @@ impl EngineInventory {
     }
 }
 
-/// The engines as v0.5.17 serializes them: without `class` and `weekly_requests`.
+/// The engines as v0.5.17 serializes them: without `class`, `capabilities` and
+/// `weekly_requests`.
 fn engines_v1_json(engines: &[EngineReport]) -> String {
     let mut value = serde_json::to_value(engines).unwrap_or_default();
     if let Some(list) = value.as_array_mut() {
@@ -889,6 +897,7 @@ fn engines_v1_json(engines: &[EngineReport]) -> String {
                 continue;
             };
             engine.remove("class");
+            engine.remove("capabilities");
             if let Some(billing) = engine.get_mut("billing").and_then(|b| b.as_object_mut()) {
                 billing.remove("weekly_requests");
             }
@@ -1131,6 +1140,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         by.sign_order(&mut order);
@@ -1500,6 +1510,7 @@ mod tests {
             trust: None,
             billing: None,
             class: None,
+            capabilities: None,
         }
     }
 
@@ -1775,6 +1786,108 @@ mod tests {
         assert_eq!(
             verify_engines(&tampered, &route.agents),
             SignatureCheck::Invalid
+        );
+    }
+
+    #[test]
+    fn capabilities_are_v2_only_so_a_v0_5_17_peer_still_verifies_and_they_cannot_be_forged() {
+        use crate::capability::{Capabilities, Cost, Modality};
+        let (_t, route, fang, _, _) = channel();
+        // Nothing but a capability profile is new on this line.
+        let mut engine = engine("up");
+        engine.capabilities = Some(Capabilities {
+            modalities: vec![Modality::Text, Modality::Vision],
+            strengths: vec!["docs".into()],
+            context_k: Some(128),
+            cost: Some(Cost::FREE),
+            local: true,
+        });
+        assert!(engine.class.is_none());
+        refresh_engines(
+            &route,
+            &fang,
+            "grouchly",
+            "0.5.18",
+            vec![engine],
+            Utc::now(),
+        )
+        .unwrap();
+        let text = fs::read_to_string(engines_path(&route, "fang")).unwrap();
+        assert!(text.contains("\"capabilities\"") && text.contains("signature_v2"));
+        assert!(
+            old_peer_accepts(&text, &route.agents),
+            "the old verifier must still accept a worker that only added capabilities"
+        );
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        let original = listed[0].0.clone();
+        assert_eq!(
+            original.engines[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .modalities,
+            vec![Modality::Text, Modality::Vision]
+        );
+
+        // Claiming a modality under the v1 signature alone does not verify.
+        let mut forged = original.clone();
+        forged.engines[0]
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .modalities
+            .push(Modality::Code);
+        assert_eq!(
+            verify_engines(&forged, &route.agents),
+            SignatureCheck::Invalid
+        );
+        let mut cheaper = original.clone();
+        cheaper.engines[0].capabilities.as_mut().unwrap().cost = None;
+        assert_eq!(
+            verify_engines(&cheaper, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Stripping the v2 signature while keeping the profile does not verify either.
+        let mut stripped = original.clone();
+        stripped.signature_v2 = None;
+        assert_eq!(
+            verify_engines(&stripped, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Without a profile, an old-style inventory is as valid as ever.
+        let mut bare = original;
+        bare.engines[0].capabilities = None;
+        bare.signature_v2 = None;
+        assert_eq!(verify_engines(&bare, &route.agents), SignatureCheck::Valid);
+    }
+
+    #[test]
+    fn a_modality_from_a_newer_version_survives_a_round_trip_and_still_verifies() {
+        use crate::capability::{Capabilities, Modality};
+        let (_t, route, fang, _, _) = channel();
+        let mut engine = engine("up");
+        engine.capabilities = Some(Capabilities {
+            modalities: vec![Modality::Text, Modality::Other("hologram".into())],
+            ..Capabilities::default()
+        });
+        refresh_engines(
+            &route,
+            &fang,
+            "grouchly",
+            "0.5.18",
+            vec![engine],
+            Utc::now(),
+        )
+        .unwrap();
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        assert!(
+            listed[0].0.engines[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .has(&Modality::Other("hologram".into()))
         );
     }
 

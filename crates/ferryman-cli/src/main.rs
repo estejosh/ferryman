@@ -6,6 +6,7 @@ mod license;
 mod licensor;
 mod mcp;
 mod mcp_client;
+mod route;
 mod telegram;
 mod tgmap;
 mod tgv2;
@@ -462,6 +463,17 @@ enum Command {
     Adversary {
         #[command(subcommand)]
         command: adversary::AdversaryCommand,
+    },
+    /// The smart router: send each piece of work to the cheapest engine that will most
+    /// likely do it well. `ferry route classify <order>` shows what an order needs - kind,
+    /// size, the modalities an engine must have - and where that read came from: the
+    /// signed order, the rules, or one call to a cheap text engine.
+    ///
+    /// What each engine can do (`text`, `code`, `vision`, `image`, `video`, `audio_in`,
+    /// `audio_out`, `embed`) is in `ferry engines`.
+    Route {
+        #[command(subcommand)]
+        command: route::RouteCommand,
     },
     /// Server mode: messaging through a server. `channel` does the same with none.
     Communications {
@@ -1222,6 +1234,29 @@ enum Channel {
         /// (types, nested keys, array items, enums). Held to the whole result payload.
         #[arg(long, value_name = "FILE")]
         result_schema: Option<PathBuf>,
+        /// What kind of work this is, for the smart router: code-change, docs, tests,
+        /// review, plan, chore, research, translate, transcribe, image, video, audio or
+        /// other. Signed into the order, and it wins over anything the classifier would
+        /// guess. Leave it out and `ferry route classify <id>` shows what it would read.
+        #[arg(long, value_name = "KIND", value_parser = parse_work_kind)]
+        kind: Option<ferryman_channel::work::WorkKind>,
+        /// What an engine must be able to do: text, code, vision, image, video, audio_in,
+        /// audio_out or embed, e.g. --needs vision,audio_in. Replaces what the classifier
+        /// would find.
+        #[arg(
+            long,
+            value_name = "MODALITY",
+            num_args = 1..,
+            value_delimiter = ',',
+            value_parser = parse_modality
+        )]
+        needs: Vec<ferryman_channel::capability::Modality>,
+        /// How big the work is: small, medium or large.
+        #[arg(long, value_name = "SIZE", value_parser = parse_work_size)]
+        size: Option<ferryman_channel::work::Size>,
+        /// The context window the work wants, in thousands of tokens.
+        #[arg(long, value_name = "K")]
+        min_context_k: Option<u32>,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -3087,11 +3122,20 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                 .as_str()
                 .to_string()
             });
+            // What it can do: published by its worker, else guessed here from the line
+            // (marked `?`) for a worker older than capability profiles.
+            let (caps, guessed) = ferryman_channel::capability::Capabilities::for_report(engine);
+            let modalities = format!(
+                "{}{}",
+                caps.modalities_label(),
+                if guessed { "?" } else { "" }
+            );
             println!(
-                "  {:<12} {:<6} {:<6} {:<12} {:<30} {:<36} {:>7} {}",
+                "  {:<12} {:<6} {:<6} {:<20} {:<12} {:<30} {:<36} {:>7} {}",
                 engine.name,
                 engine.tier,
                 class,
+                modalities,
                 engine.paid,
                 state,
                 engine.model.as_deref().unwrap_or("-"),
@@ -3103,6 +3147,7 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             {
                 println!("  {:<12} {reason}", "");
             }
+            println!("  {:<12} can: {}", "", caps.describe());
             // Whether its claims have held up against the worker's own evidence.
             if let Some(trust) = &engine.trust {
                 println!("  {:<12} {}", "", trust.describe());
@@ -3738,6 +3783,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Team { command } => team_command(command).await?,
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
+        Command::Route { command } => route::command(command).await?,
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -7092,6 +7138,21 @@ fn parse_interface_ref(value: &str) -> Result<ferryman_channel::interface::Inter
     ferryman_channel::interface::InterfaceRef::parse(value).map_err(|error| format!("{error:#}"))
 }
 
+/// `code-change` as `--kind` takes it.
+fn parse_work_kind(value: &str) -> Result<ferryman_channel::work::WorkKind, String> {
+    ferryman_channel::work::WorkKind::parse(value).map_err(|error| format!("{error:#}"))
+}
+
+/// `large` as `--size` takes it.
+fn parse_work_size(value: &str) -> Result<ferryman_channel::work::Size, String> {
+    ferryman_channel::work::Size::parse(value).map_err(|error| format!("{error:#}"))
+}
+
+/// `vision` as `--needs` takes it.
+fn parse_modality(value: &str) -> Result<ferryman_channel::capability::Modality, String> {
+    ferryman_channel::capability::Modality::parse(value).map_err(|error| format!("{error:#}"))
+}
+
 /// Read a shape from a JSON file, refusing keys a shape does not have: a typo in a schema
 /// that was silently ignored would weaken the contract it was written to enforce.
 fn read_shape_file(path: &std::path::Path) -> Result<ferryman_channel::contract::Shape> {
@@ -9014,9 +9075,23 @@ fn channel(command: Channel) -> Result<()> {
             allow_overlap,
             interface,
             result_schema,
+            kind,
+            needs,
+            size,
+            min_context_k,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let needs = Some(ferryman_channel::work::ExplicitNeeds {
+                modalities: needs,
+                kind,
+                size,
+                min_context_k,
+            })
+            .filter(|needs| !needs.is_empty());
+            if let Some(k) = min_context_k {
+                ferryman_channel::capability::check_context_k(k).context("--min-context-k")?;
+            }
             let schema = result_schema
                 .as_deref()
                 .map(read_shape_file)
@@ -9066,6 +9141,7 @@ fn channel(command: Channel) -> Result<()> {
                 },
                 interface,
                 touches,
+                needs,
                 allow_overlap,
             };
             // Asked before the order exists, so it cannot find itself.
@@ -9087,6 +9163,9 @@ fn channel(command: Channel) -> Result<()> {
                 );
             }
             println!("issued {id} -> {}", path.display());
+            if let Some(needs) = &order.needs {
+                println!("  needs: {} (signed into the order)", needs.describe());
+            }
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),
                 None => println!("  open: whichever agent claims first wins"),
@@ -11460,6 +11539,77 @@ mod tests {
             "nope",
         ]);
         assert!(refused.is_err(), "an interface needs a version and a side");
+    }
+
+    /// `--kind`, `--needs` and `--size` parse the way the docs show them, and a typo is
+    /// refused rather than signed into an order.
+    #[test]
+    fn order_needs_flags_parse_and_refuse_typos() {
+        use clap::Parser;
+        use ferryman_channel::{
+            capability::Modality,
+            work::{Size, WorkKind},
+        };
+        let parsed = super::Cli::try_parse_from([
+            "ferry",
+            "channel",
+            "order",
+            "--id",
+            "t-v",
+            "--task",
+            "describe the screenshot",
+            "--kind",
+            "research",
+            "--needs",
+            "vision,audio_in",
+            "--size",
+            "small",
+            "--min-context-k",
+            "32",
+        ])
+        .unwrap();
+        let super::Command::Channel {
+            command:
+                super::Channel::Order {
+                    kind,
+                    needs,
+                    size,
+                    min_context_k,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("not an order");
+        };
+        assert_eq!(kind, Some(WorkKind::Research));
+        assert_eq!(needs, [Modality::Vision, Modality::AudioIn]);
+        assert_eq!(size, Some(Size::Small));
+        assert_eq!(min_context_k, Some(32));
+
+        let spaced = super::Cli::try_parse_from([
+            "ferry", "channel", "order", "--id", "t-w", "--task", "x", "--needs", "vision",
+            "image", "--kind", "code",
+        ])
+        .unwrap();
+        let super::Command::Channel {
+            command: super::Channel::Order { needs, kind, .. },
+        } = spaced.command
+        else {
+            panic!("not an order");
+        };
+        assert_eq!(needs, [Modality::Vision, Modality::Image]);
+        assert_eq!(kind, Some(WorkKind::CodeChange));
+
+        for bad in [
+            ["--kind", "cooking"],
+            ["--needs", "smell"],
+            ["--size", "huge"],
+        ] {
+            let refused = super::Cli::try_parse_from([
+                "ferry", "channel", "order", "--id", "t-1", "--task", "x", bad[0], bad[1],
+            ]);
+            assert!(refused.is_err(), "{bad:?} should be refused");
+        }
     }
 
     #[test]

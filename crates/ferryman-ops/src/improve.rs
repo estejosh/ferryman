@@ -671,6 +671,7 @@ fn verify_claims(
                 result_contract: None,
                 interface: None,
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             };
             identity.sign_order(&mut order);
@@ -1110,6 +1111,7 @@ fn issue_missing(
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         identity.sign_order(&mut order);
@@ -2246,6 +2248,7 @@ mod tests {
             class: None,
             effort_args: std::collections::BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
     }
 
@@ -2376,6 +2379,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp.sign_order(&mut order);
@@ -2642,6 +2646,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp.sign_order(&mut order);
@@ -3125,6 +3130,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         let task = |id: &str, output: &str| Task {
@@ -3255,6 +3261,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             }],
             Utc::now(),
         )
@@ -3349,6 +3356,7 @@ mod tests {
             result_contract,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);

@@ -674,6 +674,7 @@ pub(crate) mod tests {
             result_contract: None,
             interface: None,
             touches: globs(touches),
+            needs: None,
             allow_overlap: false,
         }
     }
