@@ -426,6 +426,9 @@ pub fn router(state: DashboardState) -> Router {
             get(delegations_get).post(delegations_set),
         )
         .route("/api/delegations/revoke", post(delegations_revoke))
+        .route("/api/contracts", get(contracts_get))
+        .route("/api/contracts/{reference}/lock", post(contract_lock))
+        .route("/api/contracts/{reference}/reject", post(contract_reject))
         // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
         // session check. A rebinding attempt is refused without its token being examined,
         // and a missing session is never reported to an origin that should not be talking
@@ -2388,6 +2391,183 @@ async fn delegations_set(
     })))
 }
 
+/// The route with its roster read fresh from the channel. The route a dashboard starts
+/// with carries the roster as it was at launch, and a contract proposed by an agent that
+/// joined since would otherwise read as unsigned - and be invisible to the very person who
+/// has to lock it.
+fn with_current_roster(route: &ProjectRoute) -> ProjectRoute {
+    let mut fresh = route.clone();
+    if let Ok(agents) = ferryman_channel::read_agent_roster(&route.communications) {
+        fresh.agents = agents;
+    }
+    fresh
+}
+
+/// One order on a contract's side, as the Contracts page lists it.
+fn contract_order_row(task: &ferryman_channel::Task) -> Value {
+    json!({
+        "id": task.order.id,
+        "state": state_value(&task.state()),
+        "holder": task.holder(),
+        "task": task.order.payload.get("task").and_then(Value::as_str).unwrap_or(""),
+        "touches": task.order.touches,
+    })
+}
+
+/// GET /api/contracts - every interface contract in the project: its status (proposed,
+/// locked or rejected), its shapes, who proposed and locked it, and the orders on each
+/// side, with the reason any of them is being held. `may_decide` is true only for the
+/// master, the one person whose Lock counts.
+async fn contracts_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = with_current_roster(&state.route_for(params.project.as_deref()));
+    let master = ferryman_channel::master::read_master(&route)
+        .ok()
+        .flatten()
+        .map(|declaration| declaration.master);
+    let may_decide = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    let tasks = ferryman_channel::list_tasks(&route).map_err(internal)?;
+    let row = |orders: &[ferryman_channel::Order]| -> Vec<Value> {
+        orders
+            .iter()
+            .filter_map(|order| tasks.iter().find(|task| task.order.id == order.id))
+            .map(|task| {
+                let mut row = contract_order_row(task);
+                row["holds"] = json!(ferryman_channel::hold::read(&route, &task.order.id));
+                row
+            })
+            .collect()
+    };
+    let mut items = Vec::new();
+    for contract in ferryman_channel::interface::list_contracts(&route) {
+        let orders = ferryman_channel::interface::orders_for_interface(
+            &route,
+            &contract.name,
+            &contract.version,
+        )
+        .map_err(internal)?;
+        items.push(json!({
+            "reference": contract.reference(),
+            "name": contract.name,
+            "version": contract.version,
+            "description": contract.description,
+            "status": ferryman_channel::interface::status(&route, &contract),
+            "proposed_by": contract.proposed_by,
+            "proposed_at": contract.proposed_at,
+            "locked_by": contract.lock.as_ref().map(|lock| lock.by.clone()),
+            "locked_at": contract.lock.as_ref().map(|lock| lock.at),
+            "request": contract.request,
+            "response": contract.response,
+            "providers": row(&orders.providers),
+            "consumers": row(&orders.consumers),
+        }));
+    }
+    Ok(Json(json!({
+        "project": route.project_id,
+        "master": master,
+        "may_decide": may_decide,
+        "contracts": items,
+    })))
+}
+
+/// The contract a request names, checked for what a decision needs: it exists and is
+/// genuine, it is not already decided.
+fn undecided_contract(
+    route: &ProjectRoute,
+    reference: &str,
+) -> Result<ferryman_channel::interface::InterfaceContract, DashboardError> {
+    let (name, version) = ferryman_channel::interface::parse_ref(reference)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    let Some(contract) = ferryman_channel::interface::read_contract(route, &name, &version) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("there is no genuine contract {reference} in this project"),
+        ));
+    };
+    match ferryman_channel::interface::status(route, &contract) {
+        ferryman_channel::interface::Status::Proposed => Ok(contract),
+        other => Err((
+            StatusCode::CONFLICT,
+            format!("{reference} is already {}", other.as_str()),
+        )),
+    }
+}
+
+/// POST /api/contracts/{reference}/lock - the master freezes a proposed contract, signed
+/// with the session's key. The browser half of `ferry contract lock`; it also answers the
+/// question Telegram asked, so the buttons there go away. Master only.
+async fn contract_lock(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Path(reference): Path<String>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let route = with_current_roster(&state.route_for(params.project.as_deref()));
+    let contract = undecided_contract(&route, &reference)?;
+    let locked = ferryman_channel::interface::lock(
+        &route,
+        &contract.name,
+        &contract.version,
+        current.name(),
+        &current,
+    )
+    .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &route,
+        &current,
+        "contract",
+        current.name(),
+        &format!("locked interface contract {}", locked.reference()),
+        None,
+    );
+    Ok(Json(json!({
+        "reference": locked.reference(),
+        "status": "locked",
+        "locked_by": locked.lock.as_ref().map(|lock| lock.by.clone()),
+    })))
+}
+
+/// POST /api/contracts/{reference}/reject - the master declines a proposed contract. The
+/// proposer's way forward is a new version. Master only.
+async fn contract_reject(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Path(reference): Path<String>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let route = with_current_roster(&state.route_for(params.project.as_deref()));
+    let contract = undecided_contract(&route, &reference)?;
+    ferryman_channel::interface::reject(
+        &route,
+        &contract.name,
+        &contract.version,
+        current.name(),
+        &current,
+    )
+    .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &route,
+        &current,
+        "contract",
+        current.name(),
+        &format!("rejected interface contract {}", contract.reference()),
+        None,
+    );
+    Ok(Json(
+        json!({ "reference": contract.reference(), "status": "rejected" }),
+    ))
+}
+
 #[derive(Deserialize)]
 struct UndelegateBody {
     delegate: String,
@@ -2606,6 +2786,12 @@ async fn tasks(
     let route = state.route_for(params.project.as_deref());
     let tasks = ferryman_channel::list_tasks(&route).map_err(internal)?;
     let now = chrono::Utc::now();
+    // Contracts, holds and overlaps are only believed when signed by someone on the
+    // roster, and a member who joined after the dashboard started must count.
+    let current = with_current_roster(&route);
+    // Which open or claimed orders are heading for the same files as which, once for the
+    // whole list rather than once per card.
+    let overlaps = ferryman_channel::overlap::overlap_map(&current, &tasks);
     let items = tasks
         .iter()
         .map(|task| {
@@ -2622,7 +2808,12 @@ async fn tasks(
                 "requires_approval": task.order.requires_approval,
                 "task": task.order.payload.get("task").and_then(Value::as_str).unwrap_or(""),
                 "depends_on": task.order.depends_on,
-                "contract_missing": task.contract_violations().unwrap_or_default(),
+                "contract_missing": task.contract_violations_in(&current).unwrap_or_default(),
+                "interface": task.order.interface,
+                "touches": task.order.touches,
+                "allow_overlap": task.order.allow_overlap,
+                "overlaps": overlaps.get(&task.order.id).cloned().unwrap_or_default(),
+                "holds": ferryman_channel::hold::read(&current, &task.order.id),
             })
         })
         .collect();
@@ -2636,6 +2827,7 @@ async fn task_detail(
     Query(params): Query<ProjectParam>,
 ) -> Result<Json<Value>, DashboardError> {
     let route = state.route_for(params.project.as_deref());
+    let current = with_current_roster(&route);
     let task = ferryman_channel::read_task(&route, &id).map_err(internal)?;
     let results = task
         .results
@@ -2679,14 +2871,43 @@ async fn task_detail(
             "requires_review": task.order.requires_review,
             "requires_approval": task.order.requires_approval,
             "depends_on": task.order.depends_on,
+            "interface": task.order.interface,
+            "touches": task.order.touches,
+            "allow_overlap": task.order.allow_overlap,
             "payload": task.order.payload,
             "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
         },
+        "holds": ferryman_channel::hold::read(&current, &task.order.id),
+        "overlaps": ferryman_channel::overlap::overlap_map(
+            &current,
+            &ferryman_channel::list_tasks(&route).unwrap_or_default(),
+        )
+        .remove(&task.order.id)
+        .unwrap_or_default(),
+        "notes": evidence_notes(&task),
         "claims": task.claims.iter().map(|c| json!({ "agent": c.agent, "at": c.claimed_at.to_rfc3339() })).collect::<Vec<_>>(),
         "results": results,
         "reviews": reviews,
-        "contract_missing": task.contract_violations().unwrap_or_default(),
+        "contract_missing": task.contract_violations_in(&current).unwrap_or_default(),
     })))
+}
+
+/// The notes the worker's evidence carries for a reviewer, newest result last. Information
+/// only: they never decide anything.
+fn evidence_notes(task: &ferryman_channel::Task) -> Vec<Value> {
+    task.results
+        .iter()
+        .filter_map(|result| {
+            let evidence = result.payload.get("evidence")?;
+            let notes = evidence.get("notes")?.as_array()?;
+            Some(
+                notes
+                    .iter()
+                    .map(move |note| json!({ "revision": result.revision, "note": note })),
+            )
+        })
+        .flatten()
+        .collect()
 }
 
 /// GET /api/stats — engine acceptance plus cost, merged into one table.
@@ -3770,14 +3991,14 @@ async fn review_task(
         "there is no result to review yet".to_string(),
     ))?;
     if body.accept
-        && let Some(missing) = task.contract_violations()
+        && let Some(missing) = task.contract_violations_in(&with_current_roster(&route))
         && !missing.is_empty()
     {
         return Err((
             StatusCode::CONFLICT,
             format!(
-                "result does not satisfy the order's contract; missing keys: {}",
-                missing.join(", ")
+                "result does not satisfy the order's contract: {}",
+                missing.join("; ")
             ),
         ));
     }
@@ -3894,6 +4115,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         }
     }
 
@@ -5126,6 +5350,181 @@ mod tests {
             &route.communications,
             &route.project_id
         ));
+    }
+
+    /// The Contracts page: a proposed contract is listed with its shapes and the orders on
+    /// each side, only the master can lock it, a locked contract cannot be decided again,
+    /// and the order cards carry the interface, the files and the overlap warning.
+    #[tokio::test]
+    async fn the_master_locks_a_contract_from_the_browser_and_nobody_else_can() {
+        use ferryman_channel::interface::{self, InterfaceRef, Side};
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        assert_eq!(
+            post(&app, "/api/contracts/user-api@1/lock", "", None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post(&app, "/api/master/init", "{}", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let alice = dashboard_state.sessions.resolve(&token).unwrap();
+        let fresh = with_current_roster(&route);
+
+        // Nothing proposed: an empty page for the master, and honest 404 / 400s.
+        let none = get_json(&app, "/api/contracts", Some(&token)).await;
+        assert_eq!(none["contracts"].as_array().unwrap().len(), 0, "{none}");
+        assert_eq!(none["may_decide"], true);
+        assert_eq!(none["master"], "alice");
+        assert_eq!(
+            post(&app, "/api/contracts/user-api@1/lock", "", Some(&token))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post(&app, "/api/contracts/nonsense/lock", "", Some(&token))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let response = ferryman_channel::contract::Shape::parse(&json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": { "id": { "type": "integer" } }
+        }))
+        .unwrap();
+        interface::propose(
+            &fresh,
+            &alice,
+            "user-api",
+            "1",
+            "GET /users/:id",
+            None,
+            response,
+        )
+        .unwrap();
+        for (id, side, touches) in [
+            ("t-api", Side::Provides, vec!["src/api/**"]),
+            ("t-ui", Side::Consumes, vec!["src/**"]),
+        ] {
+            let mut order = order(id);
+            order.issued_by = "alice".into();
+            order.interface = Some(InterfaceRef {
+                name: "user-api".into(),
+                version: "1".into(),
+                side,
+            });
+            order.touches = touches.into_iter().map(String::from).collect();
+            alice.sign_order(&mut order);
+            ferryman_channel::issue_order(&fresh, &order).unwrap();
+        }
+        ferryman_channel::hold::record(
+            &fresh,
+            &alice,
+            "t-ui",
+            "waiting for contract user-api@1 to be locked",
+        )
+        .unwrap();
+
+        let page = get_json(&app, "/api/contracts", Some(&token)).await;
+        let contract = &page["contracts"][0];
+        assert_eq!(contract["reference"], "user-api@1", "{page}");
+        assert_eq!(contract["status"], "proposed");
+        assert_eq!(contract["proposed_by"], "alice");
+        assert_eq!(contract["response"]["required"][0], "id");
+        assert_eq!(contract["providers"][0]["id"], "t-api");
+        assert_eq!(contract["consumers"][0]["id"], "t-ui");
+        assert!(
+            contract["consumers"][0]["holds"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("waiting for contract user-api@1"),
+            "{page}"
+        );
+
+        // The order cards say what they build to, the files they touch, and who they
+        // would collide with.
+        let tasks = get_json(&app, "/api/tasks", Some(&token)).await;
+        let card = |id: &str| -> Value {
+            tasks
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no card for {id}: {tasks}"))
+        };
+        assert_eq!(card("t-api")["interface"]["side"], "provides");
+        assert_eq!(card("t-ui")["touches"][0], "src/**");
+        assert_eq!(card("t-api")["overlaps"][0]["order_id"], "t-ui", "{tasks}");
+        assert_eq!(card("t-ui")["holds"][0]["agent"], "alice");
+        let detail = get_json(&app, "/api/tasks/t-ui", Some(&token)).await;
+        assert_eq!(detail["order"]["interface"]["name"], "user-api", "{detail}");
+        assert_eq!(detail["overlaps"][0]["order_id"], "t-api");
+
+        // Someone who is not the master gets a page without a button and a 403.
+        dashboard_state
+            .operators
+            .create("bob", "bobs-secret-pass")
+            .unwrap();
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"bob","password":"bobs-secret-pass"}"#,
+            None,
+        )
+        .await;
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let bob: Value = serde_json::from_slice(&body).unwrap();
+        let bob = bob["token"].as_str().unwrap();
+        let theirs = get_json(&app, "/api/contracts", Some(bob)).await;
+        assert_eq!(theirs["may_decide"], false, "{theirs}");
+        assert_eq!(
+            post(&app, "/api/contracts/user-api@1/lock", "", Some(bob))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            post(&app, "/api/contracts/user-api@1/reject", "", Some(bob))
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(interface::locked(&fresh, "user-api", "1").is_none());
+
+        // The master locks it; the question that asked is answered; it cannot be decided
+        // again, either way.
+        let locked = post(&app, "/api/contracts/user-api@1/lock", "", Some(&token)).await;
+        assert_eq!(locked.status(), StatusCode::OK);
+        assert!(interface::locked(&fresh, "user-api", "1").is_some());
+        assert!(ferryman_channel::questions::pending(&fresh).is_empty());
+        let page = get_json(&app, "/api/contracts", Some(&token)).await;
+        assert_eq!(page["contracts"][0]["status"], "locked");
+        assert_eq!(page["contracts"][0]["locked_by"], "alice");
+        for verb in ["lock", "reject"] {
+            assert_eq!(
+                post(
+                    &app,
+                    &format!("/api/contracts/user-api@1/{verb}"),
+                    "",
+                    Some(&token)
+                )
+                .await
+                .status(),
+                StatusCode::CONFLICT,
+                "{verb}"
+            );
+        }
     }
 
     /// "On for all my repos" passes over an archived project: the loop leaves finished

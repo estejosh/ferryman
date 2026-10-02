@@ -1634,6 +1634,9 @@ fn issue(
         signed_by: None,
         signature: None,
         result_contract: None,
+        interface: None,
+        touches: Vec::new(),
+        allow_overlap: false,
     };
     // Unsigned work is work nobody can attribute. If this identity can sign, it does.
     if let Some(identity) = crate::sign_as(route, issuer)? {

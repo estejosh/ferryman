@@ -28,6 +28,9 @@ pub const MERGE: &str = "merge";
 /// Background work held by the engine policy, or a free tier that asked for money.
 /// Answered with the policy's buttons; see [`crate::policy`].
 pub const POLICY: &str = "engine-policy";
+/// A proposed interface contract, waiting for the master to lock or reject it. Answered
+/// with the contract's Lock / Reject buttons; see [`crate::interface`].
+pub const CONTRACT: &str = "contract";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {

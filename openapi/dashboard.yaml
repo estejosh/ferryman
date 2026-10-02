@@ -402,6 +402,51 @@ paths:
         '200': {description: 'how many delegations were revoked'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/contracts:
+    get:
+      summary: Every interface contract in the project
+      description: >
+        Each contract with its status (`proposed`, `locked` or `rejected`), its request and
+        response shapes, who proposed and locked it, and the orders on each side with the
+        reason a worker is holding any of them. Forged, unsigned and edited-after-lock files
+        are not listed. `may_decide` is true only for the signed-in master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'the project, its master, may_decide, and the contracts'}
+        '401': {description: no active session}
+  /api/contracts/{reference}/lock:
+    post:
+      summary: The master locks a proposed contract
+      description: >
+        Freezes `name@version` with a signature of the signed-in master (or a delegate
+        holding the improve scope). A locked contract never changes; a change is a new
+        version. Also answers the question Telegram asked, so its buttons go away.
+      parameters:
+        - {name: reference, in: path, required: true, schema: {type: string}}
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: the contract, now locked}
+        '400': {description: not a name@version reference}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: no genuine contract by that name}
+        '409': {description: already locked or rejected}
+  /api/contracts/{reference}/reject:
+    post:
+      summary: The master rejects a proposed contract
+      description: >
+        Declines `name@version`. The proposer's way forward is a new version.
+      parameters:
+        - {name: reference, in: path, required: true, schema: {type: string}}
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: the contract, now rejected}
+        '400': {description: not a name@version reference}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: no genuine contract by that name}
+        '409': {description: already locked or rejected}
   /api/master/claim-all:
     post:
       summary: The signed-in person becomes master of every project with none

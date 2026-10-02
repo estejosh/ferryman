@@ -1697,6 +1697,77 @@ fn record_agent_activity(
     let _ = ferryman_channel::memory::append_agent_profile(&bank, agent, &line, identity);
 }
 
+/// What the engine is told about the shapes its order is held to: the locked interface
+/// contract the order provides or consumes, and the typed result schema it must fit.
+/// Empty for an order with neither.
+fn contract_prompt(route: &ProjectRoute, order: &ferryman_channel::Order) -> String {
+    let mut text = String::new();
+    if let Some(block) = ferryman_channel::interface::prompt_block(route, order) {
+        text.push_str(&block);
+        text.push('\n');
+    }
+    if let Some(schema) = order
+        .result_contract
+        .as_ref()
+        .and_then(|contract| contract.schema.as_ref())
+    {
+        text.push_str(&format!(
+            "RESULT SHAPE - your result is checked against this mechanically. End your answer \
+             with a fenced ```json block holding an object whose keys are the result's keys:\n{}\n\n",
+            serde_json::to_string_pretty(schema).unwrap_or_default()
+        ));
+    }
+    text
+}
+
+/// Whether the order's result is checked field by field, so the worker should lift the
+/// fields out of the engine's answer: a typed result schema, or an interface it provides.
+fn wants_result_fields(order: &ferryman_channel::Order) -> bool {
+    order
+        .result_contract
+        .as_ref()
+        .is_some_and(|contract| contract.schema.is_some())
+        || order
+            .interface
+            .as_ref()
+            .is_some_and(|reference| reference.side == ferryman_channel::interface::Side::Provides)
+}
+
+/// The JSON object an answer ends with: the last fenced block that parses as an object,
+/// or the whole answer when that is itself one.
+fn answer_object(answer: &str) -> Option<serde_json::Map<String, Value>> {
+    let as_object = |text: &str| match serde_json::from_str::<Value>(text.trim()) {
+        Ok(Value::Object(object)) => Some(object),
+        _ => None,
+    };
+    let fenced = answer
+        .split("```")
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .filter_map(|(_, block)| {
+            // The language tag, if there is one, is the run of letters before the body.
+            as_object(block.trim_start_matches(|c: char| c.is_ascii_alphabetic()))
+        })
+        .last();
+    fenced.or_else(|| as_object(answer))
+}
+
+/// Lift the engine's JSON object into the result payload, so a typed schema or an interface
+/// contract can be checked against real fields. Never overwrites a key the worker already
+/// wrote (`output`, `engine`, `cost_usd`, ...): those are the worker's own record, and an
+/// engine does not get to restate them.
+fn merge_result_fields(payload: &mut Value, answer: &str) {
+    let Some(fields) = answer_object(answer) else {
+        return;
+    };
+    let Some(target) = payload.as_object_mut() else {
+        return;
+    };
+    for (key, value) in fields {
+        target.entry(key).or_insert(value);
+    }
+}
+
 /// The prompt for a first attempt or revision, without task-matched skills.
 /// Kept as the test-facing entry point; the worker uses
 /// [`work_prompt_with_skills`].
@@ -2269,6 +2340,21 @@ pub struct Plan {
     pub would_do: Vec<(String, String)>,
 }
 
+/// Why this worker should not start `order` yet, when it should not: its interface
+/// contract is missing or not locked, or its `touches` overlap an order someone has
+/// claimed. `None` means it is free to claim.
+///
+/// A failure to read the channel here is not a reason to refuse work: the checks are
+/// advisory, and a worker that stopped on every unreadable directory would be worse than
+/// one that occasionally started something it could have waited for.
+fn start_hold(route: &ProjectRoute, order: &ferryman_channel::Order) -> Option<String> {
+    ferryman_channel::interface::hold_reason(route, order).or_else(|| {
+        ferryman_channel::overlap::claim_hold(route, order)
+            .ok()
+            .flatten()
+    })
+}
+
 /// Resolve the same things the worker resolves, and report them.
 pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
     let waiting = ferryman_channel::work_for(route, &config.agent)?;
@@ -2278,6 +2364,9 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
             let id = task.order.id.clone();
             match task.state() {
                 TaskState::Open | TaskState::Offered { .. } => {
+                    if let Some(reason) = start_hold(route, &task.order) {
+                        return Some((id, format!("hold off: {reason}")));
+                    }
                     Some((id, "claim it, then run the agent".to_string()))
                 }
                 TaskState::Claimed { .. } => {
@@ -2375,6 +2464,21 @@ pub async fn work_once(
             // Without it an order addressed to a machine that never ran looks exactly like
             // one being worked on.
             TaskState::Open | TaskState::Offered { .. } => {
+                // Not yet, and the reason is written down where everyone can read it: an
+                // interface contract the order builds to that the master has not locked,
+                // or another agent already working on the same files. Declined, not
+                // claimed - holding a claim on work nobody is doing would be the lie.
+                if let Some(reason) = start_hold(route, &task.order) {
+                    match ferryman_channel::hold::record(route, &identity, &id, &reason) {
+                        Ok(true) => report.info(&format!("  {id}: holding off, {reason}")),
+                        Ok(false) => {}
+                        Err(error) => report.warn(&format!(
+                            "  {id}: holding off, {reason} (could not record it: {error:#})"
+                        )),
+                    }
+                    continue;
+                }
+                ferryman_channel::hold::clear(route, &id, &config.agent);
                 // Nothing here can run an order of this tier right now - or, for an
                 // improvement order, nothing the engine policy allows, or this machine is
                 // not one it names: leave it for a machine that can, rather than claim it
@@ -3331,10 +3435,13 @@ async fn do_work(
     // And the roster of the other agents, so it knows who else is available, what
     // they are practiced at, and can say so when one of them is a better fit.
     let roster_text = peer_roster_block(route, &config.agent, &task_text);
+    // The interface this order builds to, and the shape its result must take, are the
+    // standing facts of the task rather than expertise: they ride just ahead of the skills.
+    let contract_text = contract_prompt(route, &task.order);
     let mut prompt = work_prompt_with_skills(
         config,
         task,
-        &format!("{profile_text}{roster_text}{skills_text}"),
+        &format!("{profile_text}{roster_text}{contract_text}{skills_text}"),
     );
     if let Some(note) = steer {
         prompt = format!(
@@ -3433,6 +3540,9 @@ async fn do_work(
     }
     if let Some(model) = &config.model {
         payload["model"] = json!(model);
+    }
+    if run.ok && wants_result_fields(&task.order) {
+        merge_result_fields(&mut payload, &engine_answer(&run.stdout));
     }
     if run.ok {
         // Recorded here, by the worker, before anything is committed or torn down - and
@@ -3602,6 +3712,43 @@ async fn collect_evidence(
     found
 }
 
+/// Record in the result's evidence which files the branch actually changed, read from git
+/// after the commit, and say - as a note for reviewers - when some fall outside the globs
+/// the order declared in `touches`.
+///
+/// Deliberately not a finding. `touches` is the issuer's estimate, a sound change may need
+/// one more file than anyone guessed, and the evidence classifier never reads the note: it
+/// cannot make a result unverified or refuted. It exists so a reviewer who is about to
+/// accept work sees that it wandered, instead of finding out at merge.
+fn record_touched(
+    workdir: &Path,
+    base_commit: &str,
+    task: &Task,
+    payload: &mut Value,
+    report: &dyn Progress,
+) {
+    let id = &task.order.id;
+    // Only a result that carries the worker's evidence has anywhere to put it.
+    let Some(mut evidence) = payload.get("evidence").and_then(|value| {
+        serde_json::from_value::<ferryman_channel::evidence::Evidence>(value.clone()).ok()
+    }) else {
+        return;
+    };
+    match ferryman_channel::worktree::changed_paths(workdir, base_commit) {
+        Ok(changed) => {
+            evidence.record_touched(&task.order.touches, &changed);
+            if let Some(note) = ferryman_channel::overlap::scope_note(&task.order.touches, &changed)
+            {
+                report.warn(&format!("  {id}: {note}"));
+            }
+            payload["evidence"] = json!(evidence);
+        }
+        Err(error) => report.warn(&format!(
+            "  {id}: could not list the files the commit changed: {error:#}"
+        )),
+    }
+}
+
 /// Commit the worktree, retire it, and publish the branch when it is worth keeping.
 ///
 /// The push is keyed off whether the branch has work, not off whether this worker
@@ -3644,6 +3791,7 @@ fn settle_worktree(
         Ok(None) => {}
         Err(e) => report.warn(&format!("  {id}: could not commit the worktree: {e}")),
     }
+    record_touched(workdir, base_commit, task, payload, report);
 
     if let Ok(head) = ferryman_channel::worktree::worktree_head(&route.workspace, branch) {
         payload["worktree_head"] = json!(head);
@@ -4742,6 +4890,9 @@ mod tests {
                 signed_by: None,
                 signature: None,
                 result_contract: None,
+                interface: None,
+                touches: Vec::new(),
+                allow_overlap: false,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -4823,6 +4974,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         }
     }
 
@@ -5131,6 +5285,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         assert_eq!(
             commit_subject("t-4f2a", &order),
@@ -5295,6 +5452,9 @@ mod tests {
                 signed_by: None,
                 signature: None,
                 result_contract: None,
+                interface: None,
+                touches: Vec::new(),
+                allow_overlap: false,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -5491,6 +5651,17 @@ mod tests {
         order_id: &str,
         config: &str,
     ) -> (ProjectRoute, AgentConfig) {
+        channel_with_shaped_order_for_wisp(comms, order_id, config, |_| {})
+    }
+
+    /// [`channel_with_order_for_wisp`], with `shape` free to change the order (its
+    /// `interface`, `touches`, ...) before the issuer signs it.
+    fn channel_with_shaped_order_for_wisp(
+        comms: &Path,
+        order_id: &str,
+        config: &str,
+        shape: impl FnOnce(&mut Order),
+    ) -> (ProjectRoute, AgentConfig) {
         let workspace = comms.join("demo-ferryman");
         enabled_channel(&workspace, "demo");
         std::fs::write(AgentConfig::path(&workspace.join(".ferryman")), config).unwrap();
@@ -5513,10 +5684,356 @@ mod tests {
         order.issued_by = "boss".into();
         order.assigned_to = Some("wisp".into());
         order.requires_review = false;
+        shape(&mut order);
         boss.sign_order(&mut order);
         ferryman_channel::issue_order(&route, &order).unwrap();
         let config = AgentConfig::load(&route.attachment).unwrap();
         (route, config)
+    }
+
+    /// A worker config that runs an engine which does not exist: the order is claimed and
+    /// handed over, and nothing runs. What a test sees is whether it was claimed.
+    const NO_ENGINE: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n";
+
+    fn boss() -> AgentIdentity {
+        AgentIdentity::from_seed("boss", [9; 32])
+    }
+
+    fn user_api() -> ferryman_channel::interface::InterfaceRef {
+        ferryman_channel::interface::InterfaceRef {
+            name: "user-api".into(),
+            version: "1".into(),
+            side: ferryman_channel::interface::Side::Consumes,
+        }
+    }
+
+    fn propose_user_api(route: &ProjectRoute) {
+        let shape = ferryman_channel::contract::Shape::parse(&json!({
+            "type": "object",
+            "required": ["user"],
+            "properties": { "user": { "type": "object", "required": ["id"],
+                "properties": { "id": { "type": "integer" } } } }
+        }))
+        .unwrap();
+        ferryman_channel::interface::propose(
+            route,
+            &boss(),
+            "user-api",
+            "1",
+            "GET /users/:id",
+            None,
+            shape,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_order_whose_contract_is_not_locked_is_held_and_then_runs() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(comms.path(), "t-ui", NO_ENGINE, |order| {
+                order.interface = Some(user_api());
+            });
+        ferryman_channel::master::initialize_master(&route, &boss(), "boss").unwrap();
+
+        // No contract at all: held, with the reason where everyone can read it.
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let task = ferryman_channel::read_task(&route, "t-ui").unwrap();
+        assert!(task.claims.is_empty(), "nothing is claimed while it waits");
+        let holds = ferryman_channel::hold::read(&route, "t-ui");
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert_eq!(holds[0].agent, "wisp");
+        assert!(
+            holds[0]
+                .reason
+                .contains("waiting for contract user-api@1 to be locked"),
+            "{}",
+            holds[0].reason
+        );
+        let plan = plan(&route, &config).unwrap();
+        assert!(
+            plan.would_do[0]
+                .1
+                .starts_with("hold off: waiting for contract"),
+            "{:?}",
+            plan.would_do
+        );
+
+        // Proposed but not locked is still waiting, and the record says what changed.
+        propose_user_api(&route);
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert!(
+            ferryman_channel::read_task(&route, "t-ui")
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        let holds = ferryman_channel::hold::read(&route, "t-ui");
+        assert_eq!(holds.len(), 1);
+        assert!(
+            holds[0].reason.contains("proposed, waiting for the master"),
+            "{}",
+            holds[0].reason
+        );
+        // A pass that finds the same reason does not rewrite the record.
+        let before = holds[0].at;
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let holds = ferryman_channel::hold::read(&route, "t-ui");
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].at, before, "an unchanged reason is not rewritten");
+
+        // Locked: the hold is cleared and the order is claimed.
+        ferryman_channel::interface::lock(&route, "user-api", "1", "boss", &boss()).unwrap();
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let task = ferryman_channel::read_task(&route, "t-ui").unwrap();
+        assert_eq!(task.claims.len(), 1, "it runs once the contract is locked");
+        assert!(ferryman_channel::hold::read(&route, "t-ui").is_empty());
+    }
+
+    /// An order for wisp that touches `touches`, and another order - for fang, who has
+    /// claimed it - that touches `other`.
+    fn channel_with_a_claimed_neighbour(
+        comms: &Path,
+        touches: &[&str],
+        allow_overlap: bool,
+        other: &[&str],
+    ) -> (ProjectRoute, AgentConfig) {
+        let touches: Vec<String> = touches.iter().map(|glob| glob.to_string()).collect();
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(comms, "t-mine", NO_ENGINE, |order| {
+                order.touches = touches;
+                order.allow_overlap = allow_overlap;
+            });
+        let mut neighbour = order("t-neighbour");
+        neighbour.project_id = route.project_id.clone();
+        neighbour.issued_by = "boss".into();
+        neighbour.assigned_to = Some("fang".into());
+        neighbour.requires_review = false;
+        neighbour.touches = other.iter().map(|glob| glob.to_string()).collect();
+        boss().sign_order(&mut neighbour);
+        ferryman_channel::issue_order(&route, &neighbour).unwrap();
+        ferryman_channel::claim_order(&route, "t-neighbour", "fang").unwrap();
+        (route, config)
+    }
+
+    #[tokio::test]
+    async fn a_worker_does_not_claim_an_order_that_overlaps_one_being_worked_on() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_a_claimed_neighbour(comms.path(), &["src/api/**"], false, &["src/**"]);
+
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        let task = ferryman_channel::read_task(&route, "t-mine").unwrap();
+        assert!(task.claims.is_empty(), "held back, not claimed");
+        let holds = ferryman_channel::hold::read(&route, "t-mine");
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert!(
+            holds[0].reason.contains("t-neighbour") && holds[0].reason.contains("fang"),
+            "{}",
+            holds[0].reason
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_overlap_and_unrelated_files_are_claimed_regardless() {
+        hermetic_machine();
+        let allowed = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_a_claimed_neighbour(allowed.path(), &["src/api/**"], true, &["src/**"]);
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(
+            ferryman_channel::read_task(&route, "t-mine")
+                .unwrap()
+                .claims
+                .len(),
+            1,
+            "allow_overlap means the issuer accepted the risk"
+        );
+        assert!(ferryman_channel::hold::read(&route, "t-mine").is_empty());
+
+        let apart = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_a_claimed_neighbour(
+            apart.path(),
+            &["src/apiv2/**"],
+            false,
+            &["src/api/**"],
+        );
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(
+            ferryman_channel::read_task(&route, "t-mine")
+                .unwrap()
+                .claims
+                .len(),
+            1,
+            "src/apiv2 is not under src/api"
+        );
+    }
+
+    #[test]
+    fn the_engines_json_block_becomes_the_results_checked_fields() {
+        let mut payload = json!({ "output": "done", "engine": "wisp" });
+        let answer = "Built it.\n\n```json\n{\"user\": {\"id\": 7}, \"output\": \"forged\"}\n```\n";
+        merge_result_fields(&mut payload, answer);
+        assert_eq!(payload["user"]["id"], json!(7));
+        assert_eq!(
+            payload["output"],
+            json!("done"),
+            "the worker's own record is never restated by the engine"
+        );
+
+        // The last parsing block wins; prose and non-object blocks are ignored.
+        let mut payload = json!({});
+        merge_result_fields(
+            &mut payload,
+            "```\n[1,2]\n```\n```json\n{\"a\": 1}\n```\n```json\n{\"a\": 2}\n```",
+        );
+        assert_eq!(payload["a"], json!(2));
+
+        // No object, no change.
+        let mut payload = json!({ "output": "x" });
+        merge_result_fields(&mut payload, "all done, nothing to report");
+        assert_eq!(payload, json!({ "output": "x" }));
+        // A bare object answer counts too.
+        merge_result_fields(&mut payload, "{\"a\": 3}");
+        assert_eq!(payload["a"], json!(3));
+    }
+
+    #[test]
+    fn only_a_checked_result_asks_the_engine_for_fields() {
+        use ferryman_channel::interface::Side;
+        let plain = order("t-plain");
+        assert!(!wants_result_fields(&plain));
+
+        let mut schema = order("t-schema");
+        schema.result_contract = Some(ferryman_channel::contract::ResultContract {
+            required: Vec::new(),
+            schema: ferryman_channel::contract::Shape::parse(&json!({ "type": "object" })).ok(),
+        });
+        assert!(wants_result_fields(&schema));
+
+        let mut provider = order("t-provider");
+        provider.interface = Some(ferryman_channel::interface::InterfaceRef {
+            side: Side::Provides,
+            ..user_api()
+        });
+        assert!(wants_result_fields(&provider));
+        let mut consumer = order("t-consumer");
+        consumer.interface = Some(user_api());
+        assert!(!wants_result_fields(&consumer));
+    }
+
+    #[test]
+    fn the_prompt_carries_the_result_shape_and_the_locked_contract() {
+        let comms = tempfile::tempdir().unwrap();
+        let (route, _) =
+            channel_with_shaped_order_for_wisp(comms.path(), "t-ui", NO_ENGINE, |_| {});
+        ferryman_channel::master::initialize_master(&route, &boss(), "boss").unwrap();
+
+        let mut consumer = order("t-ui");
+        consumer.interface = Some(user_api());
+        assert_eq!(
+            contract_prompt(&route, &consumer),
+            "",
+            "an unlocked contract says nothing: the order is not running yet anyway"
+        );
+
+        propose_user_api(&route);
+        ferryman_channel::interface::lock(&route, "user-api", "1", "boss", &boss()).unwrap();
+        let text = contract_prompt(&route, &consumer);
+        assert!(text.contains("user-api@1"), "{text}");
+        assert!(text.contains("\"integer\""), "{text}");
+
+        let mut schema = order("t-schema");
+        schema.result_contract = Some(ferryman_channel::contract::ResultContract {
+            required: Vec::new(),
+            schema: ferryman_channel::contract::Shape::parse(
+                &json!({ "type": "object", "required": ["count"] }),
+            )
+            .ok(),
+        });
+        let text = contract_prompt(&route, &schema);
+        assert!(text.contains("RESULT SHAPE"), "{text}");
+        assert!(text.contains("count"), "{text}");
+        assert_eq!(contract_prompt(&route, &order("t-plain")), "");
+    }
+
+    #[test]
+    fn the_files_a_commit_changed_are_recorded_and_a_stray_is_only_a_note() {
+        let repo = unique("ferryman-agent-touched");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "--template="]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "TOUCH-A", "worker").unwrap();
+        fs::create_dir_all(dir.join("src/api")).unwrap();
+        fs::write(dir.join("src/api/users.rs"), "// api").unwrap();
+        fs::write(dir.join("README.md"), "strayed").unwrap();
+
+        let route = project_route(&repo);
+        let mut task = test_task("TOUCH-A");
+        task.order.touches = vec!["src/api/**".into()];
+        let config = AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\n").unwrap();
+        let mut payload = json!({ "evidence": ferryman_channel::evidence::Evidence::default() });
+
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "TOUCH-A",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+
+        let evidence: ferryman_channel::evidence::Evidence =
+            serde_json::from_value(payload["evidence"].clone()).unwrap();
+        assert_eq!(evidence.touched_files, ["README.md", "src/api/users.rs"]);
+        assert_eq!(evidence.notes.len(), 1, "{:?}", evidence.notes);
+        assert!(
+            evidence.notes[0].contains("README.md"),
+            "{:?}",
+            evidence.notes
+        );
+        assert!(
+            !evidence.notes[0].contains("src/api/users.rs"),
+            "{:?}",
+            evidence.notes
+        );
+
+        // An order that declared nothing made no promise to stray from.
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "TOUCH-B", "worker").unwrap();
+        fs::write(dir.join("anything.txt"), "x").unwrap();
+        let task = test_task("TOUCH-B");
+        let mut payload = json!({ "evidence": ferryman_channel::evidence::Evidence::default() });
+        settle_worktree(
+            &route,
+            &config,
+            &task,
+            "TOUCH-B",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+        );
+        let evidence: ferryman_channel::evidence::Evidence =
+            serde_json::from_value(payload["evidence"].clone()).unwrap();
+        assert_eq!(evidence.touched_files, ["anything.txt"]);
+        assert!(evidence.notes.is_empty());
+
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[tokio::test]

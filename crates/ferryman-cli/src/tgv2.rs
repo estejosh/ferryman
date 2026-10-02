@@ -488,6 +488,9 @@ impl Bridge {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         self.agent.sign_order(&mut order);
         if let Err(error) = ferryman_channel::issue_order(&route, &order) {
@@ -559,7 +562,13 @@ impl Bridge {
                 .review(&route, &prompt.id, &principal, false, Some(text))
                 .map(|revision| format!("Sent {} r{revision} back: {text}", prompt.id)),
             _ => {
-                questions::answer(&route, &prompt.id, text, &principal, &self.agent).map(|answer| {
+                let answered = match questions::read(&route, &prompt.id) {
+                    Some(asked) if asked.kind == questions::CONTRACT => {
+                        decide_contract(&route, &asked, text.trim(), &principal, &self.agent)
+                    }
+                    _ => questions::answer(&route, &prompt.id, text, &principal, &self.agent),
+                };
+                answered.map(|answer| {
                     format!(
                         "Answered {} as {}: {}",
                         prompt.id,
@@ -1357,7 +1366,14 @@ impl Bridge {
                 ];
             }
         };
-        match questions::answer(&route, question, &choice, &principal, &self.agent) {
+        // A contract question is not answered, it is decided: Lock freezes the contract and
+        // Reject declines it, each signed for the master, and the answer follows from that.
+        let outcome = if asked.kind == questions::CONTRACT {
+            decide_contract(&route, &asked, &choice, &principal, &self.agent)
+        } else {
+            questions::answer(&route, question, &choice, &principal, &self.agent)
+        };
+        match outcome {
             Ok(answer) => {
                 // An engine-policy question's buttons do what they say: accept the
                 // recommended policy, or block the engine - signed for the master.
@@ -1649,6 +1665,8 @@ impl Bridge {
                     format!("{project} - ready to merge, waiting for you")
                 } else if question.kind == questions::POLICY {
                     format!("{project} - engine policy")
+                } else if question.kind == questions::CONTRACT {
+                    format!("{project} - interface contract, waiting for your lock")
                 } else {
                     format!("{project} - a question from {}", question.asked_by)
                 };
@@ -1661,6 +1679,31 @@ impl Bridge {
         }
         actions
     }
+}
+
+/// Lock or reject the interface contract a question is about, as the master, signed by the
+/// bridge under their delegation; the question's answer is the result. Anything but Lock or
+/// Reject is refused: a contract is frozen or declined, not discussed in a free reply.
+fn decide_contract(
+    route: &ProjectRoute,
+    asked: &questions::Question,
+    choice: &str,
+    principal: &str,
+    signer: &AgentIdentity,
+) -> Result<questions::Answer> {
+    use ferryman_channel::interface;
+    let Some(contract) = interface::contract_for_question(route, &asked.id) else {
+        bail!("that contract is gone, or no longer verifies");
+    };
+    if choice.eq_ignore_ascii_case(interface::LOCK) {
+        interface::lock(route, &contract.name, &contract.version, principal, signer)?;
+    } else if choice.eq_ignore_ascii_case(interface::REJECT) {
+        interface::reject(route, &contract.name, &contract.version, principal, signer)?;
+    } else {
+        bail!("answer {} or {}", interface::LOCK, interface::REJECT);
+    }
+    questions::answer_to(route, asked)
+        .context("the decision was recorded but its answer does not verify")
 }
 
 fn send(chat: i64, text: String, buttons: Vec<Row>) -> Action {
@@ -2321,6 +2364,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         josh().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();
@@ -2445,6 +2491,109 @@ mod tests {
         assert!(bridge.tick(Utc::now()).is_empty());
     }
 
+    /// A proposed interface contract reaches the phone once, however often it is asked
+    /// about, with Lock and Reject buttons; Lock freezes it signed for josh by the bridge,
+    /// and a free-text reply cannot stand in for the decision.
+    #[test]
+    fn a_proposed_contract_is_asked_once_and_lock_or_reject_decides_it() {
+        use ferryman_channel::contract::Shape;
+        use ferryman_channel::interface;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        let shape = Shape::parse(&json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": { "id": { "type": "integer" } }
+        }))
+        .unwrap();
+        let first = interface::propose(
+            &ferryman,
+            &wisp(),
+            "user-api",
+            "1",
+            "GET /users/:id",
+            None,
+            shape.clone(),
+        )
+        .unwrap();
+        assert!(
+            !interface::ensure_question(&ferryman, &wisp(), &first).unwrap(),
+            "asking again is asking once"
+        );
+
+        let posted = bridge.tick(Utc::now());
+        let shown = texts(&posted);
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert!(
+            shown[0].starts_with("ferryman - interface contract"),
+            "{shown:?}"
+        );
+        assert!(shown[0].contains("user-api@1"), "{shown:?}");
+        let labels: Vec<String> = buttons(&posted)
+            .into_iter()
+            .map(|(label, _)| label)
+            .collect();
+        assert_eq!(labels, ["Lock", "Reject", "Answer in words"]);
+        assert!(bridge.tick(Utc::now()).is_empty(), "posted once");
+
+        // Not a decision: the question stays open and nothing is locked.
+        let asked =
+            questions::read(&ferryman, &interface::question_id("ferryman", &first)).unwrap();
+        let error = decide_contract(
+            &ferryman,
+            &asked,
+            "sure, why not",
+            "josh",
+            &person(BRIDGE, 2),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Lock or Reject"), "{error}");
+        assert!(interface::locked(&ferryman, "user-api", "1").is_none());
+        assert_eq!(questions::pending(&ferryman).len(), 1);
+
+        let answered = press_labelled(&mut bridge, &posted, "Lock", 83);
+        assert!(
+            texts(&answered)
+                .iter()
+                .any(|t| t.contains("Answered \"Lock\" - josh via telegram-grouchly")),
+            "{answered:?}"
+        );
+        let locked = interface::locked(&ferryman, "user-api", "1").expect("locked from the phone");
+        let lock = locked.lock.unwrap();
+        assert_eq!(lock.by, "josh");
+        assert_eq!(lock.signed_by, "telegram-grouchly");
+        assert!(questions::pending(&ferryman).is_empty());
+
+        // Reject declines a second proposal; it can no longer be locked.
+        let second =
+            interface::propose(&ferryman, &wisp(), "user-api", "2", "", None, shape).unwrap();
+        let posted = bridge.tick(Utc::now());
+        press_labelled(&mut bridge, &posted, "Reject", 84);
+        assert_eq!(
+            interface::status(&ferryman, &second),
+            interface::Status::Rejected
+        );
+        assert!(interface::locked(&ferryman, "user-api", "2").is_none());
+    }
+
+    #[test]
+    fn a_contract_cannot_be_locked_from_the_phone_without_the_improve_delegation() {
+        use ferryman_channel::contract::Shape;
+        use ferryman_channel::interface;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        let shape = Shape::parse(&json!({ "type": "object" })).unwrap();
+        interface::propose(&ferryman, &wisp(), "user-api", "1", "", None, shape).unwrap();
+        let posted = bridge.tick(Utc::now());
+        let refused = press_labelled(&mut bridge, &posted, "Lock", 85);
+        assert!(
+            matches!(&refused[0], Action::Answer { text, .. } if text.contains("Not delegated")),
+            "{refused:?}"
+        );
+        assert!(interface::locked(&ferryman, "user-api", "1").is_none());
+    }
+
     #[test]
     fn self_improve_toggles_per_project_and_on_for_all_only_where_delegated() {
         let dir = tempfile::tempdir().unwrap();
@@ -2531,6 +2680,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         josh().sign_order(&mut order);
         ferryman_channel::issue_order(&ferryman, &order).unwrap();
@@ -2846,6 +2998,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         wisp().sign_order(&mut order);
         ferryman_channel::issue_order(&ferryman, &order).unwrap();

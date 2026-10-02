@@ -444,6 +444,14 @@ enum Command {
         #[command(subcommand)]
         command: Channel,
     },
+    /// Interface contracts: one agreed shape that the two halves of a feature build to.
+    ///
+    /// Any member proposes one; the master locks it; orders that provide or consume it
+    /// wait until it is locked, and a provider's result is checked against it.
+    Contract {
+        #[command(subcommand)]
+        command: ContractCommand,
+    },
     /// Server mode: messaging through a server. `channel` does the same with none.
     Communications {
         #[command(subcommand)]
@@ -950,6 +958,57 @@ enum Communications {
     },
 }
 
+/// Subcommands for [`Command::Contract`].
+#[derive(Subcommand, Clone)]
+enum ContractCommand {
+    /// Propose a contract from a JSON file: `name`, `version`, `description`, an optional
+    /// `request` shape and a `response` shape. Signed by you; the master is asked to lock it.
+    ///
+    /// A shape is `{"type": "object", "required": [...], "properties": {...}}`, with
+    /// `items` for arrays and `enum` for literals; types are string, number, integer,
+    /// boolean, array, object, null and any.
+    Propose {
+        /// The JSON file describing the contract.
+        file: PathBuf,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Who is proposing. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
+    /// Lock a proposed contract. Only the master signs this.
+    Lock {
+        /// `name@version`, e.g. user-api@1.
+        reference: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Decline a proposed contract. Only the master signs this.
+    Reject {
+        /// `name@version`, e.g. user-api@1.
+        reference: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// One contract: its status, its shapes, and the orders on each side.
+    Show {
+        /// `name@version`, e.g. user-api@1.
+        reference: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Print the contract as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every contract in this project with its status.
+    List {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Subcommand, Clone)]
 enum Channel {
     /// Where the channel for this directory lives, and what state it is in.
@@ -1119,6 +1178,24 @@ enum Channel {
         /// work until each dependency is accepted or done.
         #[arg(long)]
         depends_on: Vec<String>,
+        /// Repo-relative globs of the files this order expects to edit, e.g.
+        /// --touches 'src/api/**' 'tests/api/**'. Warns now about open or claimed orders
+        /// that overlap, and a worker will not claim it while one is being worked on.
+        #[arg(long, num_args = 1.., value_name = "GLOB")]
+        touches: Vec<String>,
+        /// Let a worker claim this order even if its --touches overlap an order that is
+        /// already claimed.
+        #[arg(long)]
+        allow_overlap: bool,
+        /// The interface contract this order provides or consumes, as
+        /// name@version:provides or name@version:consumes. A worker will not start it
+        /// until the master has locked that contract.
+        #[arg(long, value_name = "NAME@VERSION:SIDE", value_parser = parse_interface_ref)]
+        interface: Option<ferryman_channel::interface::InterfaceRef>,
+        /// A JSON file holding a shape the result must have, checked mechanically
+        /// (types, nested keys, array items, enums). Held to the whole result payload.
+        #[arg(long, value_name = "FILE")]
+        result_schema: Option<PathBuf>,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -3587,6 +3664,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Team { command } => team_command(command).await?,
+        Command::Contract { command } => contract_command(command)?,
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -6936,6 +7014,212 @@ fn soak_endpoint() -> Option<String> {
         .filter(|value| !value.is_empty() && value != "off")
 }
 
+/// `user-api@1:provides` as `--interface` takes it.
+fn parse_interface_ref(value: &str) -> Result<ferryman_channel::interface::InterfaceRef, String> {
+    ferryman_channel::interface::InterfaceRef::parse(value).map_err(|error| format!("{error:#}"))
+}
+
+/// Read a shape from a JSON file, refusing keys a shape does not have: a typo in a schema
+/// that was silently ignored would weaken the contract it was written to enforce.
+fn read_shape_file(path: &std::path::Path) -> Result<ferryman_channel::contract::Shape> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read the schema from {}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", path.display()))?;
+    ferryman_channel::contract::Shape::parse(&value)
+}
+
+/// `ferry contract ...`
+fn contract_command(command: ContractCommand) -> Result<()> {
+    use ferryman_channel::interface;
+    let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
+        let start = match workspace {
+            Some(path) => path,
+            None => std::env::current_dir().context("read the current directory")?,
+        };
+        ferryman_channel::route_for(&start)
+    };
+    let shape_of = |value: Option<&serde_json::Value>, what: &str| -> Result<Option<_>> {
+        value
+            .filter(|value| !value.is_null())
+            .map(ferryman_channel::contract::Shape::parse)
+            .transpose()
+            .with_context(|| format!("the contract's {what}"))
+    };
+    match command {
+        ContractCommand::Propose {
+            file,
+            workspace,
+            agent,
+        } => {
+            let route = here(workspace)?;
+            let text = std::fs::read_to_string(&file)
+                .with_context(|| format!("read the contract from {}", file.display()))?;
+            let spec: serde_json::Value = serde_json::from_str(&text)
+                .with_context(|| format!("{} is not JSON", file.display()))?;
+            let field = |key: &str| spec.get(key).and_then(serde_json::Value::as_str);
+            let (Some(name), Some(version)) = (field("name"), field("version")) else {
+                bail!("the contract file needs a \"name\" and a \"version\" (both strings)");
+            };
+            for key in spec
+                .as_object()
+                .into_iter()
+                .flat_map(|object| object.keys())
+            {
+                if !["name", "version", "description", "request", "response"]
+                    .contains(&key.as_str())
+                {
+                    bail!(
+                        "unknown key \"{key}\" in the contract file (it has: name, version, \
+                         description, request, response)"
+                    );
+                }
+            }
+            let Some(response) = shape_of(spec.get("response"), "response")? else {
+                bail!("the contract file needs a \"response\" shape");
+            };
+            let request = shape_of(spec.get("request"), "request")?;
+            let proposer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity = signing_identity(&route, &proposer)?;
+            let contract = interface::propose(
+                &route,
+                &identity,
+                name,
+                version,
+                field("description").unwrap_or_default(),
+                request,
+                response,
+            )?;
+            println!(
+                "proposed {} as {}; the master has been asked to lock it",
+                contract.reference(),
+                contract.proposed_by
+            );
+            println!("  until it is locked, orders that provide or consume it are held");
+        }
+        ContractCommand::Lock {
+            reference,
+            workspace,
+        } => {
+            let route = here(workspace)?;
+            let (name, version) = interface::parse_ref(&reference)?;
+            let (master, identity) =
+                mastered_signer(&route.communications, &route.attachment, None)?;
+            let locked = interface::lock(&route, &name, &version, &master, &identity)?;
+            println!(
+                "locked {} as {master}: it will not change; a change is a new version",
+                locked.reference()
+            );
+        }
+        ContractCommand::Reject {
+            reference,
+            workspace,
+        } => {
+            let route = here(workspace)?;
+            let (name, version) = interface::parse_ref(&reference)?;
+            let (master, identity) =
+                mastered_signer(&route.communications, &route.attachment, None)?;
+            let rejected = interface::reject(&route, &name, &version, &master, &identity)?;
+            println!(
+                "rejected {}: propose a new version instead",
+                rejected.reference()
+            );
+        }
+        ContractCommand::Show {
+            reference,
+            workspace,
+            json,
+        } => {
+            let route = here(workspace)?;
+            let (name, version) = interface::parse_ref(&reference)?;
+            let Some(contract) = interface::read_contract(&route, &name, &version) else {
+                bail!(
+                    "there is no genuine contract {reference} in {} (a forged, unsigned or \
+                     edited-after-lock file does not count)",
+                    route.project_id
+                );
+            };
+            let status = interface::status(&route, &contract);
+            let orders = interface::orders_for_interface(&route, &name, &version)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "contract": contract,
+                        "status": status,
+                        "orders": orders,
+                    }))?
+                );
+                return Ok(());
+            }
+            print!(
+                "{}  {}  proposed by {}",
+                contract.reference(),
+                status.as_str(),
+                contract.proposed_by
+            );
+            if let Some(lock) = &contract.lock {
+                print!(", locked by {}", lock.by);
+            }
+            println!();
+            if !contract.description.trim().is_empty() {
+                println!("  {}", contract.description.trim());
+            }
+            if let Some(request) = &contract.request {
+                println!("request:\n{}", serde_json::to_string_pretty(request)?);
+            }
+            println!(
+                "response:\n{}",
+                serde_json::to_string_pretty(&contract.response)?
+            );
+            for (label, side) in [
+                ("provided by", &orders.providers),
+                ("consumed by", &orders.consumers),
+            ] {
+                for order in side {
+                    let state = ferryman_channel::read_task(&route, &order.id)
+                        .map(|task| format!("{:?}", task.state()))
+                        .unwrap_or_else(|_| "unreadable".to_string());
+                    println!("{label}: {} ({state})", order.id);
+                }
+            }
+        }
+        ContractCommand::List { workspace, json } => {
+            let route = here(workspace)?;
+            let contracts = interface::list_contracts(&route);
+            if json {
+                let items: Vec<_> = contracts
+                    .iter()
+                    .map(|contract| {
+                        serde_json::json!({
+                            "contract": contract,
+                            "status": interface::status(&route, contract),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&items)?);
+                return Ok(());
+            }
+            if contracts.is_empty() {
+                println!("no contracts in {}", route.project_id);
+            }
+            for contract in &contracts {
+                let orders =
+                    interface::orders_for_interface(&route, &contract.name, &contract.version)?;
+                println!(
+                    "{:<24} {:<9} by {:<12} {} provider(s), {} consumer(s)",
+                    contract.reference(),
+                    interface::status(&route, contract).as_str(),
+                    contract.proposed_by,
+                    orders.providers.len(),
+                    orders.consumers.len()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The signing key for a name the OPERATOR named, refusing rather than inventing one.
 ///
 /// # Why this exists, and why it is a function rather than a rule
@@ -8559,9 +8843,18 @@ fn channel(command: Channel) -> Result<()> {
             require,
             requires_approval,
             depends_on,
+            touches,
+            allow_overlap,
+            interface,
+            result_schema,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let schema = result_schema
+                .as_deref()
+                .map(read_shape_file)
+                .transpose()
+                .context("--result-schema")?;
             let task = match (task, task_file) {
                 (Some(task), _) => task,
                 (None, Some(path)) if path.as_os_str() == "-" => {
@@ -8596,12 +8889,20 @@ fn channel(command: Channel) -> Result<()> {
                 depends_on,
                 signed_by: None,
                 signature: None,
-                result_contract: if require.is_empty() {
+                result_contract: if require.is_empty() && schema.is_none() {
                     None
                 } else {
-                    Some(ferryman_channel::contract::ResultContract { required: require })
+                    Some(ferryman_channel::contract::ResultContract {
+                        required: require,
+                        schema,
+                    })
                 },
+                interface,
+                touches,
+                allow_overlap,
             };
+            // Asked before the order exists, so it cannot find itself.
+            let overlapping = ferryman_channel::overlap::issue_warnings(&route, &order)?;
             // Actually sign it. Setting signed_by without a signature would claim
             // attribution nothing could check, which is worse than claiming none.
             if let Some(identity) = sign_as(&route, &issuer)? {
@@ -8622,6 +8923,18 @@ fn channel(command: Channel) -> Result<()> {
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),
                 None => println!("  open: whichever agent claims first wins"),
+            }
+            if let Some(reason) = ferryman_channel::interface::hold_reason(&route, &order) {
+                println!("  note: {reason}; workers hold it until then");
+            }
+            for warning in &overlapping {
+                println!("  warning: its --touches overlap {}", warning.describe());
+            }
+            if !overlapping.is_empty() && !order.allow_overlap {
+                println!(
+                    "           workers will not claim it while one of those is claimed; \
+                     issue it with --allow-overlap if running alongside them is intended"
+                );
             }
         }
 
@@ -8940,12 +9253,12 @@ fn channel(command: Channel) -> Result<()> {
             // A contract violation must be fixed before acceptance: this is the
             // mechanical rejection a result schema exists to provide.
             if accept
-                && let Some(missing) = task.contract_violations()
+                && let Some(missing) = task.contract_violations_in(&route)
                 && !missing.is_empty()
             {
                 bail!(
-                    "result for {id} does not satisfy the order's contract; missing keys: {}",
-                    missing.join(", ")
+                    "result for {id} does not satisfy the order's contract: {}",
+                    missing.join("; ")
                 );
             }
             let mut verdict = ferryman_channel::Review {
@@ -9052,12 +9365,29 @@ fn channel(command: Channel) -> Result<()> {
                         .collect();
                     println!("               waiting on {}", waiting.join(", "));
                 }
-                if let Some(missing) = task.contract_violations() {
+                if let Some(missing) = task.contract_violations_in(&route) {
                     if missing.is_empty() {
                         println!("               contract satisfied");
                     } else {
-                        println!("               contract MISSING: {}", missing.join(", "));
+                        println!("               contract MISSING: {}", missing.join("; "));
                     }
+                }
+                if let Some(reference) = &task.order.interface {
+                    println!("               interface {}", reference.describe());
+                }
+                if !task.order.touches.is_empty() {
+                    println!(
+                        "               touches {}{}",
+                        task.order.touches.join(", "),
+                        if task.order.allow_overlap {
+                            " (overlap allowed)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                for hold in ferryman_channel::hold::read(&route, &task.order.id) {
+                    println!("               held by {}: {}", hold.agent, hold.reason);
                 }
                 for result in &task.results {
                     println!(
@@ -10889,6 +11219,125 @@ mod tests {
         );
         assert_eq!(slug_of(Path::new("/tmp/foo--bar--")), "foo-bar");
         assert_eq!(slug_of(Path::new("/")), "");
+    }
+
+    /// The new order flags parse the way the docs show them: `--touches` takes several
+    /// globs, the interface is `name@version:side`, and nothing is required.
+    #[test]
+    fn the_order_flags_for_contracts_and_file_locks_parse() {
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from([
+            "ferry",
+            "channel",
+            "order",
+            "--id",
+            "t-api",
+            "--task",
+            "implement it",
+            "--interface",
+            "user-api@1:provides",
+            "--touches",
+            "src/api/**",
+            "tests/api/**",
+            "--allow-overlap",
+            "--result-schema",
+            "shape.json",
+        ])
+        .unwrap();
+        let super::Command::Channel {
+            command:
+                super::Channel::Order {
+                    touches,
+                    allow_overlap,
+                    interface,
+                    result_schema,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("not an order");
+        };
+        assert_eq!(touches, ["src/api/**", "tests/api/**"]);
+        assert!(allow_overlap);
+        assert_eq!(interface.unwrap().describe(), "user-api@1:provides");
+        assert_eq!(result_schema.unwrap(), Path::new("shape.json"));
+
+        let bare =
+            super::Cli::try_parse_from(["ferry", "channel", "order", "--id", "t-1", "--task", "x"])
+                .unwrap();
+        let super::Command::Channel {
+            command:
+                super::Channel::Order {
+                    touches,
+                    allow_overlap,
+                    interface,
+                    result_schema,
+                    ..
+                },
+        } = bare.command
+        else {
+            panic!("not an order");
+        };
+        assert!(touches.is_empty() && !allow_overlap);
+        assert!(interface.is_none() && result_schema.is_none());
+
+        let refused = super::Cli::try_parse_from([
+            "ferry",
+            "channel",
+            "order",
+            "--id",
+            "t-1",
+            "--task",
+            "x",
+            "--interface",
+            "nope",
+        ]);
+        assert!(refused.is_err(), "an interface needs a version and a side");
+    }
+
+    #[test]
+    fn contract_subcommands_take_a_reference() {
+        use clap::Parser;
+        for words in [
+            vec!["ferry", "contract", "propose", "user-api.json"],
+            vec!["ferry", "contract", "lock", "user-api@1"],
+            vec!["ferry", "contract", "reject", "user-api@1"],
+            vec!["ferry", "contract", "show", "user-api@1", "--json"],
+            vec!["ferry", "contract", "list"],
+        ] {
+            assert!(
+                super::Cli::try_parse_from(words.iter().copied()).is_ok(),
+                "{words:?}"
+            );
+        }
+        assert!(super::Cli::try_parse_from(["ferry", "contract", "lock"]).is_err());
+    }
+
+    /// A schema file with a misspelled key is refused, not quietly weakened.
+    #[test]
+    fn a_schema_file_is_read_strictly() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.json");
+        std::fs::write(
+            &good,
+            r#"{"type":"object","required":["id"],"properties":{"id":{"type":"integer"}}}"#,
+        )
+        .unwrap();
+        let shape = super::read_shape_file(&good).unwrap();
+        assert!(shape.check(&serde_json::json!({ "id": 1 })).is_empty());
+        assert_eq!(
+            shape.check(&serde_json::json!({ "id": "x" })),
+            ["result.id: expected integer, got string"]
+        );
+
+        let typo = dir.path().join("typo.json");
+        std::fs::write(&typo, r#"{"type":"object","requird":["id"]}"#).unwrap();
+        assert!(super::read_shape_file(&typo).is_err());
+        let missing = dir.path().join("missing.json");
+        assert!(super::read_shape_file(&missing).is_err());
+        let not_json = dir.path().join("not.json");
+        std::fs::write(&not_json, "{").unwrap();
+        assert!(super::read_shape_file(&not_json).is_err());
     }
 
     /// A seed is created once, used silently after that, and never created unattended.

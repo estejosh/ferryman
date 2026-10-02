@@ -576,6 +576,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         wisp().sign_order(&mut order);
         crate::issue_order(route, &order).unwrap();

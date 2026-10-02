@@ -456,6 +456,44 @@ pub fn head_of(worktree: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The paths a worktree's `HEAD` changed since `base`: what was actually committed, as
+/// repo-relative paths with forward slashes, sorted. Renames count as the delete and the
+/// add, so both paths are named. The channel's own directory is not the agent's work and
+/// is left out.
+pub fn changed_paths(worktree: &Path, base: &str) -> Result<Vec<String>> {
+    if base.trim().is_empty() {
+        bail!("there is no base commit to compare against");
+    }
+    let output = Command::new("git")
+        .args([
+            "-C",
+            worktree
+                .to_str()
+                .context("worktree path is not valid UTF-8")?,
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            base,
+            "HEAD",
+        ])
+        .output()
+        .context("git diff --name-only")?;
+    if !output.status.success() {
+        bail!(
+            "git diff --name-only failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|path| !path.is_empty() && !path.starts_with(".ferryman/"))
+        .map(str::to_string)
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
 /// Publish a branch to a remote, so the work leaves the machine that produced it.
 ///
 /// `--force-with-lease` rather than `--force`: a re-dispatched task legitimately
@@ -912,6 +950,39 @@ mod tests {
         // ...and the committing path refuses rather than reporting "nothing to commit".
         assert!(commit_all(&missing, "nebra", "x").is_err());
         let _ = fs::remove_dir_all(&missing);
+    }
+
+    /// The paths a commit actually changed, which is what a scope check has to read: the
+    /// engine's own account of what it touched is not evidence.
+    #[test]
+    fn the_changed_paths_are_what_the_commit_changed_since_the_base() {
+        let repo = temp_repo();
+        let base = head_of(&repo).unwrap();
+        assert!(
+            changed_paths(&repo, &base).unwrap().is_empty(),
+            "nothing yet"
+        );
+
+        fs::create_dir_all(repo.join("src/api")).unwrap();
+        fs::write(repo.join("src/api/users.rs"), "x").unwrap();
+        fs::write(repo.join("f.txt"), "changed").unwrap();
+        fs::create_dir_all(repo.join(".ferryman")).unwrap();
+        fs::write(repo.join(".ferryman/receipt.json"), "{}").unwrap();
+        run_git(&repo, &["add", "-A", "-f"]);
+        run_git(&repo, &["commit", "-q", "-m", "work"]);
+        // Two commits are read as one change since the base.
+        fs::write(repo.join("README.md"), "r").unwrap();
+        run_git(&repo, &["add", "README.md"]);
+        run_git(&repo, &["commit", "-q", "-m", "more"]);
+
+        assert_eq!(
+            changed_paths(&repo, &base).unwrap(),
+            vec!["README.md", "f.txt", "src/api/users.rs"],
+            "forward slashes, sorted, and not the channel's own directory"
+        );
+        assert!(changed_paths(&repo, "").is_err());
+        assert!(changed_paths(&repo, "not-a-commit").is_err());
+        let _ = fs::remove_dir_all(&repo);
     }
 
     #[test]

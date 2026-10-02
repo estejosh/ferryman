@@ -669,6 +669,9 @@ fn verify_claims(
                 signed_by: None,
                 signature: None,
                 result_contract: None,
+                interface: None,
+                touches: Vec::new(),
+                allow_overlap: false,
             };
             identity.sign_order(&mut order);
             match ferryman_channel::issue_order(route, &order) {
@@ -1080,6 +1083,9 @@ fn issue_missing(
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         identity.sign_order(&mut order);
         match ferryman_channel::issue_order(route, &order) {
@@ -2304,6 +2310,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         wisp.sign_order(&mut order);
         ferryman_channel::issue_order(&route, &order).unwrap();
@@ -2567,6 +2576,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         wisp.sign_order(&mut order);
         ferryman_channel::issue_order(&route, &order).unwrap();
@@ -3047,6 +3059,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         let task = |id: &str, output: &str| Task {
             order: order(id),
@@ -3218,6 +3233,9 @@ mod tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         };
         wisp().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();

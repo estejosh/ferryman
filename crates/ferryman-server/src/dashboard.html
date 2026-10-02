@@ -397,6 +397,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
     <div class="nav" id="nav-main">
       <button data-page="home" aria-current="page">Home</button>
       <button data-page="tasks">Tasks <span class="pill num" id="count-tasks">0</span></button>
+      <button data-page="contracts">Contracts</button>
       <button data-page="review">Needs review <span class="pill num" id="count-review">0</span></button>
       <button data-page="agents">Agents <span class="pill num" id="count-agents">0</span></button>
       <button data-page="release">Release</button>
@@ -778,6 +779,7 @@ async function showTask(id) {
       ${(d.depends_on || []).length ? `<dt>Depends on</dt><dd class="mono">${esc((d.depends_on||[]).join(", "))}</dd>` : ""}
       ${d.requires_approval ? `<dt>Approval</dt><dd><span class="badge warn">Master must accept</span></dd>` : ""}
     </dl>
+    ${taskContractDetail(d)}
     <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:0 0 8px">The order</h3>
     <pre class="out">${esc(d.order || d.payload?.task || "—")}</pre>
     ${latest ? `
@@ -845,11 +847,56 @@ function taskRow(t) {
       <div class="r">
         ${t.holder ? `<span class="badge">${esc(t.holder)}</span>` : ""}
         ${t.engine ? `<span class="badge">${esc(t.engine)}</span>` : ""}
+        ${contractBadges(t)}
         ${sigBadge(t.sig)}
         ${stageBadge(t.stage)}
         <span class="badge ${st.tone}">${esc(st.word)}</span>
       </div>
     </div>`;
+}
+
+// What an order card says about the interface it builds to and the files it touches: the
+// contract it provides or consumes, a warning when another open or claimed order is heading
+// for the same files, and why a worker is holding it back, when one is. The warning is
+// advisory - it never hides or blocks the order - and says what it overlaps on hover.
+function contractBadges(t) {
+  const out = [];
+  if (t.interface) {
+    out.push(`<span class="badge accent" title="This order ${esc(t.interface.side)} the contract">${esc(t.interface.name)}@${esc(t.interface.version)} ${esc(t.interface.side)}</span>`);
+  }
+  const overlaps = t.overlaps || [];
+  if (overlaps.length) {
+    const why = overlaps.map((o) => `${o.order_id} (${o.state}${o.holder ? " by " + o.holder : ""}): ${(o.pairs || []).map((p) => p.join(" ~ ")).join(", ")}`).join("\n");
+    out.push(`<span class="badge warn" title="${esc(why)}">overlaps ${overlaps.length} order${overlaps.length > 1 ? "s" : ""}</span>`);
+  }
+  const holds = t.holds || [];
+  if (holds.length) {
+    out.push(`<span class="badge warn" title="${esc(holds.map((h) => h.agent + ": " + h.reason).join("\n"))}">held</span>`);
+  }
+  return out.join("");
+}
+
+// The detail the card has no room for, shown in the drawer: the files the order declared,
+// overlapping orders, why it is held, and the notes the worker left for the reviewer.
+function taskContractDetail(d) {
+  const order = d.order || {};
+  const rows = [];
+  if (order.interface) {
+    rows.push(`<dt>Interface</dt><dd class="mono">${esc(order.interface.name)}@${esc(order.interface.version)} <span style="color:var(--faint)">${esc(order.interface.side)}</span></dd>`);
+  }
+  if ((order.touches || []).length) {
+    rows.push(`<dt>Touches</dt><dd class="mono">${esc(order.touches.join(", "))}${order.allow_overlap ? ` <span class="badge">overlap allowed</span>` : ""}</dd>`);
+  }
+  (d.overlaps || []).forEach((o) => {
+    rows.push(`<dt>Overlaps</dt><dd><span class="mono">${esc(o.order_id)}</span> <span class="badge warn">${esc(o.state)}${o.holder ? " by " + esc(o.holder) : ""}</span> <span class="mono" style="color:var(--faint)">${esc((o.pairs || []).map((p) => p.join(" ~ ")).join(", "))}</span></dd>`);
+  });
+  (d.holds || []).forEach((h) => {
+    rows.push(`<dt>Held</dt><dd>${esc(h.agent)} is holding off: ${esc(h.reason)}</dd>`);
+  });
+  (d.notes || []).forEach((n) => {
+    rows.push(`<dt>Note r${esc(n.revision)}</dt><dd>${esc(n.note)}</dd>`);
+  });
+  return rows.length ? `<dl class="kv">${rows.join("")}</dl>` : "";
 }
 
 // How far an unfinished order has got, from signed receipts: sent, delivered, read,
@@ -1794,6 +1841,86 @@ pages.fleet = async () => {
     </div>`;
 };
 
+// A JSON shape written the way a person reads it: the type first, then each property on
+// its own line, `*` marking the ones that are required.
+function shapeText(shape, indent) {
+  if (!shape) return "any";
+  indent = indent || "";
+  const kind = shape.type || "any";
+  const allowed = (shape.enum || []).length ? ` (one of ${shape.enum.map((v) => JSON.stringify(v)).join(", ")})` : "";
+  if (kind === "array") return `array of ${shapeText(shape.items, indent)}${allowed}`;
+  const props = Object.entries(shape.properties || {});
+  if (kind !== "object" || !props.length) return `${kind}${allowed}`;
+  const need = new Set(shape.required || []);
+  const pad = indent + "  ";
+  return `object${allowed} {\n${props.map(([k, v]) =>
+    `${pad}${k}${need.has(k) ? "*" : ""}: ${shapeText(v, pad)}`).join("\n")}\n${indent}}`;
+}
+
+function contractOrders(label, orders) {
+  if (!orders.length) return `<dt>${esc(label)}</dt><dd style="color:var(--faint)">no order yet</dd>`;
+  return `<dt>${esc(label)}</dt><dd>${orders.map((o) => {
+    const word = String((o.state || {}).status || "").replace(/_/g, " ");
+    const held = (o.holds || []).map((h) => `<div style="color:var(--faint)">${esc(h.agent)} is holding off: ${esc(h.reason)}</div>`).join("");
+    return `<div><span class="mono">${esc(o.id)}</span> <span class="badge">${esc(word)}</span>${o.holder ? ` <span class="badge">${esc(o.holder)}</span>` : ""}${(o.touches || []).length ? ` <span class="mono" style="color:var(--faint)">${esc(o.touches.join(", "))}</span>` : ""}${held}</div>`;
+  }).join("")}</dd>`;
+}
+
+// Interface contracts: the request and response two orders agree on, frozen by the master.
+// Proposed contracts wait here for the Lock button, which only the signed-in master gets;
+// a locked contract never changes, and a change is a new version.
+pages.contracts = async () => {
+  const d = await api("/api/contracts");
+  const all = d.contracts || [];
+  const list = all.filter((c) => matches(`${c.reference} ${c.description} ${c.status} ${c.proposed_by}`));
+  const pending = all.filter((c) => c.status === "proposed").length;
+  const tone = { proposed: "warn", locked: "good", rejected: "bad" };
+  return `
+    <div class="head">
+      <div><h1>Contracts</h1><p>The shapes orders agree on before they start. A worker will not begin an order whose contract is not locked${d.master ? `; ${esc(d.master)} locks them` : ""}.</p></div>
+    </div>
+    ${pending ? `<div class="notice"><b>${pending} waiting for a lock</b><div>${d.may_decide
+      ? "Read the shapes below, then lock or reject each one."
+      : "Only the master can lock a contract."}</div></div>` : ""}
+    <div class="panel">${list.length ? list.map((c) => `
+      <div class="row" style="display:block">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <span class="t mono">${esc(c.reference)}</span>
+          <span class="badge ${tone[c.status] || ""}">${esc(c.status)}</span>
+          <span style="color:var(--faint)">proposed by ${esc(c.proposed_by)} ${esc(ago(c.proposed_at))}${c.locked_by ? `, locked by ${esc(c.locked_by)} ${esc(ago(c.locked_at))}` : ""}</span>
+          ${d.may_decide && c.status === "proposed" ? `
+            <span style="margin-left:auto">
+              <button class="btn" data-contract-lock="${esc(c.reference)}">Lock</button>
+              <button class="btn" data-contract-reject="${esc(c.reference)}">Reject</button>
+            </span>` : ""}
+        </div>
+        ${c.description ? `<p>${esc(c.description)}</p>` : ""}
+        <dl class="kv">
+          ${c.request ? `<dt>Request</dt><dd><pre class="mono">${esc(shapeText(c.request))}</pre></dd>` : ""}
+          <dt>Response</dt><dd><pre class="mono">${esc(shapeText(c.response))}</pre></dd>
+          ${contractOrders("Provided by", c.providers || [])}
+          ${contractOrders("Consumed by", c.consumers || [])}
+        </dl>
+        <div class="contract-msg" style="color:var(--faint)"></div>
+      </div>`).join("") : `<div class="empty">No contract has been proposed. Propose one with <span class="mono">ferry contract propose &lt;file.json&gt;</span>.</div>`}</div>`;
+};
+
+function wireContracts() {
+  const decide = (attr, verb) => $$(`[${attr}]`).forEach((b) => b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      await api(`/api/contracts/${encodeURIComponent(b.getAttribute(attr))}/${verb}`, { method: "POST" });
+      await render();
+    } catch (err) {
+      const msg = b.closest(".row").querySelector(".contract-msg");
+      msg.textContent = String(err.message || err).slice(0, 200);
+      b.disabled = false;
+    }
+  }));
+  decide("data-contract-lock", "lock");
+  decide("data-contract-reject", "reject");
+}
+
 // The vault is the one page with no backend behind it. It says so, and shows
 // nothing — an invented count here would be a lie told in the operator's own
 // dashboard, which is the last place one belongs.
@@ -2235,6 +2362,7 @@ async function render() {
   wireRelease();
   wireTeammates();
   wireAgents();
+  wireContracts();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {

@@ -28,6 +28,8 @@ pub mod evidence;
 pub mod ferry;
 pub mod gate;
 pub mod head;
+pub mod hold;
+pub mod interface;
 pub mod interrupt;
 pub mod invite;
 pub mod keys;
@@ -40,6 +42,7 @@ pub mod marvin;
 pub mod master;
 pub mod memory;
 pub mod migration;
+pub mod overlap;
 pub mod owner;
 pub mod policy;
 pub mod portable_auth;
@@ -753,6 +756,19 @@ pub struct Order {
     /// deliverables rejected mechanically rather than reviewed by hand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_contract: Option<crate::contract::ResultContract>,
+    /// The interface contract this order provides or consumes. A worker does not start
+    /// the order until that contract is locked by the master; see [`interface`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface: Option<interface::InterfaceRef>,
+    /// Repo-relative globs of the files this order expects to edit. Advisory: it lets the
+    /// fleet notice two orders heading for the same files before they meet at merge. See
+    /// [`overlap`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub touches: Vec<String>,
+    /// Claim this order even though its `touches` overlap an order someone is already
+    /// working on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_overlap: bool,
 }
 
 /// An agent staking a claim on an open order.
@@ -1050,6 +1066,35 @@ impl Task {
         let contract = self.order.result_contract.as_ref()?;
         let latest = self.results.iter().max_by_key(|r| r.revision)?;
         Some(contract.violations(&latest.payload))
+    }
+
+    /// [`Task::contract_violations`], and also what the order's interface contract asks
+    /// of it: a provider's result must carry a `response` that fits the locked
+    /// contract's response shape (see [`interface::provider_violations`]).
+    ///
+    /// This is the check anything that accepts a result uses. It needs the route because
+    /// the contract lives in the channel, not in the order: an order names `user-api@1`,
+    /// and what `user-api@1` says is read, and verified, at the moment of the check.
+    #[must_use]
+    pub fn contract_violations_in(&self, route: &ProjectRoute) -> Option<Vec<String>> {
+        let latest = self.results.iter().max_by_key(|r| r.revision)?;
+        let mut found = self
+            .order
+            .result_contract
+            .as_ref()
+            .map(|contract| contract.violations(&latest.payload));
+        if let Some(reference) = &self.order.interface
+            && reference.side == interface::Side::Provides
+        {
+            found
+                .get_or_insert_with(Vec::new)
+                .extend(interface::provider_violations(
+                    route,
+                    reference,
+                    &latest.payload,
+                ));
+        }
+        found
     }
 
     /// A proposed verdict on the newest result that no human has settled yet.
@@ -2112,6 +2157,26 @@ fn order_payload(order: &Order) -> String {
             "\ncontract:{}",
             serde_json::to_string(&contract.required).unwrap_or_else(|_| "[]".to_string())
         ));
+        // The typed schema is signed in too, but only when there is one, so a contract
+        // without it keeps the exact bytes it always had.
+        if let Some(schema) = &contract.schema {
+            payload.push_str(&format!(
+                "\nschema:{}",
+                serde_jcs::to_string(schema).unwrap_or_default()
+            ));
+        }
+    }
+    if let Some(interface) = &order.interface {
+        payload.push_str(&format!("\ninterface:{}", interface.describe()));
+    }
+    if !order.touches.is_empty() {
+        payload.push_str(&format!(
+            "\ntouches:{}",
+            serde_json::to_string(&order.touches).unwrap_or_else(|_| "[]".to_string())
+        ));
+    }
+    if order.allow_overlap {
+        payload.push_str("\noverlap:allow");
     }
     if order.requires_approval {
         payload.push_str("\napproval:true");
@@ -9186,6 +9251,9 @@ mod work_over_files_tests {
             signed_by: None,
             signature: None,
             result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            allow_overlap: false,
         }
     }
 
