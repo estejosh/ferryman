@@ -2971,12 +2971,6 @@ fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
     if let Some(workspace) = &at.workspace {
         return Ok(vec![ferryman_channel::route_for(workspace)?]);
     }
-    let here = std::env::current_dir().context("read the current directory")?;
-    // First, check if we're inside a project.
-    if let Ok(route) = ferryman_channel::route_for(&here) {
-        return Ok(vec![route]);
-    }
-    // If not, check the ferry root's projects.
     if let Some(root) = ferryman_channel::ferry::find_root() {
         let routes: Vec<_> = root
             .projects()
@@ -2987,8 +2981,44 @@ fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
             return Ok(routes);
         }
     }
-    // Last resort: try the current directory again to get a proper error message.
+    let here = std::env::current_dir().context("read the current directory")?;
     Ok(vec![ferryman_channel::route_for(&here)?])
+}
+
+/// The channels `ferry engines` reads: what [`target_routes`] picks, plus the project the
+/// current directory is inside when that project is not one of them.
+///
+/// A ferry root lists its own projects; a project attached from elsewhere is not among
+/// them, so `ferry engines` run inside it used to say no worker had published anything
+/// while its own channel held the files. Only adds, and only without `--workspace` or
+/// `--comms`: every other fleet-wide command, and `--all`, keeps [`target_routes`].
+fn engines_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
+    let routes = target_routes(at);
+    if at.workspace.is_some() || at.comms.is_some() {
+        return routes;
+    }
+    let here = std::env::current_dir()
+        .ok()
+        .and_then(|dir| ferryman_channel::route_for(&dir).ok());
+    match routes {
+        Ok(routes) => Ok(with_current_project(routes, here)),
+        Err(error) => here.map(|route| vec![route]).ok_or(error),
+    }
+}
+
+/// `routes` with the current directory's project appended unless it is already there.
+fn with_current_project(
+    mut routes: Vec<ferryman_channel::ProjectRoute>,
+    here: Option<ferryman_channel::ProjectRoute>,
+) -> Vec<ferryman_channel::ProjectRoute> {
+    if let Some(route) = here
+        && !routes
+            .iter()
+            .any(|known| known.attachment == route.attachment)
+    {
+        routes.push(route);
+    }
+    routes
 }
 
 /// The channels a fleet-wide command acts on, each with the agent config it acts under.
@@ -3036,7 +3066,7 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
         (String, String),
         ferryman_channel::evidence::Tally,
     > = std::collections::BTreeMap::new();
-    for route in target_routes(at)? {
+    for route in engines_routes(at)? {
         let records = ferryman_channel::evidence::channel_verifications(&route);
         for (key, count) in ferryman_channel::evidence::tally(&records) {
             let sum = checked.entry(key).or_default();
@@ -3072,7 +3102,26 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                     "ferry_version": inventory.ferry_version,
                     "signature": format!("{check:?}"),
                     "channels": channels,
-                    "engines": inventory.engines,
+                    "engines": inventory.engines.iter().map(|engine| {
+                        let mut value = json!(engine);
+                        // Each engine's best kinds of work, from its signed ledger.
+                        let top: Vec<Value> = engine
+                            .trust
+                            .as_ref()
+                            .map(|trust| {
+                                ferryman_channel::router::top_kinds(&trust.kinds, chrono::Utc::now(), 5)
+                            })
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(kind, rate, decided)| json!({
+                                "kind": kind,
+                                "success_rate": (rate * 1000.0).round() / 1000.0,
+                                "results": (decided * 10.0).round() / 10.0,
+                            }))
+                            .collect();
+                        value["top_kinds"] = json!(top);
+                        value
+                    }).collect::<Vec<_>>(),
                     // Verdicts others recorded, signed, on this worker's results.
                     "checked_by_others": checked
                         .iter()
@@ -3157,6 +3206,9 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             // Whether its claims have held up against the worker's own evidence.
             if let Some(trust) = &engine.trust {
                 println!("  {:<12} {}", "", trust.describe());
+                if let Some(line) = top_kinds_line(&trust.kinds, now) {
+                    println!("  {:<12} {line}", "");
+                }
             }
             if let Some(billing) = &engine.billing {
                 if billing.spend_usd > 0.0 || billing.requests > 0 {
@@ -3176,12 +3228,35 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// An engine's best kinds of work with the share of its results that held up, e.g.
+/// `best at: docs 92% (13), code_change 80% (5)`. None until it has any decided results.
+fn top_kinds_line(
+    kinds: &[ferryman_channel::router::Outcome],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let top = ferryman_channel::router::top_kinds(kinds, now, 3);
+    if top.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "best at: {}",
+        top.iter()
+            .map(|(kind, rate, decided)| format!(
+                "{kind} {:.0}% ({})",
+                rate * 100.0,
+                decided.round().max(1.0)
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// The engine policy each project runs under, over the engines its fleet published.
 /// Projects whose policy falls the same way share one block.
 fn print_policies(at: &Targets) -> Result<()> {
     let now = chrono::Utc::now();
     let mut blocks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    for route in target_routes(at)? {
+    for route in engines_routes(at)? {
         let (policy, setting) =
             ferryman_channel::policy::effective(&route.communications, &route.project_id);
         let fleet = ferryman_channel::policy::fleet(&route, now);
@@ -11687,48 +11762,40 @@ mod tests {
         assert!(!ferryman_channel::seed::OperatorSeed::path_in(fresh.path()).exists());
     }
 
-    /// `identity show` reports which keys derive from the seed, and it skips the
-    /// Verify that target_routes resolves the current directory's project before falling
-    /// back to ferry root projects. This ensures that running `ferry engines` from inside
-    /// a project finds that project's engines, not an unrelated project from ferry root.
+    /// `ferry engines` reads the current project too when the ferry root does not list it,
+    /// and never lists a project twice. `--all`, `--workspace` and every other command read
+    /// `target_routes` unchanged.
     #[test]
-    fn target_routes_prefers_current_directory_project() {
-        use std::env;
-        use tempfile::TempDir;
-
-        // Create a temporary project with .ferryman folder
-        let proj = TempDir::new().unwrap();
-        let ferryman_dir = proj.path().join(".ferryman");
-        std::fs::create_dir_all(&ferryman_dir).unwrap();
-        std::fs::write(
-            ferryman_dir.join("project.toml"),
-            "[project]\nid = \"test-proj\"\n",
-        )
-        .unwrap();
-
-        // Save current directory
-        let original_dir = env::current_dir().unwrap();
-
-        // Change to the project directory and test that target_routes finds it
-        env::set_current_dir(proj.path()).unwrap();
-        let at = super::Targets {
-            comms: None,
-            workspace: None,
+    fn engines_routes_add_the_current_project_once() {
+        let route = |id: &str| ferryman_channel::ProjectRoute {
+            project_id: id.to_string(),
+            workspace: std::path::PathBuf::from(format!("/work/{id}")),
+            attachment: std::path::PathBuf::from(format!("/work/{id}/.ferryman")),
+            communications: std::path::PathBuf::from(format!("/comms/{id}")),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
         };
-
-        // The test passes if this doesn't panic; route_for will error with a proper
-        // message if the project structure isn't complete, but it should at least
-        // discover the .ferryman folder in the current directory.
-        let result = super::target_routes(&at);
-        assert!(
-            result.is_ok(),
-            "target_routes should find the project in current directory"
+        let root = vec![route("a"), route("b")];
+        // Not in the root: appended after what the root lists.
+        let ids = |routes: Vec<ferryman_channel::ProjectRoute>| -> Vec<String> {
+            routes.into_iter().map(|r| r.project_id).collect()
+        };
+        assert_eq!(
+            ids(super::with_current_project(root.clone(), Some(route("c")))),
+            ["a", "b", "c"]
         );
-
-        // Restore original directory
-        env::set_current_dir(original_dir).unwrap();
+        // Already in the root: nothing changes.
+        assert_eq!(
+            ids(super::with_current_project(root.clone(), Some(route("b")))),
+            ["a", "b"]
+        );
+        // Outside any project: the root's list as it was.
+        assert_eq!(ids(super::with_current_project(root, None)), ["a", "b"]);
     }
 
+    /// `identity show` reports which keys derive from the seed, and it skips the
     /// encryption keys that live beside them.
     #[test]
     fn machine_identities_separates_derived_from_rotated() {

@@ -1,15 +1,20 @@
 //! `ferry route`: the smart router, from the command line.
 //!
-//! So far one command, `ferry route classify <order>`: what an order needs, where that
-//! came from (the signed order, the rules, or a model) and why. See
-//! [`ferryman_channel::work`] for the rules and [`ferryman_ops::route`] for the
-//! model-assisted step.
+//! `ferry route classify <order>`: what an order needs, where that came from (the signed
+//! order, the rules, or a model) and why. See [`ferryman_channel::work`] for the rules and
+//! [`ferryman_ops::route`] for the model-assisted step.
+//!
+//! `ferry route explain <order>`: why it went where it did, from the decisions workers
+//! recorded. `ferry route simulate --kind docs --size small`: where work like that would
+//! go now. See [`ferryman_channel::router`].
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use ferryman_channel::{
-    Order, ProjectRoute,
+    Order, ProjectRoute, Task,
+    policy::{self, Candidate},
+    router::{self, Decision},
     work::{self, Classification, Source},
 };
 use serde_json::json;
@@ -37,10 +42,173 @@ pub(crate) enum RouteCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Why an order went to the engine it did: what it needs, the decision each worker
+    /// recorded when it took the order (every engine's success estimate, price and why the
+    /// others were out), the improve steps' records, and what the router would pick right
+    /// now, with the engines that already failed it left out.
+    Explain {
+        /// The order id, e.g. t-4f2a.
+        order: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the router for work of a kind and size over the fleet's engines and this
+    /// project's policy, without running anything: who would get it, and why.
+    ///
+    /// `ferry route simulate --kind docs --size small`. Add `--needs vision` (or audio_in,
+    /// image, ...) to see where work that needs a modality would go.
+    Simulate {
+        /// code-change, docs, tests, review, plan, chore, research, translate, transcribe, image,
+        /// video, audio or other.
+        #[arg(long)]
+        kind: String,
+        /// small, medium or large.
+        #[arg(long, default_value = "medium")]
+        size: String,
+        /// Modalities beyond what the kind implies, comma separated: vision, audio_in,
+        /// audio_out, image, video, embed.
+        #[arg(long, value_delimiter = ',')]
+        needs: Vec<String>,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// The engines in a simulated or explained order, winner first, by name.
+fn order_names(routed: &ferryman_channel::router::Routed, fleet: &[Candidate]) -> Vec<String> {
+    routed
+        .order
+        .iter()
+        .filter_map(|&index| fleet.get(index))
+        .map(|engine| format!("{} on {}", engine.name, engine.machine))
+        .collect()
 }
 
 pub(crate) async fn command(command: RouteCommand) -> Result<()> {
     match command {
+        RouteCommand::Simulate {
+            kind,
+            size,
+            needs,
+            workspace,
+            json,
+        } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = ferryman_channel::route_for(&start)?;
+            let needs = router::simulated_needs(&kind, &size, &needs)?;
+            let now = chrono::Utc::now();
+            let (policy, _) = policy::effective(&route.communications, &route.project_id);
+            let fleet = policy::fleet(&route, now);
+            let routed = router::simulate(&policy, &fleet, &needs, now);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "project": route.project_id,
+                        "engines": fleet.len(),
+                        "decision": routed.decision,
+                        "order": order_names(&routed, &fleet),
+                    }))?
+                );
+            } else {
+                println!("{}: {} engine(s) published", route.project_id, fleet.len());
+                for line in routed.decision.lines() {
+                    println!("{line}");
+                }
+                let order = order_names(&routed, &fleet);
+                if order.len() > 1 {
+                    println!("  order tried: {}", order.join(" -> "));
+                }
+            }
+            Ok(())
+        }
+        RouteCommand::Explain {
+            order,
+            workspace,
+            json,
+        } => {
+            let start = match workspace {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            let route = ferryman_channel::route_for(&start)?;
+            let task = ferryman_channel::read_task(&route, &order)
+                .with_context(|| format!("read order {order}"))?;
+            let now = chrono::Utc::now();
+            let classification = work::classify_cached(&task.order, &route);
+            let (policy, _) = policy::effective(&route.communications, &route.project_id);
+            let fleet = policy::fleet(&route, now);
+            let failed = ferryman_ops::agent::failed_engines(&task);
+            let role = policy::order_role(&task.order);
+            let mut context = router::Context::new(now);
+            context.failed = &failed;
+            let current = router::route(
+                &policy,
+                if ferryman_ops::improve::is_improvement(&task) {
+                    role
+                } else {
+                    router::role_for(classification.needs.kind)
+                },
+                role.tier(),
+                policy::Work::Background,
+                &classification.needs,
+                &fleet,
+                &context,
+            );
+            let recorded = recorded_decisions(&route, &task);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "order": task.order.id,
+                        "classification": classification,
+                        "recorded": recorded
+                            .iter()
+                            .map(|(who, decision)| json!({ "by": who, "decision": decision }))
+                            .collect::<Vec<_>>(),
+                        "failed": failed
+                            .iter()
+                            .map(|f| json!({ "engine": f.engine, "p": f.p }))
+                            .collect::<Vec<_>>(),
+                        "now": {
+                            "decision": current.decision,
+                            "order": order_names(&current, &fleet),
+                        },
+                    }))?
+                );
+                return Ok(());
+            }
+            for line in lines(&route, &task.order, &classification, false) {
+                println!("{line}");
+            }
+            if recorded.is_empty() {
+                println!(
+                    "recorded: nothing yet - a worker records its routing decision beside \
+                     each result and improve step it does (workers older than the smart \
+                     router record none)"
+                );
+            }
+            for (who, decision) in &recorded {
+                println!("recorded by {who}:");
+                for line in decision.lines() {
+                    println!("{line}");
+                }
+            }
+            println!("if it were routed now:");
+            for line in current.decision.lines() {
+                println!("{line}");
+            }
+            Ok(())
+        }
         RouteCommand::Classify {
             order,
             workspace,
@@ -87,6 +255,39 @@ pub(crate) async fn command(command: RouteCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// The routing decisions recorded for an order, oldest first, with who recorded each: the
+/// worker's note in each result, and the improve steps (plan, review, build) in the weeks
+/// around the order. A decision that appears in both is listed once.
+fn recorded_decisions(route: &ProjectRoute, task: &Task) -> Vec<(String, Decision)> {
+    let mut found: Vec<(String, Decision)> = Vec::new();
+    for result in &task.results {
+        if let Some(decision) = router::decision_of(&result.payload) {
+            found.push((
+                format!("{} (result {})", result.agent, result.revision),
+                decision,
+            ));
+        }
+    }
+    let mut weeks = vec![
+        router::iso_week(task.order.created_at),
+        router::iso_week(chrono::Utc::now()),
+    ];
+    weeks.dedup();
+    for week in weeks {
+        for step in policy::read_steps(route, &week) {
+            if step.order.as_deref() != Some(task.order.id.as_str()) {
+                continue;
+            }
+            if let Some(decision) = step.route
+                && !found.iter().any(|(_, known)| *known == decision)
+            {
+                found.push((format!("{} ({} step)", step.agent, step.step), decision));
+            }
+        }
+    }
+    found
 }
 
 /// The text `ferry route classify` prints.
@@ -214,6 +415,106 @@ mod tests {
         assert!(text.contains("at or above the 0.55"), "{text}");
         assert!(text.contains("'summarize'"), "the reason is shown: {text}");
         assert!(!text.contains("unsure"), "{text}");
+    }
+
+    #[test]
+    fn a_simulated_order_names_the_engines_winner_first() {
+        let free = Candidate {
+            agent: "wisp".into(),
+            machine: "box".into(),
+            name: "nvidia".into(),
+            tier: "build".into(),
+            paid: "free".into(),
+            state: "up".into(),
+            ..Candidate::default()
+        };
+        let fleet = vec![free];
+        let needs = router::simulated_needs("docs", "small", &[]).unwrap();
+        let routed = router::simulate(
+            &policy::Policy::default(),
+            &fleet,
+            &needs,
+            chrono::Utc::now(),
+        );
+        assert_eq!(routed.decision.kind, "docs");
+        let names = order_names(&routed, &fleet);
+        assert!(
+            names.first().is_some_and(|name| name == "nvidia on box"),
+            "{names:?} {:?}",
+            routed.decision.reason
+        );
+        assert!(router::simulated_needs("nonsense", "small", &[]).is_err());
+        assert!(router::simulated_needs("docs", "huge", &[]).is_err());
+    }
+
+    #[test]
+    fn explain_lists_the_decisions_workers_recorded_beside_their_results() {
+        let route = route();
+        let decision = |reason: &str| {
+            json!({
+                "routing": "smart", "role": "build", "kind": "docs", "size": "small",
+                "threshold": 0.75,
+                "candidates": [
+                    { "engine": "nvidia", "agent": "wisp", "machine": "box", "p": 0.8,
+                      "cost_usd": 0.0, "price": "free", "sufficient": true },
+                    { "engine": "claude", "agent": "wisp", "machine": "box",
+                      "sufficient": false, "excluded": "never" }
+                ],
+                "winner": { "engine": "nvidia", "agent": "wisp", "machine": "box",
+                            "p": 0.8, "cost_usd": 0.0 },
+                "reason": reason,
+            })
+        };
+        let result = |revision: u32, payload: serde_json::Value| ferryman_channel::TaskResult {
+            order_id: "t-route-1".into(),
+            agent: "wisp".into(),
+            revision,
+            submitted_at: chrono::Utc::now(),
+            payload,
+            signed_by: None,
+            signature: None,
+        };
+        let task = Task {
+            order: order("Summarize the meeting notes"),
+            claims: Vec::new(),
+            results: vec![
+                result(
+                    1,
+                    json!({ "output": "x", "routing": decision("nvidia: first") }),
+                ),
+                result(2, json!({ "output": "y" })),
+                result(
+                    3,
+                    json!({ "output": "z", "routing": decision("claude: second") }),
+                ),
+            ],
+            reviews: Vec::new(),
+            recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
+            kills: Vec::new(),
+        };
+        let found = recorded_decisions(&route, &task);
+        let who: Vec<&str> = found.iter().map(|(who, _)| who.as_str()).collect();
+        assert_eq!(who, ["wisp (result 1)", "wisp (result 3)"], "none for r2");
+        assert_eq!(found[0].1.reason, "nvidia: first");
+        let text = found[0].1.lines().join("\n");
+        assert!(text.contains("> nvidia"), "{text}");
+        assert!(
+            text.contains("x claude") && text.contains("out: never"),
+            "{text}"
+        );
+        assert!(text.contains("=> nvidia: first"), "{text}");
+        assert!(
+            recorded_decisions(
+                &route,
+                &Task {
+                    results: Vec::new(),
+                    ..task
+                }
+            )
+            .is_empty()
+        );
     }
 
     #[test]
