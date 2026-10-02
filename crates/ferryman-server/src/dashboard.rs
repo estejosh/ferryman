@@ -388,6 +388,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task_detail))
         .route("/api/tasks/{id}/review", post(review_task))
+        .route("/api/route/simulate", get(route_simulate))
         .route("/api/stats", get(stats))
         .route("/api/ledger", get(ledger))
         .route("/api/learnings", get(learnings))
@@ -2035,6 +2036,17 @@ async fn engine_policy_get(
         // What the adversary's findings do here: off, advisory or blocking. The policy's
         // own JSON leaves it out while it is the default.
         "adversary_mode": current.adversary.as_str(),
+        // The smart router: `smart` (the default, which the policy's own JSON leaves out)
+        // or `ordered`; the success probability that counts as sufficient per kind of work
+        // (`default_threshold` for a kind not listed); and the tie-break weights.
+        "routing": current.routing.as_str(),
+        "thresholds": current.thresholds,
+        "bias": current.bias,
+        "default_threshold": ferryman_channel::router::DEFAULT_THRESHOLD,
+        "kinds": ferryman_channel::work::WorkKind::ALL
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
         // The adversary's terms are their own file, signed by the master alone: shown to
         // everyone, changed only by the master (`may_set`).
         "adversary": {
@@ -2474,6 +2486,17 @@ struct SettingsBody {
     /// Roles whose background work may use a subscription with a weekly cap; `[]` clears.
     #[serde(default)]
     subscription_roles: Option<Vec<ferryman_channel::policy::Role>>,
+    /// `smart` or `ordered`: how background work picks an engine.
+    #[serde(default)]
+    routing: Option<ferryman_channel::policy::Routing>,
+    /// Per kind of work, the success probability that counts as sufficient: `{"docs": 0.7}`.
+    /// Replaces the signed ones; `{}` clears them.
+    #[serde(default)]
+    thresholds: Option<std::collections::BTreeMap<String, f64>>,
+    /// Per engine selector, a tie-break weight: `{"nvidia*": 3}`. Replaces the signed ones;
+    /// `{}` clears them.
+    #[serde(default)]
+    bias: Option<std::collections::BTreeMap<String, f64>>,
     #[serde(default)]
     all: bool,
 }
@@ -2487,10 +2510,49 @@ async fn engine_policy_settings(
     Json(body): Json<SettingsBody>,
 ) -> Result<Json<Value>, DashboardError> {
     let current = session_identity(&state, &headers)?;
-    if body.effort.is_empty() && body.width.is_empty() && body.subscription_roles.is_none() {
+    if body.effort.is_empty()
+        && body.width.is_empty()
+        && body.subscription_roles.is_none()
+        && body.routing.is_none()
+        && body.thresholds.is_none()
+        && body.bias.is_none()
+    {
         return Err((
             StatusCode::BAD_REQUEST,
-            "set an effort, a width or the roles that may use a subscription".to_string(),
+            "set an effort, a width, the roles that may use a subscription, the routing, \
+             a threshold or a bias"
+                .to_string(),
+        ));
+    }
+    // Kinds are stored under their canonical spelling so `code-change` and `code_change`
+    // are one threshold.
+    let mut thresholds = body.thresholds.clone();
+    if let Some(map) = thresholds.as_mut() {
+        let mut canonical = std::collections::BTreeMap::new();
+        for (kind, p) in std::mem::take(map) {
+            let kind = ferryman_channel::work::WorkKind::parse(&kind)
+                .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+            if !(p > 0.0 && p <= 1.0) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "the threshold for {} must be above 0 and at most 1",
+                        kind.as_str()
+                    ),
+                ));
+            }
+            canonical.insert(kind.as_str().to_string(), p);
+        }
+        *map = canonical;
+    }
+    if let Some(bias) = &body.bias
+        && bias
+            .iter()
+            .any(|(selector, weight)| selector.trim().is_empty() || !weight.is_finite())
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a bias needs an engine selector and a finite weight".to_string(),
         ));
     }
     if body.width.values().any(|width| *width == Some(0)) {
@@ -2519,6 +2581,15 @@ async fn engine_policy_settings(
                 roles.sort();
                 roles.dedup();
                 policy.subscription_roles = roles;
+            }
+            if let Some(routing) = body.routing {
+                policy.routing = routing;
+            }
+            if let Some(thresholds) = &thresholds {
+                policy.thresholds.clone_from(thresholds);
+            }
+            if let Some(bias) = &body.bias {
+                policy.bias.clone_from(bias);
             }
             Some(policy)
         },
@@ -3367,6 +3438,9 @@ async fn tasks(
                 // What the order needs, as the router reads it: kind, size, modalities,
                 // and whether the order, the rules or a model said so.
                 "work": work_view(&ferryman_channel::work::classify_cached(&task.order, &route)),
+                // Why this engine: the newest worker's one-line routing reason, when it
+                // recorded one (null for work done before the smart router).
+                "routing": routing_reason(task),
                 "allow_overlap": task.order.allow_overlap,
                 "overlaps": overlaps.get(&task.order.id).cloned().unwrap_or_default(),
                 "holds": ferryman_channel::hold::read(&current, &task.order.id),
@@ -3374,6 +3448,68 @@ async fn tasks(
         })
         .collect();
     Ok(Json(items))
+}
+
+/// The one-line routing reason in the newest result that recorded one.
+fn routing_reason(task: &ferryman_channel::Task) -> Option<String> {
+    task.results
+        .iter()
+        .rev()
+        .find_map(|result| ferryman_channel::router::reason_of(&result.payload))
+}
+
+/// GET /api/route/simulate?kind=docs&size=small&needs=vision - where work of this kind and
+/// size would go over the fleet's engines under this project's policy, and why. Runs the
+/// router without running anything, as `ferry route simulate` does.
+async fn route_simulate(
+    State(state): State<DashboardState>,
+    Query(params): Query<SimulateParams>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    let extra: Vec<String> = params
+        .needs
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect();
+    let needs = ferryman_channel::router::simulated_needs(
+        params.kind.as_deref().unwrap_or("code-change"),
+        params.size.as_deref().unwrap_or("medium"),
+        &extra,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    let now = chrono::Utc::now();
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    let fleet = ferryman_channel::policy::fleet(&route, now);
+    let routed = ferryman_channel::router::simulate(&policy, &fleet, &needs, now);
+    Ok(Json(json!({
+        "project": route.project_id,
+        "engines": fleet.len(),
+        "decision": routed.decision,
+        "lines": routed.decision.lines(),
+        "order": routed
+            .order
+            .iter()
+            .filter_map(|&index| fleet.get(index))
+            .map(|engine| json!({ "engine": engine.name, "machine": engine.machine }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct SimulateParams {
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    size: Option<String>,
+    /// Modalities beyond what the kind implies, comma separated.
+    #[serde(default)]
+    needs: Option<String>,
 }
 
 /// The part of a classification an order card has room for.
@@ -3414,6 +3550,9 @@ async fn task_detail(
                 "ok": trajectory.as_ref().map(|t| t.ok),
                 "sig": sig(&ferryman_channel::verify_result(r, &route.agents)),
                 "output": result_text(&r.payload),
+                // The router's decision for this attempt: every engine's success
+                // estimate and price, and why the others were out.
+                "routing": ferryman_channel::router::decision_of(&r.payload),
             })
         })
         .collect::<Vec<_>>();
@@ -4797,6 +4936,7 @@ mod tests {
             "/api/team",
             "/api/tasks",
             "/api/tasks/task-1",
+            "/api/route/simulate?kind=docs",
             "/api/stats",
             "/api/ledger",
             "/api/learnings",
@@ -5958,6 +6098,250 @@ mod tests {
         }
         let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
         assert_eq!(view["effective"]["roles"]["plan"]["width"], 2, "{view}");
+    }
+
+    /// The order card says why that engine, the drawer has every candidate, and the
+    /// Routing panel's simulation runs the router without an order.
+    #[tokio::test]
+    async fn the_cards_say_why_that_engine_and_the_router_can_be_simulated() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = AgentIdentity::from_seed("alice", [1u8; 32]);
+        let mut route = test_route(dir.path());
+        route.agents.push(AgentRoute {
+            name: "alice".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(alice.public_key_hex()),
+            encryption_key: None,
+        });
+        let route = Arc::new(route);
+        for id in ["task-routed", "task-old"] {
+            ferryman_channel::issue_order(&route, &order(id)).unwrap();
+            ferryman_channel::claim_order(&route, id, "alice").unwrap();
+        }
+        let submit = |id: &str, payload: Value| {
+            let mut result = TaskResult {
+                order_id: id.into(),
+                agent: "alice".into(),
+                revision: 1,
+                submitted_at: Utc::now(),
+                payload,
+                signed_by: None,
+                signature: None,
+            };
+            alice.sign_result(&mut result);
+            ferryman_channel::submit_result(&route, &result).unwrap();
+        };
+        submit(
+            "task-routed",
+            json!({
+                "output": "done",
+                "routing": {
+                    "routing": "smart", "role": "build", "kind": "docs", "size": "small",
+                    "threshold": 0.75,
+                    "candidates": [
+                        { "engine": "nvidia", "agent": "wisp", "machine": "box", "p": 0.8,
+                          "cost_usd": 0.0, "price": "free", "sufficient": true },
+                        { "engine": "claude", "agent": "wisp", "machine": "box",
+                          "sufficient": false, "excluded": "never" }
+                    ],
+                    "winner": { "engine": "nvidia", "agent": "wisp", "machine": "box",
+                                "p": 0.8, "cost_usd": 0.0 },
+                    "reason": "nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient"
+                }
+            }),
+        );
+        submit("task-old", json!({ "output": "done" }));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let tasks = get_json(&app, "/api/tasks", Some(&token)).await;
+        let card = |id: &str| -> Value {
+            tasks
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|task| task["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no card for {id}: {tasks}"))
+        };
+        assert_eq!(
+            card("task-routed")["routing"],
+            "nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient"
+        );
+        assert!(
+            card("task-old")["routing"].is_null(),
+            "work done before the router has no reason"
+        );
+        let detail = get_json(&app, "/api/tasks/task-routed", Some(&token)).await;
+        assert_eq!(
+            detail["results"][0]["routing"]["winner"]["engine"],
+            "nvidia"
+        );
+        assert_eq!(
+            detail["results"][0]["routing"]["candidates"][1]["excluded"],
+            "never"
+        );
+        let detail = get_json(&app, "/api/tasks/task-old", Some(&token)).await;
+        assert!(detail["results"][0]["routing"].is_null(), "{detail}");
+
+        // The simulation: no fleet has published here, so it says so rather than guessing,
+        // and takes the same kinds, sizes and modalities as `ferry route simulate`.
+        let sim = get_json(
+            &app,
+            "/api/route/simulate?kind=docs&size=small&needs=vision",
+            Some(&token),
+        )
+        .await;
+        assert_eq!(sim["decision"]["kind"], "docs", "{sim}");
+        assert_eq!(sim["decision"]["size"], "small");
+        assert_eq!(sim["decision"]["routing"], "smart");
+        assert!(
+            sim["decision"]["needs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|need| need == "vision"),
+            "{sim}"
+        );
+        assert_eq!(sim["engines"], 0);
+        assert!(
+            sim["lines"]
+                .as_array()
+                .is_some_and(|lines| !lines.is_empty())
+        );
+        assert!(sim["order"].as_array().unwrap().is_empty());
+        for bad in [
+            "kind=sorcery",
+            "kind=docs&size=huge",
+            "kind=docs&needs=telepathy",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/route/simulate?{bad}"))
+                        .header("x-ferryman-dashboard-token", &token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+        let unsigned = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/route/simulate?kind=docs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Routing, thresholds and bias from the browser: shown to anyone signed in, signed
+    /// only by the master, replaced as a set, and refused when they mean nothing.
+    #[tokio::test]
+    async fn the_master_signs_routing_thresholds_and_bias() {
+        use ferryman_channel::policy::Routing;
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(view["routing"], "smart", "smart is the default: {view}");
+        assert_eq!(view["thresholds"], json!({}));
+        assert_eq!(view["default_threshold"], 0.75);
+        assert!(
+            view["kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|kind| kind == "code-change")
+        );
+
+        let body = r#"{"routing":"ordered","thresholds":{"docs":0.7,"code_change":0.85},"bias":{"nvidia*":3}}"#;
+        let refused = post(&app, "/api/engine-policy/settings", body, Some(&token)).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::FORBIDDEN,
+            "not the master yet"
+        );
+        assert_eq!(
+            post(&app, "/api/master/init", "{}", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let set = post(&app, "/api/engine-policy/settings", body, Some(&token)).await;
+        assert_eq!(set.status(), StatusCode::OK);
+        let (policy, setting) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        assert!(
+            setting.unwrap().signature_v2.is_some(),
+            "routing is signed in v2"
+        );
+        assert_eq!(policy.routing, Routing::Ordered);
+        assert_eq!(policy.thresholds.get("docs"), Some(&0.7));
+        assert_eq!(
+            policy.thresholds.get("code-change"),
+            Some(&0.85),
+            "kinds are stored under one spelling"
+        );
+        assert_eq!(policy.bias.get("nvidia*"), Some(&3.0));
+        let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(view["routing"], "ordered", "{view}");
+        assert_eq!(view["thresholds"]["docs"], 0.7);
+        assert_eq!(view["bias"]["nvidia*"], 3.0);
+
+        // A new set replaces the old; routing left out stays as it was.
+        let set = post(
+            &app,
+            "/api/engine-policy/settings",
+            r#"{"thresholds":{"review":0.9},"bias":{}}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::OK);
+        let (policy, _) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        assert_eq!(policy.routing, Routing::Ordered, "kept");
+        assert_eq!(policy.thresholds.len(), 1, "{:?}", policy.thresholds);
+        assert_eq!(policy.thresholds.get("review"), Some(&0.9));
+        assert!(policy.bias.is_empty(), "{{}} clears");
+        // Back to smart, which is what the file leaves out.
+        let set = post(
+            &app,
+            "/api/engine-policy/settings",
+            r#"{"routing":"smart","thresholds":{}}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(set.status(), StatusCode::OK);
+        let (policy, _) =
+            ferryman_channel::policy::effective(&route.communications, &route.project_id);
+        assert_eq!(policy.routing, Routing::Smart);
+        assert!(policy.thresholds.is_empty());
+        for bad in [
+            r#"{"routing":"random"}"#,
+            r#"{"thresholds":{"sorcery":0.5}}"#,
+            r#"{"thresholds":{"docs":0}}"#,
+            r#"{"thresholds":{"docs":1.5}}"#,
+            r#"{"bias":{"":2}}"#,
+        ] {
+            let response = post(&app, "/api/engine-policy/settings", bad, Some(&token)).await;
+            assert!(
+                response.status().is_client_error(),
+                "{bad}: {}",
+                response.status()
+            );
+        }
     }
 
     /// The simple choice from the browser, and the improvements waiting for the master:

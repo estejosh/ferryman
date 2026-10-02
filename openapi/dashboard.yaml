@@ -225,7 +225,7 @@ paths:
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       responses:
-        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, team, warnings, efforts, self_improve, adversary_mode and may_set'}
+        '200': {description: 'project, auto, set_by, set_at, policy, describe, effective, recommended, team, warnings, efforts, self_improve, adversary_mode, the smart router''s routing, thresholds, bias and default_threshold, the kinds of work, and may_set'}
         '401': {description: no active session}
     post:
       summary: The master signs an engine policy, or goes back to auto
@@ -374,6 +374,12 @@ paths:
         is kept. `all` does it in every project the person is master of. The CLI equivalent
         is `ferry engines policy set --effort role=level --width role=n
         --allow-subscriptions-for role,...`.
+
+        The smart router's settings go the same way: `routing` is `smart` (the default) or
+        `ordered`; `thresholds` maps a kind of work to the success probability that counts as
+        sufficient (`{"docs": 0.7}`, `{}` clears them); `bias` maps an engine selector to a
+        tie-break weight (`{"nvidia*": 3}`, `{}` clears them). Each of the two replaces what was signed. They are signed in the
+        policy's v2 view only, so a v0.5.17 machine still verifies the file.
       parameters:
         - {name: project, in: query, required: false, schema: {type: string}}
       requestBody:
@@ -386,10 +392,13 @@ paths:
                 effort: {type: object, additionalProperties: {type: string, enum: [low, medium, high]}}
                 width: {type: object, additionalProperties: {type: integer, nullable: true, minimum: 1, maximum: 255}}
                 subscription_roles: {type: array, items: {type: string, enum: [plan, build, review, chore, adversary]}}
+                routing: {type: string, enum: [smart, ordered]}
+                thresholds: {type: object, additionalProperties: {type: number, exclusiveMinimum: 0, maximum: 1}}
+                bias: {type: object, additionalProperties: {type: number}}
                 all: {type: boolean}
       responses:
         '200': {description: 'how many changed, and per project: set, already, skipped or error'}
-        '400': {description: nothing to set, a width of 0, or a role or effort that means nothing}
+        '400': {description: 'nothing to set, a width of 0, a role, effort, kind or routing that means nothing, or a threshold outside 0 to 1'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
   /api/improve/pending:
@@ -789,6 +798,26 @@ paths:
         '401': {description: no active session}
         '403': {description: dashboard is read-only}
         '409': {description: no result to review, or result fails the order's contract}
+  /api/route/simulate:
+    get:
+      summary: Where work of a kind and size would go, and why, without running anything
+      description: >
+        Runs the smart router over the engines the fleet published, under this project's
+        engine policy: each engine's chance of getting the work right, its price, whether it
+        clears the kind's threshold, and why the others are out. The winner is the cheapest
+        sufficient engine, or the likeliest when none is sufficient. The CLI equivalent is
+        `ferry route simulate --kind docs --size small --needs vision`. Order cards show the
+        `routing` reason a worker recorded for work already done; `GET /api/tasks/{id}` has
+        the whole decision per result.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+        - {name: kind, in: query, required: false, schema: {type: string}, description: 'code-change, docs, tests, review, plan, chore, research, translate, transcribe, image, video, audio or other (default code-change)'}
+        - {name: size, in: query, required: false, schema: {type: string, enum: [small, medium, large]}, description: default medium}
+        - {name: needs, in: query, required: false, schema: {type: string}, description: 'extra modalities, comma separated: vision, audio_in, audio_out, image, video, embed'}
+      responses:
+        '200': {description: 'the decision (candidates, winner, reason), the lines `ferry route simulate` prints, and the order engines would be tried in'}
+        '400': {description: a kind, size or modality that means nothing}
+        '401': {description: no active session}
   /api/stats:
     get:
       summary: Per-engine acceptance rate and estimated cost, merged into one table
