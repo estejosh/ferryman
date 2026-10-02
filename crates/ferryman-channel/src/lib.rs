@@ -1094,12 +1094,24 @@ impl Task {
     /// and what `user-api@1` says is read, and verified, at the moment of the check.
     #[must_use]
     pub fn contract_violations_in(&self, route: &ProjectRoute) -> Option<Vec<String>> {
-        let latest = self.results.iter().max_by_key(|r| r.revision)?;
+        self.contract_violations_at(route, self.latest_revision()?)
+    }
+
+    /// [`Task::contract_violations_in`] for the result at exactly `revision`: what a gate
+    /// deciding on that revision must hold it to, whatever newer results exist.
+    /// `None` when there is no such result or nothing to satisfy.
+    #[must_use]
+    pub fn contract_violations_at(
+        &self,
+        route: &ProjectRoute,
+        revision: u32,
+    ) -> Option<Vec<String>> {
+        let result = self.results.iter().find(|r| r.revision == revision)?;
         let mut found = self
             .order
             .result_contract
             .as_ref()
-            .map(|contract| contract.violations(&latest.payload));
+            .map(|contract| contract.violations(&result.payload));
         if let Some(reference) = &self.order.interface
             && reference.side == interface::Side::Provides
         {
@@ -1108,10 +1120,26 @@ impl Task {
                 .extend(interface::provider_violations(
                     route,
                     reference,
-                    &latest.payload,
+                    &result.payload,
                 ));
         }
         found
+    }
+
+    /// Why the result at `revision` may not be accepted on the order's contract, when it
+    /// may not: it lacks a key the order's result contract requires, or its `response`
+    /// does not fit the locked interface contract it provides. The one question every
+    /// path that accepts work asks - the review, the engine key, auto-merge, the review
+    /// engine - so none of them can accept what the contract refuses.
+    #[must_use]
+    pub fn contract_refusal(&self, route: &ProjectRoute, revision: u32) -> Option<String> {
+        let violations = self.contract_violations_at(route, revision)?;
+        (!violations.is_empty()).then(|| {
+            format!(
+                "the result r{revision} breaks the order's contract: {}",
+                violations.join("; ")
+            )
+        })
     }
 
     /// A proposed verdict on the newest result that no human has settled yet.
@@ -1504,6 +1532,16 @@ pub fn submit_review(route: &ProjectRoute, review: &Review) -> Result<PathBuf> {
         if let Some(result) = task.results.iter().find(|r| r.revision == review.revision)
             && let Some(why) = crate::evidence::blocking_reason(&task.order.payload, result)
         {
+            bail!(
+                "revision {} of {} cannot be accepted: {why}",
+                review.revision,
+                review.order_id
+            )
+        }
+        // And the order's contract - the keys it requires, the locked interface it provides -
+        // is held here too, whichever surface the accepting verdict comes from: the dashboard,
+        // the phone, the CLI or a review engine acting as reviewer.
+        if let Some(why) = task.contract_refusal(route, review.revision) {
             bail!(
                 "revision {} of {} cannot be accepted: {why}",
                 review.revision,

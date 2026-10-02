@@ -46,7 +46,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AgentIdentity, ProjectRoute, SignatureCheck, Task, policy::AutoMerge};
+use crate::{
+    AgentIdentity, ProjectRoute, SignatureCheck, Task,
+    policy::{AutoMerge, Policy},
+};
 
 /// More changed files than this is not low risk: it is a change nobody can skim.
 pub const MAX_FILES: usize = 300;
@@ -1265,6 +1268,22 @@ fn reviewed_head(task: &Task, revision: u32) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Why a merge nobody is watching must not carry `revision` of `task` even though both keys
+/// are held, when it must not: the order's contract refuses the result, an adversary Block
+/// stands unanswered (any mode but `off`), or - in `blocking` mode - no eligible adversary
+/// has read exactly this revision and the master has not waived that. Checked again by
+/// [`run`], from the channel, at the moment of the merge.
+fn merge_hold(route: &ProjectRoute, policy: &Policy, task: &Task, revision: u32) -> Option<String> {
+    task.contract_refusal(route, revision)
+        .map(|why| {
+            format!(
+                "{} r{revision} is not merged on its own: {why}",
+                task.order.id
+            )
+        })
+        .or_else(|| crate::adversary::merge_refusal(route, policy, &task.order.id, revision))
+}
+
 /// Record that `task`'s newest revision holds both keys and the policy lets fm merge
 /// low-risk work, so the worker that built it may. Refused unless both are true.
 pub fn authorize(
@@ -1280,17 +1299,8 @@ pub fn authorize(
     let (true, Some(revision)) = (state.approved(), state.revision) else {
         bail!("{} does not hold both keys", task.order.id);
     };
-    // Nothing merges on its own past an adversary Block nobody answered, whatever mode
-    // the adversary is in: a merge no one is watching must not carry one.
-    if let Some(block) =
-        crate::adversary::unresolved_block(route, &policy, &task.order.id, revision)
-    {
-        bail!(
-            "{} r{revision} has an unresolved adversary Block ({}); it is not merged on its \
-             own - the master overrides it or sends the work back",
-            task.order.id,
-            block.finding.describe()
-        );
+    if let Some(why) = merge_hold(route, &policy, task, revision) {
+        bail!("{why}");
     }
     let worker = task
         .results
@@ -1353,7 +1363,7 @@ pub fn run(route: &ProjectRoute, identity: &AgentIdentity, push: Option<&str>) -
         let Some(result) = task.results.iter().find(|r| r.revision == revision) else {
             continue;
         };
-        if crate::adversary::unresolved_block(route, &policy, &task.order.id, revision).is_some() {
+        if merge_hold(route, &policy, &task, revision).is_some() {
             continue;
         }
         if !result.agent.eq_ignore_ascii_case(me)

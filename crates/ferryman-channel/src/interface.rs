@@ -260,6 +260,48 @@ pub fn digest(project: &str, contract: &InterfaceContract) -> String {
     ))
 }
 
+/// The shortest prefix of a contract's digest that names it. A button or a flag may carry a
+/// prefix; anything shorter is too easy to collide with another proposal.
+pub const DIGEST_MIN: usize = 8;
+
+/// The digest of `name@version` as it reads now - what a master looks at before locking,
+/// and what a lock must name - or `None` when there is no genuine contract by that name.
+#[must_use]
+pub fn current_digest(route: &ProjectRoute, name: &str, version: &str) -> Option<String> {
+    read_contract(route, name, version).map(|contract| digest(&route.project_id, &contract))
+}
+
+/// Whether `expected`, as a master saw it, names `actual`: a full digest or a prefix of at
+/// least [`DIGEST_MIN`] characters.
+#[must_use]
+pub fn digest_matches(actual: &str, expected: &str) -> bool {
+    let expected = expected.trim().to_ascii_lowercase();
+    expected.len() >= DIGEST_MIN && actual.to_ascii_lowercase().starts_with(&expected)
+}
+
+/// Refuse unless the contract is what the master looked at.
+fn confirm_seen(
+    route: &ProjectRoute,
+    contract: &InterfaceContract,
+    expected_digest: &str,
+) -> Result<()> {
+    let actual = digest(&route.project_id, contract);
+    if digest_matches(&actual, expected_digest) {
+        return Ok(());
+    }
+    bail!(
+        "the contract changed since you looked: {}@{} is now {}, not {}; read it again before \
+         deciding",
+        contract.name,
+        contract.version,
+        actual.get(..12).unwrap_or(&actual),
+        expected_digest
+            .trim()
+            .get(..12)
+            .unwrap_or(expected_digest.trim())
+    )
+}
+
 fn lock_payload(project: &str, name: &str, version: &str, lock: &Lock) -> String {
     format!(
         "ferryman-interface-lock-v1\n{project}\n{name}\n{version}\n{}\n{}\n{}",
@@ -621,10 +663,15 @@ fn settle_question(
 
 /// Lock `name@version`: the master (`by`), signed for by `signer` - themselves, or a
 /// delegate holding their `improve` delegation - freezes the contract as it reads now.
+///
+/// `expected_digest` is the contract's digest (or a prefix of at least [`DIGEST_MIN`]
+/// characters) as the master read it. The lock is refused when the contract is not that:
+/// a proposal replaced after they looked is not locked on the strength of the old one.
 pub fn lock(
     route: &ProjectRoute,
     name: &str,
     version: &str,
+    expected_digest: &str,
     by: &str,
     signer: &AgentIdentity,
 ) -> Result<InterfaceContract> {
@@ -635,6 +682,7 @@ pub fn lock(
             route.project_id
         );
     };
+    confirm_seen(route, &contract, expected_digest)?;
     if contract.is_locked() {
         bail!("{name}@{version} is already locked");
     }
@@ -672,38 +720,44 @@ pub fn lock(
 }
 
 /// [`lock`], first recording the master's signed override of the adversary's Block when
-/// one stands in the way (`blocking` mode, an unresolved Block). With nothing in the way
-/// it is exactly [`lock`]: an override is never recorded for a lock that needed none.
+/// one stands in the way (`blocking` mode, an unresolved Block) - or their signed waiver
+/// when no eligible adversary has read the contract at all. With nothing in the way it is
+/// exactly [`lock`]: an override is never recorded for a lock that needed none.
+///
+/// `expected_digest` is the contract as the master read it and `expected_finding` the
+/// adversary's word as they read it ([`crate::adversary::lock_finding_seen`]); either
+/// being out of date refuses the whole act, so nothing is overridden or locked that the
+/// master did not see.
+#[allow(clippy::too_many_arguments)]
 pub fn lock_overriding(
     route: &ProjectRoute,
     name: &str,
     version: &str,
+    expected_digest: &str,
+    expected_finding: &str,
     by: &str,
     signer: &AgentIdentity,
     reason: Option<&str>,
 ) -> Result<InterfaceContract> {
     deciding_authority(route, by, signer)?;
     if let Some(contract) = read_contract(route, name, version) {
+        confirm_seen(route, &contract, expected_digest)?;
         let (policy, _) = crate::policy::effective(&route.communications, &route.project_id);
-        if crate::adversary::lock_refusal(route, &policy, &contract).is_some()
-            && let Some(standing) = crate::adversary::latest_standing(
+        if crate::adversary::lock_refusal(route, &policy, &contract).is_some() {
+            let revision = crate::adversary::contract_revision(route, &contract);
+            crate::adversary::override_or_waive(
                 route,
                 &contract.reference(),
+                revision,
                 crate::adversary::Trigger::ContractLock,
-            )
-        {
-            crate::adversary::override_block(
-                route,
-                &contract.reference(),
-                standing.finding.revision,
-                crate::adversary::Trigger::ContractLock,
+                expected_finding,
                 reason,
                 by,
                 signer,
             )?;
         }
     }
-    lock(route, name, version, by, signer)
+    lock(route, name, version, expected_digest, by, signer)
 }
 
 /// Decline `name@version`. The contract is not deleted - the fleet should be able to see
@@ -914,6 +968,35 @@ mod tests {
         let fang = person("fang", 3);
         let bridge = person("telegram-grouchly", 4);
         let route = route(dir.path(), &[&josh, &wisp, &fang, &bridge]);
+        // The two agents that may play the adversary publish signed inventories that list
+        // the engine their findings name.
+        for who in [&fang, &wisp] {
+            let engine = crate::receipts::EngineReport {
+                name: "deepseek".into(),
+                kind: "http".into(),
+                model: None,
+                tier: "judge".into(),
+                paid: "prepaid".into(),
+                state: "up".into(),
+                until: None,
+                reason: None,
+                latency_ms: None,
+                balance: None,
+                checked_at: None,
+                trust: None,
+                billing: None,
+                class: None,
+            };
+            crate::receipts::refresh_engines(
+                &route,
+                who,
+                "grouchly",
+                "0.0.0",
+                vec![engine],
+                Utc::now(),
+            )
+            .unwrap();
+        }
         World {
             _dir: dir,
             route,
@@ -1680,10 +1763,42 @@ mod tests {
 
     // --- the adversary's say over a lock --------------------------------------------
 
+    // The locks below decide on what the master read: these name the contract's digest and
+    // the adversary's word as they stand when the call is made.
+    fn lock(
+        route: &ProjectRoute,
+        name: &str,
+        version: &str,
+        by: &str,
+        signer: &AgentIdentity,
+    ) -> Result<InterfaceContract> {
+        let seen = current_digest(route, name, version).unwrap_or_default();
+        super::lock(route, name, version, &seen, by, signer)
+    }
+
+    fn lock_overriding(
+        route: &ProjectRoute,
+        name: &str,
+        version: &str,
+        by: &str,
+        signer: &AgentIdentity,
+        reason: Option<&str>,
+    ) -> Result<InterfaceContract> {
+        let seen = current_digest(route, name, version).unwrap_or_default();
+        let finding = read_contract(route, name, version)
+            .map(|contract| crate::adversary::lock_finding_seen(route, &contract))
+            .unwrap_or_default();
+        super::lock_overriding(route, name, version, &seen, &finding, by, signer, reason)
+    }
+
     fn block_on(w: &World, revision: u32) {
+        block_by(w, &w.fang, revision);
+    }
+
+    fn block_by(w: &World, adversary: &AgentIdentity, revision: u32) {
         crate::adversary::record(
             &w.route,
-            &w.fang,
+            adversary,
             crate::adversary::AdversaryFinding {
                 order_id: "user-api".into(),
                 revision,
@@ -1875,5 +1990,231 @@ mod tests {
                 .iter()
                 .all(|contract| contract.version != "1.lock")
         );
+    }
+
+    // --- locking what the master looked at --------------------------------------------
+
+    #[test]
+    fn a_lock_is_refused_unless_the_contract_is_what_the_master_looked_at() {
+        let w = world();
+        propose_user_api(&w);
+        let seen = current_digest(&w.route, "user-api", "1").unwrap();
+
+        // A made-up digest, a prefix too short to name anything, and none at all.
+        for wrong in [
+            "0".repeat(64),
+            seen[..DIGEST_MIN - 1].to_string(),
+            String::new(),
+        ] {
+            let error = super::lock(&w.route, "user-api", "1", &wrong, "josh", &w.josh)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("the contract changed since you looked"),
+                "{error}"
+            );
+        }
+
+        // The proposer replaces the proposal after the master read it.
+        let mut changed = read_contract(&w.route, "user-api", "1").unwrap();
+        changed.response = shape(json!({
+            "type": "object",
+            "required": ["user"],
+            "properties": { "user": { "type": "object" } }
+        }));
+        changed.signature = String::new();
+        changed.signature = w
+            .wisp
+            .sign_bytes(contract_payload("demo", &changed).as_bytes());
+        crate::atomic_json(&contract_path(&w.route, "user-api", "1"), &changed).unwrap();
+        let error = super::lock(&w.route, "user-api", "1", &seen, "josh", &w.josh)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the contract changed since you looked"),
+            "{error}"
+        );
+        assert!(
+            !read_contract(&w.route, "user-api", "1")
+                .unwrap()
+                .is_locked(),
+            "nothing was locked"
+        );
+        // The same refusal on the override path, before anything is overridden.
+        mode(&w, crate::policy::AdversaryMode::Blocking);
+        block_on(&w, 0);
+        let finding = crate::adversary::lock_finding_seen(
+            &w.route,
+            &read_contract(&w.route, "user-api", "1").unwrap(),
+        );
+        assert!(
+            super::lock_overriding(
+                &w.route, "user-api", "1", &seen, &finding, "josh", &w.josh, None
+            )
+            .is_err()
+        );
+        assert!(
+            crate::adversary::standing(
+                &w.route,
+                "user-api@1",
+                0,
+                crate::adversary::Trigger::ContractLock
+            )
+            .unwrap()
+            .unresolved_block(),
+            "a refused lock overrides nothing"
+        );
+
+        // What they read now - in full or as a prefix - locks.
+        let now = current_digest(&w.route, "user-api", "1").unwrap();
+        assert_ne!(now, seen);
+        let locked = super::lock_overriding(
+            &w.route,
+            "user-api",
+            "1",
+            &now[..16],
+            &finding,
+            "josh",
+            &w.josh,
+            None,
+        )
+        .unwrap();
+        assert!(locked.is_locked());
+    }
+
+    #[test]
+    fn an_override_is_refused_when_the_adversarys_word_changed_since_the_master_looked() {
+        let w = world();
+        propose_user_api(&w);
+        mode(&w, crate::policy::AdversaryMode::Blocking);
+        block_by(&w, &w.fang, 0);
+        let contract = read_contract(&w.route, "user-api", "1").unwrap();
+        let looked_at = crate::adversary::lock_finding_seen(&w.route, &contract);
+        let digest = current_digest(&w.route, "user-api", "1").unwrap();
+        // A second adversary blocks too, after the master looked.
+        block_by(&w, &w.wisp, 0);
+        let error = super::lock_overriding(
+            &w.route, "user-api", "1", &digest, &looked_at, "josh", &w.josh, None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed since you looked"), "{error}");
+        assert!(
+            !read_contract(&w.route, "user-api", "1")
+                .unwrap()
+                .is_locked()
+        );
+        let now = crate::adversary::lock_finding_seen(&w.route, &contract);
+        assert_ne!(now, looked_at);
+        assert!(
+            super::lock_overriding(
+                &w.route, "user-api", "1", &digest, &now, "josh", &w.josh, None
+            )
+            .unwrap()
+            .is_locked()
+        );
+    }
+
+    #[test]
+    fn in_blocking_mode_a_contract_no_eligible_adversary_read_waits_for_a_finding_or_a_waiver() {
+        let w = world();
+        propose_user_api(&w);
+        mode(&w, crate::policy::AdversaryMode::Blocking);
+        let contract = read_contract(&w.route, "user-api", "1").unwrap();
+        let digest = current_digest(&w.route, "user-api", "1").unwrap();
+
+        // No finding at all: the lock waits (fail closed), and says what it waits for.
+        let error = lock(&w.route, "user-api", "1", "josh", &w.josh)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("no adversary has read user-api@1"),
+            "{error}"
+        );
+
+        // The builder's own Pass is no adversary's word: it opens nothing.
+        f_provider_result(&w);
+        let mut own = crate::adversary::AdversaryFinding {
+            order_id: "back".into(),
+            revision: 1,
+            trigger: crate::adversary::Trigger::ContractLock,
+            subject: "user-api@1".into(),
+            engine: "deepseek".into(),
+            model: None,
+            machine: "grouchly".into(),
+            same_engine: false,
+            verdict: crate::adversary::Verdict::Pass,
+            findings: Vec::new(),
+            created_at: Utc::now(),
+            signed_by: String::new(),
+            signature: String::new(),
+        };
+        crate::adversary::record(&w.route, &w.fang, own.clone()).unwrap();
+        let error = lock(&w.route, "user-api", "1", "josh", &w.josh)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at the provider's result r1"), "{error}");
+
+        // A stale word of what was seen is refused; the master's own waiver is not.
+        let error = super::lock_overriding(
+            &w.route,
+            "user-api",
+            "1",
+            &digest,
+            "abcdef012345",
+            "josh",
+            &w.josh,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("changed since you looked"), "{error}");
+        assert_eq!(
+            crate::adversary::lock_finding_seen(&w.route, &contract),
+            crate::adversary::NO_FINDING
+        );
+        let locked =
+            lock_overriding(&w.route, "user-api", "1", "josh", &w.josh, Some("away")).unwrap();
+        assert!(locked.is_locked());
+        assert!(
+            crate::adversary::read_waiver(
+                &w.route,
+                "user-api@1",
+                1,
+                crate::adversary::Trigger::ContractLock
+            )
+            .is_some()
+        );
+
+        // The adversary that did not build it, reading exactly r1, makes a waiver needless.
+        let w = world();
+        propose_user_api(&w);
+        mode(&w, crate::policy::AdversaryMode::Blocking);
+        f_provider_result(&w);
+        own.engine = "deepseek".into();
+        crate::adversary::record(&w.route, &w.wisp, own).unwrap();
+        assert!(
+            lock(&w.route, "user-api", "1", "josh", &w.josh)
+                .unwrap()
+                .is_locked()
+        );
+    }
+
+    /// `fang` builds a provider order for `user-api@1` and submits its signed result r1.
+    fn f_provider_result(w: &World) {
+        let mut order = contract_order("back", "user-api", Some(Side::Provides));
+        w.josh.sign_order(&mut order);
+        crate::issue_order(&w.route, &order).unwrap();
+        let mut result = crate::TaskResult {
+            order_id: "back".into(),
+            agent: "fang".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "engine": "qwen", "response": { "user": { "id": 1, "name": "a" } } }),
+            signed_by: None,
+            signature: None,
+        };
+        w.fang.sign_result(&mut result);
+        crate::submit_result(&w.route, &result).unwrap();
     }
 }
