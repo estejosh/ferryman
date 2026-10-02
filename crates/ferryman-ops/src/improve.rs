@@ -1595,15 +1595,17 @@ pub async fn review(
         }
     }
     let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
-    if let Err(why) = here(route, config, &policy) {
-        report.info(&format!("  {why}; not reviewing here"));
-        return Ok(0);
-    }
     // The adversary reads contracts waiting for a lock and improvements waiting for the
     // review engine before the judge does, so its finding is there to be shown beside the
     // keys. It has its own engine choice and its own hold; a judge that is down does not
-    // stop it, and it does not stop an advisory judge.
+    // stop it, and it does not stop an advisory judge. It runs before the engine policy's
+    // `where` is consulted, and whatever that says: `where` is the engine policy's - which
+    // a delegate signs - and must not be able to keep the check off the work.
     let challenged = crate::adversary::pass(route, config, &policy, now, report).await;
+    if let Err(why) = here(route, config, &policy) {
+        report.info(&format!("  {why}; not reviewing here"));
+        return Ok(challenged);
+    }
     let week = engines::iso_week(now);
     let waiting = read_plan(route, &week).is_some_and(|plan| plan.unreviewed)
         || awaiting_improvement_review(route);

@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! <channel>/ENGINE_POLICY                      the master's signed policy, or their signed "auto"
+//! <channel>/ADVERSARY_POLICY                   the master's own signed adversary policy
 //! <channel>/improve/<week>/steps/<agent>.json  which engine on which machine did each improve
 //!                                              step, signed by the agent that did it
 //! ```
@@ -53,11 +54,22 @@
 //! judged when the file is read, not when it was signed, because a signature-time check
 //! would let a revoked delegate backdate a setting.
 //!
-//! # What a delegate cannot change
+//! # The adversary's policy is the master's alone
 //!
-//! The adversary is the check on the work, so the one who could be checked does not get
-//! to switch it off: changing the adversary mode, or removing the adversary role, needs
-//! the master's own signature ([`set_policy_as`] refuses it for a delegate).
+//! The adversary is the check on the work, so nobody who could be checked - and a delegate
+//! signing the engine policy can be - gets to choose, starve or switch it off. Everything
+//! about it lives in its own file, `ADVERSARY_POLICY`: its mode, its engine preferences,
+//! its own `never`, the agents allowed to judge, and its weekly cap
+//! ([`AdversaryTerms`]). That file is honoured only when the master signed it with their
+//! own key - no delegation - and is protected against rollback exactly like the engine
+//! policy (its own `seq`, high-water mark and last known good, per machine).
+//!
+//! [`effective`] lays the adversary's terms over the engine policy, so the rest of the
+//! code reads one [`Policy`]; but whatever an `ENGINE_POLICY` file says about the adversary
+//! is dropped on the way in, the engine policy's `never`, `where` and caps do not apply to
+//! the adversary ([`rank`] ranks it under its own `never` and no `where`), and
+//! [`set_policy_as`] refuses a delegate any change to the adversary part.
+//! A machine that does not know `ADVERSARY_POLICY` (v0.5.17) simply never runs the adversary.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -75,6 +87,11 @@ use crate::{
 
 /// The file, inside a channel, that holds the master's signed engine policy.
 pub const ENGINE_POLICY: &str = "ENGINE_POLICY";
+
+/// The file, inside a channel, that holds the master's signed adversary policy: the
+/// adversary's mode, preferences, `never`, allowed agents and weekly cap. Only the master
+/// signs it.
+pub const ADVERSARY_POLICY: &str = "ADVERSARY_POLICY";
 /// How long a free-tier engine that asked for money stays ranked down in auto mode.
 pub const FLAG_DAYS: i64 = 7;
 /// Engine inventories older than this are not counted as the fleet.
@@ -427,6 +444,17 @@ pub struct Policy {
     /// Left out of the signed JSON when advisory, like `auto_merge` when none.
     #[serde(default, skip_serializing_if = "AdversaryMode::is_advisory")]
     pub adversary: AdversaryMode,
+    /// Selectors the adversary never uses, from the master's [`ADVERSARY_POLICY`]. Part of
+    /// the policy as a screen or a command line edits it, never of the `ENGINE_POLICY`
+    /// file: [`set_policy_as`] writes it to the master's own file, and anything the
+    /// engine policy file carries here is dropped on reading.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adversary_never: Vec<String>,
+    /// The agents the master allows to judge, from the same file (see
+    /// [`AdversaryTerms::agents`]); empty is any. Kept out of `ENGINE_POLICY` like
+    /// [`Self::adversary_never`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub adversary_agents: Vec<String>,
     /// Per role: how hard its engine is asked to think. A role left out runs at
     /// [`Role::default_effort`]. Left out of the signed JSON when empty, so a policy
     /// signed before this existed still verifies.
@@ -455,6 +483,8 @@ impl Default for Policy {
             never_applies_to: NeverScope::Background,
             auto_merge: AutoMerge::None,
             adversary: AdversaryMode::Advisory,
+            adversary_never: Vec::new(),
+            adversary_agents: Vec::new(),
             effort: BTreeMap::new(),
             width: BTreeMap::new(),
             subscription_roles: Vec::new(),
@@ -471,9 +501,15 @@ impl Policy {
                 check_selector(selector)?;
             }
         }
-        for selector in self.never.iter().chain(&self.machines) {
+        for selector in self
+            .never
+            .iter()
+            .chain(&self.machines)
+            .chain(&self.adversary_never)
+        {
             check_selector(selector)?;
         }
+        self.adversary_terms().check()?;
         for (role, cap) in &self.caps_usd {
             Role::parse(role)?;
             if !cap.is_finite() || *cap < 0.0 {
@@ -743,6 +779,24 @@ impl Policy {
             }
             .to_string(),
         );
+        if self.adversary != AdversaryMode::Off {
+            lines.push(if self.adversary_agents.is_empty() {
+                "adversary agents: any member whose signed inventory lists an engine the \
+                 adversary may use (no allowlist)"
+                    .to_string()
+            } else {
+                format!(
+                    "adversary agents: {} only",
+                    self.adversary_agents.join(", ")
+                )
+            });
+        }
+        if !self.adversary_never.is_empty() {
+            lines.push(format!(
+                "adversary never: {}",
+                self.adversary_never.join(", ")
+            ));
+        }
         lines
     }
 }
@@ -1104,6 +1158,15 @@ fn fit(role: Role, wanted: u8, level: u8) -> Option<u8> {
 /// order.
 #[must_use]
 pub fn rank(policy: &Policy, role: Role, tier: &str, work: Work, engines: &[Candidate]) -> Ranking {
+    if role == Role::Adversary {
+        // The adversary is ranked under its own `never` and no `where`: the engine
+        // policy's cannot starve it.
+        return rank_in(&policy.adversary_view(), role, tier, work, engines);
+    }
+    rank_in(policy, role, tier, work, engines)
+}
+
+fn rank_in(policy: &Policy, role: Role, tier: &str, work: Work, engines: &[Candidate]) -> Ranking {
     let wanted = tier_level(tier);
     let listed = policy.preferences(role).len();
     let mut ranking = Ranking::default();
@@ -2249,6 +2312,8 @@ impl Policy {
         let known = |selector: &String| !selector.trim().starts_with("class:");
         let mut view = Policy {
             adversary: AdversaryMode::Advisory,
+            adversary_never: Vec::new(),
+            adversary_agents: Vec::new(),
             effort: BTreeMap::new(),
             width: BTreeMap::new(),
             subscription_roles: Vec::new(),
@@ -2368,7 +2433,173 @@ impl PolicySetting {
     }
 }
 
+// --- the adversary's own policy -----------------------------------------------------------
+
+/// What the master decides about the adversary, and nobody else: whether it runs and what
+/// its findings do, which engines it prefers or never uses, which agents may judge, and
+/// what it may spend a week. Kept out of the engine policy - which a delegate can sign -
+/// so the one who could be checked cannot choose, starve or switch off the check.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AdversaryTerms {
+    #[serde(default)]
+    pub mode: AdversaryMode,
+    /// Selectors, most preferred first: which engine challenges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefer: Vec<String>,
+    /// Selectors the adversary never uses. The engine policy's `never` does not apply to
+    /// it, so a delegate cannot starve it with one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub never: Vec<String>,
+    /// The agents whose word counts as an adversary's. Empty: any member whose signed
+    /// engine inventory lists an engine the preferences allow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<String>,
+    /// Dollars the adversary may spend in one ISO week; the engine policy's caps do not
+    /// apply to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cap_usd: Option<f64>,
+}
+
+impl AdversaryTerms {
+    /// Refuse terms with a selector, agent or cap that means nothing.
+    pub fn check(&self) -> Result<()> {
+        for selector in self.prefer.iter().chain(&self.never) {
+            check_selector(selector)?;
+        }
+        if self.agents.len() > 64 {
+            bail!("at most 64 adversary agents can be named");
+        }
+        for agent in &self.agents {
+            if !crate::is_safe_component(agent) {
+                bail!("an adversary agent is a path-safe agent name, not '{agent}'");
+            }
+        }
+        if let Some(cap) = self.cap_usd
+            && (!cap.is_finite() || cap < 0.0)
+        {
+            bail!("the adversary cap must be a dollar amount of zero or more");
+        }
+        Ok(())
+    }
+}
+
+/// The master's signed adversary policy: the file `ADVERSARY_POLICY`. Honoured only when
+/// the master signed it with their own key - there is no delegation for it - and then
+/// protected against rollback exactly as the engine policy is, by a `seq` and this
+/// machine's own memory of the highest it has seen and the last good one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdversarySetting {
+    pub project_id: String,
+    pub terms: AdversaryTerms,
+    pub set_at: DateTime<Utc>,
+    pub signed_by: String,
+    pub signature: String,
+    /// One more than the highest `seq` the master saw when signing.
+    pub seq: u64,
+}
+
+impl AdversarySetting {
+    /// Exactly what `signature` covers.
+    fn payload(&self) -> String {
+        format!(
+            "ferryman-adversary-policy-v1\n{}\n{}\n{}\nseq:{}",
+            self.project_id,
+            self.set_at.to_rfc3339(),
+            serde_jcs::to_string(&self.terms).unwrap_or_default(),
+            self.seq
+        )
+    }
+
+    fn sign(&mut self, signer: &AgentIdentity) {
+        self.signature = signer.sign_bytes(self.payload().as_bytes());
+    }
+
+    /// Whether this is the master's own word for `project_id` in `channel`: signed by the
+    /// master's key, over exactly what it says. A delegate's signature is not enough.
+    fn genuine(&self, channel: &Path, project_id: &str) -> bool {
+        let Ok(roster) = crate::read_agent_roster(channel) else {
+            return false;
+        };
+        let Ok(Some(master)) = crate::master::read_master_at(channel, &roster) else {
+            return false;
+        };
+        self.project_id == project_id
+            && master.project_id == project_id
+            && self.seq >= 1
+            && self.signed_by.eq_ignore_ascii_case(&master.master)
+            && self.terms.check().is_ok()
+            && crate::check_signature(
+                Some(&self.signed_by),
+                Some(&self.signature),
+                &self.payload(),
+                &roster,
+            ) == SignatureCheck::Valid
+    }
+}
+
+impl Policy {
+    /// The adversary's terms as this (composed) policy carries them.
+    #[must_use]
+    pub fn adversary_terms(&self) -> AdversaryTerms {
+        AdversaryTerms {
+            mode: self.adversary,
+            prefer: self.preferences(Role::Adversary).to_vec(),
+            never: self.adversary_never.clone(),
+            agents: self.adversary_agents.clone(),
+            cap_usd: self.cap(Role::Adversary),
+        }
+    }
+
+    /// The engine policy proper: everything about the adversary taken out.
+    #[must_use]
+    pub fn without_adversary(&self) -> Policy {
+        let mut policy = self.clone();
+        policy.adversary = AdversaryMode::Advisory;
+        policy.adversary_never.clear();
+        policy.adversary_agents.clear();
+        policy.prefer.remove(Role::Adversary.as_str());
+        policy.caps_usd.remove(Role::Adversary.as_str());
+        policy
+    }
+
+    /// This policy with the adversary's `terms` laid over it, whatever it had.
+    #[must_use]
+    pub fn with_adversary(mut self, terms: &AdversaryTerms) -> Policy {
+        self = self.without_adversary();
+        self.adversary = terms.mode;
+        self.adversary_never.clone_from(&terms.never);
+        self.adversary_agents.clone_from(&terms.agents);
+        if !terms.prefer.is_empty() {
+            self.prefer
+                .insert(Role::Adversary.as_str().to_string(), terms.prefer.clone());
+        }
+        if let Some(cap) = terms.cap_usd {
+            self.caps_usd
+                .insert(Role::Adversary.as_str().to_string(), cap);
+        }
+        self
+    }
+
+    /// This policy with the adversary part of `in_force` instead of its own: what a
+    /// delegate may sign, since the adversary's terms are the master's alone.
+    #[must_use]
+    pub fn keeping_adversary_of(&self, in_force: &Policy) -> Policy {
+        self.clone().with_adversary(&in_force.adversary_terms())
+    }
+
+    /// The policy the adversary is ranked and capped under: its own `never`, and no
+    /// `where` - the engine policy's `never` and `where` cannot starve it.
+    fn adversary_view(&self) -> Policy {
+        Policy {
+            never: self.adversary_never.clone(),
+            machines: Vec::new(),
+            ..self.clone()
+        }
+    }
+}
+
 /// The file's setting as parsed, genuine or not.
+#[cfg(test)]
 fn read_file_setting(channel: &Path) -> Option<PolicySetting> {
     serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).ok()?).ok()
 }
@@ -2405,22 +2636,71 @@ fn genuine(channel: &Path, project_id: &str, setting: &PolicySetting) -> bool {
         && setting.signed_validly(&roster)
 }
 
+/// A signed file this machine tracks for rollback: the engine policy and the adversary
+/// policy are each one, with their own file, `seq` and memory.
+trait Signed: Clone + PartialEq + Serialize + serde::de::DeserializeOwned {
+    /// The file inside the channel.
+    const FILE: &'static str;
+    /// This machine's state directory for it.
+    const STATE: &'static str;
+    /// What it is called in a notice.
+    const LABEL: &'static str;
+    /// The question id stem the master is asked under.
+    const QUESTION: &'static str;
+    fn seq(&self) -> u64;
+    fn set_at(&self) -> DateTime<Utc>;
+    /// Whether it is the master's word for `project_id` in `channel`.
+    fn is_genuine(&self, channel: &Path, project_id: &str) -> bool;
+}
+
+impl Signed for PolicySetting {
+    const FILE: &'static str = ENGINE_POLICY;
+    const STATE: &'static str = "engine-policy";
+    const LABEL: &'static str = "engine policy";
+    const QUESTION: &'static str = "engine-policy";
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn set_at(&self) -> DateTime<Utc> {
+        self.set_at
+    }
+    fn is_genuine(&self, channel: &Path, project_id: &str) -> bool {
+        genuine(channel, project_id, self)
+    }
+}
+
+impl Signed for AdversarySetting {
+    const FILE: &'static str = ADVERSARY_POLICY;
+    const STATE: &'static str = "adversary-policy";
+    const LABEL: &'static str = "adversary policy";
+    const QUESTION: &'static str = "adversary-policy";
+    fn seq(&self) -> u64 {
+        self.seq
+    }
+    fn set_at(&self) -> DateTime<Utc> {
+        self.set_at
+    }
+    fn is_genuine(&self, channel: &Path, project_id: &str) -> bool {
+        self.genuine(channel, project_id)
+    }
+}
+
 /// What this machine remembers of a project's policy, in its own state directory: never
 /// in the synced channel, so nobody who can write the channel can edit it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct Seen {
+struct Seen<T> {
     /// The highest `seq` this machine has accepted.
     high: u64,
     /// The last good setting, with its signature; verified again whenever it is used.
-    setting: Option<PolicySetting>,
+    setting: Option<T>,
     /// What went wrong with the channel's file, until it is put right.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     alert: Option<String>,
 }
 
-fn seen_path(channel: &Path, project_id: &str) -> Option<std::path::PathBuf> {
+fn seen_path<T: Signed>(channel: &Path, project_id: &str) -> Option<std::path::PathBuf> {
     use sha2::{Digest, Sha256};
-    let dir = crate::licensing::machine_state_dir()?.join("engine-policy");
+    let dir = crate::licensing::machine_state_dir()?.join(T::STATE);
     let channel = std::fs::canonicalize(channel).unwrap_or_else(|_| channel.to_path_buf());
     let key = hex::encode(Sha256::digest(
         format!("{}\n{project_id}", channel.display()).as_bytes(),
@@ -2428,12 +2708,12 @@ fn seen_path(channel: &Path, project_id: &str) -> Option<std::path::PathBuf> {
     Some(dir.join(format!("{}.json", &key[..24])))
 }
 
-fn read_seen(path: &Path) -> Option<Seen> {
+fn read_seen<T: Signed>(path: &Path) -> Option<Seen<T>> {
     serde_json::from_slice(&std::fs::read(path).ok()?).ok()
 }
 
 /// Best effort: a machine that cannot remember simply has no rollback protection.
-fn write_seen(path: &Path, seen: &Seen) {
+fn write_seen<T: Signed>(path: &Path, seen: &Seen<T>) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -2441,8 +2721,8 @@ fn write_seen(path: &Path, seen: &Seen) {
 }
 
 /// The setting in force and how it was reached.
-struct Resolved {
-    setting: Option<PolicySetting>,
+struct Resolved<T> {
+    setting: Option<T>,
     /// The setting is this machine's memory of an earlier one, because the channel's file
     /// went back or is gone.
     from_memory: bool,
@@ -2450,16 +2730,19 @@ struct Resolved {
     high: u64,
 }
 
-fn resolve(channel: &Path, project_id: &str) -> Resolved {
-    let file = read_file_setting(channel).filter(|setting| genuine(channel, project_id, setting));
-    let file_seq = file.as_ref().map_or(0, |setting| setting.seq);
-    let path = seen_path(channel, project_id);
-    let Some(memory) = path.as_deref().and_then(read_seen) else {
+fn resolve<T: Signed>(channel: &Path, project_id: &str) -> Resolved<T> {
+    let file = std::fs::read(channel.join(T::FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<T>(&bytes).ok())
+        .filter(|setting| setting.is_genuine(channel, project_id));
+    let file_seq = file.as_ref().map_or(0, Signed::seq);
+    let path = seen_path::<T>(channel, project_id);
+    let Some(memory) = path.as_deref().and_then(read_seen::<T>) else {
         if let (Some(file), Some(path)) = (&file, &path) {
             write_seen(
                 path,
                 &Seen {
-                    high: file.seq,
+                    high: file.seq(),
                     setting: Some(file.clone()),
                     alert: None,
                 },
@@ -2474,25 +2757,25 @@ fn resolve(channel: &Path, project_id: &str) -> Resolved {
     let good = memory
         .setting
         .clone()
-        .filter(|setting| genuine(channel, project_id, setting));
+        .filter(|setting| setting.is_genuine(channel, project_id));
     let high = memory.high.max(file_seq);
-    let remember = |seen: Seen| {
+    let remember = |seen: Seen<T>| {
         if let Some(path) = &path
-            && Some(&seen) != Some(&memory)
+            && seen != memory
         {
             write_seen(path, &seen);
         }
     };
     match file {
         Some(file)
-            if file.seq > memory.high
-                || (file.seq == memory.high
+            if file.seq() > memory.high
+                || (file.seq() == memory.high
                     && good
                         .as_ref()
-                        .is_none_or(|good| *good == file || file.set_at >= good.set_at)) =>
+                        .is_none_or(|good| *good == file || file.set_at() >= good.set_at())) =>
         {
             remember(Seen {
-                high: file.seq,
+                high: file.seq(),
                 setting: Some(file.clone()),
                 alert: None,
             });
@@ -2507,9 +2790,11 @@ fn resolve(channel: &Path, project_id: &str) -> Resolved {
                 high: memory.high,
                 setting: memory.setting.clone(),
                 alert: Some(format!(
-                    "the channel's engine policy is at sequence {} but this machine has \
-                     already seen sequence {}: an older signed policy was put back",
-                    file.seq, memory.high
+                    "the channel's {} is at sequence {} but this machine has already seen \
+                     sequence {}: an older signed one was put back",
+                    T::LABEL,
+                    file.seq(),
+                    memory.high
                 )),
             });
             Resolved {
@@ -2522,9 +2807,10 @@ fn resolve(channel: &Path, project_id: &str) -> Resolved {
             remember(Seen {
                 high: memory.high,
                 setting: memory.setting.clone(),
-                alert: Some(
-                    "the channel's engine policy is gone or no longer verifies".to_string(),
-                ),
+                alert: Some(format!(
+                    "the channel's {} is gone or no longer verifies",
+                    T::LABEL
+                )),
             });
             Resolved {
                 setting: good,
@@ -2544,55 +2830,101 @@ fn resolve(channel: &Path, project_id: &str) -> Resolved {
 /// and it verifies. Anything else is `None`, which means auto - unless this machine has
 /// seen a newer one before, in which case that last known good setting stays in force
 /// (see the module documentation on rollback and deletion).
+///
+/// The setting's policy is the engine policy proper: whatever a file carries about the
+/// adversary is dropped here, because the adversary's terms come only from
+/// [`adversary_setting`].
 #[must_use]
 pub fn setting(channel: &Path, project_id: &str) -> Option<PolicySetting> {
-    resolve(channel, project_id).setting
+    resolve::<PolicySetting>(channel, project_id)
+        .setting
+        .map(|mut setting| {
+            setting.policy = setting.policy.map(|policy| policy.without_adversary());
+            setting
+        })
 }
 
-/// What is wrong with the channel's engine policy, when this machine is holding on to an
-/// earlier one because the file went back, vanished or stopped verifying.
+/// The master's own adversary policy for the project in `channel`, when there is one and
+/// it verifies - signed by the master, never by a delegate. `None` means the defaults
+/// (advisory, auto choice, no allowlist, no cap) - unless this machine has seen a newer
+/// one, in which case the last known good one stays in force.
+#[must_use]
+pub fn adversary_setting(channel: &Path, project_id: &str) -> Option<AdversarySetting> {
+    resolve::<AdversarySetting>(channel, project_id).setting
+}
+
+/// What is wrong with the channel's engine policy or adversary policy, when this machine
+/// is holding on to an earlier one because the file went back, vanished or stopped
+/// verifying.
 #[must_use]
 pub fn rollback_notice(channel: &Path, project_id: &str) -> Option<String> {
-    resolve(channel, project_id);
-    read_seen(&seen_path(channel, project_id)?)?.alert
+    let notices: Vec<String> = [
+        notice::<PolicySetting>(channel, project_id),
+        notice::<AdversarySetting>(channel, project_id),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!notices.is_empty()).then(|| notices.join("; "))
+}
+
+fn notice<T: Signed>(channel: &Path, project_id: &str) -> Option<String> {
+    resolve::<T>(channel, project_id);
+    read_seen::<T>(&seen_path::<T>(channel, project_id)?)?.alert
 }
 
 /// Ask the master, once per sequence number however many machines notice, what to do
 /// about a policy that went back or vanished. Returns whether it was asked now; `false`
 /// when nothing is wrong or the question already exists. Re-signing the policy (`ferry
-/// engines policy set`, or the dashboard) is the answer: it carries a newer `seq`.
+/// engines policy set`, or the dashboard) is the answer: it carries a newer `seq`. The
+/// engine policy and the adversary policy are asked about separately.
 pub fn ask_rollback(route: &ProjectRoute, identity: &AgentIdentity) -> Result<bool> {
-    let Some(notice) = rollback_notice(&route.communications, &route.project_id) else {
+    let engine = ask_rollback_of::<PolicySetting>(route, identity)?;
+    let adversary = ask_rollback_of::<AdversarySetting>(route, identity)?;
+    Ok(engine || adversary)
+}
+
+fn ask_rollback_of<T: Signed>(route: &ProjectRoute, identity: &AgentIdentity) -> Result<bool> {
+    let Some(notice) = notice::<T>(&route.communications, &route.project_id) else {
         return Ok(false);
     };
-    let high = resolve(&route.communications, &route.project_id).high;
+    let high = resolve::<T>(&route.communications, &route.project_id).high;
     crate::questions::ask(
         route,
         identity,
-        &format!("engine-policy-rollback-{high}"),
+        &format!("{}-rollback-{high}", T::QUESTION),
         crate::questions::POLICY,
         &format!(
-            "{}'s engine policy looks wrong: {notice}. This machine keeps using the last \
-             policy you signed. If you did not do this, find who can write the channel; to \
-             settle it, sign the engine policy again (dashboard Teammates page, or `ferry \
-             engines policy set`).",
-            route.project_id
+            "{}'s {} looks wrong: {notice}. This machine keeps using the last one you \
+             signed. If you did not do this, find who can write the channel; to settle it, \
+             sign it again as the master (dashboard Teammates page, or `ferry engines \
+             policy set`).",
+            route.project_id,
+            T::LABEL
         ),
         &["Understood".to_string()],
         None,
     )
 }
 
-/// The policy in force for a project: the master's, or auto's defaults when they set
-/// none, chose auto, or the file does not verify. With the setting, when there is one.
+/// The policy in force for a project: the master's engine policy with the master's
+/// adversary policy laid over it, or auto's defaults where they set none, chose auto, or
+/// the file does not verify. With the engine policy's setting, when there is one.
+///
+/// The adversary part - mode, engine preferences, `never`, allowed agents, cap - is only
+/// ever the master's own adversary policy: nothing in the engine policy reaches it.
 #[must_use]
 pub fn effective(channel: &Path, project_id: &str) -> (Policy, Option<PolicySetting>) {
     let setting = setting(channel, project_id);
+    let terms = adversary_setting(channel, project_id)
+        .map(|adversary| adversary.terms)
+        .unwrap_or_default();
     (
         setting
             .as_ref()
             .and_then(|setting| setting.policy.clone())
-            .unwrap_or_default(),
+            .unwrap_or_default()
+            .with_adversary(&terms),
         setting,
     )
 }
@@ -2605,6 +2937,10 @@ pub fn is_set(channel: &Path, project_id: &str) -> bool {
 
 /// Set the project's engine policy, signed by its master. `None` goes back to auto.
 /// Returns whether anything changed.
+///
+/// The adversary part of `policy` is not part of the engine policy: when it differs from
+/// what is in force it is written as the master's [`ADVERSARY_POLICY`], which only the
+/// master can sign.
 pub fn set_policy(
     channel: &Path,
     project_id: &str,
@@ -2615,7 +2951,9 @@ pub fn set_policy(
 }
 
 /// [`set_policy`], signed by a delegate for `on_behalf_of`, who must be the master and
-/// must have delegated `improve` to the signer. `None` is the signer's own.
+/// must have delegated `improve` to the signer. `None` is the signer's own. A delegate
+/// signs the engine policy only: a `policy` whose adversary part differs from the one in
+/// force is refused, because that needs the master's own signature.
 pub fn set_policy_as(
     channel: &Path,
     project_id: &str,
@@ -2660,32 +2998,59 @@ pub fn set_policy_as(
             }
         }
     }
-    let resolved = resolve(channel, project_id);
-    if on_behalf_of.is_some() {
-        let in_force = resolved
-            .setting
-            .as_ref()
-            .and_then(|setting| setting.policy.clone())
-            .unwrap_or_default();
-        let next = policy.clone().unwrap_or_default();
-        if let Some(why) = adversary_change(&in_force, &next) {
-            bail!(
-                "{} signs for {} as a delegate, and {why}: that needs {}'s own signature",
-                signer.name(),
-                on_behalf_of.unwrap_or_default(),
-                on_behalf_of.unwrap_or_default()
-            );
-        }
+    let resolved = resolve::<PolicySetting>(channel, project_id);
+    let adversary = resolve::<AdversarySetting>(channel, project_id);
+    let adversary_in_force = adversary
+        .setting
+        .as_ref()
+        .map(|setting| setting.terms.clone())
+        .unwrap_or_default();
+    // `None` is auto for the engine policy and leaves the adversary's terms alone.
+    let adversary_next = policy.as_ref().map(Policy::adversary_terms);
+    if let (Some(principal), Some(next)) = (on_behalf_of, &adversary_next)
+        && let Some(why) = adversary_change(&adversary_in_force, next)
+    {
+        bail!(
+            "{} signs for {principal} as a delegate, and {why}: that needs {principal}'s own \
+             signature",
+            signer.name()
+        );
     }
+    let mut changed = false;
+    // Only the master writes the adversary's terms - and when the channel's file is not the
+    // one in force (it went back, or is gone), signing the same terms again repairs it.
+    if on_behalf_of.is_none()
+        && let Some(next) =
+            adversary_next.filter(|next| *next != adversary_in_force || adversary.from_memory)
+    {
+        let seq = adversary
+            .high
+            .max(adversary.setting.as_ref().map_or(0, |setting| setting.seq))
+            + 1;
+        let mut written = AdversarySetting {
+            project_id: project_id.to_owned(),
+            terms: next,
+            set_at: Utc::now(),
+            signed_by: signer.name().to_owned(),
+            signature: String::new(),
+            seq,
+        };
+        written.sign(signer);
+        let path = channel.join(ADVERSARY_POLICY);
+        crate::atomic_json(&path, &written)
+            .with_context(|| format!("writing {}", path.display()))?;
+        changed = true;
+    }
+    // The engine policy proper: nothing about the adversary in it.
+    let policy = policy.map(|policy| policy.without_adversary());
     // Unchanged - unless the channel's file is not the setting in force (it went back, or
     // is gone), in which case signing the same policy again is what repairs it.
     if !resolved.from_memory
-        && resolved
-            .setting
-            .as_ref()
-            .is_some_and(|existing| existing.policy == policy)
+        && resolved.setting.as_ref().is_some_and(|existing| {
+            existing.policy.clone().map(|p| p.without_adversary()) == policy
+        })
     {
-        return Ok(false);
+        return Ok(changed);
     }
     let seq = resolved
         .high
@@ -2960,23 +3325,24 @@ pub fn over_cap(route: &ProjectRoute, policy: &Policy, week: &str, role: Role) -
 
 // --- asking the master --------------------------------------------------------------------
 
-/// Why a delegate may not turn `in_force` into `next`, when the difference is the adversary
-/// being switched off or changed: its mode, or its role removed. Only the master does that.
-fn adversary_change(in_force: &Policy, next: &Policy) -> Option<String> {
-    if in_force.adversary != next.adversary {
+/// Why a delegate may not turn the adversary's `in_force` terms into `next`, when they
+/// differ: its mode switched, its role removed, or anything else about who challenges and
+/// at what price. Only the master does that.
+fn adversary_change(in_force: &AdversaryTerms, next: &AdversaryTerms) -> Option<String> {
+    if in_force == next {
+        return None;
+    }
+    if in_force.mode != next.mode {
         return Some(format!(
             "this changes the adversary mode from {} to {}",
-            in_force.adversary.as_str(),
-            next.adversary.as_str()
+            in_force.mode.as_str(),
+            next.mode.as_str()
         ));
     }
-    let role = Role::Adversary.as_str();
-    let had = in_force
-        .prefer
-        .get(role)
-        .is_some_and(|list| !list.is_empty());
-    let has = next.prefer.get(role).is_some_and(|list| !list.is_empty());
-    (had && !has).then(|| "this removes the adversary role".to_string())
+    if !in_force.prefer.is_empty() && next.prefer.is_empty() {
+        return Some("this removes the adversary role".to_string());
+    }
+    Some("this changes which engines or agents the adversary may use, or its cap".to_string())
 }
 
 /// The team preset laid over the policy in force: the preset's `prefer`, `effort`,
@@ -3821,12 +4187,26 @@ mod tests {
             judge("claude", "claude-sonnet", 3),
         ];
         let policy = Policy {
-            never: vec!["name:claude".into()],
+            adversary_never: vec!["name:claude".into()],
             ..Policy::default()
         };
         let ranked = rank_adversary(&policy, &built_by("deepseek", "deepseek-chat"), &engines);
         assert_eq!(names(&ranked.ranking, &engines), ["deepseek"]);
         assert_eq!(ranked.same_engine, [true]);
+
+        // The engine policy's `never` and `where` are not the adversary's: a delegate who
+        // signs them cannot take its judges away.
+        let engine_policy = Policy {
+            never: vec!["name:claude".into(), "name:deepseek".into()],
+            machines: vec!["nowhere".into()],
+            ..Policy::default()
+        };
+        let ranked = rank_adversary(
+            &engine_policy,
+            &built_by("deepseek", "deepseek-chat"),
+            &engines,
+        );
+        assert_eq!(names(&ranked.ranking, &engines), ["claude", "deepseek"]);
 
         // A build-tier engine is not an adversary at all.
         let engines = vec![engine("nemotron", "build", "free-tier")];
@@ -4780,10 +5160,16 @@ mod tests {
         no_role.prefer.remove("adversary");
         let error = as_delegate(no_role).unwrap_err().to_string();
         assert!(error.contains("removes the adversary role"), "{error}");
-        assert!(
-            as_delegate_auto(channel, &bridge).is_err(),
-            "auto drops it too"
-        );
+        let mut other_engine = strict.clone();
+        other_engine.set_adversary_engine("name:claude");
+        let error = as_delegate(other_engine).unwrap_err().to_string();
+        assert!(error.contains("josh's own signature"), "{error}");
+        let mut capped = strict.clone();
+        capped.caps_usd.insert("adversary".into(), 0.01);
+        assert!(as_delegate(capped).is_err(), "starving it is the same");
+        let mut never = strict.clone();
+        never.adversary_never = vec!["name:deepseek".into()];
+        assert!(as_delegate(never).is_err());
         assert_eq!(effective(channel, "demo").0, strict, "nothing changed");
 
         // Anything else is still the delegate's to change.
@@ -4798,6 +5184,216 @@ mod tests {
         };
         assert!(set_policy(channel, "demo", Some(off.clone()), &josh).unwrap());
         assert_eq!(effective(channel, "demo").0, off);
+        // Auto, from a delegate, is the engine policy going back to auto: the adversary's
+        // terms are not part of it and stay as the master signed them.
+        assert!(as_delegate_auto(channel, &bridge).unwrap());
+        let (after, setting) = effective(channel, "demo");
+        assert!(setting.is_some_and(|setting| setting.policy.is_none()));
+        assert_eq!(after.adversary, AdversaryMode::Off);
+        assert_eq!(after.adversary_engine(), Some("name:deepseek"));
+    }
+
+    /// A fleet with the master `josh` and a delegate `telegram-grouchly` who holds `improve`.
+    fn with_a_delegate() -> (
+        tempfile::TempDir,
+        ProjectRoute,
+        AgentIdentity,
+        AgentIdentity,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let bridge = person("telegram-grouchly", 3);
+        let route = route(dir.path(), &[&josh, &bridge]);
+        crate::delegation::grant(
+            &route.communications,
+            "demo",
+            &josh,
+            "telegram-grouchly",
+            &["improve".to_string()],
+            None,
+        )
+        .unwrap();
+        (dir, route, josh, bridge)
+    }
+
+    #[test]
+    fn the_master_signs_the_adversary_policy_and_a_delegate_signed_one_is_ignored() {
+        let (_dir, route, josh, bridge) = with_a_delegate();
+        let channel = &route.communications;
+        let mut strict = hardened();
+        strict.adversary_agents = vec!["wisp".into()];
+        strict.adversary_never = vec!["name:grok".into()];
+        assert!(set_policy(channel, "demo", Some(strict.clone()), &josh).unwrap());
+        let signed = adversary_setting(channel, "demo").expect("the master's file");
+        assert_eq!(signed.signed_by, "josh");
+        assert_eq!(signed.terms.mode, AdversaryMode::Blocking);
+        assert_eq!(signed.terms.agents, ["wisp"]);
+        assert_eq!(effective(channel, "demo").0, strict);
+        let path = channel.join(ADVERSARY_POLICY);
+        let good = std::fs::read(&path).unwrap();
+
+        // The delegate - who holds `improve`, which is enough for the engine policy -
+        // writes an adversary policy of their own, with a newer sequence number.
+        let mut forged = AdversarySetting {
+            project_id: "demo".into(),
+            terms: AdversaryTerms {
+                mode: AdversaryMode::Off,
+                ..AdversaryTerms::default()
+            },
+            set_at: Utc::now(),
+            signed_by: "telegram-grouchly".into(),
+            signature: String::new(),
+            seq: signed.seq + 1,
+        };
+        forged.sign(&bridge);
+        crate::atomic_json(&path, &forged).unwrap();
+        assert!(
+            !forged.genuine(channel, "demo"),
+            "a delegate is not the master"
+        );
+        assert_eq!(effective(channel, "demo").0, strict, "still the master's");
+
+        // Claiming to be the master with the delegate's key does not verify either.
+        let mut as_master = forged.clone();
+        as_master.signed_by = "josh".into();
+        as_master.sign(&bridge);
+        crate::atomic_json(&path, &as_master).unwrap();
+        assert!(!as_master.genuine(channel, "demo"));
+        assert_eq!(
+            effective(channel, "demo").0.adversary,
+            AdversaryMode::Blocking
+        );
+
+        // The master's own file is honoured again once it is back; and the terms signed
+        // for one project are no use in another.
+        std::fs::write(&path, &good).unwrap();
+        assert_eq!(effective(channel, "demo").0, strict);
+        assert!(!signed.genuine(channel, "other"));
+        // No delegation can reach it through `set_policy_as` either.
+        let error = set_policy_as(
+            channel,
+            "demo",
+            Some(Policy {
+                adversary: AdversaryMode::Off,
+                ..strict.clone()
+            }),
+            &bridge,
+            Some("josh"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("josh's own signature"), "{error}");
+        assert_eq!(effective(channel, "demo").0, strict);
+    }
+
+    #[test]
+    fn a_delegates_engine_policy_cannot_touch_the_adversarys_selection_mode_or_budget() {
+        let (_dir, route, josh, bridge) = with_a_delegate();
+        let channel = &route.communications;
+        let mut strict = hardened();
+        strict.adversary_never = vec!["name:grok".into()];
+        strict.caps_usd.insert("adversary".into(), 5.0);
+        assert!(set_policy(channel, "demo", Some(strict.clone()), &josh).unwrap());
+        let (in_force, _) = effective(channel, "demo");
+        assert_eq!(in_force.adversary, AdversaryMode::Blocking);
+        assert_eq!(in_force.adversary_engine(), Some("name:deepseek"));
+        assert_eq!(in_force.cap(Role::Adversary), Some(5.0));
+
+        // A delegate-signed engine policy - written straight to the file, the way a
+        // compromised delegate would - that says everything it can about the adversary:
+        // off, a different engine, a cap of nothing, and a `never` and `where` that match
+        // every engine and machine.
+        let mut hostile = strict.without_adversary();
+        hostile.adversary = AdversaryMode::Off;
+        hostile
+            .prefer
+            .insert("adversary".into(), vec!["name:claude".into()]);
+        hostile.caps_usd.insert("adversary".into(), 0.0);
+        hostile.never = vec!["name:deepseek".into(), "name:claude".into()];
+        hostile.machines = vec!["nowhere".into()];
+        let mut file = PolicySetting {
+            project_id: "demo".into(),
+            policy: Some(hostile),
+            set_at: Utc::now(),
+            signed_by: "telegram-grouchly".into(),
+            signature: String::new(),
+            on_behalf_of: Some("josh".into()),
+            seq: 9,
+            signature_v2: None,
+        };
+        file.sign(&bridge);
+        assert!(genuine(channel, "demo", &file), "a valid delegate signing");
+        crate::atomic_json(&channel.join(ENGINE_POLICY), &file).unwrap();
+
+        let (read, _) = effective(channel, "demo");
+        assert_eq!(
+            read.never,
+            ["name:deepseek", "name:claude"],
+            "the engine policy took effect"
+        );
+        assert_eq!(read.machines, ["nowhere"]);
+        // But the adversary is exactly what the master signed.
+        assert_eq!(read.adversary, AdversaryMode::Blocking);
+        assert_eq!(read.adversary_engine(), Some("name:deepseek"));
+        assert_eq!(read.cap(Role::Adversary), Some(5.0));
+        assert_eq!(read.adversary_never, ["name:grok"]);
+        // ...and it is still ranked: neither `never` nor `where` reaches it.
+        let engines = vec![
+            judge("deepseek", "deepseek-chat", 3),
+            judge("claude", "claude-sonnet", 3),
+        ];
+        let ranked = rank_adversary(&read, &[], &engines);
+        assert_eq!(names(&ranked.ranking, &engines), ["deepseek", "claude"]);
+    }
+
+    #[test]
+    fn an_older_adversary_policy_put_back_or_deleted_does_not_roll_the_machine_back() {
+        let (_dir, route, josh, _bridge) = with_a_delegate();
+        let channel = &route.communications;
+        let path = channel.join(ADVERSARY_POLICY);
+        let blocking = Policy {
+            adversary: AdversaryMode::Blocking,
+            ..Policy::default()
+        };
+        let off = Policy {
+            adversary: AdversaryMode::Off,
+            ..Policy::default()
+        };
+        assert!(set_policy(channel, "demo", Some(blocking.clone()), &josh).unwrap());
+        let old = std::fs::read(&path).unwrap();
+        assert_eq!(adversary_setting(channel, "demo").unwrap().seq, 1);
+        assert!(set_policy(channel, "demo", Some(off.clone()), &josh).unwrap());
+        assert_eq!(adversary_setting(channel, "demo").unwrap().seq, 2);
+        assert!(rollback_notice(channel, "demo").is_none());
+
+        // The earlier, genuinely signed file is put back: the adversary stays off here,
+        // and the master is asked once.
+        std::fs::write(&path, &old).unwrap();
+        assert_eq!(effective(channel, "demo").0.adversary, AdversaryMode::Off);
+        let notice = rollback_notice(channel, "demo").unwrap();
+        assert!(notice.contains("adversary policy"), "{notice}");
+        assert!(ask_rollback(&route, &josh).unwrap());
+        assert!(!ask_rollback(&route, &josh).unwrap());
+        assert_eq!(
+            crate::questions::list(&route)
+                .iter()
+                .filter(|(q, _)| q.id.starts_with("adversary-policy-rollback-"))
+                .count(),
+            1
+        );
+
+        // Deleted: the same. Removing the file does not turn the check back on or off.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(effective(channel, "demo").0.adversary, AdversaryMode::Off);
+        assert!(rollback_notice(channel, "demo").is_some());
+
+        // Signing again, as the master, supersedes it with a newer sequence.
+        assert!(set_policy(channel, "demo", Some(off.clone()), &josh).unwrap());
+        assert_eq!(adversary_setting(channel, "demo").unwrap().seq, 3);
+        assert!(rollback_notice(channel, "demo").is_none());
+        // Putting the engine policy back to auto leaves the adversary's terms alone.
+        set_policy(channel, "demo", None, &josh).unwrap();
+        assert_eq!(effective(channel, "demo").0.adversary, AdversaryMode::Off);
     }
 
     fn as_delegate_auto(channel: &Path, bridge: &AgentIdentity) -> Result<bool> {
@@ -4929,12 +5525,20 @@ mod tests {
         assert_eq!(read.adversary, AdversaryMode::Blocking);
         assert!(set.unwrap().signature_v2.is_some());
 
-        // The file says so: the v1 view in `policy`, the whole of it in `policy_v2`.
+        // The file says so: the v1 view in `policy`, the whole of it in `policy_v2` - which
+        // has nothing about the adversary, that being the master's own file.
         let wire: serde_json::Value =
             serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).unwrap()).unwrap();
         assert!(wire["policy"].get("adversary").is_none(), "{wire}");
-        assert_eq!(wire["policy_v2"]["adversary"], "blocking", "{wire}");
+        assert!(wire["policy_v2"].get("adversary").is_none(), "{wire}");
+        assert!(wire["policy_v2"]["prefer"].get("adversary").is_none());
+        assert!(wire["policy_v2"]["caps_usd"].get("adversary").is_none());
         assert_eq!(wire["seq"], 1);
+        let adversary: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.join(ADVERSARY_POLICY)).unwrap())
+                .unwrap();
+        assert_eq!(adversary["terms"]["mode"], "blocking", "{adversary}");
+        assert_eq!(adversary["terms"]["cap_usd"], 2.0, "{adversary}");
 
         // A policy of only what v0.5.17 knew is the file v0.5.17 wrote, plus two lines.
         let plain = Policy {

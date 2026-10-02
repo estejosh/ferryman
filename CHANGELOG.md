@@ -102,6 +102,20 @@
   A finding now carries a signed `result_digest` (a hash of the result's order, revision
   and signature); a contract-lock or pre-done finding counts only when it names the result
   that is at that revision now. Rounds are for display and file names only.
+- **The adversary's policy is the master's alone.** Its mode, engine preferences, `never`,
+  allowed agents and weekly cap used to live in `ENGINE_POLICY`, which a delegate holding
+  `improve` can sign - so the one who could be checked could switch the check off, name
+  its judge, starve it with a `never`, `where` or a $0 cap, or have its findings ignored.
+  They are now a separate `ADVERSARY_POLICY` file honoured only under the master's own
+  signature (no delegation), with the same `seq`, per-machine high-water mark and
+  last-known-good protection as the engine policy and its own rollback question. An
+  `ENGINE_POLICY` file's adversary fields are dropped on reading, the engine policy's
+  `never`, `where` and caps no longer apply to the adversary, and the review pass runs the
+  adversary before the `where` check. `ferry engines policy set` gains
+  `--adversary-agents` and `--adversary-never` (they, `--adversary` and `--role adversary`
+  write the master's file); the dashboard shows the terms to everyone and changes them
+  only for the master; Telegram shows them and never signs them. Putting the engine policy
+  back to auto leaves the adversary's policy as signed.
 
 ## v0.5.17 - 2026-09-29
 

@@ -2002,6 +2002,7 @@ async fn engine_policy_get(
     let route = state.route_for(params.project.as_deref());
     let channel = &route.communications;
     let (current, setting) = policy::effective(channel, &route.project_id);
+    let adversary = policy::adversary_setting(channel, &route.project_id);
     let now = chrono::Utc::now();
     let fleet = policy::fleet(&route, now);
     let recommended = policy::recommend_for(&route, now);
@@ -2032,6 +2033,18 @@ async fn engine_policy_get(
         // What the adversary's findings do here: off, advisory or blocking. The policy's
         // own JSON leaves it out while it is the default.
         "adversary_mode": current.adversary.as_str(),
+        // The adversary's terms are their own file, signed by the master alone: shown to
+        // everyone, changed only by the master (`may_set`).
+        "adversary": {
+            "set_by": adversary.as_ref().map(|s| s.signed_by.clone()),
+            "set_at": adversary.as_ref().map(|s| s.set_at),
+            "mode": current.adversary.as_str(),
+            "prefer": current.preferences(policy::Role::Adversary),
+            "agents": current.adversary_agents,
+            "never": current.adversary_never,
+            "cap_usd": current.cap(policy::Role::Adversary),
+            "master_only": true,
+        },
         "may_set": may_set,
     })))
 }
@@ -5723,6 +5736,16 @@ mod tests {
         assert!(before["recommended"]["reasons"].is_array(), "{before}");
         let refused = post(&app, "/api/engine-policy/accept", "{}", Some(&token)).await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+        // The adversary's terms are the master's own signature: not anyone's else's.
+        let adversary_terms = r#"{"policy":{"adversary":"blocking","adversary_agents":["wisp"],"adversary_never":["claude"]}}"#;
+        let refused = post(&app, "/api/engine-policy", adversary_terms, Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+        assert!(
+            ferryman_channel::policy::adversary_setting(&route.communications, &route.project_id)
+                .is_none()
+        );
+        assert_eq!(before["adversary"]["master_only"], true, "{before}");
+        assert_eq!(before["adversary"]["set_by"], Value::Null);
 
         let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
         assert_eq!(claimed.status(), StatusCode::OK);
@@ -5746,6 +5769,17 @@ mod tests {
             policy.preferences(ferryman_channel::policy::Role::Build),
             ["nemotron", "deepseek"]
         );
+        let signed = post(&app, "/api/engine-policy", adversary_terms, Some(&token)).await;
+        assert_eq!(signed.status(), StatusCode::OK);
+        let view = get_json(&app, "/api/engine-policy", Some(&token)).await;
+        assert_eq!(view["adversary"]["set_by"], "alice", "{view}");
+        assert_eq!(view["adversary"]["mode"], "blocking");
+        assert_eq!(view["adversary"]["agents"][0], "wisp");
+        assert_eq!(view["adversary"]["never"][0], "claude");
+        let on_disk =
+            ferryman_channel::policy::adversary_setting(&route.communications, &route.project_id)
+                .unwrap();
+        assert_eq!(on_disk.signed_by, "alice");
         let nonsense = post(
             &app,
             "/api/engine-policy",
@@ -5765,6 +5799,10 @@ mod tests {
         assert_eq!(cleared.status(), StatusCode::OK);
         let back = get_json(&app, "/api/engine-policy", Some(&token)).await;
         assert_eq!(back["auto"], true, "{back}");
+        assert_eq!(
+            back["adversary"]["mode"], "blocking",
+            "going back to auto leaves the adversary's own policy: {back}"
+        );
     }
 
     /// The team preset from the browser: proposed with reasons to anyone signed in,

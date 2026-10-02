@@ -2278,7 +2278,8 @@ mod tests {
         );
         awaiting(&route, "t-1", "deepseek");
         let mut policy = policy_of(&route);
-        policy.never.push("name:qwen".into());
+        // The adversary's own `never`: the engine policy's does not reach it.
+        policy.adversary_never.push("name:qwen".into());
         let outcome = futures_lite_block(challenge(
             &route,
             &config,
@@ -3068,6 +3069,44 @@ mod tests {
         let policy = policy_of(&route);
         futures_lite_block(pass(&route, &config, &policy, Utc::now(), &crate::Silent));
         assert!(may_judge(&route, &policy, &task));
+    }
+
+    #[test]
+    fn the_engine_policys_where_list_does_not_keep_the_adversary_off_the_work() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine("qwen", "qwen-max", &says("block", HIGH))],
+        );
+        // The engine policy runs this project's work on another machine only. The
+        // adversary is not the engine policy's to place: it still reads the work here.
+        ferryman_channel::policy::set_policy(
+            &route.communications,
+            &route.project_id,
+            Some(Policy {
+                machines: vec!["somewhere-else".into()],
+                adversary: AdversaryMode::Blocking,
+                ..Policy::default()
+            }),
+            &josh(),
+        )
+        .unwrap();
+        let task = awaiting(&route, "t-n2-1", "deepseek");
+        let policy = policy_of(&route);
+        assert!(!may_judge(&route, &policy, &task), "not read yet");
+        let done = futures_lite_block(crate::improve::review(
+            &route,
+            &config,
+            Utc::now(),
+            &crate::Silent,
+        ))
+        .unwrap();
+        assert_eq!(
+            done, 1,
+            "the adversary challenged it before `where` stopped the judge"
+        );
+        assert!(data::read(&route, "t-n2-1", 1, Trigger::PreDone, "wisp").is_some());
     }
 
     // --- moment 1: before a contract locks -----------------------------------------------------

@@ -555,8 +555,9 @@ copy of every step:
    dashboard's review card, the Telegram review card.
 
 It answers with a verdict - `pass`, `concern` or `block` - and findings, each with a
-severity. Output that cannot be parsed is a `concern` carrying the raw tail, never a
-silent pass. Each finding is a signed file in `<channel>/adversary/` (one per subject,
+severity. Only a reply that ends with one fenced `json` block holding a `verdict` and a
+`findings` list is read; anything else records nothing (it is not a finding, so it cannot
+satisfy `blocking`) and the next allowed engine is asked. Each finding is a signed file in `<channel>/adversary/` (one per subject,
 revision and moment, so asking again changes nothing), and the engine, model, machine and
 cost go into the ledger like any improvement step.
 
@@ -572,13 +573,26 @@ cost go into the ledger like any improvement step.
   from the phone; the other two need `review`.
 - `off`: it is never asked, and nothing about it is shown.
 
-Changing the adversary's mode, or removing the adversary role, is the master's own signed
-act: a delegate (the phone, a dashboard session acting under a delegation) cannot loosen
-it.
+**The adversary's policy is the master's alone.** Everything about the adversary -
+its mode, which engines it prefers (`--role adversary --prefer`), the engines it never
+uses (`--adversary-never`), the agents allowed to judge (`--adversary-agents`) and its
+weekly cap (`--role adversary --cap-usd`) - is its own signed file,
+`<channel>/ADVERSARY_POLICY`, and not part of `ENGINE_POLICY`. It is honoured only when the
+master signed it with their own key: there is no delegation for it, so the phone, a
+dashboard session acting under a delegation, or anyone else who holds `improve` can
+neither loosen it nor take its judges or its budget away. Like the engine policy it
+carries a sequence number and every machine remembers the highest it has seen and the last
+good one, so putting an older copy back, or deleting the file, changes nothing and asks
+the master once. The engine policy's `never`, `where` and caps do not apply to the
+adversary, and anything an `ENGINE_POLICY` file says about it is ignored. The dashboard
+shows the adversary's terms to everyone and changes them only for the master; Telegram
+shows them and never changes them (accepting a preset there leaves them as they are).
+Putting the engine policy back to auto leaves the adversary's policy as signed. A machine
+still on v0.5.17 does not know the file and never runs the adversary.
 
 **Whose finding counts.** A finding is only heard when its signer did not build the work
 it judges, published a valid signed engine inventory that lists the engine the finding
-names, and is on a machine the policy's `machines` list allows. A finding is one signed
+names. A finding is one signed
 file per signer (`adversary/<subject>-r<revision>-<moment>.<signer>.json`, and the file
 name must name the signer), so nobody can pre-empt or overwrite another adversary's word;
 several adversaries add up, and a Block from any of them stands. A finding that does not
@@ -594,9 +608,9 @@ shows the contract's digest and asks you to confirm at a terminal (or take
 with `--override`); the dashboard sends the digests `/api/contracts` gave; Telegram's
 buttons carry them. A mismatch is refused with "the contract changed since you looked".
 
-**Who challenges.** The adversary is a role in the engine policy and follows the same
-rules as background work: blocked engines and machines are skipped and paid engines need
-a cap. It is never the engine that built the work unless that is the only one allowed -
+**Who challenges.** The adversary ranks engines by the same rules as background work -
+subscriptions protected, paid engines need a cap - but under its own `never` and its own
+cap, and with no `where` list. It is never the engine that built the work unless that is the only one allowed -
 then it runs and the finding says `same engine`. Among the rest, a different model family
 (deepseek, qwen, llama, gemma, claude, gpt...) is preferred over the builder's own.
 `recommend()` picks one for you with a one-line reason.

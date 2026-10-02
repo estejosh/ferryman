@@ -33,7 +33,9 @@
 //!   (for a contract, any provider order's result agent);
 //! - its signer published a valid signed engine inventory that lists the engine the
 //!   finding names, so the engine named is one a machine of the fleet really has;
-//! - the engine policy's `where` list, when it has one, allows the signer's machine;
+//! - nothing in the engine policy decides it: its `where`, `never` and caps do not apply to
+//!   the adversary (see [`crate::policy::ADVERSARY_POLICY`]), because a delegate can sign
+//!   the engine policy and must not be able to starve the check on its own work;
 //! - its revision is a real one: an order's existing result, a contract's existing provider
 //!   result - or 0, "the shapes on their own", while no provider has a result.
 //!
@@ -641,6 +643,29 @@ impl Ignored {
     }
 }
 
+/// What is being weighed: one signer's word about one revision of one subject.
+#[derive(Clone, Copy)]
+struct Word<'a> {
+    subject: &'a str,
+    signer: &'a str,
+    /// The engine it names, when it is known.
+    engine: Option<&'a str>,
+    revision: u32,
+    trigger: Trigger,
+    verdict: Verdict,
+    /// The result it says it judged, when that is being held to account.
+    digest: Option<&'a str>,
+}
+
+/// One verified provider result of a contract, before its round is numbered.
+struct Round {
+    at: DateTime<Utc>,
+    order: String,
+    revision: u32,
+    who: Vec<String>,
+    digest: String,
+}
+
 /// One verified result of a subject, as one of the people who built it.
 #[derive(Debug, Clone)]
 struct Built {
@@ -650,15 +675,13 @@ struct Built {
 }
 
 /// What decides whether a finding counts, for one subject: who built it, which revisions
-/// exist, what the fleet's signed inventories say each machine can run, and the policy's
-/// `where`.
+/// exist, and what the fleet's signed inventories say each machine can run.
 struct Facts {
     contract: bool,
     /// The revisions of verified results, with who built each (the agent a result names
     /// and the key that signed it) and the digest of the result itself.
     results: Vec<Built>,
     inventories: Vec<crate::receipts::EngineInventory>,
-    policy: Policy,
 }
 
 impl Facts {
@@ -670,26 +693,24 @@ impl Facts {
             .filter(|(_, check)| *check == SignatureCheck::Valid)
             .map(|(inventory, _)| inventory)
             .collect();
-        let (policy, _) = crate::policy::effective(&route.communications, &route.project_id);
         Self {
             contract,
             results,
             inventories,
-            policy,
         }
     }
 
     /// Why `signer`'s word on this revision does not count, or `Ok`.
-    fn check(
-        &self,
-        subject: &str,
-        signer: &str,
-        engine: Option<&str>,
-        revision: u32,
-        trigger: Trigger,
-        verdict: Verdict,
-        digest: Option<&str>,
-    ) -> std::result::Result<(), String> {
+    fn check(&self, word: Word<'_>) -> std::result::Result<(), String> {
+        let Word {
+            subject,
+            signer,
+            engine,
+            revision,
+            trigger,
+            verdict,
+            digest,
+        } = word;
         let real = self.results.iter().any(|built| built.revision == revision)
             || (self.contract && revision == 0 && self.results.is_empty());
         if !real {
@@ -750,25 +771,21 @@ impl Facts {
                 "{signer}'s signed engine inventory does not list {engine}"
             ));
         }
-        if !self.policy.allows_machine(signer, &inventory.machine) {
-            return Err(format!(
-                "{signer} on {} is not where the engine policy runs this project's work",
-                inventory.machine
-            ));
-        }
+        // The engine policy's `where` does not apply here: it is the delegate-signable half
+        // of the policy, and the adversary's own allowlist is the master's alone.
         Ok(())
     }
 
     fn check_finding(&self, finding: &AdversaryFinding) -> std::result::Result<(), String> {
-        self.check(
-            &finding.subject,
-            &finding.signed_by,
-            Some(&finding.engine),
-            finding.revision,
-            finding.trigger,
-            finding.verdict,
-            Some(&finding.result_digest),
-        )
+        self.check(Word {
+            subject: &finding.subject,
+            signer: &finding.signed_by,
+            engine: Some(&finding.engine),
+            revision: finding.revision,
+            trigger: finding.trigger,
+            verdict: finding.verdict,
+            digest: Some(&finding.result_digest),
+        })
     }
 }
 
@@ -808,7 +825,7 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<Built>) {
             // A contract's revisions are rounds: its verified provider results across every
             // provider order, numbered 1.. in submission order (the same numbering
             // `contract_context` uses), so two providers' revision 1s are two rounds.
-            let mut verified: Vec<(DateTime<Utc>, String, u32, Vec<String>, String)> = Vec::new();
+            let mut verified: Vec<Round> = Vec::new();
             for order in &providers {
                 let Ok(task) = crate::read_task(route, &order.id) else {
                     continue;
@@ -823,21 +840,23 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<Built>) {
                     {
                         who.push(signer.clone());
                     }
-                    verified.push((
-                        result.submitted_at,
-                        order.id.clone(),
-                        result.revision,
+                    verified.push(Round {
+                        at: result.submitted_at,
+                        order: order.id.clone(),
+                        revision: result.revision,
                         who,
-                        result_digest(result),
-                    ));
+                        digest: result_digest(result),
+                    });
                 }
             }
-            verified.sort_by(|x, y| (x.0, &x.1, x.2).cmp(&(y.0, &y.1, y.2)));
+            verified
+                .sort_by(|x, y| (x.at, &x.order, x.revision).cmp(&(y.at, &y.order, y.revision)));
             let results = verified
                 .into_iter()
                 .zip(1_u32..)
-                .flat_map(|((_, _, _, who, digest), round)| {
-                    who.into_iter().map(move |w| Built {
+                .flat_map(|(one, round)| {
+                    let digest = one.digest;
+                    one.who.into_iter().map(move |w| Built {
                         revision: round,
                         who: w,
                         digest: digest.clone(),
@@ -857,7 +876,7 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<Built>) {
 
 /// Whether `signer`, asked to challenge `subject` at `revision` for `trigger` with `engine`
 /// (when it is known), would be heard: it did not build the work, its signed inventory
-/// lists the engine, the policy's `where` allows its machine, and the revision is real.
+/// lists the engine, and the revision is real.
 /// Asked before any engine is paid for, so no money goes on a finding that would be ignored.
 pub fn eligibility(
     route: &ProjectRoute,
@@ -867,15 +886,15 @@ pub fn eligibility(
     signer: &str,
     engine: Option<&str>,
 ) -> std::result::Result<(), String> {
-    Facts::load(route, subject).check(
+    Facts::load(route, subject).check(Word {
         subject,
         signer,
         engine,
         revision,
         trigger,
-        Verdict::Pass,
-        None,
-    )
+        verdict: Verdict::Pass,
+        digest: None,
+    })
 }
 
 // --- what the findings add up to -------------------------------------------------------------
@@ -2503,12 +2522,16 @@ mod tests {
     }
 
     #[test]
-    fn the_policys_where_list_rules_out_a_signer_on_another_machine() {
+    fn the_engine_policys_where_list_cannot_rule_out_an_adversary() {
         let f = Fleet::new();
         f.work("t-1", 1);
         let mut allowed = policy(AdversaryMode::Blocking);
         allowed.machines = vec!["beastly".into()];
+        allowed.never = vec!["name:deepseek".into()];
         crate::policy::set_policy(&f.route.communications, "demo", Some(allowed), &f.boss).unwrap();
+        // wisp runs on grouchly, which `where` leaves out, on an engine `never` names:
+        // neither is the adversary's to obey - the engine policy is the part a delegate
+        // can sign.
         record(
             &f.route,
             &f.wisp,
@@ -2516,22 +2539,7 @@ mod tests {
         )
         .unwrap();
         let survey = survey(&f.route, "t-1");
-        assert!(survey.standings.is_empty(), "wisp runs on grouchly");
-        assert!(
-            survey.ignored[0]
-                .reason
-                .contains("is not where the engine policy runs"),
-            "{:?}",
-            survey.ignored
-        );
-        // bridge is on beastly.
-        record(
-            &f.route,
-            &f.bridge,
-            finding("t-1", 1, Trigger::PreDone, Verdict::Pass),
-        )
-        .unwrap();
-        assert_eq!(self::survey(&f.route, "t-1").standings.len(), 1);
+        assert_eq!(survey.standings.len(), 1, "{:?}", survey.ignored);
     }
 
     #[test]

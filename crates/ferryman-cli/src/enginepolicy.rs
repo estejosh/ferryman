@@ -18,6 +18,9 @@ use super::{
     ImproveProject, improve_project, mastered_signer, mastered_targets, signing_identity_in,
 };
 
+/// One command line is parsed once; the variants differ in size only because `set` has a
+/// flag for each part of the policy.
+#[allow(clippy::large_enum_variant)]
 #[derive(clap::Subcommand, Clone)]
 pub(crate) enum PolicyCommand {
     /// The policy in force for a project, who signed it, and how it falls on the fleet
@@ -127,8 +130,22 @@ pub(crate) enum PolicyCommand {
         /// `--role adversary --prefer <engine>`.
         ///
         ///   ferry engines policy set --role adversary --prefer deepseek --adversary blocking
+        ///
+        /// The adversary's terms - this, `--role adversary --prefer`, `--role adversary
+        /// --cap-usd`, `--adversary-agents` and `--adversary-never` - are the master's
+        /// alone: they are signed into their own file (ADVERSARY_POLICY) and need the
+        /// master's own key, never a delegate's.
         #[arg(long, value_name = "off|advisory|blocking", value_parser = policy::AdversaryMode::parse)]
         adversary: Option<policy::AdversaryMode>,
+        /// The agents whose word counts as an adversary's; repeat. Replaces the list;
+        /// `any` clears it. With none named, any member whose signed engine inventory
+        /// lists an engine the adversary may use counts.
+        #[arg(long = "adversary-agents", value_name = "AGENT")]
+        adversary_agents: Vec<String>,
+        /// Selectors the adversary never uses; repeat. Replaces the list; `none` clears
+        /// it. The engine policy's `--never` does not apply to the adversary.
+        #[arg(long = "adversary-never", value_name = "SELECTOR")]
+        adversary_never: Vec<String>,
         /// How hard a role thinks: `build=medium`, `plan=high`, `chore=low`; repeat. The
         /// engine's `{effort}` argument, `effort_args` or reasoning field gets it.
         #[arg(long, value_name = "ROLE=LEVEL")]
@@ -447,6 +464,8 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             never_applies_to,
             auto_merge,
             adversary,
+            adversary_agents,
+            adversary_never,
             effort,
             width,
             allow_subscriptions_for,
@@ -483,6 +502,8 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 && scope.is_none()
                 && auto_merge.is_none()
                 && adversary.is_none()
+                && adversary_agents.is_empty()
+                && adversary_never.is_empty()
                 && efforts.is_empty()
                 && widths.is_empty()
                 && subscription_roles.is_none()
@@ -490,7 +511,8 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 bail!(
                     "nothing to set: name --improve, --review, --prefer, --never, --where, \
                      --cap-usd, --protect-subscriptions, --never-applies-to, --auto-merge, \
-                     --adversary, --effort, --width or --allow-subscriptions-for"
+                     --adversary, --adversary-agents, --adversary-never, --effort, --width or \
+                     --allow-subscriptions-for"
                 );
             }
             sign_each(&which, "set", |_, _, mut current| {
@@ -532,6 +554,26 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 if let Some(mode) = adversary {
                     current.adversary = mode;
                 }
+                if !adversary_agents.is_empty() {
+                    current.adversary_agents = if adversary_agents
+                        .iter()
+                        .any(|a| a.eq_ignore_ascii_case("any"))
+                    {
+                        Vec::new()
+                    } else {
+                        adversary_agents.clone()
+                    };
+                }
+                if !adversary_never.is_empty() {
+                    current.adversary_never = if adversary_never
+                        .iter()
+                        .any(|a| a.eq_ignore_ascii_case("none"))
+                    {
+                        Vec::new()
+                    } else {
+                        adversary_never.clone()
+                    };
+                }
                 current.effort.extend(efforts.clone());
                 for (role, width) in &widths {
                     match width {
@@ -546,6 +588,7 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             })
         }
         PolicyCommand::Clear { which } => {
+            // The adversary's terms are their own file and stay as signed.
             sign_each(&which, "cleared - back to auto", |_, _, _| Ok(None))
         }
     }
@@ -583,9 +626,9 @@ fn sign_each(
             Err(error) => return Err(error),
         };
         me.get_or_insert(master.clone());
-        let current = policy::setting(&channel, &project)
-            .and_then(|setting| setting.policy)
-            .unwrap_or_default();
+        // The policy in force as a whole - the engine policy with the master's adversary
+        // terms laid over it - so a change to one part does not reset the other.
+        let current = policy::effective(&channel, &project).0;
         let next = change(&project, &channel, current)?;
         match policy::set_policy(&channel, &project, next, &identity) {
             Ok(true) => {
@@ -608,6 +651,7 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
     let mut out: Vec<Value> = Vec::new();
     for (project, channel, _) in all_or_one(which)? {
         let (policy, setting) = policy::effective(&channel, &project);
+        let adversary = policy::adversary_setting(&channel, &project);
         let engines = fleet(&channel);
         if as_json {
             out.push(json!({
@@ -615,6 +659,8 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
                 "auto": setting.as_ref().is_none_or(|s| s.policy.is_none()),
                 "set_by": setting.as_ref().map(policy::PolicySetting::set_by),
                 "set_at": setting.as_ref().map(|s| s.set_at),
+                "adversary_set_by": adversary.as_ref().map(|s| s.signed_by.clone()),
+                "adversary_set_at": adversary.as_ref().map(|s| s.set_at),
                 "policy": policy,
                 "effective": policy::view(&policy, &engines),
                 "warnings": policy::subscription_warnings(&policy, &engines),
@@ -625,6 +671,7 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
         for line in policy.describe() {
             println!("  {line}");
         }
+        println!("  {}", adversary_source(adversary.as_ref()));
         if engines.is_empty() {
             println!("  no worker has published its engines here yet");
         } else {
@@ -657,6 +704,19 @@ pub(crate) fn source(setting: Option<&policy::PolicySetting>) -> String {
         ),
         Some(setting) => format!("auto, chosen by {}", setting.set_by()),
         None => "auto (no policy signed; subscriptions protected)".to_string(),
+    }
+}
+
+/// Who set the adversary's terms, as a person reads it.
+pub(crate) fn adversary_source(setting: Option<&policy::AdversarySetting>) -> String {
+    match setting {
+        Some(setting) => format!(
+            "adversary policy signed by {} (the master only), {} UTC",
+            setting.signed_by,
+            setting.set_at.format("%Y-%m-%d %H:%M")
+        ),
+        None => "adversary policy: none signed - advisory, auto choice, no allowlist, no cap"
+            .to_string(),
     }
 }
 
@@ -752,10 +812,16 @@ pub(crate) fn offer(signed: &[(String, PathBuf, ferryman_channel::AgentIdentity)
         return;
     }
     for (project, channel, identity) in without {
+        // Laid over what is in force, so signing engine preferences keeps the adversary's
+        // mode, allowlist and cap the master already signed.
+        let in_force = policy::effective(channel, project).0;
         match policy::set_policy(
             channel,
             project,
-            Some(recommendation(channel).policy),
+            Some(policy::apply_recommendation(
+                &in_force,
+                &recommendation(channel).policy,
+            )),
             identity,
         ) {
             Ok(_) => println!("  {project}: engine policy accepted"),

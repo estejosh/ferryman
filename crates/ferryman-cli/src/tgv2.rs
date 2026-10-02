@@ -757,6 +757,11 @@ impl Bridge {
             }
         )];
         lines.extend(current.describe());
+        lines.push(
+            "The adversary's terms (mode, engine, agents, cap) are the master's own signature: \
+             here they are shown, not changed - use `ferry engines policy set` or the dashboard."
+                .to_string(),
+        );
         lines.extend(policy::summary(&current, &fleet));
         let shown = |selector: Option<&str>| {
             selector
@@ -890,7 +895,10 @@ impl Bridge {
         // What accepting signs is the preset laid over the policy in force: the master's
         // `never`, caps, auto-merge, adversary mode and `where` are theirs to change, not
         // the preset's.
-        proposal.policy = policy::apply_team(&current, &proposal.policy);
+        // The adversary's terms are the master's own signature, so the phone shows and signs
+        // the preset with the adversary part as it is.
+        proposal.policy =
+            policy::apply_team(&current, &proposal.policy).keeping_adversary_of(&current);
         let warnings = policy::subscription_warnings(&proposal.policy, &policy::fleet(route, now));
         Ok((proposal, warnings))
     }
@@ -933,9 +941,12 @@ impl Bridge {
         let principal = self.principal(route)?;
         let (current, _) = policy::effective(&route.communications, &route.project_id);
         let recommended = policy::recommend_for(route, Utc::now()).policy;
-        let Some(next) = change(current, recommended) else {
+        let Some(next) = change(current.clone(), recommended) else {
             return Ok(false);
         };
+        // The bridge signs as a delegate, and a delegate never signs the adversary's terms:
+        // whatever the change carries, they stay as the master left them.
+        let next = next.keeping_adversary_of(&current);
         policy::set_policy_as(
             &route.communications,
             &route.project_id,
@@ -3333,7 +3344,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (mut bridge, ferryman, _) = bridge(dir.path());
         three_engines(&ferryman);
-        let mine = policy::Policy {
+        let mut mine = policy::Policy {
             never: vec!["name:claude".into()],
             caps_usd: std::collections::BTreeMap::from([("build".to_string(), 5.0)]),
             auto_merge: policy::AutoMerge::LowRisk,
@@ -3341,6 +3352,8 @@ mod tests {
             protect_subscriptions: true,
             ..policy::Policy::default()
         };
+        mine.set_adversary_engine("name:deepseek");
+        mine.adversary_agents = vec!["wisp".into()];
         policy::set_policy(
             &ferryman.communications,
             "ferryman",
@@ -3372,6 +3385,14 @@ mod tests {
         assert_eq!(set.caps_usd, mine.caps_usd);
         assert_eq!(set.auto_merge, policy::AutoMerge::LowRisk);
         assert_eq!(set.adversary, policy::AdversaryMode::Blocking);
+        // The adversary's terms are the master's own signature: the phone's delegation does
+        // not carry them, so the preset's adversary choice is not applied from here and the
+        // file is still the master's.
+        assert_eq!(set.adversary_engine(), Some("name:deepseek"));
+        assert_eq!(set.adversary_agents, ["wisp"]);
+        let adversary = policy::adversary_setting(&ferryman.communications, "ferryman").unwrap();
+        assert_eq!(adversary.signed_by, "josh");
+        assert_eq!(adversary.seq, 1, "never re-signed from the phone");
     }
 
     /// Held work's question arrives with buttons; "Accept recommended" answers it and

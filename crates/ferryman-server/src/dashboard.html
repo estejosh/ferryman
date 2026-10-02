@@ -1102,6 +1102,21 @@ function adversaryText(x) {
     issues.map((i) => `<div class="m"><b>[${esc(i.severity)}]</b> ${esc(i.title)}${i.location ? ` (${esc(i.location)})` : ""}: ${esc(i.detail)}</div>`).join("") +
     `</div>`;
 }
+/* The adversary's terms live in their own file, signed by the master alone: everyone sees
+   them here, only the master changes them. */
+function adversaryTerms(ep) {
+  const a = ep.adversary || {};
+  const who = a.set_by
+    ? `signed by ${esc(a.set_by)}, ${esc(String(a.set_at || "").slice(0, 16).replace("T", " "))} UTC`
+    : "none signed &mdash; advisory, automatic choice, no allowlist, no cap";
+  const judges = (a.agents || []).length
+    ? esc(a.agents.join(", ")) + " only"
+    : "any member whose signed inventory lists an engine the adversary may use";
+  return `Adversary policy: ${who}. Judges: ${judges}.` +
+    ((a.never || []).length ? ` Never: ${esc(a.never.join(", "))}.` : "") +
+    (a.cap_usd !== null && a.cap_usd !== undefined ? ` Cap: $${Number(a.cap_usd).toFixed(2)} a week.` : "") +
+    ` Only the master signs it${ep.may_set ? "" : " &mdash; you can read it here, not change it"}.`;
+}
 function policyPanel(ep) {
   lastPolicy = ep.policy || {};
   const when = (at) => esc(String(at || "").slice(0, 16).replace("T", " "));
@@ -1143,6 +1158,7 @@ function policyPanel(ep) {
           ${ep.may_set ? `<button class="btn primary" id="ep-choose">Save</button><button class="btn" id="ep-use-rec">Use recommended</button>
           <label style="display:inline-flex;gap:6px;align-items:center"><input type="checkbox" id="ep-all" /> for all my projects</label>` : ""}
         </div>
+        <div class="s" style="margin-top:6px" id="ep-adversary-terms">${adversaryTerms(ep)}</div>
         <div class="s" style="margin-top:6px"><span class="badge good">Recommended</span> improve: ${nameOf(recd.improve)} &middot; review: ${nameOf(recd.review)} &middot; adversary: ${nameOf(recd.adversary)}.
           Every improvement needs the review engine's verdict and then yours before it can go live. The adversary is a different engine that challenges work before a contract locks, when an order fails twice, and before an improvement is called done.</div>
         <label class="s" style="display:inline-flex;gap:6px;align-items:center;margin-top:8px"><input type="checkbox" id="ep-automerge" ${p.auto_merge === "low-risk" ? "checked" : ""} ${ep.may_set ? "" : "disabled"} /> Auto-merge docs/tests/deps after both approvals</label>
@@ -1415,6 +1431,11 @@ function wirePolicy() {
     // Signing this edit must not quietly undo the adversary's own choices.
     if ((lastPolicy.prefer || {}).adversary) policy.prefer.adversary = lastPolicy.prefer.adversary;
     if (lastPolicy.adversary) policy.adversary = lastPolicy.adversary;
+    if (lastPolicy.adversary_never) policy.adversary_never = lastPolicy.adversary_never;
+    if (lastPolicy.adversary_agents) policy.adversary_agents = lastPolicy.adversary_agents;
+    if ((lastPolicy.caps_usd || {}).adversary !== undefined) {
+      policy.caps_usd = Object.assign({}, policy.caps_usd, { adversary: lastPolicy.caps_usd.adversary });
+    }
     if (lastPolicy.auto_merge) policy.auto_merge = lastPolicy.auto_merge;
     try {
       const r = await api("/api/engine-policy", {
