@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Typed result schemas.** `--result-schema <file.json>` gives an order a shape its result
+  must have: `type` (string, number, integer, boolean, array, object, null, any),
+  `required`, `properties`, `items` and `enum`, nested. Violations are path-qualified
+  (`result.user.id: expected integer, got string`) and go through the existing contract
+  violation path, so they block acceptance. Orders without a schema are unchanged.
+- **Interface contracts.** A signed `contracts/<name>@<version>.json` that any member can
+  propose and the master (or an `improve` delegate) locks with a separate signature.
+  A locked contract never changes - a change is a new version - and a forged, unsigned or
+  edited-after-lock file is ignored. Orders say `--interface name@version:provides|consumes`;
+  a worker will not start one whose contract is missing or not locked and records why
+  ("waiting for contract user-api@1 to be locked"). Consumers get the locked shapes in
+  their engine prompt; a provider's result is validated against the locked response. The
+  master is asked once, however often it is proposed, with Lock / Reject buttons in
+  Telegram. `ferry contract propose | lock | reject | show | list`; a Contracts page on the
+  dashboard with status, shapes, the orders on each side and a Lock button for the master.
+  `interface::pending_locks` and `interface::orders_for_interface` expose what is waiting
+  to be locked, and which orders depend on it, to a reviewer.
+- **File-overlap locks.** `--touches <glob>...` and `--allow-overlap` on an order.
+  Issuing warns about overlapping open or claimed orders, the dashboard marks them, and a
+  worker will not claim an order that overlaps one currently claimed unless
+  `--allow-overlap`, recording why and moving on. After the commit the result records
+  `touched_files`, with a reviewer note (not a refutation) for any outside the declared
+  globs.
+
 ## v0.5.17 - 2026-09-29
 
 You choose which model does self-improve and on which machine, fm recommends one that spares your subscriptions, and nothing goes live without both an engine review and your approval. OmniRoute works as an engine.
