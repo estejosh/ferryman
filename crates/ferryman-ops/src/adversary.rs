@@ -18,9 +18,10 @@
 //!
 //! Three questions, each with the facts a model would otherwise have to guess - see
 //! [`contract_prompt`], [`repeat_prompt`] and [`pre_done_prompt`] - and each ends with the
-//! same demand: a final fenced JSON block. A reply that does not carry one is a
-//! [`Verdict::Concern`] with what was said as its detail, never a silent pass
-//! ([`parse_reply`]).
+//! same demand: a final fenced JSON block. Only a block at the very end of the reply counts
+//! ([`parse_reply`]); a reply without one is not recorded at all - it is a failure the next
+//! pass tries again - because a Concern written for it would be a signed finding the
+//! adversary never made, and would satisfy `blocking` mode for work it never judged.
 //!
 //! # What does not need asking
 //!
@@ -102,61 +103,6 @@ fn tail(text: &str, limit: usize) -> String {
 pub struct Reply {
     pub verdict: Verdict,
     pub issues: Vec<Issue>,
-    /// `false` when the reply carried no readable verdict, and `verdict` is the Concern
-    /// that stands in for it.
-    pub readable: bool,
-}
-
-/// Every top-level `{...}` in `text`, string-aware, in order.
-fn balanced_objects(text: &str) -> Vec<&str> {
-    let mut found = Vec::new();
-    let (mut depth, mut start, mut in_string, mut escaped) = (0usize, 0usize, false, false);
-    for (index, c) in text.char_indices() {
-        if in_string {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' if depth > 0 => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = index;
-                }
-                depth += 1;
-            }
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    found.push(&text[start..=index]);
-                }
-            }
-            _ => {}
-        }
-    }
-    found
-}
-
-/// The bodies of the fenced blocks in `text`, in order.
-fn fenced_blocks(text: &str) -> Vec<&str> {
-    let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find("```") {
-        let after = &rest[open + 3..];
-        // Skip the language tag on the opening line.
-        let body_start = after.find('\n').map_or(0, |newline| newline + 1);
-        let body = &after[body_start..];
-        let Some(close) = body.find("```") else {
-            break;
-        };
-        found.push(&body[..close]);
-        rest = &body[close + 3..];
-    }
-    found
 }
 
 fn issue_from(value: &Value) -> Option<Issue> {
@@ -184,14 +130,17 @@ fn issue_from(value: &Value) -> Option<Issue> {
     })
 }
 
+/// The reply's JSON when it has the keys that were asked for: a `verdict` that is one of
+/// pass, concern or block, and a `findings` list.
 fn reply_from(value: &Value) -> Option<Reply> {
     let verdict = Verdict::parse(value.get("verdict")?.as_str()?).ok()?;
     let issues: Vec<Issue> = value
-        .get("findings")
-        .or_else(|| value.get("issues"))
-        .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(issue_from).take(12).collect())
-        .unwrap_or_default();
+        .get("findings")?
+        .as_array()?
+        .iter()
+        .filter_map(issue_from)
+        .take(12)
+        .collect();
     // A pass that lists a High finding says two things at once; the louder one stands.
     let verdict = if verdict == Verdict::Pass
         && issues.iter().any(|issue| issue.severity == Severity::High)
@@ -200,44 +149,51 @@ fn reply_from(value: &Value) -> Option<Reply> {
     } else {
         verdict
     };
-    Some(Reply {
-        verdict,
-        issues,
-        readable: true,
-    })
+    Some(Reply { verdict, issues })
 }
 
-/// Read the adversary's reply: the last fenced JSON block (or, failing that, the last
-/// JSON object) that carries a verdict. A reply that has none is a Concern holding the
-/// end of what was said - never a Pass, because "could not read it" is not "found nothing".
+/// Read the adversary's reply: the one fenced JSON block at the very end of it, with only
+/// whitespace after its closing fence, carrying a `verdict` and `findings`. `None` for
+/// anything else - an empty or garbled reply, a truncated block, a reply that ends in
+/// prose, a block without the keys.
+///
+/// Nothing earlier in the reply is looked at as a verdict. A diff or a quotation the
+/// model echoed can contain `{"verdict": "pass"}`, and "the last JSON object wins" would
+/// let it decide; only what the model signed off with counts. And an unreadable reply is
+/// not a finding at all (the caller records nothing and asks again later): a Concern
+/// written for it would be a signed, eligible word that satisfies `blocking` mode for a
+/// revision the adversary never judged.
 #[must_use]
-pub fn parse_reply(text: &str) -> Reply {
-    let mut candidates: Vec<&str> = fenced_blocks(text);
-    candidates.extend(balanced_objects(text));
-    // The last one wins: a model that thinks aloud may draft one earlier.
-    for candidate in candidates.into_iter().rev() {
-        if let Ok(value) = serde_json::from_str::<Value>(candidate.trim())
-            && let Some(reply) = reply_from(&value)
+pub fn parse_reply(text: &str) -> Option<Reply> {
+    let body = text.trim_end().strip_suffix("```")?;
+    // The closing fence is the last one; the opening fence is the nearest one before it
+    // that leaves JSON between them. (A string inside the JSON may itself hold a fence.)
+    let mut upto = body.len();
+    while let Some(open) = body[..upto].rfind("```") {
+        let inner = &body[open + 3..];
+        // The opening line is the language tag: `json`, or nothing.
+        if let Some((tag, json)) = inner.split_once('\n')
+            && matches!(tag.trim().to_ascii_lowercase().as_str(), "" | "json")
+            && let Ok(value) = serde_json::from_str::<Value>(json.trim())
         {
-            return reply;
+            return reply_from(&value);
         }
+        upto = open;
     }
-    Reply {
-        verdict: Verdict::Concern,
-        issues: vec![Issue {
-            severity: Severity::Medium,
-            title: "the adversary's reply could not be read".to_string(),
-            detail: if text.trim().is_empty() {
-                "the reply was empty".to_string()
-            } else {
-                format!(
-                    "it carried no JSON block with a verdict. The end of it: {}",
-                    tail(text, TAIL_CHARS)
-                )
-            },
-            location: None,
-        }],
-        readable: false,
+    None
+}
+
+/// Why a reply could not be read, for the warning and the failure that is reported: the
+/// end of what was said.
+fn unreadable(text: &str) -> String {
+    if text.trim().is_empty() {
+        "the reply was empty".to_string()
+    } else {
+        format!(
+            "it did not end with a fenced JSON block carrying a verdict and findings. The end \
+             of it: {}",
+            tail(text, 400)
+        )
     }
 }
 
@@ -674,6 +630,7 @@ pub async fn challenge(
         return Outcome::Held(why);
     }
     let mut tried: Vec<String> = Vec::new();
+    let mut unreadable_from: Vec<String> = Vec::new();
     loop {
         let (engine, same_engine) = match choose(config, policy, &request.built_by, &tried, now) {
             Ok(chosen) => chosen,
@@ -681,7 +638,13 @@ pub async fn challenge(
                 hold(route, config, &week, &why, report);
                 return Outcome::Held(why);
             }
-            Err(why) => {
+            Err(mut why) => {
+                if !unreadable_from.is_empty() {
+                    why = format!(
+                        "{why}; replies that could not be read and were not recorded: {}",
+                        unreadable_from.join("; ")
+                    );
+                }
                 note_step(
                     route,
                     config,
@@ -731,7 +694,18 @@ pub async fn challenge(
                 continue;
             }
         };
-        let reply = parse_reply(&answer);
+        let Some(reply) = parse_reply(&answer) else {
+            // Not a finding: nothing is recorded, so nothing is signed that an eligible
+            // adversary never said. The next engine is asked, and what is left over is
+            // a failure the next pass tries again.
+            let why = unreadable(&answer);
+            report.warn(&format!(
+                "  {}: {} answered about {} but {why}; recording nothing, trying the next engine",
+                route.project_id, engine.name, request.subject
+            ));
+            unreadable_from.push(format!("{} ({why})", engine.name));
+            continue;
+        };
         let mut findings = request.known.clone();
         findings.extend(reply.issues);
         let finding = AdversaryFinding {
@@ -2080,26 +2054,75 @@ mod tests {
     // --- reading what the adversary said ------------------------------------------------
 
     #[test]
-    fn the_last_fenced_json_block_with_a_verdict_is_the_reply() {
+    fn only_the_fenced_json_block_at_the_very_end_is_the_reply() {
         let reply = parse_reply(
             "Thinking.\n```json\n{\"verdict\": \"pass\", \"findings\": []}\n```\nOn reflection:\n\
              ```json\n{\"verdict\": \"BLOCK\", \"findings\": [{\"severity\": \"High\", \
-             \"title\": \"tests deleted\", \"detail\": \"two\", \"location\": \"tests/a.rs\"}]}\n```\n",
-        );
-        assert!(reply.readable);
+             \"title\": \"tests deleted\", \"detail\": \"two\", \"location\": \"tests/a.rs\"}]}\n```\n  \n",
+        )
+        .expect("the last block, with only whitespace after it");
         assert_eq!(reply.verdict, Verdict::Block);
         assert_eq!(reply.issues.len(), 1);
         assert_eq!(reply.issues[0].severity, Severity::High);
         assert_eq!(reply.issues[0].title, "tests deleted");
         assert_eq!(reply.issues[0].location.as_deref(), Some("tests/a.rs"));
+        // A carriage return after the language tag, and a bare fence, are still a block.
+        assert!(
+            parse_reply("x\r\n```json\r\n{\"verdict\":\"pass\",\"findings\":[]}\r\n```\r\n")
+                .is_some()
+        );
+        assert!(parse_reply("```\n{\"verdict\":\"pass\",\"findings\":[]}\n```").is_some());
     }
 
     #[test]
-    fn a_bare_json_object_and_loose_field_names_are_read() {
+    fn a_reply_that_quotes_a_pass_earlier_but_ends_with_a_block_is_a_block() {
         let reply = parse_reply(
-            "{\"verdict\": \"concern\", \"issues\": [{\"summary\": \"no limit\", \"description\": \"unbounded\"}, 5]}",
+            "The diff adds this to a test: {\"verdict\": \"pass\", \"findings\": []}\n\
+             and this one too:\n```json\n{\"verdict\": \"pass\", \"findings\": []}\n```\n\
+             But that is only the fixture. My verdict:\n```json\n{\"verdict\": \"block\", \
+             \"findings\": [{\"severity\": \"high\", \"title\": \"fixture hides the failure\"}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(reply.verdict, Verdict::Block);
+        // A fence inside a string of the final block does not cut it short.
+        let reply = parse_reply(
+            "```json\n{\"verdict\": \"concern\", \"findings\": [{\"title\": \"quote\", \
+             \"detail\": \"the code has ``` in it\"}]}\n```",
+        )
+        .unwrap();
+        assert_eq!(reply.verdict, Verdict::Concern);
+        assert_eq!(reply.issues[0].detail, "the code has ``` in it");
+    }
+
+    #[test]
+    fn a_json_object_echoed_in_the_text_never_decides_when_the_reply_ends_in_prose() {
+        assert_eq!(
+            parse_reply(
+                "{\"verdict\": \"pass\", \"findings\": []}\nI looked and it seems fine to me."
+            ),
+            None
         );
-        assert!(reply.readable);
+        assert_eq!(
+            parse_reply(
+                "```json\n{\"verdict\": \"pass\", \"findings\": []}\n```\nHope that helps."
+            ),
+            None,
+            "text after the closing fence"
+        );
+        assert_eq!(
+            parse_reply("{\"verdict\": \"concern\", \"findings\": []}"),
+            None,
+            "a bare object is not a fenced block"
+        );
+    }
+
+    #[test]
+    fn issue_field_names_are_read_loosely_inside_the_block() {
+        let reply = parse_reply(
+            "```json\n{\"verdict\": \"concern\", \"findings\": [{\"summary\": \"no limit\", \
+             \"description\": \"unbounded\"}, 5]}\n```",
+        )
+        .unwrap();
         assert_eq!(reply.verdict, Verdict::Concern);
         assert_eq!(reply.issues.len(), 1, "a non-object entry is skipped");
         assert_eq!(reply.issues[0].title, "no limit");
@@ -2115,39 +2138,35 @@ mod tests {
     fn a_pass_that_lists_a_high_finding_is_a_concern() {
         let reply = parse_reply(
             "```json\n{\"verdict\": \"pass\", \"findings\": [{\"severity\": \"high\", \"title\": \"x\"}]}\n```",
-        );
+        )
+        .unwrap();
         assert_eq!(reply.verdict, Verdict::Concern);
     }
 
     #[test]
-    fn a_reply_that_cannot_be_read_is_a_concern_holding_what_was_said_never_a_pass() {
+    fn a_reply_that_cannot_be_read_is_not_a_reply() {
         for text in [
             "I looked and it seems fine to me.",
-            "```json\n{\"verdict\": \"fine\"}\n```",
+            "",
+            "   \n",
+            "```json\n{\"verdict\": \"fine\", \"findings\": []}\n```",
             "```json\n{not json at all\n```",
-            "{\"findings\": []}",
+            "```json\n{\"findings\": []}\n```",
+            "```json\n{\"verdict\": \"pass\"}\n```",
+            "```json\n{\"verdict\": \"pass\", \"findings\": \"none\"}\n```",
+            "Reading it.\n```json\n{\"verdict\": \"blo",
+            "Reading it.\n```json\n{\"verdict\": \"block\", \"findings\": []}",
+            "```json\n[{\"verdict\": \"pass\", \"findings\": []}]\n```",
         ] {
-            let reply = parse_reply(text);
-            assert!(!reply.readable, "{text}");
-            assert_eq!(reply.verdict, Verdict::Concern, "{text}");
-            assert_eq!(reply.issues.len(), 1);
-            assert!(
-                reply.issues[0].detail.contains("could not")
-                    || reply.issues[0].detail.contains("no JSON"),
-                "{:?}",
-                reply.issues[0]
-            );
+            assert_eq!(parse_reply(text), None, "{text:?}");
         }
+        assert!(unreadable("  ").contains("empty"));
         let long = format!("{}THE END OF IT", "x".repeat(5_000));
-        let reply = parse_reply(&long);
         assert!(
-            reply.issues[0].detail.contains("THE END OF IT"),
-            "the raw tail is kept"
+            unreadable(&long).contains("THE END OF IT"),
+            "the tail is kept"
         );
-        assert!(reply.issues[0].detail.len() < 2_000, "and only the tail");
-        let empty = parse_reply("  ");
-        assert_eq!(empty.verdict, Verdict::Concern);
-        assert!(empty.issues[0].detail.contains("empty"));
+        assert!(unreadable(&long).len() < 800, "and only the tail");
     }
 
     // --- choosing who asks ---------------------------------------------------------------
@@ -2438,7 +2457,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_reply_is_recorded_as_a_concern_with_the_raw_tail() {
+    fn an_unreadable_reply_is_never_recorded_so_it_cannot_clear_blocking_mode() {
         hermetic();
         let dir = tempfile::tempdir().unwrap();
         let (route, config) = fixture(
@@ -2449,24 +2468,53 @@ mod tests {
                 "fake://ok:Looks fine to me, ship it.",
             )],
         );
-        awaiting(&route, "t-1", "deepseek");
+        set_mode(&route, AdversaryMode::Blocking);
+        awaiting(&route, "t-n4-1", "deepseek");
         let outcome = futures_lite_block(challenge(
             &route,
             &config,
             &policy_of(&route),
-            simple("t-1", Trigger::PreDone),
+            simple("t-n4-1", Trigger::PreDone),
             Utc::now(),
             &crate::Silent,
         ));
-        let finding = outcome.finding().unwrap();
-        assert_eq!(finding.verdict, Verdict::Concern, "never a silent pass");
+        match outcome {
+            Outcome::Failed(why) => assert!(
+                why.contains("could not be read") && why.contains("qwen"),
+                "{why}"
+            ),
+            other => panic!("expected a failure, got {other:?}"),
+        }
         assert!(
-            finding.findings[0]
-                .detail
-                .contains("Looks fine to me, ship it."),
-            "{:?}",
-            finding.findings
+            data::list(&route).is_empty(),
+            "nothing was signed: {:?}",
+            data::list(&route)
         );
+        assert!(data::standing(&route, "t-n4-1", 1, Trigger::PreDone).is_none());
+        // So blocking mode still holds the review engine's key: no adversary has read it.
+        let why =
+            data::engine_key_refusal(&route, &policy_of(&route), "t-n4-1", 1).expect("still held");
+        assert!(why.contains("no adversary has read"), "{why}");
+        // And a reply that quotes a pass but ends with a block is the block.
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine(
+                "qwen",
+                "qwen-max",
+                "fake://ok:The test says {\"verdict\": \"pass\", \"findings\": []}.\n```json\n{\"verdict\": \"block\", \"findings\": [{\"severity\": \"high\", \"title\": \"hidden\"}]}\n```",
+            )],
+        );
+        awaiting(&route, "t-n4-2", "deepseek");
+        let outcome = futures_lite_block(challenge(
+            &route,
+            &config,
+            &policy_of(&route),
+            simple("t-n4-2", Trigger::PreDone),
+            Utc::now(),
+            &crate::Silent,
+        ));
+        assert_eq!(outcome.finding().unwrap().verdict, Verdict::Block);
     }
 
     #[test]
@@ -3484,6 +3532,12 @@ mod tests {
         assert_eq!(finding.engine, "tamper-scan");
         assert_eq!(finding.trigger, Trigger::PreDone);
         assert!(finding.has_high());
+        // And it counts: the floor is not a file nobody listens to. Under `blocking` it
+        // holds the review engine's key until the master answers.
+        let standing = data::standing(&route, "t-1", 1, Trigger::PreDone)
+            .expect("the pre-done scan finding is eligible with no engine inventory for it");
+        assert!(standing.unresolved_block());
+        assert!(data::unresolved_block(&route, &policy_of(&route), "t-1", 1).is_some());
 
         // A clean branch with no engine records nothing, as before.
         let dir = tempfile::tempdir().unwrap();

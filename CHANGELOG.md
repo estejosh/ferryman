@@ -87,6 +87,15 @@
   it (or refuses a value that starts with `-`). A gated order with no readable commit in a
   git workspace is an Unscanned concern, not a clean pass, and a branch read without a
   named commit is fetched first so a stale local tip is not read instead.
+- **An unreadable adversary reply is no longer a finding.** A reply with no readable
+  verdict used to be recorded as a signed Concern, which is an eligible word that satisfies
+  `blocking` mode for a revision the adversary never judged; and "the last JSON object
+  wins" let a `{"verdict": "pass"}` echoed from a diff decide. Only the one fenced `json`
+  block at the very end of the reply, with a `verdict` and `findings`, is read; anything
+  else records nothing and is a failure the next pass retries (the next engine is asked
+  first). The deterministic tamper-scan floor now also counts at the pre-done moment, as a
+  Block only, so a diff that deletes tests blocks the review key even when no engine could
+  be asked.
 
 ## v0.5.17 - 2026-09-29
 

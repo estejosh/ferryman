@@ -39,7 +39,8 @@
 //!
 //! The deterministic tamper scan ([`TAMPER_SCAN`]) is the one exception to the builder and
 //! engine rules, because it asks no model and can only block: a worker may record what the
-//! scan found in the diff it is about to retry.
+//! scan found in the diff it is about to retry, and the pre-done pass what it found in the
+//! diff about to go to the review engine - even when no engine could be asked at all.
 //!
 //! # What the findings add up to
 //!
@@ -647,9 +648,11 @@ impl Facts {
             });
         }
         // The scan asks no model and can only block, so the agent that is about to retry
-        // may record what it found in its own failed diff.
+        // - or the one about to put an improvement before the review engine - may record
+        // what it found in the diff, whoever built it, with no engine inventory to list.
+        // It is a floor: a tamper-scan finding that is not a Block never counts.
         let scan = engine == Some(TAMPER_SCAN)
-            && trigger == Trigger::RepeatFailure
+            && matches!(trigger, Trigger::RepeatFailure | Trigger::PreDone)
             && verdict == Verdict::Block;
         let built = self
             .results
@@ -2642,6 +2645,56 @@ mod tests {
         passing_scan.engine = TAMPER_SCAN.into();
         record(&f.route, &f.fang, passing_scan).unwrap();
         assert!(self::standing(&f.route, "t-1", 1, Trigger::PreDone).is_none());
+    }
+
+    #[test]
+    fn the_scan_is_a_floor_at_pre_done_too_even_with_no_engine_inventory_and_only_blocks() {
+        let f = Fleet::new();
+        f.work("t-1", 2);
+        let blocking = policy(AdversaryMode::Blocking);
+        // `scribe` published no engine inventory: a model's word from it is ignored ...
+        let mut model = finding("t-1", 1, Trigger::PreDone, Verdict::Block);
+        model.engine = "qwen".into();
+        record(&f.route, &f.scribe, model).unwrap();
+        assert!(standing(&f.route, "t-1", 1, Trigger::PreDone).is_none());
+        // ... but what the deterministic scan found in the diff counts as a Block.
+        let mut scan = finding("t-1", 1, Trigger::PreDone, Verdict::Block);
+        scan.engine = TAMPER_SCAN.into();
+        record(&f.route, &f.fang, scan.clone()).unwrap();
+        let standing = standing(&f.route, "t-1", 1, Trigger::PreDone)
+            .expect("the pre-done scan counts with no engine at all");
+        assert!(standing.unresolved_block());
+        let why = engine_key_refusal(&f.route, &blocking, "t-1", 1).unwrap();
+        assert!(why.contains("blocks t-1 r1"), "{why}");
+        // The scan only ever blocks: a Concern or a Pass under its name counts for nothing,
+        // and neither does a Block under its name at a moment it is not a floor for.
+        for (revision, trigger, verdict) in [
+            (2, Trigger::PreDone, Verdict::Concern),
+            (1, Trigger::ContractLock, Verdict::Block),
+        ] {
+            let mut other = finding("t-1", revision, trigger, verdict);
+            other.engine = TAMPER_SCAN.into();
+            record(&f.route, &f.scribe, other).unwrap();
+        }
+        let survey = survey(&f.route, "t-1");
+        assert_eq!(
+            survey.standings.len(),
+            1,
+            "only the Block: {:?}",
+            survey.standings
+        );
+        assert!(
+            survey
+                .ignored
+                .iter()
+                .any(|ignored| ignored.finding.trigger == Trigger::ContractLock)
+        );
+        assert!(
+            survey
+                .ignored
+                .iter()
+                .any(|ignored| ignored.finding.verdict == Verdict::Concern)
+        );
     }
 
     #[test]
