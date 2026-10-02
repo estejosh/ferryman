@@ -1,10 +1,14 @@
 //! The adversary: a second model that challenges the work at three critical moments.
 //!
 //! ```text
-//! <channel>/adversary/<subject>-r<revision>-<trigger>.<signer>.json            the finding, signed by <signer>
-//! <channel>/adversary/<subject>-r<revision>-<trigger>.<signer>.override.json   the master's override of that finding
-//! <channel>/adversary/<subject>-r<revision>-<trigger>.override.json            the master's waiver: go ahead with no finding
+//! <channel>/adversary/<subject>-r<revision>-<trigger>/<signer>.finding.json    the finding, signed by <signer>
+//! <channel>/adversary/<subject>-r<revision>-<trigger>/<signer>.override.json   the master's override of that finding
+//! <channel>/adversary/<subject>-r<revision>-<trigger>/waiver.json              the master's waiver: go ahead with no finding
 //! ```
+//!
+//! One directory per (subject, revision, trigger), and a signer is one path component
+//! without a `.`: so the three kinds of file cannot be told apart by anything a signer
+//! chooses, and no signer name can reach another signer's file, an override or the waiver.
 //!
 //! Builders (cheap and medium models) build. A separate engine, the *adversary*, reads
 //! the work and tries to break it - but only when it matters, so it costs little:
@@ -375,9 +379,33 @@ fn stem(subject: &str, revision: u32, trigger: Trigger) -> String {
     format!("{subject}-r{revision}-{}", trigger.as_str())
 }
 
-/// `<stem>.<signer>.json`: the one path a signer writes a finding to.
-fn finding_file(subject: &str, revision: u32, trigger: Trigger, signer: &str) -> String {
-    format!("{}.{signer}.json", stem(subject, revision, trigger))
+/// The ending of a finding's file name, and of an override's: `<signer>` + one of these.
+const FINDING_SUFFIX: &str = ".finding.json";
+const OVERRIDE_SUFFIX: &str = ".override.json";
+/// The master's waiver, in the directory of the moment it covers.
+const WAIVER_FILE: &str = "waiver.json";
+
+/// `<signer>.finding.json`: the one file name a signer writes a finding under.
+fn finding_file(signer: &str) -> String {
+    format!("{signer}{FINDING_SUFFIX}")
+}
+
+/// The directory every file about one (subject, revision, trigger) lives in.
+fn moment_dir(route: &ProjectRoute, subject: &str, revision: u32, trigger: Trigger) -> PathBuf {
+    dir(route).join(stem(subject, revision, trigger))
+}
+
+/// The subject a moment's directory name names, or `None` for a name that is not one:
+/// `<subject>-r<revision>-<trigger>` read from the right, where the trigger is one of the
+/// three words and the revision is digits, so exactly one subject fits any name.
+fn subject_of_stem(name: &str) -> Option<&str> {
+    Trigger::ALL.iter().find_map(|trigger| {
+        let rest = name.strip_suffix(trigger.as_str())?.strip_suffix('-')?;
+        let (subject, revision) = rest.rsplit_once("-r")?;
+        (!revision.is_empty() && revision.bytes().all(|byte| byte.is_ascii_digit()))
+            .then_some(subject)
+            .filter(|subject| subject_ok(subject))
+    })
 }
 
 /// The engine name the deterministic diff scan records under when no model could be asked.
@@ -401,9 +429,11 @@ fn dir(route: &ProjectRoute) -> PathBuf {
     route.communications.join(DIR)
 }
 
-/// A signer that can be a part of a file name, and is not the word that names a waiver.
+/// A signer that can be the start of a file name: one safe path component with no `.`, so
+/// `<signer>.finding.json` and `<signer>.override.json` cannot be confused with each other
+/// or with `waiver.json`, whatever the name.
 fn signer_ok(signer: &str) -> bool {
-    is_safe_component(signer) && !signer.eq_ignore_ascii_case("override")
+    is_safe_component(signer) && !signer.contains('.')
 }
 
 /// Where `signer`'s finding for a subject, revision and trigger is stored. Each signer has
@@ -416,16 +446,13 @@ pub fn finding_path(
     signer: &str,
 ) -> Option<PathBuf> {
     (subject_ok(subject) && signer_ok(signer))
-        .then(|| dir(route).join(finding_file(subject, revision, trigger, signer)))
+        .then(|| moment_dir(route, subject, revision, trigger).join(finding_file(signer)))
 }
 
 fn override_path(route: &ProjectRoute, finding: &AdversaryFinding) -> Option<PathBuf> {
     (subject_ok(&finding.subject) && signer_ok(&finding.signed_by)).then(|| {
-        dir(route).join(format!(
-            "{}.{}.override.json",
-            stem(&finding.subject, finding.revision, finding.trigger),
-            finding.signed_by
-        ))
+        moment_dir(route, &finding.subject, finding.revision, finding.trigger)
+            .join(format!("{}{OVERRIDE_SUFFIX}", finding.signed_by))
     })
 }
 
@@ -435,12 +462,7 @@ fn waiver_path(
     revision: u32,
     trigger: Trigger,
 ) -> Option<PathBuf> {
-    subject_ok(subject).then(|| {
-        dir(route).join(format!(
-            "{}.override.json",
-            stem(subject, revision, trigger)
-        ))
-    })
+    subject_ok(subject).then(|| moment_dir(route, subject, revision, trigger).join(WAIVER_FILE))
 }
 
 /// A finding read from disk is genuine only if its signature verifies as its signer's and
@@ -457,40 +479,77 @@ fn genuine(route: &ProjectRoute, finding: &AdversaryFinding) -> bool {
         && !crate::master::is_revoked(route, &finding.signed_by).unwrap_or(true)
 }
 
-/// The genuine findings in files whose names start with `prefix`, read in one pass over
-/// the directory. A finding counts only from the file its content names - its subject,
-/// revision, trigger and signer - so a copy under another name is not read.
-fn scan(route: &ProjectRoute, prefix: &str, subject: Option<&str>) -> Vec<AdversaryFinding> {
-    let Ok(entries) = fs::read_dir(dir(route)) else {
+/// The genuine findings in the moment directories `keep` accepts, read in one pass. A
+/// finding counts only from the file its content names - its subject, revision, trigger
+/// and signer - so a copy under another name or in another directory is not read.
+fn scan(
+    route: &ProjectRoute,
+    keep: impl Fn(&str) -> bool,
+    subject: Option<&str>,
+) -> Vec<AdversaryFinding> {
+    let Ok(moments) = fs::read_dir(dir(route)) else {
         return Vec::new();
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().into_string().ok()?;
-            if !name.starts_with(prefix)
-                || !name.ends_with(".json")
-                || name.ends_with(".override.json")
-                || name.contains(".sync-conflict-")
-            {
-                return None;
+    let mut found = Vec::new();
+    for moment in moments.flatten() {
+        let Ok(moment_name) = moment.file_name().into_string() else {
+            continue;
+        };
+        if !keep(&moment_name) || !moment.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let Ok(files) = fs::read_dir(moment.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let Ok(name) = file.file_name().into_string() else {
+                continue;
+            };
+            if !name.ends_with(FINDING_SUFFIX) || name.contains(".sync-conflict-") {
+                continue;
             }
-            let finding: AdversaryFinding =
-                serde_json::from_slice(&fs::read(entry.path()).ok()?).ok()?;
+            let Some(finding) = fs::read(file.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<AdversaryFinding>(&bytes).ok())
+            else {
+                continue;
+            };
             if subject.is_some_and(|subject| finding.subject != subject) {
-                return None;
+                continue;
             }
-            (name
-                == finding_file(
-                    &finding.subject,
-                    finding.revision,
-                    finding.trigger,
-                    &finding.signed_by,
-                )
-                && genuine(route, &finding))
-            .then_some(finding)
-        })
-        .collect()
+            if name == finding_file(&finding.signed_by)
+                && moment_name == finding.stem()
+                && genuine(route, &finding)
+            {
+                found.push(finding);
+            }
+        }
+    }
+    found
+}
+
+/// The moment directories of `subject`, whatever their revision and trigger.
+fn of_subject(subject: &str) -> impl Fn(&str) -> bool + '_ {
+    move |name| name.starts_with(&format!("{subject}-r"))
+}
+
+/// Every subject a finding directory names, from a listing of the directory names alone:
+/// nothing is read, so a long history costs one directory listing, and no cap decides
+/// which subjects a display forgets.
+#[must_use]
+pub fn subjects(route: &ProjectRoute) -> Vec<String> {
+    let Ok(moments) = fs::read_dir(dir(route)) else {
+        return Vec::new();
+    };
+    let mut subjects: Vec<String> = moments
+        .flatten()
+        .filter(|moment| moment.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|moment| moment.file_name().into_string().ok())
+        .filter_map(|name| subject_of_stem(&name).map(str::to_string))
+        .collect();
+    subjects.sort();
+    subjects.dedup();
+    subjects
 }
 
 /// `signer`'s genuine finding for exactly this (subject, revision, trigger), whether or
@@ -542,7 +601,7 @@ pub fn record(
         );
     }
     if !signer_ok(identity.name()) {
-        bail!("agent name must be a path-safe identifier");
+        bail!("an adversary agent name is a path-safe identifier without a '.'");
     }
     if done(
         route,
@@ -590,7 +649,7 @@ pub fn current_digest(route: &ProjectRoute, subject: &str, revision: u32) -> Str
 /// decision reads exactly its subject's files ([`standing`], [`survey`]) and never this.
 #[must_use]
 pub fn list(route: &ProjectRoute) -> Vec<AdversaryFinding> {
-    let mut found = scan(route, "", None);
+    let mut found = scan(route, |_| true, None);
     found.sort_by_key(|finding| std::cmp::Reverse(finding.created_at));
     found.truncate(MAX_LISTED);
     found
@@ -602,7 +661,7 @@ pub fn for_subject(route: &ProjectRoute, subject: &str) -> Vec<AdversaryFinding>
     if !subject_ok(subject) {
         return Vec::new();
     }
-    let mut found = scan(route, &format!("{subject}-r"), Some(subject));
+    let mut found = scan(route, of_subject(subject), Some(subject));
     found.sort_by_key(|finding| std::cmp::Reverse(finding.created_at));
     found
 }
@@ -1149,7 +1208,7 @@ pub fn survey(route: &ProjectRoute, subject: &str) -> Survey {
     assemble(
         route,
         subject,
-        scan(route, &format!("{subject}-r"), Some(subject)),
+        scan(route, of_subject(subject), Some(subject)),
     )
 }
 
@@ -1165,24 +1224,23 @@ pub fn standing(
     if !subject_ok(subject) {
         return None;
     }
-    let prefix = format!("{}.", stem(subject, revision, trigger));
-    assemble(route, subject, scan(route, &prefix, Some(subject)))
-        .standings
-        .into_iter()
-        .next()
+    let moment = stem(subject, revision, trigger);
+    assemble(
+        route,
+        subject,
+        scan(route, |name| name == moment, Some(subject)),
+    )
+    .standings
+    .into_iter()
+    .next()
 }
 
-/// [`survey`] over every subject in the channel's newest findings: for display only.
+/// [`survey`] over every subject the channel has a finding directory for ([`subjects`]):
+/// for display only, and complete however many findings there are.
 #[must_use]
 pub fn list_standings(route: &ProjectRoute) -> Survey {
-    let mut subjects: Vec<String> = list(route)
-        .into_iter()
-        .map(|finding| finding.subject)
-        .collect();
-    subjects.sort();
-    subjects.dedup();
     let mut all = Survey::default();
-    for subject in subjects {
+    for subject in subjects(route) {
         let one = survey(route, &subject);
         all.standings.extend(one.standings);
         all.ignored.extend(one.ignored);
@@ -2254,7 +2312,10 @@ mod tests {
             .unwrap()
         );
         let path = finding_path(&f.route, "t-1", 2, Trigger::PreDone, "wisp").unwrap();
-        assert!(path.ends_with("t-1-r2-pre-done.wisp.json"), "{path:?}");
+        assert!(
+            path.ends_with("t-1-r2-pre-done/wisp.finding.json"),
+            "{path:?}"
+        );
         let read = read(&f.route, "t-1", 2, Trigger::PreDone, "wisp").expect("a genuine finding");
         assert_eq!(read.signed_by, "wisp");
         assert_eq!(read.verdict, Verdict::Block);
@@ -2373,9 +2434,11 @@ mod tests {
             finding("t-2", 1, Trigger::PreDone, Verdict::Block),
         )
         .unwrap();
+        let elsewhere = finding_path(route, "t-3", 1, Trigger::PreDone, "wisp").unwrap();
+        fs::create_dir_all(elsewhere.parent().unwrap()).unwrap();
         fs::copy(
             finding_path(route, "t-2", 1, Trigger::PreDone, "wisp").unwrap(),
-            finding_path(route, "t-3", 1, Trigger::PreDone, "wisp").unwrap(),
+            elsewhere,
         )
         .unwrap();
         assert!(read(route, "t-3", 1, Trigger::PreDone, "wisp").is_none());
@@ -2402,6 +2465,13 @@ mod tests {
         squat.signature = f.bridge.sign_bytes(squat.payload("demo").as_bytes());
         let wisps = finding_path(&f.route, "t-1", 1, Trigger::PreDone, "wisp").unwrap();
         crate::atomic_json(&wisps, &squat).unwrap();
+        // ...or into a name of its own that the content does not match.
+        crate::atomic_json(&wisps.with_file_name("bridge.finding.json"), &{
+            let mut other = squat.clone();
+            other.signed_by = "wisp".into();
+            other
+        })
+        .unwrap();
         assert!(read(&f.route, "t-1", 1, Trigger::PreDone, "wisp").is_none());
         assert!(!done(&f.route, "t-1", 1, Trigger::PreDone, "wisp"));
         assert!(
@@ -2422,17 +2492,22 @@ mod tests {
                 .unwrap()
                 .unresolved_block()
         );
-        // The word "override" names a waiver, not a signer.
-        let sneaky = person("override", 7);
-        assert!(
-            record(
+        // A signer's name cannot be made to look like another kind of file: no '.', so
+        // "wisp.override" is not a signer, and the waiver's file name is not a finding's.
+        for name in ["override", "waiver", "wisp.override", "wisp.finding", "a.b"] {
+            let sneaky = person(name, 7);
+            let attempt = record(
                 &f.route,
                 &sneaky,
-                finding("t-1", 1, Trigger::PreDone, Verdict::Pass)
-            )
-            .is_err()
-        );
-        assert!(finding_path(&f.route, "t-1", 1, Trigger::PreDone, "Override").is_none());
+                finding("t-1", 1, Trigger::PreDone, Verdict::Pass),
+            );
+            assert_eq!(attempt.is_ok(), !name.contains('.'), "{name}: {attempt:?}");
+            assert_eq!(
+                finding_path(&f.route, "t-1", 1, Trigger::PreDone, name).is_some(),
+                !name.contains('.')
+            );
+        }
+        assert!(finding_path(&f.route, "t-1", 1, Trigger::PreDone, "wisp.override").is_none());
     }
 
     #[test]
@@ -2449,10 +2524,11 @@ mod tests {
             finding("t-1", 1, Trigger::PreDone, Verdict::Block),
         )
         .unwrap();
-        fs::create_dir_all(dir(&elsewhere)).unwrap();
+        let target = finding_path(&elsewhere, "t-1", 1, Trigger::PreDone, "wisp").unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
         fs::copy(
             finding_path(&f.route, "t-1", 1, Trigger::PreDone, "wisp").unwrap(),
-            finding_path(&elsewhere, "t-1", 1, Trigger::PreDone, "wisp").unwrap(),
+            target,
         )
         .unwrap();
         assert!(read(&elsewhere, "t-1", 1, Trigger::PreDone, "wisp").is_none());
@@ -2478,6 +2554,82 @@ mod tests {
         );
         assert!(finding_path(&f.route, "../x", 1, Trigger::PreDone, "wisp").is_none());
         assert!(finding_path(&f.route, "t-1", 1, Trigger::PreDone, "../wisp").is_none());
+    }
+
+    #[test]
+    fn a_signer_named_like_a_kind_of_file_cannot_collide_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (boss, over, waiver) = (
+            person("boss", 1),
+            person("override", 2),
+            person("waiver", 3),
+        );
+        let route = route(dir.path(), &[&boss, &over, &waiver]);
+        for signer in [&over, &waiver] {
+            assert!(
+                record(
+                    &route,
+                    signer,
+                    finding("t-1", 1, Trigger::PreDone, Verdict::Block)
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(for_subject(&route, "t-1").len(), 2);
+        let one = read(&route, "t-1", 1, Trigger::PreDone, "override").unwrap();
+        let two = read(&route, "t-1", 1, Trigger::PreDone, "waiver").unwrap();
+        // Six different files in one directory, none the same as another.
+        let paths = [
+            finding_path(&route, "t-1", 1, Trigger::PreDone, "override").unwrap(),
+            finding_path(&route, "t-1", 1, Trigger::PreDone, "waiver").unwrap(),
+            override_path(&route, &one).unwrap(),
+            override_path(&route, &two).unwrap(),
+            waiver_path(&route, "t-1", 1, Trigger::PreDone).unwrap(),
+        ];
+        let mut names: Vec<_> = paths.iter().map(|path| path.file_name().unwrap()).collect();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), paths.len(), "{paths:?}");
+        assert!(paths.iter().all(|path| path.parent() == paths[0].parent()));
+        // An override file and a waiver beside the findings leave both findings, and each
+        // other, alone.
+        crate::atomic_json(&paths[2], &json!({ "not": "a finding" })).unwrap();
+        crate::atomic_json(&paths[4], &json!({ "not": "a finding" })).unwrap();
+        assert_eq!(for_subject(&route, "t-1").len(), 2);
+        assert!(
+            read_override(&route, &one).is_none(),
+            "a junk file is no override"
+        );
+        assert!(read_waiver(&route, "t-1", 1, Trigger::PreDone).is_none());
+    }
+
+    #[test]
+    fn a_moment_directory_name_gives_back_exactly_the_subject_it_was_made_from() {
+        for subject in ["t-1", "user-api@1", "a-r1-pre-done", "x-r9", "r-r0-r-r2"] {
+            for trigger in Trigger::ALL {
+                for revision in [0, 1, 12] {
+                    let name = stem(subject, revision, trigger);
+                    assert_eq!(subject_of_stem(&name), Some(subject), "{name}");
+                }
+            }
+        }
+        // Different (subject, revision, trigger) never share a name.
+        assert_ne!(
+            stem("a-r1-pre-done", 2, Trigger::PreDone),
+            stem("a", 1, Trigger::PreDone)
+        );
+        for not_a_moment in [
+            "t-1",
+            "t-1-r-pre-done",
+            "t-1-rx-pre-done",
+            "-r1-pre-done",
+            "t-1-r1-done",
+            "t-1-r1-pre-done.json",
+            "../x-r1-pre-done",
+            "",
+        ] {
+            assert_eq!(subject_of_stem(not_a_moment), None, "{not_a_moment}");
+        }
     }
 
     // --- whose word counts ---------------------------------------------------------------
@@ -2889,7 +3041,20 @@ mod tests {
             !list(&f.route)
                 .iter()
                 .any(|finding| finding.subject == "t-1"),
-            "t-1's finding fell off the display"
+            "t-1's finding fell off the newest-findings listing"
+        );
+        // ...but the displays list subjects from the directory names, so it is still there.
+        assert_eq!(
+            subjects(&f.route),
+            vec!["t-1".to_string(), "t-9".to_string()]
+        );
+        let shown = list_standings(&f.route);
+        assert!(
+            shown
+                .standings
+                .iter()
+                .any(|standing| standing.finding.subject == "t-1"),
+            "t-1 is on the display however many newer findings there are"
         );
         // The gate still sees it.
         let blocking = policy(AdversaryMode::Blocking);
@@ -3161,7 +3326,7 @@ mod tests {
         let finding_now = read(&f.route, "t-1", 1, Trigger::PreDone, "wisp").unwrap();
         let path = override_path(&f.route, &finding_now).unwrap();
         assert!(
-            path.ends_with("t-1-r1-pre-done.wisp.override.json"),
+            path.ends_with("t-1-r1-pre-done/wisp.override.json"),
             "{path:?}"
         );
 

@@ -1034,6 +1034,34 @@ impl Task {
             .map(|claim| claim.claimed_at)
     }
 
+    /// Whether somebody is plausibly still reworking an order that was sent back for
+    /// changes: its holder has a live claim (a sign of life inside the stale window), or
+    /// the review that sent it back is itself newer than that window - the worker has not
+    /// had time to notice yet. A claim that went quiet long ago on a verdict nobody acted
+    /// on is not "in play": it must not keep other orders off those files forever.
+    #[must_use]
+    pub(crate) fn rework_in_play(&self, now: DateTime<Utc>) -> bool {
+        let sent_back = self
+            .latest_revision()
+            .and_then(|revision| {
+                self.reviews
+                    .iter()
+                    .find(|review| review.revision == revision && !review.accepted)
+            })
+            .map(|review| review.reviewed_at);
+        if sent_back.is_some_and(|at| !lapsed(at, now)) {
+            return true;
+        }
+        let Some(holder) = self.holder() else {
+            return false;
+        };
+        self.held_by_claim(holder)
+            && self
+                .heartbeat_for(holder)
+                .map_or_else(|| self.claimed_at(holder), |beat| Some(beat.at))
+                .is_none_or(|since| !lapsed(since, now))
+    }
+
     /// The holder's heartbeat, if one was written under the holder's own name.
     fn heartbeat_for(&self, agent: &str) -> Option<&Heartbeat> {
         self.heartbeats

@@ -137,6 +137,17 @@
   v1-only file while a member whose inventory carries a v2 signature is on the roster, and
   signing the same policy again now upgrades a v1-only file instead of reporting "already
   so".
+- **The adversary's files cannot collide, and its displays are not capped.** A finding is
+  now `adversary/<subject>-r<revision>-<moment>/<signer>.finding.json`, a master's override
+  `<signer>.override.json` and a waiver `waiver.json` in the same directory; a signer's name
+  must be a path-safe component with no `.`, so no name can be mistaken for another kind of
+  file (the old layout reserved the word `override` by hand). `ferry adversary list`, the
+  dashboard, the Telegram view, the summary and the weekly report take their subjects from a
+  listing of those directory names rather than from the 500 newest findings, so an old
+  Block cannot fall off a display. A worker keeps off the files of a sent-back order only
+  while its rework is in play (a live claim, or a verdict newer than the stale window), so
+  an abandoned rework no longer holds them for ever. The file-overlap matcher refuses a glob
+  or path over 1024 bytes: it overlaps everything and matches nothing.
 
 ## v0.5.17 - 2026-09-29
 

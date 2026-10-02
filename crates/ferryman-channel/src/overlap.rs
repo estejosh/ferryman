@@ -26,8 +26,18 @@
 //! `src/api/x.rs`; `src/api/**` does not overlap `src/apiv2/x.rs`; `**` overlaps
 //! everything. Comparison ignores case, because the machines doing the work include
 //! Windows ones.
+//!
+//! A glob or a path longer than [`MAX_GLOB_BYTES`] is never taken apart: it counts as
+//! overlapping everything (an overlap question is answered on the cautious side) and as
+//! matching nothing (so what it was meant to cover is reported as outside its order's
+//! declaration). Both are the conservative answer to their question, and neither refuses
+//! work for good.
 
 use serde::Serialize;
+
+/// The longest glob or path, in bytes, that is compared at all. A real file glob is a
+/// short line; a longer one comes from a mistake or from somebody making the matcher work.
+pub const MAX_GLOB_BYTES: usize = 1024;
 
 use crate::{Order, ProjectRoute, SignatureCheck, Task, TaskState};
 
@@ -94,20 +104,25 @@ fn overlap_pair(a: &Pattern, b: &Pattern) -> bool {
 /// Conservative: see the module documentation. An empty list never overlaps anything.
 #[must_use]
 pub fn overlaps(a: &[String], b: &[String]) -> Vec<(String, String)> {
-    let left: Vec<(&String, Pattern)> = a
+    // `None` is a glob over the cap: it may refer to anything, so it overlaps everything.
+    let left: Vec<(&String, Option<Pattern>)> = a
         .iter()
         .filter(|glob| !glob.trim().is_empty())
-        .map(|glob| (glob, pattern(glob)))
+        .map(|glob| (glob, (glob.len() <= MAX_GLOB_BYTES).then(|| pattern(glob))))
         .collect();
-    let right: Vec<(&String, Pattern)> = b
+    let right: Vec<(&String, Option<Pattern>)> = b
         .iter()
         .filter(|glob| !glob.trim().is_empty())
-        .map(|glob| (glob, pattern(glob)))
+        .map(|glob| (glob, (glob.len() <= MAX_GLOB_BYTES).then(|| pattern(glob))))
         .collect();
     let mut found = Vec::new();
     for (left_glob, left_pattern) in &left {
         for (right_glob, right_pattern) in &right {
-            if overlap_pair(left_pattern, right_pattern) {
+            let may_overlap = match (left_pattern, right_pattern) {
+                (Some(left), Some(right)) => overlap_pair(left, right),
+                _ => true,
+            };
+            if may_overlap {
                 found.push(((*left_glob).clone(), (*right_glob).clone()));
             }
         }
@@ -232,9 +247,13 @@ fn glob_here(pat: &[char], text: &[char]) -> bool {
 
 /// Whether `path` is one of the files `glob` stands for. `*` stays inside a directory,
 /// `**` crosses them, `?` is one character, `[a-z]` a class, `{a,b}` a choice. A glob with
-/// no wildcard also covers everything under it, so `src/api` covers `src/api/x.rs`.
+/// no wildcard also covers everything under it, so `src/api` covers `src/api/x.rs`. A glob
+/// or a path over [`MAX_GLOB_BYTES`] matches nothing.
 #[must_use]
 pub fn glob_matches(glob: &str, path: &str) -> bool {
+    if glob.len() > MAX_GLOB_BYTES || path.len() > MAX_GLOB_BYTES {
+        return false;
+    }
     let path = normalize(path);
     let text: Vec<char> = path.chars().collect();
     expand_braces(&normalize(glob)).iter().any(|one| {
@@ -396,7 +415,8 @@ pub fn overlap_map(
 }
 
 /// Why a worker should not claim `order` right now: an order currently `Claimed` - not
-/// merely stale - by anyone in this project has `touches` that overlap it. `None` when it
+/// merely stale - by anyone in this project, or sent back for changes while its rework is
+/// in play ([`Task::rework_in_play`]), has `touches` that overlap it. `None` when it
 /// is free to claim, including whenever it says `allow_overlap` or declares nothing.
 ///
 /// The channel is read fresh each time, so an order this same worker claimed a moment ago
@@ -405,13 +425,15 @@ pub fn claim_hold(route: &ProjectRoute, order: &Order) -> anyhow::Result<Option<
     if order.allow_overlap || order.touches.is_empty() {
         return Ok(None);
     }
+    let now = chrono::Utc::now();
     for other in crate::list_tasks(route)? {
-        // A claimed order is being worked on. So is one sent back for changes: someone
-        // is reworking it, and its files are still in play. A stale claim and a finished
-        // order are not.
-        let by = match other.state() {
+        // A claimed order is being worked on. So is one sent back for changes, while
+        // someone is reworking it (a live claim) or the verdict is fresh: its files are
+        // still in play. A stale claim, a sent-back order nobody has touched for longer
+        // than the stale window, and a finished order are not.
+        let by = match other.state_at(now) {
             TaskState::Claimed { by } => by,
-            TaskState::ChangesRequested { .. } => other
+            TaskState::ChangesRequested { .. } if other.rework_in_play(now) => other
                 .holder()
                 .map_or_else(|| "its worker".to_string(), str::to_string),
             _ => continue,
@@ -835,7 +857,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_pathological_glob_matches_in_linear_time_and_still_matches_correctly() {
-        let path = "a/".repeat(3_000) + "c";
+        let path = "a/".repeat(500) + "c";
         let evil = "**/*a*/**/*a*/**/*a*/**/*a*/**/*a*/**/*a*/b";
         let started = std::time::Instant::now();
         assert!(!glob_matches(evil, &path));
@@ -857,6 +879,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_glob_or_path_over_the_cap_overlaps_everything_and_matches_nothing() {
+        let long = format!("docs/{}", "a".repeat(MAX_GLOB_BYTES));
+        assert!(long.len() > MAX_GLOB_BYTES);
+        // Over the cap: the cautious answer to "do these overlap" is yes, even for a
+        // literal in another directory entirely, from either side.
+        assert!(overlap(&[long.as_str()], &["src/api/x.rs"]));
+        assert!(overlap(&["src/api/x.rs"], &[long.as_str()]));
+        assert!(overlap(&[long.as_str()], &[long.as_str()]));
+        // At the cap it is parsed like any other, so unrelated stays unrelated.
+        let exact = format!("docs/{}", "a".repeat(MAX_GLOB_BYTES - 5));
+        assert_eq!(exact.len(), MAX_GLOB_BYTES);
+        assert!(!overlap(&[exact.as_str()], &["src/api/x.rs"]));
+        // An empty list still overlaps nothing, however long the other one is.
+        assert!(!overlap(&[long.as_str()], &[]));
+        assert!(!overlap(&[], &[long.as_str()]));
+        // Matching: nothing matches an over-long glob or path, so an order is told what
+        // strayed rather than the matcher being handed a pathological input.
+        assert!(!glob_matches(&long, &long));
+        assert!(!glob_matches("**", &long));
+        assert!(glob_matches(&exact, &exact));
+        let changed = vec![long];
+        assert_eq!(outside(&globs(&["docs/**"]), &changed), changed);
+        assert!(scope_note(&globs(&["docs/**"]), &changed).is_some());
+    }
+
+    #[test]
     fn allow_overlap_and_unrelated_files_are_never_held() {
         let f = fixture();
         issue(&f, order("t-first", &["src/api/**"]));
@@ -868,6 +916,83 @@ pub(crate) mod tests {
         assert!(claim_hold(&f.route, &elsewhere).unwrap().is_none());
         let declares_nothing = order("t-nothing", &[]);
         assert!(claim_hold(&f.route, &declares_nothing).unwrap().is_none());
+    }
+
+    /// `t-rework` by `wisp`, a first result, and a review that sent it back at `reviewed_at`.
+    fn send_back(f: &Fixture, id: &str, reviewed_at: chrono::DateTime<Utc>) {
+        let mut result = crate::TaskResult {
+            order_id: id.into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "first try" }),
+            signed_by: None,
+            signature: None,
+        };
+        f.wisp.sign_result(&mut result);
+        crate::submit_result(&f.route, &result).unwrap();
+        let mut review = crate::Review {
+            order_id: id.into(),
+            revision: 1,
+            reviewer: "josh".into(),
+            reviewed_at,
+            accepted: false,
+            notes: Some("again".into()),
+            signed_by: None,
+            signature: None,
+        };
+        f.josh.sign_review(&mut review);
+        crate::submit_review(&f.route, &review).unwrap();
+        let task = crate::read_task(&f.route, id).unwrap();
+        assert!(
+            matches!(task.state(), TaskState::ChangesRequested { .. }),
+            "{:?}",
+            task.state()
+        );
+    }
+
+    #[test]
+    fn a_sent_back_order_holds_its_files_only_while_its_rework_is_in_play() {
+        let long_ago = Utc::now() - chrono::Duration::hours(2);
+        let wanted = order("t-wanted-rw", &["src/api/users.rs"]);
+
+        // An old verdict nobody acted on and a claim that went quiet: not in play.
+        let f = fixture();
+        issue(&f, order("t-abandoned", &["src/api/**"]));
+        mark_stale(&f.route, "t-abandoned", "wisp");
+        send_back(&f, "t-abandoned", long_ago);
+        let task = crate::read_task(&f.route, "t-abandoned").unwrap();
+        assert!(!task.rework_in_play(Utc::now()));
+        assert!(
+            claim_hold(&f.route, &wanted).unwrap().is_none(),
+            "an abandoned rework does not hold the files for ever"
+        );
+
+        // The same claim, but the verdict is fresh: the worker has not had time to notice.
+        let f = fixture();
+        issue(&f, order("t-fresh", &["src/api/**"]));
+        mark_stale(&f.route, "t-fresh", "wisp");
+        send_back(&f, "t-fresh", Utc::now());
+        assert!(claim_hold(&f.route, &wanted).unwrap().is_some());
+
+        // An old verdict, but the worker is alive and on it (a fresh claim).
+        let f = fixture();
+        issue(&f, order("t-working", &["src/api/**"]));
+        claim(&f, "t-working");
+        send_back(&f, "t-working", long_ago);
+        let reason = claim_hold(&f.route, &wanted).unwrap().unwrap();
+        assert!(reason.contains("t-working"), "{reason}");
+
+        // And once that worker's heartbeat lapses too, the hold lifts.
+        let beat = crate::Heartbeat {
+            order_id: "t-working".into(),
+            agent: "wisp".into(),
+            run: "r".into(),
+            pid: 1,
+            at: long_ago,
+        };
+        crate::write_heartbeat(&f.route, &beat).unwrap();
+        assert!(claim_hold(&f.route, &wanted).unwrap().is_none());
     }
 
     #[test]

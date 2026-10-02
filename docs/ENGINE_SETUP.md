@@ -589,8 +589,11 @@ copy of every step:
 It answers with a verdict - `pass`, `concern` or `block` - and findings, each with a
 severity. Only a reply that ends with one fenced `json` block holding a `verdict` and a
 `findings` list is read; anything else records nothing (it is not a finding, so it cannot
-satisfy `blocking`) and the next allowed engine is asked. Each finding is a signed file in `<channel>/adversary/` (one per subject,
-revision and moment, so asking again changes nothing), and the engine, model, machine and
+satisfy `blocking`) and the next allowed engine is asked. Each finding is a signed file,
+`<channel>/adversary/<subject>-r<revision>-<moment>/<signer>.finding.json` (one per signer, subject,
+revision and moment, so asking again changes nothing; a master's override sits beside it as
+`<signer>.override.json` and a waiver as `waiver.json`, and a signer's name has no `.` so none
+of them can be mistaken for another), and the engine, model, machine and
 cost go into the ledger like any improvement step.
 
 **Modes**, set with `--adversary`:

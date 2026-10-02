@@ -318,7 +318,9 @@ globs overlap an open or claimed one prints a warning, the dashboard marks both 
 a worker will not claim an order while an overlapping one is being worked on (it records
 why and takes other work) unless the order says `--allow-overlap`. The comparison is
 conservative and on whole path segments: `src/api/**` overlaps `src/api/x.rs` but not
-`src/apiv2/x.rs`. After the commit, the result records `touched_files`, and a reviewer note
+`src/apiv2/x.rs`. A worker keeps off a sent-back order's files only while someone is on
+the rework (a live claim, or a verdict newer than the stale window). A glob or path over 1024
+bytes counts as overlapping everything and matching nothing. After the commit, the result records `touched_files`, and a reviewer note
 says so when any fall outside the declared globs - a note, never a refutation. A single
 order can also carry its own result shape with `--result-schema file.json`.
 
