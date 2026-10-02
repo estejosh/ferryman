@@ -849,6 +849,159 @@ would. `--json` prints the classification. The dashboard shows the same on each 
 card (kind, size, any modality beyond text; unsure ones are marked) and, with the
 reasons, in the order's detail.
 
+## Smart routing: the cheapest engine that will do it well
+
+Every piece of background work goes to the engine best suited to it, by one rule: **use
+the cheapest engine that will most likely do it well, and move up only when a cheaper
+one has failed at that kind of work.** It applies to text, code, vision, image, video
+and audio work, and to local, free, prepaid and subscription engines alike. Smart is
+the default; `routing = "ordered"` keeps the strict prefer lists exactly as they were
+before the router.
+
+### What runs before any scoring
+
+The router chooses only among the engines the engine policy already lets through, so
+none of these can be bypassed: the `never` list, `protect_subscriptions` and
+`subscription_roles` with their weekly caps, `caps_usd`, `where`, an engine that is out of
+credit, and the tiers (a chore engine never builds, a demoted engine only does chore
+work, review is a judge's). **The adversary is never routed**: it keeps its own
+master-only `ADVERSARY_POLICY` and its own order. After that the router also leaves out an
+engine that lacks a modality the work needs (code-change needs `code`, which only a `cli`
+engine has; vision work needs `vision`), or whose context window is smaller than the work
+wants. An `http` engine is sent text only, so it is never given vision, audio, image or
+video work, whatever its profile says: point a `cli` engine at the model and declare the
+modality on it. A fleet with no `cli` engine at all still takes build orders on `http`
+engines, as it always has, and the reason says so.
+
+### How the choice is made
+
+1. **Estimate.** For each engine and kind of work, the chance it does the work well is a
+   Beta estimate. The prior is the engine's size class (large 0.80, medium 0.70, small
+   0.55), plus 0.05 for each strength tag that matches the kind (at most 0.10), minus 0.10
+   for each class the engine is below the size of the work. It is worth four results.
+   The evidence is the worker's own ledger of results for this engine and kind, verified or
+   refuted by its checks, each counting for half as much after 14 days. So
+   `p = (prior x 4 + verified) / (4 + verified + refuted)`.
+2. **Price.** One call is estimated at 3k/1k, 12k/3k or 48k/10k tokens in/out for small,
+   medium and large work, times the engine's price. Local and free-tier engines cost 0. An
+   engine with **no declared price is not free**: it is assumed to cost a frontier model's
+   list price ($5 in, $25 out per million tokens), so a declared price always beats a
+   guess. A free tier that asked for money is priced like an unpriced one until its flag
+   lapses. A subscription costs nothing per call, but its **scarcity** is priced: about two
+   cents a call with the weekly cap full, rising to ten times that as the cap runs down.
+3. **Choose.** The *sufficient set* is every engine whose estimate reaches the threshold
+   for the kind (0.75 unless the policy says otherwise). The winner is the cheapest of
+   them. If none is sufficient, the winner is the one most likely to succeed. Costs within
+   10% count as tied, and ties go to **bias**, then the nearer tier, then the faster engine,
+   then the order the policy and `agent.toml` already gave.
+4. **Escalate.** After a result is refuted by its own evidence, or sent back with changes
+   requested, the next attempt leaves that engine out and needs an estimate **higher than the
+   one the failed engine was chosen at**. A retry therefore climbs: cheap first, then up.
+5. **Learn.** Each verified or refuted result is counted for that (engine, kind) in the
+   worker's engine ledger, under the same lock as the rest of it, and published in the
+   signed inventory (a v2-only field). A cheap engine that keeps getting docs right becomes
+   sufficient for docs; one that gets refuted stops being picked for it, while what it is
+   good at is untouched. `ferry engines` shows each engine's best kinds with its success rate.
+
+### The policy fields
+
+```sh
+ferry engines policy set --routing smart            # the default; `ordered` is today's strict order
+ferry engines policy set --threshold docs=0.7 --threshold code-change=0.85
+ferry engines policy set --bias 'nemotron*=3' --bias 'claude-sonnet*=2'
+ferry engines policy set --threshold none --bias none   # clear them
+```
+
+- `routing`: `smart` or `ordered`. With `ordered` nothing is scored and the first engine the
+  lists allow does the work, byte for byte as before.
+- `thresholds`: per kind (`code-change`, `docs`, `tests`, `review`, `plan`, `chore`,
+  `research`, `translate`, `transcribe`, `image`, `video`, `audio`, `other`), the
+  probability that counts as sufficient. Higher means "only the engines I trust with this";
+  lower lets a cheap engine try.
+- `bias`: per selector, a tie-break weight. Higher goes first **among engines that cost the
+  same**. It never lets a dearer engine beat a cheaper sufficient one; to force an order use
+  `ordered`. Your prefer lists already give their first entries a small bias of their own.
+
+All three are signed in the policy's v2 view only, like `effort` and `width`: a v0.5.17
+machine still verifies the file and keeps ordering. In the dashboard, the Engine policy
+panel has a Routing section with the same three settings.
+
+### Seeing why
+
+```sh
+ferry route simulate --kind docs --size small                 # who would get it now, and why
+ferry route simulate --kind docs --size small --needs vision  # ... if it needs to read images
+ferry route explain <order>     # what it needs, what each worker recorded, and what would happen now
+ferry engines                   # each engine's top kinds with their success rates
+```
+
+Every routing decision is recorded beside the step and in the result: each candidate with its
+estimate and price, why each excluded engine was left out, and a one-line reason such as
+`nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient`. The dashboard shows the reason
+on each order card, every candidate in the order's drawer, and a Routing panel that runs the
+simulation without running anything. Telegram's review card carries the one-line reason.
+
+### Example: NVIDIA first while it is free, then Sonnet, then Haiku, local models too
+
+"If one model is better suited, or can do it well cheaply, it should be used." That is the
+rule above; what you add is only a bias for ties. Declare what each engine is, then sign the
+policy. This is an example: use the names and models of your own `agent.toml`.
+
+```toml
+engines = ["nemotron", "claude-sonnet", "claude-haiku", "ollama"]
+
+# Free while it lasts, and large. Prices of 0 make it the cheapest; the router also learns
+# whether it is good at each kind of work.
+engine.nemotron.kind = "cli"
+engine.nemotron.model = "nvidia/nemotron-3-super-120b-a12b"
+engine.nemotron.env = {"OPENAI_BASE_URL":"https://integrate.api.nvidia.com/v1","OPENAI_API_KEY":"secret:NVIDIA_API_KEY","OPENAI_MODEL":"nvidia/nemotron-3-super-120b-a12b"}
+engine.nemotron.base_url = "https://integrate.api.nvidia.com/v1"
+engine.nemotron.key = "secret:NVIDIA_API_KEY"
+engine.nemotron.paid = "free-tier"
+engine.nemotron.class = "large"
+
+# Subscriptions: no price per call, but the weekly cap makes them scarce as it runs down.
+engine.claude-sonnet.kind = "cli"
+engine.claude-sonnet.command = "claude"
+engine.claude-sonnet.args = ["-p", "--model", "{model}", "{prompt}"]
+engine.claude-sonnet.model = "claude-sonnet-4-6"
+engine.claude-sonnet.paid = "subscription"
+engine.claude-sonnet.weekly_requests = "300"
+engine.claude-sonnet.strengths = ["code", "docs", "reasoning"]
+engine.claude-haiku.kind = "cli"
+engine.claude-haiku.command = "claude"
+engine.claude-haiku.args = ["-p", "--model", "{model}", "{prompt}"]
+engine.claude-haiku.model = "claude-haiku-4-5"
+engine.claude-haiku.paid = "subscription"
+engine.claude-haiku.weekly_requests = "600"
+
+# Local models count: free, and eligible for the work they prove they can do.
+engine.ollama.kind = "http"
+engine.ollama.base_url = "http://localhost:11434/v1"
+engine.ollama.model = "qwen2.5-coder"
+engine.ollama.paid = "local"
+```
+
+```sh
+ferry engines policy set --routing smart \
+  --prefer nemotron --prefer claude-sonnet --prefer claude-haiku \
+  --bias 'nemotron*=3' --bias 'claude-sonnet*=2' --bias 'claude-haiku*=1' \
+  --threshold docs=0.7 --threshold chore=0.6 \
+  --allow-subscriptions-for plan,build,chore
+```
+
+What that does: NVIDIA is free and large, so it takes the work while it is up and keeps taking
+it for as long as it keeps getting it right. When it is out of credit, down, or has failed
+at that kind of work, the next cheapest engine that is likely to do it well takes over: a
+local model that has proven itself at it, then Sonnet, then Haiku (Sonnet before Haiku
+when their price is tied, because of the bias). Haiku, a small model, becomes sufficient for a
+kind of work by proving itself at it, or because you lowered that kind's threshold: that is
+"can do it well cheaply". A subscription is used for a role only because
+`--allow-subscriptions-for` says so, and only an engine with a weekly cap; `never` and the
+dollar caps still apply first. Drop `--allow-subscriptions-for` and the two Claude engines
+are never used for background work, as before. `ferry route simulate --kind docs --size small`
+shows the ranking before you trust it.
+
 ## OmniRoute: a free gateway as an engine
 
 [OmniRoute](https://github.com/diegosouzapw/OmniRoute) (MIT) is a self-hosted AI

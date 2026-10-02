@@ -2,9 +2,54 @@
 
 ## Unreleased
 
-Smart router, part 1: every engine now says what it can do, every order can say what it needs, and a deterministic classifier (with a cheap model as a fallback) works out the needs of orders that did not say.
+Smart router: every engine says what it can do, every order can say what it needs, and background work goes to the cheapest engine that will most likely do that kind of work well, moving up only after a cheaper one has failed at it.
 
-### Added
+### Smart router, part 2: choosing the engine
+
+- **Cheapest sufficient engine.** Each engine gets a success estimate for the kind of work
+  (a prior from its size class and matching strengths, updated by its own verified and
+  refuted results with a 14-day half-life) and an expected price (declared price, or an
+  assumed frontier list price when none is declared - unpriced is not free; a scarcity price
+  for subscriptions that rises as the weekly cap runs down). The engines whose estimate
+  reaches the kind's threshold (default 0.75) are sufficient and the cheapest wins; with none
+  sufficient the likeliest wins. Ties go to bias, then tier, then speed. Only engines that
+  have the modalities the work needs are considered: code-change needs a `cli` engine that can
+  edit, and an `http` engine (which is sent text only) is never given vision, audio, image or
+  video work. The policy's `never`, subscription protection and caps, `caps_usd`, `where` and
+  tiers still apply first, and the adversary is never routed.
+- **Escalation.** After a result is refuted by its own evidence or sent back with changes
+  requested, the next attempt leaves that engine out and needs an estimate above the failed
+  one's.
+- **Learning.** Verified and refuted results are counted per (engine, kind) in the engine
+  ledger, under its existing lock, and published in the signed inventory (v2-only).
+  `ferry engines` shows each engine's best kinds with their success rate.
+- **Policy: `routing`, `thresholds`, `bias`.** `routing = smart` is the default;
+  `ordered` is exactly the previous strict prefer-list behaviour. Set them with
+  `ferry engines policy set --routing smart --threshold docs=0.7 --bias 'nemotron*=3'`
+  (`--threshold none` / `--bias none` clear them) or in the dashboard's Engine policy panel.
+  They are signed in the policy's v2 view only, so v0.5.17 machines still verify the file.
+- **Explainability.** Every decision is recorded beside the step and in the result: each
+  candidate with its estimate and price, why the others were out, and a one-line reason
+  (`nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient`). `ferry route explain
+  <order>` shows what workers recorded and what would happen now; `ferry route simulate
+  --kind docs --size small [--needs vision]` shows the ranking without running anything.
+  The dashboard shows the reason on each order card, every candidate in the order's drawer,
+  and a Routing panel that runs the simulation (`GET /api/route/simulate`);
+  Telegram's review card carries the one-line reason.
+- Orders from people keep the operator's own engine order unless they need a capability
+  only the router knows engines have (vision, audio, image, video).
+- **Docs:** a "Smart routing" section in `docs/ENGINE_SETUP.md`, with an example for
+  NVIDIA first while free, then Sonnet, then Haiku, local models eligible.
+
+### Changed
+
+- `ferry engines` reads the project the current directory is inside as well as the ferry
+  root's projects, so it no longer says no worker has published when run inside an attached
+  project. Other fleet-wide commands resolve projects as before.
+
+### Smart router, part 1: what engines can do and what orders need
+
+#### Added
 
 - **Engine capability profiles.** Each engine has `modalities` (`text`, `code`, `vision`,
   `image`, `video`, `audio-in`, `audio-out`, `embed`, plus any value a newer peer
