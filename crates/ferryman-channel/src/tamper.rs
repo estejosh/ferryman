@@ -89,10 +89,13 @@ impl Hit {
     }
 }
 
-/// Whether any hit is [`Severity::High`].
+/// Whether any hit is [`Severity::High`] tampering. A part of the diff the scan could not
+/// read ([`Kind::Unscanned`]) is High too, but it is not tampering: it is what the scan did
+/// not clear, and it raises the verdict only to a Concern.
 #[must_use]
 pub fn has_high(hits: &[Hit]) -> bool {
-    hits.iter().any(|hit| hit.severity == Severity::High)
+    hits.iter()
+        .any(|hit| hit.severity == Severity::High && hit.kind != Kind::Unscanned)
 }
 
 /// The hits as lines for a prompt or a person.
