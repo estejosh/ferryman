@@ -2982,6 +2982,18 @@ async fn attempt(
         Attempt::Now => {}
     }
 
+    // An order that has failed twice meets the adversary before a third try: is the work
+    // fixing the cause or hiding the symptom? A Block rides into the next prompt (see
+    // `do_work`) and is put to the master once; only the master taking the order over
+    // stops the attempt.
+    if let crate::adversary::Gate::Hold(why) =
+        crate::adversary::before_attempt(route, config, task, chrono::Utc::now(), report).await
+    {
+        report.warn(&format!("  {id}: {why}; not attempting it"));
+        let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
+        return false;
+    }
+
     // Engine fallback. An engine that is out of credit, or cannot run here, is not a
     // failed attempt: it is marked, and the same order goes straight to the next engine
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
@@ -3438,10 +3450,14 @@ async fn do_work(
     // The interface this order builds to, and the shape its result must take, are the
     // standing facts of the task rather than expertise: they ride just ahead of the skills.
     let contract_text = contract_prompt(route, &task.order);
+    // What the adversary found when it blocked this order's next attempt, if it did.
+    let adversary_text = ferryman_channel::adversary::attempt_notice(route, id)
+        .map(|notice| format!("{notice}\n"))
+        .unwrap_or_default();
     let mut prompt = work_prompt_with_skills(
         config,
         task,
-        &format!("{profile_text}{roster_text}{contract_text}{skills_text}"),
+        &format!("{profile_text}{roster_text}{contract_text}{adversary_text}{skills_text}"),
     );
     if let Some(note) = steer {
         prompt = format!(
@@ -6601,8 +6617,11 @@ mod tests {
     async fn with_only_blocked_engines_an_improvement_waits_and_never_falls_back() {
         hermetic_machine();
         let comms = tempfile::tempdir().unwrap();
+        // Its own order id: the backoff ledger is process-wide and keyed by project and
+        // order id, so sharing "t-mine" with the overlap tests (whose engine-less order
+        // fails and backs off) made this one depend on which ran first.
         let (route, config) =
-            channel_with_order_for_wisp(comms.path(), "t-mine", FREE_AND_SUBSCRIPTION);
+            channel_with_order_for_wisp(comms.path(), "t-mine-direct", FREE_AND_SUBSCRIPTION);
         let mut policy = ferryman_channel::policy::Policy::default();
         policy.never.push("nemotron".into());
         master_sets_policy(&route, policy);
@@ -6621,7 +6640,7 @@ mod tests {
             "{error}"
         );
         // A person's own order is not background work: it ran.
-        let mine = ferryman_channel::read_task(&route, "t-mine").unwrap();
+        let mine = ferryman_channel::read_task(&route, "t-mine-direct").unwrap();
         assert_eq!(mine.results.len(), 1);
     }
 
