@@ -647,6 +647,21 @@ fn unix_ms_to_system_time(value: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(value)
 }
 
+/// Held while one of this agent's own files is read, changed and written back.
+///
+/// A worker that runs several orders at once (`max_parallel`) has several of them
+/// finishing together, each wanting to add a step to the same signed step log or a line to
+/// the same profile. Each of those is read-modify-write on a file with one writer - this
+/// agent - so a lock inside the process is the whole of the contention, and without it the
+/// last writer silently drops the others' lines.
+pub fn own_files_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panic while holding it leaves nothing half-written that the next writer cannot
+    // read past, so a poisoned lock is still a lock.
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("path has no parent")?;
     fs::create_dir_all(parent)?;

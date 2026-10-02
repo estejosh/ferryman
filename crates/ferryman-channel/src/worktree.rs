@@ -167,6 +167,13 @@ fn worktree_holder(repo: &Path) -> String {
 /// worktree path and the branch. Idempotent: a re-dispatched task finds its own
 /// worktree again instead of creating a second one.
 pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(PathBuf, String)> {
+    // One at a time within this process: a worker running several orders at once adds
+    // worktrees to one repository together, and `git worktree add` takes locks in the
+    // repository's shared `.git` that two of them can fight over.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
     let branch = branch_name(order_id, agent);
     // Where a worktree goes.

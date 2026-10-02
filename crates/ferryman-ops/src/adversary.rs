@@ -598,6 +598,7 @@ fn note_step(
         model: engine.and_then(|(engine, _)| engine.model.clone()),
         cost_usd: engine.map(|(_, cost)| cost),
         order: Some(subject.to_string()),
+        effort: engines::effort_used(route, Role::Adversary, engine.map(|(engine, _)| engine)),
         outcome,
     };
     if let Err(error) = ferryman_channel::policy::record_step(route, identity, week, step) {
@@ -672,8 +673,13 @@ pub async fn challenge(
             }
         };
         tried.push(engine.name.clone());
-        let asked =
-            crate::agent::ask_costed(route, &config.with_engine(&engine), &request.prompt).await;
+        let effort = policy.effort_for(Role::Adversary);
+        let asked = crate::agent::ask_costed(
+            route,
+            &config.with_engine_effort(&engine, Some(effort)),
+            &request.prompt,
+        )
+        .await;
         let (answer, cost) = match asked {
             Ok(answered) => answered,
             Err(error) => {
@@ -1273,6 +1279,9 @@ mod tests {
             weekly_usd: None,
             provider: None,
             route: Vec::new(),
+            class: None,
+            effort_args: std::collections::BTreeMap::new(),
+            supports_effort: false,
         }
     }
 

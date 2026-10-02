@@ -10,6 +10,7 @@ description = "Ferryman operations: enable a project, run the worker and reviewe
 anyhow.workspace = true
 chrono.workspace = true
 ferryman-channel = { path = "../ferryman-channel" }
+futures-util.workspace = true
 hostname.workspace = true
 reqwest.workspace = true
 serde.workspace = true

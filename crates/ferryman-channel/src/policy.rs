@@ -235,6 +235,145 @@ fn yes() -> bool {
     true
 }
 
+/// How hard an engine is asked to think: the `{effort}` an engine's arguments may use,
+/// the extra arguments it may declare per level, and the reasoning-effort field an HTTP
+/// engine that supports one is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    pub const ALL: [Effort; 3] = [Effort::Low, Effort::Medium, Effort::High];
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Self::Low),
+            "medium" | "med" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            other => bail!("effort is low, medium or high, not '{other}'"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+}
+
+impl Role {
+    /// The effort a role runs at when the policy names none: plan on high, build on
+    /// medium, chores on low, and the judges - review and the adversary - on high.
+    #[must_use]
+    pub fn default_effort(self) -> Effort {
+        match self {
+            Self::Plan | Self::Review | Self::Adversary => Effort::High,
+            Self::Build => Effort::Medium,
+            Self::Chore => Effort::Low,
+        }
+    }
+}
+
+/// How big a model is, which is what decides what work it is worth spending on: a swarm
+/// of small ones for chores, mid-size ones to build, a large one to plan and judge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelClass {
+    Small,
+    Medium,
+    Large,
+}
+
+impl ModelClass {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "small" => Ok(Self::Small),
+            "medium" | "mid" => Ok(Self::Medium),
+            "large" => Ok(Self::Large),
+            other => bail!("class is small, medium or large, not '{other}'"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+}
+
+/// A model's size class, guessed from its name when nobody declared one.
+///
+/// A parameter count in the name decides first - `llama-3.1-8b` is small, `70b` and up is
+/// large, in between is medium - and for a mixture-of-experts name that also gives the
+/// active count (`...-120b-a12b`) the active count is the one used, since that is what
+/// it costs to run. Without a size, a word decides: small for `haiku`, `mini`, `nano`,
+/// `flash-lite` and `small`; large for `opus`, `pro`, `ultra`, `large`, `reasoner` and
+/// `r1`; medium for everything else (`sonnet`, `flash`, `deepseek-chat`, `nemotron
+/// super`). Whoever runs the engine can always say better: `engine.<name>.class`.
+#[must_use]
+pub fn guess_class(model: &str) -> ModelClass {
+    let lower = model.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| matches!(c, '-' | '_' | '/' | ':' | ' ' | '@'))
+        .filter(|token| !token.is_empty())
+        .collect();
+    // `70b`, `1.5b`; and `a12b`, the active parameters of a mixture of experts.
+    let billions = |token: &str, active: bool| -> Option<f64> {
+        let digits = if active {
+            token.strip_prefix('a')?
+        } else {
+            token
+        };
+        let digits = digits.strip_suffix('b')?;
+        (!digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit() || c == '.'))
+            .then(|| digits.parse::<f64>().ok())
+            .flatten()
+    };
+    let size = tokens
+        .iter()
+        .find_map(|token| billions(token, true))
+        .or_else(|| tokens.iter().find_map(|token| billions(token, false)));
+    if let Some(size) = size {
+        return if size < 10.0 {
+            ModelClass::Small
+        } else if size < 70.0 {
+            ModelClass::Medium
+        } else {
+            ModelClass::Large
+        };
+    }
+    let has = |word: &str| tokens.contains(&word);
+    if has("haiku")
+        || has("mini")
+        || has("nano")
+        || has("small")
+        || lower.contains("flash-lite")
+        || lower.contains("flash_lite")
+    {
+        ModelClass::Small
+    } else if has("opus")
+        || has("pro")
+        || has("ultra")
+        || has("large")
+        || has("reasoner")
+        || has("r1")
+    {
+        ModelClass::Large
+    } else {
+        ModelClass::Medium
+    }
+}
+
 /// One project's engine policy.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Policy {
@@ -265,6 +404,21 @@ pub struct Policy {
     /// Left out of the signed JSON when advisory, like `auto_merge` when none.
     #[serde(default, skip_serializing_if = "AdversaryMode::is_advisory")]
     pub adversary: AdversaryMode,
+    /// Per role: how hard its engine is asked to think. A role left out runs at
+    /// [`Role::default_effort`]. Left out of the signed JSON when empty, so a policy
+    /// signed before this existed still verifies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub effort: BTreeMap<Role, Effort>,
+    /// Per role: the most improvement orders of that role the fleet has claimed at once
+    /// (build and chore are the roles that claim orders). A role left out is not
+    /// capped. Left out of the signed JSON when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub width: BTreeMap<Role, u8>,
+    /// Roles whose background work may use a subscription despite
+    /// `protect_subscriptions` - and only an engine that has a `weekly_requests` cap, so
+    /// a swarm cannot drain it. Left out of the signed JSON when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscription_roles: Vec<Role>,
 }
 
 impl Default for Policy {
@@ -278,6 +432,9 @@ impl Default for Policy {
             never_applies_to: NeverScope::Background,
             auto_merge: AutoMerge::None,
             adversary: AdversaryMode::Advisory,
+            effort: BTreeMap::new(),
+            width: BTreeMap::new(),
+            subscription_roles: Vec::new(),
         }
     }
 }
@@ -300,7 +457,36 @@ impl Policy {
                 bail!("the {role} cap must be a dollar amount of zero or more");
             }
         }
+        for (role, width) in &self.width {
+            if *width == 0 {
+                bail!(
+                    "the {} width must be 1 or more; to stop a role, leave it no engine",
+                    role.as_str()
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// How hard `role`'s engine is asked to think: the policy's word, else the default.
+    #[must_use]
+    pub fn effort_for(&self, role: Role) -> Effort {
+        self.effort
+            .get(&role)
+            .copied()
+            .unwrap_or_else(|| role.default_effort())
+    }
+
+    /// The most orders of `role` the fleet may have claimed at once, when capped.
+    #[must_use]
+    pub fn width_for(&self, role: Role) -> Option<u8> {
+        self.width.get(&role).copied()
+    }
+
+    /// Whether the policy lets `role` use a subscription that is capped.
+    #[must_use]
+    pub fn subscriptions_for(&self, role: Role) -> bool {
+        self.subscription_roles.contains(&role)
     }
 
     /// The role's preference list, empty when it has none.
@@ -320,6 +506,18 @@ impl Policy {
     /// Why this engine may not do this work, or `None` when it may.
     #[must_use]
     pub fn blocked(&self, engine: &Candidate, work: Work) -> Option<String> {
+        self.blocked_for(engine, work, None)
+    }
+
+    /// [`Self::blocked`] for work in `role`: `subscription_roles` lets a role use a
+    /// subscription, but only one with a `weekly_requests` cap.
+    #[must_use]
+    pub fn blocked_for(
+        &self,
+        engine: &Candidate,
+        work: Work,
+        role: Option<Role>,
+    ) -> Option<String> {
         if (work == Work::Background || self.never_applies_to == NeverScope::All)
             && let Some(selector) = self.never.iter().find(|s| matches(s, engine))
         {
@@ -329,6 +527,19 @@ impl Policy {
             && self.protect_subscriptions
             && engine.paid_class() == "subscription"
         {
+            if let Some(role) = role
+                && self.subscriptions_for(role)
+            {
+                if engine.weekly_requests.is_some() {
+                    return None;
+                }
+                return Some(format!(
+                    "a subscription with no weekly_requests cap: subscription_roles lists {} \
+                     but only an engine with a weekly cap may be used, so a swarm cannot \
+                     drain it",
+                    role.as_str()
+                ));
+            }
             return Some(if engine.paid == "subscription" {
                 "a subscription, and protect_subscriptions is on".to_string()
             } else {
@@ -461,6 +672,28 @@ impl Policy {
                 "allowed"
             }
         ));
+        if !self.subscription_roles.is_empty() {
+            lines.push(format!(
+                "subscriptions allowed for {} - only an engine with a weekly_requests cap",
+                self.subscription_roles
+                    .iter()
+                    .map(|role| role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        for role in Role::ALL {
+            let effort = self.effort.get(&role);
+            let width = self.width.get(&role);
+            if effort.is_some() || width.is_some() {
+                lines.push(format!(
+                    "{}: effort {}{}",
+                    role.as_str(),
+                    self.effort_for(role).as_str(),
+                    width.map_or(String::new(), |width| format!(", width {width}"))
+                ));
+            }
+        }
         if self.never_applies_to == NeverScope::All {
             lines.push("never applies to people's own orders too".to_string());
         }
@@ -504,6 +737,9 @@ fn check_selector(selector: &str) -> Result<()> {
     {
         bail!("paid:{class} names no paid class (subscription, prepaid, free-tier, local)");
     }
+    if let Some(class) = trimmed.strip_prefix("class:") {
+        ModelClass::parse(class)?;
+    }
     Ok(())
 }
 
@@ -533,6 +769,10 @@ pub struct Candidate {
     pub host: Option<String>,
     /// A weekly cap bounds it.
     pub capped: bool,
+    /// Its weekly request cap, when one is set: the cap `subscription_roles` needs.
+    pub weekly_requests: Option<u64>,
+    /// The size class its worker published; `None` from a worker older than classes.
+    pub class: Option<ModelClass>,
     /// `up`, `down`, `exhausted` or `unknown`.
     pub state: String,
     /// When an exhausted engine is expected back.
@@ -564,6 +804,11 @@ impl Candidate {
             paid: report.paid.clone(),
             host: billing.host,
             capped: billing.capped,
+            weekly_requests: billing.weekly_requests,
+            class: report
+                .class
+                .as_deref()
+                .and_then(|class| ModelClass::parse(class).ok()),
             state: report.state.clone(),
             until: report.until,
             verified: trust.verified,
@@ -593,6 +838,14 @@ impl Candidate {
             return "subscription";
         }
         &self.paid
+    }
+
+    /// Its size class: the one its worker published (declared or guessed there), else
+    /// guessed here from its model - or its name, with no model.
+    #[must_use]
+    pub fn class(&self) -> ModelClass {
+        self.class
+            .unwrap_or_else(|| guess_class(self.model.as_deref().unwrap_or(&self.name)))
     }
 
     /// The tier it may work at now: chore while demoted.
@@ -633,6 +886,12 @@ impl Candidate {
             } else {
                 " with no cap"
             });
+        }
+        if self.paid_class() == "subscription" {
+            match self.weekly_requests {
+                Some(cap) => text.push_str(&format!(" with a weekly cap of {cap} requests")),
+                None => text.push_str(" with no weekly request cap"),
+            }
         }
         text.push_str(&format!(
             ", {} verified, {} refuted",
@@ -680,6 +939,7 @@ pub fn auto_rank(engine: &Candidate) -> u8 {
 ///
 /// - `paid:free-tier` (also `paid:subscription`, `paid:prepaid`, `paid:local`,
 ///   `paid:unknown`): how it is paid for;
+/// - `class:small` (also `class:medium`, `class:large`): its size class;
 /// - `model:nvidia/nemotron*`: a model glob; `name:nemotron` (or `engine:`): the engine's
 ///   name in agent.toml, glob allowed; `host:deepseek.com` (or `provider:`): the endpoint
 ///   host or any subdomain of it;
@@ -697,7 +957,7 @@ pub fn matches(selector: &str, engine: &Candidate) -> bool {
         Some((kind, rest))
             if matches!(
                 kind,
-                "paid" | "model" | "name" | "engine" | "host" | "provider"
+                "paid" | "model" | "name" | "engine" | "host" | "provider" | "class"
             ) =>
         {
             (kind, rest.trim())
@@ -716,6 +976,7 @@ pub fn matches(selector: &str, engine: &Candidate) -> bool {
     let provider_of = |step: &String| step.split('/').next().unwrap_or_default().to_string();
     match kind {
         "paid" => normal_paid(pattern) == engine.paid_class(),
+        "class" => ModelClass::parse(pattern).is_ok_and(|class| class == engine.class()),
         "model" => {
             (!model.is_empty() && glob(pattern, &model))
                 || route.iter().any(|step| glob(pattern, step))
@@ -835,7 +1096,7 @@ pub fn rank(policy: &Policy, role: Role, tier: &str, work: Work, engines: &[Cand
             ));
             continue;
         }
-        if let Some(why) = policy.blocked(engine, work) {
+        if let Some(why) = policy.blocked_for(engine, work, Some(role)) {
             ranking.blocked.push((index, why));
             continue;
         }
@@ -1043,6 +1304,8 @@ pub fn view(policy: &Policy, engines: &[Candidate]) -> serde_json::Value {
             "machine": engine.machine,
             "model": engine.model,
             "paid": engine.paid_class(),
+            "class": engine.class().as_str(),
+            "weekly_requests": engine.weekly_requests,
             "facts": engine.facts(),
         })
     };
@@ -1054,6 +1317,10 @@ pub fn view(policy: &Policy, engines: &[Candidate]) -> serde_json::Value {
         roles.insert(
             role.as_str().to_string(),
             serde_json::json!({
+                "effort": policy.effort_for(role).as_str(),
+                "effort_set": policy.effort.contains_key(&role),
+                "width": policy.width_for(role),
+                "subscriptions": policy.subscriptions_for(role),
                 "order": ranking.order.iter().map(|i| describe(&engines[*i])).collect::<Vec<_>>(),
                 "out": ranking.out.iter().map(|(i, why)| {
                     let mut line = describe(&engines[*i]);
@@ -1090,6 +1357,8 @@ pub fn choices(policy: &Policy, engines: &[Candidate], recommended: &Policy) -> 
             "selector": selector,
             "label": label(engine),
             "paid": engine.paid_class(),
+            "class": engine.class().as_str(),
+            "weekly_requests": engine.weekly_requests,
             "machines": machines,
             "blocked": policy.blocked(engine, Work::Background),
             "recommended": recommend.is_some_and(|chosen| chosen.eq_ignore_ascii_case(&selector)),
@@ -1210,30 +1479,7 @@ fn ordinal(rank: usize) -> String {
 /// workers online now and not paused.
 #[must_use]
 pub fn recommend(engines: &[Candidate], online: &[String]) -> Recommendation {
-    // One entry per engine name: the same engine on two machines is one choice, and its
-    // record is the two machines' together.
-    let mut merged: Vec<Candidate> = Vec::new();
-    for engine in engines {
-        match merged
-            .iter_mut()
-            .find(|seen| seen.name.eq_ignore_ascii_case(&engine.name))
-        {
-            Some(seen) => {
-                seen.verified += engine.verified;
-                seen.refuted += engine.refuted;
-                seen.spend_usd += engine.spend_usd;
-                seen.demoted &= engine.demoted;
-                seen.flag = seen.flag.take().or_else(|| engine.flag.clone());
-                seen.capped &= engine.capped;
-            }
-            None => {
-                let mut first = engine.clone();
-                first.state = "up".to_string();
-                first.until = None;
-                merged.push(first);
-            }
-        }
-    }
+    let merged = merge_engines(engines);
     let base = Policy::default();
     let mut policy = Policy::default();
     let mut reasons = Vec::new();
@@ -1347,6 +1593,45 @@ pub fn recommend(engines: &[Candidate], online: &[String]) -> Recommendation {
             reasons.push(format!("{} never for background work: {why}", engine.name));
         }
     }
+    policy.machines = online_machines(online, &mut reasons);
+    Recommendation { policy, reasons }
+}
+
+/// One entry per engine name: the same engine on two machines is one choice, and its
+/// record is the two machines' together. A subscription is capped only when it is on
+/// every machine that has it.
+fn merge_engines(engines: &[Candidate]) -> Vec<Candidate> {
+    let mut merged: Vec<Candidate> = Vec::new();
+    for engine in engines {
+        match merged
+            .iter_mut()
+            .find(|seen| seen.name.eq_ignore_ascii_case(&engine.name))
+        {
+            Some(seen) => {
+                seen.verified += engine.verified;
+                seen.refuted += engine.refuted;
+                seen.spend_usd += engine.spend_usd;
+                seen.demoted &= engine.demoted;
+                seen.flag = seen.flag.take().or_else(|| engine.flag.clone());
+                seen.capped &= engine.capped;
+                seen.weekly_requests = seen
+                    .weekly_requests
+                    .zip(engine.weekly_requests)
+                    .map(|(a, b)| a.min(b));
+            }
+            None => {
+                let mut first = engine.clone();
+                first.state = "up".to_string();
+                first.until = None;
+                merged.push(first);
+            }
+        }
+    }
+    merged
+}
+
+/// The workers online now, once each, with the line that says so.
+fn online_machines(online: &[String], reasons: &mut Vec<String>) -> Vec<String> {
     let mut machines: Vec<String> = Vec::new();
     for agent in online {
         if !machines.iter().any(|m| m.eq_ignore_ascii_case(agent)) {
@@ -1361,8 +1646,368 @@ pub fn recommend(engines: &[Candidate], online: &[String]) -> Recommendation {
             machines.join(", ")
         ));
     }
-    policy.machines = machines;
+    machines
+}
+
+// --- the team preset ----------------------------------------------------------------------
+
+/// What a person asks of the team preset beyond its defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TeamOptions {
+    /// Roles whose background work may use a capped subscription.
+    pub subscription_roles: Vec<Role>,
+    /// Widths that replace the preset's (plan 1, build 3, chore 4).
+    pub width: BTreeMap<Role, u8>,
+    /// Efforts that replace the preset's (plan, review and adversary high, build medium,
+    /// chore low).
+    pub effort: BTreeMap<Role, Effort>,
+}
+
+/// The size classes a role looks for, best fit first: a large model plans, judges and
+/// challenges; a mid-size one builds; a small one does chores. Whatever is left after the
+/// fit follows, so a fleet without the ideal engine still has someone to ask.
+fn class_order(role: Role) -> [ModelClass; 3] {
+    match role {
+        Role::Plan | Role::Review | Role::Adversary => {
+            [ModelClass::Large, ModelClass::Medium, ModelClass::Small]
+        }
+        Role::Build => [ModelClass::Medium, ModelClass::Large, ModelClass::Small],
+        Role::Chore => [ModelClass::Small, ModelClass::Medium, ModelClass::Large],
+    }
+}
+
+fn class_place(role: Role, engine: &Candidate) -> usize {
+    class_order(role)
+        .iter()
+        .position(|class| *class == engine.class())
+        .unwrap_or(2)
+}
+
+/// "Plan on high, build on medium, swarm the cheap work": a recommended policy built from
+/// the engines the fleet published.
+///
+/// - plan: a large judge-tier engine, high effort, one at a time;
+/// - build: mid-size engines, medium effort, three orders at once;
+/// - chore: the smallest engines, low effort, four at once;
+/// - review: a large judge, high effort;
+/// - adversary: a large judge of a different model family from the engine that builds
+///   first, high effort, advisory.
+///
+/// Within a size class the order is [`recommend`]'s: local, free, capped prepaid, then
+/// the rest, with trust and cost per verified result breaking ties, and subscriptions
+/// never while `protect_subscriptions` holds - except for the roles in
+/// `options.subscription_roles`, and then only an engine with a `weekly_requests` cap. An
+/// engine of the wrong size is kept after the right ones, as the fallback.
+#[must_use]
+pub fn team(engines: &[Candidate], online: &[String], options: &TeamOptions) -> Recommendation {
+    let merged = merge_engines(engines);
+    let mut policy = Policy::default();
+    for role in &options.subscription_roles {
+        if !policy.subscription_roles.contains(role) {
+            policy.subscription_roles.push(*role);
+        }
+    }
+    policy.subscription_roles.sort();
+    for role in Role::ALL {
+        policy.effort.insert(
+            role,
+            options
+                .effort
+                .get(&role)
+                .copied()
+                .unwrap_or_else(|| role.default_effort()),
+        );
+    }
+    for (role, width) in [(Role::Plan, 1), (Role::Build, 3), (Role::Chore, 4)] {
+        policy.width.insert(role, width);
+    }
+    for (role, width) in &options.width {
+        policy.width.insert(*role, *width);
+    }
+    let mut reasons = Vec::new();
+    let mut build_first: Option<Builder> = None;
+    for role in [Role::Plan, Role::Build, Role::Review, Role::Chore] {
+        let ranking = rank(&policy, role, role.tier(), Work::Background, &merged);
+        let mut order: Vec<usize> = ranking.order.clone();
+        // A judge plans before anything else does, whatever its size; then the size that
+        // fits, then the ranking the engines always followed.
+        order.sort_by_key(|index| {
+            let engine = &merged[*index];
+            (
+                matches!(role, Role::Plan | Role::Review) && engine.level() < 2,
+                class_place(role, engine),
+            )
+        });
+        let list: Vec<String> = order
+            .iter()
+            .map(|index| format!("name:{}", merged[*index].name.to_ascii_lowercase()))
+            .collect();
+        let effort = policy.effort_for(role);
+        for (place, index) in order.iter().enumerate() {
+            let engine = &merged[*index];
+            let fits = class_place(role, engine) == 0;
+            let judge = if matches!(role, Role::Plan | Role::Review) && engine.level() == 2 {
+                ", judge tier"
+            } else {
+                ""
+            };
+            reasons.push(format!(
+                "{} {} for {}: {} class{judge}{}, {} effort, {}",
+                engine.name,
+                ordinal(place),
+                role.as_str(),
+                engine.class().as_str(),
+                if fits {
+                    String::new()
+                } else {
+                    format!(" (not {}: the fallback)", class_order(role)[0].as_str())
+                },
+                effort.as_str(),
+                engine.facts()
+            ));
+        }
+        if role == Role::Build {
+            build_first = order.first().map(|index| Builder {
+                engine: merged[*index].name.clone(),
+                model: merged[*index].model.clone(),
+            });
+        }
+        if list.is_empty() {
+            reasons.push(format!(
+                "nothing for {}: no allowed engine can do it, so it would wait",
+                role.as_str()
+            ));
+        } else {
+            policy.prefer.insert(role.as_str().to_string(), list);
+        }
+    }
+    // The adversary: a large judge, and - the point of it - not the family of the engine
+    // that builds first.
+    let top_build: Vec<Builder> = build_first.into_iter().collect();
+    let challengers = diversify(
+        rank(
+            &policy,
+            Role::Adversary,
+            Role::Adversary.tier(),
+            Work::Background,
+            &merged,
+        ),
+        &top_build,
+        &merged,
+    );
+    let mut keyed: Vec<(bool, bool, usize, usize)> = challengers
+        .ranking
+        .order
+        .iter()
+        .enumerate()
+        .map(|(place, index)| {
+            (
+                challengers.same_engine[place],
+                challengers.same_family[place],
+                class_place(Role::Adversary, &merged[*index]),
+                *index,
+            )
+        })
+        .collect();
+    keyed.sort_by_key(|(same_engine, same_family, class, _)| (*same_engine, *same_family, *class));
+    let mut adversaries = Vec::new();
+    for (place, (same_engine, same_family, _, index)) in keyed.iter().enumerate() {
+        let engine = &merged[*index];
+        adversaries.push(format!("name:{}", engine.name.to_ascii_lowercase()));
+        let versus = match top_build.first() {
+            None => String::new(),
+            Some(builder) if *same_engine => format!(
+                "the same engine as {}, the top build engine - used only when nothing else \
+                 is allowed, ",
+                builder.engine
+            ),
+            Some(builder) if *same_family => format!(
+                "the same family ({}) as {}, the top build engine, ",
+                family_of(engine),
+                builder.engine
+            ),
+            Some(builder) => format!(
+                "a different family ({}) from {}, the top build engine, ",
+                family_of(engine),
+                builder.engine
+            ),
+        };
+        reasons.push(format!(
+            "{} {} for adversary: {} class, judge tier, {versus}{} effort, {}",
+            engine.name,
+            ordinal(place),
+            engine.class().as_str(),
+            policy.effort_for(Role::Adversary).as_str(),
+            engine.facts()
+        ));
+    }
+    if adversaries.is_empty() {
+        reasons.push(
+            "nothing for adversary: no allowed judge-tier engine, so nothing would challenge \
+             the work"
+                .to_string(),
+        );
+    } else {
+        policy
+            .prefer
+            .insert(Role::Adversary.as_str().to_string(), adversaries);
+    }
+    for role in [Role::Plan, Role::Build, Role::Chore] {
+        if let Some(width) = policy.width_for(role) {
+            reasons.push(format!(
+                "{}: up to {width} at once across the fleet",
+                role.as_str()
+            ));
+        }
+    }
+    // What the subscription opt-in did and did not reach.
+    let mut named = BTreeSet::new();
+    for engine in &merged {
+        if engine.paid_class() != "subscription" {
+            continue;
+        }
+        for role in &policy.subscription_roles {
+            if let Some(why) = policy.blocked_for(engine, Work::Background, Some(*role))
+                && named.insert((engine.name.to_ascii_lowercase(), *role))
+            {
+                reasons.push(format!(
+                    "{} not used for {}: {why}",
+                    engine.name,
+                    role.as_str()
+                ));
+            }
+        }
+    }
+    let mut blocked = BTreeSet::new();
+    for engine in &merged {
+        let used = policy
+            .prefer
+            .values()
+            .any(|list| list.contains(&format!("name:{}", engine.name.to_ascii_lowercase())));
+        if !used
+            && let Some(why) = policy.blocked(engine, Work::Background)
+            && blocked.insert(engine.name.to_ascii_lowercase())
+        {
+            reasons.push(format!("{} never for background work: {why}", engine.name));
+        }
+    }
+    policy.machines = online_machines(online, &mut reasons);
     Recommendation { policy, reasons }
+}
+
+/// The team preset for one project, from its channel.
+#[must_use]
+pub fn team_for(route: &ProjectRoute, now: DateTime<Utc>, options: &TeamOptions) -> Recommendation {
+    team(&fleet(route, now), &online(route, now), options)
+}
+
+// --- width: how many orders at once -------------------------------------------------------
+
+/// The tag every improvement order carries.
+pub const IMPROVEMENT_TAG: &str = "improvement";
+
+fn is_improvement_order(order: &crate::Order) -> bool {
+    order
+        .payload
+        .get("tags")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(IMPROVEMENT_TAG)))
+}
+
+/// The role an improvement order's work is done in: chore for a chore-tier order,
+/// otherwise build.
+#[must_use]
+pub fn order_role(order: &crate::Order) -> Role {
+    Role::for_order_tier(
+        order
+            .payload
+            .get("tier")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("build"),
+    )
+}
+
+/// How many improvement orders are claimed right now, per role, by anyone: a claim whose
+/// holder's heartbeat has lapsed (stale) is not being worked on, so it is not counted.
+#[must_use]
+pub fn claimed_per_role(tasks: &[crate::Task]) -> BTreeMap<Role, usize> {
+    let mut counts = BTreeMap::new();
+    for task in tasks {
+        if is_improvement_order(&task.order)
+            && matches!(task.state(), crate::TaskState::Claimed { .. })
+        {
+            *counts.entry(order_role(&task.order)).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Why a worker should not claim `order` yet: it is an improvement order, and the fleet
+/// already has the policy's `width` for its role claimed. `None` when it may be claimed,
+/// including whenever the role has no width.
+///
+/// Counted from `tasks` as read now, so an order this same worker claimed a moment ago
+/// in the same pass counts. Like the file-overlap check it is a soft cap: two machines
+/// claiming in the same instant can each get in.
+#[must_use]
+pub fn width_hold(policy: &Policy, tasks: &[crate::Task], order: &crate::Order) -> Option<String> {
+    if !is_improvement_order(order) {
+        return None;
+    }
+    let role = order_role(order);
+    let width = policy.width_for(role)?;
+    let claimed = claimed_per_role(tasks).get(&role).copied().unwrap_or(0);
+    (claimed >= usize::from(width)).then(|| {
+        format!(
+            "the policy's width for {} is {width}, and that many are claimed already",
+            role.as_str()
+        )
+    })
+}
+
+/// [`width_hold`] for a project, read from its channel.
+#[must_use]
+pub fn width_hold_in(route: &ProjectRoute, order: &crate::Order) -> Option<String> {
+    if !is_improvement_order(order) {
+        return None;
+    }
+    let (policy, _) = effective(&route.communications, &route.project_id);
+    policy.width_for(order_role(order))?;
+    let tasks = crate::list_tasks(route).ok()?;
+    width_hold(&policy, &tasks, order)
+}
+
+/// One line per role as a person reads it: how hard it thinks, how many at once, and
+/// the class of the engine first in line.
+#[must_use]
+pub fn role_lines(policy: &Policy, engines: &[Candidate]) -> Vec<String> {
+    Role::ALL
+        .iter()
+        .map(|role| {
+            let first = rank(policy, *role, role.tier(), Work::Background, engines)
+                .order
+                .first()
+                .map(|index| &engines[*index]);
+            format!(
+                "{:<10}effort {}{}, width {}, {}",
+                role.as_str(),
+                policy.effort_for(*role).as_str(),
+                if policy.effort.contains_key(role) {
+                    ""
+                } else {
+                    " (default)"
+                },
+                policy
+                    .width_for(*role)
+                    .map_or("unlimited".to_string(), |width| width.to_string()),
+                first.map_or("no engine can do it now".to_string(), |engine| format!(
+                    "first: {} ({} class)",
+                    engine.name,
+                    engine.class().as_str()
+                )),
+            )
+        })
+        .collect()
 }
 
 /// Every engine the fleet published into this channel: valid, signed inventories no
@@ -1609,6 +2254,10 @@ pub struct Step {
     /// The improvement order, for a build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order: Option<String>,
+    /// How hard the engine was asked to think (`low`, `medium`, `high`), where it ran
+    /// with an effort. Left out of the signed JSON when unknown, so older records verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// `done`, or what happened instead: `held: ...`, `failed: ...`.
     pub outcome: String,
 }
@@ -1630,8 +2279,13 @@ impl Step {
             .cost_usd
             .map(|cost| format!(", ${cost:.2}"))
             .unwrap_or_default();
+        let effort = self
+            .effort
+            .as_ref()
+            .map(|effort| format!(", {effort} effort"))
+            .unwrap_or_default();
         format!(
-            "{what}: {engine} on {} ({}){cost} - {}",
+            "{what}: {engine} on {} ({}){effort}{cost} - {}",
             self.machine, self.agent, self.outcome
         )
     }
@@ -1679,6 +2333,7 @@ pub fn record_step(
         bail!("agent and week must be path-safe");
     }
     let path = steps_dir(route, week).join(format!("{agent}.json"));
+    let _lock = crate::own_files_lock();
     let mut log = std::fs::read(&path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<StepLog>(&bytes).ok())
@@ -2694,6 +3349,7 @@ mod tests {
             model: Some("nvidia/nemotron".into()),
             cost_usd: Some(cost),
             order: None,
+            effort: None,
             outcome: "done".into(),
         };
         record_step(&route, &wisp, "2026-W40", step("plan", 0.25)).unwrap();
@@ -2725,5 +3381,460 @@ mod tests {
         forged.signature = Some(josh.sign_bytes(steps_payload(&forged).as_bytes()));
         crate::atomic_json(&steps_dir(&route, "2026-W40").join("wisp.json"), &forged).unwrap();
         assert!(read_steps(&route, "2026-W40").is_empty());
+    }
+
+    // --- effort, class, width, subscription_roles and the team preset ---------------------
+
+    /// A policy signed before effort, width and subscription_roles existed carries none
+    /// of them and still verifies; one that uses them round-trips through a signed file.
+    #[test]
+    fn a_policy_signed_before_effort_width_and_subscriptions_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+
+        let mut old = Policy::default();
+        old.never.push("claude".into());
+        let shape = serde_json::to_value(&old).unwrap();
+        for key in ["effort", "width", "subscription_roles"] {
+            assert!(shape.get(key).is_none(), "{key} is left out: {shape}");
+        }
+        let from_old: Policy = serde_json::from_value(shape.clone()).unwrap();
+        assert_eq!(from_old, old);
+        assert!(from_old.effort.is_empty() && from_old.width.is_empty());
+        assert!(from_old.subscription_roles.is_empty());
+        assert_eq!(
+            serde_jcs::to_string(&from_old).unwrap(),
+            serde_jcs::to_string(&shape).unwrap(),
+            "the bytes the old signature covered are the bytes now"
+        );
+        assert!(set_policy(channel, "demo", Some(old.clone()), &josh).unwrap());
+        assert_eq!(effective(channel, "demo").0, old);
+
+        let mut new = old.clone();
+        new.effort.insert(Role::Build, Effort::Low);
+        new.width.insert(Role::Chore, 4);
+        new.subscription_roles = vec![Role::Build, Role::Chore];
+        new.check().unwrap();
+        let shape = serde_json::to_value(&new).unwrap();
+        assert_eq!(shape["effort"]["build"], "low");
+        assert_eq!(shape["width"]["chore"], 4);
+        assert_eq!(shape["subscription_roles"][1], "chore");
+        assert!(set_policy(channel, "demo", Some(new.clone()), &josh).unwrap());
+        let (read, set) = effective(channel, "demo");
+        assert!(set.is_some(), "the signature over the new fields verifies");
+        assert_eq!(read, new);
+
+        let zero = Policy {
+            width: BTreeMap::from([(Role::Build, 0)]),
+            ..Policy::default()
+        };
+        assert!(zero.check().is_err(), "a width of zero is refused");
+    }
+
+    #[test]
+    fn effort_has_defaults_per_role_and_the_policy_overrides_them() {
+        let mut policy = Policy::default();
+        assert_eq!(policy.effort_for(Role::Plan), Effort::High);
+        assert_eq!(policy.effort_for(Role::Review), Effort::High);
+        assert_eq!(policy.effort_for(Role::Adversary), Effort::High);
+        assert_eq!(policy.effort_for(Role::Build), Effort::Medium);
+        assert_eq!(policy.effort_for(Role::Chore), Effort::Low);
+        policy.effort.insert(Role::Build, Effort::High);
+        assert_eq!(policy.effort_for(Role::Build), Effort::High);
+        assert_eq!(policy.effort_for(Role::Chore), Effort::Low);
+        assert_eq!(Effort::parse("Medium").unwrap(), Effort::Medium);
+        assert!(Effort::parse("extreme").is_err());
+        assert!(Effort::Low < Effort::Medium && Effort::Medium < Effort::High);
+    }
+
+    #[test]
+    fn a_model_class_is_guessed_from_its_name() {
+        let small = [
+            "claude-haiku-4",
+            "gpt-5-mini",
+            "o4-mini",
+            "gpt-5-nano",
+            "gemini-2.5-flash-lite",
+            "mistral-small-3",
+            "meta/llama-3.1-8b-instruct",
+            "qwen2.5-coder-1.5b",
+            "phi-3-mini-4k",
+            "llama3.2:3b",
+        ];
+        let large = [
+            "claude-opus-4",
+            "gemini-2.5-pro",
+            "deepseek-v4-pro",
+            "gemini-ultra",
+            "mistral-large-2",
+            "deepseek-reasoner",
+            "deepseek-r1",
+            "meta/llama-3.3-70b-instruct",
+            "gpt-oss-120b",
+            "nvidia/nemotron-70b",
+        ];
+        let medium = [
+            "claude-sonnet-4",
+            "gemini-2.5-flash",
+            "deepseek-chat",
+            "nvidia/llama-3.3-nemotron-super-49b-v1",
+            "nvidia/nemotron-3-super-120b-a12b",
+            "gpt-5",
+            "kimi-k2",
+            "qwen/qwen3-coder-480b-a35b-instruct",
+            "glm-4.6",
+        ];
+        for model in small {
+            assert_eq!(guess_class(model), ModelClass::Small, "{model}");
+        }
+        for model in large {
+            assert_eq!(guess_class(model), ModelClass::Large, "{model}");
+        }
+        for model in medium {
+            assert_eq!(guess_class(model), ModelClass::Medium, "{model}");
+        }
+        assert_eq!(ModelClass::parse("Small").unwrap(), ModelClass::Small);
+        assert!(ModelClass::parse("huge").is_err());
+    }
+
+    #[test]
+    fn a_declared_class_wins_and_class_is_a_selector() {
+        let mut sonnet = engine("claude", "build", "subscription");
+        sonnet.model = Some("claude-sonnet-4".into());
+        assert_eq!(sonnet.class(), ModelClass::Medium, "guessed");
+        sonnet.class = Some(ModelClass::Small);
+        assert_eq!(sonnet.class(), ModelClass::Small, "declared wins");
+        assert!(matches("class:small", &sonnet));
+        assert!(!matches("class:large", &sonnet));
+        assert!(check_selector("class:small").is_ok());
+        assert!(check_selector("class:enormous").is_err());
+        // With no model the name is what is guessed from.
+        assert_eq!(
+            engine("haiku", "chore", "free-tier").class(),
+            ModelClass::Small
+        );
+    }
+
+    fn task(id: &str, tier: &str, improvement: bool, claimed: Option<(&str, i64)>) -> crate::Task {
+        let tags: Vec<&str> = if improvement {
+            vec![IMPROVEMENT_TAG]
+        } else {
+            vec![]
+        };
+        crate::Task {
+            order: crate::Order {
+                id: id.into(),
+                project_id: "demo".into(),
+                issued_by: "boss".into(),
+                assigned_to: None,
+                created_at: Utc::now(),
+                payload: serde_json::json!({ "tier": tier, "tags": tags }),
+                requires_review: false,
+                requires_approval: false,
+                depends_on: Vec::new(),
+                signed_by: None,
+                signature: None,
+                result_contract: None,
+                interface: None,
+                touches: Vec::new(),
+                allow_overlap: false,
+            },
+            claims: claimed
+                .map(|(agent, age)| crate::Claim {
+                    order_id: id.into(),
+                    agent: agent.into(),
+                    claimed_at: Utc::now() - Duration::seconds(age),
+                })
+                .into_iter()
+                .collect(),
+            results: Vec::new(),
+            reviews: Vec::new(),
+            recommendations: Vec::new(),
+            heartbeats: Vec::new(),
+            releases: Vec::new(),
+            kills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_width_cap_counts_current_claims_of_the_role_and_not_stale_ones() {
+        let policy = Policy {
+            width: BTreeMap::from([(Role::Build, 2), (Role::Chore, 1)]),
+            ..Policy::default()
+        };
+        let stale = (crate::HEARTBEAT_STALE_MULTIPLE + 5) * crate::HEARTBEAT_INTERVAL_SECS;
+        let tasks = vec![
+            task("b1", "build", true, Some(("wisp", 5))),
+            task("b2", "build", true, Some(("fang", 5))),
+            task("b-stale", "build", true, Some(("old", stale))),
+            task("c1", "chore", true, Some(("wisp", 5))),
+            // Not an improvement order: a person's own, never counted or capped.
+            task("direct", "build", false, Some(("wisp", 5))),
+            task("open-build", "build", true, None),
+            task("open-chore", "chore", true, None),
+            task("open-direct", "build", false, None),
+        ];
+        let counts = claimed_per_role(&tasks);
+        assert_eq!(
+            counts.get(&Role::Build),
+            Some(&2),
+            "stale and direct are not counted"
+        );
+        assert_eq!(counts.get(&Role::Chore), Some(&1));
+        let find = |id: &str| tasks.iter().find(|t| t.order.id == id).unwrap();
+        let hold = width_hold(&policy, &tasks, &find("open-build").order).expect("build is at 2");
+        assert!(hold.contains("width for build is 2"), "{hold}");
+        assert!(width_hold(&policy, &tasks, &find("open-chore").order).is_some());
+        assert_eq!(
+            width_hold(&policy, &tasks, &find("open-direct").order),
+            None,
+            "a person's own order is never capped"
+        );
+        // One fewer claimed and there is room; a role with no width is never held.
+        let fewer: Vec<crate::Task> = tasks
+            .iter()
+            .filter(|t| t.order.id != "b2")
+            .cloned()
+            .collect();
+        assert_eq!(width_hold(&policy, &fewer, &find("open-build").order), None);
+        assert_eq!(
+            width_hold(&Policy::default(), &tasks, &find("open-build").order),
+            None
+        );
+    }
+
+    fn sized(name: &str, model: &str, tier: &str, paid: &str) -> Candidate {
+        let mut found = engine(name, tier, paid);
+        found.model = Some(model.into());
+        found
+    }
+
+    fn fleet_for_team() -> Vec<Candidate> {
+        vec![
+            sized("opus", "claude-opus-4", "judge", "prepaid"),
+            sized("pro", "deepseek-v4-pro", "judge", "prepaid"),
+            sized(
+                "nemotron",
+                "nvidia/llama-3.3-nemotron-super-49b-v1",
+                "build",
+                "free-tier",
+            ),
+            sized("deepseek", "deepseek-chat", "build", "prepaid"),
+            sized("haiku-local", "llama3.2:3b", "chore", "local"),
+            sized("mini", "gpt-5-mini", "chore", "free-tier"),
+        ]
+    }
+
+    fn list(policy: &Policy, role: Role) -> Vec<String> {
+        policy.preferences(role).to_vec()
+    }
+
+    #[test]
+    fn the_team_plans_large_builds_medium_and_does_chores_small() {
+        let proposal = team(
+            &fleet_for_team(),
+            &["grouchly".into()],
+            &TeamOptions::default(),
+        );
+        let policy = &proposal.policy;
+        policy.check().unwrap();
+        // Large judges plan and review; the free medium engines build, before the prepaid.
+        assert_eq!(list(policy, Role::Plan)[0], "name:opus");
+        assert_eq!(list(policy, Role::Review)[0], "name:opus");
+        assert_eq!(list(policy, Role::Build)[0], "name:nemotron");
+        assert_eq!(list(policy, Role::Chore)[0], "name:haiku-local");
+        // The fallback is kept after the right size.
+        assert!(list(policy, Role::Build).contains(&"name:opus".to_string()));
+        assert!(list(policy, Role::Chore).contains(&"name:nemotron".to_string()));
+        // Effort and width are the preset's.
+        assert_eq!(policy.effort_for(Role::Plan), Effort::High);
+        assert_eq!(policy.effort_for(Role::Build), Effort::Medium);
+        assert_eq!(policy.effort_for(Role::Chore), Effort::Low);
+        assert_eq!(policy.width_for(Role::Plan), Some(1));
+        assert_eq!(policy.width_for(Role::Build), Some(3));
+        assert_eq!(policy.width_for(Role::Chore), Some(4));
+        assert_eq!(policy.adversary, AdversaryMode::Advisory);
+        assert_eq!(policy.machines, ["grouchly"]);
+        // Every engine placed has a reason that says its class and its effort.
+        let build = proposal
+            .reasons
+            .iter()
+            .find(|line| line.starts_with("nemotron first for build"))
+            .expect("a reason for the top builder");
+        assert!(
+            build.contains("medium class") && build.contains("medium effort"),
+            "{build}"
+        );
+        assert!(
+            proposal
+                .reasons
+                .iter()
+                .any(|line| line.contains("up to 3 at once"))
+        );
+    }
+
+    #[test]
+    fn the_teams_adversary_is_a_large_judge_of_another_family_than_the_top_builder() {
+        // The top builder is deepseek-chat; the two large judges are deepseek-v4-pro (the
+        // builder's family) and claude-opus (not). The adversary must be the latter even
+        // though the former is listed first by every other ranking.
+        let engines = vec![
+            sized("pro", "deepseek-v4-pro", "judge", "local"),
+            sized("opus", "claude-opus-4", "judge", "prepaid"),
+            sized("deepseek", "deepseek-chat", "build", "free-tier"),
+        ];
+        let proposal = team(&engines, &[], &TeamOptions::default());
+        assert_eq!(list(&proposal.policy, Role::Build)[0], "name:deepseek");
+        let adversaries = list(&proposal.policy, Role::Adversary);
+        assert_eq!(adversaries[0], "name:opus", "{adversaries:?}");
+        assert!(adversaries.contains(&"name:pro".to_string()), "kept, last");
+        let line = proposal
+            .reasons
+            .iter()
+            .find(|line| line.starts_with("opus first for adversary"))
+            .unwrap();
+        assert!(
+            line.contains("a different family (anthropic) from deepseek"),
+            "{line}"
+        );
+        assert!(line.contains("high effort"), "{line}");
+        assert_eq!(proposal.policy.effort_for(Role::Adversary), Effort::High);
+    }
+
+    #[test]
+    fn subscription_roles_are_honoured_only_for_an_engine_with_a_weekly_cap() {
+        let mut sonnet = sized("claude-sonnet", "claude-sonnet-4", "build", "subscription");
+        let mut haiku = sized("claude-haiku", "claude-haiku-4", "chore", "subscription");
+        let mut engines_with = |sonnet_cap: Option<u64>, haiku_cap: Option<u64>| {
+            sonnet.weekly_requests = sonnet_cap;
+            haiku.weekly_requests = haiku_cap;
+            vec![sonnet.clone(), haiku.clone()]
+        };
+        // Protected, and nothing opted in: neither is used, and the reasons say why.
+        let none = team(
+            &engines_with(Some(200), Some(500)),
+            &[],
+            &TeamOptions::default(),
+        );
+        assert!(list(&none.policy, Role::Build).is_empty());
+        assert!(list(&none.policy, Role::Chore).is_empty());
+        assert!(
+            none.reasons
+                .iter()
+                .any(|line| line.contains("claude-sonnet never")),
+            "{:?}",
+            none.reasons
+        );
+
+        let options = TeamOptions {
+            subscription_roles: vec![Role::Chore, Role::Build, Role::Build],
+            ..TeamOptions::default()
+        };
+        // Both capped: build gets sonnet, chore gets haiku; plan, review and the
+        // adversary are not opted in, so they get nobody.
+        let opted = team(&engines_with(Some(200), Some(500)), &[], &options);
+        assert_eq!(
+            opted.policy.subscription_roles,
+            [Role::Build, Role::Chore],
+            "sorted, once"
+        );
+        assert_eq!(list(&opted.policy, Role::Build)[0], "name:claude-sonnet");
+        assert_eq!(list(&opted.policy, Role::Chore)[0], "name:claude-haiku");
+        assert!(list(&opted.policy, Role::Review).is_empty());
+        let line = opted
+            .reasons
+            .iter()
+            .find(|line| line.starts_with("claude-haiku first for chore"))
+            .unwrap();
+        assert!(
+            line.contains("small class") && line.contains("weekly cap of 500"),
+            "{line}"
+        );
+
+        // Sonnet has no cap: the opt-in is not honoured for it, and the reason says so.
+        let uncapped = team(&engines_with(None, Some(500)), &[], &options);
+        assert!(!list(&uncapped.policy, Role::Build).contains(&"name:claude-sonnet".to_string()));
+        assert_eq!(list(&uncapped.policy, Role::Chore)[0], "name:claude-haiku");
+        assert!(
+            uncapped.reasons.iter().any(|line| {
+                line.contains("claude-sonnet not used for build")
+                    && line.contains("weekly_requests")
+            }),
+            "{:?}",
+            uncapped.reasons
+        );
+        // The rule is the policy's own, so a hand-set policy cannot get around it either.
+        let policy = Policy {
+            subscription_roles: vec![Role::Build],
+            ..Policy::default()
+        };
+        sonnet.weekly_requests = None;
+        assert!(
+            policy
+                .blocked_for(&sonnet, Work::Background, Some(Role::Build))
+                .is_some()
+        );
+        sonnet.weekly_requests = Some(10);
+        assert!(
+            policy
+                .blocked_for(&sonnet, Work::Background, Some(Role::Build))
+                .is_none()
+        );
+        assert!(
+            policy
+                .blocked_for(&sonnet, Work::Background, Some(Role::Plan))
+                .is_some()
+        );
+        assert!(policy.blocked(&sonnet, Work::Background).is_some());
+    }
+
+    #[test]
+    fn team_options_replace_the_presets_width_and_effort() {
+        let options = TeamOptions {
+            width: BTreeMap::from([(Role::Build, 6)]),
+            effort: BTreeMap::from([(Role::Build, Effort::High)]),
+            ..TeamOptions::default()
+        };
+        let policy = team(&fleet_for_team(), &[], &options).policy;
+        assert_eq!(policy.width_for(Role::Build), Some(6));
+        assert_eq!(policy.width_for(Role::Chore), Some(4));
+        assert_eq!(policy.effort_for(Role::Build), Effort::High);
+        assert!(policy.check().is_ok());
+        // The proposal survives a signed round trip.
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        assert!(set_policy(&route.communications, "demo", Some(policy.clone()), &josh).unwrap());
+        assert_eq!(effective(&route.communications, "demo").0, policy);
+    }
+
+    #[test]
+    fn a_step_records_its_effort_and_an_old_record_still_verifies() {
+        let old = Step {
+            step: "build".into(),
+            role: Some("build".into()),
+            at: Utc::now(),
+            agent: "wisp".into(),
+            machine: "grouchly".into(),
+            engine: Some("nemotron".into()),
+            model: None,
+            cost_usd: None,
+            order: None,
+            effort: None,
+            outcome: "done".into(),
+        };
+        assert!(serde_json::to_value(&old).unwrap().get("effort").is_none());
+        let with = Step {
+            effort: Some("medium".into()),
+            ..old
+        };
+        assert_eq!(serde_json::to_value(&with).unwrap()["effort"], "medium");
+        assert!(
+            with.describe().contains("medium effort"),
+            "{}",
+            with.describe()
+        );
     }
 }

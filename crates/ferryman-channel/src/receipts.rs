@@ -739,6 +739,10 @@ pub struct EngineReport {
     /// `None` from a worker older than the engine policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub billing: Option<EngineBilling>,
+    /// The engine's size class, `small`, `medium` or `large`: what its operator declared,
+    /// else guessed from its model's name. `None` from a worker older than classes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
 }
 
 /// How one engine is billed, as far as the worker running it can tell. Never a
@@ -752,6 +756,10 @@ pub struct EngineBilling {
     /// A weekly request or dollar cap is set in agent.toml.
     #[serde(default)]
     pub capped: bool,
+    /// The weekly request cap, when agent.toml sets one. Published because a project's
+    /// `subscription_roles` honours a subscription only when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weekly_requests: Option<u64>,
     /// The ISO week the counts are for.
     #[serde(default)]
     pub week: String,
@@ -1421,6 +1429,7 @@ mod tests {
             checked_at: Some(Utc::now()),
             trust: None,
             billing: None,
+            class: None,
         }
     }
 

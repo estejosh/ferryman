@@ -257,7 +257,9 @@ pub fn engine_key(
                 "{} is not where the policy runs it",
                 review.machine
             ))
-        } else if let Some(blocked) = policy.blocked(&engine, Work::Background) {
+        } else if let Some(blocked) =
+            policy.blocked_for(&engine, Work::Background, Some(Role::Review))
+        {
             Some(format!("{} is {blocked}", review.engine))
         } else if !listed.is_empty() && policy.preference(Role::Review, &engine).is_none() {
             Some(format!(

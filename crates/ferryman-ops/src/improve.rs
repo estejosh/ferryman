@@ -1163,7 +1163,14 @@ async fn ask_best(
         };
         tried.push(engine.name.clone());
         let judge = engines::effective_tier(&engine, &ledger.state(&engine.name)) == Tier::Judge;
-        match crate::agent::ask_costed(route, &config.with_engine(&engine), prompt).await {
+        let effort = policy.effort_for(Role::Plan);
+        match crate::agent::ask_costed(
+            route,
+            &config.with_engine_effort(&engine, Some(effort)),
+            prompt,
+        )
+        .await
+        {
             Ok((answer, cost)) => return Asked::Answered(answer, Box::new(engine), judge, cost),
             Err(error) => {
                 if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
@@ -1203,6 +1210,7 @@ fn note_step(
         model: engine.and_then(|engine| engine.model.clone()),
         cost_usd: cost,
         order: None,
+        effort: role.and_then(|role| engines::effort_used(route, role, engine)),
         outcome: outcome.to_string(),
     };
     if let Err(error) = ferryman_channel::policy::record_step(route, &identity, week, record) {
@@ -1642,7 +1650,14 @@ pub async fn review(
             serde_json::to_string_pretty(&plan.improvements)?,
             fs::read_to_string(week_dir(route, &week).join("evidence.md")).unwrap_or_default()
         );
-        match crate::agent::ask(route, &config.with_engine(&judge), &prompt).await {
+        let effort = policy.effort_for(Role::Review);
+        match crate::agent::ask(
+            route,
+            &config.with_engine_effort(&judge, Some(effort)),
+            &prompt,
+        )
+        .await
+        {
             Ok(answer) => {
                 let path = week_dir(route, &week).join("plan-review.md");
                 fs::write(
@@ -1673,7 +1688,8 @@ pub async fn review(
         // engine key the gate would refuse.
         let wanted =
             |task: &Task| is_improvement(task) && crate::adversary::may_judge(route, &policy, task);
-        match crate::agent::review_where(route, &config.with_engine(&judge), report, wanted).await {
+        let reviewer = config.with_engine_effort(&judge, Some(policy.effort_for(Role::Review)));
+        match crate::agent::review_where(route, &reviewer, report, wanted).await {
             Ok(count) => judged += count,
             Err(error) => {
                 return Ok(settle(
@@ -2205,6 +2221,9 @@ mod tests {
             weekly_usd: None,
             provider: None,
             route: Vec::new(),
+            class: None,
+            effort_args: std::collections::BTreeMap::new(),
+            supports_effort: false,
         }
     }
 
