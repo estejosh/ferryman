@@ -1993,12 +1993,15 @@ pub fn order_role(order: &crate::Order) -> Role {
 
 /// How many improvement orders are claimed right now, per role, by anyone: a claim whose
 /// holder's heartbeat has lapsed (stale) is not being worked on, so it is not counted.
+/// Only orders whose signature and authority verify count, as for file overlap: a forged
+/// or unsigned order must not be able to use up the width and keep real work waiting.
 #[must_use]
-pub fn claimed_per_role(tasks: &[crate::Task]) -> BTreeMap<Role, usize> {
+pub fn claimed_per_role(route: &ProjectRoute, tasks: &[crate::Task]) -> BTreeMap<Role, usize> {
     let mut counts = BTreeMap::new();
     for task in tasks {
         if is_improvement_order(&task.order)
             && matches!(task.state(), crate::TaskState::Claimed { .. })
+            && crate::verify_order_in(route, &task.order) == SignatureCheck::Valid
         {
             *counts.entry(order_role(&task.order)).or_insert(0) += 1;
         }
@@ -2014,13 +2017,21 @@ pub fn claimed_per_role(tasks: &[crate::Task]) -> BTreeMap<Role, usize> {
 /// in the same pass counts. Like the file-overlap check it is a soft cap: two machines
 /// claiming in the same instant can each get in.
 #[must_use]
-pub fn width_hold(policy: &Policy, tasks: &[crate::Task], order: &crate::Order) -> Option<String> {
+pub fn width_hold(
+    route: &ProjectRoute,
+    policy: &Policy,
+    tasks: &[crate::Task],
+    order: &crate::Order,
+) -> Option<String> {
     if !is_improvement_order(order) {
         return None;
     }
     let role = order_role(order);
     let width = policy.width_for(role)?;
-    let claimed = claimed_per_role(tasks).get(&role).copied().unwrap_or(0);
+    let claimed = claimed_per_role(route, tasks)
+        .get(&role)
+        .copied()
+        .unwrap_or(0);
     (claimed >= usize::from(width)).then(|| {
         format!(
             "the policy's width for {} is {width}, and that many are claimed already",
@@ -2038,7 +2049,7 @@ pub fn width_hold_in(route: &ProjectRoute, order: &crate::Order) -> Option<Strin
     let (policy, _) = effective(&route.communications, &route.project_id);
     policy.width_for(order_role(order))?;
     let tasks = crate::list_tasks(route).ok()?;
-    width_hold(&policy, &tasks, order)
+    width_hold(route, &policy, &tasks, order)
 }
 
 /// One line per role as a person reads it: how hard it thinks, how many at once, and
@@ -2588,13 +2599,65 @@ pub struct StepLog {
     pub steps: Vec<Step>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
+    /// Signs the v1 view: the steps without `effort`, which is what v0.5.17 re-serializes
+    /// after dropping it, so an older peer still verifies the log.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+    /// Signs the whole log, `effort` included. Required by a verifier that knows it
+    /// whenever any step carries an effort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_v2: Option<String>,
+}
+
+impl StepLog {
+    fn has_v2_fields(&self) -> bool {
+        self.steps.iter().any(|step| step.effort.is_some())
+    }
+
+    /// Whether the log is the signing agent's own: v1 always, and v2 as well when a field
+    /// the v1 signature does not cover is present.
+    fn signed_validly(&self, roster: &[crate::AgentRoute]) -> bool {
+        let v1 = crate::check_signature(
+            self.signed_by.as_ref(),
+            self.signature.as_ref(),
+            &steps_payload(self),
+            roster,
+        ) == SignatureCheck::Valid;
+        v1 && (!self.has_v2_fields()
+            || crate::check_signature(
+                self.signed_by.as_ref(),
+                self.signature_v2.as_ref(),
+                &steps_payload_v2(self),
+                roster,
+            ) == SignatureCheck::Valid)
+    }
+}
+
+/// The steps as v0.5.17 serializes them, without `effort`.
+fn steps_v1_json(steps: &[Step]) -> String {
+    let mut value = serde_json::to_value(steps).unwrap_or_default();
+    if let Some(list) = value.as_array_mut() {
+        for step in list {
+            if let Some(step) = step.as_object_mut() {
+                step.remove("effort");
+            }
+        }
+    }
+    serde_jcs::to_string(&value).unwrap_or_default()
 }
 
 fn steps_payload(log: &StepLog) -> String {
     format!(
         "ferryman-improve-steps-v1\n{}\n{}\n{}",
+        log.agent,
+        log.week,
+        steps_v1_json(&log.steps)
+    )
+}
+
+fn steps_payload_v2(log: &StepLog) -> String {
+    format!(
+        "ferryman-improve-steps-v2\n{}\n{}\n{}",
         log.agent,
         log.week,
         serde_jcs::to_string(&log.steps).unwrap_or_default()
@@ -2632,6 +2695,7 @@ pub fn record_step(
             steps: Vec::new(),
             signed_by: None,
             signature: None,
+            signature_v2: None,
         });
     log.steps.push(step);
     if log.steps.len() > KEEP_STEPS {
@@ -2640,6 +2704,7 @@ pub fn record_step(
     }
     log.signed_by = Some(agent.to_string());
     log.signature = Some(identity.sign_bytes(steps_payload(&log).as_bytes()));
+    log.signature_v2 = Some(identity.sign_bytes(steps_payload_v2(&log).as_bytes()));
     crate::atomic_json(&path, &log).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -2664,12 +2729,7 @@ pub fn read_steps(route: &ProjectRoute, week: &str) -> Vec<Step> {
                     .signed_by
                     .as_deref()
                     .is_some_and(|signer| signer.eq_ignore_ascii_case(&log.agent))
-                && crate::check_signature(
-                    log.signed_by.as_ref(),
-                    log.signature.as_ref(),
-                    &steps_payload(log),
-                    &route.agents,
-                ) == SignatureCheck::Valid
+                && log.signed_validly(&route.agents)
         })
         .flat_map(|log| {
             let agent = log.agent.clone();
@@ -3726,10 +3786,113 @@ mod tests {
             steps: vec![step("plan", 99.0)],
             signed_by: Some("josh".into()),
             signature: None,
+            signature_v2: None,
         };
         forged.signature = Some(josh.sign_bytes(steps_payload(&forged).as_bytes()));
         crate::atomic_json(&steps_dir(&route, "2026-W40").join("wisp.json"), &forged).unwrap();
         assert!(read_steps(&route, "2026-W40").is_empty());
+    }
+
+    // v0.5.17's step shapes, copied so the test does not follow the live structs.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldStep {
+        step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        at: DateTime<Utc>,
+        agent: String,
+        machine: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<String>,
+        outcome: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldStepLog {
+        agent: String,
+        week: String,
+        #[serde(default)]
+        steps: Vec<OldStep>,
+        #[serde(default)]
+        signed_by: Option<String>,
+        #[serde(default)]
+        signature: Option<String>,
+    }
+
+    fn old_peer_accepts_steps(bytes: &[u8], roster: &[AgentRoute]) -> bool {
+        let Ok(old) = serde_json::from_slice::<OldStepLog>(bytes) else {
+            return false;
+        };
+        let payload = format!(
+            "ferryman-improve-steps-v1\n{}\n{}\n{}",
+            old.agent,
+            old.week,
+            serde_jcs::to_string(&old.steps).unwrap_or_default()
+        );
+        crate::check_signature(
+            old.signed_by.as_ref(),
+            old.signature.as_ref(),
+            &payload,
+            roster,
+        ) == SignatureCheck::Valid
+    }
+
+    #[test]
+    fn a_step_log_with_effort_verifies_on_a_v0_5_17_peer_and_effort_cannot_be_forged() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let wisp = person("wisp", 2);
+        let route = route(dir.path(), &[&josh, &wisp]);
+        let step = |effort: Option<&str>| Step {
+            step: "build".into(),
+            role: Some("build".into()),
+            at: Utc::now(),
+            agent: "wisp".into(),
+            machine: "grouchly".into(),
+            engine: Some("nemotron".into()),
+            model: None,
+            cost_usd: Some(0.5),
+            order: Some("o-1".into()),
+            effort: effort.map(str::to_string),
+            outcome: "done".into(),
+        };
+        record_step(&route, &wisp, "2026-W40", step(Some("high"))).unwrap();
+        let path = steps_dir(&route, "2026-W40").join("wisp.json");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            old_peer_accepts_steps(&bytes, &route.agents),
+            "an old peer must not drop a log because a step carries an effort"
+        );
+        let steps = read_steps(&route, "2026-W40");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].effort.as_deref(), Some("high"));
+
+        // Changing the effort, or stripping the v2 signature, is not accepted by a new peer.
+        let log: StepLog = serde_json::from_slice(&bytes).unwrap();
+        let mut forged = log.clone();
+        forged.steps[0].effort = Some("low".into());
+        crate::atomic_json(&path, &forged).unwrap();
+        assert!(read_steps(&route, "2026-W40").is_empty());
+        let mut stripped = log.clone();
+        stripped.signature_v2 = None;
+        crate::atomic_json(&path, &stripped).unwrap();
+        assert!(read_steps(&route, "2026-W40").is_empty());
+        // A log with no effort anywhere is the v1 file and verifies without a v2 signature.
+        let mut plain = StepLog {
+            steps: vec![step(None)],
+            signature: None,
+            signature_v2: None,
+            ..log
+        };
+        plain.signature = Some(wisp.sign_bytes(steps_payload(&plain).as_bytes()));
+        crate::atomic_json(&path, &plain).unwrap();
+        assert_eq!(read_steps(&route, "2026-W40").len(), 1);
     }
 
     // --- effort, class, width, subscription_roles and the team preset ---------------------
@@ -3914,7 +4077,10 @@ mod tests {
             ..Policy::default()
         };
         let stale = (crate::HEARTBEAT_STALE_MULTIPLE + 5) * crate::HEARTBEAT_INTERVAL_SECS;
-        let tasks = vec![
+        let dir = tempfile::tempdir().unwrap();
+        let boss = person("boss", 1);
+        let route = route(dir.path(), &[&boss]);
+        let mut tasks = vec![
             task("b1", "build", true, Some(("wisp", 5))),
             task("b2", "build", true, Some(("fang", 5))),
             task("b-stale", "build", true, Some(("old", stale))),
@@ -3925,7 +4091,18 @@ mod tests {
             task("open-chore", "chore", true, None),
             task("open-direct", "build", false, None),
         ];
-        let counts = claimed_per_role(&tasks);
+        for task in &mut tasks {
+            boss.sign_order(&mut task.order);
+        }
+        // A claimed order nobody signed is not an order anyone would act on, so it does
+        // not count against the width either.
+        let forged = task("forged", "build", true, Some(("wisp", 5)));
+        assert_eq!(forged.order.signature, None);
+        let honest = claimed_per_role(&route, &tasks);
+        let mut with_forged = tasks.clone();
+        with_forged.push(forged);
+        assert_eq!(claimed_per_role(&route, &with_forged), honest);
+        let counts = claimed_per_role(&route, &tasks);
         assert_eq!(
             counts.get(&Role::Build),
             Some(&2),
@@ -3933,11 +4110,12 @@ mod tests {
         );
         assert_eq!(counts.get(&Role::Chore), Some(&1));
         let find = |id: &str| tasks.iter().find(|t| t.order.id == id).unwrap();
-        let hold = width_hold(&policy, &tasks, &find("open-build").order).expect("build is at 2");
+        let hold =
+            width_hold(&route, &policy, &tasks, &find("open-build").order).expect("build is at 2");
         assert!(hold.contains("width for build is 2"), "{hold}");
-        assert!(width_hold(&policy, &tasks, &find("open-chore").order).is_some());
+        assert!(width_hold(&route, &policy, &tasks, &find("open-chore").order).is_some());
         assert_eq!(
-            width_hold(&policy, &tasks, &find("open-direct").order),
+            width_hold(&route, &policy, &tasks, &find("open-direct").order),
             None,
             "a person's own order is never capped"
         );
@@ -3947,9 +4125,17 @@ mod tests {
             .filter(|t| t.order.id != "b2")
             .cloned()
             .collect();
-        assert_eq!(width_hold(&policy, &fewer, &find("open-build").order), None);
         assert_eq!(
-            width_hold(&Policy::default(), &tasks, &find("open-build").order),
+            width_hold(&route, &policy, &fewer, &find("open-build").order),
+            None
+        );
+        assert_eq!(
+            width_hold(
+                &route,
+                &Policy::default(),
+                &tasks,
+                &find("open-build").order
+            ),
             None
         );
     }

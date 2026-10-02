@@ -723,10 +723,32 @@ fn subject_results(route: &ProjectRoute, subject: &str) -> (bool, Vec<(u32, Stri
             let providers = interface::orders_for_interface(route, name, version)
                 .map(|orders| orders.providers)
                 .unwrap_or_default();
-            let results = providers
-                .iter()
-                .filter_map(|order| crate::read_task(route, &order.id).ok())
-                .flat_map(|task| built(&task))
+            // A contract's revisions are rounds: its verified provider results across every
+            // provider order, numbered 1.. in submission order (the same numbering
+            // `contract_context` uses), so two providers' revision 1s are two rounds.
+            let mut verified: Vec<(DateTime<Utc>, String, u32, Vec<String>)> = Vec::new();
+            for order in &providers {
+                let Ok(task) = crate::read_task(route, &order.id) else {
+                    continue;
+                };
+                for result in &task.results {
+                    if crate::verify_result(result, &roster) != SignatureCheck::Valid {
+                        continue;
+                    }
+                    let mut who = vec![result.agent.clone()];
+                    if let Some(signer) = &result.signed_by
+                        && !signer.eq_ignore_ascii_case(&result.agent)
+                    {
+                        who.push(signer.clone());
+                    }
+                    verified.push((result.submitted_at, order.id.clone(), result.revision, who));
+                }
+            }
+            verified.sort_by(|x, y| (x.0, &x.1, x.2).cmp(&(y.0, &y.1, y.2)));
+            let results = verified
+                .into_iter()
+                .zip(1_u32..)
+                .flat_map(|((_, _, _, who), round)| who.into_iter().map(move |w| (round, w)))
                 .collect();
             (true, results)
         }
@@ -1618,9 +1640,11 @@ pub struct ContractContext {
     pub contract: InterfaceContract,
     /// The first provider order, or empty.
     pub order_id: String,
-    /// The newest provider result's revision, or 0 when none has a result.
+    /// How many provider results there are across every provider order (0 when none has a
+    /// result): the round the contract is reviewed at. It grows whenever any provider
+    /// submits, so each (provider order, revision) is read once.
     pub revision: u32,
-    /// The provider's result payload, when one has a result.
+    /// The newest provider result's payload, when one has a result.
     pub provider_result: Option<Value>,
     /// What built the provider's result.
     pub builders: Vec<Builder>,
@@ -1651,8 +1675,15 @@ pub fn contract_context(
         consumers: Vec::new(),
         precheck: Vec::new(),
     };
+    // Revisions count per order, so two providers' revision 1s are two different results and
+    // a bigger number is not a newer one. The newest result is the latest submitted (ties
+    // broken the same way on every machine), and the contract's `revision` is how many
+    // verified provider results there are in all - the same numbering `subject_results`
+    // uses - so every (provider order, revision) is reviewed once and the lock gate always
+    // reads the newest review.
     let roster = crate::gate::roster(route);
-    let mut newest: Option<(u32, String, Value)> = None;
+    let mut newest: Option<(chrono::DateTime<chrono::Utc>, String, u32, Value)> = None;
+    let mut round = 0_u32;
     for order in &orders.providers {
         let Ok(task) = crate::read_task(route, &order.id) else {
             continue;
@@ -1662,21 +1693,23 @@ pub fn contract_context(
             if crate::verify_result(result, &roster) != SignatureCheck::Valid {
                 continue;
             }
+            round += 1;
             if let Some(builder) = Builder::from_payload(&result.payload)
                 && !context.builders.contains(&builder)
             {
                 context.builders.push(builder);
             }
+            let key = (result.submitted_at, order.id.clone(), result.revision);
             if newest
                 .as_ref()
-                .is_none_or(|(revision, _, _)| result.revision > *revision)
+                .is_none_or(|(at, id, revision, _)| key > (*at, id.clone(), *revision))
             {
-                newest = Some((result.revision, order.id.clone(), result.payload.clone()));
+                newest = Some((key.0, key.1, key.2, result.payload.clone()));
             }
         }
     }
-    if let Some((revision, order_id, payload)) = newest {
-        context.revision = revision;
+    if let Some((_, order_id, _, payload)) = newest {
+        context.revision = round;
         context.order_id = order_id;
         context.precheck = match payload.get("response") {
             None | Some(Value::Null) => vec![
@@ -3382,5 +3415,51 @@ mod tests {
             "name is missing: {:?}",
             context.precheck
         );
+    }
+
+    #[test]
+    fn a_second_providers_revision_one_is_a_new_round_and_the_newest_result_is_read() {
+        let f = Fleet::new();
+        let proposed = contract(&f);
+        f.issue("back", Some(interface::Side::Provides));
+        f.issue("back2", Some(interface::Side::Provides));
+        let start = Utc::now();
+        let submit = |id: &str, revision: u32, engine: &str, seconds: i64| {
+            let mut result = TaskResult {
+                order_id: id.into(),
+                agent: "fang".into(),
+                revision,
+                submitted_at: start + chrono::Duration::seconds(seconds),
+                payload: json!({ "engine": engine, "response": { "id": 1 } }),
+                signed_by: None,
+                signature: None,
+            };
+            f.fang.sign_result(&mut result);
+            crate::submit_result(&f.route, &result).unwrap();
+        };
+
+        submit("back", 1, "first", 1);
+        let one = contract_context(&f.route, &proposed).unwrap();
+        assert_eq!((one.order_id.as_str(), one.revision), ("back", 1));
+
+        // Another provider's revision 1, later: not a repeat of the number 1, and the one
+        // the adversary must now read.
+        submit("back2", 1, "second", 2);
+        let two = contract_context(&f.route, &proposed).unwrap();
+        assert_eq!(two.order_id, "back2");
+        assert_eq!(two.revision, 2, "a new round, so it is reviewed again");
+        assert_eq!(two.provider_result.as_ref().unwrap()["engine"], "second");
+        assert_eq!(
+            contract_revision(&f.route, &proposed),
+            2,
+            "eligibility counts the rounds the same way"
+        );
+
+        // The first provider's next revision is newer still.
+        submit("back", 2, "third", 3);
+        let three = contract_context(&f.route, &proposed).unwrap();
+        assert_eq!((three.order_id.as_str(), three.revision), ("back", 3));
+        assert_eq!(three.provider_result.as_ref().unwrap()["engine"], "third");
+        assert_eq!(contract_revision(&f.route, &proposed), 3);
     }
 }

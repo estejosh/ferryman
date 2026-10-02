@@ -73,8 +73,6 @@ and their reviewer overlooked. Challenge it.\n\n";
 const DIFF_CHARS: usize = 24_000;
 const TAIL_CHARS: usize = 1_500;
 const TEXT_CHARS: usize = 3_000;
-/// The most the scan reads of a diff.
-const SCAN_BYTES: usize = 2 * 1024 * 1024;
 
 fn clip(text: &str, limit: usize) -> String {
     if text.chars().count() <= limit {
@@ -816,52 +814,376 @@ fn record(
 
 // --- the diff ----------------------------------------------------------------------------
 
-fn git_output(workspace: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+/// The most of one file's diff the scan reads. A file with more is read as far as this and
+/// named in a High finding: what the scan did not read, it did not clear.
+const FILE_SCAN_BYTES: usize = 256 * 1024;
+/// The most one line of a diff keeps (a minified bundle is a single line).
+const LINE_SCAN_BYTES: usize = 16 * 1024;
+/// The most of a whole diff the scan reads, however many files it spans.
+const TOTAL_SCAN_BYTES: usize = 16 * 1024 * 1024;
+/// How many unread files a finding names.
+const NAMED_SKIPPED: usize = 8;
+/// How long a fetch from `origin` may take before the scan gives up on it.
+const FETCH_SECONDS: u64 = 30;
+
+/// A diff as the scan read it: every file's header and as much of its body as the caps allow,
+/// and the files (or "the rest of the diff") it did not read in full.
+#[derive(Debug, Default)]
+struct DiffRead {
+    text: String,
+    skipped: Vec<String>,
+}
+
+/// Files nobody reviews line by line: a cut diff of one is not worth a finding.
+fn is_generated(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.ends_with(".lock")
+        || matches!(
+            name,
+            "go.sum" | "package-lock.json" | "pnpm-lock.yaml" | "npm-shrinkwrap.json"
+        )
+}
+
+/// The path a `diff --git a/x b/x` header names (the new side).
+fn header_path(header: &str) -> String {
+    let rest = header
+        .trim_end()
+        .strip_prefix("diff --git ")
+        .unwrap_or(header);
+    rest.rsplit_once(" b/")
+        .map_or(rest, |(_, new)| new)
+        .trim_matches('"')
+        .to_string()
+}
+
+/// One line, keeping at most `cap` bytes of it and dropping the rest; the returned flag says
+/// whether anything was dropped. `None` at the end of the stream.
+fn read_capped_line<R: std::io::BufRead>(
+    reader: &mut R,
+    keep: &mut Vec<u8>,
+    cap: usize,
+) -> std::io::Result<Option<bool>> {
+    keep.clear();
+    let mut any = false;
+    let mut cut = false;
+    loop {
+        let buffered = reader.fill_buf()?;
+        if buffered.is_empty() {
+            return Ok(any.then_some(cut));
+        }
+        any = true;
+        let (chunk, ended) = match buffered.iter().position(|byte| *byte == b'\n') {
+            Some(at) => (&buffered[..=at], true),
+            None => (buffered, false),
+        };
+        let room = cap.saturating_sub(keep.len());
+        if chunk.len() > room {
+            cut = true;
+            keep.extend_from_slice(&chunk[..room]);
+        } else {
+            keep.extend_from_slice(chunk);
+        }
+        let used = chunk.len();
+        reader.consume(used);
+        if ended {
+            if cut && keep.last() != Some(&b'\n') {
+                keep.push(b'\n');
+            }
+            return Ok(Some(cut));
+        }
+    }
+}
+
+/// `git diff <spec>` read file by file, each file capped on its own so one huge file cannot
+/// push the rest out of the scan. `None` when git fails.
+fn read_diff(workspace: &Path, spec: &str) -> Option<DiffRead> {
+    use std::io::BufReader;
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args([
+            "diff",
+            "--no-color",
+            "-M",
+            "-U3",
+            spec,
+            "--",
+            ".",
+            ":(exclude).ferryman",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut reader = BufReader::with_capacity(64 * 1024, child.stdout.take()?);
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut file = String::new();
+    let mut file_bytes = 0_usize;
+    let mut file_cut = false;
+    let mut line: Vec<u8> = Vec::new();
+    let mut ran_out = false;
+    let mut failed = false;
+    let finish = |file: &str, cut: bool, skipped: &mut Vec<String>| {
+        if cut && !file.is_empty() && !is_generated(file) {
+            skipped.push(file.to_string());
+        }
+    };
+    loop {
+        match read_capped_line(&mut reader, &mut line, LINE_SCAN_BYTES) {
+            Ok(Some(line_cut)) => {
+                let header = line.starts_with(b"diff --git ");
+                if header {
+                    finish(&file, file_cut, &mut skipped);
+                    file = header_path(&String::from_utf8_lossy(&line));
+                    file_bytes = 0;
+                    file_cut = false;
+                }
+                if bytes.len() >= TOTAL_SCAN_BYTES {
+                    ran_out = true;
+                    break;
+                }
+                if line_cut {
+                    file_cut = true;
+                }
+                if !header && file_bytes + line.len() > FILE_SCAN_BYTES {
+                    file_cut = true;
+                    continue;
+                }
+                file_bytes += line.len();
+                bytes.extend_from_slice(&line);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                failed = true;
+                break;
+            }
+        }
+    }
+    finish(&file, file_cut || ran_out, &mut skipped);
+    if ran_out {
+        skipped.push("the rest of the diff".to_string());
+        let _ = child.kill();
+    }
+    let status = child.wait().ok()?;
+    if failed || (!ran_out && !status.success()) {
+        return None;
+    }
+    Some(DiffRead {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        skipped,
+    })
+}
+
+fn git_ok(workspace: &Path, args: &[&str]) -> bool {
+    Command::new("git")
         .arg("-C")
         .arg(workspace)
         .args(args)
         .stdin(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status.success().then(|| {
-        let bytes = &out.stdout[..out.stdout.len().min(SCAN_BYTES)];
-        String::from_utf8_lossy(bytes).into_owned()
-    })
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
-/// The order branch's diff against its base, as this machine's repository has it: the
-/// reviewed commit the result names, else the branch, else the branch on `origin`. `None`
-/// when the workspace is not a git repository or none of them is here.
-#[must_use]
-pub fn order_diff(route: &ProjectRoute, result: &TaskResult) -> Option<String> {
+/// Whether this checkout has `rev` as a commit.
+fn has_commit(workspace: &Path, rev: &str) -> bool {
+    git_ok(workspace, &["cat-file", "-e", &format!("{rev}^{{commit}}")])
+}
+
+/// Fetch `what` from `origin`, quietly, without ever prompting, and give up after
+/// [`FETCH_SECONDS`]. A missing remote or a failed fetch is just `false`.
+fn fetch_from_origin(workspace: &Path, what: &str) -> bool {
+    if !git_ok(workspace, &["remote", "get-url", "origin"]) {
+        return false;
+    }
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["fetch", "--quiet", "--no-tags", "origin", what])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if started.elapsed().as_secs() < FETCH_SECONDS => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// What reading an order's branch came to.
+enum OrderRead {
+    /// Not a git repository, or no branch and no commit to read: nothing to scan.
+    Nothing,
+    Read(DiffRead),
+    /// The result names a commit this machine cannot read. Never replaced by an older tip.
+    Unreadable(String),
+}
+
+fn read_order(route: &ProjectRoute, result: &TaskResult) -> OrderRead {
     let workspace = &route.workspace;
     if !ferryman_channel::worktree::is_git_repo(workspace) {
-        return None;
+        return OrderRead::Nothing;
     }
     let (base, _) = ferryman_channel::worktree::task_base(workspace);
     let branch = ferryman_channel::worktree::branch_name(&result.order_id, &result.agent);
-    let mut tips: Vec<String> = Vec::new();
-    if let Some(head) = result.payload.get("worktree_head").and_then(Value::as_str) {
-        tips.push(head.to_string());
+    let diff_to = |tip: &str| read_diff(workspace, &format!("{base}...{tip}"));
+    let named = result
+        .payload
+        .get("worktree_head")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|head| !head.is_empty());
+    if let Some(head) = named {
+        // The reviewed commit is the one that counts. Fetch it if it is not here; an older
+        // tip of the same branch is a different diff and would clear what it never read.
+        if !has_commit(workspace, head) {
+            fetch_from_origin(workspace, &branch);
+        }
+        if !has_commit(workspace, head) {
+            fetch_from_origin(workspace, head);
+        }
+        let short: String = head.chars().take(12).collect();
+        if !has_commit(workspace, head) {
+            return OrderRead::Unreadable(format!(
+                "the result names commit {short}, which is neither in this checkout nor on \
+                 origin, so its diff was not read (an older tip of {branch} would be a \
+                 different diff)"
+            ));
+        }
+        return match diff_to(head) {
+            Some(read) => OrderRead::Read(read),
+            None => OrderRead::Unreadable(format!(
+                "git could not diff the base against commit {short}, so it was not read"
+            )),
+        };
     }
-    tips.push(branch.clone());
-    tips.push(format!("origin/{branch}"));
-    tips.into_iter().find_map(|tip| {
-        git_output(
-            workspace,
-            &[
-                "diff",
-                "--no-color",
-                "-M",
-                "-U3",
-                &format!("{base}...{tip}"),
-                "--",
-                ".",
-                ":(exclude).ferryman",
-            ],
-        )
-    })
+    let tips = [branch.clone(), format!("origin/{branch}")];
+    for attempt in 0..2 {
+        if let Some(read) = tips.iter().find_map(|tip| diff_to(tip)) {
+            return OrderRead::Read(read);
+        }
+        if attempt == 0 {
+            fetch_from_origin(workspace, &branch);
+        }
+    }
+    OrderRead::Nothing
+}
+
+/// The order branch's diff against its base, as this machine's repository has it (the
+/// text of what the scan read, capped per file). `None` when the workspace is not a git
+/// repository or the diff could not be read.
+#[must_use]
+pub fn order_diff(route: &ProjectRoute, result: &TaskResult) -> Option<String> {
+    match read_order(route, result) {
+        OrderRead::Read(read) => Some(read.text),
+        _ => None,
+    }
+}
+
+/// What reading and scanning an order's branch found.
+#[derive(Debug, Default)]
+pub struct OrderScan {
+    pub diff: Option<String>,
+    pub hits: Vec<tamper::Hit>,
+}
+
+impl OrderScan {
+    /// Whether the scan found High tampering (not merely a part it could not read).
+    #[must_use]
+    pub fn tampered(&self) -> bool {
+        tamper::has_high(&self.hits)
+    }
+
+    /// Whether any of the diff went unread.
+    #[must_use]
+    pub fn unscanned(&self) -> bool {
+        self.hits
+            .iter()
+            .any(|hit| hit.kind == tamper::Kind::Unscanned)
+    }
+
+    /// The least verdict this scan allows: Block on High tampering, Concern when part of the
+    /// diff was not read (it is not cleared), else Pass.
+    #[must_use]
+    pub fn floor(&self) -> Verdict {
+        if self.tampered() {
+            Verdict::Block
+        } else if self.unscanned() {
+            Verdict::Concern
+        } else {
+            Verdict::Pass
+        }
+    }
+}
+
+/// Read the order's branch and scan it for tampering. A diff too large to read in full, or a
+/// commit that cannot be read at all, is a finding of its own.
+#[must_use]
+pub fn scan_order(
+    route: &ProjectRoute,
+    result: &TaskResult,
+    required: &[Vec<String>],
+) -> OrderScan {
+    match read_order(route, result) {
+        OrderRead::Nothing => OrderScan::default(),
+        OrderRead::Unreadable(why) => OrderScan {
+            diff: None,
+            hits: vec![tamper::Hit {
+                kind: tamper::Kind::Unscanned,
+                severity: Severity::Medium,
+                file: ferryman_channel::worktree::branch_name(&result.order_id, &result.agent),
+                detail: why,
+            }],
+        },
+        OrderRead::Read(read) => {
+            let mut hits = tamper::scan(&read.text, required);
+            if !read.skipped.is_empty() {
+                let files: Vec<&str> = read
+                    .skipped
+                    .iter()
+                    .take(NAMED_SKIPPED)
+                    .map(String::as_str)
+                    .collect();
+                let more = read.skipped.len().saturating_sub(NAMED_SKIPPED);
+                let tail = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+                hits.push(tamper::Hit {
+                    kind: tamper::Kind::Unscanned,
+                    severity: Severity::High,
+                    file: files[0].to_string(),
+                    detail: format!(
+                        "diff too large to scan: {}{tail}; what was not read was not cleared",
+                        files.join(", ")
+                    ),
+                });
+                hits.sort_by_key(|hit| std::cmp::Reverse(hit.severity));
+            }
+            OrderScan {
+                diff: Some(read.text),
+                hits,
+            }
+        }
+    }
 }
 
 /// Whether nothing is left for `me` to ask at (subject, revision, trigger): this agent has
@@ -990,23 +1312,44 @@ pub async fn pre_done_pass(
         {
             continue;
         }
-        let diff = order_diff(route, result);
-        let hits = diff
-            .as_deref()
-            .map(|diff| tamper::scan(diff, &required_of(&task)))
-            .unwrap_or_default();
+        let scan = scan_order(route, result, &required_of(&task));
         let request = Request {
             subject: task.order.id.clone(),
             order_id: task.order.id.clone(),
             revision,
             trigger: Trigger::PreDone,
             built_by: Builder::from_payload(&result.payload).into_iter().collect(),
-            prompt: pre_done_prompt(&task, result, &hits, diff.as_deref()),
-            known: hits.iter().map(tamper::Hit::issue).collect(),
-            floor: Verdict::Pass,
+            prompt: pre_done_prompt(&task, result, &scan.hits, scan.diff.as_deref()),
+            known: scan.hits.iter().map(tamper::Hit::issue).collect(),
+            // Tampering is a fact whatever the model says; so is a diff nobody read.
+            floor: scan.floor(),
         };
-        if let Outcome::Recorded(_) = challenge(route, config, policy, request, now, report).await {
-            challenged += 1;
+        match challenge(route, config, policy, request, now, report).await {
+            Outcome::Recorded(_) => challenged += 1,
+            Outcome::Held(why) | Outcome::Failed(why) | Outcome::Ineligible(why)
+                if scan.tampered() =>
+            {
+                // No engine could be asked, but the scan found what it found.
+                if scan_only(
+                    route,
+                    config,
+                    &task.order.id,
+                    revision,
+                    Trigger::PreDone,
+                    &scan.hits,
+                    &why,
+                    report,
+                )
+                .is_some()
+                {
+                    challenged += 1;
+                }
+            }
+            Outcome::Held(_)
+            | Outcome::Failed(_)
+            | Outcome::Ineligible(_)
+            | Outcome::Off
+            | Outcome::Existing(_) => {}
         }
     }
     challenged
@@ -1135,12 +1478,11 @@ pub async fn before_attempt(
     });
     if !asked {
         let result = task.results.iter().find(|r| r.revision == revision);
-        let diff = result.and_then(|result| order_diff(route, result));
-        let hits = diff
-            .as_deref()
-            .map(|diff| tamper::scan(diff, &required_of(task)))
+        let scan = result
+            .map(|result| scan_order(route, result, &required_of(task)))
             .unwrap_or_default();
-        let tampered = tamper::has_high(&hits);
+        let (diff, hits) = (scan.diff.as_deref(), &scan.hits);
+        let tampered = scan.tampered();
         let request = Request {
             subject: id.clone(),
             order_id: id.clone(),
@@ -1151,19 +1493,24 @@ pub async fn before_attempt(
                 .iter()
                 .filter_map(|failed| failed.builder.clone())
                 .collect(),
-            prompt: repeat_prompt(task, &repeat, &hits, diff.as_deref()),
+            prompt: repeat_prompt(task, &repeat, hits, diff),
             known: hits.iter().map(tamper::Hit::issue).collect(),
-            floor: if tampered {
-                Verdict::Block
-            } else {
-                Verdict::Pass
-            },
+            floor: scan.floor(),
         };
         match challenge(route, config, &policy, request, now, report).await {
             Outcome::Off => return Gate::Proceed,
             Outcome::Held(why) | Outcome::Failed(why) | Outcome::Ineligible(why) if tampered => {
                 // No engine could be asked, but the scan found what it found.
-                scan_only(route, config, &id, revision, &hits, &why, report);
+                scan_only(
+                    route,
+                    config,
+                    &id,
+                    revision,
+                    Trigger::RepeatFailure,
+                    hits,
+                    &why,
+                    report,
+                );
             }
             Outcome::Recorded(_)
             | Outcome::Existing(_)
@@ -1209,11 +1556,13 @@ pub async fn before_attempt(
 
 /// The deterministic finding for a diff whose scan found a High hit when no engine could be
 /// asked: signed by this agent, with the scan as the engine.
+#[allow(clippy::too_many_arguments)]
 fn scan_only(
     route: &ProjectRoute,
     config: &AgentConfig,
     id: &str,
     revision: u32,
+    trigger: Trigger,
     hits: &[tamper::Hit],
     why: &str,
     report: &dyn Progress,
@@ -1229,7 +1578,7 @@ fn scan_only(
     let finding = AdversaryFinding {
         order_id: id.to_string(),
         revision,
-        trigger: Trigger::RepeatFailure,
+        trigger,
         subject: id.to_string(),
         engine: data::TAMPER_SCAN.to_string(),
         model: None,
@@ -2742,5 +3091,200 @@ mod tests {
         assert!(prompt.contains("FAILED"), "the mechanical check, loudly");
         assert!(prompt.contains("result.response.id"));
         assert!(prompt.contains("```json"));
+    }
+
+    // --- reading the diff: caps per file, a missing commit, the floor ----------------------------
+
+    fn kinds(scan: &OrderScan) -> Vec<tamper::Kind> {
+        scan.hits.iter().map(|hit| hit.kind).collect()
+    }
+
+    #[test]
+    fn a_huge_early_file_cannot_push_a_later_test_deletion_out_of_the_scan() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        // Sorts before tests/double.rs and is bigger than the old global cap on its own.
+        let big = "let x = 1;\n".repeat(300_000);
+        branch(&route, "t-1", &[("a_big.rs", &big)], &["tests/double.rs"]);
+        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[]);
+        let kinds = kinds(&scan);
+        assert!(
+            kinds.contains(&tamper::Kind::DeletedTest),
+            "the deletion after the big file is found: {:?}",
+            scan.hits
+        );
+        let unscanned = scan
+            .hits
+            .iter()
+            .find(|hit| hit.kind == tamper::Kind::Unscanned)
+            .expect("the file that was not read in full is named");
+        assert_eq!(unscanned.severity, Severity::High);
+        assert!(
+            unscanned
+                .detail
+                .starts_with("diff too large to scan: a_big.rs"),
+            "{}",
+            unscanned.detail
+        );
+        assert_eq!(scan.floor(), Verdict::Block, "the deletion is tampering");
+        assert!(
+            scan.diff.as_deref().unwrap().len() < 1024 * 1024,
+            "one file is kept to its own cap"
+        );
+    }
+
+    #[test]
+    fn a_diff_too_big_to_read_and_nothing_else_is_a_concern_not_a_pass_and_a_lockfile_is_not() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        let big = "let x = 1;\n".repeat(60_000);
+        branch(&route, "t-1", &[("src/big.rs", &big)], &[]);
+        let scan = scan_order(&route, &result("t-1", 1, "deepseek", 0), &[]);
+        assert!(scan.unscanned() && !scan.tampered(), "{:?}", scan.hits);
+        assert_eq!(scan.floor(), Verdict::Concern);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        let lock = "name = \"x\"\n".repeat(60_000);
+        branch(&route, "t-2", &[("Cargo.lock", &lock)], &[]);
+        let scan = scan_order(&route, &result("t-2", 1, "deepseek", 0), &[]);
+        assert!(scan.hits.is_empty(), "{:?}", scan.hits);
+        assert_eq!(scan.floor(), Verdict::Pass);
+    }
+
+    #[test]
+    fn a_commit_the_result_names_that_is_not_here_is_a_concern_never_the_older_branch_tip() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        // The branch tip here deletes a test; the commit the result names is not here.
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        let mut named = result("t-1", 1, "deepseek", 0);
+        named.payload["worktree_head"] = json!("0123456789abcdef0123456789abcdef01234567");
+        assert!(order_diff(&route, &named).is_none(), "no stand-in diff");
+        let scan = scan_order(&route, &named, &[]);
+        assert!(scan.diff.is_none());
+        assert!(
+            !scan.tampered(),
+            "it did not read the older tip: {:?}",
+            scan.hits
+        );
+        assert_eq!(scan.floor(), Verdict::Concern);
+        assert!(
+            scan.hits[0].detail.contains("0123456789ab")
+                && scan.hits[0].detail.contains("not read"),
+            "{:?}",
+            scan.hits
+        );
+    }
+
+    #[test]
+    fn a_commit_that_is_only_on_origin_is_fetched_before_it_is_read() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _config) = fixture(dir.path(), Vec::new());
+        let repo = route.workspace.clone();
+        let origin = dir.path().join("origin.git");
+        run_origin(&origin);
+        git(
+            &repo,
+            &["remote", "add", "origin", &origin.display().to_string()],
+        );
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        let name = ferryman_channel::worktree::branch_name("t-1", "fang");
+        let head = git(&repo, &["rev-parse", &name]);
+        git(&repo, &["push", "-q", "origin", &name]);
+        // Forget it locally: the branch, its remote-tracking ref and the object itself.
+        git(&repo, &["branch", "-q", "-D", &name]);
+        git(
+            &repo,
+            &["update-ref", "-d", &format!("refs/remotes/origin/{name}")],
+        );
+        git(&repo, &["reflog", "expire", "--expire=now", "--all"]);
+        git(&repo, &["gc", "-q", "--prune=now"]);
+        assert!(!has_commit(&repo, &head), "the commit is gone from here");
+
+        let mut named = result("t-1", 1, "deepseek", 0);
+        named.payload["worktree_head"] = json!(head);
+        let scan = scan_order(&route, &named, &[]);
+        assert!(
+            kinds(&scan).contains(&tamper::Kind::DeletedTest),
+            "fetched and read: {:?}",
+            scan.hits
+        );
+        assert!(!scan.unscanned());
+    }
+
+    fn run_origin(path: &Path) {
+        let out = Command::new("git")
+            .args(["init", "-q", "--bare"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    }
+
+    #[test]
+    fn the_pre_done_pass_floors_a_high_tampering_hit_at_block_whatever_the_engine_says() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(
+            dir.path(),
+            vec![engine("qwen", "qwen-max", &says("pass", ""))],
+        );
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        awaiting(&route, "t-1", "deepseek");
+        let challenged = futures_lite_block(pass(
+            &route,
+            &config,
+            &policy_of(&route),
+            Utc::now(),
+            &crate::Silent,
+        ));
+        assert_eq!(challenged, 1);
+        let finding = data::read(&route, "t-1", 1, Trigger::PreDone, "wisp").unwrap();
+        assert_eq!(finding.verdict, Verdict::Block, "{finding:?}");
+        assert_eq!(finding.engine, "qwen");
+    }
+
+    #[test]
+    fn the_pre_done_pass_records_a_high_hit_with_no_engine_to_ask() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(dir.path(), Vec::new());
+        branch(&route, "t-1", &[], &["tests/double.rs"]);
+        awaiting(&route, "t-1", "deepseek");
+        let challenged = futures_lite_block(pass(
+            &route,
+            &config,
+            &policy_of(&route),
+            Utc::now(),
+            &crate::Silent,
+        ));
+        assert_eq!(challenged, 1);
+        let finding =
+            data::read(&route, "t-1", 1, Trigger::PreDone, "wisp").expect("recorded by the scan");
+        assert_eq!(finding.verdict, Verdict::Block);
+        assert_eq!(finding.engine, "tamper-scan");
+        assert_eq!(finding.trigger, Trigger::PreDone);
+        assert!(finding.has_high());
+
+        // A clean branch with no engine records nothing, as before.
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = fixture(dir.path(), Vec::new());
+        awaiting(&route, "t-2", "deepseek");
+        assert_eq!(
+            futures_lite_block(pass(
+                &route,
+                &config,
+                &policy_of(&route),
+                Utc::now(),
+                &crate::Silent
+            )),
+            0
+        );
+        assert!(data::list(&route).is_empty());
     }
 }

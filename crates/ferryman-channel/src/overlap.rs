@@ -151,46 +151,83 @@ fn class_matches(class: &[char], c: char) -> bool {
     hit != negated
 }
 
+/// Whether the whole of `text` is one of the paths `pat` stands for.
+///
+/// Dynamic programming over the pattern from its end: `rows[p][t]` says whether the
+/// pattern from element `p` matches the text from `t`. Each element is settled in one
+/// pass over the text, so the cost is the pattern's length times the text's - never
+/// exponential, however many `*` and `**` a pattern stacks against a long path.
 fn glob_here(pat: &[char], text: &[char]) -> bool {
-    let Some(&first) = pat.first() else {
-        return text.is_empty();
-    };
-    match first {
-        '*' if pat.get(1) == Some(&'*') => {
-            let rest = &pat[2..];
-            if rest.first() == Some(&'/') {
-                // `**/` stands for any number of whole directories, including none.
-                let after = &rest[1..];
-                glob_here(after, text)
-                    || (0..text.len()).any(|i| text[i] == '/' && glob_here(after, &text[i + 1..]))
-            } else {
-                (0..=text.len()).any(|i| glob_here(rest, &text[i..]))
+    let n = text.len();
+    let mut rows: Vec<Vec<bool>> = vec![Vec::new(); pat.len() + 1];
+    let mut end = vec![false; n + 1];
+    end[n] = true;
+    rows[pat.len()] = end;
+    for p in (0..pat.len()).rev() {
+        let mut row = vec![false; n + 1];
+        match pat[p] {
+            '*' if pat.get(p + 1) == Some(&'*') => {
+                let rest = p + 2;
+                if pat.get(rest) == Some(&'/') {
+                    // `**/` stands for any number of whole directories, including none.
+                    let after = &rows[rest + 1];
+                    let mut slash_then_match = false;
+                    for t in (0..=n).rev() {
+                        if t < n && text[t] == '/' && after[t + 1] {
+                            slash_then_match = true;
+                        }
+                        row[t] = after[t] || slash_then_match;
+                    }
+                } else {
+                    // Anything at all, `/` included.
+                    let after = &rows[rest];
+                    let mut any = false;
+                    for t in (0..=n).rev() {
+                        any |= after[t];
+                        row[t] = any;
+                    }
+                }
+            }
+            '*' => {
+                // Anything but `/`.
+                let after = &rows[p + 1];
+                for t in (0..=n).rev() {
+                    row[t] = after[t] || (t < n && text[t] != '/' && row[t + 1]);
+                }
+            }
+            '?' => {
+                let after = &rows[p + 1];
+                for t in 0..n {
+                    row[t] = text[t] != '/' && after[t + 1];
+                }
+            }
+            '[' => match pat[p..].iter().skip(2).position(|&c| c == ']') {
+                Some(close) => {
+                    let close = p + close + 2;
+                    let after = &rows[close + 1];
+                    for t in 0..n {
+                        row[t] = text[t] != '/'
+                            && class_matches(&pat[p + 1..close], text[t])
+                            && after[t + 1];
+                    }
+                }
+                None => {
+                    let after = &rows[p + 1];
+                    for t in 0..n {
+                        row[t] = text[t] == '[' && after[t + 1];
+                    }
+                }
+            },
+            literal => {
+                let after = &rows[p + 1];
+                for t in 0..n {
+                    row[t] = text[t] == literal && after[t + 1];
+                }
             }
         }
-        '*' => {
-            let rest = &pat[1..];
-            for i in 0..=text.len() {
-                if glob_here(rest, &text[i..]) {
-                    return true;
-                }
-                if text.get(i) == Some(&'/') {
-                    break;
-                }
-            }
-            false
-        }
-        '?' => text.first().is_some_and(|&c| c != '/') && glob_here(&pat[1..], &text[1..]),
-        '[' => match pat.iter().skip(2).position(|&c| c == ']') {
-            Some(end) => {
-                let end = end + 2;
-                text.first()
-                    .is_some_and(|&c| c != '/' && class_matches(&pat[1..end], c))
-                    && glob_here(&pat[end + 1..], &text[1..])
-            }
-            None => text.first() == Some(&'[') && glob_here(&pat[1..], &text[1..]),
-        },
-        literal => text.first() == Some(&literal) && glob_here(&pat[1..], &text[1..]),
+        rows[p] = row;
     }
+    rows[0][0]
 }
 
 /// Whether `path` is one of the files `glob` stands for. `*` stays inside a directory,
@@ -369,8 +406,15 @@ pub fn claim_hold(route: &ProjectRoute, order: &Order) -> anyhow::Result<Option<
         return Ok(None);
     }
     for other in crate::list_tasks(route)? {
-        let TaskState::Claimed { by } = other.state() else {
-            continue;
+        // A claimed order is being worked on. So is one sent back for changes: someone
+        // is reworking it, and its files are still in play. A stale claim and a finished
+        // order are not.
+        let by = match other.state() {
+            TaskState::Claimed { by } => by,
+            TaskState::ChangesRequested { .. } => other
+                .holder()
+                .map_or_else(|| "its worker".to_string(), str::to_string),
+            _ => continue,
         };
         if let Some(found) = warning_against(route, &order.touches, &order.id, &other) {
             // No times, no counts: the reason is compared to the last one written, and a
@@ -747,6 +791,69 @@ pub(crate) mod tests {
         assert!(reason.contains("claimed by wisp"), "{reason}");
         // The reason is stable from one pass to the next, so it is written once.
         assert_eq!(claim_hold(&f.route, &second).unwrap().unwrap(), reason);
+    }
+
+    #[test]
+    fn an_order_sent_back_for_changes_still_holds_its_files() {
+        let f = fixture();
+        issue(&f, order("t-rework", &["src/api/**"]));
+        claim(&f, "t-rework");
+        let mut result = crate::TaskResult {
+            order_id: "t-rework".into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: Utc::now(),
+            payload: json!({ "output": "first try" }),
+            signed_by: None,
+            signature: None,
+        };
+        f.wisp.sign_result(&mut result);
+        crate::submit_result(&f.route, &result).unwrap();
+        let wanted = order("t-wanted", &["src/api/users.rs"]);
+        let mut review = crate::Review {
+            order_id: "t-rework".into(),
+            revision: 1,
+            reviewer: "josh".into(),
+            reviewed_at: Utc::now(),
+            accepted: false,
+            notes: Some("again".into()),
+            signed_by: None,
+            signature: None,
+        };
+        f.josh.sign_review(&mut review);
+        crate::submit_review(&f.route, &review).unwrap();
+        let task = crate::read_task(&f.route, "t-rework").unwrap();
+        assert!(
+            matches!(task.state(), TaskState::ChangesRequested { .. }),
+            "{:?}",
+            task.state()
+        );
+        let reason = claim_hold(&f.route, &wanted).unwrap().unwrap();
+        assert!(reason.contains("t-rework"), "{reason}");
+        assert!(reason.contains("wisp"), "{reason}");
+    }
+
+    #[test]
+    fn a_pathological_glob_matches_in_linear_time_and_still_matches_correctly() {
+        let path = "a/".repeat(3_000) + "c";
+        let evil = "**/*a*/**/*a*/**/*a*/**/*a*/**/*a*/**/*a*/b";
+        let started = std::time::Instant::now();
+        assert!(!glob_matches(evil, &path));
+        assert!(!glob_matches("**a**a**a**a**a**a**b", &path));
+        assert!(glob_matches("**/*a*/**/*a*/**/*a*/**/*a*/**/c", &path));
+        assert!(glob_matches("**a**a**a**a**a**a**c", &path));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
+        // The ordinary cases keep their meaning.
+        assert!(glob_matches("src/**/x/*.rs", "src/a/b/x/y.rs"));
+        assert!(!glob_matches("src/**/x/*.rs", "src/a/b/x/y/z.rs"));
+        assert!(glob_matches("src/a*c/[x-z]?.rs", "src/abbc/y1.rs"));
+        assert!(glob_matches("**", ""));
+        assert!(glob_matches("a/**/b", "a/b"));
+        assert!(!glob_matches("a/*/b", "a/b"));
     }
 
     #[test]
