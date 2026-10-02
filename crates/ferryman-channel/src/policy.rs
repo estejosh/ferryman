@@ -2134,28 +2134,156 @@ pub fn recommend_for(route: &ProjectRoute, now: DateTime<Utc>) -> Recommendation
 // --- the master's signed setting ---------------------------------------------------------
 
 /// What the [`ENGINE_POLICY`] file holds.
+///
+/// A v0.5.17 machine reads this file too, and must not lose the master's `never`,
+/// `machines` and `prefer` because the file also says things it has never heard of. So the
+/// file carries two views of one signing. The v1 view - `policy` as that release knows it,
+/// no `seq` - is what `signature` covers and what an old machine verifies and obeys. The
+/// full policy and the sequence number are covered by `signature_v2`; a policy that has
+/// anything the old view lacks carries the full one in `policy_v2`, and a machine that
+/// understands it reads that and requires `signature_v2` to verify.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SettingWire", into = "SettingWire")]
 pub struct PolicySetting {
     pub project_id: String,
-    /// `None`: the master chose auto.
-    #[serde(default)]
+    /// `None`: the master chose auto. The whole policy, whatever the file's `policy` holds.
     pub policy: Option<Policy>,
     pub set_at: DateTime<Utc>,
     pub signed_by: String,
+    /// Over the v1 view: [`setting_payload`].
     pub signature: String,
     /// Whose policy this is, when a delegate signed it. Honoured only under a valid
     /// `improve` delegation from the master.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_behalf_of: Option<String>,
     /// One more than the highest `seq` the signer saw when signing, so a machine can tell
-    /// an older signed policy put back from a newer one. Left out of the file (and the
-    /// signature) when 0, so a policy signed before this existed still verifies.
-    #[serde(default, skip_serializing_if = "is_zero")]
+    /// an older signed policy put back from a newer one. Left out of the file when 0, and
+    /// never part of the v1 view, so a policy signed before this existed still verifies.
     pub seq: u64,
+    /// Over the full setting, `seq` included: [`setting_payload_v2`]. Absent on a policy
+    /// signed by a release that has no v2, which is read as the v1 view it is - unless it
+    /// has `seq` or anything else the v1 view lacks, which then cannot be taken without it.
+    pub signature_v2: Option<String>,
+}
+
+/// The file as written: `policy` is the v1 view, `policy_v2` the whole policy when the
+/// two differ.
+#[derive(Serialize, Deserialize)]
+struct SettingWire {
+    project_id: String,
+    #[serde(default)]
+    policy: Option<Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    policy_v2: Option<Policy>,
+    set_at: DateTime<Utc>,
+    signed_by: String,
+    signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_behalf_of: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature_v2: Option<String>,
+}
+
+impl From<PolicySetting> for SettingWire {
+    fn from(setting: PolicySetting) -> Self {
+        let policy_v2 = setting.policy.clone().filter(|policy| !policy.is_v1_only());
+        Self {
+            project_id: setting.project_id,
+            policy: setting.policy.as_ref().map(Policy::v1),
+            policy_v2,
+            set_at: setting.set_at,
+            signed_by: setting.signed_by,
+            signature: setting.signature,
+            on_behalf_of: setting.on_behalf_of,
+            seq: setting.seq,
+            signature_v2: setting.signature_v2,
+        }
+    }
+}
+
+impl From<SettingWire> for PolicySetting {
+    fn from(wire: SettingWire) -> Self {
+        Self {
+            project_id: wire.project_id,
+            policy: wire.policy_v2.or(wire.policy),
+            set_at: wire.set_at,
+            signed_by: wire.signed_by,
+            signature: wire.signature,
+            on_behalf_of: wire.on_behalf_of,
+            seq: wire.seq,
+            signature_v2: wire.signature_v2,
+        }
+    }
 }
 
 fn is_zero(value: &u64) -> bool {
     *value == 0
+}
+
+/// A policy as v0.5.17 had it, field for field: what its signature covers. A field added
+/// since is not in here, so it is not in the v1 signature however it is serialised.
+#[derive(Serialize)]
+struct PolicyV1<'a> {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    prefer: &'a BTreeMap<String, Vec<String>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    never: &'a Vec<String>,
+    #[serde(rename = "where", skip_serializing_if = "Vec::is_empty")]
+    machines: &'a Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    caps_usd: &'a BTreeMap<String, f64>,
+    protect_subscriptions: bool,
+    never_applies_to: NeverScope,
+    #[serde(skip_serializing_if = "AutoMerge::is_none")]
+    auto_merge: AutoMerge,
+}
+
+impl Policy {
+    /// This policy as v0.5.17 can use it: what that release's [`PolicyV1`] has, with the
+    /// parts it would refuse taken out - the adversary role (a key in `prefer` and
+    /// `caps_usd` it cannot parse) and `class:` selectors - because a policy that fails its
+    /// own check is ignored whole, and then it would lose `never`, `machines` and the rest.
+    #[must_use]
+    pub fn v1(&self) -> Policy {
+        let known = |selector: &String| !selector.trim().starts_with("class:");
+        let mut view = Policy {
+            adversary: AdversaryMode::Advisory,
+            effort: BTreeMap::new(),
+            width: BTreeMap::new(),
+            subscription_roles: Vec::new(),
+            ..self.clone()
+        };
+        view.prefer.remove(Role::Adversary.as_str());
+        view.caps_usd.remove(Role::Adversary.as_str());
+        for list in view.prefer.values_mut() {
+            list.retain(known);
+        }
+        view.never.retain(known);
+        view.machines.retain(known);
+        view
+    }
+
+    /// The canonical JSON a v0.5.17 machine computes for this policy.
+    fn v1_json(&self) -> String {
+        let view = self.v1();
+        serde_jcs::to_string(&PolicyV1 {
+            prefer: &view.prefer,
+            never: &view.never,
+            machines: &view.machines,
+            caps_usd: &view.caps_usd,
+            protect_subscriptions: view.protect_subscriptions,
+            never_applies_to: view.never_applies_to,
+            auto_merge: view.auto_merge,
+        })
+        .unwrap_or_default()
+    }
+
+    /// Whether the v1 view says all there is to say: nothing here that v0.5.17 would not
+    /// see, so the v1 signature covers it.
+    fn is_v1_only(&self) -> bool {
+        serde_jcs::to_string(self).is_ok_and(|full| full == self.v1_json())
+    }
 }
 
 impl PolicySetting {
@@ -2169,11 +2297,31 @@ impl PolicySetting {
     }
 }
 
-/// Exactly what the signature covers: the project, when, the whole policy in canonical
-/// JSON, and for a delegate the principal.
+/// Exactly what `signature` covers, byte for byte what v0.5.17 computes: the project, when,
+/// the policy's v1 view in canonical JSON (`null` for auto), and for a delegate the
+/// principal. No `seq`, and nothing a v0.5.17 policy does not have.
 fn setting_payload(setting: &PolicySetting) -> String {
+    let policy = match &setting.policy {
+        Some(policy) => policy.v1_json(),
+        None => "null".to_string(),
+    };
     let mut payload = format!(
         "ferryman-engine-policy-v1\n{}\n{}\n{}",
+        setting.project_id,
+        setting.set_at.to_rfc3339(),
+        policy
+    );
+    if let Some(principal) = &setting.on_behalf_of {
+        payload.push_str(&format!("\nfor:{principal}"));
+    }
+    payload
+}
+
+/// What `signature_v2` covers: [`setting_payload`] but with the whole policy and, when
+/// non-zero, the sequence number.
+fn setting_payload_v2(setting: &PolicySetting) -> String {
+    let mut payload = format!(
+        "ferryman-engine-policy-v2\n{}\n{}\n{}",
         setting.project_id,
         setting.set_at.to_rfc3339(),
         serde_jcs::to_string(&setting.policy).unwrap_or_default()
@@ -2185,6 +2333,39 @@ fn setting_payload(setting: &PolicySetting) -> String {
         payload.push_str(&format!("\nseq:{}", setting.seq));
     }
     payload
+}
+
+impl PolicySetting {
+    /// Whether the v1 signature leaves something out that a machine must not take on the
+    /// file's word: a sequence number, or any part of the policy the v1 view lacks.
+    fn needs_v2(&self) -> bool {
+        self.seq != 0
+            || self
+                .policy
+                .as_ref()
+                .is_some_and(|policy| !policy.is_v1_only())
+    }
+
+    /// Whether the signatures hold: the v1 one always; the v2 one whenever the file has
+    /// it, and it must when [`Self::needs_v2`]. So stripping `signature_v2` off a setting
+    /// that carries `seq` or a Blocking adversary cannot turn it into a plain one.
+    fn signed_validly(&self, roster: &[crate::AgentRoute]) -> bool {
+        let valid = |signature: Option<&String>, payload: String| {
+            crate::check_signature(Some(&self.signed_by), signature, &payload, roster)
+                == SignatureCheck::Valid
+        };
+        valid(Some(&self.signature), setting_payload(self))
+            && match &self.signature_v2 {
+                Some(signature) => valid(Some(signature), setting_payload_v2(self)),
+                None => !self.needs_v2(),
+            }
+    }
+
+    /// Sign both views as `signer`.
+    fn sign(&mut self, signer: &AgentIdentity) {
+        self.signature = signer.sign_bytes(setting_payload(self).as_bytes());
+        self.signature_v2 = Some(signer.sign_bytes(setting_payload_v2(self).as_bytes()));
+    }
 }
 
 /// The file's setting as parsed, genuine or not.
@@ -2221,12 +2402,7 @@ fn genuine(channel: &Path, project_id: &str, setting: &PolicySetting) -> bool {
             Utc::now(),
         )
         .allowed()
-        && crate::check_signature(
-            Some(&setting.signed_by),
-            Some(&setting.signature),
-            &setting_payload(setting),
-            &roster,
-        ) == SignatureCheck::Valid
+        && setting.signed_validly(&roster)
 }
 
 /// What this machine remembers of a project's policy, in its own state directory: never
@@ -2523,8 +2699,9 @@ pub fn set_policy_as(
         signature: String::new(),
         on_behalf_of: on_behalf_of.map(str::to_owned),
         seq,
+        signature_v2: None,
     };
-    setting.signature = signer.sign_bytes(setting_payload(&setting).as_bytes());
+    setting.sign(signer);
     let path = channel.join(ENGINE_POLICY);
     crate::atomic_json(&path, &setting).with_context(|| format!("writing {}", path.display()))?;
     Ok(true)
@@ -3368,19 +3545,21 @@ mod tests {
             signature: String::new(),
             on_behalf_of: None,
             seq: 99,
+            signature_v2: None,
         };
-        forged.signature = grouchly.sign_bytes(setting_payload(&forged).as_bytes());
+        forged.sign(&grouchly);
         crate::atomic_json(&path, &forged).unwrap();
         assert_eq!(effective(channel, "demo").0, mine);
         // Unsigned.
         forged.signature.clear();
+        forged.signature_v2 = None;
         crate::atomic_json(&path, &forged).unwrap();
         assert!(effective(channel, "demo").0.protect_subscriptions);
         // Lifted from another project.
         let mut lifted = forged.clone();
         lifted.project_id = "elsewhere".into();
         lifted.signed_by = "josh".into();
-        lifted.signature = josh.sign_bytes(setting_payload(&lifted).as_bytes());
+        lifted.sign(&josh);
         crate::atomic_json(&path, &lifted).unwrap();
         assert_eq!(effective(channel, "demo").0, mine);
         // Garbage.
@@ -3508,6 +3687,7 @@ mod tests {
             signature: String::new(),
             on_behalf_of: None,
             seq: 0,
+            signature_v2: None,
         };
         signed.signature = josh.sign_bytes(setting_payload(&signed).as_bytes());
         crate::atomic_json(&channel.join(ENGINE_POLICY), &signed).unwrap();
@@ -4535,14 +4715,22 @@ mod tests {
         let josh = person("josh", 1);
         let route = route(dir.path(), &[&josh]);
         let channel = &route.communications;
+        // What the release before seq could write: only the fields it had.
+        let legacy = Policy {
+            never: vec!["name:claude".into()],
+            machines: vec!["grouchly".into()],
+            auto_merge: AutoMerge::LowRisk,
+            ..Policy::default()
+        };
         let mut old = PolicySetting {
             project_id: "demo".into(),
-            policy: Some(hardened()),
+            policy: Some(legacy.clone()),
             set_at: Utc::now(),
             signed_by: "josh".into(),
             signature: String::new(),
             on_behalf_of: None,
             seq: 0,
+            signature_v2: None,
         };
         old.signature = josh.sign_bytes(setting_payload(&old).as_bytes());
         let wire = serde_json::to_value(&old).unwrap();
@@ -4551,7 +4739,7 @@ mod tests {
             "seq 0 stays off the wire: {wire}"
         );
         crate::atomic_json(&channel.join(ENGINE_POLICY), &old).unwrap();
-        assert_eq!(effective(channel, "demo").0, hardened());
+        assert_eq!(effective(channel, "demo").0, legacy);
         assert!(set_policy(channel, "demo", Some(Policy::default()), &josh).unwrap());
         assert_eq!(setting(channel, "demo").unwrap().seq, 1);
     }
@@ -4614,5 +4802,263 @@ mod tests {
 
     fn as_delegate_auto(channel: &Path, bridge: &AgentIdentity) -> Result<bool> {
         set_policy_as(channel, "demo", None, bridge, Some("josh"))
+    }
+
+    // --- a mixed fleet: v0.5.17 machines read the same file ----------------------------------
+
+    /// The v0.5.17 `Policy`, copied: seven fields, no adversary, effort, width or
+    /// subscription roles.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct OldPolicy {
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        prefer: BTreeMap<String, Vec<String>>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        never: Vec<String>,
+        #[serde(default, rename = "where", skip_serializing_if = "Vec::is_empty")]
+        machines: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        caps_usd: BTreeMap<String, f64>,
+        #[serde(default = "yes")]
+        protect_subscriptions: bool,
+        #[serde(default)]
+        never_applies_to: NeverScope,
+        #[serde(default, skip_serializing_if = "AutoMerge::is_none")]
+        auto_merge: AutoMerge,
+    }
+
+    impl OldPolicy {
+        /// v0.5.17's `Policy::check`: four roles, and no `class:` selector.
+        fn check(&self) -> bool {
+            let role =
+                |role: &String| ["plan", "build", "review", "chore"].contains(&role.as_str());
+            let selector = |selector: &String| {
+                !selector.trim().starts_with("class:") && check_selector(selector).is_ok()
+            };
+            self.prefer
+                .iter()
+                .all(|(name, list)| role(name) && list.iter().all(selector))
+                && self.never.iter().chain(&self.machines).all(selector)
+                && self.caps_usd.keys().all(role)
+        }
+    }
+
+    /// The v0.5.17 `PolicySetting`, copied: no `seq`, no second signature.
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct OldPolicySetting {
+        project_id: String,
+        #[serde(default)]
+        policy: Option<OldPolicy>,
+        set_at: DateTime<Utc>,
+        signed_by: String,
+        signature: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        on_behalf_of: Option<String>,
+    }
+
+    /// v0.5.17's `setting_payload`, copied.
+    fn old_payload(setting: &OldPolicySetting) -> String {
+        let mut payload = format!(
+            "ferryman-engine-policy-v1\n{}\n{}\n{}",
+            setting.project_id,
+            setting.set_at.to_rfc3339(),
+            serde_jcs::to_string(&setting.policy).unwrap_or_default()
+        );
+        if let Some(principal) = &setting.on_behalf_of {
+            payload.push_str(&format!("\nfor:{principal}"));
+        }
+        payload
+    }
+
+    /// What a v0.5.17 machine makes of the channel's policy file: the setting if it parses,
+    /// verifies against the roster and passes its own check; else nothing, which is auto.
+    fn old_machine_reads(channel: &Path) -> Option<OldPolicySetting> {
+        let old: OldPolicySetting =
+            serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).ok()?).ok()?;
+        let roster = crate::read_agent_roster(channel).ok()?;
+        (old.policy.as_ref().is_none_or(OldPolicy::check)
+            && crate::check_signature(
+                Some(&old.signed_by),
+                Some(&old.signature),
+                &old_payload(&old),
+                &roster,
+            ) == SignatureCheck::Valid)
+            .then_some(old)
+    }
+
+    /// The policy the master signs once this release has put a Blocking adversary, an
+    /// adversary engine, an effort, a width, a subscription role and a `class:` selector on
+    /// top of what v0.5.17 knew.
+    fn upgraded_policy() -> Policy {
+        let mut policy = hardened();
+        policy.never.push("class:small".into());
+        policy.caps_usd.insert("adversary".into(), 2.0);
+        policy.effort.insert(Role::Build, Effort::High);
+        policy.width.insert(Role::Build, 3);
+        policy
+    }
+
+    #[test]
+    fn a_v0_5_17_machine_still_obeys_a_policy_signed_with_the_new_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+        let policy = upgraded_policy();
+        policy.check().unwrap();
+        assert!(set_policy(channel, "demo", Some(policy.clone()), &josh).unwrap());
+
+        // The old machine verifies the signature and passes its own check...
+        let old = old_machine_reads(channel).expect("the old machine accepts it");
+        let seen = old.policy.unwrap();
+        // ...and keeps everything it understands, minus only what it could not parse.
+        assert_eq!(
+            seen.never,
+            ["name:claude"],
+            "the class selector is not its to read"
+        );
+        assert_eq!(seen.machines, ["grouchly"]);
+        assert_eq!(seen.caps_usd, BTreeMap::from([("build".to_string(), 5.0)]));
+        assert!(!seen.protect_subscriptions);
+        assert_eq!(seen.never_applies_to, NeverScope::All);
+        assert_eq!(seen.auto_merge, AutoMerge::LowRisk);
+        assert!(!seen.prefer.contains_key("adversary"), "{:?}", seen.prefer);
+
+        // A new machine reads all of it.
+        let (read, set) = effective(channel, "demo");
+        assert_eq!(read, policy);
+        assert_eq!(read.adversary, AdversaryMode::Blocking);
+        assert!(set.unwrap().signature_v2.is_some());
+
+        // The file says so: the v1 view in `policy`, the whole of it in `policy_v2`.
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).unwrap()).unwrap();
+        assert!(wire["policy"].get("adversary").is_none(), "{wire}");
+        assert_eq!(wire["policy_v2"]["adversary"], "blocking", "{wire}");
+        assert_eq!(wire["seq"], 1);
+
+        // A policy of only what v0.5.17 knew is the file v0.5.17 wrote, plus two lines.
+        let plain = Policy {
+            never: vec!["name:claude".into()],
+            ..Policy::default()
+        };
+        assert!(set_policy(channel, "demo", Some(plain.clone()), &josh).unwrap());
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).unwrap()).unwrap();
+        assert!(wire.get("policy_v2").is_none(), "{wire}");
+        assert_eq!(
+            old_machine_reads(channel).unwrap().policy.unwrap().never,
+            ["name:claude"]
+        );
+        assert_eq!(effective(channel, "demo").0, plain);
+        // And auto.
+        assert!(set_policy(channel, "demo", None, &josh).unwrap());
+        assert!(old_machine_reads(channel).is_some_and(|old| old.policy.is_none()));
+    }
+
+    #[test]
+    fn the_new_fields_and_the_sequence_cannot_be_forged_or_stripped_on_a_new_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (josh, grouchly) = (person("josh", 1), person("grouchly", 2));
+        let route = route(dir.path(), &[&josh, &grouchly]);
+        let channel = &route.communications;
+        let strict = upgraded_policy();
+        assert!(set_policy(channel, "demo", Some(strict.clone()), &josh).unwrap());
+        let good = read_file_setting(channel).unwrap();
+        assert!(genuine(channel, "demo", &good));
+
+        // The adversary switched off, with every signature left as it was.
+        let mut off = good.clone();
+        off.policy.as_mut().unwrap().adversary = AdversaryMode::Off;
+        assert!(
+            !genuine(channel, "demo", &off),
+            "the v1 signature still holds; v2 does not"
+        );
+        // The sequence number changed.
+        let mut renumbered = good.clone();
+        renumbered.seq = 9;
+        assert!(!genuine(channel, "demo", &renumbered));
+        // The v2 signature taken off, so only the v1 view is signed.
+        let mut stripped = good.clone();
+        stripped.signature_v2 = None;
+        assert!(
+            !genuine(channel, "demo", &stripped),
+            "a Blocking policy needs its v2"
+        );
+        // A v2 signature by someone else on the roster.
+        let mut other = good.clone();
+        other.signature_v2 = Some(grouchly.sign_bytes(setting_payload_v2(&other).as_bytes()));
+        assert!(!genuine(channel, "demo", &other));
+        // A selector added to the policy in the file, under both signatures as they were.
+        let mut weaker = good.clone();
+        weaker
+            .policy
+            .as_mut()
+            .unwrap()
+            .never
+            .push("name:grok".into());
+        assert!(!genuine(channel, "demo", &weaker));
+
+        // Taken down to exactly the v1 view - no `policy_v2`, no `seq`, no v2 - the file is
+        // what an old master could have signed. A machine that has seen the newer one
+        // refuses it as an older signing and keeps the strict policy.
+        let downgraded = PolicySetting {
+            policy: Some(strict.v1()),
+            seq: 0,
+            signature_v2: None,
+            ..good.clone()
+        };
+        assert!(
+            genuine(channel, "demo", &downgraded),
+            "it is a valid v1 setting"
+        );
+        assert_eq!(effective(channel, "demo").0, strict);
+        crate::atomic_json(&channel.join(ENGINE_POLICY), &downgraded).unwrap();
+        assert_eq!(effective(channel, "demo").0, strict, "not the downgrade");
+        assert!(rollback_notice(channel, "demo").is_some());
+    }
+
+    #[test]
+    fn a_policy_signed_by_v0_5_17_verifies_on_a_new_machine() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let channel = &route.communications;
+        let mut old = OldPolicySetting {
+            project_id: "demo".into(),
+            policy: Some(OldPolicy {
+                prefer: BTreeMap::from([("build".to_string(), vec!["name:nemotron".to_string()])]),
+                never: vec!["name:claude".into()],
+                machines: vec!["grouchly".into()],
+                caps_usd: BTreeMap::from([("build".to_string(), 5.0)]),
+                protect_subscriptions: true,
+                never_applies_to: NeverScope::All,
+                auto_merge: AutoMerge::LowRisk,
+            }),
+            set_at: Utc::now(),
+            signed_by: "josh".into(),
+            signature: String::new(),
+            on_behalf_of: None,
+        };
+        old.signature = josh.sign_bytes(old_payload(&old).as_bytes());
+        crate::atomic_json(&channel.join(ENGINE_POLICY), &old).unwrap();
+
+        let read = setting(channel, "demo").expect("a v0.5.17 signature verifies here");
+        assert_eq!(read.seq, 0);
+        assert!(read.signature_v2.is_none());
+        let (policy, _) = effective(channel, "demo");
+        assert_eq!(policy.never, ["name:claude"]);
+        assert_eq!(policy.machines, ["grouchly"]);
+        assert_eq!(policy.auto_merge, AutoMerge::LowRisk);
+        assert_eq!(policy.adversary, AdversaryMode::Advisory);
+        // The next signing numbers past it and is read by both generations.
+        let mut next = policy;
+        next.never.push("name:grok".into());
+        assert!(set_policy(channel, "demo", Some(next.clone()), &josh).unwrap());
+        assert_eq!(setting(channel, "demo").unwrap().seq, 1);
+        assert_eq!(effective(channel, "demo").0, next);
+        assert_eq!(
+            old_machine_reads(channel).unwrap().policy.unwrap().never,
+            ["name:claude", "name:grok"]
+        );
     }
 }
