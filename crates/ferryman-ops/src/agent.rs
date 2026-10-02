@@ -3313,8 +3313,8 @@ async fn attempt(
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
     let mut tried: Vec<String> = Vec::new();
     let result = loop {
-        let engine = match next_engine(route, config, task, &tried) {
-            Ok(engine) => engine,
+        let (engine, routing) = match next_routed(route, config, task, &tried) {
+            Ok(chosen) => chosen,
             Err(why) => {
                 report.warn(&format!(
                     "  {id}: {why}; it waits, and nothing is counted against it"
@@ -3326,6 +3326,9 @@ async fn attempt(
             }
         };
         tried.push(engine.name.clone());
+        if let Some(decision) = &routing {
+            report.info(&format!("  {id}: routing - {}", decision.reason));
+        }
         // How hard this order's role is asked to think, by the engine policy.
         let (policy, _) =
             ferryman_channel::policy::effective(&route.communications, &route.project_id);
@@ -3333,7 +3336,16 @@ async fn attempt(
             order_tier(task).as_str(),
         ));
         let effective = config.with_engine_effort(&engine, Some(effort));
-        match do_work(route, &effective, identity, task, concurrent, report).await {
+        match do_work(
+            route,
+            &effective,
+            identity,
+            task,
+            (concurrent, routing.as_ref()),
+            report,
+        )
+        .await
+        {
             // No checkout of its own while others run beside it: not a failure and not
             // the engine's doing. Let go of the claim so a pass that runs it alone (or
             // another machine) takes it, rather than run it in the others' checkout.
@@ -3390,6 +3402,45 @@ async fn attempt(
             false
         }
     }
+}
+
+/// The engines that already failed this order, with the success estimate each was routed
+/// at: a result the worker's own evidence refuted, or one a reviewer sent back with changes
+/// requested. A retry leaves them out and must beat their estimate (see
+/// [`ferryman_channel::router`]).
+#[must_use]
+pub fn failed_engines(task: &Task) -> Vec<ferryman_channel::router::Failed> {
+    let mut failed: Vec<ferryman_channel::router::Failed> = Vec::new();
+    for result in &task.results {
+        let Some(engine) = result.payload.get("engine").and_then(Value::as_str) else {
+            continue;
+        };
+        let refuted = ferryman_channel::evidence::classify(&task.order.payload, result).status
+            == ferryman_channel::evidence::Status::Refuted;
+        let sent_back = task
+            .reviews
+            .iter()
+            .any(|review| review.revision == result.revision && !review.accepted);
+        if !refuted && !sent_back {
+            continue;
+        }
+        let p = ferryman_channel::router::decision_of(&result.payload)
+            .and_then(|decision| decision.winner)
+            .map(|winner| winner.p);
+        match failed.iter_mut().find(|known| known.engine == engine) {
+            Some(known) => {
+                known.p = match (known.p, p) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    (a, b) => a.or(b),
+                };
+            }
+            None => failed.push(ferryman_channel::router::Failed {
+                engine: engine.to_string(),
+                p,
+            }),
+        }
+    }
+    failed
 }
 
 /// The tier an order asks for: `"tier": "chore"` in its payload, otherwise build.
@@ -3581,6 +3632,28 @@ fn next_engine(
     task: &Task,
     tried: &[String],
 ) -> std::result::Result<crate::engines::EngineSpec, String> {
+    next_routed(route, config, task, tried).map(|(engine, _)| engine)
+}
+
+/// [`next_engine`], and the smart router's decision when the engine was chosen by it: for
+/// an improvement order (background work), and for a person's order that needs a capability
+/// (vision, audio, image, video) which only the router knows engines have. A person's
+/// ordinary text or code order keeps the operator's own engine order, as it always has.
+/// With the policy's `routing = "ordered"` the engine is the one [`next_engine`] always
+/// chose, and the decision says so.
+fn next_routed(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    task: &Task,
+    tried: &[String],
+) -> std::result::Result<
+    (
+        crate::engines::EngineSpec,
+        Option<ferryman_channel::router::Decision>,
+    ),
+    String,
+> {
+    use ferryman_channel::policy::{Role, Routing, Work};
     let ledger = crate::engines::Ledger::load(&config.agent);
     let now = chrono::Utc::now();
     let wanted = order_tier(task);
@@ -3591,25 +3664,46 @@ fn next_engine(
         if !policy.allows_machine(here.0, here.1) {
             return Err(not_here(here.0, here.1, &policy));
         }
-        let role = ferryman_channel::policy::Role::for_order_tier(wanted.as_str());
+        let role = Role::for_order_tier(wanted.as_str());
         if let Some(why) =
             ferryman_channel::policy::over_cap(route, &policy, &crate::engines::iso_week(now), role)
         {
             return Err(why);
         }
-        return crate::engines::choose(
+        let needs = ferryman_channel::work::classify_cached(&task.order, route).needs;
+        let failed = failed_engines(task);
+        return crate::engines::choose_routed(
             &config.engines,
             &ledger,
             now,
             &policy,
-            role,
-            wanted,
-            tried,
+            (role, wanted, Work::Background),
+            &needs,
+            (&failed, tried),
             here,
-        );
+        )
+        .map(|(engine, decision)| (engine, Some(decision)));
+    }
+    if policy.routing == Routing::Smart {
+        let needs = ferryman_channel::work::classify_cached(&task.order, route).needs;
+        if needs.modalities.iter().any(|m| m.is_media()) {
+            let failed = failed_engines(task);
+            return crate::engines::choose_routed(
+                &config.engines,
+                &ledger,
+                now,
+                &policy,
+                (Role::Build, wanted, Work::Direct),
+                &needs,
+                (&failed, tried),
+                here,
+            )
+            .map(|(engine, decision)| (engine, Some(decision)));
+        }
     }
     crate::engines::pick_direct(&config.engines, &ledger, now, wanted, tried, &policy, here)
         .cloned()
+        .map(|engine| (engine, None))
         .ok_or_else(|| {
             format!(
                 "no {} engine can run it now ({})",
@@ -3672,15 +3766,17 @@ pub async fn ask_costed(
     Ok((engine_answer(&run.stdout), cost))
 }
 
-#[tracing::instrument(name = "do_work", skip(route, config, identity, task, report), fields(order = %task.order.id, agent = %config.agent))]
+#[tracing::instrument(name = "do_work", skip(route, config, identity, task, how, report), fields(order = %task.order.id, agent = %config.agent))]
 async fn do_work(
     route: &ProjectRoute,
     config: &AgentConfig,
     identity: &AgentIdentity,
     task: &Task,
-    concurrent: bool,
+    how: (bool, Option<&ferryman_channel::router::Decision>),
     report: &dyn Progress,
 ) -> Result<()> {
+    // Whether others run beside this order, and why the smart router chose this engine.
+    let (concurrent, routing) = how;
     use ferryman_channel::interrupt::InterruptAction;
 
     let id = &task.order.id;
@@ -3914,6 +4010,11 @@ async fn do_work(
     if let Some(effort) = config.applied_effort() {
         payload["effort"] = json!(effort.as_str());
     }
+    // And why this engine: the smart router's decision, every candidate's estimate and
+    // price included, so a reviewer - and `ferry route explain` - can read the choice.
+    if let Some(decision) = routing {
+        payload["routing"] = json!(decision);
+    }
     if run.ok && wants_result_fields(&task.order) {
         merge_result_fields(&mut payload, &engine_answer(&run.stdout));
     }
@@ -3928,9 +4029,22 @@ async fn do_work(
         } else {
             report.info(&format!("  {id}: evidence {}", found.describe()));
         }
-        if crate::engines::record_verification(
+        // Counted for this kind of work too, which is what the router learns from: the
+        // kind it was routed as, else what the rules read the order to be.
+        let kind = routing.map_or_else(
+            || {
+                ferryman_channel::work::classify_cached(&task.order, route)
+                    .needs
+                    .kind
+                    .as_str()
+                    .to_string()
+            },
+            |decision| decision.kind.clone(),
+        );
+        if crate::engines::record_verification_for(
             &config.agent,
             &engine.name,
+            Some(&kind),
             found.status,
             chrono::Utc::now(),
         ) {
@@ -4023,6 +4137,7 @@ async fn do_work(
             effort: config
                 .applied_effort()
                 .map(|effort| effort.as_str().to_string()),
+            route: routing.cloned(),
             outcome: format!("submitted r{revision}"),
         };
         if let Err(error) = ferryman_channel::policy::record_step(route, identity, &week, step) {
@@ -5398,6 +5513,78 @@ mod tests {
             signed_by: None,
             signature: None,
         }
+    }
+
+    /// An engine's result for a revision, with the routing decision it was chosen under.
+    fn routed_result(revision: u32, engine: &str, body: &str, p: f64) -> TaskResult {
+        let mut found = result(revision, body);
+        found.payload["engine"] = json!(engine);
+        found.payload["routing"] = json!({
+            "routing": "smart", "role": "build", "kind": "docs", "size": "small",
+            "threshold": 0.75, "candidates": [],
+            "winner": { "engine": engine, "agent": "w", "machine": "m", "p": p, "cost_usd": 0.0 },
+            "reason": format!("{engine}: free, p {p:.2} for docs >= 0.75, cheapest sufficient"),
+        });
+        found
+    }
+
+    #[test]
+    fn an_engine_whose_result_was_refuted_or_sent_back_has_failed_the_order() {
+        let sent_back = |revision: u32| Review {
+            order_id: "t-1".into(),
+            revision,
+            reviewer: "orchestrator".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: false,
+            notes: Some("wrong".into()),
+            signed_by: None,
+            signature: None,
+        };
+        let accepted = Review {
+            accepted: true,
+            notes: None,
+            ..sent_back(3)
+        };
+        // Nothing yet: nobody has failed.
+        assert!(failed_engines(&task_with(Vec::new(), Vec::new())).is_empty());
+        // A good result nobody sent back is not a failure.
+        let good = task_with(
+            vec![routed_result(1, "nvidia", "the report", 0.8)],
+            Vec::new(),
+        );
+        assert!(failed_engines(&good).is_empty());
+        // A result that is no answer is refuted by its own text, whatever the review says.
+        let refuted = task_with(vec![routed_result(1, "nvidia", "", 0.8)], Vec::new());
+        let failed = failed_engines(&refuted);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].engine, "nvidia");
+        assert_eq!(failed[0].p, Some(0.8), "the estimate it was routed at");
+        // Sent back with changes requested.
+        let back = task_with(
+            vec![routed_result(1, "nvidia", "the report", 0.8)],
+            vec![sent_back(1)],
+        );
+        assert_eq!(failed_engines(&back)[0].engine, "nvidia");
+        // Accepted later does not clear an earlier failure of another engine's result.
+        let mixed = task_with(
+            vec![
+                routed_result(1, "nvidia", "the report", 0.7),
+                routed_result(2, "claude", "the better report", 0.9),
+                routed_result(3, "nvidia", "another go", 0.8),
+            ],
+            vec![sent_back(1), sent_back(2), accepted],
+        );
+        let failed = failed_engines(&mixed);
+        let names: Vec<&str> = failed.iter().map(|f| f.engine.as_str()).collect();
+        assert_eq!(names, ["nvidia", "claude"]);
+        assert_eq!(failed[0].p, Some(0.7), "r3 was accepted, so only r1 counts");
+        // A result from before the router has no estimate to beat, but still failed.
+        let old = TaskResult {
+            payload: json!({ "output": "", "engine": "codex" }),
+            ..result(1, "")
+        };
+        let failed = failed_engines(&task_with(vec![old], Vec::new()));
+        assert_eq!((failed[0].engine.as_str(), failed[0].p), ("codex", None));
     }
 
     #[test]

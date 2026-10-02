@@ -52,6 +52,7 @@ pub mod quantly;
 pub mod questions;
 pub mod receipts;
 pub mod release;
+pub mod router;
 pub mod secrets;
 pub mod seed;
 pub mod skills;

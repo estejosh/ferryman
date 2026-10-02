@@ -562,6 +562,8 @@ fn note_step(
         cost_usd: engine.map(|(_, cost)| cost),
         order: Some(subject.to_string()),
         effort: engines::effort_used(route, Role::Adversary, engine.map(|(engine, _)| engine)),
+        // The adversary is never routed: its engine comes from its own policy order.
+        route: None,
         outcome,
     };
     if let Err(error) = ferryman_channel::policy::record_step(route, identity, week, step) {

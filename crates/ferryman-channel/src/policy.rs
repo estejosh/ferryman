@@ -271,6 +271,43 @@ pub enum Work {
     Direct,
 }
 
+/// How an engine is picked for background work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Routing {
+    /// The smart router: of the engines the rules below allow, the cheapest one that will
+    /// most likely do this kind of work well, escalating only after a cheaper one failed.
+    /// The prefer lists become a bias that breaks ties. See [`crate::router`].
+    #[default]
+    Smart,
+    /// Today's strict order: the preference list, then auto order. Nothing is scored.
+    Ordered,
+}
+
+impl Routing {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "smart" | "auto" => Ok(Self::Smart),
+            "ordered" | "order" | "strict" => Ok(Self::Ordered),
+            other => bail!("routing is smart or ordered, not '{other}'"),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smart => "smart",
+            Self::Ordered => "ordered",
+        }
+    }
+
+    /// The default is left out of the signed JSON, so a policy signed before routing
+    /// existed (which reads as smart) is byte for byte what it was.
+    fn is_smart(&self) -> bool {
+        *self == Self::Smart
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -470,6 +507,21 @@ pub struct Policy {
     /// a swarm cannot drain it. Left out of the signed JSON when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subscription_roles: Vec<Role>,
+    /// `smart` (the default) or `ordered`. A v2-only field: left out of the signed JSON
+    /// when smart, and never part of the v1 view, so a v0.5.17 machine - which only knows
+    /// ordered - still verifies the file and keeps its own behaviour.
+    #[serde(default, skip_serializing_if = "Routing::is_smart")]
+    pub routing: Routing,
+    /// Per kind of work (`docs`, `code-change`, ...): the success probability an engine
+    /// must reach to count as sufficient. A kind left out uses
+    /// [`crate::router::DEFAULT_THRESHOLD`]. Smart routing only; v2-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub thresholds: BTreeMap<String, f64>,
+    /// Per selector: a weight that breaks ties between engines of equal price. Higher
+    /// first. A prefer list already gives its first entries a small bias of their own.
+    /// Smart routing only; v2-only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bias: BTreeMap<String, f64>,
 }
 
 impl Default for Policy {
@@ -488,6 +540,9 @@ impl Default for Policy {
             effort: BTreeMap::new(),
             width: BTreeMap::new(),
             subscription_roles: Vec::new(),
+            routing: Routing::Smart,
+            thresholds: BTreeMap::new(),
+            bias: BTreeMap::new(),
         }
     }
 }
@@ -516,6 +571,18 @@ impl Policy {
                 bail!("the {role} cap must be a dollar amount of zero or more");
             }
         }
+        for (kind, threshold) in &self.thresholds {
+            crate::work::WorkKind::parse(kind)?;
+            if !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0 {
+                bail!("the {kind} threshold must be a probability above 0 and at most 1");
+            }
+        }
+        for (selector, weight) in &self.bias {
+            check_selector(selector)?;
+            if !weight.is_finite() || weight.abs() > 100.0 {
+                bail!("the bias for {selector} must be a number from -100 to 100");
+            }
+        }
         for (role, width) in &self.width {
             if *width == 0 {
                 bail!(
@@ -525,6 +592,16 @@ impl Policy {
             }
         }
         Ok(())
+    }
+
+    /// The success probability an engine must reach for `kind` of work: the policy's
+    /// word, else [`crate::router::DEFAULT_THRESHOLD`]. Keys are the kind's name.
+    #[must_use]
+    pub fn threshold_for(&self, kind: crate::work::WorkKind) -> f64 {
+        self.thresholds
+            .iter()
+            .find(|(name, _)| crate::work::WorkKind::parse(name).is_ok_and(|parsed| parsed == kind))
+            .map_or(crate::router::DEFAULT_THRESHOLD, |(_, value)| *value)
     }
 
     /// How hard `role`'s engine is asked to think: the policy's word, else the default.
@@ -753,6 +830,33 @@ impl Policy {
                 ));
             }
         }
+        if self.routing != Routing::Smart {
+            lines.push(
+                "routing: ordered - the first engine the lists above allow does the work; \
+                 nothing is scored"
+                    .to_string(),
+            );
+        }
+        if !self.thresholds.is_empty() {
+            lines.push(format!(
+                "routing thresholds: {}",
+                self.thresholds
+                    .iter()
+                    .map(|(kind, value)| format!("{kind} {value:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !self.bias.is_empty() {
+            lines.push(format!(
+                "routing bias: {}",
+                self.bias
+                    .iter()
+                    .map(|(selector, weight)| format!("{selector} {weight:+}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         if self.never_applies_to == NeverScope::All {
             lines.push("never applies to people's own orders too".to_string());
         }
@@ -867,6 +971,18 @@ pub struct Candidate {
     /// What it can do: what its worker published, else guessed from its name, kind and
     /// how it is paid (see [`crate::capability`]). Empty for a hand-built candidate.
     pub capabilities: crate::capability::Capabilities,
+    /// An `http` engine: asked once in text and answering in text. Everything else is a
+    /// CLI. The router sends an http engine text work only.
+    pub http: bool,
+    /// Requests counted against its week, and which ISO week (`2026-W40`) that is. Only
+    /// the current week's count says how much of a weekly cap is left.
+    pub requests: u64,
+    pub week: String,
+    /// How long its last probe took, in milliseconds.
+    pub latency_ms: Option<u64>,
+    /// How its work of each kind has turned out, as its worker's ledger counts it (see
+    /// [`crate::router::Outcome`]).
+    pub outcomes: Vec<crate::router::Outcome>,
 }
 
 impl Candidate {
@@ -898,6 +1014,11 @@ impl Candidate {
             spend_usd: billing.spend_usd,
             flag: billing.flag,
             route: billing.route,
+            http: report.kind == "http",
+            requests: billing.requests,
+            week: billing.week,
+            latency_ms: report.latency_ms,
+            outcomes: trust.kinds,
         }
     }
 
@@ -930,7 +1051,7 @@ impl Candidate {
     }
 
     /// The tier it may work at now: chore while demoted.
-    fn level(&self) -> u8 {
+    pub(crate) fn level(&self) -> u8 {
         if self.demoted {
             0
         } else {
@@ -991,7 +1112,7 @@ impl Candidate {
     }
 }
 
-fn tier_level(tier: &str) -> u8 {
+pub(crate) fn tier_level(tier: &str) -> u8 {
     match tier.trim().to_ascii_lowercase().as_str() {
         "chore" => 0,
         "judge" => 2,
@@ -2321,6 +2442,9 @@ impl Policy {
             effort: BTreeMap::new(),
             width: BTreeMap::new(),
             subscription_roles: Vec::new(),
+            routing: Routing::Smart,
+            thresholds: BTreeMap::new(),
+            bias: BTreeMap::new(),
             ..self.clone()
         };
         view.prefer.remove(Role::Adversary.as_str());
@@ -3157,6 +3281,11 @@ pub struct Step {
     /// with an effort. Left out of the signed JSON when unknown, so older records verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// Why this engine: the smart router's decision, with every candidate's success
+    /// estimate and price and why the others were out. Left out of the signed JSON when
+    /// absent, and never part of the v1 view, so older records verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::router::Decision>,
     /// `done`, or what happened instead: `held: ...`, `failed: ...`.
     pub outcome: String,
 }
@@ -3211,7 +3340,9 @@ pub struct StepLog {
 
 impl StepLog {
     fn has_v2_fields(&self) -> bool {
-        self.steps.iter().any(|step| step.effort.is_some())
+        self.steps
+            .iter()
+            .any(|step| step.effort.is_some() || step.route.is_some())
     }
 
     /// Whether the log is the signing agent's own: v1 always, and v2 as well when a field
@@ -3233,13 +3364,14 @@ impl StepLog {
     }
 }
 
-/// The steps as v0.5.17 serializes them, without `effort`.
+/// The steps as v0.5.17 serializes them, without `effort` and `route`.
 fn steps_v1_json(steps: &[Step]) -> String {
     let mut value = serde_json::to_value(steps).unwrap_or_default();
     if let Some(list) = value.as_array_mut() {
         for step in list {
             if let Some(step) = step.as_object_mut() {
                 step.remove("effort");
+                step.remove("route");
             }
         }
     }
@@ -4377,6 +4509,7 @@ mod tests {
             cost_usd: Some(cost),
             order: None,
             effort: None,
+            route: None,
             outcome: "done".into(),
         };
         record_step(&route, &wisp, "2026-W40", step("plan", 0.25)).unwrap();
@@ -4478,6 +4611,7 @@ mod tests {
             cost_usd: Some(0.5),
             order: Some("o-1".into()),
             effort: effort.map(str::to_string),
+            route: None,
             outcome: "done".into(),
         };
         record_step(&route, &wisp, "2026-W40", step(Some("high"))).unwrap();
@@ -4977,6 +5111,7 @@ mod tests {
             cost_usd: None,
             order: None,
             effort: None,
+            route: None,
             outcome: "done".into(),
         };
         assert!(serde_json::to_value(&old).unwrap().get("effort").is_none());
@@ -5678,6 +5813,189 @@ mod tests {
         crate::atomic_json(&channel.join(ENGINE_POLICY), &downgraded).unwrap();
         assert_eq!(effective(channel, "demo").0, strict, "not the downgrade");
         assert!(rollback_notice(channel, "demo").is_some());
+    }
+
+    #[test]
+    fn routing_thresholds_and_bias_are_v2_only_and_cannot_be_forged_or_stripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let (josh, grouchly) = (person("josh", 1), person("grouchly", 2));
+        let route = route(dir.path(), &[&josh, &grouchly]);
+        let channel = &route.communications;
+        let mut policy = upgraded_policy();
+        policy.routing = Routing::Ordered;
+        policy.thresholds.insert("docs".into(), 0.7);
+        policy.bias.insert("nvidia*".into(), 3.0);
+        policy.check().unwrap();
+        assert!(set_policy(channel, "demo", Some(policy.clone()), &josh).unwrap());
+
+        // A v0.5.17 machine verifies the file and keeps everything it understands.
+        let old = old_machine_reads(channel).expect("the old machine accepts it");
+        assert_eq!(old.policy.unwrap().machines, ["grouchly"]);
+
+        // A new machine reads all of it, and the file keeps the new fields out of the v1 view.
+        let (read, set) = effective(channel, "demo");
+        assert_eq!(read, policy);
+        assert!(set.unwrap().signature_v2.is_some());
+        let wire: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(channel.join(ENGINE_POLICY)).unwrap()).unwrap();
+        for key in ["routing", "thresholds", "bias"] {
+            assert!(
+                wire["policy"].get(key).is_none(),
+                "{key} in the v1 view: {wire}"
+            );
+            assert!(
+                wire["policy_v2"].get(key).is_some(),
+                "{key} missing from v2: {wire}"
+            );
+        }
+        assert_eq!(wire["policy_v2"]["routing"], "ordered");
+        assert_eq!(wire["policy_v2"]["thresholds"]["docs"], 0.7);
+
+        let good = read_file_setting(channel).unwrap();
+        assert!(genuine(channel, "demo", &good));
+        // Each of them changed with the signatures left as they were: the v1 one still
+        // holds (it never covered them), the v2 one does not.
+        let mut smart = good.clone();
+        smart.policy.as_mut().unwrap().routing = Routing::Smart;
+        assert!(!genuine(channel, "demo", &smart), "routing flipped");
+        let mut easy = good.clone();
+        easy.policy
+            .as_mut()
+            .unwrap()
+            .thresholds
+            .insert("docs".into(), 0.1);
+        assert!(!genuine(channel, "demo", &easy), "threshold lowered");
+        let mut bias = good.clone();
+        bias.policy.as_mut().unwrap().bias.clear();
+        assert!(!genuine(channel, "demo", &bias), "bias dropped");
+        // The v2 signature taken off: the routing would ride on the v1 signature alone.
+        let mut stripped = good.clone();
+        stripped.signature_v2 = None;
+        assert!(
+            !genuine(channel, "demo", &stripped),
+            "a routing policy needs its v2"
+        );
+    }
+
+    #[test]
+    fn smart_is_the_default_and_leaves_no_trace_in_what_was_signed() {
+        let policy = Policy::default();
+        assert_eq!(policy.routing, Routing::Smart);
+        let shape = serde_json::to_value(&policy).unwrap();
+        for key in ["routing", "thresholds", "bias"] {
+            assert!(shape.get(key).is_none(), "{key} is left out: {shape}");
+        }
+        // A policy signed before routing existed reads as smart, byte for byte as it was.
+        let from_old: Policy = serde_json::from_value(shape.clone()).unwrap();
+        assert_eq!(from_old, policy);
+        assert_eq!(
+            serde_jcs::to_string(&from_old).unwrap(),
+            serde_jcs::to_string(&shape).unwrap()
+        );
+        assert!(policy.is_v1_only(), "smart alone needs no v2 signature");
+        let ordered = Policy {
+            routing: Routing::Ordered,
+            ..Policy::default()
+        };
+        assert!(!ordered.is_v1_only());
+        assert_eq!(Routing::parse("Smart").unwrap(), Routing::Smart);
+        assert_eq!(Routing::parse("ordered").unwrap(), Routing::Ordered);
+        assert!(Routing::parse("random").is_err());
+
+        // Thresholds: the policy's word for a kind, else the default.
+        let docs = crate::work::WorkKind::Docs;
+        assert!((policy.threshold_for(docs) - crate::router::DEFAULT_THRESHOLD).abs() < 1e-9);
+        let mut tuned = Policy::default();
+        tuned.thresholds.insert(docs.as_str().into(), 0.7);
+        tuned.check().unwrap();
+        assert!((tuned.threshold_for(docs) - 0.7).abs() < 1e-9);
+        assert!(
+            (tuned.threshold_for(crate::work::WorkKind::Review) - crate::router::DEFAULT_THRESHOLD)
+                .abs()
+                < 1e-9
+        );
+        // And what `check` refuses.
+        for bad in [0.0, -0.2, 1.5, f64::NAN] {
+            let mut policy = Policy::default();
+            policy.thresholds.insert(docs.as_str().into(), bad);
+            assert!(policy.check().is_err(), "threshold {bad}");
+        }
+        let mut nonsense = Policy::default();
+        nonsense.thresholds.insert("sorcery".into(), 0.5);
+        assert!(nonsense.check().is_err(), "no such kind");
+        let mut loud = Policy::default();
+        loud.bias.insert("nvidia*".into(), 1000.0);
+        assert!(loud.check().is_err(), "a bias is a weight, not a command");
+        loud.bias.insert("nvidia*".into(), f64::NAN);
+        assert!(loud.check().is_err());
+        let mut fine = Policy::default();
+        fine.bias.insert("nvidia*".into(), -0.5);
+        fine.check().unwrap();
+    }
+
+    #[test]
+    fn a_step_with_a_routing_decision_verifies_on_a_v0_5_17_peer_and_cannot_be_forged() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let wisp = person("wisp", 2);
+        let route = route(dir.path(), &[&josh, &wisp]);
+        let decision = |reason: &str| crate::router::Decision {
+            routing: "smart".into(),
+            role: "build".into(),
+            kind: "docs".into(),
+            size: "small".into(),
+            needs: vec!["text".into()],
+            threshold: 0.75,
+            candidates: Vec::new(),
+            winner: None,
+            reason: reason.into(),
+            failed: Vec::new(),
+            must_beat: None,
+        };
+        let step = Step {
+            step: "build".into(),
+            role: Some("build".into()),
+            at: Utc::now(),
+            agent: "wisp".into(),
+            machine: "grouchly".into(),
+            engine: Some("nemotron".into()),
+            model: None,
+            cost_usd: Some(0.0),
+            order: Some("o-1".into()),
+            effort: None,
+            route: Some(decision(
+                "nemotron: free, p 0.80 for docs >= 0.75, cheapest sufficient",
+            )),
+            outcome: "done".into(),
+        };
+        record_step(&route, &wisp, "2026-W40", step).unwrap();
+        let path = steps_dir(&route, "2026-W40").join("wisp.json");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            old_peer_accepts_steps(&bytes, &route.agents),
+            "an old peer must not drop a log because a step carries its routing"
+        );
+        let steps = read_steps(&route, "2026-W40");
+        assert_eq!(steps.len(), 1);
+        assert!(
+            steps[0]
+                .route
+                .as_ref()
+                .unwrap()
+                .reason
+                .starts_with("nemotron: free")
+        );
+
+        // Rewriting the reason, or taking the v2 signature off, is refused by a new peer.
+        let log: StepLog = serde_json::from_slice(&bytes).unwrap();
+        let mut forged = log.clone();
+        forged.steps[0].route = Some(decision("claude: the best"));
+        crate::atomic_json(&path, &forged).unwrap();
+        assert!(read_steps(&route, "2026-W40").is_empty());
+        let mut stripped = log;
+        stripped.signature_v2 = None;
+        crate::atomic_json(&path, &stripped).unwrap();
+        assert!(read_steps(&route, "2026-W40").is_empty());
     }
 
     #[test]

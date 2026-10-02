@@ -56,7 +56,10 @@ use ferryman_channel::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use ferryman_channel::policy::{Policy, Role, Step};
+use ferryman_channel::{
+    policy::{Policy, Role, Step, Work},
+    router::{self, Decision},
+};
 
 use crate::{
     Progress,
@@ -1137,8 +1140,8 @@ fn signing_identity(route: &ProjectRoute, config: &AgentConfig) -> Result<AgentI
 
 /// What asking for a plan came to.
 enum Asked {
-    /// The answer, the engine, whether it is a judge, and what it cost.
-    Answered(String, Box<EngineSpec>, bool, f64),
+    /// The answer, the engine, whether it is a judge, what it cost, and why that engine.
+    Answered(String, Box<EngineSpec>, bool, f64, Box<Decision>),
     /// Nothing the engine policy allows could be asked: the work waits.
     Held(String),
     /// Every allowed engine was asked and none answered.
@@ -1159,17 +1162,17 @@ async fn ask_best(
     let mut tried = Vec::new();
     loop {
         let ledger = engines::Ledger::load(&config.agent);
-        let engine = match engines::choose(
+        let (engine, decision) = match engines::choose_routed(
             &config.engines,
             &ledger,
             Utc::now(),
             policy,
-            Role::Plan,
-            Tier::Judge,
-            &tried,
+            (Role::Plan, Tier::Judge, Work::Background),
+            &router::needs_for_role(Role::Plan),
+            (&[], &tried),
             (&config.agent, &machine),
         ) {
-            Ok(engine) => engine,
+            Ok(chosen) => chosen,
             Err(why) if tried.is_empty() => return Asked::Held(why),
             Err(why) => return Asked::Failed(why),
         };
@@ -1183,7 +1186,9 @@ async fn ask_best(
         )
         .await
         {
-            Ok((answer, cost)) => return Asked::Answered(answer, Box::new(engine), judge, cost),
+            Ok((answer, cost)) => {
+                return Asked::Answered(answer, Box::new(engine), judge, cost, Box::new(decision));
+            }
             Err(error) => {
                 if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
                     crate::agent::note_unavailable(route, config, skip);
@@ -1209,6 +1214,30 @@ fn note_step(
     cost: Option<f64>,
     outcome: &str,
 ) {
+    note_step_routed(
+        route,
+        config,
+        week,
+        step,
+        role,
+        (engine, None),
+        cost,
+        outcome,
+    );
+}
+
+/// [`note_step`] with the smart router's decision beside the engine, when it chose it.
+#[allow(clippy::too_many_arguments)]
+fn note_step_routed(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    week: &str,
+    step: &str,
+    role: Option<Role>,
+    (engine, decision): (Option<&EngineSpec>, Option<&Decision>),
+    cost: Option<f64>,
+    outcome: &str,
+) {
     let Ok(identity) = signing_identity(route, config) else {
         return;
     };
@@ -1223,6 +1252,7 @@ fn note_step(
         cost_usd: cost,
         order: None,
         effort: role.and_then(|role| engines::effort_used(route, role, engine)),
+        route: decision.cloned(),
         outcome: outcome.to_string(),
     };
     if let Err(error) = ferryman_channel::policy::record_step(route, &identity, week, record) {
@@ -1401,7 +1431,7 @@ pub async fn plan(
         hold(route, config, Role::Plan, &week, &why, report);
         return Ok(PlanOutcome::Held(why));
     }
-    let (answer, engine, judged, cost) = match ask_best(
+    let (answer, engine, judged, cost, plan_route) = match ask_best(
         route,
         config,
         &policy,
@@ -1410,7 +1440,9 @@ pub async fn plan(
     )
     .await
     {
-        Asked::Answered(answer, engine, judged, cost) => (answer, *engine, judged, cost),
+        Asked::Answered(answer, engine, judged, cost, decision) => {
+            (answer, *engine, judged, cost, *decision)
+        }
         Asked::Held(why) => {
             hold(route, config, Role::Plan, &week, &why, report);
             return Ok(PlanOutcome::Held(why));
@@ -1432,13 +1464,13 @@ pub async fn plan(
             ));
         }
     };
-    note_step(
+    note_step_routed(
         route,
         config,
         &week,
         "plan",
         Some(Role::Plan),
-        Some(&engine),
+        (Some(&engine), Some(&plan_route)),
         Some(cost),
         if judged { "done" } else { "done (unreviewed)" },
     );
@@ -1615,19 +1647,19 @@ pub async fn review(
     let machine = ferryman_channel::receipts::machine_label();
     let chosen = match ferryman_channel::policy::over_cap(route, &policy, &week, Role::Review) {
         Some(why) => Err(why),
-        None => engines::choose(
+        None => engines::choose_routed(
             &config.engines,
             &ledger,
             now,
             &policy,
-            Role::Review,
-            Tier::Judge,
-            &[],
+            (Role::Review, Tier::Judge, Work::Background),
+            &router::needs_for_role(Role::Review),
+            (&[], &[]),
             (&config.agent, &machine),
         ),
     };
-    let judge = match chosen {
-        Ok(judge) => judge,
+    let (judge, judge_route) = match chosen {
+        Ok(chosen) => chosen,
         Err(why) if waiting => {
             hold(route, config, Role::Review, &week, &why, report);
             return Ok(0);
@@ -1718,13 +1750,13 @@ pub async fn review(
         }
     }
     if judged > 0 {
-        note_step(
+        note_step_routed(
             route,
             config,
             &week,
             "review",
             Some(Role::Review),
-            Some(&judge),
+            (Some(&judge), Some(&judge_route)),
             Some(spent_since(config, &judge, &spent_before, now)),
             &format!("judged {judged}"),
         );
