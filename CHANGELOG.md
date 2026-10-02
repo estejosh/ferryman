@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.5.18 - 2026-10-02
+
+A second model of your choice challenges the work at three moments - before a contract locks, when an order fails twice, and before an improvement is done - and in blocking mode nothing goes live until it has. Orders can share signed interface contracts and declare the files they touch, and a team preset runs cheap models in parallel swarms, including Claude Sonnet and Haiku when you opt a role in with a weekly cap.
 
 ### Added
 
