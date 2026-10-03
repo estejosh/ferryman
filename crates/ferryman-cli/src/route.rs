@@ -45,7 +45,7 @@ pub(crate) enum RouteCommand {
     /// Why an order went to the engine it did: what it needs, the decision each worker
     /// recorded when it took the order (every engine's success estimate, price and why the
     /// others were out), the improve steps' records, and what the router would pick right
-    /// now, with the engines that already failed it left out.
+    /// now, with the engines that already failed it tried again only after the others.
     Explain {
         /// The order id, e.g. t-4f2a.
         order: String,
@@ -147,7 +147,15 @@ pub(crate) async fn command(command: RouteCommand) -> Result<()> {
             let classification = work::classify_cached(&task.order, &route);
             let (policy, _) = policy::effective(&route.communications, &route.project_id);
             let fleet = policy::fleet(&route, now);
-            let failed = ferryman_ops::agent::failed_engines(&task);
+            // Each agent's own failures: a failure belongs to the engine on the agent that
+            // ran it, and only results that agent signed count.
+            let mut agents: Vec<&str> = fleet.iter().map(|e| e.agent.as_str()).collect();
+            agents.sort_unstable_by_key(|a| a.to_ascii_lowercase());
+            agents.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+            let failed: Vec<router::Failed> = agents
+                .iter()
+                .flat_map(|agent| ferryman_ops::agent::failed_engines(&route, &task, agent))
+                .collect();
             let role = policy::order_role(&task.order);
             let mut context = router::Context::new(now);
             context.failed = &failed;
@@ -177,7 +185,11 @@ pub(crate) async fn command(command: RouteCommand) -> Result<()> {
                             .collect::<Vec<_>>(),
                         "failed": failed
                             .iter()
-                            .map(|f| json!({ "engine": f.engine, "p": f.p }))
+                            .map(|f| json!({
+                                "agent": f.agent,
+                                "machine": f.machine,
+                                "engine": f.engine,
+                            }))
                             .collect::<Vec<_>>(),
                         "now": {
                             "decision": current.decision,

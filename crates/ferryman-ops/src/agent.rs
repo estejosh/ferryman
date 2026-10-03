@@ -3404,40 +3404,78 @@ async fn attempt(
     }
 }
 
-/// The engines that already failed this order, with the success estimate each was routed
-/// at: a result the worker's own evidence refuted, or one a reviewer sent back with changes
-/// requested. A retry leaves them out and must beat their estimate (see
-/// [`ferryman_channel::router`]).
+/// The engines of `agent` that already failed this order: a result of its own, signed by it,
+/// that its evidence refuted, or that a signed review sent back with changes requested. A
+/// retry leaves them out (see [`ferryman_channel::router`]).
+///
+/// Only this worker's own results count, and only ones whose signature verifies against
+/// the roster: a result another agent wrote, or one nobody signed, says nothing about the
+/// engines here, and must not be able to shut them out of an order. The estimate a failed
+/// engine was routed at is deliberately not read from the result either - a payload is
+/// whatever its writer says - so the router works the floor out from this worker's own
+/// ledger instead.
 #[must_use]
-pub fn failed_engines(task: &Task) -> Vec<ferryman_channel::router::Failed> {
+pub fn failed_engines(
+    route: &ProjectRoute,
+    task: &Task,
+    agent: &str,
+) -> Vec<ferryman_channel::router::Failed> {
+    failed_engines_by(
+        task,
+        agent,
+        &|result| {
+            ferryman_channel::verify_result(result, &route.agents)
+                == ferryman_channel::SignatureCheck::Valid
+        },
+        &|review| {
+            ferryman_channel::verify_review(review, &route.agents)
+                == ferryman_channel::SignatureCheck::Valid
+                && ferryman_channel::review_authority(route, review).allowed()
+        },
+    )
+}
+
+/// [`failed_engines`], with what to trust given: whether a result's, and a review's,
+/// signature checks out.
+fn failed_engines_by(
+    task: &Task,
+    agent: &str,
+    trusted_result: &dyn Fn(&TaskResult) -> bool,
+    trusted_review: &dyn Fn(&Review) -> bool,
+) -> Vec<ferryman_channel::router::Failed> {
     let mut failed: Vec<ferryman_channel::router::Failed> = Vec::new();
     for result in &task.results {
+        if !result.agent.eq_ignore_ascii_case(agent) || !trusted_result(result) {
+            continue;
+        }
         let Some(engine) = result.payload.get("engine").and_then(Value::as_str) else {
             continue;
         };
         let refuted = ferryman_channel::evidence::classify(&task.order.payload, result).status
             == ferryman_channel::evidence::Status::Refuted;
-        let sent_back = task
-            .reviews
-            .iter()
-            .any(|review| review.revision == result.revision && !review.accepted);
+        let sent_back = task.reviews.iter().any(|review| {
+            review.revision == result.revision && !review.accepted && trusted_review(review)
+        });
         if !refuted && !sent_back {
             continue;
         }
-        let p = ferryman_channel::router::decision_of(&result.payload)
-            .and_then(|decision| decision.winner)
-            .map(|winner| winner.p);
-        match failed.iter_mut().find(|known| known.engine == engine) {
-            Some(known) => {
-                known.p = match (known.p, p) {
-                    (Some(a), Some(b)) => Some(a.max(b)),
-                    (a, b) => a.or(b),
-                };
-            }
-            None => failed.push(ferryman_channel::router::Failed {
+        let machine = result
+            .payload
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let known = failed.iter().any(|known| {
+            known.engine == engine
+                && known.machine.eq_ignore_ascii_case(machine)
+                && known.agent.eq_ignore_ascii_case(agent)
+        });
+        if !known {
+            failed.push(ferryman_channel::router::Failed {
+                agent: agent.to_string(),
+                machine: machine.to_string(),
                 engine: engine.to_string(),
-                p,
-            }),
+                p: None,
+            });
         }
     }
     failed
@@ -5545,6 +5583,8 @@ mod tests {
             notes: None,
             ..sent_back(3)
         };
+        // This worker, and everything it signed trusted: what the failures of "worker" are.
+        let failed_engines = |task: &Task| failed_engines_by(task, "worker", &|_| true, &|_| true);
         // Nothing yet: nobody has failed.
         assert!(failed_engines(&task_with(Vec::new(), Vec::new())).is_empty());
         // A good result nobody sent back is not a failure.
@@ -5558,7 +5598,11 @@ mod tests {
         let failed = failed_engines(&refuted);
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].engine, "nvidia");
-        assert_eq!(failed[0].p, Some(0.8), "the estimate it was routed at");
+        assert_eq!(failed[0].agent, "worker");
+        assert_eq!(
+            failed[0].p, None,
+            "the estimate a result claims is not read: the router works the floor out itself"
+        );
         // Sent back with changes requested.
         let back = task_with(
             vec![routed_result(1, "nvidia", "the report", 0.8)],
@@ -5577,7 +5621,6 @@ mod tests {
         let failed = failed_engines(&mixed);
         let names: Vec<&str> = failed.iter().map(|f| f.engine.as_str()).collect();
         assert_eq!(names, ["nvidia", "claude"]);
-        assert_eq!(failed[0].p, Some(0.7), "r3 was accepted, so only r1 counts");
         // A result from before the router has no estimate to beat, but still failed.
         let old = TaskResult {
             payload: json!({ "output": "", "engine": "codex" }),
@@ -5585,6 +5628,61 @@ mod tests {
         };
         let failed = failed_engines(&task_with(vec![old], Vec::new()));
         assert_eq!((failed[0].engine.as_str(), failed[0].p), ("codex", None));
+    }
+
+    #[test]
+    fn only_this_workers_own_trusted_results_count_as_its_engines_failing() {
+        let refuted = |agent: &str, engine: &str, machine: &str, p: f64| {
+            let mut found = routed_result(1, engine, "", p);
+            found.agent = agent.into();
+            found.payload["machine"] = json!(machine);
+            found
+        };
+        let trusting = |task: &Task, agent: &str| {
+            failed_engines_by(task, agent, &|_| true, &|_| true)
+                .iter()
+                .map(|f| format!("{}/{}/{}", f.agent, f.machine, f.engine))
+                .collect::<Vec<_>>()
+        };
+        // Another member's refuted result, or one claiming to be a cheap engine's failure,
+        // is nothing to do with this worker's engines.
+        let task = task_with(
+            vec![
+                refuted("mallory", "nemotron", "evil", 1.0),
+                refuted("worker", "claude", "box", 0.1),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(trusting(&task, "worker"), ["worker/box/claude"]);
+        assert_eq!(trusting(&task, "mallory"), ["mallory/evil/nemotron"]);
+        assert!(
+            trusting(&task, "ember").is_empty(),
+            "claude failed on worker's box, not ember's"
+        );
+        // A result whose signature does not check out (a forgery with this worker's name on
+        // it) is not a failure either.
+        let forged = failed_engines_by(&task, "worker", &|_| false, &|_| true);
+        assert!(forged.is_empty(), "{forged:?}");
+        // And a signed review by someone with no authority does not send a result back.
+        let review = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "orchestrator".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: false,
+            notes: Some("no".into()),
+            signed_by: None,
+            signature: None,
+        };
+        let fine = task_with(
+            vec![routed_result(1, "nvidia", "the report", 0.9)],
+            vec![review],
+        );
+        assert!(failed_engines_by(&fine, "worker", &|_| true, &|_| false).is_empty());
+        assert_eq!(
+            failed_engines_by(&fine, "worker", &|_| true, &|_| true).len(),
+            1
+        );
     }
 
     #[test]

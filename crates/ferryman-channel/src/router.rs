@@ -36,9 +36,20 @@
 //! - **Planning** prefers a judge-tier engine only as a tie-break (the existing rule: a plan
 //!   a judge wrote needs no second reading); a builder the operator listed, or one that is
 //!   cheaper and sufficient, can plan, marked unreviewed as before.
-//! - **Escalation.** An engine that already failed this order (its result was refuted by
-//!   its own evidence, or sent back with changes requested) is out, and the next engine must
-//!   have a higher success estimate than the failed one had.
+//! - **Escalation.** An engine that already failed this order (a result of this worker's
+//!   own, refuted by its own evidence or sent back with changes requested; an engine is the
+//!   engine of one agent on one machine, so another machine's `claude` failing says nothing
+//!   about this one) is left out of the sufficient set, and the next engine is *preferred*
+//!   to have a higher success estimate than the failed one had: that is a bar the sufficient
+//!   set must clear, not a rule. When no engine clears it the highest estimate wins as
+//!   always, even at or below the failed one's; and when the failed engines are the only
+//!   ones that can do the work, the likeliest of them is tried again, and the reason says
+//!   so, rather than the order waiting for an engine that is never coming. The estimate to
+//!   beat is worked out from this worker's own ledger, never read from a result's payload,
+//!   which anyone who can write one could set to 1.0.
+//! - **Work that edits files** (see `work::routing_needs`) needs `code` whatever its kind:
+//!   background build and chore orders, and any order with declared `touches` or that
+//!   requires changes, so a text-only engine is not sent an order it can only fail.
 //!
 //! # The success estimate
 //!
@@ -595,11 +606,29 @@ pub fn decision_of(payload: &Value) -> Option<Decision> {
     serde_json::from_value(payload.get("routing")?.clone()).ok()
 }
 
-/// An engine that already failed this order, and the estimate it had.
+/// An engine that already failed this order, where, and the estimate it had. A failure
+/// belongs to the engine on the machine of the worker that ran it: another machine's
+/// `claude` that failed is not this machine's `claude`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Failed {
+    pub agent: String,
+    /// Empty when the record does not say which machine: any machine of that agent.
+    pub machine: String,
     pub engine: String,
+    /// An estimate from the record, used only when the engine is not among those being
+    /// routed. The router works the bar out from its own ledger first: a record can say
+    /// anything.
     pub p: Option<f64>,
+}
+
+impl Failed {
+    /// Whether this is the failure of `engine`.
+    #[must_use]
+    pub fn is(&self, engine: &Candidate) -> bool {
+        self.engine == engine.name
+            && self.agent == engine.agent
+            && (self.machine.is_empty() || self.machine == engine.machine)
+    }
 }
 
 /// What a routing call is told besides the engines and the policy.
@@ -609,6 +638,7 @@ pub struct Context<'a> {
     /// Engines to leave out: already asked in this attempt (out of credit, or down).
     pub tried: &'a [String],
     /// Engines that failed this order: left out, and the next must beat their estimate.
+    /// When nothing else can do the work they are tried again, the likeliest first.
     pub failed: &'a [Failed],
 }
 
@@ -747,25 +777,47 @@ pub fn route(
         needs
     };
 
-    // What the policy let through, less what this call leaves out.
+    // What the policy let through, less what this call leaves out. An engine that failed
+    // this order is out - unless it is all there is, below.
     let mut pool: Vec<usize> = Vec::new();
+    let mut failed_pool: Vec<(usize, String)> = Vec::new();
     for &index in &ranking.order {
         let engine = &engines[index];
         let left_out = if context.tried.contains(&engine.name) {
             Some("already asked in this attempt".to_string())
         } else if !smart {
             None
-        } else if let Some(failed) = context.failed.iter().find(|f| f.engine == engine.name) {
-            Some(match failed.p {
-                Some(p) => format!("failed this order earlier at p {p:.2}"),
-                None => "failed this order earlier".to_string(),
-            })
+        } else if let Some(failed) = context.failed.iter().find(|f| f.is(engine)) {
+            match unable(engine, needs_here) {
+                Err(why) => Some(why),
+                Ok(()) => {
+                    failed_pool.push((
+                        index,
+                        match failed.p {
+                            Some(p) => format!("failed this order earlier at p {p:.2}"),
+                            None => "failed this order earlier".to_string(),
+                        },
+                    ));
+                    continue;
+                }
+            }
         } else {
             unable(engine, needs_here).err()
         };
         match left_out {
             Some(why) => excluded.push(considered(engine, Some(why))),
             None => pool.push(index),
+        }
+    }
+    // Nothing waits for want of an engine that failed once: when every engine that can do
+    // the work has already failed this order, the likeliest of them tries again, and the
+    // reason says so.
+    let retrying = pool.is_empty() && !failed_pool.is_empty();
+    if retrying {
+        pool = failed_pool.iter().map(|(index, _)| *index).collect();
+    } else {
+        for (index, why) in failed_pool {
+            excluded.push(considered(&engines[index], Some(why)));
         }
     }
 
@@ -817,13 +869,27 @@ pub fn route(
     }
 
     // Smart: score what is left.
-    let floor = context
-        .failed
-        .iter()
-        .filter_map(|failed| failed.p)
-        .fold(None, |best: Option<f64>, p| {
-            Some(best.map_or(p, |best| best.max(p)))
-        });
+    // What a retry must beat: what this worker's own ledger says of each failed engine now.
+    // An estimate carried by a result is only a fallback for an engine that is not here
+    // (a payload is whatever its writer says), and not at all when retrying the same
+    // engines, which have nothing better to be compared with.
+    let floor = if retrying {
+        None
+    } else {
+        context
+            .failed
+            .iter()
+            .filter_map(|failed| {
+                engines
+                    .iter()
+                    .find(|engine| failed.is(engine))
+                    .map(|engine| estimate(engine, needs, context.now).p)
+                    .or(failed.p)
+            })
+            .fold(None, |best: Option<f64>, p| {
+                Some(best.map_or(p, |best| best.max(p)))
+            })
+    };
     decision.must_beat = floor.map(round3);
     let wanted = crate::policy::tier_level(tier);
     let scored: Vec<Scored> = pool
@@ -832,8 +898,9 @@ pub fn route(
         .map(|(place, &index)| {
             let engine = &engines[index];
             let estimate = estimate(engine, needs, context.now);
-            let sufficient =
-                estimate.p + 1e-9 >= threshold && floor.is_none_or(|f| estimate.p > f + 1e-9);
+            let sufficient = !retrying
+                && estimate.p + 1e-9 >= threshold
+                && floor.is_none_or(|f| estimate.p > f + 1e-9);
             let level = i16::from(engine.level());
             Scored {
                 index,
@@ -913,6 +980,12 @@ pub fn route(
                 decision.reason.push_str(
                     "; no engine that can edit files is up, so a text-only one takes it as \
                      it always has",
+                );
+            }
+            if retrying {
+                decision.reason.push_str(
+                    "; every engine that can do this work has already failed this order, so \
+                     the likeliest of them tries again",
                 );
             }
         }
@@ -1237,6 +1310,16 @@ mod tests {
         )
     }
 
+    /// A failure of the test engine's own agent and machine.
+    fn failure(engine: &str, p: Option<f64>) -> Failed {
+        Failed {
+            agent: "wisp".into(),
+            machine: "box".into(),
+            engine: engine.into(),
+            p,
+        }
+    }
+
     fn retry(failed: &[Failed], engines: &[Candidate], needs: &Needs) -> Routed {
         route(
             &Policy::default(),
@@ -1511,78 +1594,180 @@ mod tests {
         );
     }
 
-    #[test]
-    fn josh_example_nvidia_then_sonnet_then_haiku_with_local_models_eligible() {
-        let nvidia = engine("nvidia", ModelClass::Large, "free-tier", Some(Cost::FREE));
+    /// Josh's fleet, as ENGINE_SETUP.md describes it: an NVIDIA judge on the free tier, Claude
+    /// Sonnet and Haiku on a capped subscription (with the prices they declare), and a local
+    /// ollama model.
+    fn josh_fleet() -> Vec<Candidate> {
+        let mut nvidia = http("nemotron", ModelClass::Medium, "free-tier");
+        nvidia.tier = "judge".into();
         let mut sonnet = engine(
-            "sonnet",
+            "claude-sonnet",
             ModelClass::Medium,
             "subscription",
-            Some(Cost::FREE),
+            Some(Cost {
+                per_call_usd: 0.0,
+                per_mtok_in_usd: 3.0,
+                per_mtok_out_usd: 15.0,
+            }),
         );
-        sonnet.capabilities.strengths = vec!["code".into(), "docs".into()];
         sonnet.weekly_requests = Some(500);
-        let mut haiku = engine("haiku", ModelClass::Small, "subscription", Some(Cost::FREE));
+        let mut haiku = engine(
+            "claude-haiku",
+            ModelClass::Small,
+            "subscription",
+            Some(Cost {
+                per_call_usd: 0.0,
+                per_mtok_in_usd: 1.0,
+                per_mtok_out_usd: 5.0,
+            }),
+        );
         haiku.weekly_requests = Some(500);
-        let mut ollama = engine("ollama", ModelClass::Small, "local", Some(Cost::FREE));
+        let mut ollama = http("ollama", ModelClass::Small, "local");
         ollama.capabilities.local = true;
-        let engines = [haiku, sonnet, ollama, nvidia];
-        let mut policy = Policy {
+        vec![haiku, sonnet, ollama, nvidia]
+    }
+
+    fn josh_policy() -> Policy {
+        Policy {
             protect_subscriptions: false,
             ..Policy::default()
-        };
-        policy.prefer.insert(
-            "build".into(),
-            vec![
-                "name:nvidia".into(),
-                "name:sonnet".into(),
-                "name:haiku".into(),
-                "paid:local".into(),
-            ],
-        );
-        let docs = needs(WorkKind::Docs, Size::Medium);
-        // NVIDIA is free and large: it wins while it is up.
-        let routed = run(&policy, &docs, &engines);
-        assert_eq!(pick(&routed, &engines).as_deref(), Some("nvidia"));
-        // Out of credit, Sonnet comes next: sufficient with its docs strength, where haiku
-        // and the local model are not.
-        let mut down = engines.clone();
-        down[3].state = "exhausted".into();
-        let routed = run(&policy, &docs, &down);
-        assert_eq!(
-            pick(&routed, &down).as_deref(),
-            Some("sonnet"),
-            "{:?}",
-            routed.decision
-        );
-        // Local models are eligible: proven at docs, the free local one beats a subscription.
-        for _ in 0..8 {
-            record_outcome(&mut down[2].outcomes, "docs", true, now());
         }
-        assert_eq!(
-            pick(&run(&policy, &docs, &down), &down).as_deref(),
-            Some("ollama")
-        );
-        // And with haiku proven too, price is tied between the two subscriptions and bias
-        // puts Sonnet before Haiku.
-        let mut proven = engines.clone();
-        proven[3].state = "exhausted".into();
-        proven[2].state = "exhausted".into();
-        for _ in 0..8 {
-            record_outcome(&mut proven[0].outcomes, "docs", true, now());
+    }
+
+    /// A chore that edits files: small work that needs `code`.
+    fn editing_chore() -> Needs {
+        Needs {
+            modalities: vec![Modality::Text, Modality::Code],
+            ..needs(WorkKind::Chore, Size::Small)
         }
-        let routed = run(&policy, &docs, &proven);
-        assert_eq!(pick(&routed, &proven).as_deref(), Some("sonnet"));
-        assert!(
-            routed
-                .decision
-                .reason
-                .contains("tied on price with haiku, bias put it first"),
+    }
+
+    #[test]
+    fn josh_example_text_work_goes_to_nemotron() {
+        let fleet = josh_fleet();
+        let policy = josh_policy();
+        for needs in [
+            needs(WorkKind::Docs, Size::Medium),
+            needs(WorkKind::Review, Size::Medium),
+            needs(WorkKind::Plan, Size::Medium),
+            needs(WorkKind::Chore, Size::Small),
+        ] {
+            let routed = run(&policy, &needs, &fleet);
+            assert_eq!(
+                pick(&routed, &fleet).as_deref(),
+                Some("nemotron"),
+                "{} work: {}",
+                needs.kind.as_str(),
+                routed.decision.reason
+            );
+            assert!(routed.decision.reason.contains("cheapest sufficient"));
+        }
+    }
+
+    #[test]
+    fn josh_example_code_edits_go_to_sonnet() {
+        let fleet = josh_fleet();
+        let routed = run(
+            &josh_policy(),
+            &needs(WorkKind::CodeChange, Size::Medium),
+            &fleet,
+        );
+        assert_eq!(
+            pick(&routed, &fleet).as_deref(),
+            Some("claude-sonnet"),
             "{}",
             routed.decision.reason
         );
+        // The engines that cannot edit files say so.
+        for name in ["nemotron", "ollama"] {
+            let out = routed
+                .decision
+                .candidates
+                .iter()
+                .find(|c| c.engine == name)
+                .unwrap();
+            assert!(
+                out.excluded
+                    .as_ref()
+                    .is_some_and(|why| why.contains("code")),
+                "{name}: {:?}",
+                out.excluded
+            );
+        }
     }
 
+    #[test]
+    fn josh_example_a_small_chore_that_edits_files_goes_to_haiku_when_it_is_sufficient() {
+        let fleet = josh_fleet();
+        let chore = editing_chore();
+        // Out of the box a small model is 0.55 for it, under the 0.70 default: Sonnet.
+        let routed = run(&josh_policy(), &chore, &fleet);
+        assert_eq!(pick(&routed, &fleet).as_deref(), Some("claude-sonnet"));
+        // `--threshold chore=0.55` makes Haiku sufficient, and it is the cheaper of the two.
+        let mut easy = josh_policy();
+        easy.thresholds.insert("chore".into(), 0.55);
+        easy.check().unwrap();
+        let routed = run(&easy, &chore, &fleet);
+        assert_eq!(
+            pick(&routed, &fleet).as_deref(),
+            Some("claude-haiku"),
+            "{}",
+            routed.decision.reason
+        );
+        assert!(routed.decision.reason.contains("cheapest sufficient"));
+        // Or it earns the work: eight verified chores lift it over the default.
+        let mut proven = fleet.clone();
+        for _ in 0..8 {
+            record_outcome(&mut proven[0].outcomes, "chore", true, now());
+        }
+        let routed = run(&josh_policy(), &chore, &proven);
+        assert_eq!(pick(&routed, &proven).as_deref(), Some("claude-haiku"));
+        // Chores that edit nothing still go to the free engine.
+        let routed = run(&josh_policy(), &needs(WorkKind::Chore, Size::Small), &fleet);
+        assert_eq!(pick(&routed, &fleet).as_deref(), Some("nemotron"));
+    }
+
+    #[test]
+    fn josh_example_local_models_are_eligible() {
+        let mut fleet = josh_fleet();
+        let docs = needs(WorkKind::Docs, Size::Medium);
+        // With NVIDIA out of credit, the next sufficient engine is Sonnet...
+        fleet[3].state = "exhausted".into();
+        let routed = run(&josh_policy(), &docs, &fleet);
+        assert_eq!(pick(&routed, &fleet).as_deref(), Some("claude-sonnet"));
+        // ...until the local model has proven itself at docs: free beats a subscription.
+        for _ in 0..8 {
+            record_outcome(&mut fleet[2].outcomes, "docs", true, now());
+        }
+        let routed = run(&josh_policy(), &docs, &fleet);
+        assert_eq!(
+            pick(&routed, &fleet).as_deref(),
+            Some("ollama"),
+            "{}",
+            routed.decision.reason
+        );
+        assert_eq!(routed.decision.winner.as_ref().unwrap().cost_usd, 0.0);
+    }
+
+    #[test]
+    fn a_subscription_is_scarce_even_behind_a_local_address() {
+        // The same model on a subscription, reached through a local gateway: it declares
+        // itself local, but how it is paid for decides, so it is not free.
+        let mut gateway = http("gateway", ModelClass::Large, "subscription");
+        gateway.capabilities.local = true;
+        gateway.weekly_requests = Some(100);
+        let price = price(&gateway, &needs(WorkKind::Docs, Size::Small), now());
+        assert!(price.usd > 0.0, "{price:?}");
+        assert!(price.note.starts_with("subscription"), "{}", price.note);
+        // A prepaid engine behind one is the same: not local by its address.
+        let mut prepaid = http("metered", ModelClass::Large, "prepaid");
+        prepaid.capabilities.local = false;
+        prepaid.capabilities.cost = None;
+        assert!(
+            super::price(&prepaid, &needs(WorkKind::Docs, Size::Small), now()).usd > 0.0,
+            "unpriced and paid is never free"
+        );
+    }
     #[test]
     fn a_retry_leaves_out_the_failed_engine_and_needs_a_higher_estimate() {
         let nvidia = engine("nvidia", ModelClass::Large, "free-tier", Some(Cost::FREE));
@@ -1594,10 +1779,7 @@ mod tests {
         let docs = needs(WorkKind::Docs, Size::Small);
         let first = run(&Policy::default(), &docs, &engines);
         assert_eq!(pick(&first, &engines).as_deref(), Some("nvidia"));
-        let failed = [Failed {
-            engine: "nvidia".into(),
-            p: Some(0.80),
-        }];
+        let failed = [failure("nvidia", Some(0.80))];
         let again = retry(&failed, &engines, &docs);
         // Haiku is sufficient on its own (0.75) but must beat 0.80; sonnet does (0.85).
         assert_eq!(
@@ -1626,28 +1808,157 @@ mod tests {
         let again = retry(&failed, &weak, &docs);
         assert_eq!(pick(&again, &weak).as_deref(), Some("haiku"));
         assert!(again.decision.reason.contains("none reach"));
-        // And when every engine failed there is none.
+        // And when every engine failed, nothing waits: the likeliest of them tries again.
         let all = [
-            Failed {
-                engine: "haiku".into(),
-                p: None,
-            },
-            Failed {
-                engine: "nvidia".into(),
-                p: None,
-            },
-            Failed {
-                engine: "sonnet".into(),
-                p: None,
-            },
+            failure("haiku", None),
+            failure("nvidia", None),
+            failure("sonnet", None),
         ];
-        let none = retry(&all, &engines, &docs);
-        assert!(none.order.is_empty());
+        let again = retry(&all, &engines, &docs);
+        assert_eq!(pick(&again, &engines).as_deref(), Some("sonnet"));
+        assert_eq!(again.order.len(), 3, "all of them, likeliest first");
         assert!(
-            none.decision
+            again
+                .decision
                 .reason
-                .starts_with("no engine can take it now")
+                .contains("every engine that can do this work has already failed this order"),
+            "{}",
+            again.decision.reason
         );
+        assert_eq!(again.decision.must_beat, None);
+        assert!(
+            again
+                .decision
+                .candidates
+                .iter()
+                .all(|c| c.excluded.is_none())
+        );
+        // No engines at all is still none.
+        let none = retry(&all, &[], &docs);
+        assert!(none.order.is_empty());
+        assert!(none.decision.reason.starts_with("no engine"));
+    }
+
+    #[test]
+    fn a_single_engine_that_failed_is_tried_again_rather_than_left_waiting() {
+        let only = engine("only", ModelClass::Large, "prepaid", per_call(0.01));
+        let engines = [only];
+        let code = needs(WorkKind::CodeChange, Size::Small);
+        let first = retry(&[], &engines, &code);
+        assert_eq!(pick(&first, &engines).as_deref(), Some("only"));
+        let again = retry(&[failure("only", Some(0.8))], &engines, &code);
+        assert_eq!(pick(&again, &engines).as_deref(), Some("only"));
+        assert!(
+            again.decision.reason.contains("tries again"),
+            "{}",
+            again.decision.reason
+        );
+        assert!(!again.decision.candidates[0].sufficient);
+    }
+
+    #[test]
+    fn the_bar_a_retry_must_beat_comes_from_the_local_ledger_not_the_record() {
+        let cheap = engine("cheap", ModelClass::Medium, "free-tier", Some(Cost::FREE));
+        let big = engine("big", ModelClass::Large, "prepaid", per_call(0.01));
+        let engines = [cheap, big];
+        let docs = needs(WorkKind::Docs, Size::Small);
+        // A record that says the cheap engine failed at p 1.0 (anyone who can write a
+        // result can say so) must not make everything else look insufficient.
+        let routed = retry(&[failure("cheap", Some(1.0))], &engines, &docs);
+        assert_eq!(
+            routed.decision.must_beat,
+            Some(0.7),
+            "the ledger's own figure"
+        );
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("big"));
+        let big_out = routed
+            .decision
+            .candidates
+            .iter()
+            .find(|c| c.engine == "big")
+            .unwrap();
+        assert!(big_out.sufficient, "0.80 clears the 0.70 it must beat");
+        // Without a record's figure it is the same.
+        let routed = retry(&[failure("cheap", None)], &engines, &docs);
+        assert_eq!(routed.decision.must_beat, Some(0.7));
+        // A refutation already in this machine's ledger lowers the bar it set.
+        let mut worse = engines.clone();
+        record_outcome(&mut worse[0].outcomes, "docs", false, now());
+        let routed = retry(&[failure("cheap", Some(1.0))], &worse, &docs);
+        assert!(
+            routed.decision.must_beat.unwrap() < 0.6,
+            "{:?}",
+            routed.decision
+        );
+    }
+
+    #[test]
+    fn an_order_with_an_attached_picture_waits_in_plain_words_until_an_engine_can_see() {
+        // The picture is attached, so vision is needed (unlike a picture merely named in the
+        // text, which the classifier no longer counts). Nothing can see it: the order holds
+        // and says why, rather than being sent to an engine that cannot read it.
+        let coder = engine("coder", ModelClass::Large, "prepaid", per_call(0.01));
+        let mut seer = coder.clone();
+        seer.name = "seer".into();
+        seer.capabilities.modalities.push(Modality::Vision);
+        let mut shot = needs(WorkKind::CodeChange, Size::Medium);
+        shot.modalities = resolve_modalities(&[Modality::Vision], WorkKind::CodeChange);
+        let held = run(&Policy::default(), &shot, std::slice::from_ref(&coder));
+        assert!(held.order.is_empty());
+        assert!(
+            held.decision.reason.contains("coder") && held.decision.reason.contains("lacks vision"),
+            "{}",
+            held.decision.reason
+        );
+        // An engine that can see takes it.
+        let engines = [coder, seer];
+        let routed = run(&Policy::default(), &shot, &engines);
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("seer"));
+    }
+
+    #[test]
+    fn a_failure_belongs_to_the_engine_on_that_agents_machine() {
+        // Two agents each run a `claude`; one failed, the other did not.
+        let mut wisp = engine("claude", ModelClass::Medium, "prepaid", per_call(0.01));
+        wisp.agent = "wisp".into();
+        wisp.machine = "box".into();
+        let mut ember = wisp.clone();
+        ember.agent = "ember".into();
+        ember.machine = "laptop".into();
+        let mut other_box = wisp.clone();
+        other_box.machine = "second".into();
+        let engines = [wisp, ember, other_box];
+        let docs = needs(WorkKind::Docs, Size::Small);
+        let failed = [Failed {
+            agent: "wisp".into(),
+            machine: "box".into(),
+            engine: "claude".into(),
+            p: Some(0.70),
+        }];
+        let routed = retry(&failed, &engines, &docs);
+        assert!(
+            routed.order.iter().all(|index| *index != 0),
+            "wisp's claude on box failed: {:?}",
+            routed.order
+        );
+        assert_eq!(routed.order.len(), 2, "ember's claude and wisp's other box");
+        let out = routed
+            .decision
+            .candidates
+            .iter()
+            .find(|c| c.agent == "wisp" && c.machine == "box")
+            .unwrap();
+        assert!(out.excluded.as_ref().unwrap().contains("failed this order"));
+        // A record that does not say where it ran counts for that agent's every machine, and
+        // never for another agent.
+        let anywhere = [Failed {
+            agent: "wisp".into(),
+            machine: String::new(),
+            engine: "claude".into(),
+            p: None,
+        }];
+        let routed = retry(&anywhere, &engines, &docs);
+        assert_eq!(routed.order, vec![1]);
     }
 
     #[test]

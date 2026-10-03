@@ -3045,22 +3045,22 @@ engine.local.tier = "chore"
         );
 
         // After a failure on this order the failed engine is out, whatever it learned.
-        let failed = [ferryman_channel::router::Failed {
-            engine: "free".into(),
+        let failure = |engine: &str, agent: &str| ferryman_channel::router::Failed {
+            agent: agent.into(),
+            machine: here.1.into(),
+            engine: engine.into(),
             p: Some(0.8),
-        }];
+        };
+        let failed = [failure("free", here.0)];
         let (picked, decision) = go(&smart, &Ledger::default(), &failed);
         assert_eq!(picked.name, "dear");
         assert_eq!(decision.failed, ["free"]);
-        // With everything out it says so instead of picking something.
-        let both = [
-            failed[0].clone(),
-            ferryman_channel::router::Failed {
-                engine: "dear".into(),
-                p: Some(0.9),
-            },
-        ];
-        let none = choose_routed(
+        // Another agent's `free` that failed is not this agent's `free`.
+        let (picked, _) = go(&smart, &Ledger::default(), &[failure("free", "ember")]);
+        assert_ne!(picked.name, "dear", "free is not out for wisp");
+        // With everything out nothing waits: the likeliest engine tries again.
+        let both = [failed[0].clone(), failure("dear", here.0)];
+        let (_, again) = choose_routed(
             &specs,
             &Ledger::default(),
             now,
@@ -3069,7 +3069,8 @@ engine.local.tier = "chore"
             &needs,
             (&both, &[]),
             here,
-        );
-        assert!(none.is_err());
+        )
+        .expect("every engine failed once: try again, do not hold");
+        assert!(again.reason.contains("tries again"), "{}", again.reason);
     }
 }
