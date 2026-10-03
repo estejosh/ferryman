@@ -45,7 +45,8 @@ Smart router: every engine says what it can do, every order can say what it need
 
 - `ferry engines` reads the project the current directory is inside as well as the ferry
   root's projects, so it no longer says no worker has published when run inside an attached
-  project. Other fleet-wide commands resolve projects as before.
+  project (the same project under another spelling of its path - `..`, case or slashes on
+  Windows - is not counted twice). Other fleet-wide commands resolve projects as before.
 
 ### Smart router, part 1: what engines can do and what orders need
 

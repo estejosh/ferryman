@@ -2991,7 +2991,8 @@ fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
 /// A ferry root lists its own projects; a project attached from elsewhere is not among
 /// them, so `ferry engines` run inside it used to say no worker had published anything
 /// while its own channel held the files. Only adds, and only without `--workspace` or
-/// `--comms`: every other fleet-wide command, and `--all`, keeps [`target_routes`].
+/// `--comms`: those, and every other fleet-wide command (whose `--all` is a different
+/// flag), keep [`target_routes`].
 fn engines_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
     let routes = target_routes(at);
     if at.workspace.is_some() || at.comms.is_some() {
@@ -3014,11 +3015,32 @@ fn with_current_project(
     if let Some(route) = here
         && !routes
             .iter()
-            .any(|known| known.attachment == route.attachment)
+            .any(|known| same_place(&known.attachment, &route.attachment))
     {
         routes.push(route);
     }
     routes
+}
+
+/// Whether two paths are the same place: equal as written, or the same once resolved
+/// (`..`, links, and on Windows `\` against `/`, upper against lower case and the `\\?\`
+/// prefix a resolved path carries). A path that cannot be resolved is compared as written.
+fn same_place(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let key = |path: &std::path::Path| {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = resolved.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            text.trim_start_matches(r"\\?\")
+                .replace('\\', "/")
+                .to_lowercase()
+        } else {
+            text
+        }
+    };
+    key(a) == key(b)
 }
 
 /// The channels a fleet-wide command acts on, each with the agent config it acts under.
@@ -11793,6 +11815,55 @@ mod tests {
         );
         // Outside any project: the root's list as it was.
         assert_eq!(ids(super::with_current_project(root, None)), ["a", "b"]);
+    }
+
+    /// The same project reached by another spelling of its path is not a second project:
+    /// `..` and links everywhere, and on Windows `\` against `/` and upper against lower
+    /// case, which would otherwise count its engines and checks twice.
+    #[test]
+    fn engines_routes_do_not_count_one_project_twice_under_two_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join("proj").join(".ferryman");
+        std::fs::create_dir_all(&attachment).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        let route = |attachment: std::path::PathBuf| ferryman_channel::ProjectRoute {
+            project_id: "p".to_string(),
+            workspace: attachment.clone(),
+            attachment,
+            communications: dir.path().join("comms"),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        let roundabout = dir
+            .path()
+            .join("other")
+            .join("..")
+            .join("proj")
+            .join(".ferryman");
+        assert_ne!(roundabout, attachment, "written differently");
+        let got =
+            super::with_current_project(vec![route(attachment.clone())], Some(route(roundabout)));
+        assert_eq!(got.len(), 1, "one project, reached two ways");
+        // A project that is somewhere else is still added.
+        let elsewhere = dir.path().join("other");
+        let got = super::with_current_project(vec![route(attachment)], Some(route(elsewhere)));
+        assert_eq!(got.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_that_differ_in_case_or_slash_are_the_same_place() {
+        use std::path::Path;
+        assert!(super::same_place(
+            Path::new(r"C:\Work\Proj\.ferryman"),
+            Path::new("c:/work/proj/.ferryman")
+        ));
+        assert!(!super::same_place(
+            Path::new(r"C:\Work\Proj\.ferryman"),
+            Path::new(r"C:\Work\Other\.ferryman")
+        ));
     }
 
     /// `identity show` reports which keys derive from the seed, and it skips the
