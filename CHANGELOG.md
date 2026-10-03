@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.5.19 - 2026-10-03
+
+A smart router: each piece of work goes to the cheapest engine that will most likely do it well - text, code, vision, image, video or audio, local or remote - and climbs to a stronger one only when a cheaper one fails. `routing = ordered` keeps the old strict order.
 
 Smart router: every engine says what it can do, every order can say what it needs, and background work goes to the cheapest engine that will most likely do that kind of work well, moving up only after a cheaper one has failed at it.
 
