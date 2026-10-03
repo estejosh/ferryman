@@ -894,12 +894,14 @@ function routingDecision(dec) {
 
 // What the smart router reads an order as needing: its kind and size, and any modality
 // beyond text (vision, audio, ...). The hover says whether the order itself, the rules or a
-// model said so, and how sure that is. An unsure one is marked: a worker will ask a model.
+// model said so, and how sure that is. An unsure one is marked: for an improvement order a
+// worker asks a model once (an http engine only, never an agent), and treats an order whose
+// kind it still cannot tell as one that edits files.
 function workBadge(w) {
   if (!w) return "";
   const extra = (w.modalities || []).filter((m) => m !== "text" && m !== "code");
   const label = [w.kind, w.size].concat(extra).join(" · ");
-  const why = `needs: ${(w.modalities || []).join(", ")}\nread from: ${w.source}, confidence ${Number(w.confidence).toFixed(2)}${w.sure ? "" : " (unsure: a worker asks a model)"}`;
+  const why = `needs: ${(w.modalities || []).join(", ")}\nread from: ${w.source}, confidence ${Number(w.confidence).toFixed(2)}${w.sure ? "" : " (unsure: a worker asks a model once, through an http engine, for an improvement order)"}`;
   return `<span class="badge${w.sure ? "" : " warn"}" title="${esc(why)}">${esc(label)}${w.sure ? "" : " ?"}</span>`;
 }
 

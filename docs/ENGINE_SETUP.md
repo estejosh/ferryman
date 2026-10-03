@@ -831,16 +831,31 @@ and the source is always recorded - `explicit`, `rules` or `model`:
    them; transcribe needs `audio_in`; image, video and audio jobs need only their media
    modality; everything else needs `text`.
 
-3. **A model, only when the rules are unsure** (confidence under 0.55). One call to the
-   cheapest text engine, asking for a small JSON label. Which engine obeys the same
+   **Work that edits files needs `code` whatever it reads as.** A docs, chore, translate
+   or `other` order is often a change to files, and an `http` engine answers in text and
+   changes nothing, so the result is refuted ("no commit and no diff") and the engine is
+   blamed and demoted for work it could never do. So an improvement order (build or chore
+   work), an order that declares `touches`, one that requires changes, and one whose kind
+   the rules cannot tell, are routed as needing `code`; the routing line says why. A plan,
+   a review or research that only produces text stays text, and a fleet with no `cli`
+   engine still takes the order on an `http` one, as it always has.
+
+3. **A model, only when the rules are unsure** (confidence under 0.55). A worker makes
+   this call itself, once per order, before it routes an improvement order under
+   `routing = "smart"` (a person's own order is routed on the rules' read). It goes to the
+   cheapest **`http`** text engine - never a `cli` engine, because that is an agent with
+   tools and the order's text is not to be trusted - asking for a small JSON label, with a
+   45 second timeout. Which engine obeys the same
    rules as any background work: the engine policy's `never` list, its `where`, weekly
    caps, `protect_subscriptions` and `subscription_roles`; local engines go first, then
    free tier, then by price. **A subscription engine is never used for this unless the
    policy's `subscription_roles` includes `chore` and the engine has a weekly request
    cap.** The reply can only choose among the known kinds and sizes (an invented kind
    is refused), the order text is sent fenced as data with an instruction not to follow
-   it, and a model's stated confidence is capped. If nothing may be asked or the answer
-   is no use, the rules' best read is used and the reason is recorded.
+   it, and a model's stated confidence is capped. The modalities a model names are
+   ignored (it never saw the attachments); only the kind and size are taken. If nothing
+   may be asked or the answer is no use, the rules' best read is used and the reason is
+   recorded.
 
    The answer is cached per order id on the machine that asked, in
    `<project attachment>/routing/classify/<order id>.json`. It is **local and not

@@ -8,7 +8,8 @@
 //!
 //! # The model-assisted step
 //!
-//! One call to the cheapest text engine, local preferred, asking for a JSON label. Which
+//! One call to the cheapest `http` text engine (never a cli one: a cli engine is an agent,
+//! not a question-answerer), local preferred, asking for a JSON label. Which
 //! engine ([`pick_classifier`]) is decided by the same rules that bound any background
 //! work: the policy's `never` list, `protect_subscriptions` and `subscription_roles`
 //! (a subscription engine only when the policy lists the `chore` role *and* the engine
@@ -68,8 +69,40 @@ impl TextRunner for LiveRunner<'_> {
         let config = self.config.with_engine(engine);
         let route = self.route;
         let prompt = prompt.to_string();
-        async move { crate::agent::ask(route, &config, &prompt).await }
+        async move {
+            // A labelling call that hangs must not hold the order: it is one question.
+            tokio::time::timeout(
+                std::time::Duration::from_secs(CLASSIFY_TIMEOUT_SECS),
+                crate::agent::ask(route, &config, &prompt),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("no answer within {CLASSIFY_TIMEOUT_SECS} seconds"))?
+        }
     }
+}
+
+/// How long a labelling call may take before the order is routed on the rules' label.
+pub const CLASSIFY_TIMEOUT_SECS: u64 = 45;
+
+/// Settle an improvement order's label before it is routed: when the rules are unsure and
+/// the policy routes smartly, ask a model once ([`classify_order_live`]) and let the answer
+/// be cached for this order, which is where the router reads it
+/// ([`ferryman_channel::work::classify_cached`]). Everything else - a sure label, a person's
+/// own order, `routing = "ordered"` - asks nothing. The reply is only ever one of the known
+/// kinds (see [`ferryman_channel::work::parse_model_reply`]) and only an `http` engine is
+/// asked ([`pick_classifier`]), never an agent with tools, because the order's text is not
+/// to be trusted.
+pub async fn settle_classification(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    order: &Order,
+    improvement: bool,
+) -> Classification {
+    let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
+    if !improvement || policy.routing != ferryman_channel::policy::Routing::Smart {
+        return work::classify_cached(order, route);
+    }
+    classify_order_live(route, config, order).await
 }
 
 /// What the model-assisted step needs to know about this machine: its engines and how they
@@ -116,6 +149,16 @@ pub fn pick_classifier<'a>(assist: &Assist<'a>) -> std::result::Result<&'a Engin
     let mut why: Vec<String> = Vec::new();
     for (index, (spec, candidate)) in assist.specs.iter().zip(&candidates).enumerate() {
         let caps = &candidate.capabilities;
+        // A cli engine is an agent, run in a scratch directory with a model's habits and
+        // a project's credentials: labelling is one question and an answer, which only an
+        // endpoint is asked.
+        if spec.kind != engines::Kind::Http {
+            why.push(format!(
+                "{}: a cli engine is not asked to label orders, only an http one",
+                spec.name
+            ));
+            continue;
+        }
         if !caps.has(&Modality::Text) {
             why.push(format!("{}: no text modality", spec.name));
             continue;
@@ -492,8 +535,11 @@ mod tests {
 
     #[test]
     fn an_engine_that_cannot_read_text_is_never_asked() {
-        let mut whisper = EngineSpec::implicit("whisper-cli", &[], Some("whisper-large-v3"));
-        whisper.name = "whisper".into();
+        let mut whisper = http("whisper", Paid::Local, "http://localhost:9000/v1");
+        whisper.declared = Declared {
+            modalities: vec![Modality::AudioIn],
+            ..Declared::default()
+        };
         let world = World::new(vec![whisper]);
         let why = pick_classifier(&world.assist()).unwrap_err();
         assert!(why.contains("whisper: no text modality"), "{why}");
@@ -507,9 +553,24 @@ mod tests {
     }
 
     #[test]
+    fn a_cli_engine_is_never_asked_to_label_an_order() {
+        // Even a free local cli engine: it is an agent, not a question-answerer.
+        let cli = EngineSpec::implicit("llama-cli", &[], Some("llama-3.2-3b"));
+        let mut world = World::new(vec![cli]);
+        let why = pick_classifier(&world.assist()).unwrap_err();
+        assert!(why.contains("a cli engine is not asked to label"), "{why}");
+        // An http one beside it is the one asked.
+        world.specs.push(http(
+            "nvidia",
+            Paid::FreeTier,
+            "https://integrate.api.nvidia.com/v1",
+        ));
+        assert_eq!(pick_classifier(&world.assist()).unwrap().name, "nvidia");
+    }
+
+    #[test]
     fn a_subscription_is_never_used_unless_the_policy_lists_chore_and_it_has_a_weekly_cap() {
-        let mut claude = EngineSpec::implicit("claude", &[], Some("claude-haiku-4-5"));
-        claude.paid = Paid::Subscription;
+        let mut claude = http("claude", Paid::Subscription, "https://api.example.com/v1");
         claude.weekly_requests = Some(200);
         let mut world = World::new(vec![claude]);
         let why = pick_classifier(&world.assist()).unwrap_err();
@@ -537,8 +598,7 @@ mod tests {
 
     #[test]
     fn a_free_engine_is_chosen_over_a_subscription_even_when_the_subscription_is_allowed() {
-        let mut claude = EngineSpec::implicit("claude", &[], Some("claude-haiku-4-5"));
-        claude.paid = Paid::Subscription;
+        let mut claude = http("claude", Paid::Subscription, "https://api.example.com/v1");
         claude.weekly_requests = Some(200);
         let free = http(
             "nvidia",
@@ -692,8 +752,7 @@ mod tests {
     #[tokio::test]
     async fn no_allowed_engine_falls_back_to_the_unsure_rules_with_the_reason() {
         let dir = tempfile::tempdir().unwrap();
-        let mut claude = EngineSpec::implicit("claude", &[], Some("claude-haiku-4-5"));
-        claude.paid = Paid::Subscription;
+        let claude = http("claude", Paid::Subscription, "https://api.example.com/v1");
         let world = World::new(vec![claude]);
         let fake = Fake::default();
         let got = classify_order(

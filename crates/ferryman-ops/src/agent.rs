@@ -3312,6 +3312,10 @@ async fn attempt(
     // failed attempt: it is marked, and the same order goes straight to the next engine
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
     let mut tried: Vec<String> = Vec::new();
+    // What kind of work this is, once per order: when the rules are unsure a model labels
+    // it (cached, so a later attempt does not ask again) and the router reads the label.
+    let improvement = crate::improve::is_improvement(task);
+    crate::route::settle_classification(route, config, &task.order, improvement).await;
     let result = loop {
         let (engine, routing) = match next_routed(route, config, task, &tried) {
             Ok(chosen) => chosen,
@@ -7880,6 +7884,16 @@ engine.coder.model = "big-coder"
         })
     }
 
+    /// What kind of work these orders are, said outright: a worker asks a model to label an
+    /// order only when the rules cannot, and these tests count the requests an engine
+    /// answers, which are the orders and nothing else.
+    fn labelled() -> Option<ferryman_channel::work::ExplicitNeeds> {
+        Some(ferryman_channel::work::ExplicitNeeds {
+            kind: Some(ferryman_channel::work::WorkKind::Chore),
+            ..Default::default()
+        })
+    }
+
     /// An improvement order, signed by boss and open to any worker.
     fn swarm_order(route: &ProjectRoute, id: &str, touches: &[&str]) {
         let mut order = order(id);
@@ -7888,6 +7902,7 @@ engine.coder.model = "big-coder"
         order.requires_review = false;
         order.touches = touches.iter().map(ToString::to_string).collect();
         order.payload = improvement_payload(id);
+        order.needs = labelled();
         boss().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();
     }
@@ -7905,6 +7920,7 @@ engine.coder.model = "big-coder"
             order.requires_review = false;
             order.touches = touches;
             order.payload = improvement_payload(&id);
+            order.needs = labelled();
         })
     }
 
