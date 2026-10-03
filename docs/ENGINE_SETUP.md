@@ -307,9 +307,12 @@ and the newest thing a machine has already seen. Know the edges.
   blocked. Upgrade every machine before relying on `blocking`.
 - **A policy signed by v0.5.17 has only the v1 signature.** A machine on this release
   accepts it (sequence 0) but it has no rollback protection beyond what that machine saw
-  first, and it cannot carry the newer parts. When the fleet has members that sign v2
+  first, and it cannot carry the newer parts - effort, width, subscription roles and
+  **routing** (`ordered`, thresholds, bias): a project that chose `routing = ordered` and is
+  then signed again by a v0.5.17 master reads as smart routing with the defaults, and
+  the file itself cannot say otherwise. When the fleet has members that sign v2
   (their inventories carry a v2 signature) and the policy in force is still a v1-only file,
-  `ferry engines policy show` and the dashboard say so. Signing the policy again from a
+  `ferry engines policy show` and the dashboard say so, routing included. Signing the policy again from a
   current `ferry` (`ferry engines policy set ...`, or the dashboard) replaces it with one
   that has a sequence number and a v2 signature. Do that once the fleet is upgraded.
 - **The adversary's policy is master-only on every machine that knows it.** A delegate

@@ -3101,10 +3101,12 @@ pub fn mixed_fleet_warning(route: &ProjectRoute) -> Option<String> {
         "the engine policy in force is a v1-only file (signed by v0.5.17: no sequence number, \
          no v2 signature) and {} run a release that signs v2. A v1-only file has no rollback \
          protection - an older signed policy can be put back and a machine with nothing \
-         remembered takes it - and cannot carry effort, width or the newer parts. Sign it \
-         again from a current ferry (`ferry engines policy set`, or the dashboard) once the \
-         fleet is upgraded; see \"Mixed fleets and what a fresh machine trusts\" in \
-         docs/ENGINE_SETUP.md",
+         remembered takes it - and cannot carry effort, width, routing or the newer parts: a \
+         project that chose `routing = ordered` (or per-kind thresholds, or bias) and was \
+         then signed again by a v0.5.17 master reads as smart routing with the defaults, \
+         silently. Sign it again from a current ferry (`ferry engines policy set`, or the \
+         dashboard) once the fleet is upgraded; see \"Mixed fleets and what a fresh machine \
+         trusts\" in docs/ENGINE_SETUP.md",
         capable.join(", ")
     ))
 }
@@ -6056,6 +6058,16 @@ mod tests {
         .unwrap();
         let warning = mixed_fleet_warning(&route).expect("a v1-only policy in a mixed fleet");
         assert!(warning.contains("v1-only"), "{warning}");
+        // A v1-only file cannot say `ordered`: it reads as smart, and the warning says that
+        // is what a re-sign by v0.5.17 does to a project that chose it.
+        assert!(
+            warning.contains("routing = ordered") && warning.contains("reads as smart"),
+            "{warning}"
+        );
+        assert_eq!(
+            setting(channel, "demo").unwrap().policy.unwrap().routing,
+            Routing::Smart
+        );
         assert!(
             warning.contains("grouchly"),
             "names who signs v2: {warning}"
