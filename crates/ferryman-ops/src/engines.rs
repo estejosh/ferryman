@@ -300,6 +300,9 @@ pub fn capabilities(spec: &EngineSpec) -> ferryman_channel::capability::Capabili
             cli: spec.kind == Kind::Cli,
             base_url: spec.base_url.as_deref(),
             paid: spec.paid.as_str(),
+            gateway: spec.provider.is_some()
+                || !spec.route.is_empty()
+                || crate::omniroute::is_omniroute(spec),
         },
     )
 }
@@ -2175,6 +2178,41 @@ mod tests {
 
     fn monday_noon() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap()
+    }
+
+    /// An endpoint on this machine is a local model only when nobody says it is somebody's
+    /// paid API behind a proxy: an OmniRoute gateway (by port, name or provider), or an
+    /// engine its operator marked prepaid, a subscription or a free tier, costs what that
+    /// says and is never priced as free.
+    #[test]
+    fn a_paid_or_gateway_endpoint_on_this_machine_is_not_a_free_local_model() {
+        let caps = |url: &str, paid: Paid, provider: Option<&str>| {
+            let mut spec = http("e", Tier::Build, url);
+            spec.paid = paid;
+            spec.provider = provider.map(str::to_string);
+            capabilities(&spec)
+        };
+        // A model server nobody said anything about: local, and free.
+        let plain = caps("http://localhost:1234/v1", Paid::Unknown, None);
+        assert!(plain.local && plain.cost.is_some_and(|c| c.is_free()));
+        // OmniRoute on its own port or by its provider: a gateway, not local, not free.
+        for spec in [
+            caps("http://localhost:20128/v1", Paid::Unknown, None),
+            caps("http://127.0.0.1:9000/v1", Paid::Unknown, Some("omniroute")),
+            caps("http://192.168.1.20/omniroute/v1", Paid::Unknown, None),
+        ] {
+            assert!(!spec.local, "{spec:?}");
+            assert!(spec.cost.is_none(), "{spec:?}");
+        }
+        // Said to be paid: not local however near it is.
+        for paid in [Paid::Prepaid, Paid::Subscription, Paid::FreeTier] {
+            assert!(
+                !caps("http://localhost:1234/v1", paid, None).local,
+                "{paid:?}"
+            );
+        }
+        // Said to be local, it is, gateway or not.
+        assert!(caps("http://localhost:20128/v1", Paid::Local, None).local);
     }
 
     #[test]

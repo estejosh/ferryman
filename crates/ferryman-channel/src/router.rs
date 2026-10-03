@@ -380,12 +380,8 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
     let caps = &engine.capabilities;
     let paid = engine.paid_class();
     let priced = |cost: &Cost| cost.estimate(read, wrote);
-    if paid == "local" || caps.local {
-        return Price {
-            usd: caps.cost.as_ref().map_or(0.0, priced),
-            note: "local".to_string(),
-        };
-    }
+    // How it is paid for decides first: a subscription is scarce wherever its endpoint
+    // is, and only then does being local make a call free.
     if paid == "subscription" {
         let left = cap_left(engine, now);
         let scarcity = SCARCITY_BASE_USD * (1.0 + 9.0 * (1.0 - left.unwrap_or(0.5)).powi(2));
@@ -399,6 +395,12 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
                 ),
                 None => "subscription, no weekly cap known".to_string(),
             },
+        };
+    }
+    if paid == "local" || caps.local {
+        return Price {
+            usd: caps.cost.as_ref().map_or(0.0, priced),
+            note: "local".to_string(),
         };
     }
     if paid == "free-tier" {

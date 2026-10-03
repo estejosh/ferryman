@@ -297,6 +297,7 @@ impl Capabilities {
             // Only the host is published; a host is all the local check needs.
             base_url: host,
             paid: &report.paid,
+            gateway: !report.billing.as_ref().is_none_or(|b| b.route.is_empty()),
         };
         (resolve(&Declared::default(), &basis), true)
     }
@@ -333,6 +334,10 @@ pub struct Basis<'a> {
     pub base_url: Option<&'a str>,
     /// `subscription`, `prepaid`, `free-tier`, `local` or `unknown`.
     pub paid: &'a str,
+    /// A gateway or proxy (OmniRoute, LiteLLM, a provider route): what is behind the
+    /// endpoint is somebody else's model, so the endpoint being on this network says
+    /// nothing about where it runs or what it costs.
+    pub gateway: bool,
 }
 
 /// The profile of an engine: declared fields win, the rest is guessed.
@@ -534,16 +539,24 @@ fn guess_cost(paid: &str, local: bool) -> Option<Cost> {
     free.then_some(Cost::FREE)
 }
 
-/// Local when it says so, when its endpoint is on this machine or a private network, or
-/// (with no endpoint at all) when it is a media CLI nobody marked as paid: a whisper,
-/// ComfyUI or TTS runner is a program on the box. An agent CLI with no endpoint
-/// (`claude`, `codex`) is not local: it calls out.
+/// Local when it says so, when its endpoint is on this machine or a private network and
+/// nobody said it is paid for, or (with no endpoint at all) when it is a media CLI nobody
+/// marked as paid: a whisper, ComfyUI or TTS runner is a program on the box. An agent CLI
+/// with no endpoint (`claude`, `codex`) is not local: it calls out. An endpoint on this
+/// network is not local when it is a gateway or proxy (OmniRoute, LiteLLM) or when its
+/// operator said it is prepaid, a subscription or a free tier: the model behind it is
+/// someone else's, and it costs what that says.
 fn guess_local(basis: &Basis, modalities: &BTreeSet<Modality>) -> bool {
-    if basis.paid.trim() == "local" {
+    let paid = basis.paid.trim();
+    if paid == "local" {
         return true;
     }
     match basis.base_url {
-        Some(url) => host_of(url).is_some_and(|host| is_private_host(&host)),
+        Some(url) => {
+            !basis.gateway
+                && paid == "unknown"
+                && host_of(url).is_some_and(|host| is_private_host(&host))
+        }
         None => {
             basis.cli && basis.paid.trim() == "unknown" && modalities.iter().any(Modality::is_media)
         }
@@ -618,6 +631,7 @@ mod tests {
             cli: true,
             base_url: None,
             paid: "unknown",
+            gateway: false,
         }
     }
 
@@ -629,6 +643,7 @@ mod tests {
             cli: false,
             base_url: Some(url),
             paid,
+            gateway: false,
         }
     }
 
@@ -935,7 +950,7 @@ mod tests {
     #[test]
     fn local_follows_the_endpoint_host() {
         let local =
-            |url: &str| resolve(&Declared::default(), &http("e", "m", url, "prepaid")).local;
+            |url: &str| resolve(&Declared::default(), &http("e", "m", url, "unknown")).local;
         assert!(local("http://localhost:1234/v1"));
         assert!(local("http://127.0.0.1:8080/v1"));
         assert!(local("http://[::1]:8080/v1"));
@@ -949,6 +964,37 @@ mod tests {
         assert!(!local("http://172.32.0.1/v1"), "outside 172.16/12");
         assert!(!local("http://100.128.0.1/v1"), "outside 100.64/10");
         assert!(!local("https://localhost.evil.example/v1"));
+    }
+
+    #[test]
+    fn a_paid_engine_behind_a_local_address_is_not_local_and_not_free() {
+        let caps = |paid: &str, gateway: bool| {
+            let mut basis = http("e", "m", "http://localhost:20128/v1", paid);
+            basis.gateway = gateway;
+            resolve(&Declared::default(), &basis)
+        };
+        // Nobody said anything: a local server.
+        let plain = caps("unknown", false);
+        assert!(plain.local && plain.cost.is_some_and(|c| c.is_free()));
+        // Said to be paid: a proxy to somebody's API, however near.
+        for paid in ["prepaid", "subscription", "free-tier"] {
+            assert!(!caps(paid, false).local, "{paid}");
+        }
+        assert!(caps("prepaid", false).cost.is_none(), "unpriced, not free");
+        // A gateway is never guessed local, even unmarked...
+        let gateway = caps("unknown", true);
+        assert!(!gateway.local);
+        assert!(gateway.cost.is_none(), "{gateway:?}");
+        // ...unless the operator says paid = local.
+        assert!(caps("local", true).local);
+        // And a declared value still wins.
+        let declared = Declared {
+            local: Some(true),
+            ..Declared::default()
+        };
+        let mut basis = http("e", "m", "http://localhost:20128/v1", "prepaid");
+        basis.gateway = true;
+        assert!(resolve(&declared, &basis).local);
     }
 
     #[test]
