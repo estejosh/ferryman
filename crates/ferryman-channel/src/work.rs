@@ -31,7 +31,8 @@
 //! # Modalities
 //!
 //! `Needs::modalities` is what an engine must be able to do: the modalities the payload
-//! evidences (a `.png` attached needs `vision`), plus what the kind implies (`code-change`
+//! evidences (a `.png` *attached* needs `vision`; one merely named in the text does not),
+//! plus what the kind implies (`code-change`
 //! and `tests` need `code`, so only a `cli` engine can take them; `transcribe` needs
 //! `audio_in`; `image`, `video` and `audio` need `image`, `video`, `audio_out`), plus
 //! `text` for plain text work. A media job needs only its media modality.
@@ -219,6 +220,83 @@ impl Needs {
     }
 }
 
+impl Needs {
+    /// These needs with `code` required: an engine that can edit files in a worktree.
+    /// Plain `text` work is replaced by it (code work reads and writes text), media work
+    /// is left alone.
+    #[must_use]
+    pub fn with_code(&self) -> Self {
+        if self.modalities.contains(&Modality::Code)
+            || self.modalities.iter().any(Modality::is_media)
+        {
+            return self.clone();
+        }
+        let mut modalities: BTreeSet<Modality> = self
+            .modalities
+            .iter()
+            .filter(|m| **m != Modality::Text)
+            .cloned()
+            .collect();
+        modalities.insert(Modality::Code);
+        Self {
+            modalities: modalities.into_iter().collect(),
+            ..self.clone()
+        }
+    }
+}
+
+/// Whether an order will edit files, whatever kind of work it reads as: a docs, chore,
+/// translate or "other" order is often a change to files. Then an engine that cannot edit
+/// (an `http` one answers in text and changes nothing, so the result is refuted and the
+/// engine is blamed for it) must not be sent it. `background_build` is an improvement
+/// order, which is build or chore work by definition. The reason is `None` when text is
+/// enough.
+#[must_use]
+pub fn edits_files(
+    order: &Order,
+    classification: &Classification,
+    background_build: bool,
+) -> Option<&'static str> {
+    if classification
+        .needs
+        .modalities
+        .iter()
+        .any(Modality::is_media)
+    {
+        return None;
+    }
+    // A plan, a review or research only produces text, even as background work.
+    let text_only = matches!(
+        classification.needs.kind,
+        WorkKind::Plan | WorkKind::Review | WorkKind::Research
+    );
+    if background_build && !text_only {
+        Some("background build and chore work edits files")
+    } else if !order.touches.is_empty() {
+        Some("the order declares files it touches")
+    } else if crate::evidence::requires_changes(&order.payload) {
+        Some("the order requires changes")
+    } else if classification.source == Source::Rules && !classification.is_sure() {
+        Some("the rules could not tell whether it edits files")
+    } else {
+        None
+    }
+}
+
+/// The needs to route `order` on: its classification, plus `code` when it will edit files
+/// ([`edits_files`]). With the reason, to say in the routing line.
+#[must_use]
+pub fn routing_needs(
+    order: &Order,
+    classification: &Classification,
+    background_build: bool,
+) -> (Needs, Option<&'static str>) {
+    match edits_files(order, classification, background_build) {
+        Some(why) => (classification.needs.with_code(), Some(why)),
+        None => (classification.needs.clone(), None),
+    }
+}
+
 /// What the issuer of an order said it needs: signed into the order, every field
 /// optional. Left out of the signed bytes entirely when empty, so an order issued without
 /// it keeps exactly the bytes it always had.
@@ -364,14 +442,27 @@ impl Classification {
     /// size, when it gave one), and whatever the issuer fixed explicitly still fixed.
     #[must_use]
     pub fn with_model(&self, verdict: &ModelVerdict, explicit: Option<&ExplicitNeeds>) -> Self {
-        let mut signals: BTreeSet<Modality> = self.signals.iter().cloned().collect();
-        signals.extend(verdict.modalities.iter().cloned());
-        let signals: Vec<Modality> = signals.into_iter().collect();
+        // A model reads only the text, never the attachments, so the modalities it names
+        // are not evidence of anything the files do not show: a made-up `vision` on a code
+        // order would leave it with no engine. They are ignored; a media kind it chose
+        // implies its own modality, and attachments already made their own signals.
+        let signals: Vec<Modality> = self.signals.clone();
         let confidence = verdict
             .confidence
             .unwrap_or(0.6)
             .clamp(0.0, MODEL_CONFIDENCE_CAP);
         let mut reasons = self.reasons.clone();
+        if !verdict.modalities.is_empty() {
+            reasons.push(format!(
+                "the model's extra modalities ({}) are not taken: it did not see the attachments",
+                verdict
+                    .modalities
+                    .iter()
+                    .map(Modality::as_str)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            ));
+        }
         reasons.push(format!(
             "a model read the order: {}{} (it said {confidence:.2})",
             verdict.kind.as_str(),
@@ -432,7 +523,10 @@ pub struct Rule {
     pub words: &'static [&'static str],
     /// Phrases, lowercase, matched anywhere in the text with spaces collapsed.
     pub phrases: &'static [&'static str],
-    /// A modality the hit also evidences, by wire name.
+    /// The modality the kind needs, by wire name. Not evidence on its own: a verb in the
+    /// text does not make an engine's modality necessary unless the kind it names wins
+    /// (the kind implies it), so "fix the transcription retry in src/lib.rs" is code, not
+    /// audio.
     pub modality: Option<&'static str>,
     /// Text the rule fires on; a test holds every rule to it.
     pub example: &'static str,
@@ -722,6 +816,10 @@ const CODE_EXT: &[&str] = &[
     "cs", "kt", "swift", "sh", "ps1", "sql", "lua", "scala", "dart", "vue", "svelte",
 ];
 const DOC_EXT: &[&str] = &["md", "mdx", "rst", "txt", "adoc", "org"];
+/// A first path component that says the text is naming source code.
+const CODE_DIRS: &[&str] = &[
+    "src", "lib", "crates", "pkg", "cmd", "internal", "app", "include", "scripts",
+];
 
 fn extension(name: &str) -> Option<String> {
     let path = name.split(['?', '#']).next().unwrap_or(name);
@@ -990,34 +1088,46 @@ pub fn classify_rules(evidence: &Evidence) -> Classification {
             None => {}
         }
     }
+    // Media files the text merely names are not attached, so no engine is asked to see or
+    // hear them: the mention is noted, and the kind is decided by the rest.
     let mut mentions_code_file = false;
+    let mut mentions_code_dir = false;
     for token in evidence.text.split_whitespace() {
         let token = token.trim_matches(|c: char| {
             !c.is_ascii_alphanumeric() && c != '.' && c != '/' && c != '_' && c != '-'
         });
         match media_of(token, None) {
             Some(Media::Image) => {
-                if signals.insert(Modality::Vision) {
-                    reasons.push(format!("the text names an image ({token}): needs vision"));
+                if seen_media.insert("image-named") {
+                    reasons.push(format!(
+                        "the text names an image ({token}); it is not attached, so vision is \
+                         not required"
+                    ));
                 }
             }
             Some(Media::Audio) => {
-                if signals.insert(Modality::AudioIn) {
+                if seen_media.insert("audio-named") {
                     reasons.push(format!(
-                        "the text names an audio file ({token}): needs speech to text"
+                        "the text names an audio file ({token}); it is not attached, so speech \
+                         to text is not required by that alone"
                     ));
                 }
             }
             Some(Media::Video) => {
-                if signals.insert(Modality::Video) {
+                if seen_media.insert("video-named") {
                     reasons.push(format!(
-                        "the text names a video file ({token}): needs video"
+                        "the text names a video file ({token}); it is not attached"
                     ));
                 }
             }
             None => {
                 if extension(token).is_some_and(|ext| CODE_EXT.contains(&ext.as_str())) {
                     mentions_code_file = true;
+                } else if token
+                    .split_once('/')
+                    .is_some_and(|(first, _)| CODE_DIRS.contains(&first))
+                {
+                    mentions_code_dir = true;
                 }
             }
         }
@@ -1048,13 +1158,40 @@ pub fn classify_rules(evidence: &Evidence) -> Classification {
         }
     }
 
+    // The order is about code when it names a source file or a source directory, or says it
+    // touches code. A media verb in that text (a "transcription" retry, a "narration"
+    // module) is then a word in the code's name, not the job: it does not count unless a
+    // file of that media is attached.
+    let code_path = mentions_code_file
+        || mentions_code_dir
+        || evidence
+            .touches
+            .iter()
+            .any(|glob| glob_kind(glob) == GlobKind::Code);
+    let attached = |kind: WorkKind| match kind {
+        WorkKind::Transcribe => signals.contains(&Modality::AudioIn),
+        WorkKind::Video => signals.contains(&Modality::Video),
+        _ => false,
+    };
+
     // Verbs and phrases in the text.
     for rule in RULES {
         if let Some(found) = hit(rule, &text, &word_set) {
-            hits.push((rule.kind, rule.weight));
-            if let Some(wire) = rule.modality {
-                signals.insert(Modality::from_wire(wire));
+            if code_path
+                && matches!(
+                    rule.kind,
+                    WorkKind::Transcribe | WorkKind::Image | WorkKind::Video | WorkKind::Audio
+                )
+                && !attached(rule.kind)
+            {
+                reasons.push(format!(
+                    "'{found}' ignored ({}): the order is about code, so it is a name in the \
+                     code, not the job",
+                    rule.name
+                ));
+                continue;
             }
+            hits.push((rule.kind, rule.weight));
             reasons.push(format!(
                 "'{found}' ({}: {}, weight {:.2})",
                 rule.name,
@@ -1342,10 +1479,12 @@ mod tests {
             } else {
                 assert!(!got.is_sure(), "{} is too weak to decide alone", rule.name);
             }
-            if let Some(wire) = rule.modality {
+            if let Some(wire) = rule.modality
+                && rule.weight >= 0.55
+            {
                 assert!(
-                    got.signals.contains(&Modality::from_wire(wire)),
-                    "{} should evidence {wire}",
+                    got.needs.modalities.contains(&Modality::from_wire(wire)),
+                    "{} should need {wire}",
                     rule.name
                 );
             }
@@ -1463,12 +1602,140 @@ mod tests {
     }
 
     #[test]
-    fn media_files_named_in_the_text_count_as_evidence_of_the_modality() {
+    fn media_files_named_in_the_text_are_not_attachments_and_ask_for_nothing() {
+        // The verb decides the kind, and the kind implies its modality...
         let got = rules("Transcribe interview.mp3 and attach it to the notes");
-        assert!(got.signals.contains(&Modality::AudioIn));
+        assert_eq!(got.needs.kind, WorkKind::Transcribe);
+        assert!(got.needs.modalities.contains(&Modality::AudioIn));
+        // ...but a file only named in the text is no evidence of a modality by itself.
         let got = rules("Fix the icon in assets/logo.png");
-        assert!(got.signals.contains(&Modality::Vision));
-        assert!(got.reasons.iter().any(|r| r.contains("names an image")));
+        assert!(!got.signals.contains(&Modality::Vision));
+        assert!(!got.needs.modalities.contains(&Modality::Vision));
+        assert!(got.reasons.iter().any(|r| r.contains("not attached")));
+        let got = rules("Update the README to say icon.png and photo.jpg are used");
+        assert_eq!(got.needs.kind, WorkKind::Docs);
+        assert_eq!(got.needs.modalities, vec![Modality::Text]);
+    }
+
+    fn order_with(payload: Value, touches: &[&str]) -> Order {
+        Order {
+            id: "t-code".into(),
+            project_id: "p".into(),
+            issued_by: "josh".into(),
+            assigned_to: None,
+            created_at: chrono::Utc::now(),
+            payload,
+            requires_review: false,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+            interface: None,
+            touches: touches.iter().map(ToString::to_string).collect(),
+            needs: None,
+            allow_overlap: false,
+        }
+    }
+
+    #[test]
+    fn an_order_that_will_edit_files_needs_code_whatever_it_reads_as() {
+        let sure_docs = |order: &Order| classify_evidence(&gather(order, None), None);
+        // Plain prose work: text is enough.
+        let prose = order_with(
+            serde_json::json!({"task": "Summarize the meeting notes"}),
+            &[],
+        );
+        let c = sure_docs(&prose);
+        assert_eq!(c.needs.kind, WorkKind::Docs);
+        assert_eq!(edits_files(&prose, &c, false), None);
+        assert_eq!(
+            routing_needs(&prose, &c, false).0.modalities,
+            vec![Modality::Text]
+        );
+        // The same words as background work, or with files declared, or requiring
+        // changes, need an engine that can edit them.
+        let (needs, why) = routing_needs(&prose, &c, true);
+        assert_eq!(needs.modalities, vec![Modality::Code]);
+        assert_eq!(needs.kind, WorkKind::Docs, "the kind is still docs");
+        assert!(why.unwrap().contains("background"));
+        let touching = order_with(
+            serde_json::json!({"task": "Summarize the meeting notes"}),
+            &["notes/**"],
+        );
+        let c = sure_docs(&touching);
+        assert_eq!(c.needs.kind, WorkKind::Docs);
+        assert!(
+            routing_needs(&touching, &c, false)
+                .0
+                .modalities
+                .contains(&Modality::Code)
+        );
+        let changes = order_with(
+            serde_json::json!({"task": "Translate the welcome email", "requires_changes": true}),
+            &[],
+        );
+        let c = sure_docs(&changes);
+        assert_eq!(c.needs.kind, WorkKind::Translate);
+        assert_eq!(
+            routing_needs(&changes, &c, false).0.modalities,
+            vec![Modality::Code]
+        );
+        // Not knowing what it is counts too.
+        let vague = order_with(serde_json::json!({"task": "hello there"}), &[]);
+        let c = sure_docs(&vague);
+        assert!(!c.is_sure());
+        assert!(
+            edits_files(&vague, &c, false)
+                .unwrap()
+                .contains("could not tell")
+        );
+        // Media jobs stay media jobs.
+        let image = order_with(
+            serde_json::json!({"task": "Generate an image of a fox"}),
+            &[],
+        );
+        let c = sure_docs(&image);
+        assert_eq!(edits_files(&image, &c, true), None);
+        assert_eq!(
+            routing_needs(&image, &c, true).0.modalities,
+            vec![Modality::Image]
+        );
+        // Already code: unchanged.
+        let fix = order_with(
+            serde_json::json!({"task": "Fix the crash in src/lib.rs"}),
+            &[],
+        );
+        let c = sure_docs(&fix);
+        assert_eq!(routing_needs(&fix, &c, true).0, c.needs);
+    }
+
+    #[test]
+    fn a_media_word_in_code_work_does_not_make_it_media_work() {
+        let got = rules("fix the transcription retry in src/lib.rs");
+        assert_eq!(got.needs.kind, WorkKind::CodeChange, "{:?}", got.reasons);
+        assert_eq!(got.needs.modalities, vec![Modality::Code]);
+        assert!(got.reasons.iter().any(|r| r.contains("ignored")));
+        let got = rules("Refactor the narration module under src/audio/ and fix the bug");
+        assert_eq!(got.needs.kind, WorkKind::CodeChange);
+        assert_eq!(got.needs.modalities, vec![Modality::Code]);
+        let got = rules("update logo.png and logo.jpg references in app/ui.tsx");
+        assert_eq!(got.needs.modalities, vec![Modality::Code]);
+        // Touching code says the same.
+        let mut e = text("Generate an image loader that retries");
+        e.touches = vec!["src/**".into()];
+        assert_eq!(classify_rules(&e).needs.modalities, vec![Modality::Code]);
+        // With the audio actually attached, the job is the audio's.
+        let mut e = text("transcribe the recording, ignoring src/ noise");
+        e.attachments = attachments(&serde_json::json!({"attachments": ["call.m4a"]}));
+        let got = classify_rules(&e);
+        assert_eq!(got.needs.kind, WorkKind::Transcribe);
+        assert!(got.needs.modalities.contains(&Modality::AudioIn));
+        // And without any code in it, the verb still means the job.
+        assert_eq!(
+            rules("Transcribe the standup recording").needs.modalities,
+            vec![Modality::AudioIn]
+        );
     }
 
     #[test]
@@ -1868,6 +2135,74 @@ mod tests {
             None,
         );
         assert_eq!(quiet.confidence, 0.6);
+    }
+
+    #[test]
+    fn a_models_media_modalities_are_not_taken_for_work_that_is_not_media() {
+        // The model never saw an attachment: its `vision` on a code order is a guess that
+        // would leave the order with no engine.
+        let base = rules("hello there");
+        let verdict = ModelVerdict {
+            kind: WorkKind::CodeChange,
+            size: None,
+            modalities: vec![Modality::Vision, Modality::AudioIn],
+            confidence: Some(0.8),
+        };
+        let got = base.with_model(&verdict, None);
+        assert_eq!(got.needs.kind, WorkKind::CodeChange);
+        assert_eq!(
+            got.needs.modalities,
+            vec![Modality::Code],
+            "{:?}",
+            got.reasons
+        );
+        assert!(got.reasons.iter().any(|r| r.contains("not taken")));
+        // A media kind still brings its own.
+        let audio = base.with_model(
+            &ModelVerdict {
+                kind: WorkKind::Transcribe,
+                modalities: verdict.modalities.clone(),
+                ..verdict
+            },
+            None,
+        );
+        assert_eq!(audio.needs.modalities, vec![Modality::AudioIn]);
+        // And an attachment the rules saw still counts.
+        let mut seen = text("fix the thing please");
+        seen.attachments = attachments(&serde_json::json!({"attachments": ["shot.png"]}));
+        let got = classify_rules(&seen).with_model(&verdict, None);
+        assert!(got.needs.modalities.contains(&Modality::Vision));
+    }
+
+    #[test]
+    fn plans_reviews_and_research_stay_text_even_as_background_work() {
+        let o = |task: &str| order_with(serde_json::json!({ "task": task }), &[]);
+        for task in [
+            "Plan the migration to the new billing provider",
+            "Review the pull request for security problems",
+            "Research which queue library fits our load",
+        ] {
+            let order = o(task);
+            let c = classify_evidence(&gather(&order, None), None);
+            assert!(c.is_sure(), "{task}");
+            assert_eq!(edits_files(&order, &c, true), None, "{task}");
+            assert_eq!(
+                routing_needs(&order, &c, true).0.modalities,
+                vec![Modality::Text]
+            );
+        }
+        // Unless they declare files to change.
+        let order = order_with(
+            serde_json::json!({"task": "Plan the migration to the new billing provider"}),
+            &["docs/**"],
+        );
+        let c = classify_evidence(&gather(&order, None), None);
+        assert!(edits_files(&order, &c, true).is_some());
+        // A chore or a docs order as background work edits files.
+        let order = o("Tidy the whitespace in the build scripts");
+        let c = classify_evidence(&gather(&order, None), None);
+        assert_eq!(c.needs.kind, WorkKind::Chore);
+        assert!(edits_files(&order, &c, true).is_some());
     }
 
     #[test]

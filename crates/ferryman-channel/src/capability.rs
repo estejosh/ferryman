@@ -144,6 +144,14 @@ impl Modality {
             Self::Image | Self::Video | Self::AudioIn | Self::AudioOut | Self::Embed
         )
     }
+
+    /// Text or code: what every engine the operator lists is assumed to do. Anything else
+    /// (vision included, which [`Self::is_media`] leaves out) is a capability only the
+    /// router knows engines have.
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        matches!(self, Self::Text | Self::Code)
+    }
 }
 
 impl fmt::Display for Modality {

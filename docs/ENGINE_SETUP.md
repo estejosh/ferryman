@@ -806,7 +806,14 @@ and the source is always recorded - `explicit`, `rules` or `model`:
 2. **Rules** - deterministic, no model. They read:
    - *attachments and file types*: an order payload may carry `attachments` (or `files`,
      `images`), each a path or URL or `{"path":..., "mime":...}`. Images need `vision`,
-     audio `audio_in`, video `video`; a media file named in the task text counts too;
+     audio `audio_in`, video `video`. **Only an attachment (or an explicit `--needs`)
+     makes an engine need one of these**: a media file merely *named* in the task text
+     (`update docs/logo.png in the README`) is noted in the reasons and asks for nothing,
+     and a media word in code work (`fix the transcription retry in src/lib.rs`) is a name
+     in the code, not the job: an order that names a source file or directory, or touches
+     code, is code work unless the audio, video or image is attached. Only when the winning
+     kind is itself media (`Transcribe the standup recording`) does the text make the
+     engine need the media modality;
    - *the `touches` globs*: only docs (`docs/**`, `*.md`, `README*`) is `docs`, only
      tests (`tests/**`, `*_test.rs`, `*.spec.ts`) is `tests`, any code leans
      `code-change`;
