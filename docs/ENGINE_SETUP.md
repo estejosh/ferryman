@@ -908,20 +908,41 @@ engines, as it always has, and the reason says so.
    refuted by its checks, each counting for half as much after 14 days. So
    `p = (prior x 4 + verified) / (4 + verified + refuted)`.
 2. **Price.** One call is estimated at 3k/1k, 12k/3k or 48k/10k tokens in/out for small,
-   medium and large work, times the engine's price. Local and free-tier engines cost 0. An
+   medium and large work, times the engine's price. Local and free-tier engines cost 0 -
+   but how an engine is paid for decides before where it runs: an endpoint on this machine
+   or network counts as local only when nothing says it is somebody's paid API behind a
+   proxy. An OmniRoute or LiteLLM style gateway (OmniRoute's provider or port 20128, or a
+   known route) is never guessed local, and an engine marked `paid = "prepaid"`,
+   `"subscription"` or `"free-tier"` is priced as that even at `localhost`; declare
+   `local = "true"` or `paid = "local"` to say it really is. An
    engine with **no declared price is not free**: it is assumed to cost a frontier model's
    list price ($5 in, $25 out per million tokens), so a declared price always beats a
    guess. A free tier that asked for money is priced like an unpriced one until its flag
    lapses. A subscription costs nothing per call, but its **scarcity** is priced: about two
    cents a call with the weekly cap full, rising to ten times that as the cap runs down.
 3. **Choose.** The *sufficient set* is every engine whose estimate reaches the threshold
-   for the kind (0.75 unless the policy says otherwise). The winner is the cheapest of
-   them. If none is sufficient, the winner is the one most likely to succeed. Costs within
-   10% count as tied, and ties go to **bias**, then the nearer tier, then the faster engine,
-   then the order the policy and `agent.toml` already gave.
-4. **Escalate.** After a result is refuted by its own evidence, or sent back with changes
-   requested, the next attempt leaves that engine out and needs an estimate **higher than the
-   one the failed engine was chosen at**. A retry therefore climbs: cheap first, then up.
+   for the kind. Unless the policy says otherwise that is **0.70 for docs, chore, tests,
+   review, plan and research** - a medium engine such as a free nemotron starts at exactly
+   0.70, so it takes that work from the start and loses it as soon as its results are
+   refuted - and **0.75 for everything else** (code changes and media), where a medium
+   engine must first prove itself and a small one (0.55) must earn either. The winner is
+   the cheapest of the sufficient set. If none is sufficient, the winner is the one most
+   likely to succeed. Costs within 10% count as tied, and ties go to **bias**, then the
+   nearer tier, then the faster engine, then the order the policy and `agent.toml` already
+   gave.
+4. **Escalate.** After a result *of this worker's own* is refuted by its own evidence, or
+   sent back with changes requested, the next attempt leaves that engine out and prefers
+   an estimate **higher than the failed engine's**. A retry therefore climbs: cheap first,
+   then up. That is a bar for the sufficient set, not a rule: when no remaining engine
+   clears it, the likeliest remaining engine still takes the order, even at or below the
+   failed one's estimate. And when the failed engine is the only one that can do the work
+   (a single-engine fleet), nothing waits for another that is never coming: the likeliest
+   of the failed engines tries again, and the routing line says so. An engine here is
+   *this agent's engine on this machine*, so another machine's `claude` failing says
+   nothing about yours. The failures are read only from results this worker signed, and
+   the estimate to beat is worked out from this worker's own ledger, never from the
+   numbers a result's payload carries: anyone who can write a result could otherwise name
+   your cheap engine "failed" or set the bar to 1.0.
 5. **Learn.** Each verified or refuted result is counted for that (engine, kind) in the
    worker's engine ledger, under the same lock as the rest of it, and published in the
    signed inventory (a v2-only field). A cheap engine that keeps getting docs right becomes
@@ -932,7 +953,7 @@ engines, as it always has, and the reason says so.
 
 ```sh
 ferry engines policy set --routing smart            # the default; `ordered` is today's strict order
-ferry engines policy set --threshold docs=0.7 --threshold code-change=0.85
+ferry engines policy set --threshold docs=0.6 --threshold code-change=0.85
 ferry engines policy set --bias 'nemotron*=3' --bias 'claude-sonnet*=2'
 ferry engines policy set --threshold none --bias none   # clear them
 ```
@@ -962,7 +983,7 @@ ferry engines                   # each engine's top kinds with their success rat
 
 Every routing decision is recorded beside the step and in the result: each candidate with its
 estimate and price, why each excluded engine was left out, and a one-line reason such as
-`nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient`. The dashboard shows the reason
+`nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient`. The dashboard shows the reason
 on each order card, every candidate in the order's drawer, and a Routing panel that runs the
 simulation without running anything. Telegram's review card carries the one-line reason.
 
@@ -1011,7 +1032,7 @@ engine.ollama.paid = "local"
 ferry engines policy set --routing smart \
   --prefer nemotron --prefer claude-sonnet --prefer claude-haiku \
   --bias 'nemotron*=3' --bias 'claude-sonnet*=2' --bias 'claude-haiku*=1' \
-  --threshold docs=0.7 --threshold chore=0.6 \
+  --threshold chore=0.55 \
   --allow-subscriptions-for plan,build,chore
 ```
 
@@ -1019,10 +1040,12 @@ What that does: NVIDIA is free and large, so it takes the work while it is up an
 it for as long as it keeps getting it right. When it is out of credit, down, or has failed
 at that kind of work, the next cheapest engine that is likely to do it well takes over: a
 local model that has proven itself at it, then Sonnet, then Haiku (Sonnet before Haiku
-when their price is tied, because of the bias). Haiku, a small model, becomes sufficient for a
-kind of work by proving itself at it, or because you lowered that kind's threshold: that is
-"can do it well cheaply". A subscription is used for a role only because
-`--allow-subscriptions-for` says so, and only an engine with a weekly cap; `never` and the
+when their price is tied, because of the bias). Docs, review, plan, research, tests and
+chores need only 0.70 by default, which any medium or large engine meets from the start,
+so a free one wins them cheaply until its results are refuted. Haiku, a small model,
+becomes sufficient for a kind of work by proving itself at it, or because you lowered that
+kind's threshold (`--threshold chore=0.55` above): that is "can do it well cheaply". A
+subscription is used for a role only because `--allow-subscriptions-for` says so, and only an engine with a weekly cap; `never` and the
 dollar caps still apply first. Drop `--allow-subscriptions-for` and the two Claude engines
 are never used for background work, as before. `ferry route simulate --kind docs --size small`
 shows the ranking before you trust it.

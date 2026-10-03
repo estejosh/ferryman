@@ -65,9 +65,13 @@
 //! refuted by the worker's own checks, each weighted by `0.5^(age / 14 days)` so that old
 //! results fade: [`Outcome`]. `p = (prior * 4 + verified) / (4 + verified + refuted)`.
 //!
-//! So a medium engine starts at 0.70 and is below the default threshold of 0.75; it is
-//! tried for work only when nothing sufficient is cheaper, and proves itself, or not, one
-//! verified result at a time. A large engine starts above it.
+//! So a medium engine starts at 0.70. That is enough for the kinds whose result is words,
+//! and for chores and tests ([`TEXT_THRESHOLD`], 0.70), so a free medium engine such as
+//! NVIDIA's nemotron does that work from the start and loses it as soon as its results are
+//! refuted. It is below the default for code changes and media ([`DEFAULT_THRESHOLD`],
+//! 0.75): there a medium engine is tried only when nothing sufficient is cheaper, and
+//! proves itself, or not, one verified result at a time. A large engine starts above both;
+//! a small one (0.55) must earn either.
 //!
 //! # The expected cost
 //!
@@ -88,20 +92,23 @@
 //! # The choice
 //!
 //! The *sufficient set* is every engine with `p` at or above the threshold for the kind
-//! (0.75 by default, `thresholds` in the policy per kind) - and above the failed engine's
-//! `p` when escalating. The winner is the cheapest of them. Costs within 10% (or half a
-//! tenth of a cent) of the cheapest count as tied, and ties go to the operator's **bias**
+//! ([`default_threshold`]: 0.70 for docs, chore, tests, review, plan and research, 0.75 for
+//! the rest; `thresholds` in the policy per kind) - and above the failed engine's `p` when
+//! escalating. The winner is the cheapest of them. Costs within 10% (or half a tenth of a
+//! cent) of the cheapest count as tied, and ties go to the operator's **bias**
 //! (the policy's `bias` weights, then the engine's place in the role's `prefer` list), then
 //! the nearer tier, then the faster engine, then the order the policy and the engine list
 //! already gave (how engines nothing else distinguishes were always told apart, so a fleet
 //! of look-alikes behaves as it did), and last the name. With an empty sufficient set the
-//! winner is the highest `p` (within 0.005, the cheaper). Bias never lets a dearer engine
-//! beat a cheaper sufficient one; to force an order use `routing = "ordered"`.
+//! winner is the highest `p` (within 0.005, the cheaper) *of the engines that can do the
+//! work* - which, on a retry, may be at or below the `p` of the engine that failed: an
+//! escalation is preferred, never required (see Escalation above). Bias never lets a dearer
+//! engine beat a cheaper sufficient one; to force an order use `routing = "ordered"`.
 //!
 //! # Explainability
 //!
 //! [`route`] returns a [`Decision`]: every candidate with its `p`, price and, when it was
-//! left out, why; the winner; and one line - `nvidia: free, p 0.81 for docs >= 0.75,
+//! left out, why; the winner; and one line - `nvidia: free, p 0.81 for docs >= 0.70,
 //! cheapest sufficient`. Workers record it beside the step and in the result;
 //! `ferry route explain`, `ferry route simulate` and the dashboard show it.
 
@@ -118,8 +125,30 @@ use crate::{
 };
 
 /// The success probability an engine must reach to count as sufficient, unless the policy
-/// says otherwise for the kind.
+/// says otherwise for the kind: for work that changes code, and for media.
 pub const DEFAULT_THRESHOLD: f64 = 0.75;
+/// The same for work whose result is words (docs, review, plan, research) and for the small
+/// jobs a person can check at a glance (chores, tests). A medium engine's prior is 0.70, so
+/// at 0.75 a free medium engine such as NVIDIA's nemotron could never be sufficient until it
+/// had proved itself, and the first dollar would always go to a dearer one. At 0.70 it is
+/// sufficient from the start, and the ledger takes it out of the running the moment it is
+/// refuted; a small engine (0.55) still has to earn it.
+pub const TEXT_THRESHOLD: f64 = 0.70;
+
+/// The threshold for `kind` when the policy sets none.
+#[must_use]
+pub fn default_threshold(kind: WorkKind) -> f64 {
+    match kind {
+        WorkKind::Docs
+        | WorkKind::Chore
+        | WorkKind::Tests
+        | WorkKind::Review
+        | WorkKind::Plan
+        | WorkKind::Research => TEXT_THRESHOLD,
+        _ => DEFAULT_THRESHOLD,
+    }
+}
+
 /// How long it takes a ledger result to count for half as much.
 pub const HALF_LIFE_DAYS: f64 = 14.0;
 /// How many observations the class prior is worth.
@@ -1438,14 +1467,17 @@ mod tests {
         assert_eq!(pick(&routed, &engines).as_deref(), Some("nvidia"));
         assert_eq!(
             routed.decision.reason,
-            "nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient"
+            "nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient"
         );
         assert_eq!(routed.decision.routing, "smart");
         assert_eq!(routed.decision.winner.as_ref().unwrap().cost_usd, 0.0);
         // The loser is recorded with its own p and price.
         let sonnet = &routed.decision.candidates[1];
         assert_eq!(sonnet.engine, "sonnet");
-        assert!(!sonnet.sufficient && sonnet.p == Some(0.7));
+        assert!(
+            sonnet.sufficient && sonnet.p == Some(0.7),
+            "sufficient, but dearer"
+        );
         assert!(sonnet.cost_usd.unwrap() > 0.0);
     }
 
@@ -1500,7 +1532,7 @@ mod tests {
         let engines = [a, b];
         let routed = run(
             &Policy::default(),
-            &needs(WorkKind::Docs, Size::Small),
+            &needs(WorkKind::Docs, Size::Large),
             &engines,
         );
         assert_eq!(pick(&routed, &engines).as_deref(), Some("b"));
@@ -1509,7 +1541,7 @@ mod tests {
                 .decision
                 .reason
                 .contains("the highest of the engines that can do it")
-                && routed.decision.reason.contains("none reach 0.75"),
+                && routed.decision.reason.contains("none reach 0.70"),
             "{}",
             routed.decision.reason
         );
@@ -1518,26 +1550,26 @@ mod tests {
 
     #[test]
     fn the_threshold_is_the_policys_per_kind() {
-        let medium = engine("m", ModelClass::Medium, "free-tier", Some(Cost::FREE));
+        let small = engine("m", ModelClass::Small, "free-tier", Some(Cost::FREE));
         let large = engine("l", ModelClass::Large, "prepaid", per_call(0.01));
-        let engines = [medium, large];
-        let docs = needs(WorkKind::Docs, Size::Medium);
+        let engines = [small, large];
+        let docs = needs(WorkKind::Docs, Size::Small);
         assert_eq!(
             pick(&run(&Policy::default(), &docs, &engines), &engines).as_deref(),
             Some("l")
         );
         let mut lax = Policy::default();
-        lax.thresholds.insert("docs".into(), 0.65);
+        lax.thresholds.insert("docs".into(), 0.55);
         lax.check().unwrap();
         let routed = run(&lax, &docs, &engines);
         assert_eq!(pick(&routed, &engines).as_deref(), Some("m"));
         assert!(
-            routed.decision.reason.contains(">= 0.65"),
+            routed.decision.reason.contains(">= 0.55"),
             "{}",
             routed.decision.reason
         );
         // Another kind keeps the default.
-        let code = needs(WorkKind::CodeChange, Size::Medium);
+        let code = needs(WorkKind::CodeChange, Size::Small);
         assert_eq!(
             pick(&run(&lax, &code, &engines), &engines).as_deref(),
             Some("l")
@@ -2343,7 +2375,7 @@ mod tests {
         let payload = serde_json::json!({ "routing": value });
         assert_eq!(
             reason_of(&payload).as_deref(),
-            Some("nvidia: free, p 0.80 for docs >= 0.75, cheapest sufficient")
+            Some("nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient")
         );
         assert_eq!(decision_of(&payload).unwrap(), routed.decision);
         assert!(reason_of(&serde_json::json!({})).is_none());

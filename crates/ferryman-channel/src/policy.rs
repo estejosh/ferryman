@@ -514,7 +514,7 @@ pub struct Policy {
     pub routing: Routing,
     /// Per kind of work (`docs`, `code-change`, ...): the success probability an engine
     /// must reach to count as sufficient. A kind left out uses
-    /// [`crate::router::DEFAULT_THRESHOLD`]. Smart routing only; v2-only.
+    /// [`crate::router::default_threshold`]. Smart routing only; v2-only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub thresholds: BTreeMap<String, f64>,
     /// Per selector: a weight that breaks ties between engines of equal price. Higher
@@ -595,13 +595,16 @@ impl Policy {
     }
 
     /// The success probability an engine must reach for `kind` of work: the policy's
-    /// word, else [`crate::router::DEFAULT_THRESHOLD`]. Keys are the kind's name.
+    /// word, else [`crate::router::default_threshold`]. Keys are the kind's name.
     #[must_use]
     pub fn threshold_for(&self, kind: crate::work::WorkKind) -> f64 {
         self.thresholds
             .iter()
             .find(|(name, _)| crate::work::WorkKind::parse(name).is_ok_and(|parsed| parsed == kind))
-            .map_or(crate::router::DEFAULT_THRESHOLD, |(_, value)| *value)
+            .map_or_else(
+                || crate::router::default_threshold(kind),
+                |(_, value)| *value,
+            )
     }
 
     /// How hard `role`'s engine is asked to think: the policy's word, else the default.
@@ -5906,13 +5909,38 @@ mod tests {
 
         // Thresholds: the policy's word for a kind, else the default.
         let docs = crate::work::WorkKind::Docs;
-        assert!((policy.threshold_for(docs) - crate::router::DEFAULT_THRESHOLD).abs() < 1e-9);
+        assert!((policy.threshold_for(docs) - crate::router::TEXT_THRESHOLD).abs() < 1e-9);
+        // The defaults per kind: 0.70 where the result is words (or small enough to read at
+        // a glance), so a medium engine - whose prior is exactly 0.70 - is sufficient from
+        // the start; 0.75 for code changes and media.
+        use crate::work::WorkKind;
+        for kind in [
+            WorkKind::Docs,
+            WorkKind::Chore,
+            WorkKind::Tests,
+            WorkKind::Review,
+            WorkKind::Plan,
+            WorkKind::Research,
+        ] {
+            assert!((policy.threshold_for(kind) - 0.70).abs() < 1e-9, "{kind:?}");
+        }
+        for kind in [
+            WorkKind::CodeChange,
+            WorkKind::Translate,
+            WorkKind::Transcribe,
+            WorkKind::Image,
+            WorkKind::Video,
+            WorkKind::Audio,
+            WorkKind::Other,
+        ] {
+            assert!((policy.threshold_for(kind) - 0.75).abs() < 1e-9, "{kind:?}");
+        }
         let mut tuned = Policy::default();
-        tuned.thresholds.insert(docs.as_str().into(), 0.7);
+        tuned.thresholds.insert(docs.as_str().into(), 0.65);
         tuned.check().unwrap();
-        assert!((tuned.threshold_for(docs) - 0.7).abs() < 1e-9);
+        assert!((tuned.threshold_for(docs) - 0.65).abs() < 1e-9);
         assert!(
-            (tuned.threshold_for(crate::work::WorkKind::Review) - crate::router::DEFAULT_THRESHOLD)
+            (tuned.threshold_for(crate::work::WorkKind::Review) - crate::router::TEXT_THRESHOLD)
                 .abs()
                 < 1e-9
         );
