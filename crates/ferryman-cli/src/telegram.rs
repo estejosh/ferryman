@@ -1636,6 +1636,7 @@ fn issue(
         result_contract: None,
         interface: None,
         touches: Vec::new(),
+        needs: None,
         allow_overlap: false,
     };
     // Unsigned work is work nobody can attribute. If this identity can sign, it does.

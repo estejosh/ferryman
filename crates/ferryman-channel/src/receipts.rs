@@ -743,6 +743,12 @@ pub struct EngineReport {
     /// else guessed from its model's name. `None` from a worker older than classes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<String>,
+    /// What the engine can do: modalities, strengths, context window, cost and whether it
+    /// is local - the operator's declared values, else guessed from the model and kind
+    /// (see [`crate::capability`]). `None` from a worker older than capability profiles.
+    /// A v2-only field, like `class`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::capability::Capabilities>,
 }
 
 /// How one engine is billed, as far as the worker running it can tell. Never a
@@ -799,6 +805,12 @@ pub struct EngineTrust {
     pub demoted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canary_passed_at: Option<DateTime<Utc>>,
+    /// How this engine's results have turned out per kind of work, with the age-weighted
+    /// counts the smart router estimates from (see [`crate::router::Outcome`]). A
+    /// v2-only field: the v1 signature does not cover it, so it counts only under a valid
+    /// v2 signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<crate::router::Outcome>,
 }
 
 impl EngineTrust {
@@ -856,7 +868,7 @@ pub struct EngineInventory {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     /// Signs the v1 view of the inventory: the engines without the fields v0.5.17 did not
-    /// know (`class`, `billing.weekly_requests`). That is exactly what an older verifier
+    /// know (`class`, `capabilities`, `trust.kinds`, `billing.weekly_requests`). That is exactly what an older verifier
     /// recomputes after it deserializes and drops what it does not know, so a new
     /// inventory still verifies on an old peer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -873,6 +885,10 @@ impl EngineInventory {
     fn has_v2_fields(&self) -> bool {
         self.engines.iter().any(|e| {
             e.class.is_some()
+                || e.capabilities.is_some()
+                || e.trust
+                    .as_ref()
+                    .is_some_and(|trust| !trust.kinds.is_empty())
                 || e.billing
                     .as_ref()
                     .is_some_and(|b| b.weekly_requests.is_some())
@@ -880,7 +896,8 @@ impl EngineInventory {
     }
 }
 
-/// The engines as v0.5.17 serializes them: without `class` and `weekly_requests`.
+/// The engines as v0.5.17 serializes them: without `class`, `capabilities`,
+/// `trust.kinds` and `weekly_requests`.
 fn engines_v1_json(engines: &[EngineReport]) -> String {
     let mut value = serde_json::to_value(engines).unwrap_or_default();
     if let Some(list) = value.as_array_mut() {
@@ -889,6 +906,10 @@ fn engines_v1_json(engines: &[EngineReport]) -> String {
                 continue;
             };
             engine.remove("class");
+            engine.remove("capabilities");
+            if let Some(trust) = engine.get_mut("trust").and_then(|t| t.as_object_mut()) {
+                trust.remove("kinds");
+            }
             if let Some(billing) = engine.get_mut("billing").and_then(|b| b.as_object_mut()) {
                 billing.remove("weekly_requests");
             }
@@ -1131,6 +1152,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         by.sign_order(&mut order);
@@ -1500,6 +1522,7 @@ mod tests {
             trust: None,
             billing: None,
             class: None,
+            capabilities: None,
         }
     }
 
@@ -1775,6 +1798,247 @@ mod tests {
         assert_eq!(
             verify_engines(&tampered, &route.agents),
             SignatureCheck::Invalid
+        );
+    }
+
+    #[test]
+    fn capabilities_are_v2_only_so_a_v0_5_17_peer_still_verifies_and_they_cannot_be_forged() {
+        use crate::capability::{Capabilities, Cost, Modality};
+        let (_t, route, fang, _, _) = channel();
+        // Nothing but a capability profile is new on this line.
+        let mut engine = engine("up");
+        engine.capabilities = Some(Capabilities {
+            modalities: vec![Modality::Text, Modality::Vision],
+            strengths: vec!["docs".into()],
+            context_k: Some(128),
+            cost: Some(Cost::FREE),
+            local: true,
+        });
+        assert!(engine.class.is_none());
+        refresh_engines(
+            &route,
+            &fang,
+            "grouchly",
+            "0.5.18",
+            vec![engine],
+            Utc::now(),
+        )
+        .unwrap();
+        let text = fs::read_to_string(engines_path(&route, "fang")).unwrap();
+        assert!(text.contains("\"capabilities\"") && text.contains("signature_v2"));
+        assert!(
+            old_peer_accepts(&text, &route.agents),
+            "the old verifier must still accept a worker that only added capabilities"
+        );
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        let original = listed[0].0.clone();
+        assert_eq!(
+            original.engines[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .modalities,
+            vec![Modality::Text, Modality::Vision]
+        );
+
+        // Claiming a modality under the v1 signature alone does not verify.
+        let mut forged = original.clone();
+        forged.engines[0]
+            .capabilities
+            .as_mut()
+            .unwrap()
+            .modalities
+            .push(Modality::Code);
+        assert_eq!(
+            verify_engines(&forged, &route.agents),
+            SignatureCheck::Invalid
+        );
+        let mut cheaper = original.clone();
+        cheaper.engines[0].capabilities.as_mut().unwrap().cost = None;
+        assert_eq!(
+            verify_engines(&cheaper, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Stripping the v2 signature while keeping the profile does not verify either.
+        let mut stripped = original.clone();
+        stripped.signature_v2 = None;
+        assert_eq!(
+            verify_engines(&stripped, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Without a profile, an old-style inventory is as valid as ever.
+        let mut bare = original;
+        bare.engines[0].capabilities = None;
+        bare.signature_v2 = None;
+        assert_eq!(verify_engines(&bare, &route.agents), SignatureCheck::Valid);
+    }
+
+    // v0.5.17's trust line, copied: no per-kind outcomes. A peer reads an inventory into
+    // this, drops what it does not know, and checks the signature over what it re-serializes.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldEngineTrust {
+        verified: u64,
+        #[serde(alias = "contradicted")]
+        refuted: u64,
+        #[serde(default)]
+        unverified: u64,
+        #[serde(default)]
+        recent: u32,
+        #[serde(default)]
+        demoted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        demoted_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        canary_passed_at: Option<DateTime<Utc>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldTrustEngineReport {
+        name: String,
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        tier: String,
+        paid: String,
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        until: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latency_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        balance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checked_at: Option<DateTime<Utc>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trust: Option<OldEngineTrust>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        billing: Option<OldEngineBilling>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldTrustInventory {
+        agent: String,
+        machine: String,
+        updated_at: DateTime<Utc>,
+        ferry_version: String,
+        engines: Vec<OldTrustEngineReport>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signed_by: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    }
+
+    fn old_peer_accepts_trust(text: &str, roster: &[AgentRoute]) -> bool {
+        let Ok(old) = serde_json::from_str::<OldTrustInventory>(text) else {
+            return false;
+        };
+        let payload = format!(
+            "ferryman-engines-v1\n{}\n{}\n{}\n{}\n{}",
+            old.agent,
+            old.machine,
+            old.updated_at.to_rfc3339(),
+            old.ferry_version,
+            serde_jcs::to_string(&old.engines).unwrap_or_default(),
+        );
+        verify_as(
+            &old.agent,
+            old.signed_by.as_ref(),
+            old.signature.as_ref(),
+            &payload,
+            roster,
+        ) == SignatureCheck::Valid
+    }
+
+    #[test]
+    fn per_kind_outcomes_are_v2_only_so_a_v0_5_17_peer_still_verifies_and_they_cannot_be_forged() {
+        let (_t, route, fang, _, _) = channel();
+        let now = Utc::now();
+        let mut kinds = Vec::new();
+        for _ in 0..3 {
+            crate::router::record_outcome(&mut kinds, "docs", true, now);
+        }
+        crate::router::record_outcome(&mut kinds, "tests", false, now);
+        let mut engine = engine("up");
+        engine.trust = Some(EngineTrust {
+            verified: 3,
+            refuted: 1,
+            kinds,
+            ..EngineTrust::default()
+        });
+        refresh_engines(&route, &fang, "grouchly", "0.5.18", vec![engine], now).unwrap();
+        let text = fs::read_to_string(engines_path(&route, "fang")).unwrap();
+        assert!(
+            text.contains("\"kinds\"") && text.contains("signature_v2"),
+            "{text}"
+        );
+        assert!(
+            old_peer_accepts_trust(&text, &route.agents),
+            "the old verifier must still accept a worker that only added per-kind outcomes"
+        );
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        let original = listed[0].0.clone();
+        let trust = original.engines[0].trust.as_ref().unwrap();
+        assert_eq!(trust.kinds.len(), 2);
+        assert_eq!(trust.kinds[0].kind, "docs");
+
+        // Better results claimed under the v1 signature alone do not verify.
+        let mut forged = original.clone();
+        forged.engines[0].trust.as_mut().unwrap().kinds[0].verified_milli = 90_000;
+        assert_eq!(
+            verify_engines(&forged, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // A refutation taken out does not either.
+        let mut cleaned = original.clone();
+        cleaned.engines[0].trust.as_mut().unwrap().kinds.pop();
+        assert_eq!(
+            verify_engines(&cleaned, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Nor does stripping the v2 signature while keeping the outcomes.
+        let mut stripped = original.clone();
+        stripped.signature_v2 = None;
+        assert_eq!(
+            verify_engines(&stripped, &route.agents),
+            SignatureCheck::Invalid
+        );
+        // Without outcomes, an old-style inventory is as valid as ever.
+        let mut bare = original;
+        bare.engines[0].trust.as_mut().unwrap().kinds.clear();
+        bare.signature_v2 = None;
+        assert_eq!(verify_engines(&bare, &route.agents), SignatureCheck::Valid);
+    }
+
+    #[test]
+    fn a_modality_from_a_newer_version_survives_a_round_trip_and_still_verifies() {
+        use crate::capability::{Capabilities, Modality};
+        let (_t, route, fang, _, _) = channel();
+        let mut engine = engine("up");
+        engine.capabilities = Some(Capabilities {
+            modalities: vec![Modality::Text, Modality::Other("hologram".into())],
+            ..Capabilities::default()
+        });
+        refresh_engines(
+            &route,
+            &fang,
+            "grouchly",
+            "0.5.18",
+            vec![engine],
+            Utc::now(),
+        )
+        .unwrap();
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed[0].1, SignatureCheck::Valid);
+        assert!(
+            listed[0].0.engines[0]
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .has(&Modality::Other("hologram".into()))
         );
     }
 

@@ -202,6 +202,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         let claim = ferryman_channel::Claim {

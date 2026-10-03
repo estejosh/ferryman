@@ -3312,9 +3312,13 @@ async fn attempt(
     // failed attempt: it is marked, and the same order goes straight to the next engine
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
     let mut tried: Vec<String> = Vec::new();
+    // What kind of work this is, once per order: when the rules are unsure a model labels
+    // it (cached, so a later attempt does not ask again) and the router reads the label.
+    let improvement = crate::improve::is_improvement(task);
+    crate::route::settle_classification(route, config, &task.order, improvement).await;
     let result = loop {
-        let engine = match next_engine(route, config, task, &tried) {
-            Ok(engine) => engine,
+        let (engine, routing) = match next_routed(route, config, task, &tried) {
+            Ok(chosen) => chosen,
             Err(why) => {
                 report.warn(&format!(
                     "  {id}: {why}; it waits, and nothing is counted against it"
@@ -3326,6 +3330,9 @@ async fn attempt(
             }
         };
         tried.push(engine.name.clone());
+        if let Some(decision) = &routing {
+            report.info(&format!("  {id}: routing - {}", decision.reason));
+        }
         // How hard this order's role is asked to think, by the engine policy.
         let (policy, _) =
             ferryman_channel::policy::effective(&route.communications, &route.project_id);
@@ -3333,7 +3340,16 @@ async fn attempt(
             order_tier(task).as_str(),
         ));
         let effective = config.with_engine_effort(&engine, Some(effort));
-        match do_work(route, &effective, identity, task, concurrent, report).await {
+        match do_work(
+            route,
+            &effective,
+            identity,
+            task,
+            (concurrent, routing.as_ref()),
+            report,
+        )
+        .await
+        {
             // No checkout of its own while others run beside it: not a failure and not
             // the engine's doing. Let go of the claim so a pass that runs it alone (or
             // another machine) takes it, rather than run it in the others' checkout.
@@ -3390,6 +3406,83 @@ async fn attempt(
             false
         }
     }
+}
+
+/// The engines of `agent` that already failed this order: a result of its own, signed by it,
+/// that its evidence refuted, or that a signed review sent back with changes requested. A
+/// retry leaves them out (see [`ferryman_channel::router`]).
+///
+/// Only this worker's own results count, and only ones whose signature verifies against
+/// the roster: a result another agent wrote, or one nobody signed, says nothing about the
+/// engines here, and must not be able to shut them out of an order. The estimate a failed
+/// engine was routed at is deliberately not read from the result either - a payload is
+/// whatever its writer says - so the router works the floor out from this worker's own
+/// ledger instead.
+#[must_use]
+pub fn failed_engines(
+    route: &ProjectRoute,
+    task: &Task,
+    agent: &str,
+) -> Vec<ferryman_channel::router::Failed> {
+    failed_engines_by(
+        task,
+        agent,
+        &|result| {
+            ferryman_channel::verify_result(result, &route.agents)
+                == ferryman_channel::SignatureCheck::Valid
+        },
+        &|review| {
+            ferryman_channel::verify_review(review, &route.agents)
+                == ferryman_channel::SignatureCheck::Valid
+                && ferryman_channel::review_authority(route, review).allowed()
+        },
+    )
+}
+
+/// [`failed_engines`], with what to trust given: whether a result's, and a review's,
+/// signature checks out.
+fn failed_engines_by(
+    task: &Task,
+    agent: &str,
+    trusted_result: &dyn Fn(&TaskResult) -> bool,
+    trusted_review: &dyn Fn(&Review) -> bool,
+) -> Vec<ferryman_channel::router::Failed> {
+    let mut failed: Vec<ferryman_channel::router::Failed> = Vec::new();
+    for result in &task.results {
+        if !result.agent.eq_ignore_ascii_case(agent) || !trusted_result(result) {
+            continue;
+        }
+        let Some(engine) = result.payload.get("engine").and_then(Value::as_str) else {
+            continue;
+        };
+        let refuted = ferryman_channel::evidence::classify(&task.order.payload, result).status
+            == ferryman_channel::evidence::Status::Refuted;
+        let sent_back = task.reviews.iter().any(|review| {
+            review.revision == result.revision && !review.accepted && trusted_review(review)
+        });
+        if !refuted && !sent_back {
+            continue;
+        }
+        let machine = result
+            .payload
+            .get("machine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let known = failed.iter().any(|known| {
+            known.engine == engine
+                && known.machine.eq_ignore_ascii_case(machine)
+                && known.agent.eq_ignore_ascii_case(agent)
+        });
+        if !known {
+            failed.push(ferryman_channel::router::Failed {
+                agent: agent.to_string(),
+                machine: machine.to_string(),
+                engine: engine.to_string(),
+                p: None,
+            });
+        }
+    }
+    failed
 }
 
 /// The tier an order asks for: `"tier": "chore"` in its payload, otherwise build.
@@ -3581,6 +3674,28 @@ fn next_engine(
     task: &Task,
     tried: &[String],
 ) -> std::result::Result<crate::engines::EngineSpec, String> {
+    next_routed(route, config, task, tried).map(|(engine, _)| engine)
+}
+
+/// [`next_engine`], and the smart router's decision when the engine was chosen by it: for
+/// an improvement order (background work), and for a person's order that needs a capability
+/// (vision, audio, image, video) which only the router knows engines have. A person's
+/// ordinary text or code order keeps the operator's own engine order, as it always has.
+/// With the policy's `routing = "ordered"` the engine is the one [`next_engine`] always
+/// chose, and the decision says so.
+fn next_routed(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    task: &Task,
+    tried: &[String],
+) -> std::result::Result<
+    (
+        crate::engines::EngineSpec,
+        Option<ferryman_channel::router::Decision>,
+    ),
+    String,
+> {
+    use ferryman_channel::policy::{Role, Routing, Work};
     let ledger = crate::engines::Ledger::load(&config.agent);
     let now = chrono::Utc::now();
     let wanted = order_tier(task);
@@ -3591,25 +3706,61 @@ fn next_engine(
         if !policy.allows_machine(here.0, here.1) {
             return Err(not_here(here.0, here.1, &policy));
         }
-        let role = ferryman_channel::policy::Role::for_order_tier(wanted.as_str());
+        let role = Role::for_order_tier(wanted.as_str());
         if let Some(why) =
             ferryman_channel::policy::over_cap(route, &policy, &crate::engines::iso_week(now), role)
         {
             return Err(why);
         }
-        return crate::engines::choose(
+        // An improvement order is build or chore work: it changes files in a worktree, which
+        // only a cli engine can do (an http engine answers in text, changes nothing, and is
+        // refuted for it). Plan, review and research orders only produce text.
+        let classification = ferryman_channel::work::classify_cached(&task.order, route);
+        let (needs, edits) =
+            ferryman_channel::work::routing_needs(&task.order, &classification, true);
+        let failed = failed_engines(route, task, &config.agent);
+        return crate::engines::choose_routed(
             &config.engines,
             &ledger,
             now,
             &policy,
-            role,
-            wanted,
-            tried,
+            (role, wanted, Work::Background),
+            &needs,
+            (&failed, tried),
             here,
-        );
+        )
+        .map(|(engine, mut decision)| {
+            if let Some(why) = edits {
+                decision
+                    .reason
+                    .push_str(&format!("; needs an engine that can edit files: {why}"));
+            }
+            (engine, Some(decision))
+        });
+    }
+    if policy.routing == Routing::Smart {
+        let needs = ferryman_channel::work::classify_cached(&task.order, route).needs;
+        // A person's order is routed by the router only when it needs something the
+        // operator's own engine order cannot know an engine has: a modality beyond text and
+        // code (vision included).
+        if needs.modalities.iter().any(|m| !m.is_plain()) {
+            let failed = failed_engines(route, task, &config.agent);
+            return crate::engines::choose_routed(
+                &config.engines,
+                &ledger,
+                now,
+                &policy,
+                (Role::Build, wanted, Work::Direct),
+                &needs,
+                (&failed, tried),
+                here,
+            )
+            .map(|(engine, decision)| (engine, Some(decision)));
+        }
     }
     crate::engines::pick_direct(&config.engines, &ledger, now, wanted, tried, &policy, here)
         .cloned()
+        .map(|engine| (engine, None))
         .ok_or_else(|| {
             format!(
                 "no {} engine can run it now ({})",
@@ -3672,15 +3823,17 @@ pub async fn ask_costed(
     Ok((engine_answer(&run.stdout), cost))
 }
 
-#[tracing::instrument(name = "do_work", skip(route, config, identity, task, report), fields(order = %task.order.id, agent = %config.agent))]
+#[tracing::instrument(name = "do_work", skip(route, config, identity, task, how, report), fields(order = %task.order.id, agent = %config.agent))]
 async fn do_work(
     route: &ProjectRoute,
     config: &AgentConfig,
     identity: &AgentIdentity,
     task: &Task,
-    concurrent: bool,
+    how: (bool, Option<&ferryman_channel::router::Decision>),
     report: &dyn Progress,
 ) -> Result<()> {
+    // Whether others run beside this order, and why the smart router chose this engine.
+    let (concurrent, routing) = how;
     use ferryman_channel::interrupt::InterruptAction;
 
     let id = &task.order.id;
@@ -3914,6 +4067,11 @@ async fn do_work(
     if let Some(effort) = config.applied_effort() {
         payload["effort"] = json!(effort.as_str());
     }
+    // And why this engine: the smart router's decision, every candidate's estimate and
+    // price included, so a reviewer - and `ferry route explain` - can read the choice.
+    if let Some(decision) = routing {
+        payload["routing"] = json!(decision);
+    }
     if run.ok && wants_result_fields(&task.order) {
         merge_result_fields(&mut payload, &engine_answer(&run.stdout));
     }
@@ -3928,9 +4086,22 @@ async fn do_work(
         } else {
             report.info(&format!("  {id}: evidence {}", found.describe()));
         }
-        if crate::engines::record_verification(
+        // Counted for this kind of work too, which is what the router learns from: the
+        // kind it was routed as, else what the rules read the order to be.
+        let kind = routing.map_or_else(
+            || {
+                ferryman_channel::work::classify_cached(&task.order, route)
+                    .needs
+                    .kind
+                    .as_str()
+                    .to_string()
+            },
+            |decision| decision.kind.clone(),
+        );
+        if crate::engines::record_verification_for(
             &config.agent,
             &engine.name,
+            Some(&kind),
             found.status,
             chrono::Utc::now(),
         ) {
@@ -4023,6 +4194,7 @@ async fn do_work(
             effort: config
                 .applied_effort()
                 .map(|effort| effort.as_str().to_string()),
+            route: routing.cloned(),
             outcome: format!("submitted r{revision}"),
         };
         if let Err(error) = ferryman_channel::policy::record_step(route, identity, &week, step) {
@@ -5281,6 +5453,7 @@ mod tests {
                 result_contract: None,
                 interface: None,
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             },
             claims: Vec::new(),
@@ -5365,6 +5538,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         }
     }
@@ -5396,6 +5570,138 @@ mod tests {
             signed_by: None,
             signature: None,
         }
+    }
+
+    /// An engine's result for a revision, with the routing decision it was chosen under.
+    fn routed_result(revision: u32, engine: &str, body: &str, p: f64) -> TaskResult {
+        let mut found = result(revision, body);
+        found.payload["engine"] = json!(engine);
+        found.payload["routing"] = json!({
+            "routing": "smart", "role": "build", "kind": "docs", "size": "small",
+            "threshold": 0.75, "candidates": [],
+            "winner": { "engine": engine, "agent": "w", "machine": "m", "p": p, "cost_usd": 0.0 },
+            "reason": format!("{engine}: free, p {p:.2} for docs >= 0.75, cheapest sufficient"),
+        });
+        found
+    }
+
+    #[test]
+    fn an_engine_whose_result_was_refuted_or_sent_back_has_failed_the_order() {
+        let sent_back = |revision: u32| Review {
+            order_id: "t-1".into(),
+            revision,
+            reviewer: "orchestrator".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: false,
+            notes: Some("wrong".into()),
+            signed_by: None,
+            signature: None,
+        };
+        let accepted = Review {
+            accepted: true,
+            notes: None,
+            ..sent_back(3)
+        };
+        // This worker, and everything it signed trusted: what the failures of "worker" are.
+        let failed_engines = |task: &Task| failed_engines_by(task, "worker", &|_| true, &|_| true);
+        // Nothing yet: nobody has failed.
+        assert!(failed_engines(&task_with(Vec::new(), Vec::new())).is_empty());
+        // A good result nobody sent back is not a failure.
+        let good = task_with(
+            vec![routed_result(1, "nvidia", "the report", 0.8)],
+            Vec::new(),
+        );
+        assert!(failed_engines(&good).is_empty());
+        // A result that is no answer is refuted by its own text, whatever the review says.
+        let refuted = task_with(vec![routed_result(1, "nvidia", "", 0.8)], Vec::new());
+        let failed = failed_engines(&refuted);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].engine, "nvidia");
+        assert_eq!(failed[0].agent, "worker");
+        assert_eq!(
+            failed[0].p, None,
+            "the estimate a result claims is not read: the router works the floor out itself"
+        );
+        // Sent back with changes requested.
+        let back = task_with(
+            vec![routed_result(1, "nvidia", "the report", 0.8)],
+            vec![sent_back(1)],
+        );
+        assert_eq!(failed_engines(&back)[0].engine, "nvidia");
+        // Accepted later does not clear an earlier failure of another engine's result.
+        let mixed = task_with(
+            vec![
+                routed_result(1, "nvidia", "the report", 0.7),
+                routed_result(2, "claude", "the better report", 0.9),
+                routed_result(3, "nvidia", "another go", 0.8),
+            ],
+            vec![sent_back(1), sent_back(2), accepted],
+        );
+        let failed = failed_engines(&mixed);
+        let names: Vec<&str> = failed.iter().map(|f| f.engine.as_str()).collect();
+        assert_eq!(names, ["nvidia", "claude"]);
+        // A result from before the router has no estimate to beat, but still failed.
+        let old = TaskResult {
+            payload: json!({ "output": "", "engine": "codex" }),
+            ..result(1, "")
+        };
+        let failed = failed_engines(&task_with(vec![old], Vec::new()));
+        assert_eq!((failed[0].engine.as_str(), failed[0].p), ("codex", None));
+    }
+
+    #[test]
+    fn only_this_workers_own_trusted_results_count_as_its_engines_failing() {
+        let refuted = |agent: &str, engine: &str, machine: &str, p: f64| {
+            let mut found = routed_result(1, engine, "", p);
+            found.agent = agent.into();
+            found.payload["machine"] = json!(machine);
+            found
+        };
+        let trusting = |task: &Task, agent: &str| {
+            failed_engines_by(task, agent, &|_| true, &|_| true)
+                .iter()
+                .map(|f| format!("{}/{}/{}", f.agent, f.machine, f.engine))
+                .collect::<Vec<_>>()
+        };
+        // Another member's refuted result, or one claiming to be a cheap engine's failure,
+        // is nothing to do with this worker's engines.
+        let task = task_with(
+            vec![
+                refuted("mallory", "nemotron", "evil", 1.0),
+                refuted("worker", "claude", "box", 0.1),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(trusting(&task, "worker"), ["worker/box/claude"]);
+        assert_eq!(trusting(&task, "mallory"), ["mallory/evil/nemotron"]);
+        assert!(
+            trusting(&task, "ember").is_empty(),
+            "claude failed on worker's box, not ember's"
+        );
+        // A result whose signature does not check out (a forgery with this worker's name on
+        // it) is not a failure either.
+        let forged = failed_engines_by(&task, "worker", &|_| false, &|_| true);
+        assert!(forged.is_empty(), "{forged:?}");
+        // And a signed review by someone with no authority does not send a result back.
+        let review = Review {
+            order_id: "t-1".into(),
+            revision: 1,
+            reviewer: "orchestrator".into(),
+            reviewed_at: chrono::Utc::now(),
+            accepted: false,
+            notes: Some("no".into()),
+            signed_by: None,
+            signature: None,
+        };
+        let fine = task_with(
+            vec![routed_result(1, "nvidia", "the report", 0.9)],
+            vec![review],
+        );
+        assert!(failed_engines_by(&fine, "worker", &|_| true, &|_| false).is_empty());
+        assert_eq!(
+            failed_engines_by(&fine, "worker", &|_| true, &|_| true).len(),
+            1
+        );
     }
 
     #[test]
@@ -5676,6 +5982,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         assert_eq!(
@@ -5843,6 +6150,7 @@ mod tests {
                 result_contract: None,
                 interface: None,
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             },
             claims: Vec::new(),
@@ -6728,6 +7036,7 @@ mod tests {
             class: None,
             effort_args: std::collections::BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
     }
 
@@ -7135,6 +7444,241 @@ mod tests {
         assert!(waiting.claims.is_empty(), "not claimed outside where");
     }
 
+    /// A worker config that lists engines the way a test needs, none of them runnable.
+    fn fleet(engines: &str) -> String {
+        format!(
+            "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+             pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+             defer_improvements_while_active = \"false\"\n{engines}"
+        )
+    }
+
+    /// A free text engine listed first, and a cli engine that can edit files.
+    fn editor_and_free_text() -> String {
+        fleet(
+            "engines = [\"nemotron\", \"coder\"]\n\
+             engine.nemotron.base_url = \"fake://ok:nemotron did it\"\n\
+             engine.nemotron.model = \"nvidia/nemotron\"\nengine.nemotron.paid = \"free-tier\"\n\
+             engine.coder.command = \"ferryman-no-such-engine\"\nengine.coder.model = \"big-coder\"\n\
+             engine.coder.paid = \"prepaid\"\n",
+        )
+    }
+
+    /// An improvement order is build or chore work, which edits files in a worktree: a free
+    /// text-only engine would answer in prose, change nothing, be refuted for it and demoted.
+    /// It goes to the engine that can edit, and the routing line says why.
+    #[test]
+    fn an_improvement_order_goes_to_an_engine_that_can_edit_files_not_a_free_text_one() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_order_for_wisp(comms.path(), "t-edit-direct", &editor_and_free_text());
+        improvement_order(&route, "improve-2026-w40-edit");
+        let task = ferryman_channel::read_task(&route, "improve-2026-w40-edit").unwrap();
+
+        let (engine, decision) = next_routed(&route, &config, &task, &[]).unwrap();
+
+        assert_eq!(engine.name, "coder");
+        let reason = decision.expect("routed by the smart router").reason;
+        assert!(reason.contains("can edit files"), "{reason}");
+    }
+
+    /// A person's order that carries a screenshot needs an engine that can see it. Vision is
+    /// not "media" to the policy, which used to leave such an order on the operator's own
+    /// engine order; a plain order still keeps it.
+    #[test]
+    fn a_persons_order_with_a_screenshot_goes_to_an_engine_that_can_see_it() {
+        hermetic_machine();
+        let engines = fleet(
+            "engines = [\"plain\", \"seer\"]\n\
+             engine.plain.command = \"ferryman-no-such-engine\"\n\
+             engine.seer.command = \"ferryman-no-such-engine\"\n\
+             engine.seer.modalities = \"text, code, vision\"\n",
+        );
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(comms.path(), "t-shot", &engines, |order| {
+                order.payload =
+                    json!({ "task": "fix the layout shown here", "attachments": ["shot.png"] });
+            });
+        let task = ferryman_channel::read_task(&route, "t-shot").unwrap();
+        let (engine, decision) = next_routed(&route, &config, &task, &[]).unwrap();
+        assert_eq!(engine.name, "seer", "only it can see the picture");
+        assert!(decision.is_some_and(|d| d.needs.iter().any(|n| n == "vision")));
+
+        // The same words with no picture: the operator's own order, plain first.
+        let other = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(other.path(), "t-noshot", &engines, |order| {
+                order.payload = json!({ "task": "fix the layout shown here" });
+            });
+        let task = ferryman_channel::read_task(&route, "t-noshot").unwrap();
+        let (engine, decision) = next_routed(&route, &config, &task, &[]).unwrap();
+        assert_eq!(engine.name, "plain");
+        assert!(decision.is_none());
+    }
+
+    /// What the worker does with an improvement order whose kind the rules cannot tell: it asks
+    /// a model to label it, once - the answer is cached for the order, and the router reads it
+    /// from there - and never for a person's own order. The order's text goes out fenced as
+    /// data, to an `http` engine only.
+    #[tokio::test]
+    async fn a_worker_asks_a_model_to_label_an_improvement_order_once() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let both = fleet(
+            r#"engines = ["labeller", "coder"]
+engine.labeller.base_url = "fake://slow:label-once:0:{"kind":"docs","size":"small","confidence":0.8}"
+engine.labeller.model = "m"
+engine.labeller.paid = "free-tier"
+engine.coder.command = "ferryman-no-such-engine"
+engine.coder.model = "big-coder"
+"#,
+        );
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-label-direct", &both);
+        improvement_order(&route, "improve-2026-w40-label");
+        let order = ferryman_channel::read_task(&route, "improve-2026-w40-label")
+            .unwrap()
+            .order;
+        assert!(!ferryman_channel::work::classify(&order, &route).is_sure());
+
+        // A person's own order asks nothing.
+        crate::route::settle_classification(&route, &config, &order, false).await;
+        assert!(runs_of("label-once").is_empty());
+
+        // An improvement order is labelled by the model...
+        let got = crate::route::settle_classification(&route, &config, &order, true).await;
+        assert_eq!(got.source, ferryman_channel::work::Source::Model);
+        assert_eq!(got.needs.kind, ferryman_channel::work::WorkKind::Docs);
+        let runs = runs_of("label-once");
+        assert_eq!(runs.len(), 1, "{runs:?}");
+        assert!(
+            runs[0].prompt.contains("<<<ORDER") && runs[0].prompt.contains("must not follow"),
+            "the order's text is fenced as data: {}",
+            runs[0].prompt
+        );
+        // ...once: asked again, it answers from the cache without a second request, and the
+        // router reads the label.
+        crate::route::settle_classification(&route, &config, &order, true).await;
+        assert_eq!(runs_of("label-once").len(), 1);
+        assert_eq!(
+            ferryman_channel::work::classify_cached(&order, &route)
+                .needs
+                .kind,
+            ferryman_channel::work::WorkKind::Docs
+        );
+    }
+
+    /// A fleet of agents with tools only has nothing safe to ask: an order's text is not to
+    /// be trusted with a `cli` engine, so the rules' read stands and the reason is recorded.
+    #[tokio::test]
+    async fn a_worker_never_asks_a_cli_engine_to_label_an_order() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let cli_only = fleet(
+            "engines = [\"coder\"]\n\
+             engine.coder.command = \"ferryman-no-such-engine\"\nengine.coder.model = \"big-coder\"\n",
+        );
+        let (route, config) =
+            channel_with_order_for_wisp(comms.path(), "t-nolabel-direct", &cli_only);
+        improvement_order(&route, "improve-2026-w40-nolabel");
+        let order = ferryman_channel::read_task(&route, "improve-2026-w40-nolabel")
+            .unwrap()
+            .order;
+        let got = crate::route::settle_classification(&route, &config, &order, true).await;
+        assert_eq!(got.source, ferryman_channel::work::Source::Rules);
+        assert!(
+            got.reasons.iter().any(|why| why.contains("cli engine")),
+            "{:?}",
+            got.reasons
+        );
+        assert!(
+            ferryman_channel::work::read_cache(&route, &order.id).is_none(),
+            "nothing was asked, so nothing is cached"
+        );
+    }
+
+    /// A signed result of this worker's own, naming `engine`, that its evidence refutes.
+    fn own_refuted_result(order_id: &str, engine: &str) -> TaskResult {
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        let mut result = TaskResult {
+            order_id: order_id.into(),
+            agent: "wisp".into(),
+            revision: 1,
+            submitted_at: chrono::Utc::now(),
+            payload: json!({
+                "output": "",
+                "engine": engine,
+                "machine": ferryman_channel::receipts::machine_label(),
+            }),
+            signed_by: None,
+            signature: None,
+        };
+        wisp.sign_result(&mut result);
+        result
+    }
+
+    /// One engine, and it failed the order once. The order is not left waiting for an engine
+    /// that is never coming: the same engine tries again, and the routing line says so.
+    #[test]
+    fn a_lone_engine_that_failed_the_order_tries_again_instead_of_waiting() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let only = fleet(
+            "engines = [\"coder\"]\n\
+             engine.coder.command = \"ferryman-no-such-engine\"\nengine.coder.model = \"big-coder\"\n",
+        );
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-lone-direct", &only);
+        improvement_order(&route, "improve-2026-w40-lone");
+        let mut task = ferryman_channel::read_task(&route, "improve-2026-w40-lone").unwrap();
+        task.results
+            .push(own_refuted_result("improve-2026-w40-lone", "coder"));
+
+        let (engine, decision) = next_routed(&route, &config, &task, &[]).unwrap();
+
+        assert_eq!(engine.name, "coder");
+        let reason = decision.unwrap().reason;
+        assert!(reason.contains("tries again"), "{reason}");
+    }
+
+    /// An engine is out of an order because this worker's own signed result with it was
+    /// refuted. Another agent's result naming the same engine (or one nobody signed) shuts
+    /// nothing out: a member could otherwise name this worker's engines "failed" at will.
+    #[test]
+    fn only_this_workers_own_signed_failures_leave_its_engines_out() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let two = fleet(
+            "engines = [\"alpha\", \"beta\"]\n\
+             engine.alpha.command = \"ferryman-no-such-engine\"\nengine.alpha.model = \"m\"\n\
+             engine.beta.command = \"ferryman-no-such-engine\"\nengine.beta.model = \"m\"\n",
+        );
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-two-direct", &two);
+        improvement_order(&route, "improve-2026-w40-two");
+        let id = "improve-2026-w40-two";
+        let mut task = ferryman_channel::read_task(&route, id).unwrap();
+        let first = |task: &Task| next_routed(&route, &config, task, &[]).unwrap().0.name;
+        assert_eq!(
+            first(&task),
+            "alpha",
+            "the operator's first, nothing failed"
+        );
+
+        // Someone else says alpha failed, and an unsigned result says it too.
+        let mut other = own_refuted_result(id, "alpha");
+        other.agent = "mallory".into();
+        let mut unsigned = own_refuted_result(id, "alpha");
+        unsigned.signature = None;
+        unsigned.signed_by = None;
+        task.results.push(other);
+        task.results.push(unsigned);
+        assert_eq!(first(&task), "alpha", "not this worker's word to take");
+
+        // This worker's own signed, refuted result with alpha is what leaves it out.
+        task.results.push(own_refuted_result(id, "alpha"));
+        assert_eq!(first(&task), "beta");
+    }
+
     /// Nothing the policy allows: the improvement order waits unclaimed, and nothing
     /// falls back to the blocked engine - even though it is up and would do it.
     #[tokio::test]
@@ -7340,6 +7884,16 @@ mod tests {
         })
     }
 
+    /// What kind of work these orders are, said outright: a worker asks a model to label an
+    /// order only when the rules cannot, and these tests count the requests an engine
+    /// answers, which are the orders and nothing else.
+    fn labelled() -> Option<ferryman_channel::work::ExplicitNeeds> {
+        Some(ferryman_channel::work::ExplicitNeeds {
+            kind: Some(ferryman_channel::work::WorkKind::Chore),
+            ..Default::default()
+        })
+    }
+
     /// An improvement order, signed by boss and open to any worker.
     fn swarm_order(route: &ProjectRoute, id: &str, touches: &[&str]) {
         let mut order = order(id);
@@ -7348,6 +7902,7 @@ mod tests {
         order.requires_review = false;
         order.touches = touches.iter().map(ToString::to_string).collect();
         order.payload = improvement_payload(id);
+        order.needs = labelled();
         boss().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();
     }
@@ -7365,6 +7920,7 @@ mod tests {
             order.requires_review = false;
             order.touches = touches;
             order.payload = improvement_payload(&id);
+            order.needs = labelled();
         })
     }
 

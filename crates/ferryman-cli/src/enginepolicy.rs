@@ -160,6 +160,26 @@ pub(crate) enum PolicyCommand {
         ///   ferry engines policy set --allow-subscriptions-for build,chore
         #[arg(long, value_name = "ROLES", value_delimiter = ',')]
         allow_subscriptions_for: Vec<String>,
+        /// How background work picks an engine: `smart` (the default: the cheapest engine
+        /// whose chance of getting the work right clears the kind's threshold) or `ordered`
+        /// (the prefer lists, exactly as before the router). See `ferry route simulate`.
+        ///
+        /// Signed as a v2-only field: a machine on v0.5.17 still verifies the file and keeps
+        /// ordering.
+        #[arg(long, value_name = "smart|ordered", value_parser = policy::Routing::parse)]
+        routing: Option<policy::Routing>,
+        /// The success probability that counts as sufficient for a kind of work:
+        /// `docs=0.7`, `code_change=0.85`; repeat. `none` clears them all. Smart routing
+        /// only; a kind left out uses 0.75.
+        #[arg(long, value_name = "KIND=P")]
+        threshold: Vec<String>,
+        /// A tie-break weight for engines that cost the same: `nvidia*=3`,
+        /// `claude-sonnet*=2`; repeat. Higher goes first; it never beats a cheaper
+        /// sufficient engine. `none` clears them all.
+        ///
+        ///   ferry engines policy set --bias 'nvidia*=3' --bias 'claude-sonnet*=2'
+        #[arg(long, value_name = "SELECTOR=WEIGHT")]
+        bias: Vec<String>,
     },
     /// Go back to auto, signed.
     Clear {
@@ -268,6 +288,65 @@ fn parse_widths(values: &[String]) -> Result<BTreeMap<Role, Option<u8>>> {
             }
         })
         .collect()
+}
+
+/// `--threshold docs=0.7 --threshold code_change=0.85`, or `none`. None when the flag was
+/// not given; an empty map for `none`, which clears what is signed.
+fn parse_thresholds(values: &[String]) -> Result<Option<BTreeMap<String, f64>>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.iter().any(|v| v.trim().eq_ignore_ascii_case("none")) {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let mut out = BTreeMap::new();
+    for value in values {
+        let Some((kind, p)) = value.split_once('=') else {
+            bail!("--threshold wants KIND=P, like docs=0.7, not '{value}'");
+        };
+        let kind = ferryman_channel::work::WorkKind::parse(kind.trim())?;
+        let p: f64 = p
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--threshold {}: '{p}' is not a number", kind.as_str()))?;
+        if !(p > 0.0 && p <= 1.0) {
+            bail!(
+                "--threshold {}={p}: a success probability above 0 and at most 1",
+                kind.as_str()
+            );
+        }
+        out.insert(kind.as_str().to_string(), p);
+    }
+    Ok(Some(out))
+}
+
+/// `--bias 'nvidia*=3'`, or `none`: a selector and a weight. Same shape as thresholds.
+fn parse_biases(values: &[String]) -> Result<Option<BTreeMap<String, f64>>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    if values.iter().any(|v| v.trim().eq_ignore_ascii_case("none")) {
+        return Ok(Some(BTreeMap::new()));
+    }
+    let mut out = BTreeMap::new();
+    for value in values {
+        let Some((selector, weight)) = value.rsplit_once('=') else {
+            bail!("--bias wants SELECTOR=WEIGHT, like 'nvidia*=3', not '{value}'");
+        };
+        let selector = selector.trim();
+        if selector.is_empty() {
+            bail!("--bias '{value}' names no engine");
+        }
+        let weight: f64 = weight
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--bias {selector}: '{weight}' is not a number"))?;
+        if !weight.is_finite() {
+            bail!("--bias {selector}: the weight must be a finite number");
+        }
+        out.insert(selector.to_string(), weight);
+    }
+    Ok(Some(out))
 }
 
 /// What `ferry engines policy team` was asked for, as [`TeamOptions`].
@@ -469,9 +548,14 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
             effort,
             width,
             allow_subscriptions_for,
+            routing,
+            threshold,
+            bias,
         } => {
             let efforts = parse_efforts(&effort)?;
             let widths = parse_widths(&width)?;
+            let thresholds = parse_thresholds(&threshold)?;
+            let biases = parse_biases(&bias)?;
             let subscription_roles =
                 parse_roles("--allow-subscriptions-for", &allow_subscriptions_for)?;
             // The adversary is never a default: `--prefer deepseek` with no `--role` sets
@@ -507,12 +591,15 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 && efforts.is_empty()
                 && widths.is_empty()
                 && subscription_roles.is_none()
+                && routing.is_none()
+                && thresholds.is_none()
+                && biases.is_none()
             {
                 bail!(
                     "nothing to set: name --improve, --review, --prefer, --never, --where, \
                      --cap-usd, --protect-subscriptions, --never-applies-to, --auto-merge, \
-                     --adversary, --adversary-agents, --adversary-never, --effort, --width or \
-                     --allow-subscriptions-for"
+                     --adversary, --adversary-agents, --adversary-never, --effort, --width, \
+                     --allow-subscriptions-for, --routing, --threshold or --bias"
                 );
             }
             sign_each(&which, "set", |_, _, mut current| {
@@ -583,6 +670,25 @@ pub(crate) async fn command(command: PolicyCommand) -> Result<()> {
                 }
                 if let Some(roles) = &subscription_roles {
                     current.subscription_roles.clone_from(roles);
+                }
+                if let Some(mode) = routing {
+                    current.routing = mode;
+                }
+                if let Some(thresholds) = &thresholds {
+                    // `none` is an empty map: it clears them. Otherwise each one is set
+                    // beside the others already signed.
+                    if thresholds.is_empty() {
+                        current.thresholds.clear();
+                    } else {
+                        current.thresholds.extend(thresholds.clone());
+                    }
+                }
+                if let Some(biases) = &biases {
+                    if biases.is_empty() {
+                        current.bias.clear();
+                    } else {
+                        current.bias.extend(biases.clone());
+                    }
                 }
                 Ok(Some(current))
             })
@@ -674,6 +780,12 @@ fn show(which: &ImproveProject, as_json: bool) -> Result<()> {
         println!("{project}: {}", source(setting.as_ref()));
         for line in policy.describe() {
             println!("  {line}");
+        }
+        if policy.routing == policy::Routing::Smart {
+            println!(
+                "  routing: smart (the default) - the cheapest engine that clears the \
+                 threshold for the work; `ferry route simulate` shows it"
+            );
         }
         println!("  {}", adversary_source(adversary.as_ref()));
         if let Some(warning) = &mixed {
@@ -1053,5 +1165,69 @@ mod tests {
             "the preset always caps"
         );
         assert!(parse_roles("--x", &one("builder")).is_err());
+    }
+
+    #[test]
+    fn the_routing_flags_parse_and_refuse_nonsense() {
+        let one = |value: &str| vec![value.to_string()];
+        let cli = Cli::try_parse_from([
+            "policy",
+            "set",
+            "--routing",
+            "ordered",
+            "--threshold",
+            "docs=0.7",
+            "--bias",
+            "nvidia*=3",
+        ])
+        .unwrap();
+        let PolicyCommand::Set {
+            routing,
+            threshold,
+            bias,
+            ..
+        } = cli.command
+        else {
+            panic!("not set")
+        };
+        assert_eq!(routing, Some(policy::Routing::Ordered));
+        assert_eq!(
+            parse_thresholds(&threshold).unwrap(),
+            Some(BTreeMap::from([("docs".to_string(), 0.7)]))
+        );
+        assert_eq!(
+            parse_biases(&bias).unwrap(),
+            Some(BTreeMap::from([("nvidia*".to_string(), 3.0)]))
+        );
+        assert!(Cli::try_parse_from(["policy", "set", "--routing", "random"]).is_err());
+        assert_eq!(
+            parse_thresholds(&[]).unwrap(),
+            None,
+            "absent changes nothing"
+        );
+        assert_eq!(
+            parse_thresholds(&one("none")).unwrap(),
+            Some(BTreeMap::new()),
+            "none clears"
+        );
+        assert!(parse_thresholds(&one("docs")).is_err(), "no =");
+        assert!(
+            parse_thresholds(&one("docs=0")).is_err(),
+            "never sufficient"
+        );
+        assert!(parse_thresholds(&one("docs=1.5")).is_err(), "over 1");
+        assert!(parse_thresholds(&one("docs=high")).is_err());
+        assert!(
+            parse_thresholds(&one("nonsense=0.5")).is_err(),
+            "no such kind"
+        );
+        assert!(parse_biases(&one("nvidia*")).is_err(), "no =");
+        assert!(parse_biases(&one("=3")).is_err(), "no selector");
+        assert!(parse_biases(&one("nvidia*=lots")).is_err());
+        assert_eq!(
+            parse_biases(&one("none")).unwrap(),
+            Some(BTreeMap::new()),
+            "none clears"
+        );
     }
 }

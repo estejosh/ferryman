@@ -307,9 +307,12 @@ and the newest thing a machine has already seen. Know the edges.
   blocked. Upgrade every machine before relying on `blocking`.
 - **A policy signed by v0.5.17 has only the v1 signature.** A machine on this release
   accepts it (sequence 0) but it has no rollback protection beyond what that machine saw
-  first, and it cannot carry the newer parts. When the fleet has members that sign v2
+  first, and it cannot carry the newer parts - effort, width, subscription roles and
+  **routing** (`ordered`, thresholds, bias): a project that chose `routing = ordered` and is
+  then signed again by a v0.5.17 master reads as smart routing with the defaults, and
+  the file itself cannot say otherwise. When the fleet has members that sign v2
   (their inventories carry a v2 signature) and the policy in force is still a v1-only file,
-  `ferry engines policy show` and the dashboard say so. Signing the policy again from a
+  `ferry engines policy show` and the dashboard say so, routing included. Signing the policy again from a
   current `ferry` (`ferry engines policy set ...`, or the dashboard) replaces it with one
   that has a sequence number and a v2 signature. Do that once the fleet is upgraded.
 - **The adversary's policy is master-only on every machine that knows it.** A delegate
@@ -677,6 +680,375 @@ ferry contract lock user-api@1 --digest 89abcdef --override "..." --finding none
 its own schedule. On the dashboard the policy panel has the adversary engine and mode,
 and a Block carries an Override button for the master; on the phone it is an "Override
 the Block" button, shown only for a Block.
+
+## What an engine can do, and what an order needs: capabilities and the work profile
+
+The smart router sends each piece of work to the cheapest engine that will most likely
+do it well. To do that it has to know two things: what each engine can do, and what
+each order needs. This section is the first half of that - the profiles. (Choosing
+between engines from them comes next; nothing here changes which engine runs an order.)
+
+### The engine's capability profile
+
+Every engine has a profile, published in the signed engine inventory and shown by
+`ferry engines` (the modalities column, and a `can:` line under each engine) and on the
+dashboard's Engines page:
+
+| Field | Meaning |
+| --- | --- |
+| `modalities` | What it takes in or makes: `text`; `code` (edits files in a worktree - only a `cli` engine can have it, so a declared `code` on an `http` engine is dropped); `vision` (reads images); `image`, `video` (generates or edits); `audio_in` (speech to text); `audio_out` (text to speech); `embed`. |
+| `strengths` | Free tags: `code`, `reasoning`, `docs`, `tests`, `review`, `translation`, `long-context`, `math`. |
+| `context_k` | The context window in thousands of tokens. |
+| `cost` | `per_call_usd`, `per_mtok_in_usd`, `per_mtok_out_usd`. Local, free-tier and subscription engines are zero (a subscription is zero marginal cost; its scarcity is the weekly cap's job). A prepaid engine nobody priced is **unknown**, not zero. |
+| `local` | Nothing leaves the machine or the private network. |
+
+**Your word wins, field by field.** Say any of it in `agent.toml` and that field is
+used as written - a declared `modalities` replaces the guessed list, it does not add to
+it. Whatever you leave out is guessed:
+
+```toml
+engine.vision.base_url = "http://localhost:1234/v1"
+engine.vision.model = "qwen2.5-vl-72b-instruct"
+engine.vision.modalities = ["text","vision"]        # or: text, vision
+engine.vision.strengths = ["docs","review"]
+engine.vision.context_k = "32"
+engine.vision.cost_per_call_usd = "0"
+engine.vision.cost_per_mtok_in_usd = "0"
+engine.vision.cost_per_mtok_out_usd = "0"
+engine.vision.local = "true"
+```
+
+**What is guessed**, from the engine's name, model and command, its kind, its endpoint
+and how it is paid for. Every rule below is a unit test:
+
+- A `cli` engine gets `text` and `code`; an `http` engine gets `text`.
+- `vl`, `vision` or `llava` in the name means `vision`. A `claude`, `gemini` or
+  `gpt-4o`/`gpt-4.1`/`gpt-5` CLI sees images too; an HTTP endpoint is not assumed to
+  from a family name alone.
+- `whisper` means `audio_in`; `tts`, `kokoro` or `piper` means `audio_out`.
+- `flux`, `sdxl`, `stable-diffusion` or `comfyui` means `image`; `wan`, `hunyuan-video`
+  or `ltx` means `video`; `embed` means `embed`. An engine named like one of these does
+  *only* that until you say otherwise: it is not also assumed to chat or edit code.
+- `coder`, `codestral`, `devstral`, `codellama` or `codex` is a `code` strength;
+  `reasoner`, `r1`, `o1`, `o3`, `qwq` or `thinking` is `reasoning`; `math` and
+  `translation`/`nllb` likewise. A context of 200k or more adds `long-context`.
+- Only a window written in the name (`-128k`, `-1m`) is guessed for `context_k`; a wrong
+  guess would shut an engine out of work it could do, so unknown stays unknown.
+- `local` is true when the endpoint's host is `localhost`, a `.local`/`.lan` name, a
+  loopback, private (10/8, 172.16/12, 192.168/16), link-local or Tailscale-range
+  (100.64/10) address, when it is `paid = "local"`, or when it is a media CLI with no
+  endpoint that nobody marked as paid. An agent CLI such as `claude` or `codex` is not
+  local: it calls out.
+
+The profile rides in the signed inventory as a v2-only field, like `class`: a v0.5.17
+peer still verifies the rest of the inventory, and a forged or stripped profile does not
+verify on a new one. A worker older than profiles publishes none, and `ferry engines`
+shows a guess for it marked `?`.
+
+### Media engines are ordinary cli engines
+
+Nothing special is needed for pictures, sound or video: an engine is a command that
+takes a prompt, and its modalities say what it makes. **The three below are examples
+only** - the command lines, flags, file names and model names are placeholders for
+whatever you have installed; check each tool's own documentation, and use `{prompt}`
+where your runner takes the work. None of them ships with Ferryman.
+
+```toml
+engines = ["claude", "comfy", "whisper", "speak"]
+
+# EXAMPLE ONLY: a ComfyUI workflow runner. "run-comfy-workflow" stands for a script of
+# yours that submits a workflow to a ComfyUI server and writes the image into the order's
+# worktree. The names say image, so it is guessed `image` only; declared here anyway.
+engine.comfy.command = "run-comfy-workflow"
+engine.comfy.args = ["--workflow","flux-dev.json","--prompt","{prompt}"]
+engine.comfy.model = "flux-dev"
+engine.comfy.modalities = ["image"]
+engine.comfy.paid = "local"
+
+# EXAMPLE ONLY: speech to text with a whisper CLI that prints a transcript. The model
+# name says whisper, so `audio_in` is guessed.
+engine.whisper.command = "whisper-cli"
+engine.whisper.args = ["--model","large-v3","--output-txt","{prompt}"]
+engine.whisper.model = "whisper-large-v3"
+engine.whisper.paid = "local"
+
+# EXAMPLE ONLY: text to speech with a piper-style CLI. `kokoro` or `tts` in the name
+# would be guessed `audio_out` as well.
+engine.speak.command = "piper-say"
+engine.speak.args = ["--voice","en_US-lessac","--text","{prompt}"]
+engine.speak.model = "piper-en-us"
+engine.speak.paid = "local"
+```
+
+`ferry engines` then lists them as `image`, `audio_in` and `audio_out`, and the router
+will never offer them text work or a chat engine an image job.
+
+### What an order needs
+
+`ferry route classify <order>` shows what an order needs and where that read came from.
+The profile has four parts: the **modalities** an engine must have, the **kind** of work
+(`code-change`, `docs`, `tests`, `review`, `plan`, `chore`, `research`, `translate`,
+`transcribe`, `image`, `video`, `audio` or `other`), its **size** (`small`, `medium`,
+`large`) and the **context** it wants (`min_context_k`). It is decided in this order,
+and the source is always recorded - `explicit`, `rules` or `model`:
+
+1. **Explicit.** Say it when you issue the order; it is signed into the order, so it
+   cannot be changed afterwards, and it wins over everything below:
+
+   ```sh
+   ferry channel order --id t-9 --task-file brief.md --kind docs --size small
+   ferry channel order --id t-10 --task "what is wrong in this screenshot?" \
+       --needs vision --kind review   # (--needs takes modalities)
+   ```
+
+   `--kind`, `--needs` (modalities, comma-separated or repeated), `--size` and
+   `--min-context-k` are all optional and independent: leave one out and the rules fill
+   it in. Orders issued without any of them are byte-for-byte what they always were and
+   verify as before.
+
+2. **Rules** - deterministic, no model. They read:
+   - *attachments and file types*: an order payload may carry `attachments` (or `files`,
+     `images`), each a path or URL or `{"path":..., "mime":...}`. Images need `vision`,
+     audio `audio_in`, video `video`. **Only an attachment (or an explicit `--needs`)
+     makes an engine need one of these**: a media file merely *named* in the task text
+     (`update docs/logo.png in the README`) is noted in the reasons and asks for nothing,
+     and a media word in code work (`fix the transcription retry in src/lib.rs`) is a name
+     in the code, not the job: an order that names a source file or directory, or touches
+     code, is code work unless the audio, video or image is attached. Only when the winning
+     kind is itself media (`Transcribe the standup recording`) does the text make the
+     engine need the media modality;
+   - *the `touches` globs*: only docs (`docs/**`, `*.md`, `README*`) is `docs`, only
+     tests (`tests/**`, `*_test.rs`, `*.spec.ts`) is `tests`, any code leans
+     `code-change`;
+   - *verbs in the task text*: transcribe, translate, summarize, review, plan,
+     research, "generate an image", "render a video", "text to speech", "add unit
+     tests", "update the README", fix/implement/refactor, bump/tidy, and so on - the
+     table is `RULES` in `ferryman_channel::work`, one tested example each;
+   - *the order's tier*: `"tier": "chore"` is `chore`;
+   - *size*: about four characters a token over the task text plus attached text files
+     (measured by file size, never read), and how many files it means to touch; the
+     context wanted is that plus room to answer.
+
+   Evidence combines per kind; two kinds that both fire (`fix the typo in the README`)
+   lower the confidence. Code and tests need `code`, so only a `cli` engine can take
+   them; transcribe needs `audio_in`; image, video and audio jobs need only their media
+   modality; everything else needs `text`.
+
+   **Work that edits files needs `code` whatever it reads as.** A docs, chore, translate
+   or `other` order is often a change to files, and an `http` engine answers in text and
+   changes nothing, so the result is refuted ("no commit and no diff") and the engine is
+   blamed and demoted for work it could never do. So an improvement order (build or chore
+   work), an order that declares `touches`, one that requires changes, and one whose kind
+   the rules cannot tell, are routed as needing `code`; the routing line says why. A plan,
+   a review or research that only produces text stays text, and a fleet with no `cli`
+   engine still takes the order on an `http` one, as it always has.
+
+3. **A model, only when the rules are unsure** (confidence under 0.55). A worker makes
+   this call itself, once per order, before it routes an improvement order under
+   `routing = "smart"` (a person's own order is routed on the rules' read). It goes to the
+   cheapest **`http`** text engine - never a `cli` engine, because that is an agent with
+   tools and the order's text is not to be trusted - asking for a small JSON label, with a
+   45 second timeout. Which engine obeys the same
+   rules as any background work: the engine policy's `never` list, its `where`, weekly
+   caps, `protect_subscriptions` and `subscription_roles`; local engines go first, then
+   free tier, then by price. **A subscription engine is never used for this unless the
+   policy's `subscription_roles` includes `chore` and the engine has a weekly request
+   cap.** The reply can only choose among the known kinds and sizes (an invented kind
+   is refused), the order text is sent fenced as data with an instruction not to follow
+   it, and a model's stated confidence is capped. The modalities a model names are
+   ignored (it never saw the attachments); only the kind and size are taken. If nothing
+   may be asked or the answer is no use, the rules' best read is used and the reason is
+   recorded.
+
+   The answer is cached per order id on the machine that asked, in
+   `<project attachment>/routing/classify/<order id>.json`. It is **local and not
+   signed**: it is advice derived from an order that is already signed, it is cheap to
+   redo, and keeping it off the synced channel means no second writer and nothing for a
+   peer to forge. Two machines may each pay for one call; an explicit `--kind` on the
+   order is how you make every machine agree. An unusable answer is remembered for an
+   hour so a model that cannot follow the format is not asked on every pass.
+
+`ferry route classify <order>` never calls an engine by itself: it prints the rules'
+read, or the cached model answer, with the reasons. `--model` asks now, as a worker
+would. `--json` prints the classification. The dashboard shows the same on each order
+card (kind, size, any modality beyond text; unsure ones are marked) and, with the
+reasons, in the order's detail.
+
+## Smart routing: the cheapest engine that will do it well
+
+Every piece of background work goes to the engine best suited to it, by one rule: **use
+the cheapest engine that will most likely do it well, and move up only when a cheaper
+one has failed at that kind of work.** It applies to text, code, vision, image, video
+and audio work, and to local, free, prepaid and subscription engines alike. Smart is
+the default; `routing = "ordered"` keeps the strict prefer lists exactly as they were
+before the router.
+
+### What runs before any scoring
+
+The router chooses only among the engines the engine policy already lets through, so
+none of these can be bypassed: the `never` list, `protect_subscriptions` and
+`subscription_roles` with their weekly caps, `caps_usd`, `where`, an engine that is out of
+credit, and the tiers (a chore engine never builds, a demoted engine only does chore
+work, review is a judge's). **The adversary is never routed**: it keeps its own
+master-only `ADVERSARY_POLICY` and its own order. After that the router also leaves out an
+engine that lacks a modality the work needs (code-change needs `code`, which only a `cli`
+engine has; vision work needs `vision`), or whose context window is smaller than the work
+wants. An `http` engine is sent text only, so it is never given vision, audio, image or
+video work, whatever its profile says: point a `cli` engine at the model and declare the
+modality on it. A fleet with no `cli` engine at all still takes build orders on `http`
+engines, as it always has, and the reason says so.
+
+### How the choice is made
+
+1. **Estimate.** For each engine and kind of work, the chance it does the work well is a
+   Beta estimate. The prior is the engine's size class (large 0.80, medium 0.70, small
+   0.55), plus 0.05 for each strength tag that matches the kind (at most 0.10), minus 0.10
+   for each class the engine is below the size of the work. It is worth four results.
+   The evidence is the worker's own ledger of results for this engine and kind, verified or
+   refuted by its checks, each counting for half as much after 14 days. So
+   `p = (prior x 4 + verified) / (4 + verified + refuted)`.
+2. **Price.** One call is estimated at 3k/1k, 12k/3k or 48k/10k tokens in/out for small,
+   medium and large work, times the engine's price. Local and free-tier engines cost 0 -
+   but how an engine is paid for decides before where it runs: an endpoint on this machine
+   or network counts as local only when nothing says it is somebody's paid API behind a
+   proxy. An OmniRoute or LiteLLM style gateway (OmniRoute's provider or port 20128, or a
+   known route) is never guessed local, and an engine marked `paid = "prepaid"`,
+   `"subscription"` or `"free-tier"` is priced as that even at `localhost`; declare
+   `local = "true"` or `paid = "local"` to say it really is. An
+   engine with **no declared price is not free**: it is assumed to cost a frontier model's
+   list price ($5 in, $25 out per million tokens), so a declared price always beats a
+   guess. A free tier that asked for money is priced like an unpriced one until its flag
+   lapses. A subscription costs nothing per call, but its **scarcity** is priced: about two
+   cents a call with the weekly cap full, rising to ten times that as the cap runs down.
+3. **Choose.** The *sufficient set* is every engine whose estimate reaches the threshold
+   for the kind. Unless the policy says otherwise that is **0.70 for docs, chore, tests,
+   review, plan and research** - a medium engine such as a free nemotron starts at exactly
+   0.70, so it takes that work from the start and loses it as soon as its results are
+   refuted - and **0.75 for everything else** (code changes and media), where a medium
+   engine must first prove itself and a small one (0.55) must earn either. The winner is
+   the cheapest of the sufficient set. If none is sufficient, the winner is the one most
+   likely to succeed. Costs within 10% count as tied, and ties go to **bias**, then the
+   nearer tier, then the faster engine, then the order the policy and `agent.toml` already
+   gave.
+4. **Escalate.** After a result *of this worker's own* is refuted by its own evidence, or
+   sent back with changes requested, the next attempt leaves that engine out and prefers
+   an estimate **higher than the failed engine's**. A retry therefore climbs: cheap first,
+   then up. That is a bar for the sufficient set, not a rule: when no remaining engine
+   clears it, the likeliest remaining engine still takes the order, even at or below the
+   failed one's estimate. And when the failed engine is the only one that can do the work
+   (a single-engine fleet), nothing waits for another that is never coming: the likeliest
+   of the failed engines tries again, and the routing line says so. An engine here is
+   *this agent's engine on this machine*, so another machine's `claude` failing says
+   nothing about yours. The failures are read only from results this worker signed, and
+   the estimate to beat is worked out from this worker's own ledger, never from the
+   numbers a result's payload carries: anyone who can write a result could otherwise name
+   your cheap engine "failed" or set the bar to 1.0.
+5. **Learn.** Each verified or refuted result is counted for that (engine, kind) in the
+   worker's engine ledger, under the same lock as the rest of it, and published in the
+   signed inventory (a v2-only field). A cheap engine that keeps getting docs right becomes
+   sufficient for docs; one that gets refuted stops being picked for it, while what it is
+   good at is untouched. `ferry engines` shows each engine's best kinds with its success rate.
+
+### The policy fields
+
+```sh
+ferry engines policy set --routing smart            # the default; `ordered` is today's strict order
+ferry engines policy set --threshold docs=0.6 --threshold code-change=0.85
+ferry engines policy set --bias 'nemotron*=3' --bias 'claude-sonnet*=2'
+ferry engines policy set --threshold none --bias none   # clear them
+```
+
+- `routing`: `smart` or `ordered`. With `ordered` nothing is scored and the first engine the
+  lists allow does the work, byte for byte as before.
+- `thresholds`: per kind (`code-change`, `docs`, `tests`, `review`, `plan`, `chore`,
+  `research`, `translate`, `transcribe`, `image`, `video`, `audio`, `other`), the
+  probability that counts as sufficient. Higher means "only the engines I trust with this";
+  lower lets a cheap engine try.
+- `bias`: per selector, a tie-break weight. Higher goes first **among engines that cost the
+  same**. It never lets a dearer engine beat a cheaper sufficient one; to force an order use
+  `ordered`. Your prefer lists already give their first entries a small bias of their own.
+
+All three are signed in the policy's v2 view only, like `effort` and `width`: a v0.5.17
+machine still verifies the file and keeps ordering. In the dashboard, the Engine policy
+panel has a Routing section with the same three settings.
+
+### Seeing why
+
+```sh
+ferry route simulate --kind docs --size small                 # who would get it now, and why
+ferry route simulate --kind docs --size small --needs vision  # ... if it needs to read images
+ferry route explain <order>     # what it needs, what each worker recorded, and what would happen now
+ferry engines                   # each engine's top kinds with their success rates
+```
+
+Every routing decision is recorded beside the step and in the result: each candidate with its
+estimate and price, why each excluded engine was left out, and a one-line reason such as
+`nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient`. The dashboard shows the reason
+on each order card, every candidate in the order's drawer, and a Routing panel that runs the
+simulation without running anything. Telegram's review card carries the one-line reason.
+
+### Example: NVIDIA first while it is free, then Sonnet, then Haiku, local models too
+
+"If one model is better suited, or can do it well cheaply, it should be used." That is the
+rule above; what you add is only a bias for ties. Declare what each engine is, then sign the
+policy. This is an example: use the names and models of your own `agent.toml`.
+
+```toml
+engines = ["nemotron", "claude-sonnet", "claude-haiku", "ollama"]
+
+# Free while it lasts, and large. Prices of 0 make it the cheapest; the router also learns
+# whether it is good at each kind of work.
+engine.nemotron.kind = "cli"
+engine.nemotron.model = "nvidia/nemotron-3-super-120b-a12b"
+engine.nemotron.env = {"OPENAI_BASE_URL":"https://integrate.api.nvidia.com/v1","OPENAI_API_KEY":"secret:NVIDIA_API_KEY","OPENAI_MODEL":"nvidia/nemotron-3-super-120b-a12b"}
+engine.nemotron.base_url = "https://integrate.api.nvidia.com/v1"
+engine.nemotron.key = "secret:NVIDIA_API_KEY"
+engine.nemotron.paid = "free-tier"
+engine.nemotron.class = "large"
+
+# Subscriptions: no price per call, but the weekly cap makes them scarce as it runs down.
+engine.claude-sonnet.kind = "cli"
+engine.claude-sonnet.command = "claude"
+engine.claude-sonnet.args = ["-p", "--model", "{model}", "{prompt}"]
+engine.claude-sonnet.model = "claude-sonnet-4-6"
+engine.claude-sonnet.paid = "subscription"
+engine.claude-sonnet.weekly_requests = "300"
+engine.claude-sonnet.strengths = ["code", "docs", "reasoning"]
+engine.claude-haiku.kind = "cli"
+engine.claude-haiku.command = "claude"
+engine.claude-haiku.args = ["-p", "--model", "{model}", "{prompt}"]
+engine.claude-haiku.model = "claude-haiku-4-5"
+engine.claude-haiku.paid = "subscription"
+engine.claude-haiku.weekly_requests = "600"
+
+# Local models count: free, and eligible for the work they prove they can do.
+engine.ollama.kind = "http"
+engine.ollama.base_url = "http://localhost:11434/v1"
+engine.ollama.model = "qwen2.5-coder"
+engine.ollama.paid = "local"
+```
+
+```sh
+ferry engines policy set --routing smart \
+  --prefer nemotron --prefer claude-sonnet --prefer claude-haiku \
+  --bias 'nemotron*=3' --bias 'claude-sonnet*=2' --bias 'claude-haiku*=1' \
+  --threshold chore=0.55 \
+  --allow-subscriptions-for plan,build,chore
+```
+
+What that does: NVIDIA is free and large, so it takes the work while it is up and keeps taking
+it for as long as it keeps getting it right. When it is out of credit, down, or has failed
+at that kind of work, the next cheapest engine that is likely to do it well takes over: a
+local model that has proven itself at it, then Sonnet, then Haiku (Sonnet before Haiku
+when their price is tied, because of the bias). Docs, review, plan, research, tests and
+chores need only 0.70 by default, which any medium or large engine meets from the start,
+so a free one wins them cheaply until its results are refuted. Haiku, a small model,
+becomes sufficient for a kind of work by proving itself at it, or because you lowered that
+kind's threshold (`--threshold chore=0.55` above): that is "can do it well cheaply". A
+subscription is used for a role only because `--allow-subscriptions-for` says so, and only an engine with a weekly cap; `never` and the
+dollar caps still apply first. Drop `--allow-subscriptions-for` and the two Claude engines
+are never used for background work, as before. `ferry route simulate --kind docs --size small`
+shows the ranking before you trust it.
 
 ## OmniRoute: a free gateway as an engine
 

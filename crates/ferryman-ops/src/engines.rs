@@ -191,6 +191,10 @@ pub struct EngineSpec {
     /// An HTTP engine takes a `reasoning_effort` field (`engine.<name>.supports_effort =
     /// "true"`). Off by default: an endpoint that does not know the field may refuse it.
     pub supports_effort: bool,
+    /// What the operator says the engine can do (`engine.<name>.modalities`, `strengths`,
+    /// `context_k`, `cost_per_call_usd`, `cost_per_mtok_in_usd`, `cost_per_mtok_out_usd`,
+    /// `local`). Whatever is left out is guessed; see [`capabilities`].
+    pub declared: ferryman_channel::capability::Declared,
 }
 
 impl EngineSpec {
@@ -216,7 +220,14 @@ impl EngineSpec {
             class: None,
             effort_args: BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
+    }
+
+    /// What this engine can do: [`capabilities`].
+    #[must_use]
+    pub fn capabilities(&self) -> ferryman_channel::capability::Capabilities {
+        capabilities(self)
     }
 
     /// The CLI arguments with this engine's model and endpoint filled in, and no effort
@@ -270,6 +281,111 @@ impl EngineSpec {
             ferryman_channel::policy::guess_class(self.model.as_deref().unwrap_or(&self.name))
         })
     }
+}
+
+/// What an engine can do: modalities, strengths, context window, cost and whether it is
+/// local. What the operator declared in `agent.toml` wins, field by field; the rest is
+/// guessed from the engine's name, model, command, kind, endpoint and how it is paid
+/// for. This is what the signed engine inventory publishes (see [`reports`]) and what the
+/// smart router reads. The rules and their limits are in
+/// [`ferryman_channel::capability`].
+#[must_use]
+pub fn capabilities(spec: &EngineSpec) -> ferryman_channel::capability::Capabilities {
+    ferryman_channel::capability::resolve(
+        &spec.declared,
+        &ferryman_channel::capability::Basis {
+            name: &spec.name,
+            model: spec.model.as_deref(),
+            command: &spec.command,
+            cli: spec.kind == Kind::Cli,
+            base_url: spec.base_url.as_deref(),
+            paid: spec.paid.as_str(),
+            gateway: spec.provider.is_some()
+                || !spec.route.is_empty()
+                || crate::omniroute::is_omniroute(spec),
+        },
+    )
+}
+
+/// Read what an operator declared an engine can do. All of it is optional: lists are a
+/// JSON array or words separated by commas, prices are dollars, and a typo is refused so
+/// it cannot silently leave an engine unable (or newly able) to take work.
+fn parse_declared(
+    name: &str,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Result<ferryman_channel::capability::Declared> {
+    use ferryman_channel::capability::{Cost, Declared, Modality, check_context_k};
+    let modalities = match get("modalities") {
+        Some(raw) => {
+            Modality::parse_list(&raw).with_context(|| format!("engine.{name}.modalities"))?
+        }
+        None => Vec::new(),
+    };
+    let strengths = match get("strengths") {
+        Some(raw) => {
+            let words: Vec<String> = if raw.trim_start().starts_with('[') {
+                serde_json::from_str(&raw).with_context(|| {
+                    format!("engine.{name}.strengths must be a JSON array of words")
+                })?
+            } else {
+                raw.split(',').map(str::to_string).collect()
+            };
+            let mut tags: Vec<String> = words
+                .iter()
+                .map(|word| word.trim().to_ascii_lowercase())
+                .filter(|word| !word.is_empty())
+                .collect();
+            tags.sort();
+            tags.dedup();
+            tags
+        }
+        None => Vec::new(),
+    };
+    let context_k = get("context_k")
+        .map(|value| {
+            let k = value.parse::<u32>().with_context(|| {
+                format!("engine.{name}.context_k must be a whole number of thousands of tokens")
+            })?;
+            check_context_k(k).with_context(|| format!("engine.{name}.context_k"))?;
+            Ok::<_, anyhow::Error>(k)
+        })
+        .transpose()?;
+    let price = |field: &str| -> Result<Option<f64>> {
+        get(field)
+            .map(|value| {
+                let dollars = value
+                    .parse::<f64>()
+                    .with_context(|| format!("engine.{name}.{field} must be a number"))?;
+                if !dollars.is_finite() || dollars < 0.0 {
+                    bail!("engine.{name}.{field} must be zero or more dollars")
+                }
+                Ok(dollars)
+            })
+            .transpose()
+    };
+    let (per_call, per_in, per_out) = (
+        price("cost_per_call_usd")?,
+        price("cost_per_mtok_in_usd")?,
+        price("cost_per_mtok_out_usd")?,
+    );
+    let cost = (per_call.is_some() || per_in.is_some() || per_out.is_some()).then(|| Cost {
+        per_call_usd: per_call.unwrap_or(0.0),
+        per_mtok_in_usd: per_in.unwrap_or(0.0),
+        per_mtok_out_usd: per_out.unwrap_or(0.0),
+    });
+    let local = match get("local").as_deref() {
+        None => None,
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        Some(other) => bail!("engine.{name}.local must be true or false, not '{other}'"),
+    };
+    Ok(Declared {
+        modalities,
+        strengths,
+        context_k,
+        cost,
+        local,
+    })
 }
 
 /// A short name for a command: its file name, lowercased, without `.exe`.
@@ -425,6 +541,7 @@ pub fn parse_engines(
                 bail!("engine.{name}.supports_effort must be true or false, not '{other}'")
             }
         };
+        let declared = parse_declared(&name, &get)?;
         let spec_model = get("model").or_else(|| {
             (kind == Kind::Cli && own_command.is_none())
                 .then(|| model.map(str::to_string))
@@ -459,6 +576,7 @@ pub fn parse_engines(
             class,
             effort_args,
             supports_effort,
+            declared,
             name,
         });
     }
@@ -530,6 +648,11 @@ pub struct EngineState {
     /// What an OmniRoute gateway offers, from its last probe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gateway: Option<crate::omniroute::Catalog>,
+    /// How this engine's results have turned out per kind of work - verified or refuted by
+    /// this worker's own checks, age-weighted with a 14-day half-life - which is what the
+    /// smart router's success estimate learns from. Published in the engine's trust line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<ferryman_channel::router::Outcome>,
 }
 
 impl EngineState {
@@ -920,6 +1043,68 @@ pub fn choose(
         })
 }
 
+/// [`choose`] with the smart router: the engine to run `needs` next in `role`, the decision
+/// that says why, and - when the policy's `routing` is `ordered` - exactly [`choose`]'s
+/// engine.
+///
+/// The policy's background rules run first, as in [`choose`] (the router starts from the
+/// same ranking), so nothing here can reach an engine `choose` would not. `failed` are the
+/// engines that already failed this order, and the choice must beat them; `tried` are the
+/// ones already asked in this attempt. `work` is [`Work::Background`] for the fleet's own
+/// work and [`Work::Direct`] for a person's order that needs a capability only the router
+/// knows about.
+///
+/// [`Work::Background`]: ferryman_channel::policy::Work::Background
+/// [`Work::Direct`]: ferryman_channel::policy::Work::Direct
+#[allow(clippy::too_many_arguments)]
+pub fn choose_routed(
+    specs: &[EngineSpec],
+    ledger: &Ledger,
+    now: DateTime<Utc>,
+    policy: &ferryman_channel::policy::Policy,
+    (role, tier, work): (
+        ferryman_channel::policy::Role,
+        Tier,
+        ferryman_channel::policy::Work,
+    ),
+    needs: &ferryman_channel::work::Needs,
+    (failed, tried): (&[ferryman_channel::router::Failed], &[String]),
+    (agent, machine): (&str, &str),
+) -> std::result::Result<(EngineSpec, ferryman_channel::router::Decision), String> {
+    let specs = effective_specs(specs, ledger);
+    let all = candidates(agent, machine, &specs, ledger, now);
+    let routed = ferryman_channel::router::route(
+        policy,
+        role,
+        tier.as_str(),
+        work,
+        needs,
+        &all,
+        &ferryman_channel::router::Context { now, tried, failed },
+    );
+    match routed.order.first() {
+        Some(index) => Ok((specs[*index].clone(), routed.decision)),
+        None => {
+            let ranking = ferryman_channel::policy::rank(policy, role, tier.as_str(), work, &all);
+            Err(if ranking.order.is_empty() {
+                ranking.why_none(role, &all)
+            } else if ranking
+                .order
+                .iter()
+                .all(|index| tried.contains(&specs[*index].name))
+            {
+                format!(
+                    "every allowed engine for {} work was tried ({})",
+                    role.as_str(),
+                    tried.join(", ")
+                )
+            } else {
+                routed.decision.reason
+            })
+        }
+    }
+}
+
 /// The effort the engine policy asked `role` to run at, as it is recorded beside the
 /// engine that ran it - and only when that engine acts on an effort at all, so a record
 /// never claims an effort that was not applied.
@@ -998,9 +1183,35 @@ pub fn record_verification(
     status: ferryman_channel::evidence::Status,
     now: DateTime<Utc>,
 ) -> bool {
+    record_verification_for(agent, engine, None, status, now)
+}
+
+/// [`record_verification`] for work of a known `kind` (`docs`, `code-change`, ...): a
+/// verified or refuted result is also counted against that kind in the engine's per-kind
+/// outcomes, which is what the smart router estimates success from. A result the evidence
+/// could not decide counts for nothing there.
+pub fn record_verification_for(
+    agent: &str,
+    engine: &str,
+    kind: Option<&str>,
+    status: ferryman_channel::evidence::Status,
+    now: DateTime<Utc>,
+) -> bool {
+    use ferryman_channel::evidence::Status;
     let mut demoted = false;
     update(agent, |ledger| {
-        demoted = ledger.entry(engine).note(status, now)
+        let state = ledger.entry(engine);
+        demoted = state.note(status, now);
+        if let Some(kind) = kind
+            && matches!(status, Status::Verified | Status::Refuted)
+        {
+            ferryman_channel::router::record_outcome(
+                &mut state.outcomes,
+                kind,
+                status == Status::Verified,
+                now,
+            );
+        }
     });
     demoted
 }
@@ -1063,6 +1274,7 @@ pub fn record_canary(agent: &str, engine: &str, passed: bool, now: DateTime<Utc>
 pub fn trust(state: &EngineState) -> Option<ferryman_channel::receipts::EngineTrust> {
     (state.verified > 0 || state.refuted > 0 || state.unverified > 0 || state.demoted()).then(
         || ferryman_channel::receipts::EngineTrust {
+            kinds: state.outcomes.clone(),
             verified: state.verified,
             refuted: state.refuted,
             unverified: state.unverified,
@@ -1896,6 +2108,7 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
                 trust: trust(&state),
                 billing: Some(billing(spec, &state, now)),
                 class: Some(spec.class().as_str().to_string()),
+                capabilities: Some(capabilities(spec)),
             }
         })
         .collect()
@@ -1959,11 +2172,47 @@ mod tests {
             class: None,
             effort_args: BTreeMap::new(),
             supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
         }
     }
 
     fn monday_noon() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 28, 12, 0, 0).unwrap()
+    }
+
+    /// An endpoint on this machine is a local model only when nobody says it is somebody's
+    /// paid API behind a proxy: an OmniRoute gateway (by port, name or provider), or an
+    /// engine its operator marked prepaid, a subscription or a free tier, costs what that
+    /// says and is never priced as free.
+    #[test]
+    fn a_paid_or_gateway_endpoint_on_this_machine_is_not_a_free_local_model() {
+        let caps = |url: &str, paid: Paid, provider: Option<&str>| {
+            let mut spec = http("e", Tier::Build, url);
+            spec.paid = paid;
+            spec.provider = provider.map(str::to_string);
+            capabilities(&spec)
+        };
+        // A model server nobody said anything about: local, and free.
+        let plain = caps("http://localhost:1234/v1", Paid::Unknown, None);
+        assert!(plain.local && plain.cost.is_some_and(|c| c.is_free()));
+        // OmniRoute on its own port or by its provider: a gateway, not local, not free.
+        for spec in [
+            caps("http://localhost:20128/v1", Paid::Unknown, None),
+            caps("http://127.0.0.1:9000/v1", Paid::Unknown, Some("omniroute")),
+            caps("http://192.168.1.20/omniroute/v1", Paid::Unknown, None),
+        ] {
+            assert!(!spec.local, "{spec:?}");
+            assert!(spec.cost.is_none(), "{spec:?}");
+        }
+        // Said to be paid: not local however near it is.
+        for paid in [Paid::Prepaid, Paid::Subscription, Paid::FreeTier] {
+            assert!(
+                !caps("http://localhost:1234/v1", paid, None).local,
+                "{paid:?}"
+            );
+        }
+        // Said to be local, it is, gateway or not.
+        assert!(caps("http://localhost:20128/v1", Paid::Local, None).local);
     }
 
     #[test]
@@ -2643,5 +2892,185 @@ engine.local.tier = "chore"
         assert_eq!(state.requests, 200, "{state:?}");
         assert_eq!(state.verified, 8, "{state:?}");
         assert!((state.spend_usd - 2.0).abs() < 1e-6, "{state:?}");
+    }
+
+    #[test]
+    fn outcomes_are_kept_per_kind_fade_with_age_and_ride_the_inventory() {
+        use ferryman_channel::evidence::Status;
+        let agent = format!("outcomes-{}", std::process::id());
+        let now = monday_noon();
+        for _ in 0..3 {
+            record_verification_for(&agent, "nvidia", Some("docs"), Status::Verified, now);
+        }
+        record_verification_for(&agent, "nvidia", Some("docs"), Status::Refuted, now);
+        record_verification_for(&agent, "nvidia", Some("code-change"), Status::Refuted, now);
+        // A result the evidence could not decide counts for the engine, not for a kind,
+        // and so does one with no kind.
+        record_verification_for(&agent, "nvidia", Some("docs"), Status::Unverified, now);
+        record_verification(&agent, "nvidia", Status::Verified, now);
+        let ledger = Ledger::load(&agent);
+        let state = ledger.state("nvidia");
+        assert_eq!((state.verified, state.refuted, state.unverified), (4, 2, 1));
+        let docs = state.outcomes.iter().find(|o| o.kind == "docs").unwrap();
+        let (verified, refuted) = docs.weights(now);
+        assert!((verified - 3.0).abs() < 1e-3 && (refuted - 1.0).abs() < 1e-3);
+        let code = state
+            .outcomes
+            .iter()
+            .find(|o| o.kind == "code-change")
+            .unwrap();
+        assert!(
+            (code.weights(now).1 - 1.0).abs() < 1e-3,
+            "kept apart from docs"
+        );
+        // A fortnight on, every result counts for half.
+        let later = now + chrono::Duration::days(14);
+        let (verified, refuted) = docs.weights(later);
+        assert!((verified - 1.5).abs() < 1e-3 && (refuted - 0.5).abs() < 1e-3);
+        // The share of results that held up is the same; there are fewer of them.
+        let (rate, decided) = docs.rate(later).unwrap();
+        assert!((rate - 0.75).abs() < 1e-3 && (decided - 2.0).abs() < 1e-3);
+
+        // Published in the engine's trust line, and read back as the fleet's view of it.
+        let spec = http("nvidia", Tier::Build, "https://integrate.api.nvidia.com/v1");
+        let reports = reports(&[spec], &ledger, now);
+        let published = reports[0].trust.as_ref().unwrap();
+        assert_eq!(published.kinds.len(), 2);
+        let candidate = ferryman_channel::policy::Candidate::from_report("a", "m", 0, &reports[0]);
+        assert_eq!(candidate.outcomes, published.kinds);
+        // A worker that has no kinds yet publishes none.
+        assert!(trust(&EngineState::default()).is_none());
+    }
+
+    /// Two fake engines, one free and one paid, both large: what the router picks, what
+    /// `ordered` picks (exactly [`choose`]), and what happens once the free one fails.
+    #[test]
+    fn the_router_picks_the_cheapest_sufficient_engine_and_ordered_is_choose() {
+        use ferryman_channel::{
+            capability::Cost,
+            evidence::Status,
+            policy::{Policy, Role, Routing, Work},
+        };
+        let now = monday_noon();
+        let here = ("wisp", "grouchly");
+        let mut free = http("free", Tier::Build, "https://free.example/v1");
+        free.paid = Paid::FreeTier;
+        free.class = Some(ModelClass::Large);
+        free.declared.cost = Some(Cost::FREE);
+        let mut dear = http("dear", Tier::Build, "https://dear.example/v1");
+        dear.paid = Paid::Prepaid;
+        dear.class = Some(ModelClass::Large);
+        dear.declared.cost = Some(Cost {
+            per_call_usd: 0.0,
+            per_mtok_in_usd: 3.0,
+            per_mtok_out_usd: 15.0,
+        });
+        let specs = vec![dear, free];
+        let needs = ferryman_channel::router::simulated_needs("docs", "small", &[]).unwrap();
+        let go = |policy: &Policy, ledger: &Ledger, failed: &[ferryman_channel::router::Failed]| {
+            choose_routed(
+                &specs,
+                ledger,
+                now,
+                policy,
+                (Role::Build, Tier::Build, Work::Background),
+                &needs,
+                (failed, &[]),
+                here,
+            )
+            .unwrap()
+        };
+        let smart = Policy::default();
+        let (picked, decision) = go(&smart, &Ledger::default(), &[]);
+        assert_eq!(picked.name, "free", "{}", decision.reason);
+        assert!(
+            decision.reason.contains("cheapest sufficient"),
+            "{}",
+            decision.reason
+        );
+        assert_eq!(decision.routing, "smart");
+
+        // Ordered is choose(), whatever the prices say.
+        let mut ordered = Policy {
+            routing: Routing::Ordered,
+            ..Policy::default()
+        };
+        ordered
+            .prefer
+            .insert("build".into(), vec!["name:dear".into()]);
+        let (picked, decision) = go(&ordered, &Ledger::default(), &[]);
+        let old = choose(
+            &specs,
+            &Ledger::default(),
+            now,
+            &ordered,
+            Role::Build,
+            Tier::Build,
+            &[],
+            here,
+        )
+        .unwrap();
+        assert_eq!((picked.name.as_str(), old.name.as_str()), ("dear", "dear"));
+        assert_eq!(decision.routing, "ordered");
+        // Smart with the same prefer list: the preference is only a bias, so it does not
+        // beat a cheaper engine that is sufficient.
+        let mut biased = smart.clone();
+        biased
+            .prefer
+            .insert("build".into(), vec!["name:dear".into()]);
+        assert_eq!(go(&biased, &Ledger::default(), &[]).0.name, "free");
+
+        // The free engine's docs work gets refuted once: it stops being sufficient and
+        // the paid one takes docs work, while the free one is still the pick for tests.
+        let agent = format!("router-learns-{}", std::process::id());
+        record_verification_for(&agent, "free", Some("docs"), Status::Refuted, now);
+        let learned = Ledger::load(&agent);
+        let (picked, decision) = go(&smart, &learned, &[]);
+        assert_eq!(picked.name, "dear", "{}", decision.reason);
+        let tests = ferryman_channel::router::simulated_needs("tests", "small", &[]).unwrap();
+        let (picked, _) = choose_routed(
+            &specs,
+            &learned,
+            now,
+            &smart,
+            (Role::Build, Tier::Build, Work::Background),
+            &tests,
+            (&[], &[]),
+            here,
+        )
+        .unwrap();
+        assert_eq!(
+            picked.name, "free",
+            "what failed at docs is not held against tests"
+        );
+
+        // After a failure on this order the failed engine is out, whatever it learned.
+        let failure = |engine: &str, agent: &str| ferryman_channel::router::Failed {
+            agent: agent.into(),
+            machine: here.1.into(),
+            engine: engine.into(),
+            p: Some(0.8),
+        };
+        let failed = [failure("free", here.0)];
+        let (picked, decision) = go(&smart, &Ledger::default(), &failed);
+        assert_eq!(picked.name, "dear");
+        assert_eq!(decision.failed, ["free"]);
+        // Another agent's `free` that failed is not this agent's `free`.
+        let (picked, _) = go(&smart, &Ledger::default(), &[failure("free", "ember")]);
+        assert_ne!(picked.name, "dear", "free is not out for wisp");
+        // With everything out nothing waits: the likeliest engine tries again.
+        let both = [failed[0].clone(), failure("dear", here.0)];
+        let (_, again) = choose_routed(
+            &specs,
+            &Ledger::default(),
+            now,
+            &smart,
+            (Role::Build, Tier::Build, Work::Background),
+            &needs,
+            (&both, &[]),
+            here,
+        )
+        .expect("every engine failed once: try again, do not hold");
+        assert!(again.reason.contains("tries again"), "{}", again.reason);
     }
 }

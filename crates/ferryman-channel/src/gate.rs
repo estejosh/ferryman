@@ -612,6 +612,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);
@@ -816,6 +817,7 @@ mod tests {
             }),
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);

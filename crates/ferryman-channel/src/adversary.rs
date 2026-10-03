@@ -2151,6 +2151,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             })
             .collect();
         crate::receipts::refresh_engines(route, who, machine, "0.0.0", reports, Utc::now())
@@ -2219,6 +2220,7 @@ mod tests {
                     side,
                 }),
                 touches: Vec::new(),
+                needs: None,
                 allow_overlap: false,
             };
             self.boss.sign_order(&mut order);
@@ -3543,6 +3545,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         Task {

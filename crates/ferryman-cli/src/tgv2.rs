@@ -502,6 +502,7 @@ impl Bridge {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         self.agent.sign_order(&mut order);
@@ -1683,9 +1684,10 @@ impl Bridge {
                 actions.push(send(
                     home,
                     format!(
-                        "{} in {project} needs you - r{revision} by {by}:\n{}\n\n{result}{adversary}",
+                        "{} in {project} needs you - r{revision} by {by}:\n{}{}\n\n{result}{adversary}",
                         task.order.id,
-                        excerpt(&title(&task), 200)
+                        excerpt(&title(&task), 200),
+                        routing_line(Some(&task), revision)
                     ),
                     buttons,
                 ));
@@ -1711,6 +1713,15 @@ impl Bridge {
                     lines.push(format!("Diff: {stat}"));
                 }
                 lines.push(format!("Evidence: {}", waiting.evidence));
+                let routed = routing_line(
+                    ferryman_channel::read_task(&route, &waiting.order_id)
+                        .ok()
+                        .as_ref(),
+                    waiting.revision,
+                );
+                if let Some(routed) = routed.strip_prefix('\n') {
+                    lines.push(routed.to_string());
+                }
                 if let Some(engine) = &waiting.engine {
                     lines.push(format!(
                         "Review engine: {}",
@@ -2030,6 +2041,16 @@ fn found_seen(route: &ProjectRoute, order: &str, revision: u32) -> String {
         revision,
         ferryman_channel::adversary::Trigger::PreDone,
     )
+}
+
+/// The smart router's one-line reason on an order's card: a newline and `Routed: nvidia:
+/// free, p 0.81 for docs >= 0.75, cheapest sufficient`, from what the worker recorded with
+/// that revision. Empty when it recorded none, so work done before the router reads as it did.
+fn routing_line(task: Option<&ferryman_channel::Task>, revision: u32) -> String {
+    task.and_then(|task| task.results.iter().find(|r| r.revision == revision))
+        .and_then(|result| ferryman_channel::router::reason_of(&result.payload))
+        .map(|why| format!("\nRouted: {}", excerpt(&why, 300)))
+        .unwrap_or_default()
 }
 
 /// The adversary's finding as card lines: the headline, then its worst issues.
@@ -2515,6 +2536,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             }],
             Utc::now(),
         );
@@ -2792,6 +2814,10 @@ mod tests {
     /// An order of josh's that needs him, with a result in: its message carries Approve /
     /// Send back / Details, and each writes a verdict in his name through the delegation.
     fn awaiting_review(route: &ProjectRoute, id: &str) {
+        awaiting_review_with(route, id, json!({ "output": "renamed" }));
+    }
+
+    fn awaiting_review_with(route: &ProjectRoute, id: &str, payload: Value) {
         let mut order = ferryman_channel::Order {
             id: id.into(),
             project_id: route.project_id.clone(),
@@ -2807,6 +2833,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         josh().sign_order(&mut order);
@@ -2816,7 +2843,7 @@ mod tests {
             agent: "wisp".into(),
             revision: 1,
             submitted_at: Utc::now(),
-            payload: json!({ "output": "renamed" }),
+            payload,
             signed_by: None,
             signature: None,
         };
@@ -2877,6 +2904,35 @@ mod tests {
         assert_eq!(task.state(), TaskState::ChangesRequested { revision: 2 });
         assert_eq!(task.reviews[0].reviewer, "josh");
         assert_eq!(task.reviews[0].signed_by.as_deref(), Some(BRIDGE));
+    }
+
+    #[test]
+    fn the_card_says_why_that_engine_when_the_worker_recorded_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["orders", "review"]);
+        assert!(bridge.tick(Utc::now()).is_empty());
+        awaiting_review_with(
+            &ferryman,
+            "t-9",
+            json!({
+                "output": "renamed",
+                "routing": { "reason": "nvidia: free, p 0.81 for docs >= 0.75, cheapest sufficient" }
+            }),
+        );
+        awaiting_review(&ferryman, "t-8");
+        let posted = bridge.tick(Utc::now());
+        let cards = texts(&posted);
+        let routed = cards.iter().find(|t| t.contains("t-9 in")).unwrap();
+        assert!(
+            routed.contains("\nRouted: nvidia: free, p 0.81 for docs >= 0.75, cheapest sufficient"),
+            "{routed}"
+        );
+        let plain = cards.iter().find(|t| t.contains("t-8 in")).unwrap();
+        assert!(
+            !plain.contains("Routed:"),
+            "work with no recorded decision reads as it did: {plain}"
+        );
     }
 
     #[test]
@@ -3123,6 +3179,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         josh().sign_order(&mut order);
@@ -3168,6 +3225,7 @@ mod tests {
             trust: None,
             billing: None,
             class: None,
+            capabilities: None,
         };
         let now = Utc::now();
         ferryman_channel::receipts::refresh_engines(
@@ -3220,6 +3278,7 @@ mod tests {
                 trust: None,
                 billing: None,
                 class: None,
+                capabilities: None,
             };
         ferryman_channel::receipts::refresh_engines(
             route,
@@ -3544,6 +3603,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);
@@ -3924,6 +3984,7 @@ mod tests {
             }),
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);
@@ -3980,6 +4041,7 @@ mod tests {
             result_contract: None,
             interface: None,
             touches: Vec::new(),
+            needs: None,
             allow_overlap: false,
         };
         wisp().sign_order(&mut order);

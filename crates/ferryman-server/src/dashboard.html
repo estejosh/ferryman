@@ -843,6 +843,7 @@ function taskRow(t) {
         <div class="m">
           <span>${esc((t.task || "").slice(0, 110))}${(t.task || "").length > 110 ? "…" : ""}</span>
         </div>
+        ${t.routing ? `<div class="m" title="Why this engine: the smart router's reason, recorded by the worker">${esc(t.routing)}</div>` : ""}
       </div>
       <div class="r">
         ${t.holder ? `<span class="badge">${esc(t.holder)}</span>` : ""}
@@ -873,7 +874,35 @@ function contractBadges(t) {
   if (holds.length) {
     out.push(`<span class="badge warn" title="${esc(holds.map((h) => h.agent + ": " + h.reason).join("\n"))}">held</span>`);
   }
+  out.push(workBadge(t.work));
   return out.join("");
+}
+
+// One routing decision: the one-line reason, then every engine it looked at - its success
+// estimate, its price, and why it was left out when it was. `>` the winner, `+` sufficient.
+function routingDecision(dec) {
+  if (!dec) return "";
+  const win = dec.winner || {};
+  const rows = (dec.candidates || []).map((c) => {
+    const mark = c.excluded ? "x" : (win.engine === c.engine && win.machine === c.machine ? ">" : (c.sufficient ? "+" : "-"));
+    const facts = c.p == null ? "" : `p ${Number(c.p).toFixed(2)}, ${c.price || ""}`;
+    return `<div class="mono" style="color:var(--faint)">${mark} ${esc(c.engine)} on ${esc(c.machine)} ${esc(facts)}${c.excluded ? ` &mdash; out: ${esc(c.excluded)}` : ""}</div>`;
+  }).join("");
+  const retry = (dec.failed || []).length ? `<div style="color:var(--faint)">retry: ${esc(dec.failed.join(", "))} failed this order${dec.must_beat != null ? `; the next engine needs p above ${Number(dec.must_beat).toFixed(2)}` : ""}</div>` : "";
+  return `${esc(dec.reason)} <span class="badge">${esc(dec.routing)}</span>${retry}${rows}`;
+}
+
+// What the smart router reads an order as needing: its kind and size, and any modality
+// beyond text (vision, audio, ...). The hover says whether the order itself, the rules or a
+// model said so, and how sure that is. An unsure one is marked: for an improvement order a
+// worker asks a model once (an http engine only, never an agent), and treats an order whose
+// kind it still cannot tell as one that edits files.
+function workBadge(w) {
+  if (!w) return "";
+  const extra = (w.modalities || []).filter((m) => m !== "text" && m !== "code");
+  const label = [w.kind, w.size].concat(extra).join(" · ");
+  const why = `needs: ${(w.modalities || []).join(", ")}\nread from: ${w.source}, confidence ${Number(w.confidence).toFixed(2)}${w.sure ? "" : " (unsure: a worker asks a model once, through an http engine, for an improvement order)"}`;
+  return `<span class="badge${w.sure ? "" : " warn"}" title="${esc(why)}">${esc(label)}${w.sure ? "" : " ?"}</span>`;
 }
 
 // The detail the card has no room for, shown in the drawer: the files the order declared,
@@ -884,6 +913,12 @@ function taskContractDetail(d) {
   if (order.interface) {
     rows.push(`<dt>Interface</dt><dd class="mono">${esc(order.interface.name)}@${esc(order.interface.version)} <span style="color:var(--faint)">${esc(order.interface.side)}</span></dd>`);
   }
+  const cl = d.classification;
+  if (cl && cl.needs) {
+    const n = cl.needs;
+    const reasons = (cl.reasons || []).map((r) => `<div style="color:var(--faint)">${esc(r)}</div>`).join("");
+    rows.push(`<dt>Needs</dt><dd><span class="mono">${esc(n.kind)}, ${esc(n.size)}, ${esc((n.modalities || []).join("+"))}, ${esc(String(n.min_context_k))}k context</span> <span class="badge">${esc(cl.source)} ${Number(cl.confidence).toFixed(2)}</span>${order.needs ? ` <span class="badge accent">signed into the order</span>` : ""}${reasons}</dd>`);
+  }
   if ((order.touches || []).length) {
     rows.push(`<dt>Touches</dt><dd class="mono">${esc(order.touches.join(", "))}${order.allow_overlap ? ` <span class="badge">overlap allowed</span>` : ""}</dd>`);
   }
@@ -892,6 +927,9 @@ function taskContractDetail(d) {
   });
   (d.holds || []).forEach((h) => {
     rows.push(`<dt>Held</dt><dd>${esc(h.agent)} is holding off: ${esc(h.reason)}</dd>`);
+  });
+  (d.results || []).forEach((r) => {
+    if (r.routing) rows.push(`<dt>Routing r${esc(r.revision)}</dt><dd>${routingDecision(r.routing)}</dd>`);
   });
   (d.notes || []).forEach((n) => {
     rows.push(`<dt>Note r${esc(n.revision)}</dt><dd>${esc(n.note)}</dd>`);
@@ -1044,6 +1082,27 @@ function scopeLabel(grant) {
   return p.length ? p.join(", ") : "every project";
 }
 
+/* What an engine can do - the modalities it takes (text, code, vision, image, video,
+   audio_in, audio_out, embed), what it is good at, its window, its price and whether it is
+   local - as its worker published it, signed. A worker that predates capability profiles
+   publishes none. */
+function costText(cost) {
+  if (!cost) return "price unknown";
+  if (!cost.per_call_usd && !cost.per_mtok_in_usd && !cost.per_mtok_out_usd) return "free";
+  return `$${cost.per_call_usd || 0}/call, $${cost.per_mtok_in_usd || 0} in / $${cost.per_mtok_out_usd || 0} out per Mtok`;
+}
+function capsCell(e) {
+  const c = e.capabilities;
+  if (!c) return `<span class="badge" title="This worker predates capability profiles">&mdash;</span>`;
+  const tip = [
+    (c.strengths || []).length ? "strengths: " + c.strengths.join(", ") : "",
+    c.context_k ? c.context_k + "k context" : "",
+    costText(c.cost),
+    c.local ? "local: nothing leaves the machine" : "",
+  ].filter(Boolean).join("\n");
+  return `<span title="${esc(tip)}">${esc((c.modalities || []).join("+") || "none")}</span>${c.local ? ` <span class="badge good">local</span>` : ""}`;
+}
+
 /* Self-improve: the master's signed per-project switch for the weekly loop, and what
    each worker can run right now - its signed engine inventory, never a credential. */
 function improvePanel(imp) {
@@ -1056,7 +1115,7 @@ function improvePanel(imp) {
   for (const w of (imp.engines || [])) {
     for (const e of (w.engines || [])) {
       const st = e.state === "exhausted" && e.until ? `out of credit until ${when(e.until)} UTC` : esc(e.state);
-      rows.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td>${esc(e.name)}</td><td>${esc(e.tier)}</td><td>${esc(e.paid)}</td>` +
+      rows.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td>${esc(e.name)}</td><td>${esc(e.tier)}</td><td>${capsCell(e)}</td><td>${esc(e.paid)}</td>` +
         `<td title="${esc(e.reason || "")}">${st}</td><td>${e.latency_ms != null ? (e.latency_ms / 1000).toFixed(1) + "s" : ""}</td><td>${esc(e.balance || "")}</td>` +
         `<td>${e.billing && e.billing.spend_usd ? "$" + Number(e.billing.spend_usd).toFixed(2) : ""}${e.billing && e.billing.flag ? ` <span class="badge warn" title="${esc(e.billing.flag)}">free tier flagged</span>` : ""}</td></tr>`);
     }
@@ -1069,7 +1128,7 @@ function improvePanel(imp) {
         <div class="s" style="color:var(--dim);margin-top:6px">When on, each week the best available AI plans a few improvements to this project from what the channel recorded, and they are built as reviewed orders on their own branches. Nothing merges without you. Only the master can switch it.</div>
         ${imp.may_set ? `<div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn${imp.enabled ? "" : " primary"}" id="tm-improve" data-enabled="${imp.enabled ? "0" : "1"}">${imp.enabled ? "Turn self-improve off" : "Turn self-improve on"}</button><button class="btn" id="tm-improve-all">On for all my repos</button><span class="s" id="tm-improve-msg" style="color:var(--dim)"></span></div>` : ""}
         ${rows.length
-          ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Worker</th><th>Engine</th><th>Tier</th><th>Paid</th><th>State</th><th>Latency</th><th>Balance</th><th>This week</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
+          ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Worker</th><th>Engine</th><th>Tier</th><th>Can do</th><th>Paid</th><th>State</th><th>Latency</th><th>Balance</th><th>This week</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`
           : `<div class="s" style="color:var(--dim);margin-top:6px">No worker has published which AI engines it can run yet.</div>`}
       </div>
     </div>`;
@@ -1116,6 +1175,39 @@ function adversaryTerms(ep) {
     ((a.never || []).length ? ` Never: ${esc(a.never.join(", "))}.` : "") +
     (a.cap_usd !== null && a.cap_usd !== undefined ? ` Cap: $${Number(a.cap_usd).toFixed(2)} a week.` : "") +
     ` Only the master signs it${ep.may_set ? "" : " &mdash; you can read it here, not change it"}.`;
+}
+/* Routing: which engine gets a piece of work. Smart picks the cheapest engine that will
+   most likely do that kind of work well, and moves up only after a cheaper one failed at it;
+   ordered is the prefer lists, as before. The simulator runs the router without running
+   anything, so a change can be tried before it is signed. */
+function routingSection(ep) {
+  const dis = ep.may_set ? "" : "disabled";
+  const kinds = ep.kinds || [];
+  const th = ep.thresholds || {};
+  const def = Number(ep.default_threshold || 0.75);
+  const bias = Object.entries(ep.bias || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+  const rows = kinds.map((k) => `<tr><td>${esc(k)}</td>
+      <td><input type="number" min="0.05" max="1" step="0.05" data-rt-threshold="${esc(k)}" value="${th[k] == null ? "" : esc(th[k])}" placeholder="${def}" style="width:84px" ${dis} /></td></tr>`).join("");
+  const opts = (list, chosen) => list.map((o) => `<option value="${esc(o)}"${o === chosen ? " selected" : ""}>${esc(o)}</option>`).join("");
+  return `
+        <div style="margin-top:14px"><b>Routing</b> <span class="badge">${esc(ep.routing || "smart")}</span></div>
+        <div class="s" style="color:var(--dim);margin-top:4px">Smart sends each piece of work to the cheapest engine that will most likely do it well, and moves up only when a cheaper one has failed at that kind of work. The never list, subscription caps, dollar caps, machines and the adversary apply first. Ordered keeps the prefer lists as strict order.</div>
+        <div style="margin-top:8px;display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">
+          <label style="display:flex;flex-direction:column;gap:4px"><span class="k">Routing</span>
+            <select id="rt-mode" ${dis}>${opts(["smart", "ordered"], ep.routing || "smart")}</select></label>
+          <label style="display:flex;flex-direction:column;gap:4px;flex:1;min-width:240px"><span class="k">Bias, for engines that cost the same (higher first)</span>
+            <input id="rt-bias" placeholder="nvidia*=3, claude-sonnet*=2, claude-haiku*=1" value="${esc(bias)}" ${dis} /></label>
+          ${ep.may_set ? `<button class="btn primary" id="rt-save">Save routing</button>` : ""}
+        </div>
+        <details style="margin-top:8px"><summary>How sure it must be, per kind of work (empty is ${def})</summary>
+          <div style="margin-top:6px;overflow-x:auto"><table class="grid"><thead><tr><th>Kind</th><th>Success needed</th></tr></thead><tbody>${rows}</tbody></table></div></details>
+        <div style="margin-top:10px"><span class="k">Try it</span>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:4px">
+            <label><select id="rt-kind">${opts(kinds, "docs")}</select></label>
+            <label><select id="rt-size">${opts(["small", "medium", "large"], "small")}</select></label>
+            <input id="rt-needs" placeholder="also needs: vision, audio_in, image" style="min-width:200px" />
+            <button class="btn" id="rt-sim-go">Simulate</button></div>
+          <pre id="rt-sim" class="mono" style="white-space:pre-wrap;margin-top:6px"></pre></div>`;
 }
 function policyPanel(ep) {
   lastPolicy = ep.policy || {};
@@ -1190,6 +1282,7 @@ function policyPanel(ep) {
           <button class="btn primary" id="ep-settings">Save effort, width and subscriptions</button>
           <button class="btn" id="ep-team">Team preset</button></div>` : `<div style="margin-top:8px"><button class="btn" id="ep-team">Team preset</button></div>`}
         <div id="ep-team-box" style="margin-top:8px"></div>`;
+  const routingPanel = routingSection(ep);
   return `
     <div class="notice" style="margin-bottom:18px">
       <div style="flex:1;min-width:0">
@@ -1197,6 +1290,7 @@ function policyPanel(ep) {
         ${ep.auto && ep.self_improve ? `<div style="margin-top:6px"><span class="badge warn">Self-improve is on with no engine policy of its own.</span> Pick the engines below, or use the recommended ones.</div>` : ""}
         ${simple}
         ${teamPanel}
+        ${routingPanel}
         <details style="margin-top:12px"><summary>Advanced</summary>
         <div class="s" style="color:var(--dim);margin-top:6px">Which AI does background work here - planning, building and reviewing self-improvements - and on which machines. Orders you give yourself are never restricted by it.</div>
         <div style="margin-top:10px">${(ep.describe || []).map(esc).join("<br>")}</div>
@@ -1380,6 +1474,40 @@ function wirePolicy() {
       msg(`Signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
       await render();
     } catch (err) { msg(err.message || err); settingsBtn.disabled = false; }
+  });
+  const routingBtn = $("#rt-save");
+  if (routingBtn) routingBtn.addEventListener("click", async () => {
+    const thresholds = {};
+    document.querySelectorAll("[data-rt-threshold]").forEach((i) => {
+      if (i.value.trim() !== "") thresholds[i.dataset.rtThreshold] = Number(i.value);
+    });
+    if (Object.values(thresholds).some((p) => !(p > 0 && p <= 1))) { msg("A threshold is a probability above 0 and at most 1."); return; }
+    const bias = {};
+    for (const part of (($("#rt-bias") && $("#rt-bias").value) || "").split(",").map((x) => x.trim()).filter(Boolean)) {
+      const at = part.lastIndexOf("=");
+      const weight = Number(part.slice(at + 1));
+      if (at < 1 || part.slice(at + 1).trim() === "" || !Number.isFinite(weight)) { msg(`Bias wants engine=weight, like nvidia*=3, not '${part}'.`); return; }
+      bias[part.slice(0, at).trim()] = weight;
+    }
+    routingBtn.disabled = true;
+    try {
+      const r = await api("/api/engine-policy/settings", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ routing: $("#rt-mode").value, thresholds, bias, all: all() }),
+      });
+      msg(`Routing signed in ${r.changed} project${r.changed === 1 ? "" : "s"}.`);
+      await render();
+    } catch (err) { msg(err.message || err); routingBtn.disabled = false; }
+  });
+  const simBtn = $("#rt-sim-go");
+  if (simBtn) simBtn.addEventListener("click", async () => {
+    const out = $("#rt-sim");
+    const q = new URLSearchParams({ kind: $("#rt-kind").value, size: $("#rt-size").value, needs: $("#rt-needs").value });
+    try {
+      const r = await api(`/api/route/simulate?${q}`);
+      out.textContent = `${r.engines} engine(s) published\n` + (r.lines || []).join("\n") +
+        ((r.order || []).length > 1 ? `\n  order tried: ${r.order.map((o) => `${o.engine} on ${o.machine}`).join(" -> ")}` : "");
+    } catch (err) { out.textContent = String(err.message || err).slice(0, 300); }
   });
   const chooseBtn = $("#ep-choose");
   if (chooseBtn) chooseBtn.addEventListener("click", () => {
@@ -1946,6 +2074,22 @@ pages.learnings = async () => {
 pages.engines = async () => {
   const d = await api("/api/stats");
   const rows = d.engines || d.rows || (Array.isArray(d) ? d : []);
+  // What each worker says its engines can do: the signed inventory the router reads.
+  let fleet = [];
+  try { fleet = (await api("/api/improve")).engines || []; } catch (_) { fleet = []; }
+  const caps = [];
+  for (const w of fleet) {
+    for (const e of (w.engines || [])) {
+      const c = e.capabilities;
+      caps.push(`<tr><td>${esc(w.agent)} on ${esc(w.machine)}</td><td class="lead">${esc(e.name)}</td>` +
+        (c
+          ? `<td>${esc((c.modalities || []).join("+") || "none")}</td><td>${esc((c.strengths || []).join(", ") || "—")}</td>` +
+            `<td class="num">${c.context_k ? esc(String(c.context_k)) + "k" : "—"}</td><td>${esc(costText(c.cost))}</td>` +
+            `<td>${c.local ? `<span class="badge good">local</span>` : "—"}</td>`
+          : `<td colspan="5"><span class="badge">this worker predates capability profiles</span></td>`) +
+        `</tr>`);
+    }
+  }
 
   // An engine that reported nothing has NOT cost nothing.
   //
@@ -1984,6 +2128,15 @@ pages.engines = async () => {
           </tr>`; }).join("")
           : `<tr><td colspan="7"><div class="empty">No runs recorded yet.</div></td></tr>`}
         </tbody>
+      </table>
+    </div>
+    <div class="head" style="margin-top:28px">
+      <div><h2>What each engine can do</h2><p>What the smart router matches work against: the modalities an engine takes, what it is good at, its context window, its price and whether it runs locally. Declared in agent.toml where an operator said so, otherwise guessed from the model's name; each worker publishes it signed.</p></div>
+    </div>
+    <div class="panel scroll">
+      <table class="grid">
+        <thead><tr><th>Worker</th><th>Engine</th><th>Modalities</th><th>Strengths</th><th>Context</th><th>Cost</th><th>Where</th></tr></thead>
+        <tbody>${caps.length ? caps.join("") : `<tr><td colspan="7"><div class="empty">No worker has published its engines yet.</div></td></tr>`}</tbody>
       </table>
     </div>`;
 };

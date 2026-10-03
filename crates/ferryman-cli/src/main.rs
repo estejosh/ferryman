@@ -6,6 +6,7 @@ mod license;
 mod licensor;
 mod mcp;
 mod mcp_client;
+mod route;
 mod telegram;
 mod tgmap;
 mod tgv2;
@@ -462,6 +463,17 @@ enum Command {
     Adversary {
         #[command(subcommand)]
         command: adversary::AdversaryCommand,
+    },
+    /// The smart router: send each piece of work to the cheapest engine that will most
+    /// likely do it well. `ferry route classify <order>` shows what an order needs - kind,
+    /// size, the modalities an engine must have - and where that read came from: the
+    /// signed order, the rules, or one call to a cheap text engine.
+    ///
+    /// What each engine can do (`text`, `code`, `vision`, `image`, `video`, `audio_in`,
+    /// `audio_out`, `embed`) is in `ferry engines`.
+    Route {
+        #[command(subcommand)]
+        command: route::RouteCommand,
     },
     /// Server mode: messaging through a server. `channel` does the same with none.
     Communications {
@@ -1222,6 +1234,29 @@ enum Channel {
         /// (types, nested keys, array items, enums). Held to the whole result payload.
         #[arg(long, value_name = "FILE")]
         result_schema: Option<PathBuf>,
+        /// What kind of work this is, for the smart router: code-change, docs, tests,
+        /// review, plan, chore, research, translate, transcribe, image, video, audio or
+        /// other. Signed into the order, and it wins over anything the classifier would
+        /// guess. Leave it out and `ferry route classify <id>` shows what it would read.
+        #[arg(long, value_name = "KIND", value_parser = parse_work_kind)]
+        kind: Option<ferryman_channel::work::WorkKind>,
+        /// What an engine must be able to do: text, code, vision, image, video, audio_in,
+        /// audio_out or embed, e.g. --needs vision,audio_in. Replaces what the classifier
+        /// would find.
+        #[arg(
+            long,
+            value_name = "MODALITY",
+            num_args = 1..,
+            value_delimiter = ',',
+            value_parser = parse_modality
+        )]
+        needs: Vec<ferryman_channel::capability::Modality>,
+        /// How big the work is: small, medium or large.
+        #[arg(long, value_name = "SIZE", value_parser = parse_work_size)]
+        size: Option<ferryman_channel::work::Size>,
+        /// The context window the work wants, in thousands of tokens.
+        #[arg(long, value_name = "K")]
+        min_context_k: Option<u32>,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -2950,6 +2985,64 @@ fn target_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
     Ok(vec![ferryman_channel::route_for(&here)?])
 }
 
+/// The channels `ferry engines` reads: what [`target_routes`] picks, plus the project the
+/// current directory is inside when that project is not one of them.
+///
+/// A ferry root lists its own projects; a project attached from elsewhere is not among
+/// them, so `ferry engines` run inside it used to say no worker had published anything
+/// while its own channel held the files. Only adds, and only without `--workspace` or
+/// `--comms`: those, and every other fleet-wide command (whose `--all` is a different
+/// flag), keep [`target_routes`].
+fn engines_routes(at: &Targets) -> Result<Vec<ferryman_channel::ProjectRoute>> {
+    let routes = target_routes(at);
+    if at.workspace.is_some() || at.comms.is_some() {
+        return routes;
+    }
+    let here = std::env::current_dir()
+        .ok()
+        .and_then(|dir| ferryman_channel::route_for(&dir).ok());
+    match routes {
+        Ok(routes) => Ok(with_current_project(routes, here)),
+        Err(error) => here.map(|route| vec![route]).ok_or(error),
+    }
+}
+
+/// `routes` with the current directory's project appended unless it is already there.
+fn with_current_project(
+    mut routes: Vec<ferryman_channel::ProjectRoute>,
+    here: Option<ferryman_channel::ProjectRoute>,
+) -> Vec<ferryman_channel::ProjectRoute> {
+    if let Some(route) = here
+        && !routes
+            .iter()
+            .any(|known| same_place(&known.attachment, &route.attachment))
+    {
+        routes.push(route);
+    }
+    routes
+}
+
+/// Whether two paths are the same place: equal as written, or the same once resolved
+/// (`..`, links, and on Windows `\` against `/`, upper against lower case and the `\\?\`
+/// prefix a resolved path carries). A path that cannot be resolved is compared as written.
+fn same_place(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if a == b {
+        return true;
+    }
+    let key = |path: &std::path::Path| {
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let text = resolved.to_string_lossy().into_owned();
+        if cfg!(windows) {
+            text.trim_start_matches(r"\\?\")
+                .replace('\\', "/")
+                .to_lowercase()
+        } else {
+            text
+        }
+    };
+    key(a) == key(b)
+}
+
 /// The channels a fleet-wide command acts on, each with the agent config it acts under.
 fn target_configs(
     at: &Targets,
@@ -2995,7 +3088,7 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
         (String, String),
         ferryman_channel::evidence::Tally,
     > = std::collections::BTreeMap::new();
-    for route in target_routes(at)? {
+    for route in engines_routes(at)? {
         let records = ferryman_channel::evidence::channel_verifications(&route);
         for (key, count) in ferryman_channel::evidence::tally(&records) {
             let sum = checked.entry(key).or_default();
@@ -3031,7 +3124,26 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                     "ferry_version": inventory.ferry_version,
                     "signature": format!("{check:?}"),
                     "channels": channels,
-                    "engines": inventory.engines,
+                    "engines": inventory.engines.iter().map(|engine| {
+                        let mut value = json!(engine);
+                        // Each engine's best kinds of work, from its signed ledger.
+                        let top: Vec<Value> = engine
+                            .trust
+                            .as_ref()
+                            .map(|trust| {
+                                ferryman_channel::router::top_kinds(&trust.kinds, chrono::Utc::now(), 5)
+                            })
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|(kind, rate, decided)| json!({
+                                "kind": kind,
+                                "success_rate": (rate * 1000.0).round() / 1000.0,
+                                "results": (decided * 10.0).round() / 10.0,
+                            }))
+                            .collect();
+                        value["top_kinds"] = json!(top);
+                        value
+                    }).collect::<Vec<_>>(),
                     // Verdicts others recorded, signed, on this worker's results.
                     "checked_by_others": checked
                         .iter()
@@ -3087,11 +3199,20 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                 .as_str()
                 .to_string()
             });
+            // What it can do: published by its worker, else guessed here from the line
+            // (marked `?`) for a worker older than capability profiles.
+            let (caps, guessed) = ferryman_channel::capability::Capabilities::for_report(engine);
+            let modalities = format!(
+                "{}{}",
+                caps.modalities_label(),
+                if guessed { "?" } else { "" }
+            );
             println!(
-                "  {:<12} {:<6} {:<6} {:<12} {:<30} {:<36} {:>7} {}",
+                "  {:<12} {:<6} {:<6} {:<20} {:<12} {:<30} {:<36} {:>7} {}",
                 engine.name,
                 engine.tier,
                 class,
+                modalities,
                 engine.paid,
                 state,
                 engine.model.as_deref().unwrap_or("-"),
@@ -3103,9 +3224,13 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             {
                 println!("  {:<12} {reason}", "");
             }
+            println!("  {:<12} can: {}", "", caps.describe());
             // Whether its claims have held up against the worker's own evidence.
             if let Some(trust) = &engine.trust {
                 println!("  {:<12} {}", "", trust.describe());
+                if let Some(line) = top_kinds_line(&trust.kinds, now) {
+                    println!("  {:<12} {line}", "");
+                }
             }
             if let Some(billing) = &engine.billing {
                 if billing.spend_usd > 0.0 || billing.requests > 0 {
@@ -3125,12 +3250,35 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
     Ok(())
 }
 
+/// An engine's best kinds of work with the share of its results that held up, e.g.
+/// `best at: docs 92% (13), code_change 80% (5)`. None until it has any decided results.
+fn top_kinds_line(
+    kinds: &[ferryman_channel::router::Outcome],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let top = ferryman_channel::router::top_kinds(kinds, now, 3);
+    if top.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "best at: {}",
+        top.iter()
+            .map(|(kind, rate, decided)| format!(
+                "{kind} {:.0}% ({})",
+                rate * 100.0,
+                decided.round().max(1.0)
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+}
+
 /// The engine policy each project runs under, over the engines its fleet published.
 /// Projects whose policy falls the same way share one block.
 fn print_policies(at: &Targets) -> Result<()> {
     let now = chrono::Utc::now();
     let mut blocks: Vec<(Vec<String>, Vec<String>)> = Vec::new();
-    for route in target_routes(at)? {
+    for route in engines_routes(at)? {
         let (policy, setting) =
             ferryman_channel::policy::effective(&route.communications, &route.project_id);
         let fleet = ferryman_channel::policy::fleet(&route, now);
@@ -3738,6 +3886,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Team { command } => team_command(command).await?,
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
+        Command::Route { command } => route::command(command).await?,
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -7092,6 +7241,21 @@ fn parse_interface_ref(value: &str) -> Result<ferryman_channel::interface::Inter
     ferryman_channel::interface::InterfaceRef::parse(value).map_err(|error| format!("{error:#}"))
 }
 
+/// `code-change` as `--kind` takes it.
+fn parse_work_kind(value: &str) -> Result<ferryman_channel::work::WorkKind, String> {
+    ferryman_channel::work::WorkKind::parse(value).map_err(|error| format!("{error:#}"))
+}
+
+/// `large` as `--size` takes it.
+fn parse_work_size(value: &str) -> Result<ferryman_channel::work::Size, String> {
+    ferryman_channel::work::Size::parse(value).map_err(|error| format!("{error:#}"))
+}
+
+/// `vision` as `--needs` takes it.
+fn parse_modality(value: &str) -> Result<ferryman_channel::capability::Modality, String> {
+    ferryman_channel::capability::Modality::parse(value).map_err(|error| format!("{error:#}"))
+}
+
 /// Read a shape from a JSON file, refusing keys a shape does not have: a typo in a schema
 /// that was silently ignored would weaken the contract it was written to enforce.
 fn read_shape_file(path: &std::path::Path) -> Result<ferryman_channel::contract::Shape> {
@@ -9014,9 +9178,23 @@ fn channel(command: Channel) -> Result<()> {
             allow_overlap,
             interface,
             result_schema,
+            kind,
+            needs,
+            size,
+            min_context_k,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let needs = Some(ferryman_channel::work::ExplicitNeeds {
+                modalities: needs,
+                kind,
+                size,
+                min_context_k,
+            })
+            .filter(|needs| !needs.is_empty());
+            if let Some(k) = min_context_k {
+                ferryman_channel::capability::check_context_k(k).context("--min-context-k")?;
+            }
             let schema = result_schema
                 .as_deref()
                 .map(read_shape_file)
@@ -9066,6 +9244,7 @@ fn channel(command: Channel) -> Result<()> {
                 },
                 interface,
                 touches,
+                needs,
                 allow_overlap,
             };
             // Asked before the order exists, so it cannot find itself.
@@ -9087,6 +9266,9 @@ fn channel(command: Channel) -> Result<()> {
                 );
             }
             println!("issued {id} -> {}", path.display());
+            if let Some(needs) = &order.needs {
+                println!("  needs: {} (signed into the order)", needs.describe());
+            }
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),
                 None => println!("  open: whichever agent claims first wins"),
@@ -11462,6 +11644,77 @@ mod tests {
         assert!(refused.is_err(), "an interface needs a version and a side");
     }
 
+    /// `--kind`, `--needs` and `--size` parse the way the docs show them, and a typo is
+    /// refused rather than signed into an order.
+    #[test]
+    fn order_needs_flags_parse_and_refuse_typos() {
+        use clap::Parser;
+        use ferryman_channel::{
+            capability::Modality,
+            work::{Size, WorkKind},
+        };
+        let parsed = super::Cli::try_parse_from([
+            "ferry",
+            "channel",
+            "order",
+            "--id",
+            "t-v",
+            "--task",
+            "describe the screenshot",
+            "--kind",
+            "research",
+            "--needs",
+            "vision,audio_in",
+            "--size",
+            "small",
+            "--min-context-k",
+            "32",
+        ])
+        .unwrap();
+        let super::Command::Channel {
+            command:
+                super::Channel::Order {
+                    kind,
+                    needs,
+                    size,
+                    min_context_k,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("not an order");
+        };
+        assert_eq!(kind, Some(WorkKind::Research));
+        assert_eq!(needs, [Modality::Vision, Modality::AudioIn]);
+        assert_eq!(size, Some(Size::Small));
+        assert_eq!(min_context_k, Some(32));
+
+        let spaced = super::Cli::try_parse_from([
+            "ferry", "channel", "order", "--id", "t-w", "--task", "x", "--needs", "vision",
+            "image", "--kind", "code",
+        ])
+        .unwrap();
+        let super::Command::Channel {
+            command: super::Channel::Order { needs, kind, .. },
+        } = spaced.command
+        else {
+            panic!("not an order");
+        };
+        assert_eq!(needs, [Modality::Vision, Modality::Image]);
+        assert_eq!(kind, Some(WorkKind::CodeChange));
+
+        for bad in [
+            ["--kind", "cooking"],
+            ["--needs", "smell"],
+            ["--size", "huge"],
+        ] {
+            let refused = super::Cli::try_parse_from([
+                "ferry", "channel", "order", "--id", "t-1", "--task", "x", bad[0], bad[1],
+            ]);
+            assert!(refused.is_err(), "{bad:?} should be refused");
+        }
+    }
+
     #[test]
     fn contract_subcommands_take_a_reference() {
         use clap::Parser;
@@ -11529,6 +11782,88 @@ mod tests {
         assert_eq!(report.state, "absent");
         assert!(phrase.is_none());
         assert!(!ferryman_channel::seed::OperatorSeed::path_in(fresh.path()).exists());
+    }
+
+    /// `ferry engines` reads the current project too when the ferry root does not list it,
+    /// and never lists a project twice. `--all`, `--workspace` and every other command read
+    /// `target_routes` unchanged.
+    #[test]
+    fn engines_routes_add_the_current_project_once() {
+        let route = |id: &str| ferryman_channel::ProjectRoute {
+            project_id: id.to_string(),
+            workspace: std::path::PathBuf::from(format!("/work/{id}")),
+            attachment: std::path::PathBuf::from(format!("/work/{id}/.ferryman")),
+            communications: std::path::PathBuf::from(format!("/comms/{id}")),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        let root = vec![route("a"), route("b")];
+        // Not in the root: appended after what the root lists.
+        let ids = |routes: Vec<ferryman_channel::ProjectRoute>| -> Vec<String> {
+            routes.into_iter().map(|r| r.project_id).collect()
+        };
+        assert_eq!(
+            ids(super::with_current_project(root.clone(), Some(route("c")))),
+            ["a", "b", "c"]
+        );
+        // Already in the root: nothing changes.
+        assert_eq!(
+            ids(super::with_current_project(root.clone(), Some(route("b")))),
+            ["a", "b"]
+        );
+        // Outside any project: the root's list as it was.
+        assert_eq!(ids(super::with_current_project(root, None)), ["a", "b"]);
+    }
+
+    /// The same project reached by another spelling of its path is not a second project:
+    /// `..` and links everywhere, and on Windows `\` against `/` and upper against lower
+    /// case, which would otherwise count its engines and checks twice.
+    #[test]
+    fn engines_routes_do_not_count_one_project_twice_under_two_spellings() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join("proj").join(".ferryman");
+        std::fs::create_dir_all(&attachment).unwrap();
+        std::fs::create_dir_all(dir.path().join("other")).unwrap();
+        let route = |attachment: std::path::PathBuf| ferryman_channel::ProjectRoute {
+            project_id: "p".to_string(),
+            workspace: attachment.clone(),
+            attachment,
+            communications: dir.path().join("comms"),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        let roundabout = dir
+            .path()
+            .join("other")
+            .join("..")
+            .join("proj")
+            .join(".ferryman");
+        assert_ne!(roundabout, attachment, "written differently");
+        let got =
+            super::with_current_project(vec![route(attachment.clone())], Some(route(roundabout)));
+        assert_eq!(got.len(), 1, "one project, reached two ways");
+        // A project that is somewhere else is still added.
+        let elsewhere = dir.path().join("other");
+        let got = super::with_current_project(vec![route(attachment)], Some(route(elsewhere)));
+        assert_eq!(got.len(), 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_that_differ_in_case_or_slash_are_the_same_place() {
+        use std::path::Path;
+        assert!(super::same_place(
+            Path::new(r"C:\Work\Proj\.ferryman"),
+            Path::new("c:/work/proj/.ferryman")
+        ));
+        assert!(!super::same_place(
+            Path::new(r"C:\Work\Proj\.ferryman"),
+            Path::new(r"C:\Work\Other\.ferryman")
+        ));
     }
 
     /// `identity show` reports which keys derive from the seed, and it skips the

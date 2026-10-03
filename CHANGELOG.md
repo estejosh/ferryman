@@ -1,5 +1,108 @@
 # Changelog
 
+## Unreleased
+
+Smart router: every engine says what it can do, every order can say what it needs, and background work goes to the cheapest engine that will most likely do that kind of work well, moving up only after a cheaper one has failed at it.
+
+### Smart router, part 2: choosing the engine
+
+- **Cheapest sufficient engine.** Each engine gets a success estimate for the kind of work
+  (a prior from its size class and matching strengths, updated by its own verified and
+  refuted results with a 14-day half-life) and an expected price (declared price, or an
+  assumed frontier list price when none is declared - unpriced is not free; a scarcity price
+  for subscriptions that rises as the weekly cap runs down). The engines whose estimate
+  reaches the kind's threshold are sufficient and the cheapest wins; with none sufficient
+  the likeliest wins. The default threshold is 0.70 for docs, chore, tests, review, plan and
+  research (a medium engine such as a free nemotron starts at 0.70, so it takes that work
+  from the start and loses it when refuted) and 0.75 for code changes and media. Ties go to bias, then tier, then speed. Only engines that
+  have the modalities the work needs are considered: code-change needs a `cli` engine that can
+  edit, and an `http` engine (which is sent text only) is never given vision, audio, image or
+  video work. The policy's `never`, subscription protection and caps, `caps_usd`, `where` and
+  tiers still apply first, and the adversary is never routed.
+- **Escalation.** After a result of this worker's own is refuted by its own evidence or sent
+  back with changes requested, the next attempt leaves that engine out and prefers an
+  estimate above the failed one's (worked out from this worker's own ledger, never read from
+  a result). It is a bar, not a rule: with nothing clearing it the likeliest engine takes the
+  order, and when the failed engine is the only one that can do the work it tries again
+  instead of the order waiting forever. A failure belongs to one agent's engine on one
+  machine, and only results this worker signed count.
+- **Work that edits files needs `code`.** Improvement (build and chore) orders, orders with
+  `touches` or that require changes, and orders the rules cannot read are routed to an
+  engine that can edit files, not to a text-only one that would be refuted and demoted;
+  plans, reviews and research stay text.
+- **Media evidence comes from attachments.** A media file or word merely named in the task
+  text (`update docs/logo.png`, `fix the transcription retry in src/lib.rs`) no longer makes
+  an order need vision or audio; only attachments, explicit `--needs`, or a kind that is
+  itself media do. A model's own modalities are ignored.
+- **The model classifier is wired in.** For an improvement order whose kind the rules cannot
+  tell, a worker asks a model once (cached, 45 second timeout, an `http` engine only, never
+  an agent with tools), under the same policy rules as before.
+- A person's order that carries a screenshot (any modality beyond text and code) is routed
+  by the router, not the operator's own engine order.
+- An endpoint on this machine is local and free only when nothing says it is a gateway
+  (OmniRoute, a route) or paid (`prepaid`, `subscription`, `free-tier`); how an engine is
+  paid for is decided before whether it is local.
+- The mixed-fleet warning now says a v1-only policy cannot carry `routing`, thresholds or
+  bias, so a project set to `ordered` and re-signed by v0.5.17 reads as smart.
+- **Learning.** Verified and refuted results are counted per (engine, kind) in the engine
+  ledger, under its existing lock, and published in the signed inventory (v2-only).
+  `ferry engines` shows each engine's best kinds with their success rate.
+- **Policy: `routing`, `thresholds`, `bias`.** `routing = smart` is the default;
+  `ordered` is exactly the previous strict prefer-list behaviour. Set them with
+  `ferry engines policy set --routing smart --threshold docs=0.7 --bias 'nemotron*=3'`
+  (`--threshold none` / `--bias none` clear them) or in the dashboard's Engine policy panel.
+  They are signed in the policy's v2 view only, so v0.5.17 machines still verify the file.
+- **Explainability.** Every decision is recorded beside the step and in the result: each
+  candidate with its estimate and price, why the others were out, and a one-line reason
+  (`nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient`). `ferry route explain
+  <order>` shows what workers recorded and what would happen now; `ferry route simulate
+  --kind docs --size small [--needs vision]` shows the ranking without running anything.
+  The dashboard shows the reason on each order card, every candidate in the order's drawer,
+  and a Routing panel that runs the simulation (`GET /api/route/simulate`);
+  Telegram's review card carries the one-line reason.
+- Orders from people keep the operator's own engine order unless they need a capability
+  only the router knows engines have (vision, audio, image, video).
+- **Docs:** a "Smart routing" section in `docs/ENGINE_SETUP.md`, with an example for
+  NVIDIA first while free, then Sonnet, then Haiku, local models eligible.
+
+### Changed
+
+- `ferry engines` reads the project the current directory is inside as well as the ferry
+  root's projects, so it no longer says no worker has published when run inside an attached
+  project (the same project under another spelling of its path - `..`, case or slashes on
+  Windows - is not counted twice). Other fleet-wide commands resolve projects as before.
+
+### Smart router, part 1: what engines can do and what orders need
+
+#### Added
+
+- **Engine capability profiles.** Each engine has `modalities` (`text`, `code`, `vision`,
+  `image`, `video`, `audio-in`, `audio-out`, `embed`, plus any value a newer peer
+  publishes), `strengths`, `context_k`, `cost` and `local`. Declare them in `agent.toml`
+  (`engine.<name>.modalities`, `strengths`, `context_k`, `cost_per_call_usd`,
+  `cost_per_mtok_in_usd`, `cost_per_mtok_out_usd`, `local`); anything you leave out is
+  guessed from the engine's name, model, command and base URL, and a declared value always
+  beats a guess. An engine with no cost is *unpriced*, not free. Profiles are published in
+  the signed v2 engine inventory (the v1 signature is unchanged, so v0.5.17 peers still
+  verify the inventory), shown as a modalities column and `can:` line in `ferry engines`,
+  and as a "Can do" column and capabilities panel in the dashboard.
+- **`needs` on orders.** `ferry channel order --kind <kind> --needs <modalities>
+  --size <small|medium|large> --min-context-k <n>` states what an order needs. It is
+  signed with the order; orders that do not use it are byte-for-byte unchanged.
+- **Order classifier.** Explicit needs first, then deterministic rules over the task text,
+  attachments, file types and size (each rule has a confidence), then - only when the rules
+  are not sure - a model fallback. The result records its source (`explicit`, `rules`,
+  `model`), confidence and reasons.
+- **Model-assisted fallback.** The cheapest text engine answers, local preferred; a
+  subscription engine is used only when the policy's `subscription_roles` includes `chore`.
+  The verdict is cached per order id in a local, unsigned file under
+  `routing/classify/` (a synced file would have two writers); failures are retried after
+  an hour and never block the order.
+- **`ferry route classify <order>`** shows the needs, source, confidence and the reasons.
+- The dashboard shows each task's needs and, in the drawer, how they were decided.
+- **Docs:** a capability and routing section in `docs/ENGINE_SETUP.md`, including
+  ComfyUI, whisper and TTS engines as clearly marked examples.
+
 ## v0.5.18 - 2026-10-02
 
 A second model of your choice challenges the work at three moments - before a contract locks, when an order fails twice, and before an improvement is done - and in blocking mode nothing goes live until it has. Orders can share signed interface contracts and declare the files they touch, and a team preset runs cheap models in parallel swarms, including Claude Sonnet and Haiku when you opt a role in with a weekly cap.

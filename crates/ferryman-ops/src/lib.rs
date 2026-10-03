@@ -27,6 +27,7 @@ pub mod identity;
 pub mod improve;
 pub mod omniroute;
 pub mod priority;
+pub mod route;
 pub mod runlog;
 pub mod soak;
 pub mod status;

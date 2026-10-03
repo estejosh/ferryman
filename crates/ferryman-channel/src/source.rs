@@ -154,6 +154,7 @@ pub fn to_order(
         result_contract: None,
         interface: None,
         touches: Vec::new(),
+        needs: None,
         allow_overlap: false,
     }
 }
