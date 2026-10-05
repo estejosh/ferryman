@@ -1060,6 +1060,12 @@ pub fn list_engines(route: &ProjectRoute) -> Result<Vec<(EngineInventory, Signat
     });
     let mut kept: Vec<(EngineInventory, SignatureCheck)> = Vec::new();
     for (inventory, check) in all {
+        // A revoked worker's last inventory stays on disk and its signature still
+        // verifies. Listing it put a dead name ahead of live engines, so work routed
+        // to it and waited. Fail closed: if standing cannot be read, it is not offered.
+        if !crate::master::may_work(route, &inventory.agent, "worker").unwrap_or(false) {
+            continue;
+        }
         if !kept
             .iter()
             .any(|(i, _)| i.agent.eq_ignore_ascii_case(&inventory.agent))
@@ -1506,6 +1512,28 @@ mod tests {
         assert_eq!(short_age(Duration::days(9)), "9d");
     }
 
+    #[test]
+    fn a_revoked_worker_is_not_offered_as_an_engine() {
+        let (_t, route, fang, nebra, operator) = channel();
+        crate::master::initialize_master(&route, &operator, "operator").unwrap();
+        let now = Utc::now();
+        refresh_engines(&route, &fang, "beastly", "0.5.19", vec![engine("up")], now).unwrap();
+        refresh_engines(
+            &route,
+            &nebra,
+            "grouchly",
+            "0.5.19",
+            vec![engine("up")],
+            now,
+        )
+        .unwrap();
+        assert_eq!(list_engines(&route).unwrap().len(), 2);
+
+        crate::master::revoke_member(&route, &operator, "fang", "retired").unwrap();
+        let listed = list_engines(&route).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0.agent, "nebra");
+    }
     fn engine(state: &str) -> EngineReport {
         EngineReport {
             name: "nvidia".into(),
