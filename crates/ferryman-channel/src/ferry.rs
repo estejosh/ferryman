@@ -134,6 +134,60 @@ impl Entry {
         self.mark_holds().unwrap_or(false)
     }
 
+    /// The `.ferryman` directory of this project's checkout on this machine, if it has
+    /// one: the place its keys, `agent.toml` and `bridge.toml` live.
+    ///
+    /// `None` for a project that is only a channel here, which is the normal state for a
+    /// machine that syncs a channel but does not run the work.
+    #[must_use]
+    pub fn attachment(&self) -> Option<PathBuf> {
+        self.repo
+            .as_ref()
+            .map(|repo| repo.join(".ferryman"))
+            .filter(|attachment| attachment.join("bridge.toml").is_file())
+    }
+
+    /// The route to this project on this machine, and whether a checkout is here.
+    ///
+    /// With a checkout it is the route its `bridge.toml` describes. Without one it is the
+    /// channel and nothing else: the same stand-in `claim_masters` signs through, whose
+    /// "attachment" is only the directory the channel sits in. Such a route can read and
+    /// sign the channel's own records; there is no workspace behind it to run work in.
+    ///
+    /// # Errors
+    /// The attachment names a different project than the manifest does, or its
+    /// `bridge.toml` or the channel's roster cannot be read.
+    pub fn route(&self, root: &Root) -> Result<(crate::ProjectRoute, bool)> {
+        if let Some(attachment) = self.attachment() {
+            let route = crate::load_route(&attachment)?;
+            if route.project_id != self.project_id {
+                bail!(
+                    "the checkout at {} belongs to '{}', not '{}'",
+                    attachment.display(),
+                    route.project_id,
+                    self.project_id
+                );
+            }
+            return Ok((route, true));
+        }
+        let attachment = self
+            .channel
+            .parent()
+            .map_or_else(|| root.path.clone(), Path::to_path_buf);
+        Ok((
+            crate::ProjectRoute {
+                project_id: self.project_id.clone(),
+                workspace: attachment.parent().unwrap_or(&attachment).to_path_buf(),
+                attachment,
+                communications: self.channel.clone(),
+                shared_remote: format!("{}-ferryman", self.project_id),
+                git_remote: String::new(),
+                git_visibility: String::new(),
+                agents: crate::read_agent_roster(&self.channel)?,
+            },
+            false,
+        ))
+    }
     fn mark_holds(&self) -> Result<bool> {
         let path = self.channel.join(ARCHIVED);
         if !path.is_file() {
