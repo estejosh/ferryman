@@ -47,6 +47,10 @@
 //!   so, rather than the order waiting for an engine that is never coming. The estimate to
 //!   beat is worked out from this worker's own ledger, never read from a result's payload,
 //!   which anyone who can write one could set to 1.0.
+//! - **Opus.** In smart background work an engine whose model is Claude Opus is left out
+//!   unless the role's prefer list names it (`name:`, `model:` or its bare name; `paid:` and
+//!   `class:` selectors do not count). Opus has a profile, so it scores well when it is
+//!   named or when work is asked for directly, but the router does not spend it by itself.
 //! - **Work that edits files** (see `work::routing_needs`) needs `code` whatever its kind:
 //!   background build and chore orders, and any order with declared `touches` or that
 //!   requires changes, so a text-only engine is not sent an order it can only fail.
@@ -107,7 +111,11 @@
 //!   model's list price - so a declared price always beats a guess;
 //! - a subscription costs nothing per call, but its scarcity is priced: [`SCARCITY_BASE_USD`]
 //!   scaled up to ten times as the weekly request cap runs down (`1 + 9 * (1 - left)^2`).
-//!   With no cap known, half is assumed to be left.
+//!   With no cap known, half is assumed to be left. It is priced **per request, against its
+//!   cap**: 300 a week is the reference, so a request on a 2000 a week cap is about 6.7 times
+//!   cheaper, and with two subscriptions that both clear the bar the bigger cap is the
+//!   cheaper to use up and takes the work. The smaller one only gets what the bigger one does
+//!   not clear.
 //!
 //! # The choice
 //!
@@ -195,8 +203,14 @@ pub const ASSUMED_COST: Cost = Cost {
     per_mtok_in_usd: 5.0,
     per_mtok_out_usd: 25.0,
 };
-/// What one call on a subscription with its whole weekly cap left is worth, in dollars.
+/// What one call on a subscription with its whole weekly cap left is worth, in dollars,
+/// when the cap is [`SCARCITY_REFERENCE_CAP`] requests a week.
 pub const SCARCITY_BASE_USD: f64 = 0.02;
+/// The weekly request cap [`SCARCITY_BASE_USD`] is for. A request on a bigger cap uses up a
+/// smaller share of the week, so it is worth proportionally less: at 2000 a week a request
+/// is about 6.7 times cheaper than at 300, and a subscription with a small cap is the one
+/// to keep for the work only it clears.
+pub const SCARCITY_REFERENCE_CAP: f64 = 300.0;
 /// Costs this close (dollars) to the cheapest are tied, whatever their size.
 pub const TIE_ABSOLUTE_USD: f64 = 0.0005;
 /// Costs within this share of the cheapest are tied.
@@ -448,8 +462,8 @@ pub struct Price {
     pub usd: f64,
     /// How it is paid for, which settles a tie in price.
     pub economy: Economy,
-    /// `free`, `local`, `~$0.012`, `unpriced, assumed ~$0.21`, `subscription, 72% of the
-    /// weekly cap left`.
+    /// `free`, `local`, `~$0.012`, `unpriced, assumed ~$0.21`, `subscription, cap 300/wk,
+    /// 72% of the weekly cap left`.
     pub note: String,
 }
 
@@ -506,17 +520,23 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
     // is, and only then does being local make a call free.
     if paid == "subscription" {
         let left = cap_left(engine, now);
-        let scarcity = SCARCITY_BASE_USD * (1.0 + 9.0 * (1.0 - left.unwrap_or(0.5)).powi(2));
+        // A request is a smaller share of a bigger cap: scarcity is per request.
+        let cap = engine.weekly_requests.filter(|cap| *cap > 0);
+        let share = cap.map_or(1.0, |cap| {
+            (SCARCITY_REFERENCE_CAP / cap as f64).clamp(0.05, 20.0)
+        });
+        let scarcity =
+            SCARCITY_BASE_USD * share * (1.0 + 9.0 * (1.0 - left.unwrap_or(0.5)).powi(2));
         let own = caps.cost.as_ref().map_or(0.0, priced);
         return Price {
             usd: own + scarcity,
             economy: Economy::Subscription,
-            note: match left {
-                Some(left) => format!(
-                    "subscription, {:.0}% of the weekly cap left",
+            note: match (left, cap) {
+                (Some(left), Some(cap)) => format!(
+                    "subscription, cap {cap}/wk, {:.0}% of the weekly cap left",
                     (left * 100.0).round()
                 ),
-                None => "subscription, no weekly cap known".to_string(),
+                _ => "subscription, no weekly cap known".to_string(),
             },
         };
     }
@@ -608,7 +628,8 @@ pub struct Considered {
     /// The expected dollars for one call, as [`Price`] works it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
-    /// How that was worked out: `free`, `subscription, 72% of the weekly cap left`, ...
+    /// How that was worked out: `free`, `subscription, cap 300/wk, 72% of the weekly cap
+    /// left`, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<String>,
     /// Where `p` came from: `model profile: claude-sonnet`, `class medium`. For showing
@@ -934,6 +955,15 @@ pub fn route(
             Some("already asked in this attempt".to_string())
         } else if !smart {
             None
+        } else if work == Work::Background
+            && models::is_opus(engine.model.as_deref(), &engine.name)
+            && !named_in_prefer(policy, role, engine)
+        {
+            Some(
+                "claude opus is not used for background work unless the policy prefers it by \
+                 name"
+                    .to_string(),
+            )
         } else if let Some(failed) = context.failed.iter().find(|f| f.is(engine)) {
             match unable(engine, needs_here) {
                 Err(why) => Some(why),
@@ -1149,6 +1179,22 @@ pub fn route(
     Routed { decision, order }
 }
 
+/// Whether the role's prefer list names this engine by its name or model - `name:opus`,
+/// `model:claude-opus*`, or a bare word that is its name - and not by what it costs or how
+/// big it is (`paid:subscription`, `class:large`), which says nothing about it in particular.
+fn named_in_prefer(policy: &Policy, role: Role, engine: &Candidate) -> bool {
+    policy.preferences(role).iter().any(|selector| {
+        let lower = selector.trim().to_ascii_lowercase();
+        let by_kind = matches!(
+            lower.split_once(':'),
+            Some(("name" | "engine" | "model", _))
+        );
+        let bare = !lower.contains(':')
+            && (lower == engine.name.to_ascii_lowercase() || lower.contains("opus"));
+        (by_kind || bare) && crate::policy::matches(selector, engine)
+    })
+}
+
 /// Whether the engine can do work that needs this at all.
 fn unable(engine: &Candidate, needs: &Needs) -> Result<(), String> {
     let caps = &engine.capabilities;
@@ -1323,6 +1369,33 @@ fn winner_reason(
             "; tied on price with {}, {decider}",
             names.join(", ")
         ));
+    }
+    // On a subscription, the bigger cap is the cheaper to use up: say so when it was the
+    // reason a smaller one did not get the work.
+    let cap_of = |engine: &Candidate| engine.weekly_requests.filter(|cap| *cap > 0);
+    if win.sufficient
+        && win.price.economy == Economy::Subscription
+        && let Some(cap) = cap_of(engine)
+    {
+        let smaller: Vec<String> = scored
+            .iter()
+            .filter(|other| {
+                other.sufficient
+                    && other.index != win.index
+                    && other.price.economy == Economy::Subscription
+                    && cap_of(&engines[other.index]).is_some_and(|other_cap| other_cap < cap)
+            })
+            .map(|other| {
+                let rival = &engines[other.index];
+                format!("{} {}/wk", rival.name, cap_of(rival).unwrap_or(0))
+            })
+            .collect();
+        if !smaller.is_empty() {
+            text.push_str(&format!(
+                "; preferred over a smaller cap ({})",
+                smaller.join(", ")
+            ));
+        }
     }
     if let Some(p) = floor
         && win.sufficient
@@ -2287,17 +2360,20 @@ mod tests {
     #[test]
     fn a_subscription_costs_more_as_its_weekly_cap_runs_down() {
         let mut sub = engine("sub", ModelClass::Large, "subscription", Some(Cost::FREE));
-        sub.weekly_requests = Some(100);
+        sub.weekly_requests = Some(300);
         let docs = needs(WorkKind::Docs, Size::Small);
         let fresh = price(&sub, &docs, now());
         assert!((fresh.usd - SCARCITY_BASE_USD).abs() < 1e-9);
-        assert_eq!(fresh.note, "subscription, 100% of the weekly cap left");
+        assert_eq!(
+            fresh.note,
+            "subscription, cap 300/wk, 100% of the weekly cap left"
+        );
         sub.week = iso_week(now());
-        sub.requests = 50;
+        sub.requests = 150;
         let half = price(&sub, &docs, now());
-        sub.requests = 90;
+        sub.requests = 270;
         let low = price(&sub, &docs, now());
-        sub.requests = 100;
+        sub.requests = 300;
         let empty = price(&sub, &docs, now());
         assert!(fresh.usd < half.usd && half.usd < low.usd && low.usd < empty.usd);
         assert!((empty.usd - SCARCITY_BASE_USD * 10.0).abs() < 1e-9);
@@ -2890,5 +2966,132 @@ mod tests {
         )
         .unwrap();
         assert!(old.basis.is_none());
+    }
+
+    /// A subscription engine on a model the router knows, with its weekly cap.
+    fn subscribed(name: &str, model: &str, cap: u64) -> Candidate {
+        let mut engine = engine(name, ModelClass::Large, "subscription", Some(Cost::FREE));
+        engine.model = Some(model.into());
+        engine.weekly_requests = Some(cap);
+        engine
+    }
+
+    #[test]
+    fn a_request_on_a_bigger_weekly_cap_is_cheaper_to_use_up() {
+        let big = subscribed("claude-haiku", "haiku", 2000);
+        let small = subscribed("claude-sonnet", "sonnet", 300);
+        let docs = needs(WorkKind::Docs, Size::Small);
+        let (big_price, small_price) = (price(&big, &docs, now()), price(&small, &docs, now()));
+        // 300 is the reference cap, so it keeps the base scarcity; 2000 is 6.67 times less.
+        assert!((small_price.usd - SCARCITY_BASE_USD).abs() < 1e-9);
+        assert!((small_price.usd / big_price.usd - 2000.0 / 300.0).abs() < 1e-6);
+        assert_eq!(
+            big_price.note,
+            "subscription, cap 2000/wk, 100% of the weekly cap left"
+        );
+        assert_eq!(big_price.economy, Economy::Subscription);
+    }
+
+    #[test]
+    fn haiku_takes_what_it_clears_and_sonnet_only_what_haiku_does_not() {
+        let haiku = subscribed("claude-haiku", "haiku", 2000);
+        let sonnet = subscribed("claude-sonnet", "sonnet", 300);
+        let engines = [sonnet, haiku];
+        let policy = josh_policy();
+        // Both clear a small chore: the bigger cap is cheaper to use up, whatever p says.
+        let routed = run(&policy, &needs(WorkKind::Chore, Size::Small), &engines);
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("claude-haiku"));
+        assert!(
+            routed
+                .decision
+                .reason
+                .contains("preferred over a smaller cap (claude-sonnet 300/wk)"),
+            "{}",
+            routed.decision.reason
+        );
+        // Haiku is 0.72 at code against the 0.75 bar: only Sonnet clears it.
+        let routed = run(
+            &policy,
+            &needs(WorkKind::CodeChange, Size::Medium),
+            &engines,
+        );
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("claude-sonnet"));
+        assert!(!routed.decision.reason.contains("smaller cap"));
+        // Free still comes first, and paid still comes after both subscriptions.
+        let free = engine("free", ModelClass::Large, "free-tier", Some(Cost::FREE));
+        let paid = engine("paid", ModelClass::Large, "prepaid", per_call(0.05));
+        let all = [paid, engines[0].clone(), engines[1].clone(), free];
+        let routed = run(&policy, &needs(WorkKind::Chore, Size::Small), &all);
+        assert_eq!(
+            routed
+                .order
+                .iter()
+                .map(|i| all[*i].name.as_str())
+                .collect::<Vec<_>>(),
+            ["free", "claude-haiku", "claude-sonnet", "paid"]
+        );
+    }
+
+    #[test]
+    fn opus_is_not_picked_for_background_work_unless_the_policy_names_it() {
+        let opus = subscribed("claude-opus", "opus", 300);
+        let sonnet = subscribed("claude-sonnet", "sonnet", 300);
+        let engines = [opus, sonnet];
+        let docs = needs(WorkKind::Docs, Size::Small);
+        let policy = josh_policy();
+        let routed = run(&policy, &docs, &engines);
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("claude-sonnet"));
+        let left_out = routed
+            .decision
+            .candidates
+            .iter()
+            .find(|c| c.engine == "claude-opus")
+            .unwrap();
+        assert!(
+            left_out
+                .excluded
+                .as_ref()
+                .is_some_and(|why| why.contains("opus is not used for background work")),
+            "{left_out:?}"
+        );
+        // What the engine costs or how big it is does not name it.
+        let mut by_kind = josh_policy();
+        by_kind.prefer.insert(
+            "build".into(),
+            vec!["paid:subscription".into(), "class:large".into()],
+        );
+        let routed = run(&by_kind, &docs, &engines);
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("claude-sonnet"));
+        // Naming it (by name, or by model) lets it compete, and the bias puts it first.
+        for selector in ["name:claude-opus", "model:opus", "claude-opus"] {
+            let mut named = josh_policy();
+            named
+                .prefer
+                .insert("build".into(), vec![selector.to_string()]);
+            let routed = run(&named, &docs, &engines);
+            assert_eq!(
+                pick(&routed, &engines).as_deref(),
+                Some("claude-opus"),
+                "{selector}: {}",
+                routed.decision.reason
+            );
+        }
+        // Work somebody asked for directly is not background work.
+        let routed = route(
+            &policy,
+            Role::Build,
+            "build",
+            Work::Direct,
+            &docs,
+            &engines,
+            &Context::new(now()),
+        );
+        assert!(
+            routed
+                .decision
+                .candidates
+                .iter()
+                .any(|c| c.engine == "claude-opus" && c.excluded.is_none())
+        );
     }
 }

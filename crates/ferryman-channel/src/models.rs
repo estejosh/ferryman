@@ -139,6 +139,13 @@ pub fn profile_for(model: Option<&str>, name: &str) -> Option<Profile> {
     }
 }
 
+/// Whether an engine's model (or its name, with no model) is Claude Opus. The router does
+/// not pick it for background work unless the policy names it.
+#[must_use]
+pub fn is_opus(model: Option<&str>, name: &str) -> bool {
+    profile_for(model, name).is_some_and(|profile| profile.family == "claude-opus")
+}
+
 // --- sizes ---------------------------------------------------------------------------------
 
 /// Where the base level of a sized model stands at some parameter counts (billions): the

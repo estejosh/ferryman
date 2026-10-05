@@ -920,7 +920,12 @@ engines, as it always has, and the reason says so.
    list price ($5 in, $25 out per million tokens), so a declared price always beats a
    guess. A free tier that asked for money is priced like an unpriced one until its flag
    lapses. A subscription costs nothing per call, but its **scarcity** is priced: about two
-   cents a call with the weekly cap full, rising to ten times that as the cap runs down.
+   cents a call on a cap of 300 a week with the cap full, rising to ten times that as the
+   cap runs down, and in proportion to the cap - a request on a 2000 a week cap is about
+   6.7 times cheaper. So when two subscriptions both clear the bar, the one with the bigger
+   cap (Haiku at 2000) takes the work, and the smaller (Sonnet at 300) gets what the bigger
+   one does not clear. The line says so: `subscription, cap 2000/wk, ...; preferred over a
+   smaller cap (claude-sonnet 300/wk)`.
 3. **Choose.** The *sufficient set* is every engine whose estimate reaches the threshold
    for the kind. Unless the policy says otherwise that is **0.80 for review and plan**
    (only an engine that is actually good at judging and planning gets that work),
@@ -989,6 +994,10 @@ is found out. The rules:
   the kinds they help (0.05 each, at most 0.10), except a strength the profile already
   includes, such as `code` on a `-coder` model. For a model the router does not know,
   `class` and `strengths` count in full.
+- **Opus is never picked for background work by the router on its own.** It has a profile,
+  but an engine whose model is Claude Opus is left out of smart background routing unless
+  the role's prefer list names it (`name:claude-opus`, `model:opus`, or its bare name; a
+  `paid:` or `class:` selector does not count). Work you ask for directly is not held back.
 - Large work takes 0.05 off a medium model and 0.10 off a small one; a large model loses
   nothing.
 - `ferry route simulate` and `ferry route explain` say where each `p` came from, for
