@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.20 - 2026-10-05
+
+A revoked worker is no longer offered as an engine. Its last engines file stayed in the channel and still verified, so the router could send work to a retired name that nobody runs.
+
 ## v0.5.19 - 2026-10-03
 
 A smart router: each piece of work goes to the cheapest engine that will most likely do it well - text, code, vision, image, video or audio, local or remote - and climbs to a stronger one only when a cheaper one fails. `routing = ordered` keeps the old strict order.
