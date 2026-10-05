@@ -659,6 +659,7 @@ impl Bridge {
             vec![
                 vec![button("Projects", "projects"), button("Engines", "engines")],
                 vec![button("Tasks", "tasks"), button("Self-improve", "improve")],
+                vec![button("Focus", "focus")],
             ],
         )
     }
@@ -1149,6 +1150,131 @@ impl Bridge {
         .map_err(|error| format!("{error:#}"))
     }
 
+    /// The focus screen: every project with its tier, and the way to change it. The record
+    /// is signed in the home project's channel; the bridge signs as the master's delegate.
+    fn focus_view(&mut self, now: DateTime<Utc>) -> (String, Vec<Row>) {
+        let home = ferryman_channel::focus::home_project();
+        let Some(home_route) = self.route(&home).cloned() else {
+            return (
+                format!(
+                    "The focus is signed in {home}'s channel, which this bridge does not serve, \
+                     so it cannot change it from here. Use the dashboard, or run: ferry focus show"
+                ),
+                vec![menu_row()],
+            );
+        };
+        let focus =
+            ferryman_channel::focus::in_force(&home_route.communications, &home_route.project_id);
+        let mut lines = vec![
+            "Focus: which projects the swarm gives its time to. Focus work goes first and gets \
+             most of the weekly improve budget; paused gets none. Nothing changes until you \
+             press a project and a tier."
+                .to_string(),
+        ];
+        if !focus.is_set() {
+            lines.push("No focus is set: every project is normal.".to_string());
+        }
+        if let Some(notice) = &focus.notice {
+            lines.push(format!("Warning: {notice}"));
+        }
+        let routes = self.routes.clone();
+        let mut rows: Vec<Row> = Vec::new();
+        for route in &routes {
+            let project = &route.project_id;
+            if ferryman_channel::ferry::is_archived(&route.communications, project) {
+                lines.push(format!("{project}: archived, gets nothing"));
+                continue;
+            }
+            let entry = focus.pin(project, now).map_or_else(
+                || "normal".to_string(),
+                ferryman_channel::focus::Pin::describe,
+            );
+            lines.push(format!("{project}: {entry}"));
+            let data = self.data(format!("fsel:{project}"));
+            rows.push(vec![button(format!("{project}: {entry}"), data)]);
+        }
+        if focus.is_set() {
+            rows.push(vec![button("Clear the focus", "fclr")]);
+        }
+        rows.push(menu_row());
+        (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
+    }
+
+    /// The tiers one project can be put in.
+    fn focus_pick_view(&mut self, project: &str, now: DateTime<Utc>) -> (String, Vec<Row>) {
+        let tier = self.route(&ferryman_channel::focus::home_project()).map_or(
+            ferryman_channel::focus::Tier::Normal,
+            |home| {
+                ferryman_channel::focus::in_force(&home.communications, &home.project_id)
+                    .tier(project, now)
+            },
+        );
+        let mut lines = vec![format!("{project} is {tier} now. What should it be?")];
+        for each in ferryman_channel::focus::Tier::ALL {
+            lines.push(format!("{each}: {}", each.describe()));
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for (label, tier, days) in [
+            ("Focus for 30 days", "focus", 30),
+            ("Focus until I change it", "focus", 0),
+            ("Normal", "normal", 0),
+            ("Background for 30 days", "background", 30),
+            ("Paused for 30 days", "paused", 30),
+        ] {
+            let data = self.data(format!("fset:{project}:{tier}:{days}"));
+            rows.push(vec![button(label, data)]);
+        }
+        rows.push(vec![button("Back to the focus", "focus")]);
+        rows.push(menu_row());
+        (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
+    }
+
+    /// Change the focus as the home project's master, signed by the bridge.
+    fn change_focus(
+        &self,
+        change: impl FnOnce(&mut BTreeMap<String, ferryman_channel::focus::Pin>) -> anyhow::Result<()>,
+    ) -> std::result::Result<bool, String> {
+        let home = ferryman_channel::focus::home_project();
+        let route = self
+            .route(&home)
+            .ok_or_else(|| format!("{home}'s channel is not served here"))?;
+        let principal = self.principal(route)?;
+        ferryman_channel::focus::set(
+            &route.communications,
+            &route.project_id,
+            &self.agent,
+            Some(&principal),
+            change,
+            Utc::now(),
+        )
+        .map_err(|error| format!("{error:#}"))
+    }
+
+    /// Put one project in a tier (`days` of 0 or none: until changed). Normal is no entry.
+    fn switch_focus(
+        &self,
+        project: &str,
+        tier: &str,
+        days: Option<i64>,
+    ) -> std::result::Result<bool, String> {
+        let target = self
+            .route(project)
+            .ok_or_else(|| format!("{project} is not here"))?;
+        if ferryman_channel::ferry::is_archived(&target.communications, project) {
+            return Err(format!("{project} is archived, and gets nothing"));
+        }
+        let tier =
+            ferryman_channel::focus::Tier::parse(tier).map_err(|error| format!("{error:#}"))?;
+        let now = Utc::now();
+        self.change_focus(|entries| {
+            if tier == ferryman_channel::focus::Tier::Normal {
+                entries.remove(project);
+                Ok(())
+            } else {
+                ferryman_channel::focus::pin_project(entries, project, tier, days, now)
+            }
+        })
+    }
     fn on_callback(&mut self, callback: Callback, now: DateTime<Utc>) -> Vec<Action> {
         let chat = callback.message.as_ref().map_or(0, |m| m.chat.id);
         if !self.allowed(callback.from.id, chat) {
@@ -1268,6 +1394,28 @@ impl Bridge {
                 } else {
                     self.engines_view(chat, now)
                 })
+            }
+            "focus" => Some(self.focus_view(now)),
+            "fsel" => Some(self.focus_pick_view(&project, now)),
+            "fset" | "fclr" => {
+                let outcome = if verb == "fclr" {
+                    self.change_focus(|entries| {
+                        entries.clear();
+                        Ok(())
+                    })
+                } else {
+                    let days = extra.parse::<i64>().ok().filter(|days| *days > 0);
+                    self.switch_focus(&project, &id, days)
+                };
+                toast = match outcome {
+                    Ok(true) if verb == "fclr" => {
+                        "Focus cleared: every project is normal".to_string()
+                    }
+                    Ok(true) => format!("{project} is now {id}"),
+                    Ok(false) => "Already so".to_string(),
+                    Err(why) => excerpt(&why, 190),
+                };
+                Some(self.focus_view(now))
             }
             "tasks" => Some(self.tasks_view(chat, now)),
             "improve" => Some(self.improve_view()),
@@ -2729,10 +2877,13 @@ mod tests {
         let now = Utc::now();
         let menu = bridge.handle(text(JOSH_TG, GROUP, 1, "/start"), now);
         let labels: Vec<String> = buttons(&menu).into_iter().map(|(label, _)| label).collect();
-        assert_eq!(labels, ["Projects", "Engines", "Tasks", "Self-improve"]);
+        assert_eq!(
+            labels,
+            ["Projects", "Engines", "Tasks", "Self-improve", "Focus"]
+        );
         let other = bridge.handle(text(JOSH_TG, GROUP, 2, "/status"), now);
         assert!(texts(&other)[0].starts_with("Use the buttons"));
-        assert_eq!(buttons(&other).len(), 4, "and the menu with it");
+        assert_eq!(buttons(&other).len(), 5, "and the menu with it");
     }
 
     #[test]
@@ -3126,6 +3277,121 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn the_focus_is_viewed_and_changed_from_buttons_signed_for_the_master() {
+        use ferryman_channel::focus::{Tier, in_force};
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let (mut bridge, ferryman, bullship) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        let tier = |project: &str| {
+            in_force(&ferryman.communications, "ferryman").tier(project, Utc::now())
+        };
+        let answer = |actions: &[Action]| match &actions[0] {
+            Action::Answer { text, .. } => text.clone(),
+            other => panic!("expected an answer, got {other:?}"),
+        };
+        let push = |bridge: &mut Bridge, data: &str| {
+            bridge.handle(press(JOSH_TG, GROUP, 91, data), Utc::now())
+        };
+
+        let view = push(&mut bridge, "focus");
+        let data: Vec<String> = buttons(&view).into_iter().map(|(_, data)| data).collect();
+        assert!(data.contains(&"fsel:ferryman".to_string()), "{data:?}");
+        assert!(data.contains(&"fsel:bullship".to_string()), "{data:?}");
+        assert!(!data.contains(&"fclr".to_string()), "nothing to clear yet");
+        assert!(texts(&view)[0].contains("No focus is set"), "{view:?}");
+
+        // A project's tiers.
+        let pick = push(&mut bridge, "fsel:bullship");
+        let data: Vec<String> = buttons(&pick).into_iter().map(|(_, data)| data).collect();
+        for want in [
+            "fset:bullship:focus:30",
+            "fset:bullship:focus:0",
+            "fset:bullship:normal:0",
+            "fset:bullship:background:30",
+            "fset:bullship:paused:30",
+        ] {
+            assert!(data.contains(&want.to_string()), "{want} in {data:?}");
+        }
+
+        // Choosing one signs it as the master, through the delegation.
+        let set = push(&mut bridge, "fset:bullship:focus:30");
+        assert_eq!(answer(&set), "bullship is now focus");
+        assert_eq!(tier("bullship"), Tier::Focus);
+        assert_eq!(tier("ferryman"), Tier::Normal);
+        let record = in_force(&ferryman.communications, "ferryman")
+            .setting
+            .unwrap();
+        assert_eq!(record.set_by(), "josh via telegram-grouchly");
+        assert!(record.projects["bullship"].until.is_some(), "30 days");
+        // The view that follows shows it, and offers to clear.
+        let shown = buttons(&set);
+        assert!(
+            shown.iter().any(
+                |(label, data)| data == "fsel:bullship" && label.starts_with("bullship: focus")
+            ),
+            "{shown:?}"
+        );
+        assert!(shown.iter().any(|(_, data)| data == "fclr"));
+
+        // Until changed, pressed again: nothing to sign.
+        push(&mut bridge, "fset:bullship:focus:0");
+        let again = push(&mut bridge, "fset:bullship:focus:0");
+        assert_eq!(answer(&again), "Already so");
+        push(&mut bridge, "fset:ferryman:paused:0");
+        assert_eq!(tier("ferryman"), Tier::Paused);
+        // Normal is no entry at all.
+        push(&mut bridge, "fset:bullship:normal:0");
+        assert_eq!(tier("bullship"), Tier::Normal);
+        assert!(
+            !in_force(&ferryman.communications, "ferryman")
+                .setting
+                .unwrap()
+                .projects
+                .contains_key("bullship")
+        );
+
+        let cleared = push(&mut bridge, "fclr");
+        assert!(answer(&cleared).starts_with("Focus cleared"), "{cleared:?}");
+        assert!(!in_force(&ferryman.communications, "ferryman").is_set());
+
+        // An archived project is refused: it gets nothing.
+        ferryman_channel::ferry::set_archived(&bullship.communications, "bullship", true, &josh())
+            .unwrap();
+        let refused = push(&mut bridge, "fset:bullship:focus:30");
+        assert!(answer(&refused).contains("archived"), "{refused:?}");
+        assert!(!in_force(&ferryman.communications, "ferryman").is_set());
+        let view = push(&mut bridge, "focus");
+        assert!(
+            !buttons(&view)
+                .iter()
+                .any(|(_, data)| data == "fsel:bullship"),
+            "an archived project is not offered"
+        );
+    }
+
+    #[test]
+    fn the_focus_cannot_be_changed_from_the_phone_without_the_improve_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        // Delegated for orders only.
+        delegate(&ferryman, &["orders"]);
+        let refused = bridge.handle(
+            press(JOSH_TG, GROUP, 92, "fset:bullship:focus:30"),
+            Utc::now(),
+        );
+        assert!(
+            matches!(&refused[0], Action::Answer { text, .. } if !text.contains("is now")),
+            "{refused:?}"
+        );
+        assert!(!ferryman.communications.join("FOCUS").exists());
+        // Nobody but an approver may press the buttons at all.
+        let stranger = bridge.handle(press(777, GROUP, 93, "fset:bullship:focus:30"), Utc::now());
+        assert!(stranger.is_empty());
+        assert!(!ferryman.communications.join("FOCUS").exists());
+    }
     /// "On for all" from the phone passes over an archived project, even one the bridge
     /// may switch.
     #[test]

@@ -28,6 +28,8 @@ pub mod entitlement;
 pub mod events;
 pub mod evidence;
 pub mod ferry;
+pub mod focus;
+pub mod focus_suggest;
 pub mod gate;
 pub mod head;
 pub mod hold;

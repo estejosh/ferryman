@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod adversary;
 mod enginepolicy;
+mod focus;
 mod gitanchor;
 mod license;
 mod licensor;
@@ -363,6 +364,18 @@ enum Command {
     Improve {
         #[command(subcommand)]
         command: ImproveCommand,
+    },
+    /// Which projects the swarm is spending itself on right now: the master's signed
+    /// tier per project (focus, normal, background, paused), with an optional expiry.
+    /// Focus projects get most of the weekly improve budget and the first claim on
+    /// workers; background a trickle; paused and archived none of the swarm's own work.
+    ///
+    /// `ferry focus suggest` shows what the fleet's own signals say, signing nothing.
+    /// The record travels in the `ferryman` channel, so every machine follows it; the
+    /// dashboard (Focus) and Telegram (Focus) change it too.
+    Focus {
+        #[command(subcommand)]
+        command: focus::FocusCommand,
     },
     /// What this deployment counts as under the licence.
     License {
@@ -3390,7 +3403,9 @@ async fn improve_command(command: ImproveCommand) -> Result<()> {
                     )
                 })
                 .count();
-            let done = improve::run(&targets, max, now, &report).await;
+            // Projects in focus order, and the week's budget split by the fleet's focus.
+            let focus = ferryman_channel::focus::current();
+            let done = improve::run_focused(&targets, max, &focus, now, &report).await;
             if on == 0 {
                 println!(
                     "no project here has self-improve switched on; see 'ferry improve status'"
@@ -4126,6 +4141,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => enginepolicy::command(command).await?,
         Command::Engines { at, json, .. } => engines_command(&at, json)?,
         Command::Improve { command } => improve_command(command).await?,
+        Command::Focus { command } => focus::command(command)?,
         Command::License { command } => license_command(command).await?,
         Command::Telegram {
             agent,
@@ -6811,6 +6827,28 @@ async fn agent_command(command: Agent) -> Result<()> {
 
                 anchor_maintenance(&fleet.served, &report).await;
 
+                // The projects the fleet is focused on are looked at first, then the rest,
+                // background and paused last, and an archived one after them all. A
+                // project's own orders are never held by its tier; only the order changes.
+                // With no focus set the order is exactly as the channels were found.
+                let focus = ferryman_channel::focus::current();
+                if focus.is_set() {
+                    let ids: Vec<String> = fleet
+                        .served
+                        .iter()
+                        .map(|(route, _)| route.project_id.clone())
+                        .collect();
+                    let order = focus.claim_order(&ids, chrono::Utc::now());
+                    fleet.served.sort_by_key(|(route, _)| {
+                        (
+                            ferryman_channel::ferry::is_archived(
+                                &route.communications,
+                                &route.project_id,
+                            ),
+                            order.iter().position(|id| *id == route.project_id),
+                        )
+                    });
+                }
                 for (route, config) in &mut fleet.served {
                     match agent::work_once(route, config, &report).await {
                         Ok(0) => {}
@@ -6841,9 +6879,10 @@ async fn agent_command(command: Agent) -> Result<()> {
                     .cloned()
                     .collect();
                 if !improving.is_empty() && ferryman_ops::improve::hourly_due(chrono::Utc::now()) {
-                    for line in ferryman_ops::improve::run(
+                    for line in ferryman_ops::improve::run_focused(
                         &improving,
                         ferryman_ops::improve::DEFAULT_MAX,
+                        &ferryman_channel::focus::current(),
                         chrono::Utc::now(),
                         &report,
                     )

@@ -51,7 +51,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use ferryman_channel::{
-    AgentIdentity, Order, ProjectRoute, Task, TaskState, trajectory::Trajectory,
+    AgentIdentity, Order, ProjectRoute, Task, TaskState,
+    focus::{Focus, Share, Tier as FocusTier, allocate},
+    trajectory::Trajectory,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -2119,6 +2121,22 @@ pub async fn run(
     now: DateTime<Utc>,
     report: &dyn Progress,
 ) -> Vec<String> {
+    run_focused(targets, max, &Focus::default(), now, report).await
+}
+
+/// [`run`] under the fleet's [`Focus`]: the projects are worked in focus order, and the
+/// week's budget - `max` improvement orders for each project that is not paused - is split
+/// over them by tier weight ([`ferryman_channel::focus::allocate`]), so focus projects get
+/// the large majority, background a trickle, and a paused project is not gathered for or
+/// planned at all (what it already has in flight is still reviewed and reported). With no
+/// focus set every project is normal and gets `max`, exactly as [`run`].
+pub async fn run_focused(
+    targets: &[(ProjectRoute, AgentConfig)],
+    max: usize,
+    focus: &Focus,
+    now: DateTime<Utc>,
+    report: &dyn Progress,
+) -> Vec<String> {
     let mut done = Vec::new();
     if let Some(why) = paused() {
         report.info(&format!(
@@ -2129,7 +2147,9 @@ pub async fn run(
     let week = engines::iso_week(now);
     let last_week = engines::iso_week(now - Duration::days(7));
     let mut seen: BTreeMap<String, ()> = BTreeMap::new();
-    for (route, config) in targets {
+    let mut ordered: Vec<&(ProjectRoute, AgentConfig)> = Vec::new();
+    for target in targets {
+        let route = &target.0;
         if seen.insert(route.project_id.clone(), ()).is_some()
             || !ferryman_channel::ferry::self_improve_enabled(
                 &route.communications,
@@ -2138,7 +2158,24 @@ pub async fn run(
         {
             continue;
         }
+        ordered.push(target);
+    }
+    // Focus projects first, and the week's budget split over them by tier.
+    ordered.sort_by_key(|(route, _)| focus.tier(&route.project_id, now));
+    let tiers: Vec<(String, FocusTier)> = ordered
+        .iter()
+        .map(|(route, _)| (route.project_id.clone(), focus.tier(&route.project_id, now)))
+        .collect();
+    let shares: BTreeMap<String, Share> = allocate(&tiers, max)
+        .into_iter()
+        .map(|share| (share.project.clone(), share))
+        .collect();
+    for (route, config) in ordered {
         let project = &route.project_id;
+        let Some(share) = shares.get(project) else {
+            continue;
+        };
+        let sleeping = share.tier == FocusTier::Paused;
         // An engine policy that went back or vanished from the channel: this machine keeps
         // the last one the master signed, and the master is asked once.
         if let Ok(identity) = signing_identity(route, config)
@@ -2150,7 +2187,7 @@ pub async fn run(
             ));
         }
         let dir = week_dir(route, &week);
-        if !dir.join("evidence.md").is_file() {
+        if !sleeping && !dir.join("evidence.md").is_file() {
             match gather(route, now) {
                 Ok(_) => {
                     note_step(route, config, &week, "gather", None, None, None, "done");
@@ -2159,17 +2196,22 @@ pub async fn run(
                 Err(error) => report.warn(&format!("{project}: gather failed: {error:#}")),
             }
         }
-        if !dir.join("plan.json").is_file() {
-            match plan(route, config, max, now, report).await {
+        if !sleeping && !dir.join("plan.json").is_file() {
+            match plan(route, config, share.orders, now, report).await {
                 Ok(PlanOutcome::Planned {
                     engine,
                     unreviewed,
                     orders,
                     ..
                 }) => done.push(format!(
-                    "{project}: planned {} improvement(s) with {engine}{}",
+                    "{project}: planned {} improvement(s) with {engine}{}{}",
                     orders.len(),
-                    if unreviewed { " (unreviewed)" } else { "" }
+                    if unreviewed { " (unreviewed)" } else { "" },
+                    if focus.is_set() {
+                        format!(" [{}: up to {} this week]", share.tier, share.orders)
+                    } else {
+                        String::new()
+                    }
                 )),
                 Ok(PlanOutcome::NoEngine(why)) => {
                     report.warn(&format!("{project}: no engine could plan: {why}"));
@@ -2287,7 +2329,16 @@ mod tests {
     /// A channel whose roster knows wisp, with wisp's key held here, and a config
     /// running `engines`.
     fn channel(dir: &Path, engines: Vec<EngineSpec>) -> (ProjectRoute, AgentConfig) {
-        let workspace = dir.join("demo-ferryman");
+        channel_of(dir, "demo", engines)
+    }
+
+    /// [`channel`] for a project called `project`.
+    fn channel_of(
+        dir: &Path,
+        project: &str,
+        engines: Vec<EngineSpec>,
+    ) -> (ProjectRoute, AgentConfig) {
+        let workspace = dir.join(format!("{project}-ferryman"));
         let attachment = workspace.join(".ferryman");
         let communications = attachment.join("ferryman");
         fs::create_dir_all(communications.join("agents")).unwrap();
@@ -2295,7 +2346,7 @@ mod tests {
         fs::write(
             attachment.join("bridge.toml"),
             format!(
-                "project = \"demo\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\n",
+                "project = \"{project}\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\n",
                 slash(&workspace),
                 slash(&attachment),
                 slash(&communications)
@@ -2615,6 +2666,112 @@ mod tests {
         assert!(!read_plan(&route, &week).unwrap().unreviewed);
     }
 
+    /// The focus the master has signed, as `run_focused` reads it.
+    fn focus_of(entries: &[(&str, FocusTier)]) -> Focus {
+        let now = Utc::now();
+        let mut projects = BTreeMap::new();
+        for (project, tier) in entries {
+            ferryman_channel::focus::pin_project(&mut projects, project, *tier, None, now).unwrap();
+        }
+        Focus {
+            home: "ferryman".into(),
+            setting: Some(ferryman_channel::focus::FocusSetting {
+                home: "ferryman".into(),
+                projects,
+                set_at: now,
+                signed_by: "josh".into(),
+                signature: String::new(),
+                on_behalf_of: None,
+                seq: 1,
+            }),
+            notice: None,
+            from_memory: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_focused_run_visits_focus_first_shares_the_budget_and_leaves_a_paused_project_alone()
+    {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let sub = dir.path().join(name);
+            fs::create_dir_all(&sub).unwrap();
+            let judge = engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"));
+            let (route, config) = channel_of(&sub, name, vec![judge]);
+            switch_on(&route);
+            (route, config)
+        };
+        let (side, side_config) = make("side");
+        let (sleepy, sleepy_config) = make("sleepy");
+        let (hot, hot_config) = make("hot");
+        // Given in the order a root lists them: the focus project is last.
+        let targets = vec![
+            (side.clone(), side_config),
+            (sleepy.clone(), sleepy_config),
+            (hot.clone(), hot_config),
+        ];
+        let now = Utc::now();
+        let focus = focus_of(&[
+            ("hot", FocusTier::Focus),
+            ("side", FocusTier::Background),
+            ("sleepy", FocusTier::Paused),
+        ]);
+
+        // Two a week each, as `--max 2`: 4 orders over the two projects that are not
+        // paused, shared 12 : 1 - the focus project is held to the plan's two, the
+        // background one gets its trickle of one, the paused one nothing.
+        let done = run_focused(&targets, 2, &focus, now, &crate::Silent).await;
+        assert_eq!(improvements(&hot).len(), 2, "{done:?}");
+        assert_eq!(improvements(&side).len(), 1, "{done:?}");
+        assert!(improvements(&sleepy).is_empty(), "{done:?}");
+        let evidence = |route: &ProjectRoute| {
+            week_dir(route, &engines::iso_week(now))
+                .join("evidence.md")
+                .is_file()
+        };
+        assert!(evidence(&hot) && evidence(&side));
+        assert!(
+            !evidence(&sleepy),
+            "a paused project is not even gathered for"
+        );
+        let position = |needle: &str| done.iter().position(|line| line.starts_with(needle));
+        assert!(
+            position("hot: planned").unwrap() < position("side: planned").unwrap(),
+            "focus first: {done:?}"
+        );
+        assert!(position("sleepy: planned").is_none() && position("sleepy: gathered").is_none());
+        assert!(
+            done.iter()
+                .any(|line| line.contains("[focus: up to 3 this week]")),
+            "{done:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_no_focus_a_run_gives_every_project_its_usual() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (lone, config) = channel_of(
+            dir.path(),
+            "lone",
+            vec![engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"))],
+        );
+        switch_on(&lone);
+        let done = run_focused(
+            &[(lone.clone(), config)],
+            1,
+            &Focus::default(),
+            Utc::now(),
+            &crate::Silent,
+        )
+        .await;
+        assert_eq!(improvements(&lone).len(), 1, "{done:?}");
+        assert!(
+            !done.iter().any(|line| line.contains("this week]")),
+            "no focus, nothing said about one: {done:?}"
+        );
+    }
     #[tokio::test]
     async fn run_twice_does_the_week_once_and_nothing_while_paused() {
         hermetic();

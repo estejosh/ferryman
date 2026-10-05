@@ -218,6 +218,11 @@ n8n or cron as often as you like:
 `improve = "true"` in `agent.toml` lets the worker run it itself, at most hourly.
 `ferry pause` stops all of it.
 
+Projects are visited, and the weekly budget of `--max` orders each is shared out, by the
+master's signed focus (`ferry focus`, the dashboard's Focus page, or Telegram's Focus
+button): focus projects first and most, paused projects skipped. With no focus signed,
+every project is treated alike. See [FOCUS.md](FOCUS.md).
+
 ## Which engines do background work: the engine policy
 
 Self-improve runs with nobody watching, so it must never quietly spend the Claude or

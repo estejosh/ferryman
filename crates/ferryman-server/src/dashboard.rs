@@ -425,6 +425,8 @@ pub fn router(state: DashboardState) -> Router {
             get(engine_policy_team_get).post(engine_policy_team_accept),
         )
         .route("/api/engine-policy/settings", post(engine_policy_settings))
+        .route("/api/focus", get(focus_get).post(focus_set))
+        .route("/api/focus/clear", post(focus_clear))
         .route("/api/improve/pending", get(improve_pending))
         .route("/api/improve/decide", post(improve_decide))
         .route(
@@ -2594,6 +2596,231 @@ async fn engine_policy_settings(
             Some(policy)
         },
     )
+}
+
+/// The home project's route - the project whose channel holds the fleet's focus record:
+/// this dashboard's own project when that is it, else the one the ferry root knows.
+fn focus_home(state: &DashboardState) -> Option<Arc<ProjectRoute>> {
+    let home = ferryman_channel::focus::home_project();
+    if state.route.project_id == home {
+        return Some(state.route.clone());
+    }
+    find_project_route(&state.route, &home).map(Arc::new)
+}
+
+/// Every live project a focus screen is about, as (id, channel): the ferry root's, and
+/// this dashboard's own when the root does not list it.
+fn focus_projects(state: &DashboardState) -> Vec<(String, std::path::PathBuf)> {
+    let mut projects = every_project(state);
+    if !projects.iter().any(|(id, _)| *id == state.route.project_id)
+        && !ferryman_channel::ferry::is_archived(
+            &state.route.communications,
+            &state.route.project_id,
+        )
+    {
+        projects.push((
+            state.route.project_id.clone(),
+            state.route.communications.clone(),
+        ));
+    }
+    projects
+}
+
+#[derive(Deserialize, Default)]
+struct FocusParams {
+    /// `1` also reads the fleet's own signals and suggests a tier per project - git and
+    /// the channels are read for each, so it is asked for, not sent every time.
+    #[serde(default)]
+    suggest: Option<String>,
+}
+
+/// GET /api/focus - the swarm's focus: who signed it, each project's tier, what that comes
+/// to this week and the width its improvement orders may run at; with `?suggest=1` also
+/// what the fleet's own signals say, one reason per project. `may_set` is true only for
+/// the signed-in master of the home project.
+async fn focus_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<FocusParams>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::{focus, focus_suggest};
+    let tiers: Vec<Value> = focus::Tier::ALL
+        .iter()
+        .map(|tier| {
+            json!({ "tier": tier.as_str(), "weight": tier.weight(), "describe": tier.describe() })
+        })
+        .collect();
+    let Some(home) = focus_home(&state) else {
+        return Ok(Json(json!({
+            "available": false,
+            "home": focus::home_project(),
+            "tiers": tiers,
+            "may_set": false,
+        })));
+    };
+    let now = chrono::Utc::now();
+    let current = focus::in_force(&home.communications, &home.project_id);
+    let projects = focus_projects(&state);
+    let rows = focus::overview(&projects, &current, focus::PER_PROJECT, now);
+    let master = ferryman_channel::ferry::master_of(&home.communications)
+        .ok()
+        .flatten();
+    let may_set = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    let setting = current.setting.as_ref();
+    let suggestions = params
+        .suggest
+        .as_deref()
+        .is_some_and(|flag| !matches!(flag, "" | "0" | "false"))
+        .then(|| {
+            let mut candidates = focus_suggest::candidates_from_root();
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.project == state.route.project_id)
+            {
+                candidates.push(focus_suggest::Candidate {
+                    project: state.route.project_id.clone(),
+                    route: Some(state.route.as_ref().clone()),
+                });
+            }
+            focus_suggest::suggest(&candidates, &current, &focus_suggest::seed_list(), now)
+        });
+    Ok(Json(json!({
+        "available": true,
+        "home": home.project_id,
+        "set_by": setting.map(focus::FocusSetting::set_by),
+        "set_at": setting.map(|s| s.set_at),
+        "seq": setting.map(|s| s.seq),
+        "set": current.is_set(),
+        "notice": current.notice,
+        "expired": current
+            .expired(now)
+            .into_iter()
+            .map(|(project, pin)| json!({ "project": project, "entry": pin.describe() }))
+            .collect::<Vec<_>>(),
+        "projects": rows,
+        "tiers": tiers,
+        "may_set": may_set,
+        "master": master,
+        "suggestions": suggestions,
+    })))
+}
+
+#[derive(Deserialize)]
+struct FocusBody {
+    projects: Vec<String>,
+    tier: String,
+    /// The entry lasts this many days; without it, until changed.
+    #[serde(default)]
+    days: Option<i64>,
+}
+
+/// POST /api/focus - the master puts projects in a tier, signed with the session's key, the
+/// same as `ferry focus set`; anyone but the master is refused. Other entries stay.
+async fn focus_set(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<FocusBody>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::focus;
+    let current = session_identity(&state, &headers)?;
+    let tier = focus::Tier::parse(&body.tier)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    if body.projects.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "name a project".to_string()));
+    }
+    let live = focus_projects(&state);
+    for name in &body.projects {
+        if !live.iter().any(|(id, _)| id == name) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("{name} is not a live project here (unknown, or archived)"),
+            ));
+        }
+    }
+    let now = chrono::Utc::now();
+    let mut probe = std::collections::BTreeMap::new();
+    for name in &body.projects {
+        focus::pin_project(&mut probe, name, tier, body.days, now)
+            .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    }
+    sign_focus(&state, &current, |entries| {
+        entries.extend(probe);
+        Ok(())
+    })
+    .map(|changed| {
+        Json(json!({ "changed": changed, "tier": tier.as_str(), "projects": body.projects }))
+    })
+}
+
+#[derive(Deserialize, Default)]
+struct FocusClearBody {
+    /// The projects to take off; none named takes every entry off.
+    #[serde(default)]
+    projects: Vec<String>,
+}
+
+/// POST /api/focus/clear - the master takes entries off, signed: the named projects, or
+/// all of them.
+async fn focus_clear(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<FocusClearBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    sign_focus(&state, &current, |entries| {
+        if body.projects.is_empty() {
+            entries.clear();
+        } else {
+            for name in &body.projects {
+                entries.remove(name);
+            }
+        }
+        Ok(())
+    })
+    .map(|changed| Json(json!({ "changed": changed })))
+}
+
+/// Sign a change to the focus entries in the home project's channel as the signed-in
+/// person, who must be its master, and note it in the ledger.
+fn sign_focus(
+    state: &DashboardState,
+    current: &AgentIdentity,
+    change: impl FnOnce(
+        &mut std::collections::BTreeMap<String, ferryman_channel::focus::Pin>,
+    ) -> anyhow::Result<()>,
+) -> Result<bool, DashboardError> {
+    let home = focus_home(state).ok_or((
+        StatusCode::NOT_FOUND,
+        format!(
+            "the focus lives in {}'s channel, which is not on this machine",
+            ferryman_channel::focus::home_project()
+        ),
+    ))?;
+    let changed = ferryman_channel::focus::set(
+        &home.communications,
+        &home.project_id,
+        current,
+        None,
+        change,
+        chrono::Utc::now(),
+    )
+    .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    if changed {
+        let _ = ferryman_channel::ledger::append_ledger_entry(
+            &home,
+            current,
+            "focus",
+            current.name(),
+            &format!("{} changed the swarm's focus", current.name()),
+            None,
+        );
+    }
+    Ok(changed)
 }
 
 /// GET /api/improve/pending - improvements waiting on a key: the review engine's verdict,
@@ -4948,6 +5175,7 @@ mod tests {
             "/api/engine-policy",
             "/api/engine-policy/team",
             "/api/improve/pending",
+            "/api/focus",
         ] {
             let response = app
                 .clone()
@@ -4970,6 +5198,8 @@ mod tests {
             ("/api/cost/plan", r#"{"goal":"x"}"#),
             ("/api/engine-policy/team", "{}"),
             ("/api/engine-policy/settings", r#"{"width":{"build":9}}"#),
+            ("/api/focus", r#"{"projects":["ferryman"],"tier":"paused"}"#),
+            ("/api/focus/clear", "{}"),
         ] {
             let response = post(&app, path, body, None).await;
             assert_eq!(
@@ -5883,6 +6113,60 @@ mod tests {
 
     /// The engine policy from the browser: auto until the master signs one, what auto
     /// recommends and why, accept and edit for the master only, and back to auto.
+    #[tokio::test]
+    async fn only_the_master_sets_the_focus_from_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        let set_path = route.communications.join("FOCUS");
+        let body = r#"{"projects":["ferryman"],"tier":"focus","days":30}"#;
+
+        let before = get_json(&app, "/api/focus", Some(&token)).await;
+        assert_eq!(before["available"], true, "{before}");
+        assert_eq!(before["set"], false);
+        assert_eq!(before["may_set"], false, "nobody is master yet");
+        assert_eq!(before["tiers"].as_array().unwrap().len(), 4);
+        assert_eq!(before["projects"][0]["tier"], "normal", "{before}");
+        let refused = post(&app, "/api/focus", body, Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+        let refused = post(&app, "/api/focus/clear", "{}", Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+        assert!(!set_path.exists(), "nothing was signed");
+
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let set = post(&app, "/api/focus", body, Some(&token)).await;
+        assert_eq!(set.status(), StatusCode::OK);
+        assert!(set_path.exists());
+        let after = get_json(&app, "/api/focus?suggest=1", Some(&token)).await;
+        assert_eq!(after["set"], true, "{after}");
+        assert_eq!(after["may_set"], true);
+        assert_eq!(after["set_by"], "alice");
+        assert_eq!(after["projects"][0]["tier"], "focus", "{after}");
+        assert!(after["projects"][0]["expires"].is_string(), "{after}");
+        assert!(after["suggestions"]["rows"].is_array(), "{after}");
+
+        // Nonsense is refused before anything is signed.
+        for bad in [
+            r#"{"projects":["ferryman"],"tier":"urgent"}"#,
+            r#"{"projects":["nowhere"],"tier":"focus"}"#,
+            r#"{"projects":[],"tier":"focus"}"#,
+            r#"{"projects":["ferryman"],"tier":"focus","days":0}"#,
+        ] {
+            let refused = post(&app, "/api/focus", bad, Some(&token)).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
+        }
+
+        let cleared = post(&app, "/api/focus/clear", "{}", Some(&token)).await;
+        assert_eq!(cleared.status(), StatusCode::OK);
+        let view = get_json(&app, "/api/focus", Some(&token)).await;
+        assert_eq!(view["set"], false, "{view}");
+        assert_eq!(view["projects"][0]["tier"], "normal");
+        assert!(set_path.exists(), "clearing is a newer, empty record");
+    }
     #[tokio::test]
     async fn only_the_master_sets_the_engine_policy_from_the_browser() {
         let dir = tempfile::tempdir().unwrap();

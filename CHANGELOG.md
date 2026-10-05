@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+The swarm knows which projects are the focus. The master signs a tier for each project - focus, normal, background or paused, each with an optional expiry - in the home channel, with a sequence number and a machine-local high-water mark so an older copy cannot roll it back. `improve run` visits projects in that order and shares its weekly budget by weight (focus 12, normal 3, background 1, paused none), workers look at focus projects first, and the width of improvement orders follows the tier. A person's own orders are never held, self-improve stays a per-repo switch and an archived project gets nothing. `ferry focus show|set|suggest|clear`, the dashboard's Focus page and Telegram's Focus button change it; `suggest` proposes tiers from git activity, open and failed orders, gathered evidence and staleness, and signs nothing. See docs/FOCUS.md.
+
 ## v0.5.20 - 2026-10-05
 
 A revoked worker is no longer offered as an engine. Its last engines file stayed in the channel and still verified, so the router could send work to a retired name that nobody runs.

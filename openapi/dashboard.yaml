@@ -401,6 +401,69 @@ paths:
         '400': {description: 'nothing to set, a width of 0, a role, effort, kind or routing that means nothing, or a threshold outside 0 to 1'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/focus:
+    get:
+      summary: The swarm's focus - which projects it is spending itself on
+      description: >
+        The master-signed FOCUS record in the home project's channel (`ferryman`, or
+        FERRYMAN_FOCUS_HOME): a tier per project - focus, normal, background or paused -
+        each with an optional expiry. `projects` lays it over every live project: its tier,
+        the entry that set it, `orders` (improvement orders planned this week, for a project
+        with self-improve on) and `width` (how many of a role may run at once under the
+        tier). `notice` says when this machine is holding on to an earlier record because
+        the file went back or vanished. `?suggest=1` also returns `suggestions`: what the
+        fleet's own signals say per project, with one reason each; nothing is signed.
+        `may_set` is true only for the signed-in master of the home project. The CLI
+        equivalent is `ferry focus show` and `ferry focus suggest`.
+      parameters:
+        - {name: suggest, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'available, home, set_by, set_at, seq, set, notice, expired, projects, tiers, may_set, master and, when asked, suggestions'}
+        '401': {description: no active session}
+    post:
+      summary: The master puts projects in a tier
+      description: >
+        Signs the entries into the home project's channel with the session's key, where
+        every machine reads them; other projects keep their entries. `days` makes the
+        entries expire (1 to 366). Only the master signs it. The CLI equivalent is
+        `ferry focus set`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [projects, tier]
+              properties:
+                projects: {type: array, items: {type: string}}
+                tier: {type: string, enum: [focus, normal, background, paused]}
+                days: {type: integer, minimum: 1, maximum: 366}
+      responses:
+        '200': {description: 'whether anything changed'}
+        '400': {description: no project named, a project that is unknown or archived, a tier that means nothing, or days out of range}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: the home project's channel is not on this machine}
+  /api/focus/clear:
+    post:
+      summary: The master takes focus entries off
+      description: >
+        Signs a newer record without the named projects, or without any entry when none
+        is named, so every project reads as normal again. The CLI equivalent is
+        `ferry focus clear`.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                projects: {type: array, items: {type: string}}
+      responses:
+        '200': {description: 'whether anything changed'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: the home project's channel is not on this machine}
   /api/improve/pending:
     get:
       summary: Improvements waiting on a key
