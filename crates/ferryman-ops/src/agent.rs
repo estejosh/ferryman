@@ -8147,6 +8147,11 @@ engine.coder.model = "big-coder"
 
     /// An engine that runs out of credit while several orders are on it: the orders already
     /// on it fail over to the next engine and finish, and no later claim goes near it.
+    ///
+    /// The backup is slower than the gap between claims on purpose. In a repository its
+    /// commit-less results are refuted, and two refuted results demote it; the third order
+    /// has to fail over to it before the second of those lands. At 50 ms that depended on a
+    /// worktree being made in under 50 ms, which a fast filesystem does not guarantee.
     #[tokio::test]
     async fn an_engine_out_of_credit_mid_swarm_fails_over_without_stopping_the_others() {
         hermetic_machine();
@@ -8154,7 +8159,7 @@ engine.coder.model = "big-coder"
         let config_text = format!(
             "{SWARM_BASE}max_parallel = \"3\"\nworktree = \"true\"\nengines = [\"flaky\", \"backup\"]\n\
              engine.flaky.base_url = \"fake://slow:swarm4f:150:quota\"\nengine.flaky.model = \"m\"\n\
-             engine.backup.base_url = \"fake://slow:swarm4b:50:done\"\nengine.backup.model = \"m\"\n"
+             engine.backup.base_url = \"fake://slow:swarm4b:400:done\"\nengine.backup.model = \"m\"\n"
         );
         let (route, config) = swarm_channel(comms.path(), "sw4-a", &[], &config_text);
         swarm_order(&route, "sw4-b", &[]);
