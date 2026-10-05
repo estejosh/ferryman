@@ -36,3 +36,13 @@ Use Rust stable, `cargo fmt --check`, `cargo clippy --workspace --all-targets --
 ## Review and releases
 
 Maintainers review every pull request. CI checks formatting, linting, tests on Windows/macOS/Linux, dependency audit, secret scanning, and an SPDX SBOM. A merged commit is **not** a Ferryman update: installations only update from a versioned release declared in `bridge-release.toml`. See [the release process](docs/RELEASE_PROCESS.md).
+
+## suggestions and change requests
+
+email helpmeagent@agentmail.to with the repo name in brackets at the start of the subject:
+
+    [FERRYMAN] short description of the change
+
+one request per email. say what you want changed and why.
+an ai triages every message, replies with its assessment, and opens a github issue if it's actionable.
+don't send secrets, keys or private data.
