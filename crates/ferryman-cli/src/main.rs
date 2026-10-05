@@ -1601,10 +1601,16 @@ enum TeamCommand {
         ///
         /// Needs your master identity exactly as `team delegate` does (your password,
         /// once). A project somebody else masters, or none does, is skipped and said so.
-        /// A name you revoked in a project stays revoked there. The identity's key comes
-        /// from this machine if it holds it, else from the rosters if they all agree.
+        /// A name you revoked in a project stays revoked there. The identity's key is
+        /// the one this machine holds for the name; for a worker that lives on another
+        /// machine, give its public key with --key. A roster is never the source: any
+        /// member of a project can write one.
         #[arg(long, conflicts_with = "workspace")]
         all: bool,
+        /// With --all: the identity's public key (64 hex characters), for a name this
+        /// machine holds no key for. Refused if this machine holds a different one.
+        #[arg(long, requires = "all")]
+        key: Option<String>,
         /// With --all: whose master identity signs. Defaults to whoever masters the most
         /// projects in the ferry root.
         #[arg(long = "as", requires = "all")]
@@ -5558,25 +5564,41 @@ fn worker_progress() -> ferryman_ops::runlog::Logged<ferryman_ops::Stdout> {
 }
 
 /// `ferry team approve <name> --all`: one identity, every project the signing master owns.
-fn team_approve_all(name: &str, role: Option<String>, as_master: Option<String>) -> Result<()> {
+fn team_approve_all(
+    name: &str,
+    role: Option<String>,
+    as_master: Option<String>,
+    given_key: Option<String>,
+) -> Result<()> {
     use ferryman_ops::fleet::{self, Enrolment};
     let root = ferryman_channel::ferry::find_root()
         .context("no ferry root yet - make one with `ferry root init`")?;
     let role = role.unwrap_or_else(|| "worker".to_owned());
-    // The key is the one this machine holds for the name, when it is beside a project
-    // that has it, and otherwise the one every roster that lists the name agrees on.
-    let held = std::env::current_dir()
+    // The key is the one this machine holds for the name, or the one the master typed.
+    // Never one read off a roster: a channel is a folder anyone in the project can write,
+    // and a key found there is whatever the last writer of that file chose. Enrolling it
+    // in every project at once would hand that writer all of them.
+    let here = std::env::current_dir()
         .ok()
-        .and_then(|dir| ferryman_channel::discover_attachment(&dir))
-        .and_then(|attachment| {
-            ferryman_channel::AgentIdentity::load_existing(name, &attachment)
-                .ok()
-                .flatten()
-        });
-    let key = match held {
-        Some(identity) => identity.public_key_hex(),
-        None => fleet::key_on_rosters(&root, name)?,
+        .and_then(|dir| ferryman_channel::discover_attachment(&dir));
+    let key = match (
+        fleet::machine_key(&root, here.as_deref(), name)?,
+        given_key.map(|key| key.trim().to_ascii_lowercase()),
+    ) {
+        (Some(held), Some(given)) if held != given => bail!(
+            "--key is not the key this machine holds for '{name}' ({}...). One of them is \
+             the wrong identity; nothing was written",
+            &held[..12]
+        ),
+        (Some(held), _) => held,
+        (None, Some(given)) => given,
+        (None, None) => bail!(
+            "this machine holds no key for '{name}', and a roster is not a place to take \
+             one from. Run this where '{name}' lives, or pass its public key: --key <64 hex \
+             characters>"
+        ),
     };
+    fleet::check_enrolment(name, &role, &key)?;
     let master = match as_master {
         Some(master) => master,
         None => fleet::dominant_master(&root).context(
@@ -5687,10 +5709,11 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             name,
             role,
             all,
+            key,
             as_master,
         } => {
             if all {
-                return team_approve_all(&name, role, as_master);
+                return team_approve_all(&name, role, as_master, key);
             }
             let route = here(workspace)?;
             let roster = ferryman_channel::read_agent_roster(&route.communications)?;
@@ -6781,22 +6804,49 @@ fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
 /// The loop `--comms` and `--all-projects` share: one worker lock per channel, one pass
 /// over every channel in turn (so one `max_parallel` is the whole worker's budget), the
 /// weekly improvement loop for those that ask for it, and self-update between passes.
+///
+/// `serving_everywhere` is `--all-projects`: one worker over many projects it did not each
+/// choose, so one project it cannot take (another worker holds its lock, its lock file
+/// cannot be written) is named and left out rather than stopping the rest, and each pass
+/// asks again whether the project is still one it may work in.
 async fn run_fleet(
     fleet: agent::Fleet,
     watching: &std::path::Path,
     once: bool,
+    serving_everywhere: bool,
     report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
 ) -> Result<()> {
     // One worker per identity per channel. Two under one name resume each other's
     // claims and run the same order twice; see WorkerLock.
+    let mut fleet = fleet;
     let mut locks = Vec::new();
     let mut contested = Vec::new();
-    for (route, config) in &fleet.served {
-        match agent::WorkerLock::take(&route.attachment, &config.agent)? {
-            Some(lock) => locks.push(lock),
-            None => contested.push(route.project_id.clone()),
+    let mut taken = Vec::new();
+    for (route, config) in std::mem::take(&mut fleet.served) {
+        match agent::WorkerLock::take(&route.attachment, &config.agent) {
+            Ok(Some(lock)) => {
+                locks.push(lock);
+                taken.push((route, config));
+            }
+            Ok(None) if serving_everywhere => {
+                report.warn(&format!(
+                    "  not watching {}: another worker on this machine already holds its \
+                     lock as the same agent. Two under one identity run the same order \
+                     twice",
+                    route.project_id
+                ));
+            }
+            Ok(None) => contested.push(route.project_id.clone()),
+            Err(error) if serving_everywhere => {
+                report.warn(&format!(
+                    "  not watching {}: no worker lock ({error:#})",
+                    route.project_id
+                ));
+            }
+            Err(error) => return Err(error),
         }
     }
+    fleet.served = taken;
     if !contested.is_empty() {
         bail!(
             "another worker on this machine is already watching {} as the same \
@@ -6804,6 +6854,9 @@ async fn run_fleet(
              run the same order twice - stop the other one first.",
             contested.join(", ")
         );
+    }
+    if fleet.served.is_empty() {
+        bail!("no project could be taken: each is held by another worker or has no lock to take");
     }
     report.info(&format!(
         "worker watching {} channel(s) under {}",
@@ -6831,7 +6884,6 @@ async fn run_fleet(
         .map(|(_, config)| config.poll)
         .min()
         .unwrap_or(std::time::Duration::from_secs(300));
-    let mut fleet = fleet;
     // Stamp this machine's version on each channel it serves, so the fleet
     // page and doctor can say which machine is behind (item 7 of the
     // onboarding findings). Quiet, idempotent, and never a reason to stop.
@@ -6900,6 +6952,12 @@ async fn run_fleet(
         anchor_maintenance(&fleet.served, report).await;
 
         for (route, config) in &mut fleet.served {
+            if serving_everywhere
+                && let Some(why) = ferryman_ops::fleet::no_longer_served(route, config)
+            {
+                report.warn(&format!("{} not worked this pass: {why}", route.project_id));
+                continue;
+            }
             match agent::work_once(route, config, report).await {
                 Ok(0) => {}
                 Ok(count) => {
@@ -7045,7 +7103,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 ferryman_ops::fleet::engines_line(&config),
                 config.max_parallel
             ));
-            run_fleet(fleet, &root.comms(), once, &report).await?;
+            run_fleet(fleet, &root.comms(), once, true, &report).await?;
         }
         Agent::Run {
             // Without `--all-projects`, `--comms` and `--workspace` are mutually
@@ -7123,7 +7181,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("nothing was claimed, written or sent");
                 return Ok(());
             }
-            run_fleet(fleet, &comms, once, &report).await?;
+            run_fleet(fleet, &comms, once, false, &report).await?;
         }
         Agent::Run {
             workspace,

@@ -117,6 +117,30 @@ fn key_of_listing(listing: Option<&AgentRoute>) -> Option<&str> {
         .filter(|key| !key.is_empty())
 }
 
+/// Whether git, where it governs the checkout that `attachment` sits in, leaves a key file
+/// there out of a commit. Not a git repository, or no git here to ask, is a yes: nothing
+/// could commit it from this machine.
+fn keeps_keys_out_of_git(attachment: &Path, agent: &str) -> bool {
+    // The checkout's own repository, which is where `ferry enable` writes the entry. A
+    // directory that is merely somewhere inside another repository is that repository's
+    // business, as it is for `enable`.
+    let Some(workspace) = attachment.parent().filter(|dir| dir.join(".git").exists()) else {
+        return true;
+    };
+    let key = format!(".ferryman/keys/{}.key", canonical_agent_name(agent));
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["check-ignore", "-q", "--"])
+        .arg(key)
+        .output()
+    {
+        // 0: ignored. 1: not ignored. 128: not a repository, or git could not say.
+        Ok(out) => out.status.code() != Some(1),
+        Err(_) => true,
+    }
+}
+
 fn skip(why: impl Into<String>) -> Standing {
     Standing::Skips(why.into())
 }
@@ -134,6 +158,16 @@ pub fn plan_worker(
     home: &Path,
     config: &AgentConfig,
 ) -> Result<(WorkerPlan, AgentIdentity)> {
+    // The name becomes a file name under every checkout's `keys/` and a lock name beside
+    // it. An `agent.toml` is the operator's own, but a path is not a thing to find out
+    // about after a key has been written through it.
+    if !ferryman_channel::is_safe_component(&config.agent) {
+        bail!(
+            "'{}' is not a name a key or a lock can be filed under: use letters, digits, \
+             '.', '-' and '_'",
+            config.agent
+        );
+    }
     let Some(identity) = AgentIdentity::load_existing(&config.agent, home)? else {
         bail!(
             "this machine holds no key for '{}' in {}, so nothing it did could be signed. \
@@ -226,10 +260,42 @@ fn judge(root: &Root, entry: &Entry, config: &AgentConfig, key: &str) -> Result<
         }
         None => true,
     };
+    // Seating puts a private key under the checkout. If git would take it into a commit
+    // there (`git add -A` is what agents and people both type), it is not put there: the
+    // key would be published with the repository.
+    if seat && !keeps_keys_out_of_git(&route.attachment, agent) {
+        return Ok(skip(format!(
+            "its checkout does not git-ignore .ferryman, so this machine's key is not put \
+             there. Run 'ferry enable' in {} (it adds /.ferryman/ to .gitignore)",
+            route.workspace.display()
+        )));
+    }
     Ok(Standing::Serves {
         route: Box::new(route),
         seat,
     })
+}
+
+/// Why a project this worker started serving is not one to work in now, if it is not.
+///
+/// What was true when the worker started is not what is true after weeks: the master can
+/// revoke the identity, or its owner, and can archive the project, and none of that
+/// restarts anything. Asked before every project's turn, so a revocation stops the next
+/// pass instead of the next restart.
+#[must_use]
+pub fn no_longer_served(route: &ProjectRoute, config: &AgentConfig) -> Option<String> {
+    if ferryman_channel::ferry::is_archived(&route.communications, &route.project_id) {
+        return Some("it has been archived".to_owned());
+    }
+    match ferryman_channel::master::may_work(route, &config.agent, &config.role) {
+        Ok(true) => None,
+        Ok(false) => Some(format!(
+            "its master has not let '{}' work there as {} (revoked, or that role needs the \
+             master's grant)",
+            config.agent, config.role
+        )),
+        Err(error) => Some(format!("could not read who may work there: {error:#}")),
+    }
 }
 
 /// The projects to watch: each served project under the one `config`, and the rest named.
@@ -278,36 +344,38 @@ pub enum Enrolment {
     Skipped(String),
 }
 
-/// The public key `name` carries on the rosters under this root, when every roster that
-/// lists it with a key agrees.
+/// The public key of the identity this machine itself holds for `name`: in `start` (the
+/// attachment the command was run beside) or in any checkout of this root.
+///
+/// The one place an enrolment may take a key from without being told it. A roster is a
+/// folder anyone in the project can write, so what it says a name's key is says who wrote
+/// it last; a key file in a checkout's own `.ferryman` is private state of this machine.
 ///
 /// # Errors
-/// No roster lists it with a key, or two disagree - in which case nothing is chosen for
-/// the master: which key a name has is the thing the rosters exist to pin.
-pub fn key_on_rosters(root: &Root, name: &str) -> Result<String> {
-    let mut found: Vec<(String, String)> = Vec::new();
-    for entry in root.read().projects {
-        if let Some(listing) = listed(&entry.channel, name)
-            && let Some(key) = key_of_listing(Some(&listing))
-        {
-            found.push((entry.project_id.clone(), key.to_owned()));
+/// This machine holds more than one key under the name, or a key file it cannot read.
+pub fn machine_key(root: &Root, start: Option<&Path>, name: &str) -> Result<Option<String>> {
+    let mut keys: Vec<String> = Vec::new();
+    for attachment in start
+        .map(Path::to_path_buf)
+        .into_iter()
+        .chain(root.read().projects.iter().filter_map(Entry::attachment))
+    {
+        if let Some(identity) = AgentIdentity::load_existing(name, &attachment)? {
+            let key = identity.public_key_hex();
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
         }
     }
-    let Some((_, first)) = found.first().cloned() else {
+    if keys.len() > 1 {
         bail!(
-            "no project under {} lists '{name}' with a key, and this machine does not hold \
-             its key either. It has to have joined one project first",
-            root.path.display()
-        );
-    };
-    if let Some((project, other)) = found.iter().find(|(_, key)| *key != first) {
-        bail!(
-            "the rosters disagree about '{name}': {first} in {} and {other} in {project}. \
-             Resolve which key is real before enrolling it anywhere",
-            found[0].0
+            "this machine holds {} different keys for '{name}' across its checkouts. Which \
+             is real has to be decided, and the other removed, before it is enrolled \
+             anywhere",
+            keys.len()
         );
     }
-    Ok(first)
+    Ok(keys.pop())
 }
 
 /// The person who is master of the most projects here, to sign as when nobody said.
@@ -351,6 +419,34 @@ pub fn bare_channels(dir: &Path) -> usize {
         })
         .count()
 }
+
+/// Whether `key` is the shape of a public key as this crate writes one: 32 bytes of
+/// lowercase hex. Checked before it is written into a roster entry and a signed grant,
+/// because both are read back by parsers that trust what a signature covers.
+#[must_use]
+pub fn is_public_key(key: &str) -> bool {
+    key.len() == 64 && key.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What may be written into a grant and a roster entry for `name` as `role` with `key`,
+/// or why not. Before any project is touched: the grant is written first and a bad role
+/// would otherwise be refused by the roster only after the master had signed it.
+///
+/// # Errors
+/// A name or role that is not a path-safe identifier, or a key that is not a public key.
+pub fn check_enrolment(name: &str, role: &str, key: &str) -> Result<()> {
+    if !ferryman_channel::is_safe_component(&canonical_agent_name(name)) {
+        bail!("'{name}' is not a name: use letters, digits, '.', '-' and '_'");
+    }
+    if !ferryman_channel::is_safe_component(role) {
+        bail!("'{role}' is not a role: use letters, digits, '.', '-' and '_'");
+    }
+    if !is_public_key(key) {
+        bail!("that is not a public key (64 lowercase hex characters)");
+    }
+    Ok(())
+}
+
 /// Hands over the master's identity for one project. Called only when something is about
 /// to be written, and it is where a password is asked for.
 pub type Signer<'a> = dyn FnMut(&Entry, &str) -> Result<AgentIdentity> + 'a;
@@ -400,6 +496,7 @@ fn enrol_one(
     as_master: &str,
     signer: &mut Signer<'_>,
 ) -> Result<Enrolment> {
+    check_enrolment(name, role, key)?;
     let (route, _) = entry.route(root)?;
     let Some(declared) = ferryman_channel::master::read_master(&route)? else {
         return Ok(Enrolment::NoMaster);
@@ -417,12 +514,26 @@ fn enrol_one(
              nothing was changed"
         )));
     }
-    if ferryman_channel::master::is_revoked(&route, &name)?
-        || ferryman_channel::owner::is_revoked(&route, &name)?
-    {
+    // This machine's pin is the key every check there will use, which is not always the
+    // one in the file now.
+    let pinned = route
+        .agents
+        .iter()
+        .find(|known| canonical_agent_name(&known.name) == name)
+        .and_then(|known| known.public_key.as_deref())
+        .filter(|pinned| !pinned.is_empty());
+    if pinned.is_some_and(|pinned| pinned != key) {
         return Ok(Enrolment::Skipped(format!(
-            "'{name}' was revoked there. Enrolling would lift that; if it is meant, run \
-             'ferry team approve {name}' in that project"
+            "this machine pinned a different key for '{name}' there. First key wins, so \
+             nothing was changed"
+        )));
+    }
+    // Revoked by the master, revoked by its owner, or owned by somebody who was: a grant
+    // would lift the first and be honoured over the other two for any role but worker.
+    if !ferryman_channel::master::may_work(&route, &name, "worker")? {
+        return Ok(Enrolment::Skipped(format!(
+            "'{name}' was revoked there, or its owner was. Enrolling would lift that; if it \
+             is meant, run 'ferry team approve {name}' in that project"
         )));
     }
     let on_roster = key_of_listing(listing.as_ref()).is_some();
@@ -443,6 +554,16 @@ fn enrol_one(
     }
     // Only now, with something to write, is the master asked for.
     let master = signer(entry, &declared.master)?;
+    // The name is not the proof; the key is. The declaration verifies against this
+    // project's roster, and the identity just handed over has to be the key the roster
+    // knows the master by - or what it signs here is a grant nobody will honour, in a
+    // channel that may not be the master's at all.
+    ferryman_channel::ferry::require_master(
+        &route.communications,
+        &route.project_id,
+        &master,
+        "enrol a member",
+    )?;
     if !granted {
         ferryman_channel::master::grant_member(
             &route,

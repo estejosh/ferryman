@@ -32,13 +32,22 @@ which and what to do:
 - its channel folder is here and it is not archived;
 - it has a checkout on this machine (a repository with `.ferryman` in it). A project that
   is only a channel here has nowhere to do work. Clone it and run `ferry enable` in it;
+- the checkout's `bridge.toml` reads its channel from the folder the ferry root files the
+  project under;
 - the channel's own roster lists the identity under the same key this machine signs with;
-- the master has not revoked it, and `may_work` allows the configured `role`.
+- the master has not revoked it (or its owner), and `may_work` allows the configured `role`.
 
 Where the checkout does not hold the identity's key yet, this machine's own copy is put
 there before the first pass, as `ferry channel seat` would. It only copies a key between two
 directories of one machine, only for a project whose roster already lists exactly that key,
-and it never replaces a different key.
+and it never replaces a different key. It also never puts the key in a checkout whose git
+would commit it: if `.ferryman` is not git-ignored there, the project is skipped and says
+to run `ferry enable` in it, which adds `/.ferryman/`.
+
+The answers above are asked again before each project's turn, every pass. A revocation of
+the identity or its owner, or the master archiving the project, stops the next pass rather
+than waiting for a restart. A project another worker already holds the lock for, or whose
+lock cannot be written, is named and left out; the rest are served.
 
 `--dry-run` prints, per project, `would serve as <identity> with engines ...` or
 `not serving: <why>`, then the orders it would act on. It notes any worker already running as
@@ -72,9 +81,15 @@ same public key, role worker) and your signed grant, and reports each project as
   enrolled, or that someone else masters, never asks for it.
 - `--as <master>` says whose identity signs. Without it, it is whoever masters the most
   projects in the root. Projects mastered by anyone else are skipped.
-- The key is this machine's own copy of the identity when it holds one beside the directory
-  you run it in, otherwise the key every roster that lists the name agrees on. Rosters that
-  disagree stop it before anything is written.
+- The key is this machine's own copy of the identity (beside the directory you run it in, or
+  in any checkout of the root). A worker that lives on another machine is named by its public
+  key: `--key <64 hex characters>`. A roster is never the source, because any member of a
+  project can write one, and a key taken from it would be enrolled in every project at once.
+  Two different keys for the name on this machine, or a `--key` that is not the held one,
+  stop it before anything is written.
+- In each project the identity you sign with must be the key that project's roster knows the
+  master by, not only a name that matches. A name that is revoked there, or whose owner was,
+  is left alone.
 - Safe to run again. A roster that already knows the name under a different key is left
   alone (first key wins). A name you revoked in a project stays revoked; lifting that is
   `ferry team approve <name>` in that project, on purpose.

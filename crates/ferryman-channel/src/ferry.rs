@@ -168,6 +168,24 @@ impl Entry {
                     self.project_id
                 );
             }
+            // The manifest's channel is the folder the archive mark, the roster and the
+            // master are judged in elsewhere; the checkout's `bridge.toml` is a file
+            // somebody can edit. If they name different folders, a project would be
+            // judged in one and written to in the other.
+            if let (Ok(manifest), Ok(described)) = (
+                std::fs::canonicalize(&self.channel),
+                std::fs::canonicalize(&route.communications),
+            ) && manifest != described
+            {
+                bail!(
+                    "the checkout at {} reads its channel from {}, but this machine files \
+                     '{}' under {}",
+                    attachment.display(),
+                    route.communications.display(),
+                    self.project_id,
+                    self.channel.display()
+                );
+            }
             return Ok((route, true));
         }
         let attachment = self
@@ -266,7 +284,7 @@ pub fn set_archived(
 
 /// Refuse unless `signer` is the master of the project in `channel`, by the key the
 /// channel knows the master by. `what` finishes "only the master can ...".
-pub(crate) fn require_master(
+pub fn require_master(
     channel: &Path,
     project_id: &str,
     signer: &AgentIdentity,
