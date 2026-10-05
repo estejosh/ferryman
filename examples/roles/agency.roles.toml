@@ -1,0 +1,86 @@
+# Ferryman role profile: agency / consultancy / studio.
+# Labels: client:<id>, campaign:<id>, unreleased (embargoed work).
+format = "ferryman-roles/v1"
+profile = "agency"
+
+[roles.owner]
+scopes = ["*:*"]
+
+[roles.account-lead]
+scopes = ["tasks:*", "artifacts:read", "artifacts:write", "artifacts:read:unreleased", "artifacts:write:unreleased", "conversations:*", "memory:read", "memory:propose", "memory:approve", "ledger:read", "cost:read", "cost:plan", "team:read", "team:invite", "agents:view", "agents:message", "agents:assign", "agents:own", "secrets:list", "secrets:use"]
+label = "client"
+
+[roles.strategist]
+extends = "account-lead"
+minus = ["cost:plan", "team:invite", "secrets:use"]
+label = "client"
+
+[roles.creative]
+extends = "strategist"
+minus = ["tasks:review", "memory:approve", "agents:assign"]
+label = "campaign"
+
+[roles.freelancer]
+extends = "creative"
+minus = ["artifacts:read:unreleased", "artifacts:write:unreleased", "agents:own", "secrets:list"]
+label = "campaign"
+engagement = "contractor"
+note = "sees nothing embargoed unless the lead adds it"
+
+[roles.client]
+scopes = ["tasks:read", "artifacts:read", "conversations:read:client", "conversations:write:client"]
+label = "client"
+
+[roles.brief-agent]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "memory:read", "memory:propose", "tools:network", "cost:spend"]
+agent = true
+label = "campaign"
+handoff_depth = 1
+
+[roles.everyone]
+scopes = ["artifacts:read:library", "conversations:read:library", "memory:read", "team:read", "fleet:read", "agents:view", "agents:message"]
+auto_grant = true
+
+[two_person]
+scopes = ["secrets:set", "secrets:remove", "team:grant", "policy:write"]
+
+[break_glass]
+enabled = false
+
+[lending]
+enabled = true
+default_reveal = "borrower-scopes"
+default_transcript = "owner"
+max_hours = 336
+requires_budget = false
+
+[purposes]
+allowed = []
+
+[labels.client]
+train = "with-consent"
+infer = "cloud-with-agreement"
+export = "owner"
+redacted_view = ["freelancer", "brief-agent"]
+redacted_label = "client-scrubbed"
+
+[labels.client-scrubbed]
+train = "always"
+infer = "any"
+
+[labels.campaign]
+train = "always"
+infer = "cloud-with-agreement"
+export = "owner"
+lifecycle = "launched"
+
+[labels.unreleased]
+train = "never"
+infer = "local"
+export = "never"
+lifecycle = "launched"
+
+[labels.library]
+train = "always"
+infer = "any"
+export = "owner"

@@ -1,0 +1,159 @@
+# Ferryman role profile: law office.
+# Projects are practice groups. Matters are labels "matter:<id>"; the id is
+# the firm's matter number, never the client's name. Privileged work product
+# carries a second label "privileged:<id>".
+format = "ferryman-roles/v1"
+profile = "law-office"
+
+# Governing is not reading. No role in this file holds matter content without
+# a matter label - the managing partner included. Administrative authority is
+# firm-wide; content is per matter, for everyone.
+
+[roles.managing-partner]
+scopes = ["team:*", "policy:*", "agents:install", "agents:view", "agents:own", "secrets:list", "secrets:set", "secrets:remove", "cost:read", "cost:plan", "fleet:read", "ledger:read", "release:read", "release:approve"]
+note = "administers the firm; reads a matter only when granted it like anyone else"
+
+[roles.partner]
+extends = "managing-partner"
+minus = ["secrets:set", "secrets:remove", "policy:write", "team:exclude"]
+note = "administers the practice group; grants attorney and below; matter content per label"
+
+[roles.attorney]
+scopes = [
+  "tasks:read", "tasks:create", "tasks:take", "tasks:submit", "tasks:review", "tasks:cancel",
+  "artifacts:read", "artifacts:write", "artifacts:read:privileged", "artifacts:write:privileged",
+  "conversations:read", "conversations:write",
+  "memory:read", "memory:propose", "memory:approve",
+  "ledger:read", "fleet:read", "cost:read",
+  "agents:view", "agents:message", "agents:assign", "agents:own",
+  "secrets:list", "secrets:use",
+]
+label = "matter"
+note = "responsible attorney on the labelled matters; may lend own agents (agents:use) to any principal on the same matters"
+
+[roles.associate]
+extends = "attorney"
+minus = ["tasks:review", "tasks:cancel", "memory:approve", "agents:assign"]
+label = "matter"
+
+[roles.paralegal]
+extends = "associate"
+minus = ["tasks:create", "secrets:list", "secrets:use", "agents:own"]
+label = "matter"
+
+[roles.legal-assistant]
+scopes = ["tasks:read", "tasks:create", "artifacts:read", "conversations:read", "conversations:write", "agents:view", "agents:message"]
+label = "matter"
+note = "no privileged artifacts"
+
+[roles.of-counsel]
+extends = "attorney"
+label = "matter"
+engagement = "contractor"
+note = "outside attorney; lease-bounded by engagement"
+
+[roles.billing]
+scopes = ["tasks:read", "cost:read", "cost:plan", "ledger:read", "team:read"]
+note = "status and spend; no conversations, no artifacts"
+
+[roles.it]
+scopes = ["team:read", "team:invite", "fleet:read", "secrets:list", "secrets:set", "secrets:remove", "policy:read", "policy:write", "ledger:read", "agents:install"]
+note = "runs the box; sees no matter content"
+
+[roles.client]
+scopes = ["tasks:read", "artifacts:read", "conversations:read:client", "conversations:write:client"]
+label = "matter"
+note = "client portal: their matters, the client topic only, nothing privileged"
+
+[roles.drafting-agent]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "artifacts:read:privileged", "artifacts:write:privileged", "conversations:read", "conversations:write", "memory:read", "memory:propose", "tools:filesystem", "cost:spend"]
+agent = true
+label = "matter"
+handoff_depth = 1
+note = "owned by an attorney or associate; attenuated to the owner's matters; no shell, no network"
+
+[roles.intake-agent]
+scopes = ["tasks:create", "conversations:read:intake", "conversations:write:intake", "memory:read"]
+agent = true
+note = "business agent; owned by whoever the firm names; sees nothing privileged"
+
+
+[roles.everyone]
+scopes = ["artifacts:read:library", "conversations:read:library", "memory:read", "ledger:read", "team:read", "fleet:read", "tasks:read:library", "agents:view", "agents:message:intake-agent"]
+auto_grant = true
+note = "day-one baseline for every name on the roster and every agent: the office library, status, who is in"
+
+# Ethical walls. Master-signed. Beat every role, and bind the principal's agents.
+# [[exclusions]]
+# principal = "jdoe"
+# labels = ["matter:2026-0142"]
+# reason = "prior representation of adverse party"
+
+[two_person]
+scopes = ["secrets:set", "secrets:remove", "team:grant", "team:exclude", "policy:write", "memory:approve"]
+
+[break_glass]
+enabled = true
+max_hours = 4
+scopes = ["tasks:read", "artifacts:read", "conversations:read"]
+reviewed_by = "partner"
+
+[purposes]
+allowed = []
+
+# ---- Lending an agent. Only an owner holds agents:use on its own agents
+# (agents:own confers it); it is granted borrower-by-borrower as a lease.
+
+[lending]
+enabled = true
+default_reveal = "borrower-scopes"   # or "owner-context": show the borrower what the owner would see
+default_transcript = "owner"         # owner sees every exchange; "summary" logs the ledger line only
+max_hours = 168
+requires_budget = true
+
+# ---- The data's own policy. Roles say who; this says what the content permits.
+
+[labels.matter]
+train = "with-consent"            # the client's signed consent lease, or nothing
+infer = "local"                   # matter content never enters a cloud model prompt
+export = "two-person"
+review_before_release = true      # every agent output on a matter is accepted by a human first
+lifecycle = "closed"              # on close, every scope on the matter drops to read
+retention = "7y"                  # firm policy; confirm against the bar's rule for the jurisdiction
+redacted_view = ["legal-assistant", "intake-agent", "billing"]
+redacted_label = "matter-redacted"
+
+[labels.matter-redacted]
+train = "always"                  # the firm may learn from its work, minus the names
+infer = "cloud-with-agreement"
+export = "owner"
+
+[labels.privileged]
+train = "never"
+infer = "local"
+export = "never"
+two_person_read = false
+review_before_release = true
+
+[labels.client]                   # the client-facing topic
+train = "never"
+infer = "local"
+export = "owner"
+
+# ---- Machines. Tier and engine locality decide where a label may be processed.
+
+[machines.grouchly]
+tier = "onprem"
+region = "us"
+engines = { deepseek = { local = true } }
+
+[machines.beastlywsl]
+tier = "onprem"
+region = "us"
+engines = { claude = { local = false, agreement = "anthropic-commercial" } }
+
+[labels.library]
+train = "always"
+infer = "any"
+export = "owner"
+note = "redacted, de-identified, or original firm material safe for every agent to learn from"

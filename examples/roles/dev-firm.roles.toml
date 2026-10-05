@@ -1,0 +1,134 @@
+# Ferryman role profile: software / dev firm.
+# Copy to <project>-master-ferryman/roles.toml and edit. Roles expand to flat
+# scope lists when a grant is signed; renaming a role later does not change
+# grants already written.
+format = "ferryman-roles/v1"
+profile = "dev-firm"
+
+# A dev firm chose to let its owner read everything. That is one line to
+# change; see the law-office profile for the administrative/content split.
+[roles.owner]
+scopes = ["*:*"]
+note = "founder; every project"
+
+[roles.admin]
+extends = "owner"
+minus = ["secrets:use", "secrets:set", "secrets:remove", "team:grant", "team:revoke", "team:exclude"]
+note = "ops; sees everything, holds no secret values, cannot hand out authority"
+
+[roles.developer]
+scopes = [
+  "tasks:read", "tasks:take", "tasks:submit", "tasks:create",
+  "artifacts:read", "artifacts:write",
+  "conversations:read", "conversations:write",
+  "memory:read", "memory:propose",
+  "ledger:read", "fleet:read", "cost:read",
+  "agents:view", "agents:message", "agents:own",
+  "secrets:list", "secrets:use",
+]
+note = "staff engineer on the project"
+
+[roles.lead]
+extends = "developer"
+scopes = ["tasks:review", "tasks:cancel", "memory:approve", "agents:assign", "agents:handoff", "agents:install", "release:read", "release:approve", "cost:plan", "team:read"]
+note = "eng lead for the project"
+
+[roles.contractor]
+extends = "developer"
+minus = ["secrets:list", "secrets:use", "agents:own", "cost:read"]
+label = "feature"
+engagement = "contractor"
+note = "outside developer, scoped to feature labels"
+
+[roles.reviewer]
+scopes = ["tasks:read", "tasks:review", "artifacts:read", "conversations:read", "conversations:write", "memory:read", "ledger:read", "agents:view"]
+note = "reviews, never takes or submits"
+
+[roles.sales]
+scopes = ["tasks:read", "tasks:create:suggestion", "artifacts:read", "conversations:read", "conversations:write:sales", "conversations:write:suggestions", "memory:read", "memory:propose", "agents:view", "agents:message", "agents:own", "cost:read", "fleet:read"]
+label = "business"
+note = "works the business side; reads code; suggests, never changes; owns agents held to the same"
+
+[roles.analyst-agent]
+scopes = ["tasks:read", "artifacts:read", "conversations:read", "conversations:write:suggestions", "memory:read", "memory:propose", "tools:network", "secrets:use", "cost:spend"]
+agent = true
+handoff_depth = 0
+note = "reads the repository through a sealed read-only token, analyses, suggests; owned by sales or a lead"
+
+[roles.support]
+scopes = ["tasks:read", "tasks:create", "conversations:read", "conversations:write", "artifacts:read", "agents:view", "agents:message"]
+note = "customer support; files tasks"
+
+[roles.viewer]
+scopes = ["tasks:read", "conversations:read", "memory:read", "ledger:read", "agents:view", "fleet:read"]
+note = "read only"
+
+[roles.ci]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "release:read", "tools:shell", "tools:filesystem", "tools:network", "cost:spend"]
+agent = true
+handoff_depth = 1
+note = "build/test agent; owned by a lead"
+
+[roles.release-agent]
+extends = "ci"
+scopes = ["release:approve"]
+agent = true
+note = "prepares releases; release:approve is two-person so a human always co-signs"
+
+
+[roles.everyone]
+scopes = ["artifacts:read:library", "conversations:read:library", "memory:read", "ledger:read", "team:read", "fleet:read", "tasks:read:library", "agents:view", "agents:message"]
+auto_grant = true
+note = "day-one baseline for every name on the roster and every agent: the office library, status, who is in"
+
+[two_person]
+scopes = ["secrets:set", "secrets:remove", "release:approve", "team:grant", "policy:write"]
+
+[break_glass]
+enabled = false
+
+[purposes]
+allowed = []
+
+# ---- Lending an agent. Only an owner holds agents:use on its own agents
+# (agents:own confers it); it is granted borrower-by-borrower as a lease.
+
+[lending]
+enabled = true
+default_reveal = "borrower-scopes"   # or "owner-context": show the borrower what the owner would see
+default_transcript = "owner"         # owner sees every exchange; "summary" logs the ledger line only
+max_hours = 720
+requires_budget = false
+
+[labels.feature]
+train = "always"
+infer = "any"
+export = "any"
+lifecycle = "shipped"
+
+[labels.customer]                 # anything a customer sent: tickets, logs, samples
+train = "never"
+infer = "cloud-with-agreement"
+export = "owner"
+redacted_view = ["contractor", "ci"]
+redacted_label = "customer-scrubbed"
+
+[labels.customer-scrubbed]
+train = "always"
+infer = "any"
+
+[machines.grouchly]
+tier = "onprem"
+region = "us"
+engines = { deepseek = { local = true } }
+
+[machines.beastlywsl]
+tier = "onprem"
+region = "us"
+engines = { claude = { local = false, agreement = "anthropic-commercial" } }
+
+[labels.library]
+train = "always"
+infer = "any"
+export = "owner"
+note = "redacted, de-identified, or original firm material safe for every agent to learn from"

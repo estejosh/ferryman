@@ -1,0 +1,94 @@
+# Ferryman role profile: accounting / tax / bookkeeping firm.
+# Labels: client:<id>, period:<client>-<year>. A period closes on filing.
+format = "ferryman-roles/v1"
+profile = "accounting-firm"
+
+[roles.managing-partner]
+scopes = ["team:*", "policy:*", "agents:install", "agents:view", "agents:own", "secrets:list", "secrets:set", "secrets:remove", "cost:read", "cost:plan", "fleet:read", "ledger:read", "release:read"]
+note = "administers the firm; client content per label like everyone"
+
+[roles.partner]
+extends = "managing-partner"
+minus = ["policy:write", "team:exclude", "secrets:set", "secrets:remove"]
+
+[roles.cpa]
+scopes = ["tasks:*", "artifacts:read", "artifacts:write", "conversations:*", "memory:read", "memory:propose", "memory:approve", "ledger:read", "agents:view", "agents:message", "agents:assign", "agents:own", "secrets:list", "secrets:use"]
+label = "client"
+note = "signs the return; reviews and approves"
+
+[roles.senior]
+extends = "cpa"
+minus = ["tasks:review", "memory:approve", "secrets:use"]
+label = "client"
+
+[roles.staff-accountant]
+extends = "senior"
+minus = ["tasks:create", "agents:assign"]
+label = "client"
+
+[roles.bookkeeper]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "memory:read"]
+label = "client"
+
+[roles.admin]
+scopes = ["tasks:read", "tasks:create", "conversations:read", "conversations:write", "team:read", "cost:read"]
+note = "front office; no workpapers"
+
+[roles.client]
+scopes = ["tasks:read", "artifacts:read", "conversations:read:client", "conversations:write:client", "consent:give", "consent:revoke"]
+label = "client"
+
+[roles.prep-agent]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "memory:read", "cost:spend"]
+agent = true
+label = "client"
+handoff_depth = 0
+note = "owned by a cpa or senior; drafts, never files"
+
+[roles.everyone]
+scopes = ["artifacts:read:library", "conversations:read:library", "memory:read", "team:read", "fleet:read", "agents:view"]
+auto_grant = true
+
+[two_person]
+scopes = ["secrets:set", "secrets:remove", "team:grant", "team:exclude", "policy:write", "tasks:review"]
+
+[break_glass]
+enabled = true
+max_hours = 4
+scopes = ["tasks:read", "artifacts:read", "conversations:read"]
+reviewed_by = "partner"
+
+[lending]
+enabled = true
+default_reveal = "borrower-scopes"
+default_transcript = "owner"
+max_hours = 168
+requires_budget = true
+
+[purposes]
+allowed = []
+
+[labels.client]
+train = "with-consent"
+infer = "local"
+export = "two-person"
+review_before_release = true
+retention = "7y"
+redacted_view = ["admin", "bookkeeper"]
+redacted_label = "client-scrubbed"
+
+[labels.client-scrubbed]
+train = "always"
+infer = "cloud-with-agreement"
+
+[labels.period]
+train = "never"
+infer = "local"
+export = "two-person"
+lifecycle = "filed"
+retention = "7y"
+
+[labels.library]
+train = "always"
+infer = "any"
+export = "owner"

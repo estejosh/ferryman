@@ -1,0 +1,178 @@
+# Ferryman role profile: medical clinic.
+# Projects are departments or sites. Patients are labels "patient:<opaque>";
+# the opaque id maps to a chart only inside the clinic's system of record.
+# Billing material carries "billing:<opaque>". Nothing in the channel is a
+# name, DOB or MRN.
+#
+# Retention: set ledger retention to the clinic's own documentation retention
+# policy. Many US clinics use six years for HIPAA documentation; confirm with
+# the clinic's compliance counsel rather than this file.
+format = "ferryman-roles/v1"
+profile = "medical-clinic"
+
+# Governing is not reading. The medical director administers the clinic and
+# reads a chart only under a patient label with a purpose, like every clinician.
+
+[roles.medical-director]
+scopes = ["team:*", "policy:*", "agents:install", "agents:view", "agents:own", "secrets:list", "secrets:set", "secrets:remove", "cost:read", "cost:plan", "fleet:read", "ledger:read", "release:read", "release:approve"]
+note = "administrative authority; patient content per label and purpose, like everyone"
+
+[roles.clinic-admin]
+extends = "medical-director"
+minus = ["policy:write", "team:exclude"]
+note = "runs the clinic and owns business agents; no clinical content, no secret values"
+
+[roles.consent-recorder]
+scopes = ["consent:give", "consent:revoke"]
+label = "patient"
+note = "records a patient's consent on their behalf when the patient has no portal key; the ledger shows the clinic spoke, not the patient"
+
+[roles.physician]
+scopes = [
+  "tasks:read", "tasks:create", "tasks:take", "tasks:submit", "tasks:review", "tasks:cancel",
+  "artifacts:read", "artifacts:write",
+  "conversations:read", "conversations:write",
+  "memory:read", "memory:propose", "memory:approve",
+  "ledger:read", "fleet:read",
+  "agents:view", "agents:message", "agents:assign", "agents:own",
+]
+label = "patient"
+requires_purpose = true
+
+[roles.covering-physician]
+extends = "physician"
+label = "patient"
+engagement = "temp"
+requires_purpose = true
+note = "the usual borrower of a scribe-agent via agents:use; temp so it lapses on its own"
+
+[roles.np-pa]
+extends = "physician"
+minus = ["memory:approve"]
+label = "patient"
+requires_purpose = true
+
+[roles.nurse]
+extends = "np-pa"
+minus = ["tasks:review", "tasks:cancel", "agents:assign"]
+label = "patient"
+requires_purpose = true
+
+[roles.ma]
+extends = "nurse"
+minus = ["artifacts:write", "agents:own"]
+label = "patient"
+requires_purpose = true
+
+[roles.front-desk]
+scopes = ["tasks:create", "tasks:read:scheduling", "conversations:read:scheduling", "conversations:write:scheduling", "agents:view", "agents:message"]
+note = "scheduling only; no clinical labels"
+
+[roles.billing-coding]
+scopes = ["tasks:read:billing", "artifacts:read:billing", "cost:read", "cost:plan", "ledger:read", "team:read"]
+requires_purpose = true
+note = "purpose is always 'payment'"
+
+[roles.privacy-officer]
+scopes = ["ledger:read", "team:read", "policy:read", "fleet:read", "agents:view"]
+note = "audits; clinical content only through break-glass, which this role reviews"
+
+[roles.it]
+scopes = ["team:read", "team:invite", "fleet:read", "secrets:list", "secrets:set", "secrets:remove", "policy:read", "policy:write", "ledger:read", "agents:install"]
+note = "no clinical content"
+
+[roles.patient]
+scopes = ["tasks:read", "artifacts:read", "conversations:read:patient-portal", "conversations:write:patient-portal", "consent:give", "consent:revoke"]
+label = "patient"
+note = "own label only; the patient's own key is the source of train/export consent on their label"
+
+[roles.scribe-agent]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "memory:read", "cost:spend"]
+agent = true
+label = "patient"
+handoff_depth = 0
+note = "owned by a physician or np-pa; drafts only; no tools:*, so no shell, network or browser; attenuated to the owner's patients"
+
+[roles.triage-agent]
+scopes = ["tasks:create", "conversations:read:intake", "conversations:write:intake", "memory:read"]
+agent = true
+note = "business agent; no patient artifacts"
+
+[roles.ehr-agent]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "secrets:use:ehr"]
+agent = true
+label = "patient"
+note = "the only principal holding secrets:use:ehr; owned by clinic-admin"
+
+
+[roles.everyone]
+scopes = ["artifacts:read:library", "conversations:read:library", "memory:read", "ledger:read", "team:read", "fleet:read", "tasks:read:library", "agents:view", "agents:message:triage-agent"]
+auto_grant = true
+note = "day-one baseline for every name on the roster and every agent: the office library, status, who is in"
+
+[two_person]
+scopes = ["secrets:set", "secrets:remove", "team:grant", "team:exclude", "policy:write", "agents:install"]
+
+[break_glass]
+enabled = true
+max_hours = 4
+scopes = ["tasks:read", "artifacts:read", "conversations:read"]
+reviewed_by = "privacy-officer"
+notify = ["privacy-officer", "clinic-admin"]
+
+[purposes]
+allowed = ["treatment", "payment", "operations", "patient-request"]
+
+# ---- Lending an agent. Only an owner holds agents:use on its own agents
+# (agents:own confers it); it is granted borrower-by-borrower as a lease.
+
+[lending]
+enabled = true
+default_reveal = "borrower-scopes"   # or "owner-context": show the borrower what the owner would see
+default_transcript = "owner"         # owner sees every exchange; "summary" logs the ledger line only
+max_hours = 72
+requires_budget = true
+
+# ---- The data's own policy.
+
+[labels.patient]
+train = "with-consent"            # signed by the patient's key, or by consent-recorder on their behalf
+infer = "local"                   # PHI is never routed to a non-local engine, whatever the role
+export = "two-person"
+residency = ["us"]
+review_before_release = true      # scribe output is accepted by the clinician before it is visible
+lifecycle = "discharged"
+retention = "6y"                  # placeholder: set to the clinic's documentation retention policy
+redacted_view = ["billing-coding", "triage-agent"]
+redacted_label = "patient-deidentified"
+requires_purpose = true
+tools_forbidden = ["tools:network", "tools:browser"]   # no agent touching this label may hold these
+
+[labels.patient-deidentified]
+train = "always"
+infer = "cloud-with-agreement"    # only engines whose machine record names a signed agreement
+export = "owner"
+
+[labels.patient-restricted]       # employees, public figures, anyone the clinic flags
+train = "never"
+infer = "local"
+export = "never"
+two_person_read = true
+
+[labels.billing]
+train = "never"
+infer = "local"
+export = "two-person"
+
+# ---- Machines.
+
+[machines.clinic-server]
+tier = "onprem"
+region = "us"
+engines = { local-llm = { local = true } }
+
+[labels.library]
+train = "always"
+infer = "any"
+export = "owner"
+note = "redacted, de-identified, or original firm material safe for every agent to learn from"

@@ -172,6 +172,14 @@ pub fn app(state: AppState) -> Router {
             get(communications_status),
         )
         .route(
+            "/v1/projects/{project_id}/boundary/ingestion-key",
+            get(boundary_ingestion_key),
+        )
+        .route(
+            "/v1/projects/{project_id}/boundary/deposit",
+            post(boundary_deposit),
+        )
+        .route(
             "/v1/projects/{project_id}/agents",
             post(create_agent).get(list_agents),
         )
@@ -764,6 +772,49 @@ async fn delete_communications(
     }
     state.communication_engines.lock().await.remove(&project_id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `boundary/v1`: the two routes Custodly (github.com/estejosh/Custodly)
+/// calls into. See `communications::boundary` for what each does and what
+/// is still open; this is a thin HTTP wrapper around that module, using
+/// the same project-token auth as everything else project-scoped.
+async fn boundary_ingestion_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    let identity = communications::boundary::ingestion_identity(&route).map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "public_key_hex": identity.public_key_hex(),
+        "contract_version": communications::boundary::CONTRACT_VERSION,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DepositBody {
+    deposit_id: String,
+    sealed_secret: communications::boundary::SealedSecret,
+    metadata: communications::boundary::DepositMetadata,
+}
+
+async fn boundary_deposit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<DepositBody>,
+) -> ApiResult<(StatusCode, Json<communications::boundary::DepositReceipt>)> {
+    checked(&state, &headers, &project_id)?;
+    let route = project_route(&state, &project_id)?;
+    let receipt = communications::boundary::store_deposit(
+        &route,
+        input.deposit_id,
+        &input.sealed_secret,
+        input.metadata,
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok((StatusCode::CREATED, Json(receipt)))
 }
 
 #[derive(Deserialize)]
@@ -2264,6 +2315,128 @@ mod tests {
             .unwrap();
         assert_eq!(accepted_memory.status(), StatusCode::CREATED);
         let _ = shutdown_sender.send(());
+    }
+    #[tokio::test]
+    async fn boundary_deposit_round_trips_through_the_http_route() {
+        let dir = std::env::temp_dir().join(format!("bridge-boundary-test-{}", uuid::Uuid::new_v4()));
+        let workspace = dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let store = SqliteStore::open(dir.join("bridge.db")).unwrap();
+        store
+            .create_project("p", "P", "p-token-0123456789", &workspace.to_string_lossy())
+            .unwrap();
+        let state = AppState::new(store.clone(), dir.join("artifacts")).with_workspace_root(dir.join("projects"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            axum::serve(listener, app(state))
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_receiver.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::new();
+        let attachment = workspace.join(".ferryman");
+        let communications_dir = attachment.join("ferryman");
+        client
+            .post(format!("http://{address}/v1/projects/p/communications"))
+            .bearer_auth("p-token-0123456789")
+            .json(&json!({
+                "workspace": workspace,
+                "attachment": attachment,
+                "communications": communications_dir,
+                "shared_remote": "",
+                "git_remote": "",
+            }))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+
+        // Wiring this test actually owns: auth, routing, and rejection of a
+        // payload that cannot possibly open. The crypto itself - a real seal
+        // opening under the real ingestion key via `store_deposit` - is
+        // exercised in `ferryman_channel::boundary`'s own test suite, which
+        // has access to the crate-internal sealing test helper this one
+        // deliberately does not reach for (duplicating that construction
+        // here would test this test's own copy of it, not the real one).
+        let key_response = client
+            .get(format!("http://{address}/v1/projects/p/boundary/ingestion-key"))
+            .bearer_auth("p-token-0123456789")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        let ingestion_key_hex = key_response["public_key_hex"].as_str().unwrap();
+        assert_eq!(ingestion_key_hex.len(), 64);
+        assert!(ingestion_key_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(
+            key_response["contract_version"].as_str().unwrap(),
+            communications::boundary::CONTRACT_VERSION
+        );
+
+        // Wrong project token -> unauthenticated, same as every other
+        // project-scoped route.
+        store.create_project("other", "Other", "other-token-0123456", "").unwrap();
+        let cross_project = client
+            .get(format!("http://{address}/v1/projects/p/boundary/ingestion-key"))
+            .bearer_auth("other-token-0123456")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cross_project.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // A garbage sealed_secret cannot open under any key -> rejected, not
+        // silently accepted and stored.
+        let rejected = client
+            .post(format!("http://{address}/v1/projects/p/boundary/deposit"))
+            .bearer_auth("p-token-0123456789")
+            .json(&json!({
+                "deposit_id": uuid::Uuid::new_v4().to_string(),
+                "sealed_secret": {
+                    "ephemeral_public_hex": "00".repeat(32),
+                    "nonce_hex": "00".repeat(24),
+                    "ciphertext_hex": "00".repeat(32),
+                },
+                "metadata": {
+                    "provider": "github",
+                    "scope": "repo:read",
+                    "tier": 0,
+                    "acquired_via": "track1_api",
+                    "acquired_at": chrono::Utc::now(),
+                    "label": "bogus",
+                },
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(communications::boundary::list_deposits(&test_route_for(&workspace, &attachment, &communications_dir)).unwrap().is_empty());
+
+        let _ = shutdown_sender.send(());
+    }
+    fn test_route_for(
+        workspace: &std::path::Path,
+        attachment: &std::path::Path,
+        communications: &std::path::Path,
+    ) -> communications::ProjectRoute {
+        communications::ProjectRoute {
+            project_id: "p".into(),
+            workspace: workspace.to_path_buf(),
+            attachment: attachment.to_path_buf(),
+            communications: communications.to_path_buf(),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
     }
     #[tokio::test]
     async fn approval_lease_retry_and_artifact_are_durable() {

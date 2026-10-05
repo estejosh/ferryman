@@ -585,6 +585,79 @@ fn hex_decode_32(encoded: &str) -> Result<[u8; 32]> {
     bytes.try_into().map_err(|_| anyhow!("key is not 32 bytes"))
 }
 
+/// Open an AEAD slot sealed directly to `identity`'s public key, outside the
+/// signed-envelope/roster scheme [`open_secret`] uses. For a caller (the
+/// `boundary` module) that seals to a role identity - one that exists to
+/// receive a class of message, not a named rostered recipient - rather than
+/// a human agent, and that has no Ferryman signing key to put a
+/// [`SecretEnvelope`] around the slot in the first place.
+///
+/// Same construction as [`open_secret`]'s own decrypt step (X25519 ECDH,
+/// HKDF-SHA256, XChaCha20-Poly1305): this is that step, factored out so it
+/// has exactly one implementation. `aad` is the caller's own associated
+/// data - `open_secret` binds name/project/recipient into it; a boundary
+/// deposit binds something else - and is never derived here.
+pub(crate) fn open_slot(
+    identity: &EncryptionIdentity,
+    slot: &RecipientSlot,
+    aad: &[u8],
+) -> Result<String> {
+    let ephemeral = XPublicKey::from(hex_decode_32(&slot.ephemeral_public_hex)?);
+    let shared = identity.secret.diffie_hellman(&ephemeral);
+    let cipher = slot_cipher(&shared, &ephemeral, &identity.public())?;
+    let nonce = hex::decode(&slot.nonce_hex).context("nonce is not valid hex")?;
+    let nonce: [u8; 24] = nonce
+        .try_into()
+        .map_err(|_| anyhow!("nonce is the wrong length"))?;
+    let ciphertext = hex::decode(&slot.ciphertext_hex).context("ciphertext is not valid hex")?;
+    let plaintext = cipher
+        .decrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: &ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| {
+            anyhow!("could not be decrypted (key does not match, or payload was tampered with)")
+        })?;
+    String::from_utf8(plaintext).context("decrypted value is not valid UTF-8")
+}
+
+/// Test-only: seal `value` to `recipient_public_hex` under caller-supplied
+/// associated data, bypassing [`seal_value`]'s own name/project/recipient
+/// AAD scheme. Exists so `boundary`'s tests can stand in for what
+/// Custodly's own sealing must produce, without a second, divergent
+/// implementation of the same AEAD construction.
+#[cfg(test)]
+pub(crate) fn seal_value_for_tests(
+    ephemeral: &StaticSecret,
+    recipient_public_hex: String,
+    aad: &[u8],
+    value: &str,
+) -> Result<RecipientSlot> {
+    let recipient_public = XPublicKey::from(hex_decode_32(&recipient_public_hex)?);
+    let shared = ephemeral.diffie_hellman(&recipient_public);
+    let cipher = slot_cipher(&shared, &XPublicKey::from(ephemeral), &recipient_public)?;
+    let mut nonce = [0_u8; 24];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut nonce);
+    let ciphertext = cipher
+        .encrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: value.as_bytes(),
+                aad,
+            },
+        )
+        .map_err(|_| anyhow!("encryption failed"))?;
+    Ok(RecipientSlot {
+        recipient: String::new(),
+        ephemeral_public_hex: hex::encode(XPublicKey::from(ephemeral).as_bytes()),
+        nonce_hex: hex::encode(nonce),
+        ciphertext_hex: hex::encode(ciphertext),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,5 +1044,55 @@ mod tests {
         let json = serde_json::to_string(&summaries[0]).unwrap();
         assert!(!json.contains("supersecret"), "leaked value: {json}");
         assert!(!json.contains("ciphertext"), "leaked slot: {json}");
+    }
+
+    #[test]
+    fn open_slot_round_trips_outside_the_envelope_scheme() {
+        // boundary::open_deposit's whole job: a slot sealed straight to an
+        // identity's public key, with no SecretEnvelope, no signer, and no
+        // roster around it, still opens.
+        let dir = tempfile::tempdir().unwrap();
+        let identity = recipient(dir.path(), "state");
+        let ephemeral = StaticSecret::from([9_u8; 32]);
+        let aad = b"boundary/v1\ncustodly-ingestion\nacme";
+        let slot = seal_value(
+            &ephemeral,
+            &identity.public(),
+            "unused-name",
+            "unused-project",
+            "unused-recipient",
+            "sk-deposited-value",
+        )
+        .unwrap();
+        // seal_value binds its own name/project/recipient into the AAD, so
+        // opening it with a *different* AAD (as a real boundary caller
+        // would, since it does not share seal_value's associated_data
+        // scheme) must fail - proving open_slot actually checks the AAD it
+        // is given rather than trusting the slot.
+        assert!(open_slot(&identity, &slot, aad).is_err());
+
+        // Opening with the *same* AAD the ciphertext was sealed under
+        // round-trips, which is the real call shape: the sealer and opener
+        // agree on associated data out of band (here, `associated_data`;
+        // for a boundary deposit, `deposit_aad`).
+        let matching_aad = associated_data("unused-name", "unused-project", "unused-recipient");
+        assert_eq!(
+            open_slot(&identity, &slot, &matching_aad).unwrap(),
+            "sk-deposited-value"
+        );
+    }
+
+    #[test]
+    fn open_slot_rejects_a_tampered_ciphertext() {
+        let dir = tempfile::tempdir().unwrap();
+        let identity = recipient(dir.path(), "state");
+        let ephemeral = StaticSecret::from([9_u8; 32]);
+        let aad = associated_data("n", "p", "r");
+        let mut slot = seal_value(&ephemeral, &identity.public(), "n", "p", "r", "value").unwrap();
+        let mut bytes = hex::decode(&slot.ciphertext_hex).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        slot.ciphertext_hex = hex::encode(bytes);
+        assert!(open_slot(&identity, &slot, &aad).is_err());
     }
 }

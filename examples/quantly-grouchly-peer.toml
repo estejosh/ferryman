@@ -1,0 +1,30 @@
+# Copy this to Quantly's local configuration directory on the Grouchly machine.
+# It is a peer declaration, never a place for broker, exchange, or trading secrets.
+
+[service]
+agent = "quantly"
+role = "research-service"
+paper_only = true
+protocol = "quantly.ferryman/v1"
+capabilities = [
+  "quantly.research.receive",
+  "quantly.research.publish",
+  "quantly.paper.replay",
+  "quantly.paper.ledger",
+  "quantly.paper.market",
+]
+
+[grouchly]
+agent = "grouchly"
+role = "research-peer"
+capabilities = [
+  "quantly.research.receive",
+  "quantly.research.publish",
+  "quantly.paper.replay",
+]
+
+[safety]
+# These are intentionally declarative guardrails as well as runtime requirements.
+allow_live_trading = false
+allow_order_submission = false
+allow_broker_credentials = false

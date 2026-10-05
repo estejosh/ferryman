@@ -1,0 +1,79 @@
+# Ferryman role profile: general business. The floor every other profile
+# specialises. Labels: customer:<id>, employee:<id>, project:<id>.
+format = "ferryman-roles/v1"
+profile = "general-business"
+
+[roles.owner]
+scopes = ["*:*"]
+
+[roles.manager]
+scopes = ["tasks:*", "artifacts:read", "artifacts:write", "conversations:*", "memory:read", "memory:propose", "memory:approve", "ledger:read", "fleet:read", "cost:read", "cost:plan", "team:read", "team:invite", "agents:view", "agents:message", "agents:assign", "agents:own", "secrets:list"]
+label = "project"
+
+[roles.staff]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "tasks:create", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "memory:read", "memory:propose", "agents:view", "agents:message", "agents:own"]
+label = "project"
+
+[roles.contractor]
+extends = "staff"
+minus = ["tasks:create", "agents:own"]
+label = "project"
+engagement = "contractor"
+
+[roles.viewer]
+scopes = ["tasks:read", "conversations:read", "memory:read", "agents:view"]
+label = "project"
+
+[roles.assistant-agent]
+scopes = ["tasks:read", "tasks:take", "tasks:submit", "artifacts:read", "artifacts:write", "conversations:read", "conversations:write", "memory:read", "memory:propose", "cost:spend"]
+agent = true
+label = "project"
+handoff_depth = 1
+
+[roles.everyone]
+scopes = ["artifacts:read:library", "conversations:read:library", "memory:read", "team:read", "fleet:read", "agents:view", "agents:message"]
+auto_grant = true
+
+[two_person]
+scopes = ["secrets:set", "secrets:remove", "team:grant", "policy:write"]
+
+[break_glass]
+enabled = false
+
+[lending]
+enabled = true
+default_reveal = "borrower-scopes"
+default_transcript = "owner"
+max_hours = 168
+requires_budget = false
+
+[purposes]
+allowed = []
+
+[labels.customer]
+train = "with-consent"
+infer = "cloud-with-agreement"
+export = "owner"
+redacted_view = ["contractor", "assistant-agent"]
+redacted_label = "customer-scrubbed"
+
+[labels.customer-scrubbed]
+train = "always"
+infer = "any"
+
+[labels.employee]
+train = "never"
+infer = "local"
+export = "never"
+two_person_read = true
+
+[labels.project]
+train = "always"
+infer = "any"
+export = "owner"
+lifecycle = "done"
+
+[labels.library]
+train = "always"
+infer = "any"
+export = "owner"
