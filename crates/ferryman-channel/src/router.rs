@@ -53,25 +53,45 @@
 //!
 //! # The success estimate
 //!
-//! For one engine and one kind of work, `p` is a Beta posterior.
+//! For one engine and one kind of work, `p` is a Beta posterior. Its prior mean comes from
+//! one of two places.
 //!
-//! The prior mean is set by the engine's size class - large 0.80, medium 0.70, small 0.55 -
-//! plus 0.05 for every strength tag that matches the kind (`code` for code-change, `tests`
-//! and `code` for tests, `docs`, `review` and `reasoning`, ...), at most 0.10; minus 0.10
-//! for every class the engine is below the size of the work (a small engine on large work).
-//! The prior counts for [`PRIOR_WEIGHT`] observations.
+//! **A model the router knows.** [`crate::models`] holds a curated table of model families
+//! (Claude opus, sonnet and haiku, GPT-5 and codex, Gemini, DeepSeek, Nemotron, Qwen, GLM,
+//! Llama, Mistral, Kimi) with a conservative prior for each kind of work, so Claude Haiku
+//! starts well on chores and not on plans, and a 14b Qwen starts as a fair writer and not
+//! a reviewer. The engine's model string is matched first, then its name. When a model
+//! matches, **the profile wins**: the engine's size class is not used (it is a guess made
+//! from the same name), and large work takes 0.05 off a medium model and 0.10 off a small
+//! one. Declared or guessed strengths still add 0.05 each, to 0.10, for the kinds they
+//! help, except the tags the profile has already priced in, so a name is not counted twice.
 //!
-//! The evidence is the worker's ledger of this engine's results for this kind, verified or
-//! refuted by the worker's own checks, each weighted by `0.5^(age / 14 days)` so that old
-//! results fade: [`Outcome`]. `p = (prior * 4 + verified) / (4 + verified + refuted)`.
+//! **A model it does not know.** The engine's size class sets the prior, exactly as it
+//! always did: large 0.80, medium 0.70, small 0.55, plus 0.05 for every strength tag that
+//! matches the kind (`code` for code-change, `tests` and `code` for tests, `docs`, `review`
+//! and `reasoning`, ...), at most 0.10; minus 0.10 for every class the engine is below the
+//! size of the work (a small engine on large work). An operator's declared `class` and
+//! `strengths` count here in full.
 //!
-//! So a medium engine starts at 0.70. That is enough for the kinds whose result is words,
-//! and for chores and tests ([`TEXT_THRESHOLD`], 0.70), so a free medium engine such as
-//! NVIDIA's nemotron does that work from the start and loses it as soon as its results are
-//! refuted. It is below the default for code changes and media ([`DEFAULT_THRESHOLD`],
-//! 0.75): there a medium engine is tried only when nothing sufficient is cheaper, and
-//! proves itself, or not, one verified result at a time. A large engine starts above both;
-//! a small one (0.55) must earn either.
+//! Either prior counts for [`PRIOR_WEIGHT`] observations. The evidence is the worker's
+//! ledger of this engine's results for this kind, verified or refuted by the worker's own
+//! checks, each weighted by `0.5^(age / 14 days)` so that old results fade: [`Outcome`].
+//! `p = (prior * 4 + verified) / (4 + verified + refuted)`. So the table only says where a
+//! model starts; its own results move it from there.
+//!
+//! `ferry route simulate` and `explain` say which it was beside every `p`: `p 0.87 (model
+//! profile: claude-sonnet)` or `p 0.70 (class medium)`, with the ledger's count once it has
+//! one.
+//!
+//! # The threshold
+//!
+//! Review and plan need 0.80 ([`REASONING_THRESHOLD`]): only an engine that is actually
+//! good at judging or planning gets that work, and a medium one that is not proven must
+//! earn it. Docs, chore, tests and research need 0.70 ([`TEXT_THRESHOLD`]), so a free
+//! engine that writes well does that work from the start and loses it as soon as its results
+//! are refuted. Code changes, translation and media need 0.75 ([`DEFAULT_THRESHOLD`]).
+//! Large work of any kind adds 0.05 ([`LARGE_WORK_MARGIN`]) to its default. A threshold the
+//! policy sets for a kind is the operator's word and is used as it is, large work or not.
 //!
 //! # The expected cost
 //!
@@ -92,12 +112,15 @@
 //! # The choice
 //!
 //! The *sufficient set* is every engine with `p` at or above the threshold for the kind
-//! ([`default_threshold`]: 0.70 for docs, chore, tests, review, plan and research, 0.75 for
-//! the rest; `thresholds` in the policy per kind) - and above the failed engine's `p` when
-//! escalating. The winner is the cheapest of them. Costs within 10% (or half a tenth of a
-//! cent) of the cheapest count as tied, and ties go to the operator's **bias**
-//! (the policy's `bias` weights, then the engine's place in the role's `prefer` list), then
-//! the nearer tier, then the faster engine, then the order the policy and the engine list
+//! ([`default_threshold`]: 0.80 for review and plan, 0.70 for docs, chore, tests and
+//! research, 0.75 for the rest, and 0.05 more for large work; `thresholds` in the policy
+//! per kind, used exactly as set) - and above the failed engine's `p` when escalating. The
+//! winner is the cheapest of them. Costs within 10% (or half a tenth of a cent) of the
+//! cheapest count as tied, and ties go to the operator's **bias** (the policy's `bias`
+//! weights, then the engine's place in the role's `prefer` list), then to the engine that
+//! costs least in kind: **truly free (local, free tier) before a subscription (nothing per
+//! call, but a capped week) before paid**; then the nearer tier, then the **higher `p`**
+//! (within 0.005), then the faster engine, then the order the policy and the engine list
 //! already gave (how engines nothing else distinguishes were always told apart, so a fleet
 //! of look-alikes behaves as it did), and last the name. With an empty sufficient set the
 //! winner is the highest `p` (within 0.005, the cheaper) *of the engines that can do the
@@ -120,33 +143,40 @@ use serde_json::Value;
 
 use crate::{
     capability::{Cost, Modality},
+    models,
     policy::{Candidate, ModelClass, Policy, Role, Routing, Work, rank},
     work::{Needs, Size, WorkKind, resolve_modalities},
 };
 
 /// The success probability an engine must reach to count as sufficient, unless the policy
-/// says otherwise for the kind: for work that changes code, and for media.
+/// says otherwise for the kind: for work that changes code, translation, and media.
 pub const DEFAULT_THRESHOLD: f64 = 0.75;
-/// The same for work whose result is words (docs, review, plan, research) and for the small
-/// jobs a person can check at a glance (chores, tests). A medium engine's prior is 0.70, so
-/// at 0.75 a free medium engine such as NVIDIA's nemotron could never be sufficient until it
-/// had proved itself, and the first dollar would always go to a dearer one. At 0.70 it is
-/// sufficient from the start, and the ledger takes it out of the running the moment it is
-/// refuted; a small engine (0.55) still has to earn it.
+/// The same for work whose result is words (docs, research) and for the small jobs a
+/// person can check at a glance (chores, tests). A free engine that writes well, such as
+/// NVIDIA's nemotron, is sufficient for these from the start, and the ledger takes it out
+/// of the running the moment it is refuted; a small engine still has to earn it.
 pub const TEXT_THRESHOLD: f64 = 0.70;
+/// For review and plan: judging and planning are where a weak engine does the most harm
+/// quietly, so only an engine that is actually good at them - a large one, or a model whose
+/// profile says so - gets that work until another has proved itself.
+pub const REASONING_THRESHOLD: f64 = 0.80;
+/// Added to a kind's default threshold for large work of any kind: a long job is a bigger
+/// loss when it fails.
+pub const LARGE_WORK_MARGIN: f64 = 0.05;
 
-/// The threshold for `kind` when the policy sets none.
+/// The threshold for `kind` at `size` when the policy sets none.
 #[must_use]
-pub fn default_threshold(kind: WorkKind) -> f64 {
-    match kind {
-        WorkKind::Docs
-        | WorkKind::Chore
-        | WorkKind::Tests
-        | WorkKind::Review
-        | WorkKind::Plan
-        | WorkKind::Research => TEXT_THRESHOLD,
+pub fn default_threshold(kind: WorkKind, size: Size) -> f64 {
+    let base = match kind {
+        WorkKind::Review | WorkKind::Plan => REASONING_THRESHOLD,
+        WorkKind::Docs | WorkKind::Chore | WorkKind::Tests | WorkKind::Research => TEXT_THRESHOLD,
         _ => DEFAULT_THRESHOLD,
-    }
+    };
+    round3(if size == Size::Large {
+        base + LARGE_WORK_MARGIN
+    } else {
+        base
+    })
 }
 
 /// How long it takes a ledger result to count for half as much.
@@ -298,31 +328,63 @@ pub fn strength_tags(kind: WorkKind) -> &'static [&'static str] {
 }
 
 /// How an engine's success estimate for some work came about.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Estimate {
     /// The probability the engine does this work well.
     pub p: f64,
-    /// Before the ledger: class, strengths and size.
+    /// Before the ledger: the model's profile or the class, strengths and size.
     pub prior: f64,
     /// The ledger's age-weighted verified and refuted results for this kind.
     pub verified: f64,
     pub refuted: f64,
+    /// Where the prior came from, in words: `model profile: claude-sonnet` or `class
+    /// medium`, and the ledger's count once there is one.
+    pub basis: String,
 }
 
-/// The prior mean for an engine on work: its class, plus matching strengths, minus the size
-/// of the work above the class.
+/// The prior mean for an engine on work: the profile of its model when the router knows
+/// the model, else its class, plus matching strengths, minus the size of the work above
+/// the class.
 #[must_use]
 pub fn prior(engine: &Candidate, needs: &Needs) -> f64 {
+    prior_and_basis(engine, needs).0
+}
+
+/// [`prior`], and where it came from.
+fn prior_and_basis(engine: &Candidate, needs: &Needs) -> (f64, String) {
+    let matched_strengths = |credited: &dyn Fn(&str) -> bool| {
+        strength_tags(needs.kind)
+            .iter()
+            .filter(|tag| engine.capabilities.has_strength(tag) && !credited(tag))
+            .count()
+    };
+    // A model the router knows: its profile wins over its class. Strengths still add their
+    // bonus, except the tags the profile already priced in.
+    if let Some(profile) = models::profile_for(engine.model.as_deref(), &engine.name)
+        && let Some(base) = profile.prior(needs.kind, needs.size)
+    {
+        let matched = matched_strengths(&|tag| profile.credits(tag));
+        let bonus = (matched as f64 * STRENGTH_BONUS).min(STRENGTH_CAP);
+        return (
+            (base + bonus).clamp(0.05, 0.95),
+            format!("model profile: {}", profile.family),
+        );
+    }
+    (
+        class_prior(engine, needs, matched_strengths(&|_| false)),
+        format!("class {}", engine.class().as_str()),
+    )
+}
+
+/// The prior from the size class alone: what every model had before profiles, and still
+/// what a model the router does not know has.
+fn class_prior(engine: &Candidate, needs: &Needs, matched: usize) -> f64 {
     let class = engine.class();
     let base = match class {
         ModelClass::Large => 0.80,
         ModelClass::Medium => 0.70,
         ModelClass::Small => 0.55,
     };
-    let matched = strength_tags(needs.kind)
-        .iter()
-        .filter(|tag| engine.capabilities.has_strength(tag))
-        .count();
     let bonus = (matched as f64 * STRENGTH_BONUS).min(STRENGTH_CAP);
     let size = match needs.size {
         Size::Small => 0,
@@ -341,7 +403,7 @@ pub fn prior(engine: &Candidate, needs: &Needs) -> f64 {
 /// The success estimate of `engine` for `needs` as of `now`.
 #[must_use]
 pub fn estimate(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Estimate {
-    let prior = prior(engine, needs);
+    let (prior, mut basis) = prior_and_basis(engine, needs);
     let kind = needs.kind.as_str();
     let (verified, refuted) = engine
         .outcomes
@@ -352,20 +414,40 @@ pub fn estimate(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Estima
             (v + more_v, r + more_r)
         });
     let p = (prior * PRIOR_WEIGHT + verified) / (PRIOR_WEIGHT + verified + refuted);
+    if verified + refuted >= 0.5 {
+        basis.push_str(&format!(
+            ", ledger {verified:.0} verified {refuted:.0} refuted"
+        ));
+    }
     Estimate {
         p: p.clamp(0.0, 1.0),
         prior,
         verified,
         refuted,
+        basis,
     }
 }
 
 // --- the price -------------------------------------------------------------------------------
 
+/// How an engine is paid for, as far as breaking a tie in price goes: an engine that costs
+/// nothing at all comes before one on a subscription (nothing per call, but a capped week
+/// that other work needs), and both before one that is paid for by use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Economy {
+    /// Local, or a free tier that has not asked for money.
+    Free,
+    Subscription,
+    /// Priced, unpriced, or a free tier that is flagged for asking for money.
+    Paid,
+}
+
 /// What one call on an engine is expected to cost, and how that was worked out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Price {
     pub usd: f64,
+    /// How it is paid for, which settles a tie in price.
+    pub economy: Economy,
     /// `free`, `local`, `~$0.012`, `unpriced, assumed ~$0.21`, `subscription, 72% of the
     /// weekly cap left`.
     pub note: String,
@@ -428,6 +510,7 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
         let own = caps.cost.as_ref().map_or(0.0, priced);
         return Price {
             usd: own + scarcity,
+            economy: Economy::Subscription,
             note: match left {
                 Some(left) => format!(
                     "subscription, {:.0}% of the weekly cap left",
@@ -440,6 +523,7 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
     if paid == "local" || caps.local {
         return Price {
             usd: caps.cost.as_ref().map_or(0.0, priced),
+            economy: Economy::Free,
             note: "local".to_string(),
         };
     }
@@ -448,6 +532,7 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
             let usd = priced(&ASSUMED_COST);
             return Price {
                 usd,
+                economy: Economy::Paid,
                 note: format!(
                     "free tier but flagged for asking for money, assumed {}",
                     money(usd)
@@ -456,18 +541,21 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
         }
         return Price {
             usd: caps.cost.as_ref().map_or(0.0, priced),
+            economy: Economy::Free,
             note: "free".to_string(),
         };
     }
     match &caps.cost {
         Some(cost) if cost.is_free() => Price {
             usd: 0.0,
+            economy: Economy::Free,
             note: "free".to_string(),
         },
         Some(cost) => {
             let usd = priced(cost);
             Price {
                 usd,
+                economy: Economy::Paid,
                 note: money(usd),
             }
         }
@@ -475,6 +563,7 @@ pub fn price(engine: &Candidate, needs: &Needs, now: DateTime<Utc>) -> Price {
             let usd = priced(&ASSUMED_COST);
             Price {
                 usd,
+                economy: Economy::Paid,
                 note: format!("unpriced, assumed {}", money(usd)),
             }
         }
@@ -522,6 +611,9 @@ pub struct Considered {
     /// How that was worked out: `free`, `subscription, 72% of the weekly cap left`, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<String>,
+    /// Where `p` came from: `model profile: claude-sonnet`, `class medium`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basis: Option<String>,
     /// Reached the threshold (and beat a failed engine's estimate, when escalating).
     #[serde(default)]
     pub sufficient: bool,
@@ -597,9 +689,14 @@ impl Decision {
                 (None, _) if candidate.sufficient => "+",
                 _ => "-",
             };
+            let basis = candidate
+                .basis
+                .as_ref()
+                .map(|basis| format!(" ({basis})"))
+                .unwrap_or_default();
             let facts = match (&candidate.p, &candidate.price) {
-                (Some(p), Some(price)) => format!("p {p:.2}, {price}"),
-                (Some(p), None) => format!("p {p:.2}"),
+                (Some(p), Some(price)) => format!("p {p:.2}{basis}, {price}"),
+                (Some(p), None) => format!("p {p:.2}{basis}"),
                 _ => String::new(),
             };
             out.push(format!(
@@ -750,7 +847,7 @@ pub fn route(
     context: &Context,
 ) -> Routed {
     let ranking = rank(policy, role, tier, work, engines);
-    let threshold = policy.threshold_for(needs.kind);
+    let threshold = policy.threshold_for(needs.kind, needs.size);
     let smart = policy.routing == Routing::Smart && role != Role::Adversary;
     let mut decision = Decision {
         routing: if smart { "smart" } else { "ordered" }.to_string(),
@@ -772,6 +869,7 @@ pub fn route(
         p: None,
         cost_usd: None,
         price: None,
+        basis: None,
         sufficient: false,
         excluded,
     };
@@ -861,6 +959,7 @@ pub fn route(
                 p: Some(round3(estimate.p)),
                 cost_usd: Some(round3(price.usd)),
                 price: Some(price.note),
+                basis: Some(estimate.basis),
                 sufficient: estimate.p + 1e-9 >= threshold,
                 ..considered(engine, None)
             });
@@ -980,6 +1079,7 @@ pub fn route(
                 p: Some(round3(s.estimate.p)),
                 cost_usd: Some(round3(s.price.usd)),
                 price: Some(s.price.note.clone()),
+                basis: Some(s.estimate.basis.clone()),
                 sufficient: s.sufficient,
                 ..considered(engine, None)
             }
@@ -1078,15 +1178,24 @@ fn unable(engine: &Candidate, needs: &Needs) -> Result<(), String> {
     Ok(())
 }
 
-/// The tie-break after price: bias (higher first), the nearer tier, the faster engine, then
-/// the order the policy and the engine list already gave - which is how engines that look
-/// the same to the router were always told apart, so a fleet whose engines nothing
-/// distinguishes behaves as it did - and last the name and machine.
+/// A success estimate in steps of [`P_TIE`], so two engines whose estimates are that close
+/// compare as equal and the comparison stays a total order.
+fn p_step(scored: &Scored) -> f64 {
+    (scored.estimate.p / P_TIE).round()
+}
+
+/// The tie-break after price: bias (higher first), how it is paid for (free outright, then
+/// a subscription, then paid), the nearer tier, the higher success estimate, the faster
+/// engine, then the order the policy and the engine list already gave - which is how
+/// engines that look the same to the router were always told apart, so a fleet whose
+/// engines nothing distinguishes behaves as it did - and last the name and machine.
 fn tie_break(a: &Scored, b: &Scored, engines: &[Candidate]) -> Ordering {
     let (ea, eb) = (&engines[a.index], &engines[b.index]);
     b.bias
         .total_cmp(&a.bias)
+        .then(a.price.economy.cmp(&b.price.economy))
         .then(a.distance.cmp(&b.distance))
+        .then_with(|| p_step(b).total_cmp(&p_step(a)))
         .then(
             ea.latency_ms
                 .unwrap_or(u64::MAX)
@@ -1178,8 +1287,15 @@ fn winner_reason(
             .collect();
         let decider = if rivals.iter().any(|other| other.bias < win.bias) {
             "bias put it first"
+        } else if rivals
+            .iter()
+            .any(|other| other.price.economy != win.price.economy)
+        {
+            "how it is paid for put it first: free, then a subscription, then paid"
         } else if rivals.iter().any(|other| other.distance != win.distance) {
             "the nearer tier put it first"
+        } else if rivals.iter().any(|other| p_step(other) != p_step(win)) {
+            "its higher p put it first"
         } else {
             "speed and its place in the list put it first"
         };
@@ -1448,8 +1564,8 @@ mod tests {
     #[test]
     fn free_and_large_wins_and_the_line_says_why() {
         let nvidia = engine("nvidia", ModelClass::Large, "free-tier", Some(Cost::FREE));
-        let sonnet = engine(
-            "sonnet",
+        let metered = engine(
+            "metered",
             ModelClass::Medium,
             "prepaid",
             Some(Cost {
@@ -1458,7 +1574,7 @@ mod tests {
                 per_mtok_out_usd: 15.0,
             }),
         );
-        let engines = [sonnet, nvidia];
+        let engines = [metered, nvidia];
         let routed = run(
             &Policy::default(),
             &needs(WorkKind::Docs, Size::Small),
@@ -1472,13 +1588,13 @@ mod tests {
         assert_eq!(routed.decision.routing, "smart");
         assert_eq!(routed.decision.winner.as_ref().unwrap().cost_usd, 0.0);
         // The loser is recorded with its own p and price.
-        let sonnet = &routed.decision.candidates[1];
-        assert_eq!(sonnet.engine, "sonnet");
+        let metered = &routed.decision.candidates[1];
+        assert_eq!(metered.engine, "metered");
         assert!(
-            sonnet.sufficient && sonnet.p == Some(0.7),
+            metered.sufficient && metered.p == Some(0.7),
             "sufficient, but dearer"
         );
-        assert!(sonnet.cost_usd.unwrap() > 0.0);
+        assert!(metered.cost_usd.unwrap() > 0.0);
     }
 
     #[test]
@@ -1541,7 +1657,7 @@ mod tests {
                 .decision
                 .reason
                 .contains("the highest of the engines that can do it")
-                && routed.decision.reason.contains("none reach 0.70"),
+                && routed.decision.reason.contains("none reach 0.75"),
             "{}",
             routed.decision.reason
         );
@@ -1675,13 +1791,12 @@ mod tests {
     }
 
     #[test]
-    fn josh_example_text_work_goes_to_nemotron() {
+    fn josh_example_words_and_chores_go_to_nemotron_and_judgement_to_a_model_good_at_it() {
         let fleet = josh_fleet();
         let policy = josh_policy();
+        // Nemotron writes and tidies well enough, and it is free.
         for needs in [
             needs(WorkKind::Docs, Size::Medium),
-            needs(WorkKind::Review, Size::Medium),
-            needs(WorkKind::Plan, Size::Medium),
             needs(WorkKind::Chore, Size::Small),
         ] {
             let routed = run(&policy, &needs, &fleet);
@@ -1694,8 +1809,24 @@ mod tests {
             );
             assert!(routed.decision.reason.contains("cheapest sufficient"));
         }
+        // It is a 0.70 planner, under the 0.80 bar: Sonnet plans.
+        let routed = run(&policy, &needs(WorkKind::Plan, Size::Medium), &fleet);
+        assert_eq!(
+            pick(&routed, &fleet).as_deref(),
+            Some("claude-sonnet"),
+            "{}",
+            routed.decision.reason
+        );
+        // Review is a judge's alone, and Nemotron is the only judge: it still gets it,
+        // and the line says it was the best there was and not that it was good enough.
+        let routed = run(&policy, &needs(WorkKind::Review, Size::Medium), &fleet);
+        assert_eq!(pick(&routed, &fleet).as_deref(), Some("nemotron"));
+        assert!(
+            routed.decision.reason.contains("none reach 0.80"),
+            "{}",
+            routed.decision.reason
+        );
     }
-
     #[test]
     fn josh_example_code_edits_go_to_sonnet() {
         let fleet = josh_fleet();
@@ -1729,17 +1860,12 @@ mod tests {
     }
 
     #[test]
-    fn josh_example_a_small_chore_that_edits_files_goes_to_haiku_when_it_is_sufficient() {
+    fn josh_example_a_small_chore_that_edits_files_goes_to_haiku_until_it_is_refuted() {
         let fleet = josh_fleet();
         let chore = editing_chore();
-        // Out of the box a small model is 0.55 for it, under the 0.70 default: Sonnet.
+        // Haiku is a chore model (0.82 against the 0.70 default) and the cheaper of the
+        // two engines that can edit files.
         let routed = run(&josh_policy(), &chore, &fleet);
-        assert_eq!(pick(&routed, &fleet).as_deref(), Some("claude-sonnet"));
-        // `--threshold chore=0.55` makes Haiku sufficient, and it is the cheaper of the two.
-        let mut easy = josh_policy();
-        easy.thresholds.insert("chore".into(), 0.55);
-        easy.check().unwrap();
-        let routed = run(&easy, &chore, &fleet);
         assert_eq!(
             pick(&routed, &fleet).as_deref(),
             Some("claude-haiku"),
@@ -1747,26 +1873,26 @@ mod tests {
             routed.decision.reason
         );
         assert!(routed.decision.reason.contains("cheapest sufficient"));
-        // Or it earns the work: eight verified chores lift it over the default.
-        let mut proven = fleet.clone();
+        // Eight refuted chores take the work away from it: Sonnet.
+        let mut refuted = fleet.clone();
         for _ in 0..8 {
-            record_outcome(&mut proven[0].outcomes, "chore", true, now());
+            record_outcome(&mut refuted[0].outcomes, "chore", false, now());
         }
-        let routed = run(&josh_policy(), &chore, &proven);
-        assert_eq!(pick(&routed, &proven).as_deref(), Some("claude-haiku"));
+        let routed = run(&josh_policy(), &chore, &refuted);
+        assert_eq!(pick(&routed, &refuted).as_deref(), Some("claude-sonnet"));
         // Chores that edit nothing still go to the free engine.
         let routed = run(&josh_policy(), &needs(WorkKind::Chore, Size::Small), &fleet);
         assert_eq!(pick(&routed, &fleet).as_deref(), Some("nemotron"));
     }
-
     #[test]
     fn josh_example_local_models_are_eligible() {
         let mut fleet = josh_fleet();
         let docs = needs(WorkKind::Docs, Size::Medium);
-        // With NVIDIA out of credit, the next sufficient engine is Sonnet...
+        // With NVIDIA out of credit, the next sufficient engine is Haiku (a 0.78 writer
+        // and cheaper than Sonnet)...
         fleet[3].state = "exhausted".into();
         let routed = run(&josh_policy(), &docs, &fleet);
-        assert_eq!(pick(&routed, &fleet).as_deref(), Some("claude-sonnet"));
+        assert_eq!(pick(&routed, &fleet).as_deref(), Some("claude-haiku"));
         // ...until the local model has proven itself at docs: free beats a subscription.
         for _ in 0..8 {
             record_outcome(&mut fleet[2].outcomes, "docs", true, now());
@@ -1780,7 +1906,6 @@ mod tests {
         );
         assert_eq!(routed.decision.winner.as_ref().unwrap().cost_usd, 0.0);
     }
-
     #[test]
     fn a_subscription_is_scarce_even_behind_a_local_address() {
         // The same model on a subscription, reached through a local gateway: it declares
@@ -1803,20 +1928,20 @@ mod tests {
     #[test]
     fn a_retry_leaves_out_the_failed_engine_and_needs_a_higher_estimate() {
         let nvidia = engine("nvidia", ModelClass::Large, "free-tier", Some(Cost::FREE));
-        let mut sonnet = engine("sonnet", ModelClass::Large, "prepaid", per_call(0.01));
-        sonnet.capabilities.strengths = vec!["docs".into()];
-        let mut haiku = engine("haiku", ModelClass::Medium, "prepaid", per_call(0.001));
-        haiku.capabilities.strengths = vec!["docs".into()];
-        let engines = [haiku, nvidia, sonnet];
+        let mut steady = engine("steady", ModelClass::Large, "prepaid", per_call(0.01));
+        steady.capabilities.strengths = vec!["docs".into()];
+        let mut quick = engine("quick", ModelClass::Medium, "prepaid", per_call(0.001));
+        quick.capabilities.strengths = vec!["docs".into()];
+        let engines = [quick, nvidia, steady];
         let docs = needs(WorkKind::Docs, Size::Small);
         let first = run(&Policy::default(), &docs, &engines);
         assert_eq!(pick(&first, &engines).as_deref(), Some("nvidia"));
         let failed = [failure("nvidia", Some(0.80))];
         let again = retry(&failed, &engines, &docs);
-        // Haiku is sufficient on its own (0.75) but must beat 0.80; sonnet does (0.85).
+        // Haiku is sufficient on its own (0.75) but must beat 0.80; steady does (0.85).
         assert_eq!(
             pick(&again, &engines).as_deref(),
-            Some("sonnet"),
+            Some("steady"),
             "{:?}",
             again.decision
         );
@@ -1838,16 +1963,16 @@ mod tests {
         // With only engines that cannot beat it, the best of them still does the work.
         let weak = [engines[0].clone()];
         let again = retry(&failed, &weak, &docs);
-        assert_eq!(pick(&again, &weak).as_deref(), Some("haiku"));
+        assert_eq!(pick(&again, &weak).as_deref(), Some("quick"));
         assert!(again.decision.reason.contains("none reach"));
         // And when every engine failed, nothing waits: the likeliest of them tries again.
         let all = [
-            failure("haiku", None),
+            failure("quick", None),
             failure("nvidia", None),
-            failure("sonnet", None),
+            failure("steady", None),
         ];
         let again = retry(&all, &engines, &docs);
-        assert_eq!(pick(&again, &engines).as_deref(), Some("sonnet"));
+        assert_eq!(pick(&again, &engines).as_deref(), Some("steady"));
         assert_eq!(again.order.len(), 3, "all of them, likeliest first");
         assert!(
             again
@@ -2431,5 +2556,296 @@ mod tests {
         assert_eq!(top[0].0, "docs");
         assert!((top[0].1 - 5.0 / 6.0).abs() < 1e-3 && (top[0].2 - 6.0).abs() < 1e-3);
         assert_eq!(top[1].0, "tests");
+    }
+
+    // --- model profiles, thresholds and the new tie-breaks ------------------------------
+
+    /// An engine whose model the router may know. `class` is what its worker would have
+    /// guessed or the operator declared; a model with a profile ignores it.
+    fn modeled(name: &str, model: &str, class: ModelClass, paid: &str) -> Candidate {
+        Candidate {
+            model: Some(model.into()),
+            ..http(name, class, paid)
+        }
+    }
+
+    #[test]
+    fn a_known_model_takes_its_prior_from_its_profile_and_not_from_its_class() {
+        // Declared large, but the model is Nemotron super: it reviews like one.
+        let nemotron = modeled(
+            "nvidia",
+            "nvidia/nemotron-3-super-120b-a12b",
+            ModelClass::Large,
+            "free-tier",
+        );
+        let review = needs(WorkKind::Review, Size::Medium);
+        assert!((prior(&nemotron, &review) - 0.72).abs() < 1e-9);
+        let docs = needs(WorkKind::Docs, Size::Medium);
+        assert!((prior(&nemotron, &docs) - 0.78).abs() < 1e-9);
+        assert_eq!(
+            estimate(&nemotron, &review, now()).basis,
+            "model profile: nemotron-super"
+        );
+        // A model the router does not know keeps the class rule, to the digit.
+        let mystery = modeled("mystery", "my-own-finetune", ModelClass::Large, "free-tier");
+        assert!((prior(&mystery, &review) - 0.80).abs() < 1e-9);
+        assert_eq!(estimate(&mystery, &review, now()).basis, "class large");
+        // The model string comes first; the engine name is only the fallback.
+        let by_model = modeled("sonnet-box", "haiku", ModelClass::Large, "subscription");
+        assert_eq!(
+            estimate(&by_model, &review, now()).basis,
+            "model profile: claude-haiku"
+        );
+        let by_name = modeled(
+            "claude-sonnet",
+            "an-unlisted-model",
+            ModelClass::Small,
+            "subscription",
+        );
+        assert_eq!(
+            estimate(&by_name, &review, now()).basis,
+            "model profile: claude-sonnet"
+        );
+        let nameless = engine("claude-opus", ModelClass::Small, "subscription", None);
+        assert!(prior(&nameless, &review) > 0.90, "opus by its name");
+    }
+
+    #[test]
+    fn declared_strengths_still_add_their_bonus_to_a_profile_but_never_twice() {
+        let mut haiku = modeled("h", "haiku", ModelClass::Small, "subscription");
+        let review = needs(WorkKind::Review, Size::Medium);
+        assert!((prior(&haiku, &review) - 0.70).abs() < 1e-9);
+        haiku.capabilities.strengths = vec!["review".into()];
+        assert!((prior(&haiku, &review) - 0.75).abs() < 1e-9);
+        haiku.capabilities.strengths = vec!["review".into(), "reasoning".into()];
+        assert!((prior(&haiku, &review) - 0.80).abs() < 1e-9, "to +0.10");
+        // A tag the profile has already priced in (`code` on a -coder) adds nothing...
+        let mut coder = modeled("c", "qwen2.5-coder:32b", ModelClass::Medium, "local");
+        let code = needs(WorkKind::CodeChange, Size::Medium);
+        let base = prior(&coder, &code);
+        coder.capabilities.strengths = vec!["code".into()];
+        assert!((prior(&coder, &code) - base).abs() < 1e-9);
+        // ...but a tag it has not does: tests are helped by `tests` as well.
+        let tests = needs(WorkKind::Tests, Size::Medium);
+        coder.capabilities.strengths = vec![];
+        let base = prior(&coder, &tests);
+        coder.capabilities.strengths = vec!["code".into(), "tests".into()];
+        assert!((prior(&coder, &tests) - (base + 0.05)).abs() < 1e-9);
+        // And a model that is not known to be a coder is helped by saying so.
+        let mut flash = modeled("g", "gemini-flash", ModelClass::Medium, "free-tier");
+        let base = prior(&flash, &code);
+        flash.capabilities.strengths = vec!["code".into()];
+        assert!((prior(&flash, &code) - (base + 0.05)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_profile_is_a_prior_the_ledger_still_moves_and_the_line_shows_it() {
+        let mut haiku = modeled("h", "haiku", ModelClass::Small, "subscription");
+        let chore = needs(WorkKind::Chore, Size::Small);
+        assert!((estimate(&haiku, &chore, now()).p - 0.82).abs() < 1e-9);
+        for _ in 0..4 {
+            record_outcome(&mut haiku.outcomes, "chore", true, now());
+        }
+        let moved = estimate(&haiku, &chore, now());
+        // (0.82 * 4 + 4) / 8
+        assert!((moved.p - 0.91).abs() < 1e-3, "{}", moved.p);
+        assert_eq!(
+            moved.basis,
+            "model profile: claude-haiku, ledger 4 verified 0 refuted"
+        );
+        for _ in 0..12 {
+            record_outcome(&mut haiku.outcomes, "chore", false, now());
+        }
+        assert!(estimate(&haiku, &chore, now()).p < 0.40, "refuted again");
+    }
+
+    #[test]
+    fn large_work_is_a_step_harder_for_a_smaller_model() {
+        let mini = modeled("m", "gpt-5-mini", ModelClass::Medium, "prepaid");
+        let medium = prior(&mini, &needs(WorkKind::Docs, Size::Medium));
+        let large = prior(&mini, &needs(WorkKind::Docs, Size::Large));
+        assert!((medium - large - 0.05).abs() < 1e-9);
+        let gpt = modeled("g", "gpt-5", ModelClass::Medium, "prepaid");
+        let a = prior(&gpt, &needs(WorkKind::Docs, Size::Medium));
+        let b = prior(&gpt, &needs(WorkKind::Docs, Size::Large));
+        assert!((a - b).abs() < 1e-9, "a large model loses nothing");
+    }
+
+    #[test]
+    fn review_and_plan_need_point_eight_and_large_work_a_little_more() {
+        let engines = [modeled(
+            "d",
+            "deepseek-v4-pro",
+            ModelClass::Large,
+            "free-tier",
+        )];
+        for (kind, size, want) in [
+            (WorkKind::Review, Size::Medium, 0.80),
+            (WorkKind::Plan, Size::Small, 0.80),
+            (WorkKind::Review, Size::Large, 0.85),
+            (WorkKind::Plan, Size::Large, 0.85),
+            (WorkKind::Docs, Size::Small, 0.70),
+            (WorkKind::Docs, Size::Large, 0.75),
+            (WorkKind::Chore, Size::Large, 0.75),
+            (WorkKind::CodeChange, Size::Medium, 0.75),
+            (WorkKind::CodeChange, Size::Large, 0.80),
+        ] {
+            let routed = run(&Policy::default(), &needs(kind, size), &engines);
+            let got = routed.decision.threshold;
+            assert!((got - want).abs() < 1e-9, "{kind:?} {size:?}: {got}");
+        }
+        // What the policy signs is used as set, large or not.
+        let mut set = Policy::default();
+        set.thresholds.insert("review".into(), 0.70);
+        let routed = run(&set, &needs(WorkKind::Review, Size::Large), &engines);
+        assert!((routed.decision.threshold - 0.70).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_a_model_that_is_good_at_it_gets_review_and_a_free_one_keeps_the_words() {
+        let mut nemotron = modeled(
+            "nvidia",
+            "nvidia/nemotron-3-super-120b-a12b",
+            ModelClass::Medium,
+            "free-tier",
+        );
+        nemotron.tier = "judge".into();
+        let mut sonnet = modeled("claude-sonnet", "sonnet", ModelClass::Medium, "prepaid");
+        sonnet.tier = "judge".into();
+        sonnet.capabilities.cost = per_call(0.01);
+        let engines = [sonnet, nemotron];
+        let policy = Policy::default();
+        for kind in [WorkKind::Docs, WorkKind::Chore] {
+            let routed = run(&policy, &needs(kind, Size::Medium), &engines);
+            assert_eq!(
+                pick(&routed, &engines).as_deref(),
+                Some("nvidia"),
+                "{kind:?}: {}",
+                routed.decision.reason
+            );
+        }
+        // Nemotron is a 0.72 reviewer and a 0.70 planner; Sonnet is over the 0.80 bar.
+        for kind in [WorkKind::Review, WorkKind::Plan] {
+            let routed = run(&policy, &needs(kind, Size::Medium), &engines);
+            assert_eq!(
+                pick(&routed, &engines).as_deref(),
+                Some("claude-sonnet"),
+                "{kind:?}: {}",
+                routed.decision.reason
+            );
+            assert!(routed.decision.reason.contains("cheapest sufficient"));
+        }
+    }
+
+    #[test]
+    fn among_equal_prices_a_truly_free_engine_comes_before_a_paid_one_whatever_its_speed() {
+        // Costs within half a tenth of a cent are tied. The paid one is listed first and
+        // is faster, and the free one still wins.
+        let mut paid = engine("paid", ModelClass::Large, "prepaid", per_call(0.0002));
+        paid.latency_ms = Some(10);
+        let mut free = engine("free", ModelClass::Large, "free-tier", Some(Cost::FREE));
+        free.latency_ms = Some(900);
+        let engines = [paid, free];
+        let routed = run(
+            &Policy::default(),
+            &needs(WorkKind::Docs, Size::Small),
+            &engines,
+        );
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("free"));
+        assert!(
+            routed
+                .decision
+                .reason
+                .contains("tied on price with paid, how it is paid for put it first"),
+            "{}",
+            routed.decision.reason
+        );
+    }
+
+    #[test]
+    fn among_equal_prices_a_subscription_comes_before_a_paid_engine() {
+        // A subscription with no cap known is priced at 0.065, a paid engine at 0.066:
+        // tied, and the subscription goes first though the paid one is listed first.
+        let mut paid = engine("paid", ModelClass::Large, "prepaid", per_call(0.066));
+        paid.latency_ms = Some(10);
+        let sub = engine("sub", ModelClass::Large, "subscription", Some(Cost::FREE));
+        let engines = [paid, sub];
+        let routed = run(
+            &josh_policy(),
+            &needs(WorkKind::Docs, Size::Small),
+            &engines,
+        );
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("sub"));
+        assert!(routed.decision.reason.contains("tied on price with paid"));
+        // The same two the other way round, as listed.
+        let engines = [engines[1].clone(), engines[0].clone()];
+        let routed = run(
+            &josh_policy(),
+            &needs(WorkKind::Docs, Size::Small),
+            &engines,
+        );
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("sub"));
+    }
+
+    #[test]
+    fn among_equal_prices_the_higher_p_comes_before_speed_and_bias_still_comes_first() {
+        let mut quick = engine("quick", ModelClass::Medium, "free-tier", Some(Cost::FREE));
+        quick.latency_ms = Some(10);
+        let mut steady = engine("steady", ModelClass::Large, "free-tier", Some(Cost::FREE));
+        steady.latency_ms = Some(900);
+        let engines = [quick, steady];
+        let docs = needs(WorkKind::Docs, Size::Small);
+        // Both are sufficient (0.70 and 0.80) and free: the likelier one first.
+        let routed = run(&Policy::default(), &docs, &engines);
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("steady"));
+        assert!(
+            routed
+                .decision
+                .reason
+                .contains("tied on price with quick, its higher p put it first"),
+            "{}",
+            routed.decision.reason
+        );
+        // With p equal it is speed again.
+        let mut same = engines.clone();
+        same[1].class = Some(ModelClass::Medium);
+        let routed = run(&Policy::default(), &docs, &same);
+        assert_eq!(pick(&routed, &same).as_deref(), Some("quick"));
+        // The operator's bias is still the first word.
+        let mut prefer = Policy::default();
+        prefer
+            .prefer
+            .insert("build".into(), vec!["name:quick".into()]);
+        let routed = run(&prefer, &docs, &engines);
+        assert_eq!(pick(&routed, &engines).as_deref(), Some("quick"));
+        assert!(routed.decision.reason.contains("bias put it first"));
+    }
+
+    #[test]
+    fn the_lines_say_where_each_p_came_from_and_an_old_record_still_reads() {
+        let sonnet = modeled("claude-sonnet", "sonnet", ModelClass::Large, "subscription");
+        let plain = http("plain", ModelClass::Medium, "free-tier");
+        let engines = [sonnet, plain];
+        let routed = run(
+            &josh_policy(),
+            &needs(WorkKind::Docs, Size::Small),
+            &engines,
+        );
+        let text = routed.decision.lines().join("\n");
+        assert!(
+            text.contains("p 0.86 (model profile: claude-sonnet), subscription"),
+            "{text}"
+        );
+        assert!(text.contains("p 0.70 (class medium), free"), "{text}");
+        // The basis is recorded with the decision and survives its JSON.
+        let back: Decision =
+            serde_json::from_value(serde_json::to_value(&routed.decision).unwrap()).unwrap();
+        assert_eq!(back, routed.decision);
+        // A record written before profiles has no basis and still reads.
+        let old: Considered = serde_json::from_str(
+            r#"{"engine":"a","agent":"w","machine":"m","p":0.7,"sufficient":true}"#,
+        )
+        .unwrap();
+        assert!(old.basis.is_none());
     }
 }

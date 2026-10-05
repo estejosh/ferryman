@@ -44,6 +44,7 @@ pub mod marvin;
 pub mod master;
 pub mod memory;
 pub mod migration;
+pub mod models;
 pub mod overlap;
 pub mod owner;
 pub mod policy;

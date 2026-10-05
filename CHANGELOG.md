@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+The router now knows what each model is good at. A built-in table of model families (Claude, GPT-5, Gemini, DeepSeek, Nemotron, Qwen, GLM, Llama, Mistral, Kimi) gives each one a starting success estimate for each kind of work, so Haiku starts well on chores, Nemotron on docs but not on review, and a 7b Qwen on nothing. A model the table does not know is scored by its size class exactly as before, and the ledger still moves every estimate. Review and plan now need 0.80 and large work needs 0.05 more (a threshold you set is used as set). Among engines that cost the same, a free one goes before a subscription before a paid one, then the one more likely to succeed. `ferry route simulate` and `explain` say where each estimate came from.
+
 ## v0.5.20 - 2026-10-05
 
 A revoked worker is no longer offered as an engine. Its last engines file stayed in the channel and still verified, so the router could send work to a retired name that nobody runs.

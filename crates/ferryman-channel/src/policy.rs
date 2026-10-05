@@ -594,15 +594,16 @@ impl Policy {
         Ok(())
     }
 
-    /// The success probability an engine must reach for `kind` of work: the policy's
-    /// word, else [`crate::router::default_threshold`]. Keys are the kind's name.
+    /// The success probability an engine must reach for `kind` of work at `size`: the
+    /// policy's word for the kind, exactly as set (large work included), else
+    /// [`crate::router::default_threshold`]. Keys are the kind's name.
     #[must_use]
-    pub fn threshold_for(&self, kind: crate::work::WorkKind) -> f64 {
+    pub fn threshold_for(&self, kind: crate::work::WorkKind, size: crate::work::Size) -> f64 {
         self.thresholds
             .iter()
             .find(|(name, _)| crate::work::WorkKind::parse(name).is_ok_and(|parsed| parsed == kind))
             .map_or_else(
-                || crate::router::default_threshold(kind),
+                || crate::router::default_threshold(kind, size),
                 |(_, value)| *value,
             )
     }
@@ -5908,21 +5909,25 @@ mod tests {
         assert!(Routing::parse("random").is_err());
 
         // Thresholds: the policy's word for a kind, else the default.
-        let docs = crate::work::WorkKind::Docs;
-        assert!((policy.threshold_for(docs) - crate::router::TEXT_THRESHOLD).abs() < 1e-9);
+        use crate::work::{Size, WorkKind};
+        let docs = WorkKind::Docs;
+        let medium = Size::Medium;
+        assert!((policy.threshold_for(docs, medium) - crate::router::TEXT_THRESHOLD).abs() < 1e-9);
         // The defaults per kind: 0.70 where the result is words (or small enough to read at
-        // a glance), so a medium engine - whose prior is exactly 0.70 - is sufficient from
-        // the start; 0.75 for code changes and media.
-        use crate::work::WorkKind;
+        // a glance); 0.80 for review and plan, which only an engine that is good at them
+        // gets; 0.75 for code changes, translation and media.
         for kind in [
             WorkKind::Docs,
             WorkKind::Chore,
             WorkKind::Tests,
-            WorkKind::Review,
-            WorkKind::Plan,
             WorkKind::Research,
         ] {
-            assert!((policy.threshold_for(kind) - 0.70).abs() < 1e-9, "{kind:?}");
+            let got = policy.threshold_for(kind, medium);
+            assert!((got - 0.70).abs() < 1e-9, "{kind:?}");
+        }
+        for kind in [WorkKind::Review, WorkKind::Plan] {
+            let got = policy.threshold_for(kind, medium);
+            assert!((got - 0.80).abs() < 1e-9, "{kind:?}");
         }
         for kind in [
             WorkKind::CodeChange,
@@ -5933,17 +5938,25 @@ mod tests {
             WorkKind::Audio,
             WorkKind::Other,
         ] {
-            assert!((policy.threshold_for(kind) - 0.75).abs() < 1e-9, "{kind:?}");
+            let got = policy.threshold_for(kind, medium);
+            assert!((got - 0.75).abs() < 1e-9, "{kind:?}");
         }
+        // Large work of any kind adds 0.05 to the default; small work adds nothing.
+        for kind in WorkKind::ALL {
+            let base = policy.threshold_for(kind, medium);
+            let large = policy.threshold_for(kind, Size::Large);
+            assert!((large - base - 0.05).abs() < 1e-9, "{kind:?}");
+            assert!((policy.threshold_for(kind, Size::Small) - base).abs() < 1e-9);
+        }
+        // What the policy sets is used as it is, large work or not; the other kinds keep
+        // their defaults.
         let mut tuned = Policy::default();
         tuned.thresholds.insert(docs.as_str().into(), 0.65);
         tuned.check().unwrap();
-        assert!((tuned.threshold_for(docs) - 0.65).abs() < 1e-9);
-        assert!(
-            (tuned.threshold_for(crate::work::WorkKind::Review) - crate::router::TEXT_THRESHOLD)
-                .abs()
-                < 1e-9
-        );
+        assert!((tuned.threshold_for(docs, medium) - 0.65).abs() < 1e-9);
+        assert!((tuned.threshold_for(docs, Size::Large) - 0.65).abs() < 1e-9);
+        assert!((tuned.threshold_for(WorkKind::Review, medium) - 0.80).abs() < 1e-9);
+        assert!((tuned.threshold_for(WorkKind::Review, Size::Large) - 0.85).abs() < 1e-9);
         // And what `check` refuses.
         for bad in [0.0, -0.2, 1.5, f64::NAN] {
             let mut policy = Policy::default();
