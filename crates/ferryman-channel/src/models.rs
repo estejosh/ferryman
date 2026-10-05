@@ -23,9 +23,11 @@
 //! # How a model is found
 //!
 //! [`profile_for`] reads the engine's model string. Case does not matter and `-`, `_`, `:`,
-//! `/` and spaces all separate words, so `Claude-Sonnet-4-5`, `claude_sonnet_4_5` and the
-//! bare `sonnet` alias the claude CLI takes are the same family. When the model string is
-//! empty or names nothing in the table, the engine's own name is read the same way. A model
+//! `/`, spaces and dots all separate words (a dot between two digits is a version and stays,
+//! as in `qwen2.5` or `4.7`), so `Claude-Sonnet-4-5`, `claude_sonnet_4_5`, the bare `sonnet`
+//! alias the claude CLI takes and Bedrock's `us.anthropic.claude-sonnet-4-5-v1:0` are the
+//! same family. Only when there is **no model string** is the engine's own name read the
+//! same way: an engine named `sonnet-fast` that serves `my-finetune` is not Sonnet. A model
 //! that matches nothing has no profile, and the router keeps using its size class, exactly
 //! as before.
 //!
@@ -126,15 +128,15 @@ impl Profile {
     }
 }
 
-/// The profile for an engine: by its model string, else by its name. `None` when neither
-/// is a model this table knows.
+/// The profile for an engine: by its model string, or by its name when it has no model
+/// string. A model that is given and not in the table has no profile: the name of the
+/// engine serving it says nothing about it. `None` when the table does not know it.
 #[must_use]
 pub fn profile_for(model: Option<&str>, name: &str) -> Option<Profile> {
-    model
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .and_then(from_text)
-        .or_else(|| from_text(name))
+    match model.map(str::trim).filter(|model| !model.is_empty()) {
+        Some(model) => from_text(model),
+        None => from_text(name),
+    }
 }
 
 // --- sizes ---------------------------------------------------------------------------------
@@ -270,8 +272,9 @@ const SEES: Priors = [-0.06, -0.04, -0.05, -0.02, -0.04, 0.00, -0.04, 0.00];
 
 // --- reading a name -------------------------------------------------------------------------
 
-/// A model string as lowercase words: split at anything but a letter, digit or the dot of
-/// a version.
+/// A model string as lowercase words: split at anything but a letter or a digit, except a
+/// dot between two digits, which is a version (`2.5`) and stays inside its word. A dot
+/// anywhere else separates, as in Bedrock's `meta.llama3-1-70b` and `us.deepseek.r1-v1`.
 struct Name {
     tokens: Vec<String>,
     joined: String,
@@ -279,12 +282,23 @@ struct Name {
 
 impl Name {
     fn new(text: &str) -> Self {
-        let lower = text.to_ascii_lowercase();
-        let tokens: Vec<String> = lower
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
-            .filter(|token| token.chars().any(|c| c.is_ascii_alphanumeric()))
-            .map(str::to_string)
-            .collect();
+        let chars: Vec<char> = text.to_ascii_lowercase().chars().collect();
+        let mut tokens: Vec<String> = Vec::new();
+        let mut word = String::new();
+        for (at, &c) in chars.iter().enumerate() {
+            let version_dot = c == '.'
+                && at > 0
+                && chars[at - 1].is_ascii_digit()
+                && chars.get(at + 1).is_some_and(char::is_ascii_digit);
+            if c.is_ascii_alphanumeric() || version_dot {
+                word.push(c);
+            } else if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+        }
+        if !word.is_empty() {
+            tokens.push(word);
+        }
         let joined = tokens.join("-");
         Self { tokens, joined }
     }
@@ -705,17 +719,16 @@ mod tests {
             profile_for(Some("  "), "claude-opus").unwrap().family,
             "claude-opus"
         );
-        // The model string wins when it names a family; the name is the fallback.
+        // The model string wins when it names a family; the name is read only when there
+        // is no model string.
         assert_eq!(
             profile_for(Some("haiku"), "claude-opus").unwrap().family,
             "claude-haiku"
         );
-        assert_eq!(
-            profile_for(Some("some-model-nobody-knows"), "sonnet")
-                .unwrap()
-                .family,
-            "claude-sonnet"
-        );
+        // A model that is given and unknown is not rescued by the engine's name: an engine
+        // called `sonnet-fast` serving a finetune is not Sonnet.
+        assert!(profile_for(Some("my-finetune"), "sonnet-fast").is_none());
+        assert!(profile_for(Some("some-model-nobody-knows"), "claude-sonnet").is_none());
         // A bare `claude` names no model, so there is nothing to profile.
         assert!(profile_for(None, "claude").is_none());
     }
@@ -924,6 +937,36 @@ mod tests {
             assert!(profile_for(Some(model), "").unwrap().credits("code"));
         }
         assert!(at("devstral", WorkKind::CodeChange) > at("mistral-small", WorkKind::CodeChange));
+    }
+
+    #[test]
+    fn bedrock_style_ids_split_at_their_dots_and_versions_keep_theirs() {
+        assert_eq!(
+            family("meta.llama3-1-70b-instruct-v1:0").as_deref(),
+            Some("llama ~70b")
+        );
+        assert_eq!(
+            family("us.deepseek.r1-v1:0").as_deref(),
+            Some("deepseek-r1")
+        );
+        assert_eq!(
+            family("us.anthropic.claude-sonnet-4-5-20250929-v1:0").as_deref(),
+            Some("claude-sonnet")
+        );
+        assert_eq!(
+            family("eu.meta.llama3-3-70b-instruct-v1:0").as_deref(),
+            Some("llama ~70b")
+        );
+        // A dot between digits is a version and stays: these are read as before.
+        assert_eq!(family("qwen2.5:14b").as_deref(), Some("qwen ~14b"));
+        assert_eq!(family("deepseek-v3.1").as_deref(), Some("deepseek-v3"));
+        assert_eq!(Name::new("glm-4.7-flash").tokens, ["glm", "4.7", "flash"]);
+        assert_eq!(
+            Name::new("meta.llama3-1-70b").tokens,
+            ["meta", "llama3", "1", "70b"]
+        );
+        // A dot at either end, or beside a letter, separates.
+        assert_eq!(Name::new("a.b2.5.c.").tokens, ["a", "b2.5", "c"]);
     }
 
     #[test]

@@ -60,10 +60,10 @@
 //! (Claude opus, sonnet and haiku, GPT-5 and codex, Gemini, DeepSeek, Nemotron, Qwen, GLM,
 //! Llama, Mistral, Kimi) with a conservative prior for each kind of work, so Claude Haiku
 //! starts well on chores and not on plans, and a 14b Qwen starts as a fair writer and not
-//! a reviewer. The engine's model string is matched first, then its name. When a model
-//! matches, **the profile wins**: the engine's size class is not used (it is a guess made
-//! from the same name), and large work takes 0.05 off a medium model and 0.10 off a small
-//! one. Declared or guessed strengths still add 0.05 each, to 0.10, for the kinds they
+//! a reviewer. The engine's model string is matched (its name only when it has no model).
+//! When a model matches, **the profile wins**: the engine's size class is not used (it is a
+//! guess made from the same name), and large work takes 0.05 off a medium model and 0.10
+//! off a small one. Declared or guessed strengths still add 0.05 each, to 0.10, for the kinds they
 //! help, except the tags the profile has already priced in, so a name is not counted twice.
 //!
 //! **A model it does not know.** The engine's size class sets the prior, exactly as it
@@ -611,7 +611,8 @@ pub struct Considered {
     /// How that was worked out: `free`, `subscription, 72% of the weekly cap left`, ...
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price: Option<String>,
-    /// Where `p` came from: `model profile: claude-sonnet`, `class medium`.
+    /// Where `p` came from: `model profile: claude-sonnet`, `class medium`. For showing
+    /// only: it is stripped from signed steps (see [`Decision::for_signed_step`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis: Option<String>,
     /// Reached the threshold (and beat a failed engine's estimate, when escalating).
@@ -662,6 +663,25 @@ pub struct Decision {
 }
 
 impl Decision {
+    /// The decision as a signed improve step records it: everything but the fields that
+    /// are for showing only.
+    ///
+    /// Steps are signed over their exact serialization, and a peer on an older version
+    /// reads a step into its own structs, drops any field it does not know and signs or
+    /// verifies the re-serialized bytes, so the signature fails and the agent's whole
+    /// week of steps is dropped. **A field added to [`Decision`] or [`Considered`] must not
+    /// reach a signed step until the step signature is bumped to cover it.** `basis` is
+    /// live-only: `simulate`, `explain` and the result's `routing` show it, the step does
+    /// not carry it.
+    #[must_use]
+    pub fn for_signed_step(&self) -> Decision {
+        let mut decision = self.clone();
+        for candidate in &mut decision.candidates {
+            candidate.basis = None;
+        }
+        decision
+    }
+
     /// What `ferry route explain` prints, one line each.
     #[must_use]
     pub fn lines(&self) -> Vec<String> {
@@ -2596,16 +2616,15 @@ mod tests {
             estimate(&by_model, &review, now()).basis,
             "model profile: claude-haiku"
         );
+        // The name is read only when there is no model: a finetune served by an engine
+        // called claude-sonnet is scored by its class.
         let by_name = modeled(
             "claude-sonnet",
             "an-unlisted-model",
             ModelClass::Small,
             "subscription",
         );
-        assert_eq!(
-            estimate(&by_name, &review, now()).basis,
-            "model profile: claude-sonnet"
-        );
+        assert_eq!(estimate(&by_name, &review, now()).basis, "class small");
         let nameless = engine("claude-opus", ModelClass::Small, "subscription", None);
         assert!(prior(&nameless, &review) > 0.90, "opus by its name");
     }
@@ -2821,6 +2840,30 @@ mod tests {
         assert!(routed.decision.reason.contains("bias put it first"));
     }
 
+    #[test]
+    fn a_signed_step_keeps_the_decision_and_loses_only_what_is_for_showing() {
+        let sonnet = modeled("claude-sonnet", "sonnet", ModelClass::Large, "subscription");
+        let plain = http("plain", ModelClass::Medium, "free-tier");
+        let engines = [sonnet, plain];
+        let routed = run(
+            &josh_policy(),
+            &needs(WorkKind::Docs, Size::Small),
+            &engines,
+        );
+        let live = routed.decision;
+        assert!(live.candidates.iter().all(|c| c.basis.is_some()));
+        let signed = live.for_signed_step();
+        assert!(signed.candidates.iter().all(|c| c.basis.is_none()));
+        // Everything else is as it was, and the live decision is untouched.
+        let mut same = live.clone();
+        for candidate in &mut same.candidates {
+            candidate.basis = None;
+        }
+        assert_eq!(signed, same);
+        assert!(live.candidates.iter().all(|c| c.basis.is_some()));
+        // No `basis` in what is signed.
+        assert!(!serde_json::to_string(&signed).unwrap().contains("basis"));
+    }
     #[test]
     fn the_lines_say_where_each_p_came_from_and_an_old_record_still_reads() {
         let sonnet = modeled("claude-sonnet", "sonnet", ModelClass::Large, "subscription");

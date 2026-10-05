@@ -980,9 +980,10 @@ These are starting guesses, not benchmarks. The ledger still moves them: a few v
 refuted results change `p` as before, so a model that does better or worse than its family
 is found out. The rules:
 
-- The engine's `model` is matched first (case does not matter), then the engine's name.
-  A model that matches nothing has no profile, and it is scored by its size class exactly
-  as before.
+- The engine's `model` is matched (case does not matter; Bedrock-style ids such as
+  `us.deepseek.r1-v1:0` work). Only an engine with no `model` is matched by its name: an
+  engine called `sonnet-fast` serving `my-finetune` is not Sonnet. A model that matches
+  nothing has no profile, and it is scored by its size class exactly as before.
 - **A profile wins over the size class**, including a `class` you declared: the class is a
   size guess, and the profile is a better one. Your declared `strengths` still count for
   the kinds they help (0.05 each, at most 0.10), except a strength the profile already
