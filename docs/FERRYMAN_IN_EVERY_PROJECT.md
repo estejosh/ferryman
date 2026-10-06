@@ -113,6 +113,10 @@ ferry ask "what changed in the release flow last week"
 Read-only, and every claim in the answer carries its signed source, so the answer
 can be checked instead of trusted.
 
+One machine can serve every project instead of one worker per project:
+`ferry team approve <agent> --all` enrols the identity in every project you master, and
+`ferry agent run --all-projects` runs it as that one identity, with its one set of engines,
+across all of them. See [FLEET_WORKER.md](FLEET_WORKER.md).
 ### Rules that are not negotiable
 
 1. **Claim before you execute.** A false claim means another machine has it.

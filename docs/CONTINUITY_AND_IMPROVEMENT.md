@@ -33,3 +33,8 @@ The improvement engine is a proposal generator, not a self-modifying agent. It c
 After approval, a future GitHub/Drive adapter may submit the exact manifest. Ferryman records the result and never expands the submission beyond the approved manifest.
 
 `POST /v1/projects/{project_id}/outbound-submissions` now creates the immutable proposal/consent manifest for GitHub, Google Drive, MEGA, or private Git. It performs no delivery. GitHub delivery is constrained to a future draft-PR adapter; Drive/MEGA/private-Git delivery is constrained to opaque encrypted bundles. `POST /v1/projects/{project_id}/improvement-proposals` similarly produces only a reviewable proposal and its pending consent record—never a source-tree edit or external upload.
+
+## Focus
+
+Which projects the improvement loop and the fleet's workers spend themselves on is the master's signed word, not a default. A tier per project (ocus, 
+ormal, ackground, paused), set with `ferry focus`, the dashboard or Telegram, shares out the weekly improve budget and sets the order workers look at projects in. It never holds back a person's own orders, never switches self-improve on or off, and gives an archived project nothing. See [FOCUS.md](FOCUS.md).
