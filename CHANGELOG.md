@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.22 - 2026-10-06
+
+An order addressed to a machine now reaches the agents on it. Orders sent to `grouchly` were offered to nobody, because a worker only matched its full identity (`ichabod-grouchly-cline`). A worker now also takes an order addressed to the machine it runs on, and once one of that machine's agents claims it, that agent holds it. The first part of an agent's name is the identity, so an order to `ichabod` still means exactly `ichabod`.
+
 ## v0.5.21 - 2026-10-06
 
 The swarm spans every project: one worker serves every project it belongs to, the router knows what each model is good at (Haiku before Sonnet on Claude, never Opus in the background), and a signed focus list gives the projects that matter most the larger share of improve time and first claim on workers.
