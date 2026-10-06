@@ -1095,7 +1095,18 @@ impl Task {
     #[must_use]
     pub fn holder(&self) -> Option<&str> {
         if let Some(assignee) = &self.order.assigned_to {
-            return Some(assignee.as_str());
+            // Addressed to a machine rather than an agent: the oldest claim by one of
+            // that machine's agents holds it, by the same rule as an open order.
+            let claimant = self
+                .active_claims()
+                .filter(|claim| addressed_to(assignee, &claim.agent))
+                .min_by(|a, b| {
+                    a.claimed_at
+                        .cmp(&b.claimed_at)
+                        .then_with(|| a.agent.cmp(&b.agent))
+                })
+                .map(|claim| claim.agent.as_str());
+            return Some(claimant.unwrap_or(assignee.as_str()));
         }
         self.active_claims()
             .min_by(|a, b| {
@@ -1779,6 +1790,23 @@ pub fn dependencies_satisfied(route: &ProjectRoute, order: &Order) -> Result<boo
     Ok(true)
 }
 
+/// Whether an order addressed to `assignee` is meant for `agent`.
+///
+/// Either the agent's own name, or the machine it runs on. Agents are named
+/// `<identity>-<machine>[-<engine>]`, and the operator directs work at machines
+/// ("send it to grouchly"), not at whichever engine is seated there today. Requiring the
+/// full name meant an order to `grouchly` was offered to nobody, forever. The leading
+/// segment is the identity, never a machine, so an order to `ichabod` still means
+/// exactly `ichabod`.
+#[must_use]
+pub fn addressed_to(assignee: &str, agent: &str) -> bool {
+    agent.eq_ignore_ascii_case(assignee)
+        || agent
+            .split('-')
+            .skip(1)
+            .any(|part| part.eq_ignore_ascii_case(assignee))
+}
+
 pub fn work_for(route: &ProjectRoute, agent: &str) -> Result<Vec<Task>> {
     work_among(route, agent, list_tasks(route)?)
 }
@@ -1815,7 +1843,7 @@ pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result
                     .order
                     .assigned_to
                     .as_deref()
-                    .is_none_or(|assignee| assignee.eq_ignore_ascii_case(agent))
+                    .is_none_or(|assignee| addressed_to(assignee, agent))
                 {
                     out.push(task);
                 }
@@ -9427,6 +9455,40 @@ mod work_over_files_tests {
         claim_order(&route, "t-1", "nebra").unwrap();
         let task = read_task(&route, "t-1").unwrap();
         assert_eq!(task.holder(), Some("fang"), "the assignee holds it");
+    }
+
+    #[test]
+    fn an_order_to_a_machine_is_meant_for_its_agents() {
+        assert!(addressed_to("grouchly", "ichabod-grouchly-cline"));
+        assert!(addressed_to("Grouchly", "ichabod-grouchly"));
+        assert!(addressed_to(
+            "ichabod-grouchly-cline",
+            "ichabod-grouchly-cline"
+        ));
+        // The leading segment is the identity, not a machine.
+        assert!(!addressed_to("ichabod", "ichabod-grouchly-cline"));
+        assert!(!addressed_to("beastly", "ichabod-grouchly-cline"));
+        assert!(!addressed_to("grouch", "ichabod-grouchly-cline"));
+    }
+
+    #[test]
+    fn an_order_to_a_machine_is_held_by_the_agent_there_that_claimed_it() {
+        let (_t, route) = channel();
+        issue_order(&route, &order("t-1", Some("grouchly"), false)).unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().holder(),
+            Some("grouchly"),
+            "unclaimed, it is offered to the machine"
+        );
+        // An agent on another machine claiming changes nothing.
+        claim_order(&route, "t-1", "ichabod-beastly-claude").unwrap();
+        assert_eq!(read_task(&route, "t-1").unwrap().holder(), Some("grouchly"));
+        claim_order(&route, "t-1", "ichabod-grouchly-cline").unwrap();
+        assert_eq!(
+            read_task(&route, "t-1").unwrap().holder(),
+            Some("ichabod-grouchly-cline"),
+            "the agent on that machine that claimed it holds it"
+        );
     }
 
     #[test]
