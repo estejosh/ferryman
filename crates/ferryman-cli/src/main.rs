@@ -1539,7 +1539,8 @@ enum Channel {
     /// the thing the form calls, and exist for scripts and machines with no
     /// browser. A value is read from the terminal or stdin, never from argv.
     Secret {
-        #[arg(long)]
+        /// The project directory. Accepted before or after `set`/`list`/`get`/`rm`.
+        #[arg(long, global = true)]
         workspace: Option<PathBuf>,
         #[command(subcommand)]
         command: SecretCommand,
@@ -8977,11 +8978,81 @@ fn env_quote(value: &str) -> String {
     }
 }
 
-fn read_secret_value(name: &str) -> Result<String> {
+/// Whether a secret name is a label rather than a pasted key: `NVIDIA_API_KEY`, not
+/// `nvapi-...`. A key in this slot would become a file name in the channel, which
+/// syncs in plain text to every machine.
+fn secret_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Every recipient must be on this channel's roster with an encryption key, checked
+/// before the value is asked for. Names the ones that can receive, so the fix is
+/// on screen.
+fn check_secret_recipients(
+    route: &ferryman_channel::ProjectRoute,
+    recipients: &[String],
+) -> Result<()> {
+    if recipients.is_empty() {
+        bail!("say who can use it: --to <agent>[,<agent>...]");
+    }
+    let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+    let can: Vec<&str> = roster
+        .iter()
+        .filter(|a| a.encryption_key.is_some())
+        .map(|a| a.name.as_str())
+        .collect();
+    let missing: Vec<&String> = recipients
+        .iter()
+        .filter(|r| !can.iter().any(|c| c.eq_ignore_ascii_case(r)))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "cannot seal to {} on project '{}': not on this channel, or no encryption key \
+             published. agents that can receive here: {}. nothing was asked for or saved",
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            route.project_id,
+            if can.is_empty() {
+                "none".to_string()
+            } else {
+                can.join(", ")
+            }
+        );
+    }
+    Ok(())
+}
+
+fn read_secret_value(name: &str, recipients: &[String], project: &str) -> Result<String> {
     if std::io::stdin().is_terminal() {
-        let value = rpassword::prompt_password(format!("secret value for '{name}': "))?;
+        eprintln!();
+        eprintln!(
+            "sealing {name} for {} on project '{project}'.",
+            recipients.join(", ")
+        );
+        eprintln!();
+        eprintln!("paste the key now, then press Enter.");
+        eprintln!("  - nothing will show while you paste. that is normal.");
+        eprintln!("  - linux terminal: Ctrl+Shift+V. windows: right-click or Ctrl+V. mac: Cmd+V.");
+        eprintln!("  - paste only the key, not {name}=");
+        eprintln!();
+        let value = rpassword::prompt_password(format!("{name}: "))?;
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
         if value.is_empty() {
-            bail!("a secret value cannot be empty");
+            bail!("nothing was pasted, so nothing was saved. run the same command again");
+        }
+        if value.contains(['\r', '\n']) {
+            bail!(
+                "the key has a line break in it, so nothing was saved. copy just the key and run again"
+            );
+        }
+        if value.starts_with(&format!("{name}=")) {
+            bail!("paste only the key, without {name}=. nothing was saved");
         }
         return Ok(value);
     }
@@ -9008,6 +9079,23 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 Some(s) => s,
                 None => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
+            // Everything that can be wrong is checked before the value is asked for:
+            // a mistake found after someone has pasted a key means pasting it again.
+            if !secret_name_ok(&name) {
+                bail!(
+                    "the secret name must be a label like DEEPSEEK_API_KEY (capitals, digits, _).\n\
+                     nothing was saved. if you typed the key itself there, clear it from your \
+                     terminal history; the key is asked for after you press Enter, never on \
+                     this line"
+                );
+            }
+            let recipients: Vec<String> = to
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            check_secret_recipients(route, &recipients)?;
             // Signing is not optional for a secret: an unsigned envelope is a
             // forged one. `signing_identity` refuses when this machine cannot
             // sign as the named identity rather than silently downgrading.
@@ -9018,14 +9106,8 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                     let file = env_file.unwrap_or_else(|| route.workspace.join(".env"));
                     read_env_value(&file, &key)?
                 }
-                None => read_secret_value(&name)?,
+                None => read_secret_value(&name, &recipients, &route.project_id)?,
             };
-            let recipients: Vec<String> = to
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
             let path = ferryman_channel::secrets::set_secret(
                 route,
                 &identity,
@@ -9033,9 +9115,13 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 &value,
                 &recipients,
             )?;
-            println!("sealed '{name}' for {} recipient(s)", recipients.len());
-            println!("  written to {}", path.display());
-            println!("  signed by '{signer_name}'");
+            println!();
+            println!("done: {name} is sealed.");
+            println!("  who can use it  {}", recipients.join(", "));
+            println!("  project         {}", route.project_id);
+            println!("  signed by       {signer_name}");
+            println!("  file            {}", path.display());
+            println!("it reaches the other machines through the channel on its own.");
         }
         SecretCommand::List => {
             let summaries = ferryman_channel::secrets::list_secrets(route)?;
@@ -12321,5 +12407,106 @@ mod tests {
             super::Cli::try_parse_from(["ferry", "team", "approve", "ichabod", "--role", "worker"])
                 .is_ok()
         );
+    }
+    #[test]
+    fn secret_workspace_is_accepted_before_or_after_set() {
+        use clap::Parser;
+        for args in [
+            [
+                "ferry",
+                "channel",
+                "secret",
+                "--workspace",
+                "/w",
+                "set",
+                "--to",
+                "a",
+                "DEEPSEEK_API_KEY",
+            ],
+            [
+                "ferry",
+                "channel",
+                "secret",
+                "set",
+                "--workspace",
+                "/w",
+                "--to",
+                "a",
+                "DEEPSEEK_API_KEY",
+            ],
+        ] {
+            let parsed = super::Cli::try_parse_from(args).unwrap();
+            let super::Command::Channel {
+                command: super::Channel::Secret { workspace, command },
+            } = parsed.command
+            else {
+                panic!("not a secret command");
+            };
+            assert_eq!(workspace.as_deref(), Some(Path::new("/w")), "{args:?}");
+            let super::SecretCommand::Set { name, to, .. } = command else {
+                panic!("not set");
+            };
+            assert_eq!(name, "DEEPSEEK_API_KEY");
+            assert_eq!(to, "a");
+        }
+    }
+
+    #[test]
+    fn a_secret_name_is_a_label_not_a_key() {
+        assert!(super::secret_name_ok("DEEPSEEK_API_KEY"));
+        assert!(super::secret_name_ok("GH_TOKEN"));
+        assert!(!super::secret_name_ok("nvapi-AbC123"));
+        assert!(!super::secret_name_ok("sk-abc123"));
+        assert!(!super::secret_name_ok("github_pat_11ABC"));
+        assert!(!super::secret_name_ok("DEEPSEEK_API_KEY=sk-abc"));
+        assert!(!super::secret_name_ok("deepseek_api_key"));
+        assert!(!super::secret_name_ok(""));
+    }
+
+    #[test]
+    fn recipients_are_checked_before_the_key_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let comms = dir.path().join("comms");
+        std::fs::create_dir_all(comms.join("agents")).unwrap();
+        let write = |name: &str, enc: Option<&str>| {
+            let agent = ferryman_channel::AgentRoute {
+                name: name.into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+                encryption_key: enc.map(str::to_string),
+            };
+            std::fs::write(
+                comms.join("agents").join(format!("{name}.json")),
+                serde_json::to_vec_pretty(&agent).unwrap(),
+            )
+            .unwrap();
+        };
+        write("harbor", Some("aa"));
+        write("nokey", None);
+        let route = ferryman_channel::ProjectRoute {
+            project_id: "p".to_string(),
+            workspace: dir.path().to_path_buf(),
+            attachment: dir.path().join(".ferryman"),
+            communications: comms.clone(),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        assert!(super::check_secret_recipients(&route, &["harbor".into()]).is_ok());
+        let none = super::check_secret_recipients(&route, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("--to"), "{none}");
+        for bad in ["ghost", "nokey"] {
+            let err = super::check_secret_recipients(&route, &["harbor".into(), bad.into()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(bad) && err.contains("harbor"),
+                "names the bad one and who can: {err}"
+            );
+        }
     }
 }
