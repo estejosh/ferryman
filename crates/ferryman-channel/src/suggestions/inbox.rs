@@ -152,6 +152,10 @@ pub struct Comment {
     pub author: String,
     pub body: String,
     pub created_at: DateTime<Utc>,
+    /// Whether the inbox itself says the author has a say in the repository (its owner, a
+    /// member, a collaborator): the one fact that tells the owner's side's comments from a
+    /// stranger's that merely look like them. Only used where there is no signature.
+    pub trusted: bool,
 }
 
 /// The least an inbox must do. Every call is one request to a service that may be slow,
@@ -535,6 +539,7 @@ impl Inbox for MockInbox {
             author: self.login.clone(),
             body: body.to_string(),
             created_at: state.now(),
+            trusted: state.owner == self.login,
         };
         state
             .comments

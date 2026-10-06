@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::record::Offer;
-use super::{clean, is_login, sealed_payload, sha256_hex, verify_hex};
+use super::{clean, is_hidden, is_login, sealed_payload, sha256_hex, verify_hex};
 use crate::AgentIdentity;
 
 /// What a contributor types to agree. Nothing else counts, and there is no default-yes.
@@ -309,6 +309,12 @@ pub fn compose_reply(
     if text.chars().count() > REPLY_MAX {
         bail!("a reply is at most {REPLY_MAX} characters");
     }
+    if text
+        .chars()
+        .any(|c| is_hidden(c) || (c.is_control() && !matches!(c, '\n' | '\t')))
+    {
+        bail!("a reply cannot have control, zero-width or text-direction characters in it");
+    }
     let mut reply = Reply {
         format: REPLY_FORMAT.to_string(),
         suggestion_id: suggestion.id.clone(),
@@ -413,7 +419,22 @@ impl ContributorStore {
         std::fs::create_dir_all(&self.dir)?;
         let mut seed = [0u8; 32];
         rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
-        std::fs::write(&path, hex::encode(seed))?;
+        // Made private from the first byte (never world-readable for an instant), and never
+        // over a key another run made a moment ago: that one is used instead.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        match options.open(&path) {
+            Ok(mut file) => {
+                std::io::Write::write_all(&mut file, hex::encode(seed).as_bytes())
+                    .context("write the contributor key")?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return self.identity();
+            }
+            Err(error) => return Err(error).context("create the contributor key"),
+        }
         crate::restrict_to_owner(&path)?;
         Ok(AgentIdentity::from_seed(SIGNER, seed))
     }

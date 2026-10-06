@@ -1946,9 +1946,17 @@ impl Bridge {
                 } else {
                     format!("{project} - a question from {}", question.asked_by)
                 };
+                // A suggestion's question puts what decides first and quotes everything the
+                // stranger wrote; it is longer than the others, and cutting it would cut the
+                // part the owner is deciding on.
+                let room = if question.kind == questions::SUGGESTION {
+                    3500
+                } else {
+                    1500
+                };
                 actions.push(send(
                     home,
-                    format!("{heading}\n\n{}", excerpt(&question.text, 1500)),
+                    format!("{heading}\n\n{}", excerpt(&question.text, room)),
                     buttons,
                 ));
             }

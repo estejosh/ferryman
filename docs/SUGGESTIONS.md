@@ -108,9 +108,11 @@ this program makes on your machine (kept in `suggest/` under Ferryman's machine 
 and posted as you with your own token, which is used and never stored or shown.
 
 **Consent.** `join` shows the full terms, their sha256 and the owner's key fingerprint, and
-asks you to type exactly `I agree`. A script may pass `--agree <sha256 of the terms>`
-instead; that is recorded as `flag` rather than `typed`. An agent must not agree for a person:
-the published `AGENTS.md` tells it to show the terms to its human and to wait.
+asks you to type exactly `I agree`. A person's own script may pass `--agree <sha256 of the terms>`
+instead; that is recorded as `flag` rather than `typed`. The flag is evidence that the person agreed,
+not a way round them: an agent must show the terms to its human and wait, and the published
+`AGENTS.md` says so. (Nothing in a program can tell a person from an agent holding the flag; the
+signed record says how consent was given, and the owner sees it with every suggestion.)
 
 **For agents.** `ferry suggest new --file suggestion.json --json` (or `--file -` for stdin)
 validates, signs and posts, and prints `{"ok":true,"issue":N,"url":"..."}` or
@@ -149,8 +151,31 @@ is parsed strictly; the model cannot accept, close, label or write a file. A for
 line, a copied signed block, a stranger using someone else's agreement and a reply to a
 different round are each tested to change nothing.
 
-## The inbox
+## Limits of this design, stated plainly
 
+* **Identity is a GitHub login plus a key, not a person.** A fresh key does not reset a
+  contributor's limits (they are counted by login as well as by key), but a person with several
+  GitHub accounts has several allowances. Raise or lower the limits in the offer.
+* **Triage is a model's reading, and is shown as one.** It cannot accept, close or label, and
+  everything in the owner's question that came from the contributor or the model is shown quoted
+  (each line starting with `| `), links defanged, with the first thing shown being what Accept
+  would hand a builder. The owner decides from that, not from the model's score.
+* **What a builder gets is the owner-approved spec, as quoted data.** An accepted order lists its
+  rules first, then the quoted spec, title and pitch, and says the quoted lines are untrusted.
+  A builder can still be talked into things by clever text; the guard is the same as for any
+  order: it works on a branch, a reviewer reads the result and the master approves it.
+* **The inbox is not trusted either.** A comment counts as the owner's side's only if GitHub says
+  its author has a say in the repository; the owner's side reads at most 40 new issues a pass,
+  answers an edited invalid issue at most 3 times, reads at most 10 pages of comments, and
+  refuses an issue it cannot read whole. Text with hidden or direction-changing characters is
+  refused in suggestions, replies and terms, so what a person is asked to agree to is what they see.
+* **An accepted suggestion cannot be withdrawn by its sender.** Once the owner has accepted,
+  the work is the owner's commitment; a withdrawal or a closed issue is reported to the owner
+  and does not cancel it (decline it, or cancel its order, if you want that).
+* **The signed ledger is the legal record, but the contributor's agreement is only as good as
+  the key's secrecy.** Whoever holds the contributor key can agree as that contributor.
+
+## The inbox
 The join page is `README.md` (a marked section, so the rest of your README is kept),
 `AGENTS.md`, `TERMS.md`, `ferryman-suggest.json` (the machine-readable offer and the invite),
 `schemas/suggestion/<kind>.json` and an issue template config that points people to `ferry`.

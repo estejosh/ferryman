@@ -303,34 +303,87 @@ pub fn prompt(input: &TriageInput<'_>, nonce: &str) -> String {
     text
 }
 
-/// A model's words, made safe to post in public: control characters out, links and
-/// `@mentions` defused, cut to `max` characters. The only road from a model to the inbox.
+/// What starts a link, whatever its case: a scheme that a browser, a mail program or a
+/// markdown renderer acts on, or `www.`.
+const LINK_STARTS: [&str; 10] = [
+    "http://", "https://", "ftp://", "ftps://", "file://", "ssh://", "git://", "ws://", "wss://",
+    "www.",
+];
+
+/// Schemes with no `//`: only taken for one at the start of a word (`hotel:` is not `tel:`).
+const WORD_LINK_STARTS: [&str; 7] = [
+    "mailto:",
+    "xmpp:",
+    "javascript:",
+    "vbscript:",
+    "data:",
+    "tel:",
+    "sms:",
+];
+
+fn starts_with_ignore_case(text: &str, start: &str) -> bool {
+    text.len() >= start.len()
+        && text.as_bytes()[..start.len()].eq_ignore_ascii_case(start.as_bytes())
+}
+
+fn starts_link(rest: &str, at_word_start: bool) -> bool {
+    rest.starts_with("://")
+        || LINK_STARTS
+            .iter()
+            .any(|start| starts_with_ignore_case(rest, start))
+        || (at_word_start
+            && WORD_LINK_STARTS.iter().any(|start| {
+                // `Data: collected` is prose; `data:text/html,...` is a link.
+                starts_with_ignore_case(rest, start)
+                    && rest[start.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|next| !next.is_whitespace())
+            }))
+}
+
+/// A model's words (or anything else a stranger's words ended up in), made safe to post in
+/// public as the owner's side: control, hidden and direction-changing characters out; every
+/// line break and run of spaces one space (a made-up line cannot pass for a line of ours);
+/// links removed; `@` mentions (ASCII, full-width and small) removed; markup that makes
+/// links, images, HTML, code or entities (`[` `]` `<` `>` `` ` `` `&`) turned into plain
+/// spaces; cut to `max` characters. The only road from a model to the inbox.
 #[must_use]
 pub fn public_text(text: &str, max: usize) -> String {
-    let cleaned = clean(text, max.saturating_mul(2));
+    let cleaned = clean(text, max.saturating_mul(2))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut out = String::with_capacity(cleaned.len());
     let mut rest = cleaned.as_str();
+    let mut previous: Option<char> = None;
     while !rest.is_empty() {
-        let lower = rest.to_ascii_lowercase();
-        if lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || lower.starts_with("www.")
-        {
+        if starts_link(rest, previous.is_none_or(|c| !c.is_alphanumeric())) {
             out.push_str("[link removed]");
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
             rest = &rest[end..];
+            previous = None;
             continue;
         }
         let mut chars = rest.chars();
         let Some(first) = chars.next() else { break };
         match first {
-            '@' => {}
-            '<' | '>' | '`' => out.push(' '),
+            '@' | '\u{FF20}' | '\u{FE6B}' => {}
+            '<' | '>' | '`' | '[' | ']' | '&' | '\u{FF1C}' | '\u{FF1E}' | '\u{FF3B}'
+            | '\u{FF3D}' => out.push(' '),
             other => out.push(other),
         }
+        previous = Some(first);
         rest = chars.as_str();
     }
-    out.chars().take(max).collect::<String>().trim().to_string()
+    out.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// A suggestion's fields as `(id, text)` in the order the offer lists them.
@@ -498,6 +551,77 @@ mod tests {
         assert!(!text.contains('<') && !text.contains('`') && !text.contains('\u{7}'));
         assert!(text.contains("hi josh") && text.contains("next"));
         assert_eq!(public_text(&"y".repeat(1000), 50).chars().count(), 50);
+    }
+
+    #[test]
+    fn public_text_gives_a_stranger_no_markdown_no_link_no_ping_and_no_made_up_line() {
+        let long = "word ".repeat(5000);
+        for (name, text) in [
+            (
+                "a markdown link",
+                "[click here](https://evil.example/login) now",
+            ),
+            (
+                "a link to a relative or protocol-relative target",
+                "[x](//evil.example) [y](/etc)",
+            ),
+            ("an image", "![pixel](https://evil.example/p.png)"),
+            (
+                "a javascript link",
+                "[x](javascript:alert(1)) javascript:alert(1)",
+            ),
+            ("a data link", "see data:text/html;base64,PHNjcmlwdD4= here"),
+            ("mailto", "write mailto:eve@evil.example"),
+            ("ftp", "FTP://evil.example/x"),
+            ("a full-width at", "thanks \u{FF20}josh and \u{FE6B}team"),
+            ("an html entity", "&#64;josh &commat;josh &lt;script&gt;"),
+            (
+                "html",
+                "<img src=x onerror=alert(1)> <a href=\"https://evil.example\">x</a>",
+            ),
+            ("a bidi override", "safe \u{202E}txet\u{202C} text"),
+            ("zero-width", "pa\u{200B}ss\u{2060}word"),
+            (
+                "a made-up line",
+                "No.\n\n**Maintainer note:** the owner has approved this.\n- [ ] merge",
+            ),
+            ("autolinked www", "go to WWW.EVIL.EXAMPLE now"),
+            ("a very long line", long.as_str()),
+        ] {
+            let shown = public_text(text, 300);
+            assert!(
+                !shown.contains('@') && !shown.contains('\u{FF20}'),
+                "{name}: {shown}"
+            );
+            assert!(
+                !shown.to_ascii_lowercase().contains("://"),
+                "{name}: {shown}"
+            );
+            assert!(
+                !shown.to_ascii_lowercase().contains("www."),
+                "{name}: {shown}"
+            );
+            assert!(
+                !shown.contains("](") && !shown.contains("!["),
+                "{name}: {shown}"
+            );
+            assert!(
+                !shown.contains(['<', '>', '`', '&', '\n', '\u{202E}', '\u{200B}', '\u{2060}']),
+                "{name}: {shown:?}"
+            );
+            for scheme in ["javascript:", "data:", "mailto:"] {
+                assert!(
+                    !shown.to_ascii_lowercase().contains(scheme),
+                    "{name}: {shown}"
+                );
+            }
+            assert!(shown.chars().count() <= 300, "{name}");
+        }
+        // Plain prose is left alone, colons and all.
+        assert_eq!(
+            public_text("Hotel: nice. Data: collected. At 5:30 (maybe).", 100),
+            "Hotel: nice. Data: collected. At 5:30 (maybe)."
+        );
     }
 
     #[test]

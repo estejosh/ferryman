@@ -22,7 +22,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::inbox::InboxRef;
-use super::{sealed_payload, sha256_hex, verify_hex};
+use super::{has_hidden_text, is_hidden, sealed_payload, sha256_hex, verify_hex};
 use crate::policy::{Signed, notice, resolve};
 use crate::{AgentIdentity, SignatureCheck, check_signature};
 
@@ -254,6 +254,12 @@ impl Offer {
             {
                 problems.push(format!("{label} has control characters in it"));
             }
+            if value.chars().any(is_hidden) {
+                problems.push(format!(
+                    "{label} has hidden or direction-changing characters in it (zero-width \
+                     spaces, text-direction marks): take them out"
+                ));
+            }
             if id == "title" && value.contains('\n') {
                 problems.push("Title is one line".to_string());
             }
@@ -331,7 +337,12 @@ impl SuggestionsRecord {
             bail!("the offer is for a different project than the record");
         }
         let name_len = offer.display_name.trim().chars().count();
-        if !(1..=80).contains(&name_len) || offer.display_name.chars().any(char::is_control) {
+        if !(1..=80).contains(&name_len)
+            || offer
+                .display_name
+                .chars()
+                .any(|c| c.is_control() || is_hidden(c))
+        {
             bail!("the product's name is 1 to 80 characters, on one line");
         }
         InboxRef::parse(&offer.inbox)?;
@@ -469,17 +480,53 @@ pub fn is_open(channel: &Path, project_id: &str) -> bool {
 
 // --- the terms guard -------------------------------------------------------------------
 
-fn has_unfilled_placeholder(text: &str) -> bool {
-    text.find("{{")
-        .is_some_and(|start| text[start..].contains("}}"))
+/// What the template's placeholders are called, so one whose braces were mangled is still
+/// recognised.
+const PLACEHOLDER_NAMES: [&str; 8] = [
+    "product_name",
+    "owner_name",
+    "inbox_url",
+    "product_license",
+    "payment_statement",
+    "credits_location",
+    "governing_law",
+    "contact_email",
+];
+
+/// Sentences only the shipped template says (folded, see [`fold_for_guard`]).
+const DRAFT_SENTENCES: [&str; 3] = [
+    "replacethistextwithtermsyoustandbehind",
+    "ferrymandoesnotwriteyourterms",
+    "startingpointfortheownerandtheirlawyer",
+];
+
+/// `text` lowercased, with every space, line break, hyphen and hidden character removed and the
+/// look-alike braces folded to `{` and `}`: what the draft guard compares, so case, spacing,
+/// zero-width characters and full-width braces do not get a draft past it.
+fn fold_for_guard(text: &str) -> String {
+    text.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-' && !is_hidden(*c))
+        .map(|c| match c {
+            '\u{FF5B}' | '\u{2774}' | '\u{FE5B}' | '\u{2983}' => '{',
+            '\u{FF5D}' | '\u{2775}' | '\u{FE5C}' | '\u{2984}' => '}',
+            other => other,
+        })
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
-/// Whether `text` is the shipped template, or still carries what must be filled in.
+/// Whether `text` is the shipped template, or still carries what must be filled in: the
+/// marker line, a `{{placeholder}}` (however the braces are spaced or spelled), a
+/// placeholder's name, a sentence only the template says, or the template itself.
 #[must_use]
 pub fn is_draft(text: &str) -> bool {
-    text.contains(DRAFT_MARKER)
-        || has_unfilled_placeholder(text)
-        || sha256_hex(text.trim().as_bytes()) == sha256_hex(TEMPLATE.trim().as_bytes())
+    let folded = fold_for_guard(text);
+    folded.contains(&fold_for_guard(DRAFT_MARKER))
+        || folded.contains("{{")
+        || folded.contains("}}")
+        || PLACEHOLDER_NAMES.iter().any(|name| folded.contains(name))
+        || DRAFT_SENTENCES.iter().any(|line| folded.contains(line))
+        || folded == fold_for_guard(TEMPLATE)
 }
 
 fn ensure_terms(text: &str, accept_draft: bool) -> Result<()> {
@@ -488,6 +535,13 @@ fn ensure_terms(text: &str, accept_draft: bool) -> Result<()> {
     }
     if text.len() > MAX_TERMS_BYTES {
         bail!("the terms are longer than {MAX_TERMS_BYTES} bytes");
+    }
+    if has_hidden_text(text) {
+        bail!(
+            "the terms have a control character, a zero-width character or a text-direction \
+             mark in them. A person is asked to agree to what they see, and those change what \
+             a screen shows: take them out (an escape sequence in a terms file is never right)"
+        );
     }
     if is_draft(text) && !accept_draft {
         bail!(
@@ -1030,6 +1084,75 @@ pub(crate) mod tests {
         let mut accepted = args(TEMPLATE);
         accepted.accept_draft_terms = true;
         assert!(open(&route.communications, PROJECT, &josh, accepted, Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn the_draft_cannot_get_out_by_spacing_case_or_look_alike_characters() {
+        let variants = [
+            TEMPLATE.replace("FERRYMAN-DRAFT-TERMS", "ferryman-draft-terms"),
+            TEMPLATE.replace("FERRYMAN-DRAFT-TERMS", "Ferryman - Draft - Terms"),
+            TEMPLATE.replace("\n", "\r\n"),
+            format!("{TEMPLATE}\n\n"),
+            TEMPLATE.replace("{{", "{ {").replace("}}", "} }"),
+            TEMPLATE.replace("{{", "\u{FF5B}\u{FF5B}").replace("}}", "\u{FF5D}\u{FF5D}"),
+            TEMPLATE.replace("{{", "{{ ").replace("}}", " }}"),
+            // The marker comment and every brace taken out, but a placeholder name left.
+            "Terms for suggestions to {PRODUCT_NAME}. You grant a license.".to_string(),
+            "Terms. Contact: [CONTACT_EMAIL]".to_string(),
+            // Only the owner's half-finished edit of the draft's own sentences.
+            "You grant a license.\nDRAFT. Not legal advice. Replace this text with terms you stand behind.\n".to_string(),
+            "A half-edited copy {{OWNER_NAME".to_string(),
+            "closing braces only PRODUCT}}".to_string(),
+        ];
+        for text in variants {
+            assert!(is_draft(&text), "{text:?}");
+            assert!(ensure_terms(&text, false).is_err(), "{text:?}");
+            assert!(ensure_terms(&text, true).is_ok(), "{text:?}");
+        }
+        // A zero-width character in the marker is seen through (and the text is refused anyway).
+        let zero_width = TEMPLATE.replace("FERRYMAN-DRAFT-TERMS", "FERRYMAN\u{200B}-DRAFT-TERMS");
+        assert!(is_draft(&zero_width));
+        assert!(ensure_terms(&zero_width, true).is_err());
+        // Real terms are not mistaken for a draft.
+        assert!(!is_draft(
+            "Terms. The product name is Idle-ish. You grant the owner a license. No payment. \
+             Questions: josh@example.com. Governed by the laws of Ohio.\n"
+        ));
+        assert!(!is_draft(&terms()));
+    }
+
+    #[test]
+    fn terms_with_hidden_or_escape_characters_are_never_published() {
+        for text in [
+            "Terms.\u{1b}[8m You give us everything.\u{1b}[0m\n",
+            "Terms \u{202E}reversed\n",
+            "Terms\u{200B} with zero-width\n",
+            "Terms \u{E0049}tag characters\n",
+        ] {
+            assert!(ensure_terms(text, true).is_err(), "{text:?}");
+        }
+        assert!(ensure_terms("Plain terms\r\nwith tabs\tand CRLF.\n", false).is_ok());
+    }
+
+    #[test]
+    fn hidden_characters_in_a_suggestion_are_refused_with_the_field_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let route = route(dir.path(), &[&josh]);
+        let record = open_it(&route, &josh);
+        let mut fields = BTreeMap::new();
+        fields.insert("title".to_string(), "Timer\u{202E}".to_string());
+        fields.insert("pitch".to_string(), "ok\u{E0049}\u{E0067}".to_string());
+        fields.insert("why".to_string(), "fine\u{200B}".to_string());
+        let problems = record.offer.check_fields("idea", &fields);
+        for label in ["Title", "Pitch", "Why it fits"] {
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.starts_with(label) && p.contains("hidden")),
+                "{label}: {problems:?}"
+            );
+        }
     }
 
     #[test]

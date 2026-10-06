@@ -152,13 +152,98 @@ pub fn is_login(text: &str) -> bool {
         && !text.starts_with('-')
 }
 
-/// A text with control characters removed (newline and tab kept) and cut to `max` characters.
+/// Whether `c` changes what a reader sees, or what a model reads, without showing: text
+/// direction overrides and isolates, zero-width and invisible separators, blank-looking
+/// fillers, the byte-order mark and the invisible "tag" characters. Zero-width joiners and
+/// variation selectors are left alone (emoji and several scripts need them).
+#[must_use]
+pub fn is_hidden(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{17B4}'
+            | '\u{17B5}'
+            | '\u{180B}'..='\u{180E}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// A text with control characters and hidden ones ([`is_hidden`]) removed (newline and tab
+/// kept; the Unicode line and paragraph separators become newlines) and cut to `max`
+/// characters.
 #[must_use]
 pub(crate) fn clean(text: &str, max: usize) -> String {
     text.chars()
+        .filter(|c| !is_hidden(*c))
+        .map(|c| {
+            if matches!(c, '\u{2028}' | '\u{2029}') {
+                '\n'
+            } else {
+                c
+            }
+        })
         .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
         .take(max)
         .collect()
+}
+
+/// A text for a person's terminal or a one-line label: [`clean`], on one line.
+#[must_use]
+pub fn plain(text: &str, max: usize) -> String {
+    clean(text, max.saturating_mul(2))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect()
+}
+
+/// Whether `text` has a character that must not be in text a person is asked to agree to:
+/// a control character (an escape sequence can rewrite what a terminal shows) other than
+/// newline, carriage return and tab, or a hidden one ([`is_hidden`]).
+#[must_use]
+pub fn has_hidden_text(text: &str) -> bool {
+    text.chars()
+        .any(|c| is_hidden(c) || (c.is_control() && !matches!(c, '\n' | '\r' | '\t')))
+}
+
+/// `text` with links made unclickable (`://` and `www.` broken), for showing a stranger's
+/// words to the owner where an app would turn them into links.
+#[must_use]
+pub fn defang(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.starts_with("://") {
+            out.push_str("[:]//");
+            rest = &rest[3..];
+        } else if rest.len() >= 4 && rest.as_bytes()[..4].eq_ignore_ascii_case(b"www.") {
+            out.push_str(&rest[..3]);
+            out.push_str("[.]");
+            rest = &rest[4..];
+        } else if let Some(first) = rest.chars().next() {
+            out.push(first);
+            rest = &rest[first.len_utf8()..];
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -176,6 +261,33 @@ mod tests {
             assert_eq!(b64_decode(&text).unwrap(), bytes, "length {length}");
         }
         assert!(b64_decode("not base64 !").is_err());
+    }
+
+    #[test]
+    fn hidden_and_direction_changing_characters_are_removed_or_refused() {
+        let sneaky =
+            "pay\u{202E}live\u{200B}\u{2066}x\u{2069}\u{FEFF}\u{E0041}\u{E0069}ok\u{1b}[2J\u{7}";
+        assert_eq!(clean(sneaky, 100), "payliveXok[2J".replace('X', "x"));
+        assert!(has_hidden_text(sneaky));
+        assert!(has_hidden_text("a\u{1b}[8mb"), "an escape sequence");
+        assert!(has_hidden_text("a\u{85}b"), "a C1 control");
+        assert!(!has_hidden_text(
+            "plain\r\n\ttext, and an emoji \u{1F468}\u{200D}\u{1F469}\u{FE0F}"
+        ));
+        assert_eq!(clean("a\u{2028}b\u{2029}c", 10), "a\nb\nc");
+        assert_eq!(plain("one\n two\t\u{202E}three", 100), "one two three");
+        assert_eq!(plain(&"x".repeat(500), 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn links_are_defanged_for_the_owner() {
+        let text = defang("see https://evil.example/x and HTTP://A.B and www.x.y, WWW.Z.Q");
+        assert!(
+            !text.contains("://") && !text.to_ascii_lowercase().contains("www."),
+            "{text}"
+        );
+        assert!(text.contains("evil.example"));
+        assert_eq!(defang("naïve ünïcode ✓"), "naïve ünïcode ✓");
     }
 
     #[test]

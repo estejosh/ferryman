@@ -14,7 +14,7 @@ use super::contributor::{
 use super::inbox::{self, Inbox, InboxRef};
 use super::invite::Invite;
 use super::record::{OFFER_FILE, Offer, TERMS_FILE};
-use super::sha256_hex;
+use super::{clean, has_hidden_text, sha256_hex};
 
 /// The signed offer inside the inbox's machine-readable page.
 #[must_use]
@@ -80,6 +80,15 @@ pub fn prepare_join(
             "{TERMS_FILE} in the inbox hashes to {found}, but the owner signed {}: the terms \
              were changed after the owner signed the offer. Do not agree; tell the owner",
             offer.terms.sha256
+        );
+    }
+    // A person is asked to agree to what a screen shows them. An escape sequence can rewrite
+    // what a terminal shows, and zero-width or direction-changing characters can hide words,
+    // so terms that carry any are not shown, whoever signed them.
+    if has_hidden_text(&terms_text) {
+        bail!(
+            "the terms in the inbox have control, zero-width or text-direction characters in \
+             them, which can hide what they say. Do not agree to them; tell the owner"
         );
     }
     Ok(Joined {
@@ -319,21 +328,28 @@ pub fn status(store: &ContributorStore, inbox: &dyn Inbox, project: &str) -> Res
         let needs_reply = label.as_deref() == Some(inbox::NEEDS_CLARIFICATION) && issue.open;
         let (question, round) = if needs_reply {
             let comments = inbox.comments(issue.number)?;
+            // The owner's side's question: a comment the inbox says comes from someone with a
+            // say in the repository, not from the contributor and not from any stranger who
+            // has copied the hidden marker. What it says is shown to a person (and an agent),
+            // so it is cleaned of anything that could rewrite a screen.
             comments
                 .iter()
                 .rev()
                 .find(|comment| {
-                    !comment.author.eq_ignore_ascii_case(&issue.author)
+                    comment.trusted
+                        && !comment.author.eq_ignore_ascii_case(&issue.author)
                         && clarify_round(comment).is_some()
                 })
                 .map_or((None, None), |comment| {
-                    let text = comment
-                        .body
-                        .split("<!-- ferryman:")
-                        .next()
-                        .unwrap_or_default()
-                        .trim()
-                        .to_string();
+                    let text = clean(
+                        comment
+                            .body
+                            .split("<!-- ferryman:")
+                            .next()
+                            .unwrap_or_default()
+                            .trim(),
+                        2000,
+                    );
                     (Some(text), clarify_round(comment))
                 })
         } else {

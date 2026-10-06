@@ -86,8 +86,13 @@ pub fn token_from_environment() -> Option<Token> {
 const API: &str = "https://api.github.com";
 const REQUEST_SECS: u64 = 30;
 const PAGE: usize = 100;
-/// Most pages read of one listing: a public inbox is not a database.
+/// Most pages read of the list of issues: a public inbox is not a database. The list is
+/// newest-activity first, so what is cut is what nobody has touched for longest.
 const MAX_PAGES: usize = 30;
+/// Most pages read of one issue's comments. An issue with more is not read at all (see
+/// [`GithubInbox::pages`]): the owner's own markers and a contributor's later signed
+/// answers could be among the unread ones, and acting on half a thread is worse than waiting.
+const MAX_COMMENT_PAGES: usize = 10;
 
 /// A public GitHub repository used as an inbox.
 #[derive(Clone)]
@@ -213,10 +218,11 @@ impl GithubInbox {
         serde_json::from_str(&text).with_context(|| format!("{what}: GitHub's answer was not JSON"))
     }
 
-    /// Every item of a list, page by page.
-    fn pages(&self, path: &str, what: &str) -> Result<Vec<Value>> {
+    /// Every item of a list, page by page, up to `max_pages`. With `whole`, a list that goes
+    /// past them is an error rather than a cut-off list.
+    fn pages(&self, path: &str, what: &str, max_pages: usize, whole: bool) -> Result<Vec<Value>> {
         let mut all = Vec::new();
-        for page in 1..=MAX_PAGES {
+        for page in 1..=max_pages {
             let joiner = if path.contains('?') { '&' } else { '?' };
             let value = self.json(
                 "GET",
@@ -228,8 +234,14 @@ impl GithubInbox {
             let count = items.len();
             all.extend(items);
             if count < PAGE {
-                break;
+                return Ok(all);
             }
+        }
+        if whole {
+            bail!(
+                "{what}: more than {} of them, so none were read",
+                max_pages * PAGE
+            );
         }
         Ok(all)
     }
@@ -302,6 +314,10 @@ fn comment_of(value: &Value) -> Result<Comment> {
             .to_string(),
         body: value["body"].as_str().unwrap_or_default().to_string(),
         created_at: time_of(value, "created_at")?,
+        trusted: matches!(
+            value["author_association"].as_str(),
+            Some("OWNER" | "MEMBER" | "COLLABORATOR")
+        ),
     })
 }
 
@@ -366,22 +382,31 @@ impl Inbox for GithubInbox {
     }
 
     fn list_issues(&self) -> Result<Vec<Issue>> {
+        // Most recently touched first, so that if a flood of junk ever passes the page cap
+        // it is the quiet old issues that are not seen, never the one posted a minute ago.
         let items = self.pages(
-            &self.repo_path("/issues?state=all&sort=created&direction=asc"),
+            &self.repo_path("/issues?state=all&sort=updated&direction=desc"),
             "list the suggestions",
+            MAX_PAGES,
+            false,
         )?;
-        items
+        let mut issues = items
             .iter()
             // Pull requests are issues to GitHub; they are not suggestions.
             .filter(|item| item.get("pull_request").is_none())
             .map(issue_of)
-            .collect()
+            .collect::<Result<Vec<Issue>>>()?;
+        // The trait promises oldest first.
+        issues.sort_by_key(|issue| (issue.created_at, issue.number));
+        Ok(issues)
     }
 
     fn comments(&self, issue: u64) -> Result<Vec<Comment>> {
         let items = self.pages(
             &self.repo_path(&format!("/issues/{issue}/comments")),
             "read the comments",
+            MAX_COMMENT_PAGES,
+            true,
         )?;
         items.iter().map(comment_of).collect()
     }
@@ -832,7 +857,7 @@ mod tests {
         assert!(issues[0].open);
         let request = seen.lock().unwrap()[0].clone();
         assert!(
-            request.starts_with("GET /repos/o/r/issues?state=all&sort=created&direction=asc&per_page=100&page=1 HTTP/1.1"),
+            request.starts_with("GET /repos/o/r/issues?state=all&sort=updated&direction=desc&per_page=100&page=1 HTTP/1.1"),
             "{request}"
         );
         assert!(
@@ -845,6 +870,64 @@ mod tests {
             request
                 .to_lowercase()
                 .contains("user-agent: ferryman-suggestions")
+        );
+    }
+
+    #[test]
+    fn issues_come_back_oldest_first_however_github_ordered_them() {
+        let newer = issue_json(9, "").replace("2026-01-02T03:04:05Z", "2026-03-01T00:00:00Z");
+        let body = format!("[{newer},{}]", issue_json(3, ""));
+        let (base, _) = serve(vec![(200, body)]);
+        let numbers: Vec<u64> = inbox_at(&base)
+            .list_issues()
+            .unwrap()
+            .iter()
+            .map(|issue| issue.number)
+            .collect();
+        assert_eq!(numbers, [3, 9]);
+    }
+
+    fn comment_json(id: u64, association: &str) -> String {
+        format!(
+            r#"{{"id":{id},"body":"b","user":{{"login":"someone"}},"author_association":"{association}","created_at":"2026-01-02T03:04:05Z"}}"#
+        )
+    }
+
+    #[test]
+    fn a_comment_is_trusted_only_when_github_says_its_author_has_a_say_in_the_repository() {
+        let body = format!(
+            "[{},{},{},{}]",
+            comment_json(1, "OWNER"),
+            comment_json(2, "COLLABORATOR"),
+            comment_json(3, "NONE"),
+            comment_json(4, "CONTRIBUTOR")
+        );
+        let (base, _) = serve(vec![(200, body)]);
+        let trusted: Vec<bool> = inbox_at(&base)
+            .comments(1)
+            .unwrap()
+            .iter()
+            .map(|comment| comment.trusted)
+            .collect();
+        assert_eq!(trusted, [true, true, false, false]);
+    }
+
+    #[test]
+    fn an_issue_with_too_many_comments_is_not_read_half_way() {
+        let page: String = format!(
+            "[{}]",
+            (1..=PAGE as u64)
+                .map(|id| comment_json(id, "NONE"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let (base, seen) = serve(vec![(200, page); MAX_COMMENT_PAGES]);
+        let error = inbox_at(&base).comments(5).unwrap_err().to_string();
+        assert!(error.contains("none were read"), "{error}");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            MAX_COMMENT_PAGES,
+            "no more pages asked for"
         );
     }
 

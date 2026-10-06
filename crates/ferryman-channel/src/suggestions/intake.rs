@@ -19,6 +19,8 @@ pub struct Prior {
     pub issue: u64,
     pub suggestion_id: String,
     pub contributor_key: String,
+    /// The GitHub login it came from: the inbox vouches for this one, a key is made at will.
+    pub contributor_login: String,
     pub created_at: DateTime<Utc>,
     pub content_hash: String,
     /// Still being decided or built (counts against the open limit).
@@ -92,6 +94,9 @@ pub fn validate(offer: &Offer, issue: &Issue, priors: &[Prior], now: DateTime<Ut
                 .to_string(),
         );
     }
+    if !super::is_login(&suggestion.contributor_login) {
+        problems.push("the record is signed for something that is not a GitHub login".to_string());
+    }
     if !issue
         .author
         .eq_ignore_ascii_case(&suggestion.contributor_login)
@@ -136,31 +141,24 @@ pub fn validate(offer: &Offer, issue: &Issue, priors: &[Prior], now: DateTime<Ut
     if !problems.is_empty() {
         return Check::Invalid(problems);
     }
-    // Already said: the same suggestion id, or the same words in the same kind.
     let hash = suggestion.content_hash();
     let others: Vec<&Prior> = priors
         .iter()
         .filter(|prior| prior.issue != issue.number)
         .collect();
-    if let Some(same) = others
-        .iter()
-        .find(|prior| prior.suggestion_id == suggestion.id)
-        .or_else(|| {
-            others
-                .iter()
-                .find(|prior| prior.content_hash == hash && !prior.dead)
-        })
-    {
-        return Check::Duplicate {
-            of: same.issue,
-            envelope: Box::new(envelope),
-        };
-    }
-    // Limits, counted from what was already taken in.
+    // Limits come first, and count a contributor by the login the inbox vouches for as well
+    // as by key (a new key costs nothing, a new login costs a GitHub account), and count
+    // repeats too: otherwise the same signed block pasted as issue after issue would write
+    // a ledger line each, forever, and never meet a limit.
     let limits = &offer.limits;
     let mine: Vec<&&Prior> = others
         .iter()
-        .filter(|prior| prior.contributor_key == suggestion.contributor_key)
+        .filter(|prior| {
+            prior.contributor_key == suggestion.contributor_key
+                || prior
+                    .contributor_login
+                    .eq_ignore_ascii_case(&suggestion.contributor_login)
+        })
         .collect();
     let open = mine.iter().filter(|prior| prior.open).count();
     if open >= limits.open_per_contributor as usize {
@@ -186,6 +184,21 @@ pub fn validate(offer: &Offer, issue: &Issue, priors: &[Prior], now: DateTime<Ut
             limits.new_per_day,
             next.format("%Y-%m-%d %H:%M")
         ));
+    }
+    // Already said: the same suggestion id, or the same words in the same kind.
+    if let Some(same) = others
+        .iter()
+        .find(|prior| prior.suggestion_id == suggestion.id)
+        .or_else(|| {
+            others
+                .iter()
+                .find(|prior| prior.content_hash == hash && !prior.dead)
+        })
+    {
+        return Check::Duplicate {
+            of: same.issue,
+            envelope: Box::new(envelope),
+        };
     }
     Check::Valid(Box::new(envelope))
 }
@@ -263,6 +276,7 @@ pub(crate) mod tests {
             issue: issue.number,
             suggestion_id: envelope.suggestion.id.clone(),
             contributor_key: envelope.suggestion.contributor_key.clone(),
+            contributor_login: envelope.suggestion.contributor_login.clone(),
             created_at: issue.created_at,
             content_hash: envelope.suggestion.content_hash(),
             open: true,
@@ -442,8 +456,79 @@ pub(crate) mod tests {
         // Someone else's are not mine.
         for prior in &mut many {
             prior.contributor_key = "someone-else".into();
+            prior.contributor_login = "someone-else".into();
         }
         assert!(matches!(check(&w, &third, &many), Check::Valid(_)));
+    }
+
+    #[test]
+    fn a_fresh_key_for_the_same_github_login_does_not_reset_the_limits() {
+        let w = world();
+        let first = send(&w, "octo", &w.me, "Offline timer");
+        let priors = vec![prior_of(&first)];
+        // The same GitHub account, a key made a moment ago.
+        let second_key = ContributorStore::open(&w.dir.path().join("octo-again"))
+            .identity()
+            .unwrap();
+        assert_ne!(second_key.public_key_hex(), w.me.public_key_hex());
+        let again = send(&w, "octo", &second_key, "A different idea entirely");
+        let why = reasons(&check(&w, &again, &priors));
+        assert!(why.contains("1 new suggestion(s) per day"), "{why}");
+        // Three open ones from the same login, each under another key, meet the open cap.
+        let mut open: Vec<Prior> = (0..3)
+            .map(|i| {
+                let mut prior = prior_of(&first);
+                prior.issue = 50 + i;
+                prior.suggestion_id = format!("s{i}");
+                prior.content_hash = format!("h{i}");
+                prior.contributor_key = format!("key-{i}");
+                prior.created_at -= Duration::days(3 + i64::try_from(i).unwrap());
+                prior
+            })
+            .collect();
+        let why = reasons(&check(&w, &again, &open));
+        assert!(why.contains("3 open suggestion(s)"), "{why}");
+        // Another login is another person.
+        for prior in &mut open {
+            prior.contributor_login = "somebody-else".into();
+        }
+        assert!(matches!(check(&w, &again, &open), Check::Valid(_)));
+    }
+
+    #[test]
+    fn a_login_that_is_not_a_login_is_refused() {
+        let w = world();
+        let agreed = accept(
+            &w.me,
+            &w.record.offer,
+            "octo",
+            Consent::Typed(ACCEPT_PHRASE),
+            Utc::now(),
+        )
+        .unwrap();
+        let mut suggestion = compose(
+            &w.me,
+            &w.record.offer,
+            Some(&agreed),
+            "idea",
+            &fields("ok"),
+            Utc::now(),
+        )
+        .unwrap();
+        // A record that names a login with markup in it (signed by the key, whatever it says).
+        let mut bad = agreed.clone();
+        bad.contributor_login = "octo`; rm -rf /".into();
+        bad.signature = w.me.sign_bytes(bad.payload().as_bytes());
+        suggestion.contributor_login = bad.contributor_login.clone();
+        suggestion.acceptance_digest = bad.digest();
+        suggestion.signature = w.me.sign_bytes(suggestion.payload().as_bytes());
+        let (title, body) = render_issue(&w.record.offer, &suggestion, &bad);
+        let issue = w
+            .inbox
+            .as_user("octo`; rm -rf /")
+            .create_issue(&title, &body)
+            .unwrap();
+        assert!(reasons(&check(&w, &issue, &[])).contains("not a GitHub login"));
     }
 
     #[test]
@@ -455,10 +540,16 @@ pub(crate) mod tests {
             .as_user("octo")
             .create_issue(&first.title, &first.body)
             .unwrap();
-        let priors = vec![prior_of(&first)];
+        let mut priors = vec![prior_of(&first)];
+        // Within the day, a repeat by the same person meets the limit before it is a
+        // duplicate: pasting the same block over and over is not a way round it.
+        assert!(reasons(&check(&w, &again, &priors)).contains("per day"));
+        // Once the day is over it is the same suggestion said twice.
+        priors[0].created_at -= Duration::days(2);
         assert!(
             matches!(check(&w, &again, &priors), Check::Duplicate { of, .. } if of == first.number)
         );
+        priors[0].created_at += Duration::days(2);
         // The same words from another person: a duplicate of the live one, not of a dead one.
         let other_key = ContributorStore::open(&w.dir.path().join("eve"))
             .identity()

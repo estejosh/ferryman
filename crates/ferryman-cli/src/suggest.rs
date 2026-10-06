@@ -6,8 +6,10 @@
 //! (`GITHUB_TOKEN`, or `gh auth token`), which are never stored or printed.
 //!
 //! Consent is the point of `join`: on a terminal the person types `I agree` after the terms
-//! are shown; a script or an agent passes `--agree <sha256-of-the-terms>`, which is the same
-//! agreement signed with the same key and recorded as having been given by flag.
+//! are shown; a person's own script may pass `--agree <sha256-of-the-terms>`, which is the
+//! same agreement signed with the same key and recorded as having been given by flag. An
+//! agent must show the terms to the person it acts for and have them agree: the flag is a
+//! record that the person did, not a way round them.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +24,7 @@ use ferryman_channel::{
         flow::{self, Card, Choice, Stage},
         inbox::{Inbox, InboxRef},
         invite::Invite,
-        publish,
+        plain, publish,
         record::{self, Limits, OpenArgs, SuggestionsRecord, TEMPLATE, TriageConfig},
     },
 };
@@ -41,9 +43,10 @@ pub(crate) enum SuggestCommand {
     ///   ferry suggest join ferry-suggest:eyJ2...
     ///   ferry suggest join ferry-suggest:eyJ2... --agree <sha256 of the terms>
     ///
-    /// On a terminal the terms are shown and you type `I agree`. Without one (a script, an
-    /// agent) the terms and their sha256 are printed and nothing is agreed; run it again
-    /// with --agree and that sha256 once the person you act for has read them.
+    /// On a terminal the terms are shown and you type `I agree`. Without one the terms and
+    /// their sha256 are printed and nothing is agreed. An agent shows them to the person it
+    /// acts for, and only once that person has read and accepted them is it run again with
+    /// --agree and that sha256. An agent never agrees for its person.
     Join {
         /// The `ferry-suggest:...` text from the project's README or ferryman-suggest.json.
         invite: String,
@@ -153,11 +156,12 @@ fn print_terms_summary(joined: &Joined) {
     let offer = &joined.offer;
     println!(
         "{} takes suggestions in {}",
-        offer.display_name, offer.inbox
+        plain(&offer.display_name, 200),
+        plain(&offer.inbox, 200)
     );
     println!(
         "  from the owner {} (key {}), terms version {}",
-        offer.owner,
+        plain(&offer.owner, 200),
         offer.fingerprint(),
         offer.terms.version
     );
@@ -184,7 +188,9 @@ async fn join(invite_text: &str, agree: Option<&str>) -> Result<()> {
     {
         println!(
             "You already agreed to {}'s terms (version {}) as @{}. Nothing to do: ferry suggest new",
-            joined.offer.display_name, joined.offer.terms.version, existing.contributor_login
+            plain(&joined.offer.display_name, 200),
+            joined.offer.terms.version,
+            existing.contributor_login
         );
         return Ok(());
     }
@@ -245,7 +251,7 @@ fn types(project: Option<&str>, as_json: bool) -> Result<()> {
         );
         return Ok(());
     }
-    println!("{} takes:", offer.display_name);
+    println!("{} takes:", plain(&offer.display_name, 200));
     for spec in &offer.types {
         println!("  {}", spec.id);
         for (id, label, max, required) in client::describe_fields(&offer, &spec.id) {
@@ -352,7 +358,7 @@ async fn new(project: Option<&str>, args: NewArgs) -> Result<()> {
         );
     };
     if confirm && !args.yes {
-        println!("\nTo {}: [{kind}]", offer.display_name);
+        println!("\nTo {}: [{kind}]", plain(&offer.display_name, 200));
         for (id, label, ..) in client::describe_fields(&offer, &kind) {
             if let Some(value) = fields.get(&id) {
                 println!("  {label}: {value}");
