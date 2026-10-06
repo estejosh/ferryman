@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.5.24 - 2026-10-06
+
+A channel that Syncthing does not sync is repaired instead of ignored. A machine could hold two copies of one channel, one that Syncthing syncs and one that its worker reads; orders sent to it and results from it never crossed, while every check said healthy. The worker now checks every channel when it starts and repairs a split itself: it copies the files that only the unsynced copy has into the synced one (overwriting nothing) and points `bridge.toml` at the synced folder. Syncthing is never changed and nothing is deleted. Anything it cannot repair is named in its startup line as NOT SYNCED. `ferry doctor` now marks a split as FIX rather than a note, and `ferry doctor --fix` runs the same repair. `ferry channel send` says NOT SENT when a message cannot leave the machine, instead of a receipt that reads like delivery.
+
 ## v0.5.23 - 2026-10-06
 
 Giving an agent a key is now easy. The dashboard's Vault page, which said "Not built yet", seals keys: type a name like `DEEPSEEK_API_KEY`, paste the key into the hidden box, tick who can use it, press Seal. It lists what is sealed (never the values) and confirms with the name, who can use it and who sealed it. A key pasted into the name box is refused and nothing is saved, so a key can never become a file name that syncs in plain text.
