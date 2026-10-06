@@ -2161,7 +2161,7 @@ pub fn subscription_warnings(policy: &Policy, engines: &[Candidate]) -> Vec<Stri
 /// The tag every improvement order carries.
 pub const IMPROVEMENT_TAG: &str = "improvement";
 
-fn is_improvement_order(order: &crate::Order) -> bool {
+pub(crate) fn is_improvement_order(order: &crate::Order) -> bool {
     order
         .payload
         .get("tags")
@@ -2784,7 +2784,9 @@ fn genuine(channel: &Path, project_id: &str, setting: &PolicySetting) -> bool {
 
 /// A signed file this machine tracks for rollback: the engine policy and the adversary
 /// policy are each one, with their own file, `seq` and memory.
-trait Signed: Clone + PartialEq + Serialize + serde::de::DeserializeOwned {
+pub(crate) trait Signed:
+    Clone + PartialEq + Serialize + serde::de::DeserializeOwned
+{
     /// The file inside the channel.
     const FILE: &'static str;
     /// This machine's state directory for it.
@@ -2867,16 +2869,16 @@ fn write_seen<T: Signed>(path: &Path, seen: &Seen<T>) {
 }
 
 /// The setting in force and how it was reached.
-struct Resolved<T> {
-    setting: Option<T>,
+pub(crate) struct Resolved<T> {
+    pub(crate) setting: Option<T>,
     /// The setting is this machine's memory of an earlier one, because the channel's file
     /// went back or is gone.
-    from_memory: bool,
+    pub(crate) from_memory: bool,
     /// The highest `seq` seen, here or in the channel.
-    high: u64,
+    pub(crate) high: u64,
 }
 
-fn resolve<T: Signed>(channel: &Path, project_id: &str) -> Resolved<T> {
+pub(crate) fn resolve<T: Signed>(channel: &Path, project_id: &str) -> Resolved<T> {
     let file = std::fs::read(channel.join(T::FILE))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<T>(&bytes).ok())
@@ -3014,7 +3016,7 @@ pub fn rollback_notice(channel: &Path, project_id: &str) -> Option<String> {
     (!notices.is_empty()).then(|| notices.join("; "))
 }
 
-fn notice<T: Signed>(channel: &Path, project_id: &str) -> Option<String> {
+pub(crate) fn notice<T: Signed>(channel: &Path, project_id: &str) -> Option<String> {
     resolve::<T>(channel, project_id);
     read_seen::<T>(&seen_path::<T>(channel, project_id)?)?.alert
 }

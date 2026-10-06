@@ -408,7 +408,8 @@ textarea.notes:focus{border-color:var(--accent-dim)}
     <div class="nav" id="nav-system">
       <button data-page="ledger">Ledger</button>
       <button data-page="learnings">Learnings</button>
-      <button data-page="engines">Engines</button>
+      <button data-page="focus">Focus</button>
+<button data-page="engines">Engines</button>
       <button data-page="fleet">Fleet</button>
       <button data-page="vault">Vault</button>
       <button data-page="identity">Identity</button>
@@ -2141,6 +2142,132 @@ pages.engines = async () => {
     </div>`;
 };
 
+/* Focus: which projects the swarm is spending itself on. The master's signed tier per
+   project, in the `ferryman` channel, so every machine follows it. Focus projects get most
+   of the weekly improve budget and the first claim on workers, background a trickle,
+   paused none of the swarm's own work; a person's own orders are never held back. The
+   signals only suggest: nothing is signed until the master presses a button. */
+const FOCUS_CHOICES = [
+  ["focus:30", "Focus for 30 days"], ["focus:", "Focus until changed"], ["normal:", "Normal"],
+  ["background:30", "Background for 30 days"], ["background:", "Background"], ["paused:", "Paused"],
+];
+function focusWidth(w) {
+  const cap = (v) => (v === null || v === undefined ? "no cap" : String(v));
+  return `build ${cap((w || {}).build)}, chore ${cap((w || {}).chore)}`;
+}
+function focusBadge(tier) {
+  const tone = { focus: "good", background: "warn", paused: "bad" }[tier] || "";
+  return `<span class="badge ${tone}">${esc(tier)}</span>`;
+}
+pages.focus = async () => {
+  let f = null;
+  try { f = await api(`/api/focus${state.focusSuggest ? "?suggest=1" : ""}`); }
+  catch (err) {
+    return `<div class="head"><div><h1>Focus</h1></div></div><div class="empty">Could not read the focus: ${esc(err.message || err)}</div>`;
+  }
+  if (!f.available) {
+    return `<div class="head"><div><h1>Focus</h1></div></div>
+      <div class="notice"><div><b>The focus lives in ${esc(f.home)}&rsquo;s channel,</b> which is not on this machine, so there is nothing to show or sign here.</div></div>`;
+  }
+  const when = (at) => esc(String(at || "").slice(0, 16).replace("T", " "));
+  const who = f.set
+    ? `Signed by ${esc(f.set_by)}, ${when(f.set_at)} UTC (sequence ${esc(String(f.seq))}).`
+    : `No focus is signed: every project is normal.`;
+  const rows = (f.projects || []).map((p) => `
+    <tr>
+      <td class="lead">${esc(p.project)}</td>
+      <td>${focusBadge(p.tier)} ${p.entry && p.entry !== p.tier ? `<span class="s" style="color:var(--dim)">${esc(p.entry)}</span>` : ""}</td>
+      <td class="num">${p.improving ? esc(String(p.orders)) : `<span class="badge">self-improve off</span>`}</td>
+      <td>${esc(focusWidth(p.width))}</td>
+      ${f.may_set ? `<td style="white-space:nowrap">
+        <select data-focus-pick="${esc(p.project)}">${FOCUS_CHOICES.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join("")}</select>
+        <button class="btn" data-focus-set="${esc(p.project)}">Set</button>
+        ${p.entry ? `<button class="btn" data-focus-clear="${esc(p.project)}" title="Back to normal">Clear</button>` : ""}</td>` : ""}
+    </tr>`).join("");
+  const sg = f.suggestions;
+  const marked = sg ? sg.rows.filter((r) => !r.pinned && r.tier !== r.now) : [];
+  const sgRows = sg ? sg.rows.map((r) => `
+    <tr>
+      <td class="lead">${esc(r.project)}</td>
+      <td>${focusBadge(r.now)}</td>
+      <td>${r.tier !== r.now ? "&rarr; " : ""}${focusBadge(r.tier)}</td>
+      <td class="s">${esc(r.reason)}</td>
+      ${f.may_set ? `<td>${!r.pinned && r.tier !== r.now ? `<button class="btn" data-focus-use="${esc(r.project)}" data-tier="${esc(r.tier)}">Use</button>` : ""}</td>` : ""}
+    </tr>`).join("") : "";
+  return `
+    <div class="head">
+      <div><h1>Focus</h1><p>Which projects the swarm is spending itself on right now. Focus projects get most of the weekly improve budget and the first claim on workers; background a trickle; paused none of the swarm&rsquo;s own work. Your own orders are never held back.</p></div>
+    </div>
+    ${f.notice ? `<div class="notice"><div><b>Warning:</b> ${esc(f.notice)}<div class="s" style="color:var(--dim);margin-top:6px">This machine keeps using the last focus it saw. Signing again settles it.</div></div></div>` : ""}
+    ${(f.expired || []).length ? `<div class="notice"><div>${f.expired.map((e) => `${esc(e.project)}: ${esc(e.entry)} ended, so it is normal again.`).join("<br>")}</div></div>` : ""}
+    <div class="notice" style="margin-bottom:18px"><div style="flex:1;min-width:0">
+      <b>${who}</b>
+      <div class="s" style="color:var(--dim);margin-top:6px">${f.may_set ? "You are the master: what you set here is signed with your key and every machine follows it." : "Only the master of " + esc(f.home) + " signs the focus; you can read it here."} Self-improve stays a per-project switch (Teammates): a tier never turns it on.</div>
+      <div style="margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn" id="focus-suggest">${state.focusSuggest ? "Hide the signals" : "What do the signals suggest?"}</button>
+        ${f.may_set && f.set ? `<button class="btn" id="focus-clear-all">Clear the focus</button>` : ""}
+        <span class="s" id="focus-msg" style="color:var(--dim)"></span>
+      </div>
+    </div></div>
+    <div class="panel scroll">
+      <table class="grid">
+        <thead><tr><th>Project</th><th>Tier</th><th>Orders this week</th><th>Width at once</th>${f.may_set ? "<th></th>" : ""}</tr></thead>
+        <tbody>${rows || `<tr><td colspan="5"><div class="empty">No live project is known here.</div></td></tr>`}</tbody>
+      </table>
+    </div>
+    ${sg ? `
+    <div class="head" style="margin-top:28px"><div><h2>What the signals suggest</h2><p>Recent git activity, open and failed orders, what the last gather found, and how long a project has been quiet. ${sg.seeded ? "No focus is signed, so this starts from your seed list. " : ""}A list you named yourself is never second-guessed: the signals only fill in the rest. Nothing is signed until you press a button.</p></div></div>
+    ${(sg.seed_missing || []).length ? `<div class="notice"><div>${sg.seed_missing.map((n) => esc(n)).join(", ")}: in your seed list, not a project here.</div></div>` : ""}
+    <div class="panel scroll">
+      <table class="grid">
+        <thead><tr><th>Project</th><th>Now</th><th>Suggested</th><th>Why</th>${f.may_set ? "<th></th>" : ""}</tr></thead>
+        <tbody>${sgRows}</tbody>
+      </table>
+    </div>
+    ${f.may_set && marked.length ? `<div style="margin-top:10px"><button class="btn primary" id="focus-use-all">Sign all ${marked.length} suggested change${marked.length === 1 ? "" : "s"} (30 days)</button></div>` : ""}` : ""}`;
+};
+
+function wireFocus() {
+  const msg = (text) => { const m = $("#focus-msg"); if (m) m.textContent = String(text).slice(0, 300); };
+  const post = async (path, body) => {
+    try {
+      await api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      await render();
+    } catch (err) { msg(err.message || err); }
+  };
+  const sg = $("#focus-suggest");
+  if (sg) sg.addEventListener("click", async () => { state.focusSuggest = !state.focusSuggest; await render(); });
+  const all = $("#focus-clear-all");
+  if (all) all.addEventListener("click", () => post("/api/focus/clear", { projects: [] }));
+  for (const b of $$("[data-focus-set]")) {
+    b.addEventListener("click", () => {
+      const project = b.dataset.focusSet;
+      const pick = document.querySelector(`[data-focus-pick="${CSS.escape(project)}"]`);
+      const [tier, days] = (pick ? pick.value : "normal:").split(":");
+      post("/api/focus", { projects: [project], tier, days: days ? Number(days) : null });
+    });
+  }
+  for (const b of $$("[data-focus-clear]")) {
+    b.addEventListener("click", () => post("/api/focus/clear", { projects: [b.dataset.focusClear] }));
+  }
+  for (const b of $$("[data-focus-use]")) {
+    b.addEventListener("click", () => post("/api/focus", {
+      projects: [b.dataset.focusUse], tier: b.dataset.tier, days: b.dataset.tier === "normal" ? null : 30 }));
+  }
+  const useAll = $("#focus-use-all");
+  if (useAll) useAll.addEventListener("click", async () => {
+    useAll.disabled = true;
+    const groups = {};
+    for (const b of $$("[data-focus-use]")) (groups[b.dataset.tier] = groups[b.dataset.tier] || []).push(b.dataset.focusUse);
+    try {
+      for (const [tier, projects] of Object.entries(groups)) {
+        await api("/api/focus", { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ projects, tier, days: tier === "normal" ? null : 30 }) });
+      }
+      await render();
+    } catch (err) { msg(err.message || err); useAll.disabled = false; }
+  });
+}
 pages.fleet = async () => {
   const d = await api("/api/fleet");
   const machines = d.machines || [];
@@ -2719,6 +2846,7 @@ async function render() {
   wireTeammates();
   wireAgents();
   wireContracts();
+  wireFocus();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {

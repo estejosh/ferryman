@@ -714,3 +714,85 @@ fn a_project_revoked_or_archived_after_the_worker_started_stops_being_served() {
         Some("it has been archived")
     );
 }
+
+/// A focus that names `tiers`, as the master's signed record would after it verified.
+fn focus_of(tiers: &[(&str, ferryman_channel::focus::Tier)]) -> ferryman_channel::focus::Focus {
+    use ferryman_channel::focus::{Focus, FocusSetting, Pin};
+    Focus {
+        home: "alpha".into(),
+        setting: Some(FocusSetting {
+            home: "alpha".into(),
+            projects: tiers
+                .iter()
+                .map(|(id, tier)| {
+                    (
+                        (*id).to_owned(),
+                        Pin {
+                            tier: *tier,
+                            until: None,
+                        },
+                    )
+                })
+                .collect(),
+            set_at: chrono::Utc::now(),
+            signed_by: "josh".into(),
+            signature: String::new(),
+            on_behalf_of: None,
+            seq: 1,
+        }),
+        notice: None,
+        from_memory: false,
+    }
+}
+
+fn visited(fleet: &Fleet) -> Vec<&str> {
+    fleet
+        .served
+        .iter()
+        .map(|(route, _)| route.project_id.as_str())
+        .collect()
+}
+
+/// `--all-projects` visits the projects the master put in focus before the rest, every
+/// pass, and the ones it did not name keep the order they were found in.
+#[test]
+fn the_fleet_visits_a_focus_project_before_a_normal_one() {
+    use ferryman_channel::focus::Tier;
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    for id in ["alpha", "delta", "mike", "zeta"] {
+        project(dir.path(), &root, id, &josh(), true);
+    }
+    enrolled_everywhere(&root);
+    let (home, config) = home(dir.path(), "");
+    let (plan, identity) = plan_worker(&root, &home, &config).unwrap();
+    let mut fleet = serve(plan, &identity, &config);
+    let now = chrono::Utc::now();
+    assert_eq!(visited(&fleet), ["alpha", "delta", "mike", "zeta"]);
+
+    // Nothing set: exactly the order the projects were found in.
+    in_focus_order(
+        &mut fleet.served,
+        &ferryman_channel::focus::Focus::default(),
+        now,
+    );
+    assert_eq!(visited(&fleet), ["alpha", "delta", "mike", "zeta"]);
+
+    // zeta in focus goes first; alpha, in the background, after the unnamed delta and
+    // mike, which keep their places relative to each other.
+    let focus = focus_of(&[("zeta", Tier::Focus), ("alpha", Tier::Background)]);
+    in_focus_order(&mut fleet.served, &focus, now);
+    assert_eq!(visited(&fleet), ["zeta", "delta", "mike", "alpha"]);
+
+    // A new focus applies to the order the last pass left: mike moves up, zeta (paused) is
+    // last of the live ones, and the rest keep their places.
+    let focus = focus_of(&[("mike", Tier::Focus), ("zeta", Tier::Paused)]);
+    in_focus_order(&mut fleet.served, &focus, now);
+    assert_eq!(visited(&fleet), ["mike", "delta", "alpha", "zeta"]);
+
+    // An archived project is behind every other, whatever its tier.
+    root.archive("mike", true, &josh()).unwrap();
+    in_focus_order(&mut fleet.served, &focus, now);
+    assert_eq!(visited(&fleet), ["delta", "alpha", "zeta", "mike"]);
+}

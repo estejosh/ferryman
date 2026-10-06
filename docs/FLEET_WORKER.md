@@ -26,6 +26,8 @@ project at a time and each claims at most `max_parallel` orders, so `max_paralle
 four orders at once across all projects, not four per project. A project's own `agent.toml`
 is not read.
 
+Each pass visits the projects in the fleet's focus order (focus first, then normal, then background, then paused; see FOCUS.md), and an improvement order in a background or paused project is held as usual.
+
 A project is served when all of these hold, and otherwise skipped with one line that says
 which and what to do:
 

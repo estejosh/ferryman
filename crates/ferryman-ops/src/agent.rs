@@ -2452,6 +2452,10 @@ fn start_hold(route: &ProjectRoute, order: &ferryman_channel::Order) -> Option<S
         // The fleet's width for the order's role, counted from the claims in the channel
         // now - which include any this worker took a moment ago in the same pass.
         .or_else(|| ferryman_channel::policy::width_hold_in(route, order))
+        // The project's tier in the fleet's focus: an improvement order in a background
+        // project waits for the one running, and in a paused project does not start. A
+        // person's own order is never held by it.
+        .or_else(|| ferryman_channel::focus::hold_for(route, order))
 }
 
 /// Resolve the same things the worker resolves, and report them.

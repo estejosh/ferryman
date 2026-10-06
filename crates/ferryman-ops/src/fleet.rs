@@ -298,6 +298,38 @@ pub fn no_longer_served(route: &ProjectRoute, config: &AgentConfig) -> Option<St
     }
 }
 
+/// Put the projects a worker serves in the order the fleet's focus says to visit them:
+/// focus first, then normal (and every project the focus does not name), then background,
+/// then paused, and an archived project after them all. Within a tier the order the worker
+/// found them in is kept.
+///
+/// Called once at the top of every pass of the `--comms` and `--all-projects` loop, so a
+/// change of focus takes effect on the next pass and `max_parallel` goes to the focus
+/// projects before it can be spent elsewhere. It only changes the order: a project in a
+/// lower tier is still visited, and a person's own orders are never held by their tier
+/// (what an improvement order in a background or paused project waits for is decided where
+/// the order would be started, `start_hold`). With no focus set nothing is reordered.
+pub fn in_focus_order(
+    served: &mut [(ProjectRoute, AgentConfig)],
+    focus: &ferryman_channel::focus::Focus,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if !focus.is_set() {
+        return;
+    }
+    let ids: Vec<String> = served
+        .iter()
+        .map(|(route, _)| route.project_id.clone())
+        .collect();
+    let order = focus.claim_order(&ids, now);
+    served.sort_by_key(|(route, _)| {
+        (
+            ferryman_channel::ferry::is_archived(&route.communications, &route.project_id),
+            order.iter().position(|id| *id == route.project_id),
+        )
+    });
+}
+
 /// The projects to watch: each served project under the one `config`, and the rest named.
 ///
 /// Where the project's checkout does not hold the identity's key yet, this machine's own
