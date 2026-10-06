@@ -3909,6 +3909,27 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            if fix
+                && let Ok(route) = ferryman_channel::load_route(&start.join(".ferryman"))
+                && let ferryman_ops::syncthing::ChannelSync::Split { syncs } =
+                    ferryman_ops::syncthing::channel_sync(&route)
+            {
+                match ferryman_ops::syncthing::repoint_channel(
+                    &route.attachment,
+                    &route.communications,
+                    &syncs,
+                ) {
+                    Ok(done) if !json => println!(
+                        "  fixed channel: now reads {}, the folder Syncthing syncs \
+                         (copied {} file(s) that had not left this machine)",
+                        done.to.display(),
+                        done.copied
+                    ),
+                    Ok(_) => {}
+                    Err(err) if !json => println!("  could not repair the channel: {err:#}"),
+                    Err(_) => {}
+                }
+            }
             let report = ferryman_ops::doctor::examine(&start);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -6875,10 +6896,59 @@ async fn run_fleet(
     if fleet.served.is_empty() {
         bail!("no project could be taken: each is held by another worker or has no lock to take");
     }
+    // Before announcing anything: is each channel the folder Syncthing actually syncs?
+    // A worker reading a copy that never leaves the machine claims nothing anyone sent
+    // and sends nothing anyone sees, while every reading says healthy. Repair what can
+    // be repaired safely (copy, then repoint; Syncthing untouched, nothing deleted) and
+    // say loudly what cannot.
+    let mut not_synced = Vec::new();
+    for (route, _) in &mut fleet.served {
+        if let ferryman_ops::syncthing::ChannelSync::Split { syncs } =
+            ferryman_ops::syncthing::channel_sync(route)
+        {
+            match ferryman_ops::syncthing::repoint_channel(
+                &route.attachment,
+                &route.communications,
+                &syncs,
+            ) {
+                Ok(done) => {
+                    report.warn(&format!(
+                        "  repaired {}: it was reading {}, which Syncthing does not sync; now \
+                         reads {} (copied {} file(s) that had not left this machine)",
+                        route.project_id,
+                        done.from.display(),
+                        done.to.display(),
+                        done.copied
+                    ));
+                    route.communications = done.to;
+                }
+                Err(error) => {
+                    report.warn(&format!(
+                        "  NOT SYNCED {}: reads {} but Syncthing syncs {}. Nothing sent to \
+                         this machine reaches it and nothing it writes leaves. Could not \
+                         repair: {error:#}",
+                        route.project_id,
+                        route.communications.display(),
+                        syncs.display()
+                    ));
+                    not_synced.push(route.project_id.clone());
+                }
+            }
+        }
+    }
     report.info(&format!(
-        "worker watching {} channel(s) under {}",
+        "worker watching {} channel(s) under {}{}",
         fleet.served.len(),
-        watching.display()
+        watching.display(),
+        if not_synced.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " - {} NOT SYNCED: {}",
+                not_synced.len(),
+                not_synced.join(", ")
+            )
+        }
     ));
     for (route, config) in &fleet.served {
         report.info(&format!(
@@ -9553,6 +9623,25 @@ fn channel(command: Channel) -> Result<()> {
             let mut engine = ferryman_channel::system_delivery_engine();
             let receipt = engine.send(&route, &message)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
+            // The receipt says the file was written. Whether it can leave this machine is
+            // a different question, and the one a person sending a message means.
+            match ferryman_ops::syncthing::channel_sync(&route) {
+                ferryman_ops::syncthing::ChannelSync::Synced => eprintln!(
+                    "saved; Syncthing carries it to the other machines. It is read once the \
+                     recipient acknowledges it (ferry channel inbox --agent {})",
+                    message.recipient
+                ),
+                ferryman_ops::syncthing::ChannelSync::Split { syncs } => eprintln!(
+                    "NOT SENT: saved on this machine only. This workspace reads {} but \
+                     Syncthing syncs {}. Run `ferry doctor --fix` here, then send again",
+                    route.communications.display(),
+                    syncs.display()
+                ),
+                ferryman_ops::syncthing::ChannelSync::Unknown => eprintln!(
+                    "saved on this machine. Syncthing could not confirm it syncs this \
+                     channel, so it may not leave; run `ferry doctor` to check"
+                ),
+            }
         }
 
         Channel::Inbox {
