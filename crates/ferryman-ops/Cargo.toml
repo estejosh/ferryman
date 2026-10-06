@@ -25,5 +25,8 @@ opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 
+sha2.workspace = true
+hex.workspace = true
+
 [dev-dependencies]
 tempfile = "3.20"

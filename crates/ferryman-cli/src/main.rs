@@ -260,6 +260,16 @@ enum Command {
         #[command(subcommand)]
         action: ManagedSyncthingAction,
     },
+    /// Break-glass: a live terminal on one of your own machines, from anywhere, while a
+    /// person on that machine keeps it open.
+    ///
+    /// For when the channel itself is what broke. Nothing runs or listens until
+    /// `open`; every join is approved by the person on the machine being rescued; it
+    /// ends when they close it or at the time limit. See docs/RESCUE.md.
+    Rescue {
+        #[command(subcommand)]
+        action: RescueAction,
+    },
     /// Stop this machine taking on new work, until you resume it.
     ///
     /// Affects every project on this computer, not just this one, because "stop working
@@ -1824,6 +1834,29 @@ enum InviteAction {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum RescueAction {
+    /// Run once on each machine you might connect FROM. Makes its rescue key and shares
+    /// the public half with your other machines through Syncthing.
+    Key,
+    /// On the machine that needs help: open a session and wait. You approve each join
+    /// here; type `exit` to close it.
+    Open {
+        /// Close it after this many minutes even if nobody does.
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
+    },
+    /// From another of your machines: join an open session.
+    Join {
+        /// The join line the person on that machine read or texted you (works with sync
+        /// broken), or the machine's name (works when sync is up), e.g. grouchly.
+        target: String,
+    },
+    /// Who this machine would let ask to join (its own saved copy), and which sessions
+    /// are open.
+    Status,
 }
 
 #[derive(Subcommand, Clone)]
@@ -3963,6 +3996,68 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
         Command::Route { command } => route::command(command).await?,
+        Command::Rescue { action } => {
+            let machine = ferryman_ops::identity::machine_name()?;
+            match action {
+                RescueAction::Key => {
+                    let key = ferryman_ops::rescue::ensure_key(&machine)?;
+                    println!("rescue key ready: {}", key.display());
+                    println!(
+                        "its public half is shared with your other machines through Syncthing. \
+                         They will let {machine} ask to join, and a person there still has to \
+                         say yes."
+                    );
+                }
+                RescueAction::Open { minutes } => ferryman_ops::rescue::open(&machine, minutes)?,
+                RescueAction::Join { target } => {
+                    ferryman_ops::rescue::join(&target, &machine)?;
+                }
+                RescueAction::Status => {
+                    let dir = ferryman_ops::rescue::rescue_dir()?;
+                    let keys = ferryman_ops::rescue::cache_keys(&machine)?;
+                    println!(
+                        "may ask to join {machine} (saved on this machine, works with sync \
+                         down): {}",
+                        if keys.is_empty() {
+                            "nobody yet. Run `ferry rescue key` on the machine you connect \
+                             from, while sync works"
+                                .to_string()
+                        } else {
+                            keys.iter()
+                                .map(|(n, _)| n.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    );
+                    let now = chrono::Utc::now();
+                    let mut open = 0;
+                    if let Ok(entries) = std::fs::read_dir(dir.join("sessions")) {
+                        for entry in entries.flatten() {
+                            let Ok(bytes) = std::fs::read(entry.path()) else {
+                                continue;
+                            };
+                            let Ok(s) =
+                                serde_json::from_slice::<ferryman_ops::rescue::Session>(&bytes)
+                            else {
+                                continue;
+                            };
+                            if !s.expired(now) {
+                                open += 1;
+                                println!(
+                                    "open: {} until {} UTC  (join: ferry rescue join {})",
+                                    s.machine,
+                                    s.expires_at.format("%H:%M"),
+                                    s.machine
+                                );
+                            }
+                        }
+                    }
+                    if open == 0 {
+                        println!("no rescue session is open");
+                    }
+                }
+            }
+        }
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -6895,6 +6990,11 @@ async fn run_fleet(
     }
     if fleet.served.is_empty() {
         bail!("no project could be taken: each is held by another worker or has no lock to take");
+    }
+    // While sync works, keep this machine's saved copy of the rescue keys current, so a
+    // rescue still works on the day sync does not.
+    if let Ok(machine) = ferryman_ops::identity::machine_name() {
+        let _ = ferryman_ops::rescue::cache_keys(&machine);
     }
     // Before announcing anything: is each channel the folder Syncthing actually syncs?
     // A worker reading a copy that never leaves the machine claims nothing anyone sent
