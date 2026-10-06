@@ -678,7 +678,10 @@ fn record_of(route: &ProjectRoute) -> Result<SuggestionsRecord> {
 
 fn safe_relative(label: &str, path: &str) -> Result<()> {
     let candidate = Path::new(path);
+    // A backslash or a colon is never in a repository path the owner means, and on a
+    // platform that does not treat them as separators `C:\x` would pass as a file name.
     if path.trim().is_empty()
+        || path.contains(['\\', ':'])
         || candidate.is_absolute()
         || candidate
             .components()
