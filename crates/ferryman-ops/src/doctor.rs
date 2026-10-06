@@ -369,7 +369,10 @@ pub fn examine(start: &Path) -> Report {
                 checks.push(check(
                     "syncthing_folder",
                     moving && ours,
-                    false,
+                    // A split is not advisory. Every order to this machine and every
+                    // result from it is stranded; marking it a note let doctor say
+                    // "ready" for three weeks while nothing crossed.
+                    !ours,
                     if !ours {
                         // The id is registered, and may well be perfectly healthy - on
                         // somebody else's directory. This project then syncs nothing
@@ -377,8 +380,9 @@ pub fn examine(start: &Path) -> Report {
                         // failure one level up and just as quiet.
                         format!(
                             "folder {} is {} but Syncthing is syncing {}, not this project's \
-                             channel at {} - nothing this project writes leaves the machine; \
-                             `ferry channel syncthing on` re-points it here",
+                             channel at {} - nothing this project writes leaves the machine \
+                             and nothing sent here arrives. `ferry doctor --fix` (or the \
+                             worker, on start) repoints this workspace at the synced folder",
                             folder.folder_id,
                             folder.state,
                             folder.registered_path,

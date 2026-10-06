@@ -317,3 +317,239 @@ fn spawn_detached(binary: &Path, home: &Path) -> Result<()> {
         .with_context(|| format!("start {}", binary.display()))?;
     Ok(())
 }
+
+/// Whether the folder a workspace reads is the folder Syncthing syncs.
+///
+/// A machine can hold two copies of one channel: one Syncthing syncs, one a worker
+/// reads. Every write then lands in the copy that never leaves, every order sent to
+/// the machine lands in the copy nobody reads, and every reading on both machines says
+/// healthy. It went unnoticed for three weeks on a two-machine fleet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelSync {
+    /// Syncthing syncs exactly the folder this workspace reads.
+    Synced,
+    /// Syncthing could not be asked, or does not know this channel's folder.
+    Unknown,
+    /// Syncthing syncs a different folder under this channel's id.
+    Split { syncs: PathBuf },
+}
+
+/// Ask Syncthing which folder it syncs for this channel and compare.
+#[must_use]
+pub fn channel_sync(route: &ferryman_channel::ProjectRoute) -> ChannelSync {
+    match ferryman_channel::syncthing_channel_state(route) {
+        Some(state) if !state.registered_path.is_empty() && !state.syncs(&route.communications) => {
+            ChannelSync::Split {
+                syncs: PathBuf::from(state.registered_path),
+            }
+        }
+        Some(_) => ChannelSync::Synced,
+        None => ChannelSync::Unknown,
+    }
+}
+
+/// What [`repoint_channel`] did.
+#[derive(Debug, Clone)]
+pub struct Repointed {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// Files that existed only in the folder being left, now in the synced one.
+    pub copied: usize,
+}
+
+/// Make a workspace read the folder Syncthing syncs.
+///
+/// Copy first, repoint second, and nothing else: files that exist only in `reads` are
+/// copied into `syncs` (nothing is overwritten), then `bridge.toml` is pointed at
+/// `syncs`. Syncthing is never touched and nothing is deleted, so no deletion can reach
+/// another machine - the failure that makes the obvious fix, re-pointing Syncthing at
+/// the other folder, dangerous. The folder being left stays on disk.
+///
+/// Refuses unless `syncs` carries Syncthing's `.stfolder` marker: a path Syncthing
+/// merely remembers is not proof that anything there syncs.
+pub fn repoint_channel(attachment: &Path, reads: &Path, syncs: &Path) -> Result<Repointed> {
+    if !syncs.join(".stfolder").exists() {
+        bail!(
+            "Syncthing lists {} for this channel but it has no .stfolder marker, so it is \
+             not a folder Syncthing is syncing; left as it is",
+            syncs.display()
+        );
+    }
+    let bridge = attachment.join("bridge.toml");
+    if !bridge.is_file() {
+        bail!("no {} to repoint", bridge.display());
+    }
+    let copied = if reads.is_dir() {
+        copy_missing(reads, syncs)?
+    } else {
+        0
+    };
+    set_communications(&bridge, syncs)?;
+    Ok(Repointed {
+        from: reads.to_path_buf(),
+        to: syncs.to_path_buf(),
+        copied,
+    })
+}
+
+/// Copy every file under `from` that `to` does not have. Never overwrites. Leaves out
+/// what is local by nature: a nested `.git`, Syncthing's own markers and temporaries,
+/// sync-conflict copies, and lock files.
+fn copy_missing(from: &Path, to: &Path) -> Result<usize> {
+    let mut copied = 0;
+    for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git"
+            || name == ".stfolder"
+            || name.starts_with("~syncthing~")
+            || name.contains(".sync-conflict-")
+            || name.ends_with(".lock")
+            || name.ends_with(".tmp")
+        {
+            continue;
+        }
+        let target = to.join(&name);
+        if entry.file_type()?.is_dir() {
+            copied += copy_missing(&entry.path(), &target)?;
+        } else if !target.exists() {
+            std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
+            std::fs::copy(entry.path(), &target)
+                .with_context(|| format!("copy {}", entry.path().display()))?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
+/// Point `bridge.toml`'s `communications` at `channel`, a line at a time: these files
+/// carry Windows paths written literally, which a TOML round trip would re-escape. The
+/// previous file is kept beside it as `bridge.toml.before-repoint`.
+fn set_communications(bridge: &Path, channel: &Path) -> Result<()> {
+    let text =
+        std::fs::read_to_string(bridge).with_context(|| format!("read {}", bridge.display()))?;
+    std::fs::write(bridge.with_extension("toml.before-repoint"), &text)
+        .with_context(|| format!("back up {}", bridge.display()))?;
+    let line = format!("communications = \"{}\"", channel.display());
+    let mut found = false;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.trim_start().starts_with("communications") && l.contains('=') {
+                found = true;
+                line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        lines.push(line);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    std::fs::write(bridge, out).with_context(|| format!("write {}", bridge.display()))
+}
+
+#[cfg(test)]
+mod repoint_tests {
+    use super::*;
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn repointing_copies_what_is_missing_and_overwrites_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join("ws").join(".ferryman");
+        let reads = attachment.join("ferryman");
+        let syncs = dir.path().join("synced");
+        std::fs::create_dir_all(syncs.join(".stfolder")).unwrap();
+        write(
+            &attachment.join("bridge.toml"),
+            "project = \"p\"\ncommunications = \"old\"\n",
+        );
+        // Only on the unsynced side: must arrive.
+        write(&reads.join("secrets").join("KEY.json"), "sealed");
+        write(&reads.join("messages").join("m1.json"), "hello");
+        // On both sides with different content: the synced copy wins.
+        write(&reads.join("tasks").join("t").join("order.json"), "stale");
+        write(&syncs.join("tasks").join("t").join("order.json"), "current");
+        // Local by nature: must not travel.
+        write(&reads.join(".git").join("HEAD"), "ref");
+        write(
+            &reads.join("ledger.x.sync-conflict-20260101-000000-ABC.jsonl"),
+            "c",
+        );
+        write(&reads.join("runtime").join("locks").join("ledger.lock"), "");
+
+        let done = repoint_channel(&attachment, &reads, &syncs).unwrap();
+        assert_eq!(done.copied, 2);
+        assert_eq!(
+            std::fs::read_to_string(syncs.join("secrets").join("KEY.json")).unwrap(),
+            "sealed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(syncs.join("tasks").join("t").join("order.json")).unwrap(),
+            "current",
+            "never overwrites the synced copy"
+        );
+        assert!(!syncs.join(".git").exists());
+        assert!(
+            !syncs
+                .join("runtime")
+                .join("locks")
+                .join("ledger.lock")
+                .exists()
+        );
+        assert!(
+            reads.join("messages").join("m1.json").exists(),
+            "nothing is deleted"
+        );
+
+        let bridge = std::fs::read_to_string(attachment.join("bridge.toml")).unwrap();
+        assert!(bridge.contains(&format!("communications = \"{}\"", syncs.display())));
+        assert!(bridge.contains("project = \"p\""), "other lines untouched");
+        assert!(attachment.join("bridge.toml.before-repoint").is_file());
+
+        // A second run has nothing left to do.
+        assert_eq!(
+            repoint_channel(&attachment, &reads, &syncs).unwrap().copied,
+            0
+        );
+    }
+
+    #[test]
+    fn a_folder_without_the_syncthing_marker_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join(".ferryman");
+        write(
+            &attachment.join("bridge.toml"),
+            "communications = \"old\"\n",
+        );
+        let err = repoint_channel(
+            &attachment,
+            &attachment.join("ferryman"),
+            &dir.path().join("elsewhere"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains(".stfolder"), "{err}");
+        let bridge = std::fs::read_to_string(attachment.join("bridge.toml")).unwrap();
+        assert!(bridge.contains("communications = \"old\""), "left as it is");
+    }
+
+    #[test]
+    fn a_bridge_without_a_communications_line_gets_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join(".ferryman");
+        let syncs = dir.path().join("synced");
+        std::fs::create_dir_all(syncs.join(".stfolder")).unwrap();
+        write(&attachment.join("bridge.toml"), "project = \"p\"\n");
+        repoint_channel(&attachment, &attachment.join("ferryman"), &syncs).unwrap();
+        let bridge = std::fs::read_to_string(attachment.join("bridge.toml")).unwrap();
+        assert!(bridge.contains(&format!("communications = \"{}\"", syncs.display())));
+    }
+}
