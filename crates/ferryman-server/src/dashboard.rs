@@ -429,6 +429,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/focus/clear", post(focus_clear))
         .route("/api/improve/pending", get(improve_pending))
         .route("/api/improve/decide", post(improve_decide))
+        .route("/api/suggestions", get(suggestions_get))
+        .route("/api/suggestions/decide", post(suggestions_decide))
         .route(
             "/api/delegations",
             get(delegations_get).post(delegations_set),
@@ -2903,6 +2905,121 @@ async fn improve_decide(
     })))
 }
 
+/// `route` with the roster as the channel holds it now. Signed lines in the ledger are
+/// checked against the roster, and a worker that joined after the dashboard started must
+/// count.
+fn route_with_live_roster(route: &ProjectRoute) -> ProjectRoute {
+    let mut route = route.clone();
+    if let Ok(agents) = ferryman_channel::read_agent_roster(&route.communications) {
+        route.agents = agents;
+    }
+    route
+}
+
+/// GET /api/suggestions - the suggestions outsiders have sent this project, newest first,
+/// each with what triage made of it and where it stands, and how many wait for the master
+/// ("needs me"). `available` is false for a project that never opened an inbox. The words in
+/// the cards are the contributors' and the model's: a screen shows them as text.
+async fn suggestions_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::suggestions::{flow, record};
+    let route = route_with_live_roster(&state.route_for(params.project.as_deref()));
+    let Some(current) = record::current(&route.communications, &route.project_id) else {
+        return Ok(Json(
+            json!({ "available": false, "project": route.project_id }),
+        ));
+    };
+    let master = ferryman_channel::ferry::master_of(&route.communications)
+        .ok()
+        .flatten();
+    let may_decide = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    let cards = flow::cards(&route, Some(&current.offer));
+    let waiting = cards
+        .iter()
+        .filter(|card| card.stage == flow::Stage::Pending)
+        .count();
+    Ok(Json(json!({
+        "available": true,
+        "project": route.project_id,
+        "open": current.offer.is_open(),
+        "inbox": current.offer.inbox,
+        "terms_version": current.offer.terms.version,
+        "terms_sha256": current.offer.terms.sha256,
+        "limits": current.offer.limits,
+        "signed_by": current.signed_by,
+        "notice": record::rollback_notice(&route.communications, &route.project_id),
+        "waiting": waiting,
+        "may_decide": may_decide,
+        "master": master,
+        "cards": cards,
+    })))
+}
+
+#[derive(Deserialize)]
+struct SuggestionDecideBody {
+    /// The issue number in the inbox.
+    issue: u64,
+    /// `accept`, `decline` or `ask`.
+    choice: String,
+    /// A reason for `decline`, or a question for `ask`; both optional.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+/// POST /api/suggestions/decide - the master decides a pending suggestion, signed with the
+/// session's key, the same answer a Telegram button or `ferry suggestions accept` gives.
+/// Only the master (or a delegate) is accepted. Nothing is built here: the workers see the
+/// signed answer on their next pass, and an accept becomes an ordinary signed order.
+async fn suggestions_decide(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Json(body): Json<SuggestionDecideBody>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::suggestions::flow::{self, Choice};
+    let current = session_identity(&state, &headers)?;
+    let route = route_with_live_roster(&state.route_for(params.project.as_deref()));
+    let text = body
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let choice = match body.choice.as_str() {
+        "accept" => Choice::Accept,
+        "decline" => Choice::Decline(text),
+        "ask" => Choice::Ask(text),
+        other => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("choice is accept, decline or ask, not '{other}'"),
+            ));
+        }
+    };
+    let master = ferryman_channel::ferry::master_of(&route.communications)
+        .ok()
+        .flatten()
+        .ok_or((
+            StatusCode::CONFLICT,
+            format!("{} has no master to decide it", route.project_id),
+        ))?;
+    flow::decide(&route, body.issue, &choice, &master, &current)
+        .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    Ok(Json(json!({
+        "issue": body.issue,
+        "answer": choice.text(),
+        "state": "recorded; the workers act on it on their next pass",
+    })))
+}
+
 /// GET /api/delegations - who may act for the master in this project (the Telegram
 /// bridge, say), whether each delegation counts right now, and which agents on the
 /// roster could be delegated to.
@@ -5176,6 +5293,7 @@ mod tests {
             "/api/engine-policy/team",
             "/api/improve/pending",
             "/api/focus",
+            "/api/suggestions",
         ] {
             let response = app
                 .clone()
@@ -5200,6 +5318,10 @@ mod tests {
             ("/api/engine-policy/settings", r#"{"width":{"build":9}}"#),
             ("/api/focus", r#"{"projects":["ferryman"],"tier":"paused"}"#),
             ("/api/focus/clear", "{}"),
+            (
+                "/api/suggestions/decide",
+                r#"{"issue":1,"choice":"accept"}"#,
+            ),
         ] {
             let response = post(&app, path, body, None).await;
             assert_eq!(
@@ -6166,6 +6288,167 @@ mod tests {
         assert_eq!(view["set"], false, "{view}");
         assert_eq!(view["projects"][0]["tier"], "normal");
         assert!(set_path.exists(), "clearing is a newer, empty record");
+    }
+
+    /// Suggestions from outsiders, from the browser: the "needs me" list for anyone signed
+    /// in, and the decision for the master only, once, signed as the same answer a button
+    /// in Telegram gives.
+    #[tokio::test]
+    async fn the_master_decides_outsiders_suggestions_from_the_browser() {
+        use ferryman_channel::suggestions::{
+            client::{agree, prepare_join, send},
+            contributor::{ACCEPT_PHRASE, Consent, ContributorStore},
+            flow::{self, Ctx, TriageResult},
+            inbox::MockInbox,
+            invite::Invite,
+            publish,
+            record::{self, Limits, OpenArgs, TriageConfig, default_types},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        let decide = r#"{"issue":1,"choice":"accept"}"#;
+
+        let before = get_json(&app, "/api/suggestions", Some(&token)).await;
+        assert_eq!(
+            before["available"], false,
+            "no inbox was ever opened: {before}"
+        );
+        let refused = post(&app, "/api/suggestions/decide", decide, Some(&token)).await;
+        assert_eq!(
+            refused.status(),
+            StatusCode::CONFLICT,
+            "no master, nothing to decide"
+        );
+
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let alice = dashboard_state.sessions.resolve(&token).unwrap();
+        let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+        assert!(
+            roster.iter().any(|agent| agent.name == alice.name()),
+            "the master is on the roster: {roster:?}"
+        );
+        let opened = record::open(
+            &route.communications,
+            &route.project_id,
+            &alice,
+            OpenArgs {
+                display_name: "Ferryman".into(),
+                inbox: "github:estejosh/ferryman-ideas".into(),
+                terms_text:
+                    "Terms v1. You grant the owner a license to use your suggestion. No payment.\n"
+                        .into(),
+                types: default_types(),
+                limits: Limits::default(),
+                triage: TriageConfig::default(),
+                accept_draft_terms: false,
+            },
+            Utc::now(),
+        )
+        .unwrap();
+        let inbox = MockInbox::new("estejosh");
+        publish::publish(&inbox, &opened.offer, &opened.terms_text).unwrap();
+        let store = ContributorStore::open(&dir.path().join("octo"));
+        let theirs = inbox.as_user("octo");
+        let joined = prepare_join(&store, &theirs, &Invite::new(&opened.offer).encode()).unwrap();
+        agree(
+            &store,
+            &theirs,
+            &joined,
+            "octo",
+            Consent::Typed(ACCEPT_PHRASE),
+            Utc::now(),
+        )
+        .unwrap();
+        let fields = [
+            ("title", "Offline timer <script>alert(1)</script>"),
+            ("pitch", "Show what you would have earned."),
+            ("why", "It fits."),
+        ]
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+        let sent = send(
+            &store,
+            &theirs,
+            &route.project_id,
+            "idea",
+            &fields,
+            Utc::now(),
+        )
+        .unwrap();
+        let live = route_with_live_roster(&route);
+        let ctx = Ctx {
+            route: &live,
+            identity: &alice,
+            inbox: &inbox,
+            record: &opened,
+            now: Utc::now(),
+        };
+        let report = flow::sync(&ctx).unwrap();
+        assert_eq!(report.jobs.len(), 1, "{report:?}");
+        let verdict = r#"{"decision":"accept","scores":{"fit":3,"novelty":2,"scope":1,"risk":0,"effort":1},"questions":[],"reason":"Fits.","spec_draft":"Show offline earnings."}"#;
+        flow::apply_verdict(&ctx, &report.jobs[0], TriageResult::Text(verdict.into())).unwrap();
+
+        let view = get_json(&app, "/api/suggestions", Some(&token)).await;
+        assert_eq!(view["available"], true, "{view}");
+        assert_eq!(view["waiting"], 1, "{view}");
+        assert_eq!(view["may_decide"], true);
+        assert_eq!(view["open"], true);
+        assert_eq!(view["cards"][0]["stage"], "pending", "{view}");
+        assert_eq!(view["cards"][0]["issue"], sent.issue);
+        assert_eq!(view["cards"][0]["login"], "octo");
+        assert_eq!(
+            view["cards"][0]["pitch"],
+            "Show what you would have earned."
+        );
+        assert!(
+            view["cards"][0]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with("/issues/1"),
+            "{view}"
+        );
+
+        let bad = post(
+            &app,
+            "/api/suggestions/decide",
+            r#"{"issue":1,"choice":"merge"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let unknown = post(
+            &app,
+            "/api/suggestions/decide",
+            r#"{"issue":99,"choice":"accept"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(
+            unknown.status(),
+            StatusCode::FORBIDDEN,
+            "nothing pending there"
+        );
+        let done = post(&app, "/api/suggestions/decide", decide, Some(&token)).await;
+        assert_eq!(done.status(), StatusCode::OK);
+        let again = post(&app, "/api/suggestions/decide", decide, Some(&token)).await;
+        assert_eq!(
+            again.status(),
+            StatusCode::FORBIDDEN,
+            "a question is answered once"
+        );
+        let questions = ferryman_channel::questions::list(&live);
+        assert!(
+            questions.iter().any(|(question, answer)| {
+                question.kind == ferryman_channel::questions::SUGGESTION && answer.is_some()
+            }),
+            "the decision is a signed answer to a signed question"
+        );
     }
     #[tokio::test]
     async fn only_the_master_sets_the_engine_policy_from_the_browser() {

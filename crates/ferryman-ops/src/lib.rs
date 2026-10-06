@@ -32,6 +32,7 @@ pub mod route;
 pub mod runlog;
 pub mod soak;
 pub mod status;
+pub mod suggest;
 pub mod syncthing;
 pub mod telemetry;
 

@@ -34,6 +34,9 @@ pub const CONTRACT: &str = "contract";
 /// The adversary blocked a failing order's next attempt. One question per (order,
 /// revision); see [`crate::adversary`].
 pub const ADVERSARY: &str = "adversary";
+/// An outside suggestion waiting for the master: accept, decline or ask more. Nothing is
+/// built from one until the master's signed answer says Accept; see [`crate::suggestions`].
+pub const SUGGESTION: &str = "suggestion";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {

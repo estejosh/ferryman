@@ -505,6 +505,55 @@ paths:
         '200': {description: 'the order, the revision decided and its state'}
         '401': {description: no active session}
         '403': {description: read-only, not the master, or the review engine has not given its key}
+  /api/suggestions:
+    get:
+      summary: Suggestions outsiders have sent, and the ones waiting for the master
+      description: >
+        The project's suggestions inbox as this fleet sees it: every suggestion taken in
+        from the public inbox the master named (newest first), each with the contributor's
+        login, kind, title, pitch and why (their words, to be shown as text), the terms
+        version it was sent under and whether those are still the current terms, what
+        triage made of it (`verdict`: decision, scores, reason, a draft of what to build),
+        its stage (received, clarifying, pending, accepted, building, shipped, declined,
+        duplicate, withdrawn, expired) and the order it became. `pending` is "needs me".
+        `available` is false for a project that never opened an inbox. `may_decide` is true
+        only for the signed-in master. The CLI equivalent is `ferry suggestions pending`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'available and, when it is, project, open, inbox, terms_version, terms_sha256, limits, signed_by, notice, waiting, may_decide, master and cards'}
+        '401': {description: no active session}
+  /api/suggestions/decide:
+    post:
+      summary: The master decides a pending suggestion
+      description: >
+        Accept, decline (with an optional reason shown to the contributor) or ask more
+        (with an optional question). Recorded as the master's signed answer to the signed
+        question triage asked, the same answer a Telegram button gives; nothing is built
+        here. The workers read the answer on their next pass: an accept becomes an ordinary
+        signed order tagged `suggestion` for the normal build and review path, and a
+        suggestion whose sender has not agreed to changed terms waits for that. A question
+        is answered once. The CLI equivalents are `ferry suggestions accept`, `decline` and
+        `ask`.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [issue, choice]
+              properties:
+                issue: {type: integer, description: the issue number in the inbox}
+                choice: {type: string, enum: [accept, decline, ask]}
+                text: {type: string, description: a reason for decline or a question for ask}
+      responses:
+        '200': {description: 'the issue, the answer recorded and its state'}
+        '400': {description: a choice that is not accept, decline or ask}
+        '401': {description: no active session}
+        '403': {description: read-only, not the master (or a delegate), nothing pending for that issue, or already answered}
+        '409': {description: the project has no master}
   /api/delegations:
     get:
       summary: Who may act for the master here, and whether each delegation counts

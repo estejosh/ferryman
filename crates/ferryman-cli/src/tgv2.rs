@@ -1938,6 +1938,11 @@ impl Bridge {
                     format!("{project} - engine policy")
                 } else if question.kind == questions::CONTRACT {
                     format!("{project} - interface contract, waiting for your lock")
+                } else if question.kind == questions::SUGGESTION {
+                    // The buttons are Accept, Decline and Ask more: the same signed answer
+                    // `ferry suggestions accept` gives. Everything below the heading is the
+                    // contributor's words, shown as plain text.
+                    format!("{project} - a suggestion from outside, waiting for your decision")
                 } else {
                     format!("{project} - a question from {}", question.asked_by)
                 };
@@ -3137,6 +3142,42 @@ mod tests {
         assert_eq!(question.id, "clarify-2026-w39-1");
         assert_eq!(answer.unwrap().answer, "No");
         assert!(bridge.tick(Utc::now()).is_empty());
+    }
+
+    /// An outsider's suggestion that triage sent up arrives once, with Accept, Decline and
+    /// Ask more, and the button is the same signed answer the owner's worker then reads.
+    #[test]
+    fn a_suggestion_from_outside_is_asked_with_three_buttons_and_the_answer_parses() {
+        use ferryman_channel::suggestions::{QUESTION_KIND, flow::Choice};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        let options = ["Accept", "Decline", "Ask more"].map(String::from);
+        questions::ask(
+            &ferryman,
+            &wisp(),
+            "sugg-1",
+            QUESTION_KIND,
+            "#4 [idea] Offline timer from @octo (typed)\nTriage: accept",
+            &options,
+            None,
+        )
+        .unwrap();
+        let posted = bridge.tick(Utc::now());
+        let shown = texts(&posted);
+        assert!(
+            shown[0].starts_with("ferryman - a suggestion from outside"),
+            "{shown:?}"
+        );
+        assert!(shown[0].contains("Offline timer"), "{shown:?}");
+        let choices = buttons(&posted);
+        let labels: Vec<&str> = choices.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["Accept", "Decline", "Ask more", "Answer in words"]);
+        assert!(bridge.tick(Utc::now()).is_empty(), "posted once");
+        bridge.handle(press(JOSH_TG, GROUP, 81, &choices[0].1), Utc::now());
+        let (_, answer) = questions::list(&ferryman).remove(0);
+        let answer = answer.unwrap();
+        assert_eq!(Choice::parse(&answer.answer), Some(Choice::Accept));
     }
 
     /// A proposed interface contract reaches the phone once, however often it is asked

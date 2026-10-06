@@ -60,6 +60,7 @@ pub mod secrets;
 pub mod seed;
 pub mod skills;
 pub mod source;
+pub mod suggestions;
 pub mod tamper;
 pub mod trajectory;
 pub mod work;
