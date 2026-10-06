@@ -326,6 +326,14 @@ Listed because you will hit some of these, and finding them written down beats
 discovering them. Every one is something we know about and intend to fix; none of
 them loses work or leaks anything.
 
+- **A machine first set up with an older Ferryman can sit idle forever after
+  upgrading.** Its Syncthing still writes each channel to the old
+  `<repo>/.ferryman/ferryman` while the worker reads the channel its own
+  `.ferryman/bridge.toml` names, so orders arrive on the machine but in a folder
+  nobody reads. The issuer sees "not delivered" while Syncthing reports 100%
+  synced. Moving the folders by hand fixes it, and the order of the steps matters:
+  see
+  [Upgrading](docs/UPGRADING.md#known-issue-a-machine-set-up-with-an-older-ferryman-never-sees-new-work).
 - **Costs read as `$0.00` for engines that don't account.** Workers now record
   the token usage an engine prints and `ferry cost project` totals it per
   engine; Claude Code's JSON output is accounted today, and prose-only engines
