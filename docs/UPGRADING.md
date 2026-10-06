@@ -23,11 +23,21 @@ the binary again. Keep the copy you replaced until the new one has taken a task.
 
 ## Known issue: a machine set up with an older Ferryman never sees new work
 
-Older versions kept each channel inside its work repo, at
-`<repo>/.ferryman/ferryman`, and Syncthing was pointed there. Newer versions run one
-worker over a ferry root with `ferry agent run --comms <root>/comms`, which reads
-`<root>/comms/<project>-ferryman`. Upgrading the binary moves neither: Syncthing keeps
-syncing the old folder, and the worker reads the new one, which never fills.
+Every workspace says where its channel lives, in `.ferryman/bridge.toml`:
+
+```toml
+communications = "/path/to/the/channel"
+```
+
+When that line is absent, the channel is `<workspace>/.ferryman/ferryman`. That path is
+the only place a worker looks. Syncthing has to sync that exact folder.
+
+A machine first set up with an older Ferryman can end up with Syncthing pointed at a
+different copy. A common case: the channel used to be synced into the work repo, at
+`<repo>/.ferryman/ferryman`, and the machine now runs one worker over a ferry root
+with `ferry agent run --comms <root>/comms`, where each `comms/<project>-ferryman` is
+its own workspace with its own `.ferryman`. Upgrading the binary moves nothing.
+Syncthing keeps filling the old copy, and the worker reads one that never fills.
 
 What it looks like:
 
@@ -35,22 +45,24 @@ What it looks like:
   ("has not seen it"), while Syncthing reports the folder 100% synced to that machine.
 - The worker is healthy, says it is watching the channel, and claims nothing.
 - The order's files are on the machine, just not where the worker looks.
-- `ferry channel join` in the comms folder fails with "no Ferryman channel found",
-  because the folder the worker reads holds no channel.
 
-Check on the affected machine: compare each Syncthing folder's path with
-`<root>/comms/<folder id>`. Any `-ferryman` folder whose path is elsewhere is one the
-worker cannot see.
+Check on the affected machine, for each `-ferryman` Syncthing folder: find the
+workspace the worker uses for it, read `communications` from its
+`.ferryman/bridge.toml` (or take `<workspace>/.ferryman/ferryman`), and compare that
+with the Syncthing folder path. They must be the same folder.
+
+Do not point Syncthing at the workspace itself. The workspace holds `.ferryman`, with
+the machine's `agent.toml`, its config and its worker locks, and Syncthing would carry
+those to every other machine on the channel.
 
 Fix each mismatched folder, one at a time:
 
 1. Pause the folder in Syncthing and back up both copies.
-2. Copy the Syncthing copy into the comms path, keeping everything, including
-   `.stfolder` and `.stignore`, and without deleting what is only in the comms path
-   (`agent.toml`, keys): `rsync -a <old path>/ <root>/comms/<folder id>/`.
-3. Only then change the Syncthing folder path to `<root>/comms/<folder id>` and unpause.
-4. Watch it settle. It must not report deleting anything.
-5. Restart the worker.
+2. Copy the Syncthing copy into the channel path, keeping `.stfolder` and `.stignore`
+   and without deleting anything: `rsync -a <syncthing path>/ <channel path>/`.
+3. Check that what the issuer sent is now in the channel path.
+4. Only then change the Syncthing folder path to the channel path, and unpause.
+5. Watch it settle, then restart the worker.
 
 The order matters. Pointing Syncthing at a folder before the files are in it makes
 the missing files read as deletions, and Syncthing sends those deletions to every
