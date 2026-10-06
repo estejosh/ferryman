@@ -886,7 +886,7 @@ function routingDecision(dec) {
   const win = dec.winner || {};
   const rows = (dec.candidates || []).map((c) => {
     const mark = c.excluded ? "x" : (win.engine === c.engine && win.machine === c.machine ? ">" : (c.sufficient ? "+" : "-"));
-    const facts = c.p == null ? "" : `p ${Number(c.p).toFixed(2)}, ${c.price || ""}`;
+    const facts = c.p == null ? "" : `p ${Number(c.p).toFixed(2)}${c.basis ? ` (${c.basis})` : ""}, ${c.price || ""}`;
     return `<div class="mono" style="color:var(--faint)">${mark} ${esc(c.engine)} on ${esc(c.machine)} ${esc(facts)}${c.excluded ? ` &mdash; out: ${esc(c.excluded)}` : ""}</div>`;
   }).join("");
   const retry = (dec.failed || []).length ? `<div style="color:var(--faint)">retry: ${esc(dec.failed.join(", "))} failed this order${dec.must_beat != null ? `; the next engine needs p above ${Number(dec.must_beat).toFixed(2)}` : ""}</div>` : "";

@@ -906,12 +906,13 @@ engines, as it always has, and the reason says so.
 ### How the choice is made
 
 1. **Estimate.** For each engine and kind of work, the chance it does the work well is a
-   Beta estimate. The prior is the engine's size class (large 0.80, medium 0.70, small
-   0.55), plus 0.05 for each strength tag that matches the kind (at most 0.10), minus 0.10
-   for each class the engine is below the size of the work. It is worth four results.
-   The evidence is the worker's own ledger of results for this engine and kind, verified or
-   refuted by its checks, each counting for half as much after 14 days. So
-   `p = (prior x 4 + verified) / (4 + verified + refuted)`.
+   Beta estimate. The prior comes from the engine's **model profile** when the router knows
+   the model (see "What each model is good at" below), and from its size class when it does
+   not: large 0.80, medium 0.70, small 0.55, plus 0.05 for each strength tag that matches
+   the kind (at most 0.10), minus 0.10 for each class the engine is below the size of the
+   work. Either way it is worth four results. The evidence is the worker's own ledger of
+   results for this engine and kind, verified or refuted by its checks, each counting for
+   half as much after 14 days. So `p = (prior x 4 + verified) / (4 + verified + refuted)`.
 2. **Price.** One call is estimated at 3k/1k, 12k/3k or 48k/10k tokens in/out for small,
    medium and large work, times the engine's price. Local and free-tier engines cost 0 -
    but how an engine is paid for decides before where it runs: an endpoint on this machine
@@ -924,17 +925,25 @@ engines, as it always has, and the reason says so.
    list price ($5 in, $25 out per million tokens), so a declared price always beats a
    guess. A free tier that asked for money is priced like an unpriced one until its flag
    lapses. A subscription costs nothing per call, but its **scarcity** is priced: about two
-   cents a call with the weekly cap full, rising to ten times that as the cap runs down.
+   cents a call on a cap of 300 a week with the cap full, rising to ten times that as the
+   cap runs down, and in proportion to the cap - a request on a 2000 a week cap is about
+   6.7 times cheaper. So when two subscriptions both clear the bar, the one with the bigger
+   cap (Haiku at 2000) takes the work, and the smaller (Sonnet at 300) gets what the bigger
+   one does not clear. The line says so: `subscription, cap 2000/wk, ...; preferred over a
+   smaller cap (claude-sonnet 300/wk)`.
 3. **Choose.** The *sufficient set* is every engine whose estimate reaches the threshold
-   for the kind. Unless the policy says otherwise that is **0.70 for docs, chore, tests,
-   review, plan and research** - a medium engine such as a free nemotron starts at exactly
-   0.70, so it takes that work from the start and loses it as soon as its results are
-   refuted - and **0.75 for everything else** (code changes and media), where a medium
-   engine must first prove itself and a small one (0.55) must earn either. The winner is
-   the cheapest of the sufficient set. If none is sufficient, the winner is the one most
-   likely to succeed. Costs within 10% count as tied, and ties go to **bias**, then the
-   nearer tier, then the faster engine, then the order the policy and `agent.toml` already
-   gave.
+   for the kind. Unless the policy says otherwise that is **0.80 for review and plan**
+   (only an engine that is actually good at judging and planning gets that work),
+   **0.70 for docs, chore, tests and research** - a free engine that writes well takes
+   that work from the start and loses it as soon as its results are refuted - and **0.75
+   for everything else** (code changes, translation and media). **Large work adds 0.05** to
+   the default of any kind. A threshold you set with `--threshold` is used exactly as you
+   set it, large work or not. The winner is the cheapest of the sufficient set. If none is
+   sufficient, the winner is the one most likely to succeed. Costs within 10% count as
+   tied, and ties go to **bias**, then to **how the engine is paid for - free (local or a
+   free tier) before a subscription before paid** - then the nearer tier, then the
+   **higher estimate**, then the faster engine, then the order the policy and `agent.toml`
+   already gave.
 4. **Escalate.** After a result *of this worker's own* is refuted by its own evidence, or
    sent back with changes requested, the next attempt leaves that engine out and prefers
    an estimate **higher than the failed engine's**. A retry therefore climbs: cheap first,
@@ -953,6 +962,52 @@ engines, as it always has, and the reason says so.
    signed inventory (a v2-only field). A cheap engine that keeps getting docs right becomes
    sufficient for docs; one that gets refuted stops being picked for it, while what it is
    good at is untouched. `ferry engines` shows each engine's best kinds with its success rate.
+
+### What each model is good at
+
+The size class alone cannot tell Claude Haiku (a fine chore engine) from a model that is
+merely small, or NVIDIA's Nemotron (a good writer) from a good reviewer. So the router
+carries a built-in table of **model profiles**: for each known family, a conservative prior
+`p` for each kind of work. It covers Claude (opus, sonnet, haiku, including the bare
+`opus`, `sonnet` and `haiku` the claude CLI takes), GPT-5 (and mini, nano, codex), Gemini
+(pro, flash, flash-lite), DeepSeek (v3, v4, v4-pro, r1), NVIDIA Nemotron (super, ultra,
+nano), Qwen (2.5 and 3, scaled by the parameter count in the name; `-coder` is stronger on
+code, `vl` is a vision model and a little weaker on text), GLM-4.x (air, flash), Llama,
+Mistral (with Codestral and Devstral) and Kimi. A few of its rows, for medium-sized work:
+
+| Model | code | review | plan | docs | tests | chore |
+|---|---|---|---|---|---|---|
+| claude-opus | 0.92 | 0.92 | 0.93 | 0.90 | 0.90 | 0.88 |
+| claude-sonnet | 0.88 | 0.87 | 0.86 | 0.86 | 0.86 | 0.84 |
+| claude-haiku | 0.72 | 0.70 | 0.66 | 0.78 | 0.76 | 0.82 |
+| deepseek-v4-pro | 0.86 | 0.84 | 0.86 | 0.82 | 0.84 | 0.80 |
+| nemotron-super | 0.72 | 0.72 | 0.70 | 0.78 | 0.72 | 0.80 |
+| glm-flash | 0.72 | 0.66 | 0.64 | 0.72 | 0.70 | 0.74 |
+| qwen ~14b | 0.66 | 0.63 | 0.62 | 0.70 | 0.64 | 0.70 |
+| qwen-vl ~7b | 0.52 | 0.54 | 0.53 | 0.56 | 0.54 | 0.58 |
+
+These are starting guesses, not benchmarks. The ledger still moves them: a few verified or
+refuted results change `p` as before, so a model that does better or worse than its family
+is found out. The rules:
+
+- The engine's `model` is matched (case does not matter; Bedrock-style ids such as
+  `us.deepseek.r1-v1:0` work). Only an engine with no `model` is matched by its name: an
+  engine called `sonnet-fast` serving `my-finetune` is not Sonnet. A model that matches
+  nothing has no profile, and it is scored by its size class exactly as before.
+- **A profile wins over the size class**, including a `class` you declared: the class is a
+  size guess, and the profile is a better one. Your declared `strengths` still count for
+  the kinds they help (0.05 each, at most 0.10), except a strength the profile already
+  includes, such as `code` on a `-coder` model. For a model the router does not know,
+  `class` and `strengths` count in full.
+- **Opus is never picked for background work by the router on its own.** It has a profile,
+  but an engine whose model is Claude Opus is left out of smart background routing unless
+  the role's prefer list names it (`name:claude-opus`, `model:opus`, or its bare name; a
+  `paid:` or `class:` selector does not count). Work you ask for directly is not held back.
+- Large work takes 0.05 off a medium model and 0.10 off a small one; a large model loses
+  nothing.
+- `ferry route simulate` and `ferry route explain` say where each `p` came from, for
+  example `p 0.87 (model profile: claude-sonnet)` or `p 0.70 (class medium)`, and add the
+  ledger's counts once there are any.
 
 ### The policy fields
 
@@ -988,7 +1043,8 @@ ferry engines                   # each engine's top kinds with their success rat
 
 Every routing decision is recorded beside the step and in the result: each candidate with its
 estimate and price, why each excluded engine was left out, and a one-line reason such as
-`nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient`. The dashboard shows the reason
+`nvidia: free, p 0.80 for docs >= 0.70, cheapest sufficient`. Each candidate's line says
+where its estimate came from: `> nvidia  beastly  p 0.78 (model profile: nemotron-super), free`. The dashboard shows the reason
 on each order card, every candidate in the order's drawer, and a Routing panel that runs the
 simulation without running anything. Telegram's review card carries the one-line reason.
 
@@ -1045,11 +1101,14 @@ What that does: NVIDIA is free and large, so it takes the work while it is up an
 it for as long as it keeps getting it right. When it is out of credit, down, or has failed
 at that kind of work, the next cheapest engine that is likely to do it well takes over: a
 local model that has proven itself at it, then Sonnet, then Haiku (Sonnet before Haiku
-when their price is tied, because of the bias). Docs, review, plan, research, tests and
-chores need only 0.70 by default, which any medium or large engine meets from the start,
-so a free one wins them cheaply until its results are refuted. Haiku, a small model,
-becomes sufficient for a kind of work by proving itself at it, or because you lowered that
-kind's threshold (`--threshold chore=0.55` above): that is "can do it well cheaply". A
+when their price is tied, because of the bias). Docs, research, tests and chores need only
+0.70 by default, which a model whose profile says it writes well (Nemotron super does)
+meets from the start, so a free one wins them cheaply until its results are refuted.
+Review and plan need 0.80, so they go to a model that is actually good at them (Sonnet),
+and large work needs 0.05 more. Haiku is a good chore model by its profile; a small model
+the router does not know becomes sufficient for a kind of work by proving itself at it, or
+because you lowered that kind's threshold (`--threshold chore=0.55` above): that is "can do
+it well cheaply". A
 subscription is used for a role only because `--allow-subscriptions-for` says so, and only an engine with a weekly cap; `never` and the
 dollar caps still apply first. Drop `--allow-subscriptions-for` and the two Claude engines
 are never used for background work, as before. `ferry route simulate --kind docs --size small`

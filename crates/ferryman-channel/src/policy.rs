@@ -594,15 +594,16 @@ impl Policy {
         Ok(())
     }
 
-    /// The success probability an engine must reach for `kind` of work: the policy's
-    /// word, else [`crate::router::default_threshold`]. Keys are the kind's name.
+    /// The success probability an engine must reach for `kind` of work at `size`: the
+    /// policy's word for the kind, exactly as set (large work included), else
+    /// [`crate::router::default_threshold`]. Keys are the kind's name.
     #[must_use]
-    pub fn threshold_for(&self, kind: crate::work::WorkKind) -> f64 {
+    pub fn threshold_for(&self, kind: crate::work::WorkKind, size: crate::work::Size) -> f64 {
         self.thresholds
             .iter()
             .find(|(name, _)| crate::work::WorkKind::parse(name).is_ok_and(|parsed| parsed == kind))
             .map_or_else(
-                || crate::router::default_threshold(kind),
+                || crate::router::default_threshold(kind, size),
                 |(_, value)| *value,
             )
     }
@@ -3436,6 +3437,15 @@ pub fn record_step(
             signature: None,
             signature_v2: None,
         });
+    // Steps are signed over their exact bytes, which an older peer re-creates from its own
+    // structs: a field it does not know would break the signature and lose the whole log.
+    // So what a step carries of the routing decision is fixed, and a field added to
+    // `Decision` must not reach here without a signature bump.
+    let mut step = step;
+    step.route = step
+        .route
+        .as_ref()
+        .map(crate::router::Decision::for_signed_step);
     log.steps.push(step);
     if log.steps.len() > KEEP_STEPS {
         let excess = log.steps.len() - KEEP_STEPS;
@@ -5910,21 +5920,25 @@ mod tests {
         assert!(Routing::parse("random").is_err());
 
         // Thresholds: the policy's word for a kind, else the default.
-        let docs = crate::work::WorkKind::Docs;
-        assert!((policy.threshold_for(docs) - crate::router::TEXT_THRESHOLD).abs() < 1e-9);
+        use crate::work::{Size, WorkKind};
+        let docs = WorkKind::Docs;
+        let medium = Size::Medium;
+        assert!((policy.threshold_for(docs, medium) - crate::router::TEXT_THRESHOLD).abs() < 1e-9);
         // The defaults per kind: 0.70 where the result is words (or small enough to read at
-        // a glance), so a medium engine - whose prior is exactly 0.70 - is sufficient from
-        // the start; 0.75 for code changes and media.
-        use crate::work::WorkKind;
+        // a glance); 0.80 for review and plan, which only an engine that is good at them
+        // gets; 0.75 for code changes, translation and media.
         for kind in [
             WorkKind::Docs,
             WorkKind::Chore,
             WorkKind::Tests,
-            WorkKind::Review,
-            WorkKind::Plan,
             WorkKind::Research,
         ] {
-            assert!((policy.threshold_for(kind) - 0.70).abs() < 1e-9, "{kind:?}");
+            let got = policy.threshold_for(kind, medium);
+            assert!((got - 0.70).abs() < 1e-9, "{kind:?}");
+        }
+        for kind in [WorkKind::Review, WorkKind::Plan] {
+            let got = policy.threshold_for(kind, medium);
+            assert!((got - 0.80).abs() < 1e-9, "{kind:?}");
         }
         for kind in [
             WorkKind::CodeChange,
@@ -5935,17 +5949,25 @@ mod tests {
             WorkKind::Audio,
             WorkKind::Other,
         ] {
-            assert!((policy.threshold_for(kind) - 0.75).abs() < 1e-9, "{kind:?}");
+            let got = policy.threshold_for(kind, medium);
+            assert!((got - 0.75).abs() < 1e-9, "{kind:?}");
         }
+        // Large work of any kind adds 0.05 to the default; small work adds nothing.
+        for kind in WorkKind::ALL {
+            let base = policy.threshold_for(kind, medium);
+            let large = policy.threshold_for(kind, Size::Large);
+            assert!((large - base - 0.05).abs() < 1e-9, "{kind:?}");
+            assert!((policy.threshold_for(kind, Size::Small) - base).abs() < 1e-9);
+        }
+        // What the policy sets is used as it is, large work or not; the other kinds keep
+        // their defaults.
         let mut tuned = Policy::default();
         tuned.thresholds.insert(docs.as_str().into(), 0.65);
         tuned.check().unwrap();
-        assert!((tuned.threshold_for(docs) - 0.65).abs() < 1e-9);
-        assert!(
-            (tuned.threshold_for(crate::work::WorkKind::Review) - crate::router::TEXT_THRESHOLD)
-                .abs()
-                < 1e-9
-        );
+        assert!((tuned.threshold_for(docs, medium) - 0.65).abs() < 1e-9);
+        assert!((tuned.threshold_for(docs, Size::Large) - 0.65).abs() < 1e-9);
+        assert!((tuned.threshold_for(WorkKind::Review, medium) - 0.80).abs() < 1e-9);
+        assert!((tuned.threshold_for(WorkKind::Review, Size::Large) - 0.85).abs() < 1e-9);
         // And what `check` refuses.
         for bad in [0.0, -0.2, 1.5, f64::NAN] {
             let mut policy = Policy::default();
@@ -5963,6 +5985,190 @@ mod tests {
         let mut fine = Policy::default();
         fine.bias.insert("nvidia*".into(), -0.5);
         fine.check().unwrap();
+    }
+
+    /// What a v0.5.19 or v0.5.20 peer's structs know of a signed step with a routing
+    /// decision: no `basis`. Serde drops what a struct does not name, as it did there, and
+    /// the peer signs and verifies the bytes it re-creates.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldConsidered {
+        engine: String,
+        agent: String,
+        machine: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        p: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        price: Option<String>,
+        #[serde(default)]
+        sufficient: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        excluded: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldPick {
+        engine: String,
+        agent: String,
+        machine: String,
+        p: f64,
+        cost_usd: f64,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldDecision {
+        routing: String,
+        role: String,
+        kind: String,
+        size: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        needs: Vec<String>,
+        threshold: f64,
+        candidates: Vec<OldConsidered>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        winner: Option<OldPick>,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        failed: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        must_beat: Option<f64>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldRoutedStep {
+        step: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        role: Option<String>,
+        at: DateTime<Utc>,
+        agent: String,
+        machine: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        engine: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        order: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<OldDecision>,
+        outcome: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct OldRoutedLog {
+        agent: String,
+        week: String,
+        #[serde(default)]
+        steps: Vec<OldRoutedStep>,
+        #[serde(default)]
+        signed_by: Option<String>,
+        #[serde(default)]
+        signature_v2: Option<String>,
+    }
+
+    /// Whether an old peer, reading the log into its own structs, finds the v2 signature
+    /// valid over what it re-serializes.
+    fn old_peer_accepts_routed_steps(bytes: &[u8], roster: &[AgentRoute]) -> bool {
+        let Ok(old) = serde_json::from_slice::<OldRoutedLog>(bytes) else {
+            return false;
+        };
+        let payload = format!(
+            "ferryman-improve-steps-v2\n{}\n{}\n{}",
+            old.agent,
+            old.week,
+            serde_jcs::to_string(&old.steps).unwrap_or_default()
+        );
+        crate::check_signature(
+            old.signed_by.as_ref(),
+            old.signature_v2.as_ref(),
+            &payload,
+            roster,
+        ) == SignatureCheck::Valid
+    }
+
+    #[test]
+    fn a_routed_step_carries_no_basis_so_an_older_peer_still_verifies_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let josh = person("josh", 1);
+        let wisp = person("wisp", 2);
+        let route = route(dir.path(), &[&josh, &wisp]);
+        let decision = crate::router::Decision {
+            routing: "smart".into(),
+            role: "build".into(),
+            kind: "docs".into(),
+            size: "small".into(),
+            needs: vec!["text".into()],
+            threshold: 0.7,
+            candidates: vec![crate::router::Considered {
+                engine: "nemotron".into(),
+                agent: "wisp".into(),
+                machine: "grouchly".into(),
+                p: Some(0.78),
+                cost_usd: Some(0.0),
+                price: Some("free".into()),
+                basis: Some("model profile: nemotron-super".into()),
+                sufficient: true,
+                excluded: None,
+            }],
+            winner: Some(crate::router::Pick {
+                engine: "nemotron".into(),
+                agent: "wisp".into(),
+                machine: "grouchly".into(),
+                p: 0.78,
+                cost_usd: 0.0,
+            }),
+            reason: "nemotron: free, p 0.78 for docs >= 0.70, cheapest sufficient".into(),
+            failed: Vec::new(),
+            must_beat: None,
+        };
+        let step = Step {
+            step: "build".into(),
+            role: Some("build".into()),
+            at: Utc::now(),
+            agent: "wisp".into(),
+            machine: "grouchly".into(),
+            engine: Some("nemotron".into()),
+            model: None,
+            cost_usd: Some(0.0),
+            order: Some("o-1".into()),
+            effort: None,
+            route: Some(decision.clone()),
+            outcome: "done".into(),
+        };
+        record_step(&route, &wisp, "2026-W40", step.clone()).unwrap();
+        let path = steps_dir(&route, "2026-W40").join("wisp.json");
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("basis"),
+            "a signed step must not carry a field an older peer would drop"
+        );
+        assert!(
+            old_peer_accepts_routed_steps(&bytes, &route.agents),
+            "an older peer must not drop the log because a candidate has a basis"
+        );
+        // A new peer reads it back, with the rest of the decision intact.
+        let steps = read_steps(&route, "2026-W40");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].route, Some(decision.for_signed_step()));
+        assert!(
+            steps[0].route.as_ref().unwrap().candidates[0]
+                .basis
+                .is_none()
+        );
+
+        // The check is meaningful: the same log signed WITH the basis in it is exactly the
+        // one an older peer drops.
+        let mut log: StepLog = serde_json::from_slice(&bytes).unwrap();
+        log.steps[0] = step;
+        log.signature_v2 = Some(wisp.sign_bytes(steps_payload_v2(&log).as_bytes()));
+        crate::atomic_json(&path, &log).unwrap();
+        let with_basis = std::fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&with_basis).contains("basis"));
+        assert!(!old_peer_accepts_routed_steps(&with_basis, &route.agents));
     }
 
     #[test]
