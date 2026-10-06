@@ -21,6 +21,46 @@ moment to notice if a release disagrees with its predecessor about a record.
 Nothing is migrated in place and nothing is rewritten, so downgrading is replacing
 the binary again. Keep the copy you replaced until the new one has taken a task.
 
+## Known issue: a machine set up with an older Ferryman never sees new work
+
+Older versions kept each channel inside its work repo, at
+`<repo>/.ferryman/ferryman`, and Syncthing was pointed there. Newer versions run one
+worker over a ferry root with `ferry agent run --comms <root>/comms`, which reads
+`<root>/comms/<project>-ferryman`. Upgrading the binary moves neither: Syncthing keeps
+syncing the old folder, and the worker reads the new one, which never fills.
+
+What it looks like:
+
+- The issuing machine's `ferry channel status` says the order was not delivered
+  ("has not seen it"), while Syncthing reports the folder 100% synced to that machine.
+- The worker is healthy, says it is watching the channel, and claims nothing.
+- The order's files are on the machine, just not where the worker looks.
+- `ferry channel join` in the comms folder fails with "no Ferryman channel found",
+  because the folder the worker reads holds no channel.
+
+Check on the affected machine: compare each Syncthing folder's path with
+`<root>/comms/<folder id>`. Any `-ferryman` folder whose path is elsewhere is one the
+worker cannot see.
+
+Fix each mismatched folder, one at a time:
+
+1. Pause the folder in Syncthing and back up both copies.
+2. Copy the Syncthing copy into the comms path, keeping everything, including
+   `.stfolder` and `.stignore`, and without deleting what is only in the comms path
+   (`agent.toml`, keys): `rsync -a <old path>/ <root>/comms/<folder id>/`.
+3. Only then change the Syncthing folder path to `<root>/comms/<folder id>` and unpause.
+4. Watch it settle. It must not report deleting anything.
+5. Restart the worker.
+
+The order matters. Pointing Syncthing at a folder before the files are in it makes
+the missing files read as deletions, and Syncthing sends those deletions to every
+other machine on the channel. Leave the old folder in place until the worker has
+taken a task from the new one.
+
+Found on a two-machine fleet on 6 Oct 2026, where orders to the upgraded machine sat
+undelivered for weeks. Upgrades should detect and move these folders themselves;
+until they do, this is a manual step.
+
 ## Server mode
 
 Only if you run `ferryman-server`, the older integration path.
