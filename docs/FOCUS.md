@@ -130,14 +130,15 @@ signed, so with no focus nothing is capped. Once one is signed, a focus or norma
 
 **Claim order.** `ferryman_channel::focus::Focus::claim_order(&ids, now)` is a pure function:
 a stable sort of project ids by tier, focus then normal then background then paused. The
-fleet loop (`ferry agent run --comms`) uses it to visit the channels it serves, with an
-archived project last. A worker also asks `focus::hold_for(route, order)` before claiming,
+fleet loop (both `ferry agent run --comms` and `--all-projects`, through
+`ferryman_ops::fleet::in_focus_order`, once every pass) uses it to visit the channels it
+serves, with an archived project last. A worker also asks `focus::hold_for(route, order)` before claiming,
 so a paused project's improvement orders wait and a background one is held to one at a time.
 
 ## For a loop that serves many projects
 
-A loop that serves several projects, such as `--all-projects` on the fleet worker, needs
-three lines to follow the focus:
+The fleet worker already does this. A new loop that serves several projects needs three lines
+to follow the focus:
 
 ```rust
 let focus = ferryman_channel::focus::current();

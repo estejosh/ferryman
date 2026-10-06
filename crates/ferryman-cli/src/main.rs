@@ -1604,9 +1604,30 @@ enum TeamCommand {
         workspace: Option<PathBuf>,
         /// The agent, as it appears on the roster.
         name: String,
-        /// The role to approve. Defaults to the role the agent joined with.
+        /// The role to approve. Defaults to the role the agent joined with (with --all:
+        /// worker).
         #[arg(long)]
         role: Option<String>,
+        /// Enrol this one identity in every project in the ferry root that you are
+        /// master of: its roster entry (the same public key) and your signed grant, in
+        /// each. Safe to run again: what is there is reported, not rewritten.
+        ///
+        /// Needs your master identity exactly as `team delegate` does (your password,
+        /// once). A project somebody else masters, or none does, is skipped and said so.
+        /// A name you revoked in a project stays revoked there. The identity's key is
+        /// the one this machine holds for the name; for a worker that lives on another
+        /// machine, give its public key with --key. A roster is never the source: any
+        /// member of a project can write one.
+        #[arg(long, conflicts_with = "workspace")]
+        all: bool,
+        /// With --all: the identity's public key (64 hex characters), for a name this
+        /// machine holds no key for. Refused if this machine holds a different one.
+        #[arg(long, requires = "all")]
+        key: Option<String>,
+        /// With --all: whose master identity signs. Defaults to whoever masters the most
+        /// projects in the ferry root.
+        #[arg(long = "as", requires = "all")]
+        as_master: Option<String>,
     },
     /// Invitations: one code from the master, one line for the newcomer.
     Invite {
@@ -2242,7 +2263,12 @@ enum Agent {
         ///
         /// Each channel uses its own agent.toml if it has one, and otherwise an
         /// agent.toml beside the channels.
-        #[arg(long, conflicts_with = "workspace")]
+        ///
+        /// This is for a folder of checkouts, each holding its own `.ferryman`. A ferry
+        /// root's `comms/` holds channels, not checkouts: to serve those, use
+        /// `--all-projects`. With `--all-projects` this names the ferry root's folder
+        /// (default: the ferry root this machine knows).
+        #[arg(long)]
         comms: Option<PathBuf>,
         /// Do one pass and exit, instead of looping. For cron, or for a caller that
         /// wants to own the scheduling.
@@ -2254,6 +2280,19 @@ enum Agent {
         /// each task and what would happen to it - and then stops.
         #[arg(long)]
         dry_run: bool,
+        /// Serve every project in the ferry root that this worker's identity is on the
+        /// roster of, as that one identity with that one `agent.toml`: the one in
+        /// `--workspace` (default: here).
+        ///
+        /// The engines, the router and `max_parallel` are the config's, shared by every
+        /// project, so the budget is the worker's rather than each project's. A project
+        /// where the identity is not on the roster, may not work, or has no checkout on
+        /// this machine is skipped with a line saying why and how to fix it.
+        /// `ferry team approve <agent> --all` enrols an identity in every project its
+        /// master owns. Stop any single-project worker running as the same identity
+        /// first: two under one name run the same order twice.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Judge results that are waiting, as far as the config lets you.
     Review {
@@ -5540,6 +5579,137 @@ fn worker_progress() -> ferryman_ops::runlog::Logged<ferryman_ops::Stdout> {
     }
 }
 
+/// `ferry team approve <name> --all`: one identity, every project the signing master owns.
+fn team_approve_all(
+    name: &str,
+    role: Option<String>,
+    as_master: Option<String>,
+    given_key: Option<String>,
+) -> Result<()> {
+    use ferryman_ops::fleet::{self, Enrolment};
+    let root = ferryman_channel::ferry::find_root()
+        .context("no ferry root yet - make one with `ferry root init`")?;
+    let role = role.unwrap_or_else(|| "worker".to_owned());
+    // The key is the one this machine holds for the name, or the one the master typed.
+    // Never one read off a roster: a channel is a folder anyone in the project can write,
+    // and a key found there is whatever the last writer of that file chose. Enrolling it
+    // in every project at once would hand that writer all of them.
+    let here = std::env::current_dir()
+        .ok()
+        .and_then(|dir| ferryman_channel::discover_attachment(&dir));
+    let key = match (
+        fleet::machine_key(&root, here.as_deref(), name)?,
+        given_key.map(|key| key.trim().to_ascii_lowercase()),
+    ) {
+        (Some(held), Some(given)) if held != given => bail!(
+            "--key is not the key this machine holds for '{name}' ({}...). One of them is \
+             the wrong identity; nothing was written",
+            &held[..12]
+        ),
+        (Some(held), _) => held,
+        (None, Some(given)) => given,
+        (None, None) => bail!(
+            "this machine holds no key for '{name}', and a roster is not a place to take \
+             one from. Run this where '{name}' lives, or pass its public key: --key <64 hex \
+             characters>"
+        ),
+    };
+    fleet::check_enrolment(name, &role, &key)?;
+    let master = match as_master {
+        Some(master) => master,
+        None => fleet::dominant_master(&root).context(
+            "no project here has a master yet; claim them with 'ferry root master', or say \
+             who signs with --as",
+        )?,
+    };
+    println!(
+        "enrolling '{name}' as {role} ({}), signing as {master}",
+        &key[..key.len().min(12)]
+    );
+    let attachments: Vec<PathBuf> = root
+        .read()
+        .projects
+        .iter()
+        .filter_map(ferryman_channel::ferry::Entry::attachment)
+        .chain([root.path.clone()])
+        .collect();
+    // A failed unlock is remembered: the same wrong password is not asked for once per
+    // project.
+    let mut failure: Option<String> = None;
+    let mut signer = |entry: &ferryman_channel::ferry::Entry,
+                      declared: &str|
+     -> Result<ferryman_channel::AgentIdentity> {
+        if let Some(why) = &failure {
+            bail!("{why}");
+        }
+        if let Some(held) =
+            held_operator().filter(|held| held.name().eq_ignore_ascii_case(declared))
+        {
+            return Ok(held);
+        }
+        for attachment in entry.attachment().iter().chain(attachments.iter()) {
+            match hold_operator(attachment, declared) {
+                Ok(true) => {
+                    if let Some(held) = held_operator() {
+                        return Ok(held);
+                    }
+                }
+                Ok(false) => {
+                    if let Some(identity) =
+                        ferryman_channel::AgentIdentity::load_existing(declared, attachment)?
+                    {
+                        return Ok(identity);
+                    }
+                }
+                Err(error) => {
+                    failure = Some(format!("could not unlock '{declared}': {error:#}"));
+                    return Err(error);
+                }
+            }
+        }
+        bail!("this machine holds no signing key or operator identity for '{declared}'")
+    };
+    let done = fleet::enrol(&root, name, &role, &key, &master, &mut signer);
+    let (mut added, mut there, mut not_master, mut other) = (0, 0, 0, 0);
+    for (project, outcome) in &done {
+        match outcome {
+            Enrolment::Added { roster, grant } => {
+                added += 1;
+                let what = match (roster, grant) {
+                    (true, true) => "roster entry and grant",
+                    (true, false) => "roster entry",
+                    _ => "grant",
+                };
+                println!("  {project}: added ({what}, signed by {master})");
+            }
+            Enrolment::AlreadyThere => {
+                there += 1;
+                println!("  {project}: already there");
+            }
+            Enrolment::NotMaster { master: theirs } => {
+                not_master += 1;
+                println!("  {project}: skipped - its master is {theirs}, not {master}");
+            }
+            Enrolment::NoMaster => {
+                other += 1;
+                println!("  {project}: skipped - no master yet ('ferry root master')");
+            }
+            Enrolment::Skipped(why) => {
+                other += 1;
+                println!("  {project}: skipped - {why}");
+            }
+        }
+    }
+    println!(
+        "'{name}' as {role}: {added} added, {there} already there, {not_master} skipped (not \
+         master), {other} skipped (other)"
+    );
+    println!(
+        "serve them all with: ferry agent run --all-projects   (--dry-run says what it would do)"
+    );
+    Ok(())
+}
+
 async fn team_command(command: TeamCommand) -> Result<()> {
     use ferryman_channel::invite;
     let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
@@ -5554,7 +5724,13 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             workspace,
             name,
             role,
+            all,
+            key,
+            as_master,
         } => {
+            if all {
+                return team_approve_all(&name, role, as_master, key);
+            }
             let route = here(workspace)?;
             let roster = ferryman_channel::read_agent_roster(&route.communications)?;
             let Some(agent) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(&name)) else {
@@ -6639,7 +6815,233 @@ fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
     }
 }
 
+/// Watch the channels in `fleet`, until stopped or after one pass.
+///
+/// The loop `--comms` and `--all-projects` share: one worker lock per channel, one pass
+/// over every channel in turn (so one `max_parallel` is the whole worker's budget), the
+/// weekly improvement loop for those that ask for it, and self-update between passes.
+///
+/// `serving_everywhere` is `--all-projects`: one worker over many projects it did not each
+/// choose, so one project it cannot take (another worker holds its lock, its lock file
+/// cannot be written) is named and left out rather than stopping the rest, and each pass
+/// asks again whether the project is still one it may work in.
+async fn run_fleet(
+    fleet: agent::Fleet,
+    watching: &std::path::Path,
+    once: bool,
+    serving_everywhere: bool,
+    report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
+) -> Result<()> {
+    // One worker per identity per channel. Two under one name resume each other's
+    // claims and run the same order twice; see WorkerLock.
+    let mut fleet = fleet;
+    let mut locks = Vec::new();
+    let mut contested = Vec::new();
+    let mut taken = Vec::new();
+    for (route, config) in std::mem::take(&mut fleet.served) {
+        match agent::WorkerLock::take(&route.attachment, &config.agent) {
+            Ok(Some(lock)) => {
+                locks.push(lock);
+                taken.push((route, config));
+            }
+            Ok(None) if serving_everywhere => {
+                report.warn(&format!(
+                    "  not watching {}: another worker on this machine already holds its \
+                     lock as the same agent. Two under one identity run the same order \
+                     twice",
+                    route.project_id
+                ));
+            }
+            Ok(None) => contested.push(route.project_id.clone()),
+            Err(error) if serving_everywhere => {
+                report.warn(&format!(
+                    "  not watching {}: no worker lock ({error:#})",
+                    route.project_id
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    fleet.served = taken;
+    if !contested.is_empty() {
+        bail!(
+            "another worker on this machine is already watching {} as the same \
+             agent. Two workers under one identity resume each other's claims and \
+             run the same order twice - stop the other one first.",
+            contested.join(", ")
+        );
+    }
+    if fleet.served.is_empty() {
+        bail!("no project could be taken: each is held by another worker or has no lock to take");
+    }
+    report.info(&format!(
+        "worker watching {} channel(s) under {}",
+        fleet.served.len(),
+        watching.display()
+    ));
+    for (route, config) in &fleet.served {
+        report.info(&format!(
+            "  {} as '{}' running '{}'",
+            route.project_id,
+            config.agent,
+            config
+                .engines
+                .iter()
+                .map(|engine| format!("{} ({})", engine.name, engine.tier.as_str()))
+                .collect::<Vec<_>>()
+                .join(" > ")
+        ));
+    }
+    // The shortest poll wins. A fleet paced by its slowest channel would leave the
+    // one that asked for attention every ten seconds waiting five minutes.
+    let poll = fleet
+        .served
+        .iter()
+        .map(|(_, config)| config.poll)
+        .min()
+        .unwrap_or(std::time::Duration::from_secs(300));
+    // Stamp this machine's version on each channel it serves, so the fleet
+    // page and doctor can say which machine is behind (item 7 of the
+    // onboarding findings). Quiet, idempotent, and never a reason to stop.
+    for (route, _) in &fleet.served {
+        let _ =
+            ferryman_channel::licensing::refresh_device_version(route, env!("CARGO_PKG_VERSION"));
+    }
+    loop {
+        // Keeping a long-running worker current.
+        //
+        // `keep_current` on startup was not enough, and the gap is the whole
+        // problem: these run for weeks under a supervisor and never restart, so
+        // the machines doing the most work were the last to get any fix. Checking
+        // only at start means "auto-update" that never updates anything.
+        //
+        // So it checks here too, between passes - rate-limited to once every six
+        // hours inside `keep_current`, which costs one API call.
+        //
+        // And when it does update, this process stops. It has to: the binary on
+        // disk is new and this process is still the old code, and nothing else
+        // will ever bring it forward. Stopping BETWEEN passes rather than mid-task
+        // is what makes that safe - every task in flight has already finished, and
+        // a supervisor with `Restart=always` brings it straight back on the new
+        // version. Without a supervisor it stays stopped, which is why this says
+        // so rather than exiting silently.
+        if update::update_and_hand_over().await {
+            report.info("updated on disk; stopping so the next start runs the new version");
+            report.info("  (a supervised worker restarts by itself)");
+            return Ok(());
+        }
+
+        // The transport is a process too, and one that nothing else supervises
+        // when Ferryman runs its own. A worker that keeps polling a folder its
+        // Syncthing stopped carrying is alive and useless; better to notice.
+        keep_syncthing_up(report);
+        for (route, _) in &fleet.served {
+            let _ = ferryman_channel::invite::finish_handshake(route);
+            match ferryman_channel::invite::settle_pending(route) {
+                Ok(settled) => {
+                    for (id, device) in settled.paired {
+                        report.info(&format!(
+                            "{}: let in device {device} for invite {id}",
+                            route.project_id
+                        ));
+                    }
+                    for (_, accept) in settled.ready_to_grant {
+                        report.info(&format!(
+                            "{}: {} has joined and is waiting for the master's grant (open the dashboard)",
+                            route.project_id, accept.operator
+                        ));
+                    }
+                    // The loop holds this machine's agent key, not a person's,
+                    // so it can say the machine arrived but not claim it.
+                    for (invite, accept) in settled.ready_to_attest {
+                        let owner = invite.owner.as_deref().unwrap_or("its owner");
+                        report.info(&format!(
+                            "{}: {} has joined and is waiting for {owner} to claim it (ferry team pending --as {owner})",
+                            route.project_id, accept.operator
+                        ));
+                    }
+                }
+                Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
+            }
+        }
+
+        anchor_maintenance(&fleet.served, report).await;
+
+        // The projects the fleet is focused on are looked at first, then the rest,
+        // background and paused last, and an archived one after them all. Read afresh each
+        // pass, so a change of focus is felt on the next one. A project's own orders are
+        // never held by its tier; only the order changes (and `start_hold` holds an
+        // improvement order in a background or paused one).
+        let focus = ferryman_channel::focus::current();
+        ferryman_ops::fleet::in_focus_order(&mut fleet.served, &focus, chrono::Utc::now());
+        for (route, config) in &mut fleet.served {
+            if serving_everywhere
+                && let Some(why) = ferryman_ops::fleet::no_longer_served(route, config)
+            {
+                report.warn(&format!("{} not worked this pass: {why}", route.project_id));
+                continue;
+            }
+            match agent::work_once(route, config, report).await {
+                Ok(0) => {}
+                Ok(count) => {
+                    report.info(&format!("did {count} task(s) on {}", route.project_id));
+                }
+                // One project's failure must not stop the other eighteen being
+                // watched: a broken credential in one channel is not a reason to
+                // stop reading the rest.
+                Err(error) => report.warn(&format!(
+                    "{} failed, will retry: {error:#}",
+                    route.project_id
+                )),
+            }
+        }
+        // The weekly improvement loop, for the channels whose agent.toml asks
+        // for it. At most hourly, and cheap when nothing is due.
+        let improving: Vec<_> = fleet
+            .served
+            .iter()
+            .filter(|(_, config)| config.improve)
+            // The loop waits while the person is at this machine; it is theirs to
+            // use first. `ferry improve run` by hand is never held back.
+            .filter(|(_, config)| {
+                !(config.defer_improvements_while_active
+                    && ferryman_ops::governor::someone_here(config.idle_after))
+            })
+            .cloned()
+            .collect();
+        if !improving.is_empty() && ferryman_ops::improve::hourly_due(chrono::Utc::now()) {
+            for line in ferryman_ops::improve::run_focused(
+                &improving,
+                ferryman_ops::improve::DEFAULT_MAX,
+                &focus,
+                chrono::Utc::now(),
+                report,
+            )
+            .await
+            {
+                report.info(&format!("improve: {line}"));
+            }
+        }
+        if once {
+            break;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    Ok(())
+}
+
 async fn agent_command(command: Agent) -> Result<()> {
+    if let Agent::Run {
+        workspace: Some(_),
+        comms: Some(_),
+        all_projects: false,
+        ..
+    } = &command
+    {
+        bail!(
+            "--comms cannot be used with --workspace (unless --all-projects says which is which)"
+        );
+    }
     let route_for = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
             Some(path) => path,
@@ -6649,12 +7051,93 @@ async fn agent_command(command: Agent) -> Result<()> {
     };
     match command {
         Agent::Run {
-            // `--comms` and `--workspace` are mutually exclusive at the parser, so this
-            // arm is the fleet and has no single project to speak of.
+            workspace,
+            comms,
+            once,
+            dry_run,
+            all_projects: true,
+        } => {
+            let home = route_for(workspace)?;
+            let config = agent::AgentConfig::load(&home.attachment)?;
+            let root = match &comms {
+                Some(folder) => ferryman_channel::ferry::find_root_from(folder),
+                None => ferryman_channel::ferry::find_root(),
+            }
+            .context(
+                "no ferry root found. Point --comms at its folder, or make one with \
+                 'ferry root init'",
+            )?;
+            let (plan, identity) =
+                ferryman_ops::fleet::plan_worker(&root, &home.attachment, &config)?;
+            if dry_run {
+                println!(
+                    "worker '{}' from {}, over the projects in {}",
+                    config.agent,
+                    home.attachment.display(),
+                    root.path.display()
+                );
+                for row in &plan.rows {
+                    println!("{}  {}", row.project, row.describe(&config));
+                    let ferryman_ops::fleet::Standing::Serves { route, .. } = &row.standing else {
+                        continue;
+                    };
+                    if agent::worker_alive(&route.attachment, &config.agent) {
+                        println!(
+                            "  a worker as '{}' is already running for it here; stop that one \
+                             before starting this",
+                            config.agent
+                        );
+                    }
+                    match agent::plan(route, &config) {
+                        Ok(tasks) => {
+                            for (id, what) in &tasks.would_do {
+                                println!("  {id}  {what}");
+                            }
+                        }
+                        Err(error) => println!("  could not read its tasks: {error:#}"),
+                    }
+                }
+                println!(
+                    "{} of {} project(s) would be served, {} order(s) at a time across all of them",
+                    plan.serving(),
+                    plan.rows.len(),
+                    config.max_parallel
+                );
+                println!("nothing was claimed, written or sent");
+                return Ok(());
+            }
+            let report = worker_progress();
+            let fleet = ferryman_ops::fleet::serve(plan, &identity, &config);
+            for (path, why) in &fleet.skipped {
+                report.warn(&format!("  not watching {}: {why}", path.display()));
+            }
+            if fleet.served.is_empty() {
+                bail!(
+                    "'{}' cannot serve any project under {}. 'ferry agent run --all-projects \
+                     --dry-run' says why for each; 'ferry team approve {} --all' enrols it",
+                    config.agent,
+                    root.path.display(),
+                    config.agent
+                );
+            }
+            report.info(&format!(
+                "worker '{}' serving {} project(s), engines {}, {} order(s) at a time across all of them",
+                config.agent,
+                fleet.served.len(),
+                ferryman_ops::fleet::engines_line(&config),
+                config.max_parallel
+            ));
+            run_fleet(fleet, &root.comms(), once, true, &report).await?;
+        }
+        Agent::Run {
+            // Without `--all-projects`, `--comms` and `--workspace` are mutually
+            // exclusive (checked on entry), so this arm is the fleet and has no single
+            // project to speak of.
             workspace: _,
             comms: Some(comms),
             once,
             dry_run,
+            all_projects: false,
         } => {
             // Before the fleet resolves anything.
             //
@@ -6692,6 +7175,15 @@ async fn agent_command(command: Agent) -> Result<()> {
                 // project whose orders will sit unread.
                 report.warn(&format!("  not watching {}: {why}", path.display()));
             }
+            let bare = ferryman_ops::fleet::bare_channels(&comms);
+            if bare > 0 {
+                report.warn(&format!(
+                    "  {bare} folder(s) under {} are channels with no checkout beside them, which \
+                     --comms does not watch. To serve every project this worker is enrolled in: \
+                     ferry agent run --all-projects",
+                    comms.display()
+                ));
+            }
             if fleet.served.is_empty() {
                 bail!(
                     "no Ferryman channels under {}. Each project's folder needs a \
@@ -6713,195 +7205,14 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("nothing was claimed, written or sent");
                 return Ok(());
             }
-            // One worker per identity per channel. Two under one name resume each other's
-            // claims and run the same order twice; see WorkerLock.
-            let mut locks = Vec::new();
-            let mut contested = Vec::new();
-            for (route, config) in &fleet.served {
-                match agent::WorkerLock::take(&route.attachment, &config.agent)? {
-                    Some(lock) => locks.push(lock),
-                    None => contested.push(route.project_id.clone()),
-                }
-            }
-            if !contested.is_empty() {
-                bail!(
-                    "another worker on this machine is already watching {} as the same \
-                     agent. Two workers under one identity resume each other's claims and \
-                     run the same order twice - stop the other one first.",
-                    contested.join(", ")
-                );
-            }
-            report.info(&format!(
-                "worker watching {} channel(s) under {}",
-                fleet.served.len(),
-                comms.display()
-            ));
-            for (route, config) in &fleet.served {
-                report.info(&format!(
-                    "  {} as '{}' running '{}'",
-                    route.project_id,
-                    config.agent,
-                    config
-                        .engines
-                        .iter()
-                        .map(|engine| format!("{} ({})", engine.name, engine.tier.as_str()))
-                        .collect::<Vec<_>>()
-                        .join(" > ")
-                ));
-            }
-            // The shortest poll wins. A fleet paced by its slowest channel would leave the
-            // one that asked for attention every ten seconds waiting five minutes.
-            let poll = fleet
-                .served
-                .iter()
-                .map(|(_, config)| config.poll)
-                .min()
-                .unwrap_or(std::time::Duration::from_secs(300));
-            let mut fleet = fleet;
-            // Stamp this machine's version on each channel it serves, so the fleet
-            // page and doctor can say which machine is behind (item 7 of the
-            // onboarding findings). Quiet, idempotent, and never a reason to stop.
-            for (route, _) in &fleet.served {
-                let _ = ferryman_channel::licensing::refresh_device_version(
-                    route,
-                    env!("CARGO_PKG_VERSION"),
-                );
-            }
-            loop {
-                // Keeping a long-running worker current.
-                //
-                // `keep_current` on startup was not enough, and the gap is the whole
-                // problem: these run for weeks under a supervisor and never restart, so
-                // the machines doing the most work were the last to get any fix. Checking
-                // only at start means "auto-update" that never updates anything.
-                //
-                // So it checks here too, between passes - rate-limited to once every six
-                // hours inside `keep_current`, which costs one API call.
-                //
-                // And when it does update, this process stops. It has to: the binary on
-                // disk is new and this process is still the old code, and nothing else
-                // will ever bring it forward. Stopping BETWEEN passes rather than mid-task
-                // is what makes that safe - every task in flight has already finished, and
-                // a supervisor with `Restart=always` brings it straight back on the new
-                // version. Without a supervisor it stays stopped, which is why this says
-                // so rather than exiting silently.
-                if update::update_and_hand_over().await {
-                    report.info("updated on disk; stopping so the next start runs the new version");
-                    report.info("  (a supervised worker restarts by itself)");
-                    return Ok(());
-                }
-
-                // The transport is a process too, and one that nothing else supervises
-                // when Ferryman runs its own. A worker that keeps polling a folder its
-                // Syncthing stopped carrying is alive and useless; better to notice.
-                keep_syncthing_up(&report);
-                for (route, _) in &fleet.served {
-                    let _ = ferryman_channel::invite::finish_handshake(route);
-                    match ferryman_channel::invite::settle_pending(route) {
-                        Ok(settled) => {
-                            for (id, device) in settled.paired {
-                                report.info(&format!(
-                                    "{}: let in device {device} for invite {id}",
-                                    route.project_id
-                                ));
-                            }
-                            for (_, accept) in settled.ready_to_grant {
-                                report.info(&format!(
-                                    "{}: {} has joined and is waiting for the master's grant (open the dashboard)",
-                                    route.project_id, accept.operator
-                                ));
-                            }
-                            // The loop holds this machine's agent key, not a person's,
-                            // so it can say the machine arrived but not claim it.
-                            for (invite, accept) in settled.ready_to_attest {
-                                let owner = invite.owner.as_deref().unwrap_or("its owner");
-                                report.info(&format!(
-                                    "{}: {} has joined and is waiting for {owner} to claim it (ferry team pending --as {owner})",
-                                    route.project_id, accept.operator
-                                ));
-                            }
-                        }
-                        Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
-                    }
-                }
-
-                anchor_maintenance(&fleet.served, &report).await;
-
-                // The projects the fleet is focused on are looked at first, then the rest,
-                // background and paused last, and an archived one after them all. A
-                // project's own orders are never held by its tier; only the order changes.
-                // With no focus set the order is exactly as the channels were found.
-                let focus = ferryman_channel::focus::current();
-                if focus.is_set() {
-                    let ids: Vec<String> = fleet
-                        .served
-                        .iter()
-                        .map(|(route, _)| route.project_id.clone())
-                        .collect();
-                    let order = focus.claim_order(&ids, chrono::Utc::now());
-                    fleet.served.sort_by_key(|(route, _)| {
-                        (
-                            ferryman_channel::ferry::is_archived(
-                                &route.communications,
-                                &route.project_id,
-                            ),
-                            order.iter().position(|id| *id == route.project_id),
-                        )
-                    });
-                }
-                for (route, config) in &mut fleet.served {
-                    match agent::work_once(route, config, &report).await {
-                        Ok(0) => {}
-                        Ok(count) => {
-                            report.info(&format!("did {count} task(s) on {}", route.project_id));
-                        }
-                        // One project's failure must not stop the other eighteen being
-                        // watched: a broken credential in one channel is not a reason to
-                        // stop reading the rest.
-                        Err(error) => report.warn(&format!(
-                            "{} failed, will retry: {error:#}",
-                            route.project_id
-                        )),
-                    }
-                }
-                // The weekly improvement loop, for the channels whose agent.toml asks
-                // for it. At most hourly, and cheap when nothing is due.
-                let improving: Vec<_> = fleet
-                    .served
-                    .iter()
-                    .filter(|(_, config)| config.improve)
-                    // The loop waits while the person is at this machine; it is theirs to
-                    // use first. `ferry improve run` by hand is never held back.
-                    .filter(|(_, config)| {
-                        !(config.defer_improvements_while_active
-                            && ferryman_ops::governor::someone_here(config.idle_after))
-                    })
-                    .cloned()
-                    .collect();
-                if !improving.is_empty() && ferryman_ops::improve::hourly_due(chrono::Utc::now()) {
-                    for line in ferryman_ops::improve::run_focused(
-                        &improving,
-                        ferryman_ops::improve::DEFAULT_MAX,
-                        &ferryman_channel::focus::current(),
-                        chrono::Utc::now(),
-                        &report,
-                    )
-                    .await
-                    {
-                        report.info(&format!("improve: {line}"));
-                    }
-                }
-                if once {
-                    break;
-                }
-                tokio::time::sleep(poll).await;
-            }
+            run_fleet(fleet, &comms, once, false, &report).await?;
         }
         Agent::Run {
             workspace,
             comms: None,
             once,
             dry_run,
+            all_projects: false,
         } => {
             let route = route_for(workspace)?;
             let config = agent::AgentConfig::load(&route.attachment)?;
@@ -11927,6 +12238,88 @@ mod tests {
         assert_eq!(
             identities,
             vec![("fang".to_string(), true), ("rotated".to_string(), false),]
+        );
+    }
+
+    /// One worker for every project: the flag, with the config's home and the folder both
+    /// nameable, and the enrolment flag that goes with it.
+    #[test]
+    fn the_fleet_worker_flags_parse() {
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from([
+            "ferry",
+            "agent",
+            "run",
+            "--all-projects",
+            "--workspace",
+            "X:/ferryman",
+            "--comms",
+            "X:/ferry/comms",
+            "--dry-run",
+        ])
+        .unwrap();
+        let super::Command::Agent {
+            command:
+                super::Agent::Run {
+                    all_projects,
+                    workspace,
+                    comms,
+                    dry_run,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("not agent run")
+        };
+        assert!(all_projects && dry_run);
+        assert!(workspace.is_some() && comms.is_some());
+
+        let parsed = super::Cli::try_parse_from([
+            "ferry", "team", "approve", "ichabod", "--all", "--as", "josh",
+        ])
+        .unwrap();
+        let super::Command::Team {
+            command:
+                super::TeamCommand::Approve {
+                    all,
+                    as_master,
+                    role,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("not team approve")
+        };
+        assert!(all);
+        assert_eq!(as_master.as_deref(), Some("josh"));
+        assert!(role.is_none(), "the role is worker unless one is named");
+    }
+
+    /// `--as` only means something to the bulk form, and the bulk form is not a single
+    /// project's: neither is accepted silently.
+    #[test]
+    fn enrolling_everywhere_refuses_what_only_makes_sense_for_one_project() {
+        use clap::Parser;
+        assert!(
+            super::Cli::try_parse_from(["ferry", "team", "approve", "ichabod", "--as", "josh"])
+                .is_err()
+        );
+        assert!(
+            super::Cli::try_parse_from([
+                "ferry",
+                "team",
+                "approve",
+                "ichabod",
+                "--all",
+                "--workspace",
+                "X:/one"
+            ])
+            .is_err()
+        );
+        // And the single-project form is as it was.
+        assert!(
+            super::Cli::try_parse_from(["ferry", "team", "approve", "ichabod", "--role", "worker"])
+                .is_ok()
         );
     }
 }
