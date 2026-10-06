@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.23 - 2026-10-06
+
+Giving an agent a key is now easy. The dashboard's Vault page, which said "Not built yet", seals keys: type a name like `DEEPSEEK_API_KEY`, paste the key into the hidden box, tick who can use it, press Seal. It lists what is sealed (never the values) and confirms with the name, who can use it and who sealed it. A key pasted into the name box is refused and nothing is saved, so a key can never become a file name that syncs in plain text.
+
+`ferry channel secret set` is the same from a terminal: `--workspace` works before or after `set`, the name and recipients are checked before the key is asked for, the prompt says where to paste and that nothing will show, pressing Enter with nothing pasted stops with a message, and it ends with `done: NAME is sealed`.
+
+Docs: UPGRADING.md explains why a machine first set up with an older Ferryman can sit idle after upgrading, and how to move its channel folders safely.
+
 ## v0.5.22 - 2026-10-06
 
 An order addressed to a machine now reaches the agents on it. Orders sent to `grouchly` were offered to nobody, because a worker only matched its full identity (`ichabod-grouchly-cline`). A worker now also takes an order addressed to the machine it runs on, and once one of that machine's agents claims it, that agent holds it. The first part of an agent's name is the identity, so an order to `ichabod` still means exactly `ichabod`.
