@@ -1,0 +1,193 @@
+{
+  "agents": "AGENTS.md",
+  "commands": {
+    "join": "ferry suggest join <invite>",
+    "new": "ferry suggest new --file <json> --json",
+    "reply": "ferry suggest reply <issue> --file <text>",
+    "status": "ferry suggest status --json",
+    "withdraw": "ferry suggest withdraw <issue>"
+  },
+  "display_name": "Idle-ish",
+  "format": "ferryman-suggest/v1",
+  "inbox": "github:estejosh/idle-ish-ideas",
+  "invite": "ferry-suggest:eyJ2IjoxLCJvZmZlciI6eyJmb3JtYXQiOiJmZXJyeW1hbi1vZmZlci92MSIsInByb2plY3RfaWQiOiJpZGxlLWlzaCIsImRpc3BsYXlfbmFtZSI6IklkbGUtaXNoIiwiaW5ib3giOiJnaXRodWI6ZXN0ZWpvc2gvaWRsZS1pc2gtaWRlYXMiLCJ0ZXJtcyI6eyJ2ZXJzaW9uIjoxLCJzaGEyNTYiOiI3NTBlNGZmZjEwYTZjYjQyNjhlZTg4YTk5NWU1YmU4NDIwMDI1YmYyMjQ2N2M2YmM3OGU2YjhjMzY3YzBlMjJhIiwiZmlsZSI6IlRFUk1TLm1kIn0sInR5cGVzIjpbeyJpZCI6ImlkZWEiLCJsYWJlbCI6IklkZWEiLCJmaWVsZHMiOltdfSx7ImlkIjoiYnVnIiwibGFiZWwiOiJCdWciLCJmaWVsZHMiOlt7ImlkIjoic3RlcHMiLCJsYWJlbCI6IlN0ZXBzIiwibWF4Ijo1MDAsInJlcXVpcmVkIjp0cnVlfSx7ImlkIjoiZXhwZWN0ZWQiLCJsYWJlbCI6IkV4cGVjdGVkIiwibWF4IjozMDAsInJlcXVpcmVkIjpmYWxzZX1dfSx7ImlkIjoiY29udGVudCIsImxhYmVsIjoiQ29udGVudCIsImZpZWxkcyI6W3siaWQiOiJ3aGVyZSIsImxhYmVsIjoiV2hlcmUiLCJtYXgiOjIwMCwicmVxdWlyZWQiOmZhbHNlfV19XSwibGltaXRzIjp7InRpdGxlX21heCI6ODAsInBpdGNoX21heCI6MTAwMCwid2h5X21heCI6NTAwLCJvcGVuX3Blcl9jb250cmlidXRvciI6MywibmV3X3Blcl9kYXkiOjEsImNsYXJpZmljYXRpb25fcm91bmRzIjoyLCJhbnN3ZXJfZGF5cyI6MTR9LCJzdGF0dXMiOiJvcGVuIiwib3duZXIiOiJqb3NoIiwib3duZXJfa2V5IjoiOGE4OGUzZGQ3NDA5ZjE5NWZkNTJkYjJkM2NiYTVkNzJjYTY3MDliZjFkOTQxMjFiZjM3NDg4MDFiNDBmNmY1YyIsImlzc3VlZF9hdCI6IjIwMjYtMTAtMDZUMTI6MDA6MDBaIiwic2VxIjoxLCJzaWduYXR1cmUiOiIzZTBlYWJiZGVlZDhkYzZjZDYyYTY5NGQ5MGNiMTM0NGE5NjNhYmFmNjQ3ZWIwMWVjZjgyOWFjNzNmMWMxNDczOTg3OWMxODMxOWZkNDRiOGJmYWNhYmFkZjM1MThjYTBmMzliMDc3Zjg2MThmM2RhZWY4ZGVmY2FiMjcwMGQwMCJ9fQ",
+  "limits": {
+    "answer_days": 14,
+    "clarification_rounds": 2,
+    "new_per_day": 1,
+    "open_per_contributor": 3,
+    "pitch_max": 1000,
+    "title_max": 80,
+    "why_max": 500
+  },
+  "offer": {
+    "display_name": "Idle-ish",
+    "format": "ferryman-offer/v1",
+    "inbox": "github:estejosh/idle-ish-ideas",
+    "issued_at": "2026-10-06T12:00:00Z",
+    "limits": {
+      "answer_days": 14,
+      "clarification_rounds": 2,
+      "new_per_day": 1,
+      "open_per_contributor": 3,
+      "pitch_max": 1000,
+      "title_max": 80,
+      "why_max": 500
+    },
+    "owner": "josh",
+    "owner_key": "{{OWNER_KEY}}",
+    "project_id": "idle-ish",
+    "seq": 1,
+    "signature": "3e0eabbdeed8dc6cd62a694d90cb1344a963abaf647eb01ecf829ac73f1c14739879c18319fd44b8bfacabadf3518ca0f39b077f8618f3daef8defcab2700d00",
+    "status": "open",
+    "terms": {
+      "file": "TERMS.md",
+      "sha256": "750e4fff10a6cb4268ee88a995e5be8420025bf22467c6bc78e6b8c367c0e22a",
+      "version": 1
+    },
+    "types": [
+      {
+        "fields": [],
+        "id": "idea",
+        "label": "Idea"
+      },
+      {
+        "fields": [
+          {
+            "id": "steps",
+            "label": "Steps",
+            "max": 500,
+            "required": true
+          },
+          {
+            "id": "expected",
+            "label": "Expected",
+            "max": 300,
+            "required": false
+          }
+        ],
+        "id": "bug",
+        "label": "Bug"
+      },
+      {
+        "fields": [
+          {
+            "id": "where",
+            "label": "Where",
+            "max": 200,
+            "required": false
+          }
+        ],
+        "id": "content",
+        "label": "Content"
+      }
+    ]
+  },
+  "owner": {
+    "fingerprint": "95bbfbb1f0ef8f23",
+    "key": "{{OWNER_KEY}}",
+    "name": "josh"
+  },
+  "project_id": "idle-ish",
+  "status": "open",
+  "terms": {
+    "file": "TERMS.md",
+    "sha256": "750e4fff10a6cb4268ee88a995e5be8420025bf22467c6bc78e6b8c367c0e22a",
+    "version": 1
+  },
+  "types": [
+    {
+      "fields": [
+        {
+          "id": "title",
+          "label": "Title",
+          "max": 80,
+          "required": true
+        },
+        {
+          "id": "pitch",
+          "label": "Pitch",
+          "max": 1000,
+          "required": true
+        },
+        {
+          "id": "why",
+          "label": "Why it fits",
+          "max": 500,
+          "required": true
+        }
+      ],
+      "id": "idea",
+      "label": "Idea",
+      "schema": "schemas/suggestion/idea.json"
+    },
+    {
+      "fields": [
+        {
+          "id": "title",
+          "label": "Title",
+          "max": 80,
+          "required": true
+        },
+        {
+          "id": "pitch",
+          "label": "Pitch",
+          "max": 1000,
+          "required": true
+        },
+        {
+          "id": "why",
+          "label": "Why it fits",
+          "max": 500,
+          "required": true
+        },
+        {
+          "id": "steps",
+          "label": "Steps",
+          "max": 500,
+          "required": true
+        },
+        {
+          "id": "expected",
+          "label": "Expected",
+          "max": 300,
+          "required": false
+        }
+      ],
+      "id": "bug",
+      "label": "Bug",
+      "schema": "schemas/suggestion/bug.json"
+    },
+    {
+      "fields": [
+        {
+          "id": "title",
+          "label": "Title",
+          "max": 80,
+          "required": true
+        },
+        {
+          "id": "pitch",
+          "label": "Pitch",
+          "max": 1000,
+          "required": true
+        },
+        {
+          "id": "why",
+          "label": "Why it fits",
+          "max": 500,
+          "required": true
+        },
+        {
+          "id": "where",
+          "label": "Where",
+          "max": 200,
+          "required": false
+        }
+      ],
+      "id": "content",
+      "label": "Content",
+      "schema": "schemas/suggestion/content.json"
+    }
+  ]
+}

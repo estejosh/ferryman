@@ -409,6 +409,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <button data-page="ledger">Ledger</button>
       <button data-page="learnings">Learnings</button>
       <button data-page="focus">Focus</button>
+      <button data-page="suggestions">Suggestions <span class="pill num" id="count-suggestions">0</span></button>
 <button data-page="engines">Engines</button>
       <button data-page="fleet">Fleet</button>
       <button data-page="vault">Vault</button>
@@ -2268,6 +2269,95 @@ function wireFocus() {
     } catch (err) { msg(err.message || err); useAll.disabled = false; }
   });
 }
+/* Suggestions: ideas outsiders and their agents sent to the public inbox this project's
+   master named. Everything in a card is somebody else's words (the contributor's, or the
+   triage model's about them), so it is only ever shown as escaped text. Deciding is the
+   master's signed answer; nothing is built from this page. */
+const SUGGESTION_STAGES = {
+  received: ["Waiting to be read", ""], clarifying: ["Asked the contributor", "warn"],
+  pending: ["Needs you", "accent"], accepted: ["Accepted", "good"], building: ["Building", "good"],
+  shipped: ["Shipped", "good"], declined: ["Declined", "bad"], duplicate: ["Duplicate", ""],
+  withdrawn: ["Withdrawn", ""], expired: ["No answer in time", ""],
+};
+function suggestionLink(url) {
+  const safe = typeof url === "string" && url.startsWith("https://github.com/");
+  return safe ? `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url.replace("https://github.com/", ""))}</a>` : "";
+}
+pages.suggestions = async () => {
+  let s = null;
+  try { s = await api("/api/suggestions"); }
+  catch (err) {
+    return `<div class="head"><div><h1>Suggestions</h1></div></div><div class="empty">Could not read the suggestions: ${esc(err.message || err)}</div>`;
+  }
+  if (!s.available) {
+    return `<div class="head"><div><h1>Suggestions</h1><p>Let outsiders and their AI agents suggest improvements, under your terms.</p></div></div>
+      <div class="notice"><div><b>This project has not opened a suggestions inbox.</b>
+      <div class="s" style="color:var(--dim);margin-top:6px">Open one as the master: <span class="mono">ferry suggestions open --inbox github:owner/repo --terms TERMS.md --publish</span></div></div></div>`;
+  }
+  const when = (at) => esc(String(at || "").slice(0, 16).replace("T", " "));
+  const cards = s.cards || [];
+  const needs = cards.filter((c) => c.stage === "pending");
+  const rest = cards.filter((c) => c.stage !== "pending");
+  const stage = (c) => { const [word, tone] = SUGGESTION_STAGES[c.stage] || [c.stage, ""]; return `<span class="badge ${tone}">${esc(word)}</span>`; };
+  const verdict = (c) => {
+    const v = c.verdict;
+    if (!v) return "";
+    const sc = v.scores || {};
+    return `<div class="s" style="margin-top:8px"><b>Triage:</b> ${esc(v.decision)} &mdash; ${esc(v.reason)}
+      <div style="color:var(--dim)">fit ${esc(sc.fit)}, novelty ${esc(sc.novelty)}, scope ${esc(sc.scope)}, risk ${esc(sc.risk)}, effort ${esc(sc.effort)}</div>
+      ${v.spec_draft ? `<div style="margin-top:4px"><b>Would build:</b> ${esc(v.spec_draft)}</div>` : ""}</div>`;
+  };
+  const card = (c) => `
+    <div class="panel" style="padding:14px 16px;margin-bottom:12px">
+      <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+        <b>#${esc(c.issue)}</b> <span class="badge">${esc(c.kind)}</span> ${stage(c)}
+        <span style="flex:1"></span><span class="s" style="color:var(--dim)">@${esc(c.login)}, ${when(c.created_at)} UTC</span>
+      </div>
+      <div style="margin-top:6px"><b>${esc(c.title)}</b></div>
+      ${c.pitch ? `<div class="s" style="margin-top:6px;white-space:pre-wrap">${esc(c.pitch)}</div>` : ""}
+      ${c.why ? `<div class="s" style="margin-top:6px;color:var(--dim);white-space:pre-wrap">Why: ${esc(c.why)}</div>` : ""}
+      ${verdict(c)}
+      <div class="s" style="margin-top:8px;color:var(--dim)">${suggestionLink(c.url)}
+        &middot; terms v${esc(c.terms_version)}${c.terms_current ? "" : ` <span class="badge warn">not the current terms</span>`}
+        &middot; agreed by ${esc(c.accepted_via)}${c.order_id ? ` &middot; order ${esc(c.order_id)}` : ""}</div>
+      ${c.stage === "pending" && s.may_decide ? `
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn primary" data-sg-do="accept" data-issue="${esc(c.issue)}">Accept</button>
+        <button class="btn" data-sg-do="decline" data-issue="${esc(c.issue)}">Decline</button>
+        <button class="btn" data-sg-do="ask" data-issue="${esc(c.issue)}">Ask more</button>
+        <input type="text" data-sg-text="${esc(c.issue)}" maxlength="500" placeholder="Reason or question (optional)" style="flex:1;min-width:200px">
+      </div>` : ""}
+    </div>`;
+  const lim = s.limits || {};
+  return `
+    <div class="head">
+      <div><h1>Suggestions</h1><p>Ideas from outsiders and their AI agents, sent to ${esc(s.inbox)} under your terms (version ${esc(s.terms_version)}). Nothing is built until you accept it, and an accepted suggestion becomes an ordinary order for your workers.</p></div>
+    </div>
+    ${s.notice ? `<div class="notice"><div><b>Warning:</b> ${esc(s.notice)}</div></div>` : ""}
+    <div class="cards">
+      <div class="card"><div class="k">Needs you</div><div class="v num">${needs.length}</div><div class="s">${s.may_decide ? "Decide below" : "Only the master decides"}</div></div>
+      <div class="card"><div class="k">Taken in</div><div class="v num">${cards.length}</div><div class="s">${s.open ? "Open to new ones" : "Closed to new ones"}</div></div>
+      <div class="card"><div class="k">Limits</div><div class="v num">${esc(lim.open_per_contributor)}/${esc(lim.new_per_day)}</div><div class="s">open each / new a day</div></div>
+    </div>
+    <span class="s" id="sg-msg" style="color:var(--dim)"></span>
+    ${needs.length ? `<h2 style="margin:18px 0 8px">Needs you</h2>${needs.map(card).join("")}` : ""}
+    ${rest.length ? `<h2 style="margin:18px 0 8px">Everything else</h2>${rest.map(card).join("")}` : (needs.length ? "" : `<div class="empty">Nothing has been suggested yet. The invite is in ${esc(s.inbox)}&rsquo;s README.</div>`)}`;
+};
+function wireSuggestions() {
+  const msg = (text) => { const m = $("#sg-msg"); if (m) m.textContent = String(text).slice(0, 300); };
+  for (const b of $$("[data-sg-do]")) {
+    b.addEventListener("click", async () => {
+      const issue = Number(b.dataset.issue);
+      const box = document.querySelector(`[data-sg-text="${CSS.escape(b.dataset.issue)}"]`);
+      b.disabled = true;
+      try {
+        await api("/api/suggestions/decide", { method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ issue, choice: b.dataset.sgDo, text: box ? box.value : "" }) });
+        await render();
+      } catch (err) { msg(err.message || err); b.disabled = false; }
+    });
+  }
+}
 pages.fleet = async () => {
   const d = await api("/api/fleet");
   const machines = d.machines || [];
@@ -2905,6 +2995,7 @@ async function render() {
   wireAgents();
   wireContracts();
   wireFocus();
+  wireSuggestions();
   wireVault();
 }
 
@@ -2982,7 +3073,8 @@ function setSync(tone, text) {
 }
 
 async function refresh() {
-  const [tasks, roster] = await Promise.allSettled([api("/api/tasks"), api("/api/roster")]);
+  const [tasks, roster, suggestions] = await Promise.allSettled([
+    api("/api/tasks"), api("/api/roster"), api("/api/suggestions")]);
 
   if (tasks.status === "fulfilled") {
     const d = tasks.value;
@@ -3000,6 +3092,10 @@ async function refresh() {
   $("#count-review").textContent = state.tasks.filter(
     (t) => stateOf(t).word === "AwaitingReview").length;
   $("#count-agents").textContent = state.roster.length;
+  // Suggestions waiting for the master: zero for a project that never opened an inbox.
+  $("#count-suggestions").textContent =
+    suggestions.status === "fulfilled" && suggestions.value && suggestions.value.available
+      ? Number(suggestions.value.waiting) || 0 : 0;
   renderProjects();
 
   // The indicator reports what this page can see, not what Syncthing thinks.

@@ -8,6 +8,7 @@ mod licensor;
 mod mcp;
 mod mcp_client;
 mod route;
+mod suggest;
 mod telegram;
 mod tgmap;
 mod tgv2;
@@ -416,6 +417,28 @@ enum Command {
     Focus {
         #[command(subcommand)]
         command: focus::FocusCommand,
+    },
+    /// Send a project's owner a suggestion, as a person or as their agent. The owner opens a
+    /// public GitHub inbox with `ferry suggestions open`; you join it with the invite from
+    /// their README (`ferry suggest join`), agree to their terms, then `ferry suggest new`.
+    /// Your suggestion is signed with your own key and posted with your own GitHub
+    /// credentials; nothing of the owner's private channel is involved.
+    Suggest {
+        /// Which joined project, when you have joined more than one.
+        #[arg(long, global = true)]
+        project: Option<String>,
+        #[command(subcommand)]
+        command: suggest::SuggestCommand,
+    },
+    /// Take suggestions from outsiders and their agents, as the project's master: open an
+    /// inbox under your own terms, see what triage made of each suggestion, and accept,
+    /// decline or ask. Accepting makes a normal signed order; nothing is built until you do.
+    Suggestions {
+        /// Which project, when not run inside its folder.
+        #[arg(long, global = true)]
+        project: Option<String>,
+        #[command(subcommand)]
+        command: suggest::SuggestionsCommand,
     },
     /// What this deployment counts as under the licence.
     License {
@@ -4431,6 +4454,10 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Engines { at, json, .. } => engines_command(&at, json)?,
         Command::Improve { command } => improve_command(command).await?,
         Command::Focus { command } => focus::command(command)?,
+        Command::Suggest { project, command } => suggest::suggest(project, command).await?,
+        Command::Suggestions { project, command } => {
+            suggest::suggestions(project, command).await?;
+        }
         Command::License { command } => license_command(command).await?,
         Command::Telegram {
             agent,

@@ -133,6 +133,18 @@ fn ledger_payload(entry: &LedgerEntry) -> String {
     )
 }
 
+/// Whether `entry` was signed by a roster member over exactly what it says. A ledger line
+/// that is used as a record of something (outside suggestions are) is read through this,
+/// so a line anyone could have appended to a file does not count.
+pub(crate) fn entry_valid(route: &ProjectRoute, entry: &LedgerEntry) -> bool {
+    check_signature(
+        entry.signed_by.as_ref(),
+        entry.signature.as_ref(),
+        &ledger_payload(entry),
+        &route.agents,
+    ) == SignatureCheck::Valid
+}
+
 fn acquire_ledger_lock(route: &ProjectRoute) -> Result<fs::File> {
     let path = route.attachment.join("runtime/locks/ledger.lock");
     fs::create_dir_all(path.parent().context("ledger lock path has no parent")?)?;

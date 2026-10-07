@@ -2146,6 +2146,22 @@ pub async fn run_focused(
     }
     let week = engines::iso_week(now);
     let last_week = engines::iso_week(now - Duration::days(7));
+    // Outsiders' suggestions are looked at for every project that has opened its inbox,
+    // whether or not it improves itself, except one the master has put to sleep. Nothing at
+    // all for a project that never opened one.
+    let mut inboxes: BTreeMap<String, ()> = BTreeMap::new();
+    for (route, config) in targets {
+        if inboxes.insert(route.project_id.clone(), ()).is_some()
+            || focus.tier(&route.project_id, now) == FocusTier::Paused
+        {
+            continue;
+        }
+        let outcome = crate::suggest::pass(route, config, now).await;
+        done.extend(outcome.lines);
+        for warning in outcome.warnings {
+            report.warn(&warning);
+        }
+    }
     let mut seen: BTreeMap<String, ()> = BTreeMap::new();
     let mut ordered: Vec<&(ProjectRoute, AgentConfig)> = Vec::new();
     for target in targets {
