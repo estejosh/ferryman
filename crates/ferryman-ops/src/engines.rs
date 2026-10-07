@@ -555,6 +555,7 @@ pub fn parse_engines(
             None if base_url.as_deref().is_some_and(is_local_url) => Paid::Local,
             None => Paid::Unknown,
         };
+        let probe_chat = probe_with_chat(get("probe").as_deref(), base_url.as_deref());
         out.push(EngineSpec {
             kind,
             tier: Tier::parse(&get("tier").unwrap_or_default())?,
@@ -568,7 +569,7 @@ pub fn parse_engines(
             base_url,
             key,
             env,
-            probe_chat: get("probe").as_deref() == Some("chat"),
+            probe_chat,
             weekly_requests: number("weekly_requests")?,
             weekly_usd,
             provider,
@@ -581,6 +582,22 @@ pub fn parse_engines(
         });
     }
     Ok(out)
+}
+
+/// Whether to probe an engine with a one-token request rather than by listing models.
+///
+/// `probe = "chat"` or `probe = "models"` decides. Unset, NVIDIA's endpoint defaults to
+/// chat: its model list names every model in the catalogue, including ones a given
+/// account cannot run, so a listing probe reported such a model up while every real
+/// request to it failed or timed out. Found on grouchly, 2026-10-07.
+fn probe_with_chat(setting: Option<&str>, base_url: Option<&str>) -> bool {
+    match setting {
+        Some("chat") => true,
+        Some(_) => false,
+        None => base_url
+            .and_then(url_host)
+            .is_some_and(|host| host == "integrate.api.nvidia.com"),
+    }
 }
 
 fn is_local_url(url: &str) -> bool {
@@ -2132,6 +2149,30 @@ fn billing(
             .then(|| state.free_tier_flag(now))
             .flatten(),
         route: spec.route.clone(),
+    }
+}
+
+#[cfg(test)]
+mod probe_choice_tests {
+    use super::probe_with_chat;
+
+    #[test]
+    fn nvidia_is_probed_with_a_real_request_unless_told_otherwise() {
+        let nvidia = Some("https://integrate.api.nvidia.com/v1");
+        assert!(
+            probe_with_chat(None, nvidia),
+            "its model list proves nothing"
+        );
+        assert!(
+            !probe_with_chat(Some("models"), nvidia),
+            "an explicit setting wins"
+        );
+        assert!(!probe_with_chat(None, Some("https://api.deepseek.com")));
+        assert!(probe_with_chat(
+            Some("chat"),
+            Some("https://api.deepseek.com")
+        ));
+        assert!(!probe_with_chat(None, None));
     }
 }
 
