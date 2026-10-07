@@ -37,6 +37,8 @@ RUN set -eux; \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+# The suggestion terms template is compiled into ferryman-channel.
+COPY docs/templates/ docs/templates/
 
 # rusqlite bundles SQLite, so the C compiler must target the same architecture as Rust.
 RUN set -eux; \
