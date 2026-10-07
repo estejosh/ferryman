@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.5.25 - 2026-10-07
+
+`ferry watchdog` notices when a machine stops doing its job. Code gathers the facts - whether Syncthing is running, whether every channel is the folder Syncthing syncs, whether the worker services are up, and a real one-token request to every engine - and a local decision model (Ollama 0.35+, `nimble` or `tev1:4b`) picks one of five fixed actions: nothing, start Syncthing, repair channels, restart failed workers, or alert. Every pick is checked against the facts before it runs, and rules decide when there is no model. Reports go to the fleet folder; `ferry watchdog --show` prints every machine's. See docs/WATCHDOG.md.
+
+NVIDIA engines are probed with a real one-token request by default. NVIDIA's model list includes models a given account cannot run, so the old probe reported such a model up while every request to it timed out.
+
 ## v0.5.24 - 2026-10-06
 
 A channel that Syncthing does not sync is repaired instead of ignored. A machine could hold two copies of one channel, one that Syncthing syncs and one that its worker reads; orders sent to it and results from it never crossed, while every check said healthy. The worker now checks every channel when it starts and repairs a split itself: it copies the files that only the unsynced copy has into the synced one (overwriting nothing) and points `bridge.toml` at the synced folder. Syncthing is never changed and nothing is deleted. Anything it cannot repair is named in its startup line as NOT SYNCED. `ferry doctor` now marks a split as FIX rather than a note, and `ferry doctor --fix` runs the same repair. `ferry channel send` says NOT SENT when a message cannot leave the machine, instead of a receipt that reads like delivery.
