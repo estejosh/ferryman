@@ -35,7 +35,7 @@
       "why_max": 500
     },
     "owner": "josh",
-    "owner_key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "owner_key": "{{OWNER_KEY}}",
     "project_id": "idle-ish",
     "seq": 1,
     "signature": "3e0eabbdeed8dc6cd62a694d90cb1344a963abaf647eb01ecf829ac73f1c14739879c18319fd44b8bfacabadf3518ca0f39b077f8618f3daef8defcab2700d00",
@@ -85,7 +85,7 @@
   },
   "owner": {
     "fingerprint": "95bbfbb1f0ef8f23",
-    "key": "8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+    "key": "{{OWNER_KEY}}",
     "name": "josh"
   },
   "project_id": "idle-ish",

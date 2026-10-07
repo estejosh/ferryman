@@ -28,14 +28,24 @@ fn offer() -> Offer {
     .offer
 }
 
+/// What the golden files hold where the test owner's public key goes, so no key-shaped
+/// literal sits in the repository for a secret scanner to trip on.
+const OWNER_KEY_PLACEHOLDER: &str = "{{OWNER_KEY}}";
+
 /// Compare with `src/suggestions/golden/<name>`; `UPDATE_GOLDEN=1 cargo test` rewrites them.
-fn golden(name: &str, actual: &str) {
+/// The offer's owner key is swapped for a placeholder on both the write and the compare side.
+fn golden(offer: &Offer, name: &str, actual: &str) {
+    assert!(
+        !offer.owner_key.is_empty(),
+        "the offer has no owner key to mask"
+    );
+    let actual = actual.replace(&offer.owner_key, OWNER_KEY_PLACEHOLDER);
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src/suggestions/golden")
         .join(name);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, actual).unwrap();
+        std::fs::write(&path, &actual).unwrap();
         return;
     }
     let expected = std::fs::read_to_string(&path).unwrap_or_else(|_| {
@@ -52,14 +62,14 @@ fn golden(name: &str, actual: &str) {
 fn the_readme_section_is_what_the_owner_signed_and_does_not_drift() {
     let offer = offer();
     let invite = Invite::new(&offer).encode();
-    golden("README_section.md", &readme_section(&offer, &invite));
+    golden(&offer, "README_section.md", &readme_section(&offer, &invite));
 }
 
 #[test]
 fn the_agents_file_does_not_drift() {
     let offer = offer();
     let invite = Invite::new(&offer).encode();
-    golden("AGENTS.md", &agents_md(&offer, &invite));
+    golden(&offer, "AGENTS.md", &agents_md(&offer, &invite));
 }
 
 #[test]
@@ -67,8 +77,9 @@ fn the_machine_readable_page_does_not_drift() {
     let offer = offer();
     let invite = Invite::new(&offer).encode();
     let text = serde_json::to_string_pretty(&machine_page(&offer, &invite)).unwrap();
-    golden("ferryman-suggest.json", &format!("{text}\n"));
+    golden(&offer, "ferryman-suggest.json", &format!("{text}\n"));
     golden(
+        &offer,
         "schema-idea.json",
         &format!(
             "{}\n",
