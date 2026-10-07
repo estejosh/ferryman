@@ -4,6 +4,30 @@
 
 An owner can now open any project to suggestions from outsiders and their AI agents, under the owner's own terms. `ferry suggestions open --inbox github:owner/repo --terms TERMS.md --publish` signs an offer in the project's channel (master-signed, with a sequence number and a machine-local high-water mark, like the focus and the engine policy) and commits a join page - a README section, an `AGENTS.md` for agents, the terms, a machine-readable offer, and one schema per kind of suggestion - to a public inbox repository. Strangers never join the private channel or Syncthing: a contributor runs `ferry suggest join <invite>`, reads the terms and types `I agree` (a person's own script may pass the terms' sha256 instead, recorded as such; an agent must show the terms to its person), then `ferry suggest new`, `status`, `reply` and `withdraw`; each suggestion is signed with their own key and posted as an issue with their own GitHub token, which is never stored or shown. The owner's workers take each issue in on the next improve pass: one that does not verify, or is over a limit (3 open each, 1 new a day by default), is labelled invalid with a comment saying what to fix and never goes to a model; the rest are read by a cheap `http` text model with no tools, the contributor's words quoted as data, and its strict-JSON verdict goes to the owner as a signed question with Accept, Decline and Ask more, from `ferry suggestions pending`, the dashboard's Suggestions page or Telegram. Accepting makes an ordinary signed order tagged `suggestion`; shipping adds a credits order; every step is a line in a signed ledger that keeps the contributor's signed agreement as the legal record. `open` refuses the untouched draft terms template (however it is spaced, cased or dressed up) unless told otherwise. Everything a stranger or the model wrote is shown to the owner, and handed to the builder, quoted as untrusted data; hidden and direction-changing characters are refused in suggestions and terms; per-contributor limits follow the GitHub login as well as the key; and an inbox is read in bounded passes. See docs/SUGGESTIONS.md.
 
+## v0.5.25 - 2026-10-07
+
+`ferry watchdog` notices when a machine stops doing its job. Code gathers the facts - whether Syncthing is running, whether every channel is the folder Syncthing syncs, whether the worker services are up, and a real one-token request to every engine - and a local decision model (Ollama 0.35+, `nimble` or `tev1:4b`) picks one of five fixed actions: nothing, start Syncthing, repair channels, restart failed workers, or alert. Every pick is checked against the facts before it runs, and rules decide when there is no model. Reports go to the fleet folder; `ferry watchdog --show` prints every machine's. See docs/WATCHDOG.md.
+
+NVIDIA engines are probed with a real one-token request by default. NVIDIA's model list includes models a given account cannot run, so the old probe reported such a model up while every request to it timed out.
+
+## v0.5.24 - 2026-10-06
+
+A channel that Syncthing does not sync is repaired instead of ignored. A machine could hold two copies of one channel, one that Syncthing syncs and one that its worker reads; orders sent to it and results from it never crossed, while every check said healthy. The worker now checks every channel when it starts and repairs a split itself: it copies the files that only the unsynced copy has into the synced one (overwriting nothing) and points `bridge.toml` at the synced folder. Syncthing is never changed and nothing is deleted. Anything it cannot repair is named in its startup line as NOT SYNCED. `ferry doctor` now marks a split as FIX rather than a note, and `ferry doctor --fix` runs the same repair. `ferry channel send` says NOT SENT when a message cannot leave the machine, instead of a receipt that reads like delivery.
+
+`ferry rescue` is a break-glass way back into one of your own machines when the channel itself is what broke: a live terminal from anywhere, for as long as a person on that machine keeps it open. They approve every join, only your own machines' keys may ask, nothing is installed or listening until `ferry rescue open`, and it ends on `exit` or after 30 minutes. It does not depend on Syncthing: each machine keeps its own copy of the keys, and the join line is printed for a person to pass on. See docs/RESCUE.md.
+
+## v0.5.23 - 2026-10-06
+
+Giving an agent a key is now easy. The dashboard's Vault page, which said "Not built yet", seals keys: type a name like `DEEPSEEK_API_KEY`, paste the key into the hidden box, tick who can use it, press Seal. It lists what is sealed (never the values) and confirms with the name, who can use it and who sealed it. A key pasted into the name box is refused and nothing is saved, so a key can never become a file name that syncs in plain text.
+
+`ferry channel secret set` is the same from a terminal: `--workspace` works before or after `set`, the name and recipients are checked before the key is asked for, the prompt says where to paste and that nothing will show, pressing Enter with nothing pasted stops with a message, and it ends with `done: NAME is sealed`.
+
+Docs: UPGRADING.md explains why a machine first set up with an older Ferryman can sit idle after upgrading, and how to move its channel folders safely.
+
+## v0.5.22 - 2026-10-06
+
+An order addressed to a machine now reaches the agents on it. Orders sent to `grouchly` were offered to nobody, because a worker only matched its full identity (`ichabod-grouchly-cline`). A worker now also takes an order addressed to the machine it runs on, and once one of that machine's agents claims it, that agent holds it. The first part of an agent's name is the identity, so an order to `ichabod` still means exactly `ichabod`.
+
 ## v0.5.21 - 2026-10-06
 
 The swarm spans every project: one worker serves every project it belongs to, the router knows what each model is good at (Haiku before Sonnet on Claude, never Opus in the background), and a signed focus list gives the projects that matter most the larger share of improve time and first claim on workers.

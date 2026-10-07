@@ -261,6 +261,46 @@ enum Command {
         #[command(subcommand)]
         action: ManagedSyncthingAction,
     },
+    /// Break-glass: a live terminal on one of your own machines, from anywhere, while a
+    /// person on that machine keeps it open.
+    ///
+    /// For when the channel itself is what broke. Nothing runs or listens until
+    /// `open`; every join is approved by the person on the machine being rescued; it
+    /// ends when they close it or at the time limit. See docs/RESCUE.md.
+    Rescue {
+        #[command(subcommand)]
+        action: RescueAction,
+    },
+    /// Notice when this machine stops doing its job, fix what is safe to fix, and report.
+    ///
+    /// Checks Syncthing, every channel's sync, the worker services and every engine (with
+    /// a real one-token request). A local decision model (Ollama's `nimble`) picks from a
+    /// fixed list of actions, each checked against the facts; without one, rules decide.
+    /// Reports go to the fleet folder, so every machine sees every machine's state.
+    Watchdog {
+        /// Run once and exit, instead of every `--every` seconds.
+        #[arg(long)]
+        once: bool,
+        #[arg(long, default_value_t = 300)]
+        every: u64,
+        /// The folder of channel workspaces to watch. Defaults to the ferry root's comms.
+        #[arg(long)]
+        comms: Option<PathBuf>,
+        /// The Ollama decision model. `none` decides by rules alone.
+        #[arg(long, default_value = "nimble")]
+        decide: String,
+        /// A local model that writes a plain-English explanation when something is wrong.
+        #[arg(long)]
+        explain: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:11434")]
+        ollama: String,
+        /// Report what it would do, and do nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print every machine's latest report and exit.
+        #[arg(long)]
+        show: bool,
+    },
     /// Stop this machine taking on new work, until you resume it.
     ///
     /// Affects every project on this computer, not just this one, because "stop working
@@ -1562,7 +1602,8 @@ enum Channel {
     /// the thing the form calls, and exist for scripts and machines with no
     /// browser. A value is read from the terminal or stdin, never from argv.
     Secret {
-        #[arg(long)]
+        /// The project directory. Accepted before or after `set`/`list`/`get`/`rm`.
+        #[arg(long, global = true)]
         workspace: Option<PathBuf>,
         #[command(subcommand)]
         command: SecretCommand,
@@ -1846,6 +1887,29 @@ enum InviteAction {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+enum RescueAction {
+    /// Run once on each machine you might connect FROM. Makes its rescue key and shares
+    /// the public half with your other machines through Syncthing.
+    Key,
+    /// On the machine that needs help: open a session and wait. You approve each join
+    /// here; type `exit` to close it.
+    Open {
+        /// Close it after this many minutes even if nobody does.
+        #[arg(long, default_value_t = 30)]
+        minutes: u64,
+    },
+    /// From another of your machines: join an open session.
+    Join {
+        /// The join line the person on that machine read or texted you (works with sync
+        /// broken), or the machine's name (works when sync is up), e.g. grouchly.
+        target: String,
+    },
+    /// Who this machine would let ask to join (its own saved copy), and which sessions
+    /// are open.
+    Status,
 }
 
 #[derive(Subcommand, Clone)]
@@ -3931,6 +3995,27 @@ async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            if fix
+                && let Ok(route) = ferryman_channel::load_route(&start.join(".ferryman"))
+                && let ferryman_ops::syncthing::ChannelSync::Split { syncs } =
+                    ferryman_ops::syncthing::channel_sync(&route)
+            {
+                match ferryman_ops::syncthing::repoint_channel(
+                    &route.attachment,
+                    &route.communications,
+                    &syncs,
+                ) {
+                    Ok(done) if !json => println!(
+                        "  fixed channel: now reads {}, the folder Syncthing syncs \
+                         (copied {} file(s) that had not left this machine)",
+                        done.to.display(),
+                        done.copied
+                    ),
+                    Ok(_) => {}
+                    Err(err) if !json => println!("  could not repair the channel: {err:#}"),
+                    Err(_) => {}
+                }
+            }
             let report = ferryman_ops::doctor::examine(&start);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -3964,6 +4049,171 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
         Command::Route { command } => route::command(command).await?,
+        Command::Watchdog {
+            once,
+            every,
+            comms,
+            decide,
+            explain,
+            ollama,
+            dry_run,
+            show,
+        } => {
+            use ferryman_ops::watchdog;
+            if show {
+                let all = watchdog::reports();
+                if all.is_empty() {
+                    println!("no watchdog reports yet");
+                }
+                for r in all {
+                    println!(
+                        "{}  {}  {}  {} (by {})",
+                        r.machine,
+                        r.at.format("%Y-%m-%d %H:%M UTC"),
+                        if r.healthy { "healthy" } else { "PROBLEM" },
+                        r.decision.action.key(),
+                        r.decision.by
+                    );
+                    for d in &r.done {
+                        println!("    did: {d}");
+                    }
+                    if let Some(e) = &r.explanation {
+                        println!("    {e}");
+                    }
+                }
+                return Ok(());
+            }
+            let comms = match comms {
+                Some(dir) => dir,
+                None => ferryman_channel::ferry::find_root()
+                    .map(|root| root.comms())
+                    .context("no ferry root found here; pass --comms <folder of channels>")?,
+            };
+            let decide = (decide != "none").then_some(decide);
+            let mut last: Option<String> = watchdog::reports()
+                .into_iter()
+                .find(|r| {
+                    Some(r.machine.as_str())
+                        == ferryman_ops::identity::machine_name().ok().as_deref()
+                })
+                .map(|r| r.facts);
+            loop {
+                let facts = watchdog::gather(&comms).await;
+                let decision = watchdog::decide(&facts, &ollama, decide.as_deref()).await;
+                let done = if dry_run {
+                    Vec::new()
+                } else {
+                    watchdog::act(&facts, decision.action)
+                };
+                let text = facts.as_text();
+                let changed = last.as_deref() != Some(text.as_str());
+                let explanation = match &explain {
+                    Some(model) if !facts.healthy() && changed => {
+                        watchdog::explain(&facts, &decision, &done, &ollama, model).await
+                    }
+                    _ => None,
+                };
+                let report = watchdog::Report {
+                    at: chrono::Utc::now(),
+                    machine: facts.machine.clone(),
+                    healthy: facts.healthy(),
+                    facts: text.clone(),
+                    decision,
+                    done,
+                    explanation,
+                };
+                if let Err(error) = watchdog::publish(&report) {
+                    eprintln!("could not publish the report: {error:#}");
+                }
+                print!("{}", report.facts);
+                println!(
+                    "=> {} (by {}{}){}",
+                    report.decision.action.key(),
+                    report.decision.by,
+                    report
+                        .decision
+                        .confidence
+                        .map_or(String::new(), |c| format!(", {c:.2}")),
+                    if dry_run { " [dry run]" } else { "" }
+                );
+                if let Some(why) = &report.decision.overruled {
+                    println!("   {why}");
+                }
+                for d in &report.done {
+                    println!("   did: {d}");
+                }
+                if let Some(e) = &report.explanation {
+                    println!("   {e}");
+                }
+                last = Some(text);
+                if once {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(every.max(30))).await;
+            }
+        }
+        Command::Rescue { action } => {
+            let machine = ferryman_ops::identity::machine_name()?;
+            match action {
+                RescueAction::Key => {
+                    let key = ferryman_ops::rescue::ensure_key(&machine)?;
+                    println!("rescue key ready: {}", key.display());
+                    println!(
+                        "its public half is shared with your other machines through Syncthing. \
+                         They will let {machine} ask to join, and a person there still has to \
+                         say yes."
+                    );
+                }
+                RescueAction::Open { minutes } => ferryman_ops::rescue::open(&machine, minutes)?,
+                RescueAction::Join { target } => {
+                    ferryman_ops::rescue::join(&target, &machine)?;
+                }
+                RescueAction::Status => {
+                    let dir = ferryman_ops::rescue::rescue_dir()?;
+                    let keys = ferryman_ops::rescue::cache_keys(&machine)?;
+                    println!(
+                        "may ask to join {machine} (saved on this machine, works with sync \
+                         down): {}",
+                        if keys.is_empty() {
+                            "nobody yet. Run `ferry rescue key` on the machine you connect \
+                             from, while sync works"
+                                .to_string()
+                        } else {
+                            keys.iter()
+                                .map(|(n, _)| n.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    );
+                    let now = chrono::Utc::now();
+                    let mut open = 0;
+                    if let Ok(entries) = std::fs::read_dir(dir.join("sessions")) {
+                        for entry in entries.flatten() {
+                            let Ok(bytes) = std::fs::read(entry.path()) else {
+                                continue;
+                            };
+                            let Ok(s) =
+                                serde_json::from_slice::<ferryman_ops::rescue::Session>(&bytes)
+                            else {
+                                continue;
+                            };
+                            if !s.expired(now) {
+                                open += 1;
+                                println!(
+                                    "open: {} until {} UTC  (join: ferry rescue join {})",
+                                    s.machine,
+                                    s.expires_at.format("%H:%M"),
+                                    s.machine
+                                );
+                            }
+                        }
+                    }
+                    if open == 0 {
+                        println!("no rescue session is open");
+                    }
+                }
+            }
+        }
         Command::Syncthing { action } => match action {
             ManagedSyncthingAction::Start => {
                 let health = ferryman_ops::syncthing::start()?;
@@ -6901,10 +7151,64 @@ async fn run_fleet(
     if fleet.served.is_empty() {
         bail!("no project could be taken: each is held by another worker or has no lock to take");
     }
+    // While sync works, keep this machine's saved copy of the rescue keys current, so a
+    // rescue still works on the day sync does not.
+    if let Ok(machine) = ferryman_ops::identity::machine_name() {
+        let _ = ferryman_ops::rescue::cache_keys(&machine);
+    }
+    // Before announcing anything: is each channel the folder Syncthing actually syncs?
+    // A worker reading a copy that never leaves the machine claims nothing anyone sent
+    // and sends nothing anyone sees, while every reading says healthy. Repair what can
+    // be repaired safely (copy, then repoint; Syncthing untouched, nothing deleted) and
+    // say loudly what cannot.
+    let mut not_synced = Vec::new();
+    for (route, _) in &mut fleet.served {
+        if let ferryman_ops::syncthing::ChannelSync::Split { syncs } =
+            ferryman_ops::syncthing::channel_sync(route)
+        {
+            match ferryman_ops::syncthing::repoint_channel(
+                &route.attachment,
+                &route.communications,
+                &syncs,
+            ) {
+                Ok(done) => {
+                    report.warn(&format!(
+                        "  repaired {}: it was reading {}, which Syncthing does not sync; now \
+                         reads {} (copied {} file(s) that had not left this machine)",
+                        route.project_id,
+                        done.from.display(),
+                        done.to.display(),
+                        done.copied
+                    ));
+                    route.communications = done.to;
+                }
+                Err(error) => {
+                    report.warn(&format!(
+                        "  NOT SYNCED {}: reads {} but Syncthing syncs {}. Nothing sent to \
+                         this machine reaches it and nothing it writes leaves. Could not \
+                         repair: {error:#}",
+                        route.project_id,
+                        route.communications.display(),
+                        syncs.display()
+                    ));
+                    not_synced.push(route.project_id.clone());
+                }
+            }
+        }
+    }
     report.info(&format!(
-        "worker watching {} channel(s) under {}",
+        "worker watching {} channel(s) under {}{}",
         fleet.served.len(),
-        watching.display()
+        watching.display(),
+        if not_synced.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " - {} NOT SYNCED: {}",
+                not_synced.len(),
+                not_synced.join(", ")
+            )
+        }
     ));
     for (route, config) in &fleet.served {
         report.info(&format!(
@@ -9004,11 +9308,81 @@ fn env_quote(value: &str) -> String {
     }
 }
 
-fn read_secret_value(name: &str) -> Result<String> {
+/// Whether a secret name is a label rather than a pasted key: `NVIDIA_API_KEY`, not
+/// `nvapi-...`. A key in this slot would become a file name in the channel, which
+/// syncs in plain text to every machine.
+fn secret_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
+/// Every recipient must be on this channel's roster with an encryption key, checked
+/// before the value is asked for. Names the ones that can receive, so the fix is
+/// on screen.
+fn check_secret_recipients(
+    route: &ferryman_channel::ProjectRoute,
+    recipients: &[String],
+) -> Result<()> {
+    if recipients.is_empty() {
+        bail!("say who can use it: --to <agent>[,<agent>...]");
+    }
+    let roster = ferryman_channel::read_agent_roster(&route.communications)?;
+    let can: Vec<&str> = roster
+        .iter()
+        .filter(|a| a.encryption_key.is_some())
+        .map(|a| a.name.as_str())
+        .collect();
+    let missing: Vec<&String> = recipients
+        .iter()
+        .filter(|r| !can.iter().any(|c| c.eq_ignore_ascii_case(r)))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "cannot seal to {} on project '{}': not on this channel, or no encryption key \
+             published. agents that can receive here: {}. nothing was asked for or saved",
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            route.project_id,
+            if can.is_empty() {
+                "none".to_string()
+            } else {
+                can.join(", ")
+            }
+        );
+    }
+    Ok(())
+}
+
+fn read_secret_value(name: &str, recipients: &[String], project: &str) -> Result<String> {
     if std::io::stdin().is_terminal() {
-        let value = rpassword::prompt_password(format!("secret value for '{name}': "))?;
+        eprintln!();
+        eprintln!(
+            "sealing {name} for {} on project '{project}'.",
+            recipients.join(", ")
+        );
+        eprintln!();
+        eprintln!("paste the key now, then press Enter.");
+        eprintln!("  - nothing will show while you paste. that is normal.");
+        eprintln!("  - linux terminal: Ctrl+Shift+V. windows: right-click or Ctrl+V. mac: Cmd+V.");
+        eprintln!("  - paste only the key, not {name}=");
+        eprintln!();
+        let value = rpassword::prompt_password(format!("{name}: "))?;
+        let value = value.trim_end_matches(['\r', '\n']).to_string();
         if value.is_empty() {
-            bail!("a secret value cannot be empty");
+            bail!("nothing was pasted, so nothing was saved. run the same command again");
+        }
+        if value.contains(['\r', '\n']) {
+            bail!(
+                "the key has a line break in it, so nothing was saved. copy just the key and run again"
+            );
+        }
+        if value.starts_with(&format!("{name}=")) {
+            bail!("paste only the key, without {name}=. nothing was saved");
         }
         return Ok(value);
     }
@@ -9035,6 +9409,23 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 Some(s) => s,
                 None => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
+            // Everything that can be wrong is checked before the value is asked for:
+            // a mistake found after someone has pasted a key means pasting it again.
+            if !secret_name_ok(&name) {
+                bail!(
+                    "the secret name must be a label like DEEPSEEK_API_KEY (capitals, digits, _).\n\
+                     nothing was saved. if you typed the key itself there, clear it from your \
+                     terminal history; the key is asked for after you press Enter, never on \
+                     this line"
+                );
+            }
+            let recipients: Vec<String> = to
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            check_secret_recipients(route, &recipients)?;
             // Signing is not optional for a secret: an unsigned envelope is a
             // forged one. `signing_identity` refuses when this machine cannot
             // sign as the named identity rather than silently downgrading.
@@ -9045,14 +9436,8 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                     let file = env_file.unwrap_or_else(|| route.workspace.join(".env"));
                     read_env_value(&file, &key)?
                 }
-                None => read_secret_value(&name)?,
+                None => read_secret_value(&name, &recipients, &route.project_id)?,
             };
-            let recipients: Vec<String> = to
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
             let path = ferryman_channel::secrets::set_secret(
                 route,
                 &identity,
@@ -9060,9 +9445,13 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
                 &value,
                 &recipients,
             )?;
-            println!("sealed '{name}' for {} recipient(s)", recipients.len());
-            println!("  written to {}", path.display());
-            println!("  signed by '{signer_name}'");
+            println!();
+            println!("done: {name} is sealed.");
+            println!("  who can use it  {}", recipients.join(", "));
+            println!("  project         {}", route.project_id);
+            println!("  signed by       {signer_name}");
+            println!("  file            {}", path.display());
+            println!("it reaches the other machines through the channel on its own.");
         }
         SecretCommand::List => {
             let summaries = ferryman_channel::secrets::list_secrets(route)?;
@@ -9494,6 +9883,25 @@ fn channel(command: Channel) -> Result<()> {
             let mut engine = ferryman_channel::system_delivery_engine();
             let receipt = engine.send(&route, &message)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
+            // The receipt says the file was written. Whether it can leave this machine is
+            // a different question, and the one a person sending a message means.
+            match ferryman_ops::syncthing::channel_sync(&route) {
+                ferryman_ops::syncthing::ChannelSync::Synced => eprintln!(
+                    "saved; Syncthing carries it to the other machines. It is read once the \
+                     recipient acknowledges it (ferry channel inbox --agent {})",
+                    message.recipient
+                ),
+                ferryman_ops::syncthing::ChannelSync::Split { syncs } => eprintln!(
+                    "NOT SENT: saved on this machine only. This workspace reads {} but \
+                     Syncthing syncs {}. Run `ferry doctor --fix` here, then send again",
+                    route.communications.display(),
+                    syncs.display()
+                ),
+                ferryman_ops::syncthing::ChannelSync::Unknown => eprintln!(
+                    "saved on this machine. Syncthing could not confirm it syncs this \
+                     channel, so it may not leave; run `ferry doctor` to check"
+                ),
+            }
         }
 
         Channel::Inbox {
@@ -12348,5 +12756,106 @@ mod tests {
             super::Cli::try_parse_from(["ferry", "team", "approve", "ichabod", "--role", "worker"])
                 .is_ok()
         );
+    }
+    #[test]
+    fn secret_workspace_is_accepted_before_or_after_set() {
+        use clap::Parser;
+        for args in [
+            [
+                "ferry",
+                "channel",
+                "secret",
+                "--workspace",
+                "/w",
+                "set",
+                "--to",
+                "a",
+                "DEEPSEEK_API_KEY",
+            ],
+            [
+                "ferry",
+                "channel",
+                "secret",
+                "set",
+                "--workspace",
+                "/w",
+                "--to",
+                "a",
+                "DEEPSEEK_API_KEY",
+            ],
+        ] {
+            let parsed = super::Cli::try_parse_from(args).unwrap();
+            let super::Command::Channel {
+                command: super::Channel::Secret { workspace, command },
+            } = parsed.command
+            else {
+                panic!("not a secret command");
+            };
+            assert_eq!(workspace.as_deref(), Some(Path::new("/w")), "{args:?}");
+            let super::SecretCommand::Set { name, to, .. } = command else {
+                panic!("not set");
+            };
+            assert_eq!(name, "DEEPSEEK_API_KEY");
+            assert_eq!(to, "a");
+        }
+    }
+
+    #[test]
+    fn a_secret_name_is_a_label_not_a_key() {
+        assert!(super::secret_name_ok("DEEPSEEK_API_KEY"));
+        assert!(super::secret_name_ok("GH_TOKEN"));
+        assert!(!super::secret_name_ok("nvapi-AbC123"));
+        assert!(!super::secret_name_ok("sk-abc123"));
+        assert!(!super::secret_name_ok("github_pat_11ABC"));
+        assert!(!super::secret_name_ok("DEEPSEEK_API_KEY=sk-abc"));
+        assert!(!super::secret_name_ok("deepseek_api_key"));
+        assert!(!super::secret_name_ok(""));
+    }
+
+    #[test]
+    fn recipients_are_checked_before_the_key_is_asked_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let comms = dir.path().join("comms");
+        std::fs::create_dir_all(comms.join("agents")).unwrap();
+        let write = |name: &str, enc: Option<&str>| {
+            let agent = ferryman_channel::AgentRoute {
+                name: name.into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+                encryption_key: enc.map(str::to_string),
+            };
+            std::fs::write(
+                comms.join("agents").join(format!("{name}.json")),
+                serde_json::to_vec_pretty(&agent).unwrap(),
+            )
+            .unwrap();
+        };
+        write("harbor", Some("aa"));
+        write("nokey", None);
+        let route = ferryman_channel::ProjectRoute {
+            project_id: "p".to_string(),
+            workspace: dir.path().to_path_buf(),
+            attachment: dir.path().join(".ferryman"),
+            communications: comms.clone(),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        assert!(super::check_secret_recipients(&route, &["harbor".into()]).is_ok());
+        let none = super::check_secret_recipients(&route, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(none.contains("--to"), "{none}");
+        for bad in ["ghost", "nokey"] {
+            let err = super::check_secret_recipients(&route, &["harbor".into(), bad.into()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(bad) && err.contains("harbor"),
+                "names the bad one and who can: {err}"
+            );
+        }
     }
 }

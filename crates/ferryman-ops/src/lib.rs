@@ -28,6 +28,7 @@ pub mod identity;
 pub mod improve;
 pub mod omniroute;
 pub mod priority;
+pub mod rescue;
 pub mod route;
 pub mod runlog;
 pub mod soak;
@@ -35,6 +36,7 @@ pub mod status;
 pub mod suggest;
 pub mod syncthing;
 pub mod telemetry;
+pub mod watchdog;
 
 /// Where a long-running operation reports what it is doing.
 ///

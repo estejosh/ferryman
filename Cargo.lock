@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-channel"
-version = "0.5.21"
+version = "0.5.25"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-cli"
-version = "0.5.21"
+version = "0.5.25"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-core"
-version = "0.5.21"
+version = "0.5.25"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1278,12 +1278,13 @@ dependencies = [
 
 [[package]]
 name = "ferryman-ops"
-version = "0.5.21"
+version = "0.5.25"
 dependencies = [
  "anyhow",
  "chrono",
  "ferryman-channel",
  "futures-util",
+ "hex",
  "hostname",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1291,6 +1292,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sysinfo",
  "system-idle-time",
  "tempfile",
@@ -1302,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-server"
-version = "0.5.21"
+version = "0.5.25"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1338,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-worker-sdk"
-version = "0.5.21"
+version = "0.5.25"
 dependencies = [
  "anyhow",
  "ferryman-core",

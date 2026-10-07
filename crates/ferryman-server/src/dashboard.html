@@ -2494,34 +2494,92 @@ function wireContracts() {
   }));
 }
 
-// The vault is the one page with no backend behind it. It says so, and shows
-// nothing — an invented count here would be a lie told in the operator's own
-// dashboard, which is the last place one belongs.
-pages.vault = async () => `
-  <div class="head">
-    <div><h1>Vault</h1><p>Recipient-bound secrets: an owner assigns one key to one named person, for one repository, for a stated time. Ferryman carries the sealed envelope and never the value.</p></div>
-  </div>
-  <div class="notice">
-    <b>Not built yet</b>
-    <div>The sealing code exists on a branch and is not merged. Nothing is shown here because
-    there is nothing real to show, and a screen of example keys would be indistinguishable from
-    the working thing at a glance.</div>
-  </div>
-  <div class="cards">
-    <div class="card"><div class="k">One human</div><div class="v" style="font-size:15px;font-weight:500;margin-top:10px">No groups, no delegation</div>
-      <div class="s">A grant names exactly one recipient.</div></div>
-    <div class="card"><div class="k">Use-only</div><div class="v" style="font-size:15px;font-weight:500;margin-top:10px">Plaintext stays hidden</div>
-      <div class="s">A local broker performs the operation; reveal is off by default.</div></div>
-    <div class="card"><div class="k">Scoped</div><div class="v" style="font-size:15px;font-weight:500;margin-top:10px">One repository, one purpose</div>
-      <div class="s">Anything outside the scope fails closed.</div></div>
-    <div class="card"><div class="k">Revocable</div><div class="v" style="font-size:15px;font-weight:500;margin-top:10px">Checked before every use</div>
-      <div class="s">Expiry ends it even on a machine that never syncs again.</div></div>
-  </div>
-  <p style="color:var(--dim);max-width:70ch;margin-top:18px">
-    Once a value has been revealed, revoking the grant cannot unreveal it — the upstream
-    credential has to be rotated too. That limit is part of the design rather than a gap in it.
-  </p>`;
+// The vault: seal a secret to the agents that need it. The value is typed or pasted
+// into a hidden field, sent once to this machine's own dashboard, sealed there, and
+// never shown again - not in the list, not in the confirmation, not in an error.
+const SECRET_NAME = /^[A-Z][A-Z0-9_]{1,63}$/;
+const LOOKS_LIKE_A_KEY = /^(nvapi-|sk-|ghp_|gho_|github_pat_|xox|AKIA|AIza)|^[A-Za-z0-9_\-]{32,}$/;
+let vaultDone = null;
 
+pages.vault = async () => {
+  let secrets = [], roster = [];
+  try {
+    [secrets, roster] = await Promise.all([api("/api/secrets"), api("/api/roster")]);
+  } catch (err) {
+    return `<div class="head"><div><h1>Vault</h1></div></div>
+      <div class="notice"><b>Could not load</b><div>${esc(err.message)}</div></div>`;
+  }
+  const can = roster.filter((a) => a.encryption_key);
+  const rows = secrets.map((s) => `
+    <tr>
+      <td class="lead">${esc(s.name)}</td>
+      <td>${(s.recipients || []).map((r) => `<span class="badge">${esc(r)}</span>`).join(" ")}</td>
+      <td>${esc(s.signed_by || "")}</td>
+      <td>${esc(String(s.created_at || "").slice(0, 16).replace("T", " "))}</td>
+      <td>${s.signature === false ? `<span class="badge bad">unsigned</span>` : `<span class="badge">sealed</span>`}</td>
+    </tr>`).join("");
+  const done = vaultDone;
+  vaultDone = null;
+  return `
+    <div class="head">
+      <div><h1>Vault</h1><p>Give an agent a key - an API key, a GitHub token - without it ever sitting in a file. Paste it here once; it is sealed to the agents you tick, travels through the channel encrypted, and only they can open it.</p></div>
+    </div>
+    ${done ? `<div class="notice" style="margin-bottom:18px"><div><b>Sealed ${esc(done.name)}</b> for ${(done.recipients || []).map(esc).join(", ")}, signed by ${esc(done.signed_by)}, in ${esc(state.project || state.homeProject || "this project")}. The value was not kept anywhere on this page.</div></div>` : ""}
+    <div class="card" style="max-width:640px;margin-bottom:22px">
+      <div class="k">Add or replace a key</div>
+      <label style="display:block;margin-top:12px">Name
+        <input id="vault-name" autocomplete="off" spellcheck="false" placeholder="DEEPSEEK_API_KEY" style="width:100%">
+      </label>
+      <div class="s" style="color:var(--dim)">The label, not the key. Capitals, digits and _ only, e.g. DEEPSEEK_API_KEY.</div>
+      <label style="display:block;margin-top:12px">Key
+        <input id="vault-value" type="password" autocomplete="new-password" spellcheck="false" placeholder="paste the key itself" style="width:100%">
+      </label>
+      <div class="s" style="color:var(--dim)">Hidden while you type. Paste only the key - not NAME=key.</div>
+      <div style="margin-top:12px">Who can use it</div>
+      ${can.length ? can.map((a) => `<label style="display:block"><input type="checkbox" data-vault-to="${esc(a.name)}"> ${esc(a.name)}</label>`).join("")
+        : `<div class="s" style="color:var(--dim)">No agent on this channel has published an encryption key yet, so there is no one to seal to.</div>`}
+      <div style="margin-top:14px"><button class="btn primary" id="vault-seal" ${can.length ? "" : "disabled"}>Seal</button>
+        <span id="vault-msg" class="s" style="margin-left:10px"></span></div>
+    </div>
+    <h2 style="font-size:15px">Keys on this channel</h2>
+    ${secrets.length ? `<table><thead><tr><th>Name</th><th>Who can use it</th><th>Sealed by</th><th>When (UTC)</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+      <p class="s" style="color:var(--dim)">Values are never shown. To replace a key, seal the same name again. If a key leaked, rotate it with the provider first, then seal the new one.</p>`
+      : `<div class="empty">No keys sealed on this channel yet.</div>`}`;
+};
+
+function wireVault() {
+  const seal = $("#vault-seal");
+  if (!seal) return;
+  const msg = (text) => { $("#vault-msg").textContent = String(text).slice(0, 240); };
+  seal.addEventListener("click", async () => {
+    const nameField = $("#vault-name"), valueField = $("#vault-value");
+    const name = nameField.value.trim();
+    // One trailing newline is what a copy usually carries; anything inside is a mistake.
+    const value = valueField.value.replace(/[\r\n]+$/, "");
+    const recipients = $$("[data-vault-to]").filter((b) => b.checked).map((b) => b.dataset.vaultTo);
+    if (LOOKS_LIKE_A_KEY.test(name) && !SECRET_NAME.test(name)) {
+      nameField.value = "";
+      return msg("That looks like a key, not a name. It was not saved. Put a label like DEEPSEEK_API_KEY in Name and the key in Key.");
+    }
+    if (!SECRET_NAME.test(name)) return msg("Name: capitals, digits and _ only, e.g. DEEPSEEK_API_KEY.");
+    if (!value) return msg("Paste the key into the Key box.");
+    if (/[\r\n]/.test(value)) return msg("The key has a line break in it. Copy just the key and paste again.");
+    if (value.startsWith(name + "=")) return msg("Paste only the key, without " + name + "=.");
+    if (!recipients.length) return msg("Tick at least one agent who can use it.");
+    seal.disabled = true;
+    msg("Sealing...");
+    try {
+      vaultDone = await api("/api/secrets", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name, value, recipients }) });
+      valueField.value = "";
+      await render();
+    } catch (err) {
+      valueField.value = "";
+      seal.disabled = false;
+      msg(err.message || err);
+    }
+  });
+}
 pages.identity = async () => {
   let d;
   try {
@@ -2938,6 +2996,7 @@ async function render() {
   wireContracts();
   wireFocus();
   wireSuggestions();
+  wireVault();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {

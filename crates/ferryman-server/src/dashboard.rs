@@ -4269,6 +4269,24 @@ async fn secret_set(
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
     }
+    // A key pasted into the name field would become a file name in the channel, which
+    // syncs in plain text to every machine. Refuse it before anything is written, and
+    // never repeat it back.
+    if !secret_name_ok(&body.name) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the name must be a label like DEEPSEEK_API_KEY (capitals, digits, _). \
+             nothing was saved; put the key itself in the key field"
+                .to_string(),
+        ));
+    }
+    let value = body.value.trim_end_matches(['\r', '\n']);
+    if value.is_empty() || value.contains(['\r', '\n']) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "the key is empty or has a line break in it; nothing was saved".to_string(),
+        ));
+    }
     // The seal is signed by the human who signed in - an operator identity the
     // roster verifies - never by the machine's agent, and never unsigned.
     let identity = state.sessions.resolve(session_token(&headers)).ok_or((
@@ -4280,20 +4298,24 @@ async fn secret_set(
         .iter()
         .map(|r| ferryman_channel::canonical_agent_name(r))
         .collect();
-    let path = ferryman_channel::secrets::set_secret(
-        &route,
-        &identity,
-        &body.name,
-        &body.value,
-        &recipients,
-    )
-    .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    let path =
+        ferryman_channel::secrets::set_secret(&route, &identity, &body.name, value, &recipients)
+            .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     Ok(Json(json!({
         "name": body.name,
         "recipients": recipients,
         "signed_by": identity.name(),
         "path": path.display().to_string(),
     })))
+}
+
+/// Whether a secret name is a label rather than a pasted key: `NVIDIA_API_KEY`, not
+/// `nvapi-...`. Capitals, digits and underscores, starting with a letter, at most 64.
+fn secret_name_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_uppercase())
+        && name.len() <= 64
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
 /// DELETE /api/secrets/{name} — remove a secret envelope.
@@ -7839,6 +7861,70 @@ mod tests {
         // The value never appears in the envelope.
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("ghp_secret"), "value leaked into the channel");
+
+        // The key pasted where the name goes: refused, nothing written, and the
+        // error does not repeat it.
+        let key_as_name = post(
+            &app,
+            "/api/secrets",
+            r#"{"name":"nvapi-AbC123fakefakefakefake","value":"x","recipients":["harbor"]}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(key_as_name.status(), StatusCode::BAD_REQUEST);
+        let body = key_as_name.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            !String::from_utf8_lossy(&body).contains("nvapi-"),
+            "error echoed the key"
+        );
+        let names: Vec<_> = std::fs::read_dir(route.communications.join("secrets"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains("nvapi")),
+            "a key became a file name: {names:?}"
+        );
+
+        // A line break inside the value is a bad paste.
+        let broken = post(
+            &app,
+            "/api/secrets",
+            r#"{"name":"NIM_KEY","value":"abc\ndef","recipients":["harbor"]}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(broken.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !route
+                .communications
+                .join("secrets")
+                .join("NIM_KEY.json")
+                .exists()
+        );
+
+        // The trailing newline a copy usually carries is fine.
+        let trailing = post(
+            &app,
+            "/api/secrets",
+            r#"{"name":"NIM_KEY","value":"abcdef\r\n","recipients":["harbor"]}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(trailing.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn a_secret_name_is_a_label_not_a_key() {
+        assert!(secret_name_ok("DEEPSEEK_API_KEY"));
+        assert!(secret_name_ok("GH_TOKEN"));
+        assert!(!secret_name_ok("nvapi-abc"));
+        assert!(!secret_name_ok("sk-abc123"));
+        assert!(!secret_name_ok("github_pat_11ABC"));
+        assert!(!secret_name_ok("deepseek_api_key"));
+        assert!(!secret_name_ok("DEEPSEEK_API_KEY=sk-abc"));
+        assert!(!secret_name_ok(""));
+        assert!(!secret_name_ok("_LEADING"));
     }
 
     #[test]
