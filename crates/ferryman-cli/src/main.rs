@@ -270,6 +270,36 @@ enum Command {
         #[command(subcommand)]
         action: RescueAction,
     },
+    /// Notice when this machine stops doing its job, fix what is safe to fix, and report.
+    ///
+    /// Checks Syncthing, every channel's sync, the worker services and every engine (with
+    /// a real one-token request). A local decision model (Ollama's `nimble`) picks from a
+    /// fixed list of actions, each checked against the facts; without one, rules decide.
+    /// Reports go to the fleet folder, so every machine sees every machine's state.
+    Watchdog {
+        /// Run once and exit, instead of every `--every` seconds.
+        #[arg(long)]
+        once: bool,
+        #[arg(long, default_value_t = 300)]
+        every: u64,
+        /// The folder of channel workspaces to watch. Defaults to the ferry root's comms.
+        #[arg(long)]
+        comms: Option<PathBuf>,
+        /// The Ollama decision model. `none` decides by rules alone.
+        #[arg(long, default_value = "nimble")]
+        decide: String,
+        /// A local model that writes a plain-English explanation when something is wrong.
+        #[arg(long)]
+        explain: Option<String>,
+        #[arg(long, default_value = "http://127.0.0.1:11434")]
+        ollama: String,
+        /// Report what it would do, and do nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Print every machine's latest report and exit.
+        #[arg(long)]
+        show: bool,
+    },
     /// Stop this machine taking on new work, until you resume it.
     ///
     /// Affects every project on this computer, not just this one, because "stop working
@@ -3996,6 +4026,109 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
         Command::Route { command } => route::command(command).await?,
+        Command::Watchdog {
+            once,
+            every,
+            comms,
+            decide,
+            explain,
+            ollama,
+            dry_run,
+            show,
+        } => {
+            use ferryman_ops::watchdog;
+            if show {
+                let all = watchdog::reports();
+                if all.is_empty() {
+                    println!("no watchdog reports yet");
+                }
+                for r in all {
+                    println!(
+                        "{}  {}  {}  {} (by {})",
+                        r.machine,
+                        r.at.format("%Y-%m-%d %H:%M UTC"),
+                        if r.healthy { "healthy" } else { "PROBLEM" },
+                        r.decision.action.key(),
+                        r.decision.by
+                    );
+                    for d in &r.done {
+                        println!("    did: {d}");
+                    }
+                    if let Some(e) = &r.explanation {
+                        println!("    {e}");
+                    }
+                }
+                return Ok(());
+            }
+            let comms = match comms {
+                Some(dir) => dir,
+                None => ferryman_channel::ferry::find_root()
+                    .map(|root| root.comms())
+                    .context("no ferry root found here; pass --comms <folder of channels>")?,
+            };
+            let decide = (decide != "none").then_some(decide);
+            let mut last: Option<String> = watchdog::reports()
+                .into_iter()
+                .find(|r| {
+                    Some(r.machine.as_str())
+                        == ferryman_ops::identity::machine_name().ok().as_deref()
+                })
+                .map(|r| r.facts);
+            loop {
+                let facts = watchdog::gather(&comms).await;
+                let decision = watchdog::decide(&facts, &ollama, decide.as_deref()).await;
+                let done = if dry_run {
+                    Vec::new()
+                } else {
+                    watchdog::act(&facts, decision.action)
+                };
+                let text = facts.as_text();
+                let changed = last.as_deref() != Some(text.as_str());
+                let explanation = match &explain {
+                    Some(model) if !facts.healthy() && changed => {
+                        watchdog::explain(&facts, &decision, &done, &ollama, model).await
+                    }
+                    _ => None,
+                };
+                let report = watchdog::Report {
+                    at: chrono::Utc::now(),
+                    machine: facts.machine.clone(),
+                    healthy: facts.healthy(),
+                    facts: text.clone(),
+                    decision,
+                    done,
+                    explanation,
+                };
+                if let Err(error) = watchdog::publish(&report) {
+                    eprintln!("could not publish the report: {error:#}");
+                }
+                print!("{}", report.facts);
+                println!(
+                    "=> {} (by {}{}){}",
+                    report.decision.action.key(),
+                    report.decision.by,
+                    report
+                        .decision
+                        .confidence
+                        .map_or(String::new(), |c| format!(", {c:.2}")),
+                    if dry_run { " [dry run]" } else { "" }
+                );
+                if let Some(why) = &report.decision.overruled {
+                    println!("   {why}");
+                }
+                for d in &report.done {
+                    println!("   did: {d}");
+                }
+                if let Some(e) = &report.explanation {
+                    println!("   {e}");
+                }
+                last = Some(text);
+                if once {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(every.max(30))).await;
+            }
+        }
         Command::Rescue { action } => {
             let machine = ferryman_ops::identity::machine_name()?;
             match action {
