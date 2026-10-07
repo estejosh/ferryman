@@ -62,7 +62,11 @@ fn golden(offer: &Offer, name: &str, actual: &str) {
 fn the_readme_section_is_what_the_owner_signed_and_does_not_drift() {
     let offer = offer();
     let invite = Invite::new(&offer).encode();
-    golden(&offer, "README_section.md", &readme_section(&offer, &invite));
+    golden(
+        &offer,
+        "README_section.md",
+        &readme_section(&offer, &invite),
+    );
 }
 
 #[test]
