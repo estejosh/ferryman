@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.27 - 2026-10-08
 
 Agents hand work in; only the head pushes (ADR 0023). This switches on only once the master has named a head: a project with no head behaves exactly as before. A worker that is not the project's head no longer pushes a finished branch: it writes a signed patch (`handin.patch` and `handin.json`) into the project's work folder, which Syncthing shares as `<project>-work` with the same machines as the channel, and the result says where it is. The head runs `ferry work list`, then `ferry work accept <order>` (it checks the signature and checksum, applies the patch with `git am` so the worker stays the author, and pushes) or `ferry work reject <order> --reason ...`. `ferry work hand-in` makes one by hand. A head with a `push` remote still pushes as before; worktree mode with no remote now hands in instead of leaving the work on one disk. The first worker start after an update makes the work folder and shares it; nobody runs anything. `ferry doctor` gains `work_folder`, `handin_mode` and `tokens` (missing, orphaned or over-scoped GitHub tokens, judged from names and recipients without opening any), advice only; `doctor --fix` creates the work folder. The self-improvement prompt no longer talks about pushing.
 
