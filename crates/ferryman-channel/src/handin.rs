@@ -161,6 +161,12 @@ pub fn default_base(repo: &Path, head: &str) -> Result<String> {
         .with_context(|| format!("find where {head} left {start}; pass --base"))
 }
 
+/// The branch a checkout is on, or `HEAD` when it is detached.
+#[must_use]
+pub fn branch_of(repo: &Path) -> String {
+    git_text(repo, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".to_string())
+}
+
 /// What to cut a hand-in from.
 #[derive(Debug, Clone, Copy)]
 pub struct Cut<'a> {
@@ -435,7 +441,7 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
             path: folder,
         });
     }
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
     Ok(entries)
 }
 

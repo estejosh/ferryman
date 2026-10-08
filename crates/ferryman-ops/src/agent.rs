@@ -4314,7 +4314,8 @@ fn record_touched(
 /// [`ferryman_channel::worktree::retire_worktree`] already makes the judgement: it
 /// returns `Ok(true)` when the branch carries anything not reachable from `base`.
 /// So the push happens after the worktree is retired, which makes a kept branch
-/// always a pushed branch. A branch with no work is retired without a push.
+/// always a pushed branch (by the head) or a handed-in one (by anyone else; ADR 0023).
+/// A branch with no work is retired without either.
 //
 // Nine arguments, each load-bearing: splitting them into a struct would move
 // every call site for style alone. Allowed explicitly rather than by raising
@@ -4330,6 +4331,43 @@ fn settle_worktree(
     workdir: &Path,
     payload: &mut Value,
     report: &dyn Progress,
+) {
+    // Only the project's head pushes (ADR 0023). A head that cannot be read counts as not
+    // being the head: handing in is always safe, pushing on a guess is not.
+    let is_head =
+        ferryman_channel::head::is_head(&route.communications, &route.project_id, &config.agent)
+            .unwrap_or(false);
+    settle_worktree_as(
+        route,
+        config,
+        task,
+        id,
+        branch,
+        base_commit,
+        workdir,
+        payload,
+        report,
+        is_head,
+    );
+}
+
+/// [`settle_worktree`], told whether this agent is the head rather than asking.
+///
+/// The head with a `push` remote publishes the branch as it always has. Everyone else - and
+/// the head with nowhere to push - hands the branch in as a signed patch in the work folder,
+/// so finished work never stays on one disk and a worker never needs a write token.
+#[allow(clippy::too_many_arguments)]
+fn settle_worktree_as(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    task: &Task,
+    id: &str,
+    branch: &str,
+    base_commit: &str,
+    workdir: &Path,
+    payload: &mut Value,
+    report: &dyn Progress,
+    is_head: bool,
 ) {
     let subject = commit_subject(id, &task.order);
     match ferryman_channel::worktree::commit_all(workdir, &config.agent, &subject) {
@@ -4352,7 +4390,11 @@ fn settle_worktree(
     match ferryman_channel::worktree::retire_worktree(&route.workspace, branch, base_commit) {
         Ok(true) => {
             payload["branch_kept"] = json!(true);
-            if let Some(remote) = &config.push {
+            let push_to = config.push.as_ref().filter(|_| is_head);
+            if push_to.is_none() {
+                hand_in(route, config, id, branch, base_commit, payload, report);
+            }
+            if let Some(remote) = push_to {
                 match ferryman_channel::worktree::push_branch(&route.workspace, remote, branch) {
                     Ok(()) => {
                         payload["pushed"] = json!(remote);
@@ -4372,6 +4414,50 @@ fn settle_worktree(
         }
         Ok(false) => {}
         Err(e) => report.warn(&format!("  {id}: could not retire the worktree: {e}")),
+    }
+}
+
+/// Write a task branch into the work folder as a signed hand-in, and say where in the result.
+///
+/// Never fatal: the branch is kept either way, and a failure is recorded as
+/// `payload["handin_failed"]` so the reviewer can see the work did not leave this machine.
+fn hand_in(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    id: &str,
+    branch: &str,
+    base_commit: &str,
+    payload: &mut Value,
+    report: &dyn Progress,
+) {
+    let written = AgentIdentity::load_or_create(&config.agent, &route.attachment).and_then(|who| {
+        ferryman_channel::handin::create(
+            route,
+            &who,
+            &ferryman_channel::handin::work_dir(route),
+            id,
+            &ferryman_channel::handin::Cut {
+                repo: &route.workspace,
+                base: Some(base_commit),
+                head: branch,
+                branch,
+            },
+        )
+    });
+    match written {
+        Ok(folder) => {
+            payload["handin"] = json!(folder.display().to_string());
+            report.info(&format!(
+                "  {id}: handed in {branch} at {}",
+                folder.display()
+            ));
+        }
+        Err(e) => {
+            payload["handin_failed"] = json!(format!("{e:#}"));
+            report.warn(&format!(
+                "  {id}: kept {branch} here but could not hand it in: {e:#}"
+            ));
+        }
     }
 }
 
@@ -6202,7 +6288,7 @@ mod tests {
                 .unwrap();
         let mut payload = json!({});
 
-        settle_worktree(
+        settle_worktree_as(
             &route,
             &config,
             &task,
@@ -6212,6 +6298,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
+            true,
         );
 
         assert_eq!(payload["branch_kept"], json!(true));
@@ -6256,7 +6343,7 @@ mod tests {
                 .unwrap();
         let mut payload = json!({});
 
-        settle_worktree(
+        settle_worktree_as(
             &route,
             &config,
             &task,
@@ -6266,6 +6353,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
+            true,
         );
 
         assert!(payload.get("pushed").is_none(), "no work means no push");
@@ -6309,7 +6397,7 @@ mod tests {
                 .unwrap();
         let mut payload = json!({});
 
-        settle_worktree(
+        settle_worktree_as(
             &route,
             &config,
             &task,
@@ -6319,6 +6407,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
+            true,
         );
 
         assert_eq!(payload["branch_kept"], json!(true));
@@ -6328,6 +6417,106 @@ mod tests {
             "the failure must be recorded, not swallowed"
         );
 
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// A worker that is not the head never pushes, whatever its `push` says: the finished
+    /// branch becomes a signed hand-in and the result says where it is.
+    #[test]
+    fn a_worker_that_is_not_head_hands_in_instead_of_pushing() {
+        hermetic_machine();
+        let repo = unique("ferryman-agent-handin");
+        let remote = unique("ferryman-agent-handin-remote.git");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "--template="]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        init_bare(&remote);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "HAND-A", "worker").unwrap();
+        fs::write(dir.join("answer.txt"), "the engine wrote this").unwrap();
+
+        let route = project_route(&repo);
+        let task = test_task("HAND-A");
+        let config =
+            AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\npush = \"origin\"\n")
+                .unwrap();
+        let mut payload = json!({});
+        settle_worktree_as(
+            &route,
+            &config,
+            &task,
+            "HAND-A",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+            false,
+        );
+
+        assert_eq!(payload["branch_kept"], json!(true));
+        assert!(payload.get("pushed").is_none(), "a non-head never pushes");
+        assert!(
+            run_git(&repo, &["ls-remote", "origin", branch.as_str()]).is_empty(),
+            "nothing may reach the remote"
+        );
+        let folder = PathBuf::from(payload["handin"].as_str().expect("a hand-in path"));
+        assert!(folder.join("handin.patch").is_file());
+        assert!(folder.join("handin.json").is_file());
+        let manifest: ferryman_channel::handin::Manifest =
+            serde_json::from_slice(&fs::read(folder.join("handin.json")).unwrap()).unwrap();
+        assert_eq!(manifest.base, base);
+        assert_eq!(manifest.files, ["answer.txt"]);
+        assert_eq!(manifest.signed_by.as_deref(), Some("worker"));
+
+        let _ = fs::remove_dir_all(&repo);
+        let _ = fs::remove_dir_all(&remote);
+    }
+
+    /// Worktree mode with nowhere to push still must not leave work on one disk, even
+    /// for the head.
+    #[test]
+    fn the_head_with_no_push_remote_still_hands_in() {
+        hermetic_machine();
+        let repo = unique("ferryman-agent-handin-head");
+        fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q", "--template="]);
+        run_git(&repo, &["config", "user.email", "t@example.com"]);
+        run_git(&repo, &["config", "user.name", "tester"]);
+        fs::write(repo.join("f.txt"), "hello").unwrap();
+        run_git(&repo, &["add", "f.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]);
+        let (dir, branch) =
+            ferryman_channel::worktree::create_worktree(&repo, "HAND-B", "worker").unwrap();
+        fs::write(dir.join("answer.txt"), "x").unwrap();
+
+        let route = project_route(&repo);
+        let task = test_task("HAND-B");
+        let config = AgentConfig::parse("agent = \"worker\"\ncommand = \"claude\"\n").unwrap();
+        let mut payload = json!({});
+        settle_worktree_as(
+            &route,
+            &config,
+            &task,
+            "HAND-B",
+            &branch,
+            &base,
+            &dir,
+            &mut payload,
+            &crate::Silent,
+            true,
+        );
+        assert!(payload["handin"].is_string());
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -6684,6 +6873,8 @@ mod tests {
 
     #[test]
     fn the_files_a_commit_changed_are_recorded_and_a_stray_is_only_a_note() {
+        // Not the head, so the branch is handed in: keep that inside this test's machine.
+        hermetic_machine();
         let repo = unique("ferryman-agent-touched");
         fs::create_dir_all(&repo).unwrap();
         run_git(&repo, &["init", "-q", "--template="]);
