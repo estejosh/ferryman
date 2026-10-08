@@ -14,6 +14,9 @@ fs2.workspace = true
 hex.workspace = true
 hostname.workspace = true
 rand.workspace = true
+# The librarian's full-text index (FTS5), rebuilt in memory from the signed entries. The
+# workspace already links the bundled SQLite for ferryman-core; this adds no new crate.
+rusqlite.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true
 serde_json.workspace = true

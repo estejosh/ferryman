@@ -93,6 +93,8 @@ pub enum Track {
     SendBack { project: String, order: String },
     /// Waiting for an answer in words.
     Answer { project: String, question: String },
+    /// Waiting for a question to put to the library (the home project's channel).
+    Library { project: String },
 }
 
 /// Who may use the bridge, and where.
@@ -566,6 +568,10 @@ impl Bridge {
         let Some(route) = self.route(&prompt.project).cloned() else {
             return Vec::new();
         };
+        // A question to the library asks for advice only: it needs no delegation.
+        if prompt.kind == "libask" {
+            return self.library_answer(chat, &route, text);
+        }
         let principal = match self.principal(&route) {
             Ok(principal) => principal,
             Err(why) => return vec![send(chat, why, Vec::new())],
@@ -659,7 +665,7 @@ impl Bridge {
             vec![
                 vec![button("Projects", "projects"), button("Engines", "engines")],
                 vec![button("Tasks", "tasks"), button("Self-improve", "improve")],
-                vec![button("Focus", "focus")],
+                vec![button("Focus", "focus"), button("Library", "library")],
             ],
         )
     }
@@ -1200,6 +1206,152 @@ impl Bridge {
         (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
     }
 
+    /// The library screen: what waits for the master (each fact with Confirm and Retract),
+    /// the mail desk's questions, and the way to ask. The facts are agents' words and are shown
+    /// as plain text with links made unclickable.
+    fn library_view(&mut self) -> (String, Vec<Row>) {
+        use ferryman_channel::library::{self, Library};
+        use ferryman_channel::suggestions::{defang, plain};
+        let home = ferryman_channel::focus::home_project();
+        let Some(route) = self.route(&home).cloned() else {
+            return (
+                format!(
+                    "The library is kept in {home}'s channel, which this bridge does not serve. \
+                     Use the dashboard, or run: ferry library show"
+                ),
+                vec![menu_row()],
+            );
+        };
+        let library = Library::load(&route.communications, &route.project_id);
+        let (confirmed, unconfirmed, retracted, replaced) = library.counts();
+        let mut lines = vec![format!(
+            "Library: {confirmed} confirmed, {unconfirmed} waiting for you, {replaced} \
+             replaced, {retracted} retracted. Advice only: nothing here changes code or settings."
+        )];
+        for notice in &library.notices {
+            lines.push(format!("Warning: {}", plain(notice, 200)));
+        }
+        for conflict in library.conflicts() {
+            lines.push(format!(
+                "Disagreement about \"{}\": {}",
+                plain(&conflict.subject, 60),
+                conflict.facts.join(" vs ")
+            ));
+        }
+        let mut rows: Vec<Row> = Vec::new();
+        for fact in library.unconfirmed().take(5) {
+            lines.push(format!(
+                "{} {} from {}: {} - {}",
+                fact.id,
+                fact.created_at.format("%Y-%m-%d"),
+                fact.written_by(),
+                plain(&fact.subject, 50),
+                defang(&plain(&fact.text, 160))
+            ));
+            let confirm = self.data(format!("lcf:{home}:{}", fact.id));
+            let retract = self.data(format!("lrt:{home}:{}", fact.id));
+            rows.push(vec![
+                button(format!("Confirm {}", fact.id), confirm),
+                button("Retract", retract),
+            ]);
+        }
+        if unconfirmed > 5 {
+            lines.push(format!(
+                "...and {} more: ferry library show",
+                unconfirmed - 5
+            ));
+        }
+        let waiting: Vec<questions::Question> = questions::pending(&route)
+            .into_iter()
+            .filter(|question| {
+                question.kind == questions::LIBRARY && question.id.starts_with("library-mail-")
+            })
+            .collect();
+        if let Some(dir) = library::mail::Desk::default_dir().filter(|dir| dir.is_dir()) {
+            let desk = library::mail::Desk::at(dir);
+            lines.push(format!(
+                "Mail desk here: {} mail(s), {} reply(ies) waiting to be sent, {} waiting for you.",
+                desk.items().len(),
+                desk.outbox().len(),
+                waiting.len()
+            ));
+        } else if !waiting.is_empty() {
+            lines.push(format!("Mail desk: {} waiting for you.", waiting.len()));
+        }
+        for question in waiting.iter().take(3) {
+            // The question text is the sender's words, quoted and defanged; its first
+            // lines say which mail it is.
+            lines.push(excerpt(&question.text, 420));
+            let mut row = Row::new();
+            for (index, option) in question.options.iter().enumerate() {
+                let data = self.data(format!("ans:{home}:{}:{index}", question.id));
+                row.push(button(excerpt(option, 18), data));
+            }
+            rows.push(row);
+        }
+        rows.push(vec![button("Ask the library", "lask")]);
+        rows.push(menu_row());
+        (excerpt(&lines.join("\n"), MESSAGE_CHARS), rows)
+    }
+
+    /// Confirm or retract a fact as the master's delegate: it needs the `library` scope.
+    fn decide_fact(
+        &self,
+        project: &str,
+        id: &str,
+        confirm: bool,
+    ) -> std::result::Result<String, String> {
+        let home = ferryman_channel::focus::home_project();
+        if project != home {
+            return Err(format!("the library is kept in {home}'s channel"));
+        }
+        let route = self
+            .route(&home)
+            .ok_or_else(|| format!("{home}'s channel is not served here"))?;
+        let principal = self.principal(route)?;
+        let done = if confirm {
+            ferryman_channel::library::confirm(
+                &route.communications,
+                &route.project_id,
+                &self.agent,
+                Some(&principal),
+                id,
+            )
+        } else {
+            ferryman_channel::library::retract(
+                &route.communications,
+                &route.project_id,
+                &self.agent,
+                Some(&principal),
+                id,
+                "retracted from Telegram",
+            )
+        };
+        done.map(|_| format!("{id} {}", if confirm { "confirmed" } else { "retracted" }))
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    /// The best matches for a question put to the library from the phone.
+    fn library_answer(&self, chat: i64, route: &ProjectRoute, question: &str) -> Vec<Action> {
+        use ferryman_channel::library::ask as lask;
+        let reader = ferryman_ops::library::Reader::load(&route.communications, &route.project_id);
+        let answer = ferryman_ops::library::facts_only(&reader, question.trim(), None);
+        let body = if answer.known {
+            format!(
+                "Best matches, with ids and dates (nothing is put in words on the phone; \
+                 `ferry ask --library` does that):\n{}",
+                lask::render(&answer)
+            )
+        } else {
+            answer.answer
+        };
+        vec![send(
+            chat,
+            excerpt(&body, MESSAGE_CHARS),
+            vec![vec![button("Ask again", "lask")], menu_row()],
+        )]
+    }
+
     /// The tiers one project can be put in.
     fn focus_pick_view(&mut self, project: &str, now: DateTime<Utc>) -> (String, Vec<Row>) {
         let tier = self.route(&ferryman_channel::focus::home_project()).map_or(
@@ -1394,6 +1546,33 @@ impl Bridge {
                 } else {
                     self.engines_view(chat, now)
                 })
+            }
+            "library" => Some(self.library_view()),
+            "lcf" | "lrt" => {
+                toast = match self.decide_fact(&project, &id, verb == "lcf") {
+                    Ok(done) => done,
+                    Err(why) => excerpt(&why, 190),
+                };
+                Some(self.library_view())
+            }
+            "lask" => {
+                let home = ferryman_channel::focus::home_project();
+                return vec![
+                    Action::Answer {
+                        callback_id: callback.id.clone(),
+                        text: String::new(),
+                    },
+                    Action::Send {
+                        chat,
+                        text: "What do you want to ask the library? Reply to this message. \
+                               (It searches the facts and shows the best matches with their \
+                               ids and dates; `ferry ask --library` puts them in words.)"
+                            .to_string(),
+                        buttons: Vec::new(),
+                        force_reply: true,
+                        track: Some(Track::Library { project: home }),
+                    },
+                ];
             }
             "focus" => Some(self.focus_view(now)),
             "fsel" => Some(self.focus_pick_view(&project, now)),
@@ -1684,6 +1863,13 @@ impl Bridge {
                 kind: "answer".to_string(),
                 project,
                 id: question,
+            }),
+            Track::Library { project } => self.state.prompts.push(Prompt {
+                chat,
+                message_id,
+                kind: "libask".to_string(),
+                project,
+                id: String::new(),
             }),
         }
         bound(&mut self.state.prompts);
@@ -2892,11 +3078,18 @@ mod tests {
         let labels: Vec<String> = buttons(&menu).into_iter().map(|(label, _)| label).collect();
         assert_eq!(
             labels,
-            ["Projects", "Engines", "Tasks", "Self-improve", "Focus"]
+            [
+                "Projects",
+                "Engines",
+                "Tasks",
+                "Self-improve",
+                "Focus",
+                "Library"
+            ]
         );
         let other = bridge.handle(text(JOSH_TG, GROUP, 2, "/status"), now);
         assert!(texts(&other)[0].starts_with("Use the buttons"));
-        assert_eq!(buttons(&other).len(), 5, "and the menu with it");
+        assert_eq!(buttons(&other).len(), 6, "and the menu with it");
     }
 
     #[test]
@@ -3441,6 +3634,178 @@ mod tests {
         assert!(stranger.is_empty());
         assert!(!ferryman.communications.join("FOCUS").exists());
     }
+    /// The library on the phone: what waits for josh, each fact with Confirm and Retract,
+    /// signed through the `library` delegation and no other; the mail desk's questions with
+    /// their options; and a question put to the library, answered with ids and dates.
+    #[test]
+    fn the_library_screen_confirms_retracts_and_answers_for_the_master_only_through_its_scope() {
+        use ferryman_channel::library::{Library, NewFact, Status, remember};
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-cli-tgv2-library-{}", std::process::id())),
+        );
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        let channel = &ferryman.communications;
+        let say = |who: &AgentIdentity, subject: &str, text: &str| {
+            remember(
+                channel,
+                "ferryman",
+                who,
+                None,
+                NewFact {
+                    subject: subject.into(),
+                    text: text.into(),
+                    source: "test".into(),
+                    ..NewFact::default()
+                },
+            )
+            .unwrap()
+            .event
+            .id
+        };
+        let first = say(&wisp(), "grouchly", "grouchly is the always-on Ubuntu box");
+        let second = say(
+            &wisp(),
+            "port",
+            "the dashboard listens on 7821 https://evil.example",
+        );
+        say(&josh(), "known", "josh already confirmed this one");
+        let answer = |actions: &[Action]| match &actions[0] {
+            Action::Answer { text, .. } => text.clone(),
+            other => panic!("expected an answer, got {other:?}"),
+        };
+        let push = |bridge: &mut Bridge, data: &str| {
+            bridge.handle(press(JOSH_TG, GROUP, 94, data), Utc::now())
+        };
+
+        // The screen: counts, the two waiting facts with their buttons, a way to ask.
+        let view = push(&mut bridge, "library");
+        let shown = texts(&view).join("\n");
+        assert!(shown.contains("1 confirmed, 2 waiting for you"), "{shown}");
+        assert!(shown.contains(&first) && shown.contains(&second), "{shown}");
+        assert!(
+            !shown.contains("https://evil.example"),
+            "links in facts are made unclickable"
+        );
+        let data: Vec<String> = buttons(&view).into_iter().map(|(_, data)| data).collect();
+        for want in [
+            format!("lcf:ferryman:{first}"),
+            format!("lrt:ferryman:{first}"),
+            format!("lcf:ferryman:{second}"),
+            "lask".to_string(),
+        ] {
+            assert!(data.contains(&want), "{want} in {data:?}");
+        }
+        let menu = bridge.handle(text(JOSH_TG, GROUP, 1, "/start"), Utc::now());
+        assert!(
+            buttons(&menu)
+                .iter()
+                .any(|(label, data)| label == "Library" && data == "library")
+        );
+
+        // The improve delegation alone does not confirm anything.
+        delegate(&ferryman, &["improve"]);
+        let refused = push(&mut bridge, &format!("lcf:ferryman:{first}"));
+        let why = answer(&refused);
+        assert!(why.contains("library"), "{why}");
+        let load = || Library::load(channel, "ferryman");
+        assert_eq!(load().fact(&first).unwrap().status, Status::Unconfirmed);
+
+        // With the library scope, Confirm signs as josh through the bridge; Retract keeps
+        // the fact in the history.
+        delegate(&ferryman, &["improve", "library"]);
+        let done = push(&mut bridge, &format!("lcf:ferryman:{first}"));
+        assert_eq!(answer(&done), format!("{first} confirmed"));
+        let library = load();
+        let confirmed = library.fact(&first).unwrap();
+        assert_eq!(confirmed.status, Status::Confirmed);
+        assert_eq!(
+            confirmed.confirmed_by.as_deref(),
+            Some("josh via telegram-grouchly")
+        );
+        let gone = push(&mut bridge, &format!("lrt:ferryman:{second}"));
+        assert_eq!(answer(&gone), format!("{second} retracted"));
+        let library = load();
+        assert_eq!(library.fact(&second).unwrap().status, Status::Retracted);
+        assert_eq!(library.history("port").len(), 1);
+        let again = push(&mut bridge, &format!("lcf:ferryman:{first}"));
+        assert!(answer(&again).contains("already confirmed"), "{again:?}");
+        // Nobody but an approver may press the buttons.
+        let stranger = bridge.handle(
+            press(777, GROUP, 95, &format!("lrt:ferryman:{first}")),
+            Utc::now(),
+        );
+        assert!(stranger.is_empty());
+        assert_eq!(load().fact(&first).unwrap().status, Status::Confirmed);
+
+        // Ask: a prompt to reply to, then the best matches with ids and dates.
+        let mut ids = 3000;
+        let asking = push(&mut bridge, "lask");
+        assert!(matches!(
+            &asking[1],
+            Action::Send {
+                force_reply: true,
+                track: Some(Track::Library { .. }),
+                ..
+            }
+        ));
+        deliver(&mut bridge, &asking, &mut ids);
+        let said = bridge.handle(
+            reply(GROUP, 96, ids, "which machine is always on?"),
+            Utc::now(),
+        );
+        let body = texts(&said).join("\n");
+        assert!(body.contains(&first), "{body}");
+        assert!(
+            body.contains(&Utc::now().format("%Y-%m-%d").to_string()),
+            "{body}"
+        );
+        let asking = push(&mut bridge, "lask");
+        deliver(&mut bridge, &asking, &mut ids);
+        let idk = bridge.handle(
+            reply(GROUP, 97, ids, "what is the capital of France?"),
+            Utc::now(),
+        );
+        assert!(
+            texts(&idk).join("\n").starts_with("I don't know"),
+            "{idk:?}"
+        );
+
+        // The mail desk: a question about a piece of mail, with its options as buttons, is
+        // answered like any other question the master is asked.
+        questions::ask(
+            &ferryman,
+            &wisp(),
+            "library-mail-m-0123456789",
+            questions::LIBRARY,
+            "Mail m-0123456789 needs you (for redaktly).\n| Could we talk about a partnership?",
+            &[
+                "Accept".to_string(),
+                "Decline".to_string(),
+                "Ignore".to_string(),
+            ],
+            None,
+        )
+        .unwrap();
+        let view = push(&mut bridge, "library");
+        let shown = texts(&view).join("\n");
+        assert!(
+            shown.contains("m-0123456789") && shown.contains("partnership"),
+            "{shown}"
+        );
+        let data: Vec<String> = buttons(&view).into_iter().map(|(_, data)| data).collect();
+        assert!(
+            data.contains(&"ans:ferryman:library-mail-m-0123456789:1".to_string()),
+            "{data:?}"
+        );
+        let answered = push(&mut bridge, "ans:ferryman:library-mail-m-0123456789:1");
+        assert_eq!(answer(&answered), "Answered");
+        let question = questions::read(&ferryman, "library-mail-m-0123456789").unwrap();
+        let recorded = questions::answer_to(&ferryman, &question).unwrap();
+        assert_eq!(recorded.answer, "Decline");
+        assert_eq!(recorded.from(), "josh via telegram-grouchly");
+    }
+
     /// "On for all" from the phone passes over an archived project, even one the bridge
     /// may switch.
     #[test]

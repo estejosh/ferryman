@@ -1,0 +1,354 @@
+{
+  "name": "Librarian mail desk (AgentMail and Ferryman)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Librarian mail desk\n\nTwo small flows between the shared agent inbox (AgentMail) and the librarian's desk folder on this machine. The librarian never holds the AgentMail key and never calls AgentMail: this workflow is the only thing that does.\n\n**Setup**\n1. Create an n8n credential of type *Header Auth* named `AgentMail API key`: header `Authorization`, value `Bearer <your key>`. Pick it in the three HTTP nodes.\n2. In *Settings* below set `inbox` (the AgentMail inbox address) and `desk` (the folder the librarian's desk is mounted at, inside n8n).\n3. Let n8n touch that folder: mount it, and add it to `N8N_RESTRICT_FILE_ACCESS_TO`.\n4. On the librarian's machine set `FERRYMAN_LIBRARY_MAIL_DIR` to the same folder and run the librarian (`FERRYMAN_LIBRARIAN=1` on the worker, or `ferry library serve`).\n5. Activate.\n\n**Flow 1** writes each unread, received message to `in/` as JSON and marks it read. **Flow 2** sends each reply the librarian drafted in `out/` (a fixed text about the sender's own request, as a reply in the same thread) and leaves `ack/<reply id>` so the librarian can file it. A failed send is retried next minute; the `Idempotency-Key` header stops a duplicate.\n\nSee docs/LIBRARIAN.md.",
+        "height": 520,
+        "width": 560,
+        "color": 7
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000001",
+      "name": "Read me",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-520, -160]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000002",
+      "name": "Every minute (in)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 0]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "inbox",
+              "value": "helpmeagent@agentmail.to",
+              "type": "string"
+            },
+            {
+              "id": "a2",
+              "name": "desk",
+              "value": "/home/node/library-mail",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000003",
+      "name": "Settings",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [300, 0]
+    },
+    {
+      "parameters": {
+        "url": "=https://api.agentmail.to/v0/inboxes/{{ encodeURIComponent($json.inbox) }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "labels",
+              "value": "unread"
+            },
+            {
+              "name": "limit",
+              "value": "20"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000004",
+      "name": "List unread mail",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [520, 0],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "AgentMail API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "messages",
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000005",
+      "name": "One item per message",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [740, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ !($json.labels || []).includes('sent') && !($json.labels || []).includes('draft') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000006",
+      "name": "Only mail we received",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2.2,
+      "position": [960, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// One file per message, exactly the fields the librarian reads. Nothing here is trusted\n// downstream: the librarian caps, cleans and quotes every string itself.\nconst m = $json;\nconst cap = (s, n) => String(s == null ? '' : s).slice(0, n);\nconst file = {\n  message_id: cap(m.message_id, 300),\n  thread_id: cap(m.thread_id, 300),\n  from: cap(m.from, 300),\n  subject: cap(m.subject, 500),\n  text: cap(m.extracted_text || m.text, 200000),\n  html: m.extracted_text || m.text ? '' : cap(m.html, 200000),\n  timestamp: cap(m.timestamp, 40),\n  headers: m.headers && typeof m.headers === 'object' ? m.headers : {},\n};\nconst name = 'mail-' + String(m.message_id).replace(/[^A-Za-z0-9]/g, '-').slice(0, 80);\nreturn {\n  json: { message_id: m.message_id, name },\n  binary: {\n    data: await this.helpers.prepareBinaryData(Buffer.from(JSON.stringify(file)), name + '.json', 'application/json'),\n  },\n};"
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000007",
+      "name": "Shape the file",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 0]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $('Settings').first().json.desk }}/in/{{ $json.name }}.json",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000008",
+      "name": "Drop it in the desk",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [1400, 0]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.agentmail.to/v0/inboxes/{{ encodeURIComponent($('Settings').first().json.inbox) }}/messages/{{ encodeURIComponent($('Shape the file').item.json.message_id) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\n  \"add_labels\": [\"read\"],\n  \"remove_labels\": [\"unread\"]\n}",
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000009",
+      "name": "Mark it read",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1620, 0],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "AgentMail API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000010",
+      "name": "Every minute (out)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [80, 360]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "b1",
+              "name": "inbox",
+              "value": "helpmeagent@agentmail.to",
+              "type": "string"
+            },
+            {
+              "id": "b2",
+              "name": "desk",
+              "value": "/home/node/library-mail",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000011",
+      "name": "Settings (out)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [300, 360]
+    },
+    {
+      "parameters": {
+        "fileSelector": "={{ $json.desk }}/out/*.json",
+        "options": {
+          "dataPropertyName": "data"
+        }
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000012",
+      "name": "Replies waiting",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [520, 360]
+    },
+    {
+      "parameters": {
+        "operation": "fromJson",
+        "destinationKey": "reply",
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000013",
+      "name": "Read the reply",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [740, 360]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://api.agentmail.to/v0/inboxes/{{ encodeURIComponent($('Settings (out)').first().json.inbox) }}/messages/{{ encodeURIComponent($json.reply.message_id) }}/reply",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.reply.reply_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ text: $json.reply.text }) }}",
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000014",
+      "name": "Send the reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 360],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "AgentMail API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// The note that says this reply went out. The librarian moves it from out/ to sent/.\nconst id = $('Read the reply').item.json.reply.reply_id;\nreturn {\n  json: { reply_id: id },\n  binary: {\n    data: await this.helpers.prepareBinaryData(Buffer.from('sent'), id, 'text/plain'),\n  },\n};"
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000015",
+      "name": "Shape the ack",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 360]
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $('Settings (out)').first().json.desk }}/ack/{{ $json.reply_id }}",
+        "dataPropertyName": "data",
+        "options": {}
+      },
+      "id": "5a0b1e11-0000-4000-8000-000000000016",
+      "name": "Leave the ack",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [1400, 360]
+    }
+  ],
+  "connections": {
+    "Every minute (in)": {
+      "main": [[{ "node": "Settings", "type": "main", "index": 0 }]]
+    },
+    "Settings": {
+      "main": [[{ "node": "List unread mail", "type": "main", "index": 0 }]]
+    },
+    "List unread mail": {
+      "main": [[{ "node": "One item per message", "type": "main", "index": 0 }]]
+    },
+    "One item per message": {
+      "main": [[{ "node": "Only mail we received", "type": "main", "index": 0 }]]
+    },
+    "Only mail we received": {
+      "main": [[{ "node": "Shape the file", "type": "main", "index": 0 }]]
+    },
+    "Shape the file": {
+      "main": [[{ "node": "Drop it in the desk", "type": "main", "index": 0 }]]
+    },
+    "Drop it in the desk": {
+      "main": [[{ "node": "Mark it read", "type": "main", "index": 0 }]]
+    },
+    "Every minute (out)": {
+      "main": [[{ "node": "Settings (out)", "type": "main", "index": 0 }]]
+    },
+    "Settings (out)": {
+      "main": [[{ "node": "Replies waiting", "type": "main", "index": 0 }]]
+    },
+    "Replies waiting": {
+      "main": [[{ "node": "Read the reply", "type": "main", "index": 0 }]]
+    },
+    "Read the reply": {
+      "main": [[{ "node": "Send the reply", "type": "main", "index": 0 }]]
+    },
+    "Send the reply": {
+      "main": [[{ "node": "Shape the ack", "type": "main", "index": 0 }]]
+    },
+    "Shape the ack": {
+      "main": [[{ "node": "Leave the ack", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false
+  }
+}

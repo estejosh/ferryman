@@ -6,7 +6,10 @@
 //! learnings, skills, and the discovery manifest — so an MCP client (Claude
 //! Desktop, Codex, Claude Code, …) can observe and answer questions about a
 //! fleet without any write authority. Write tools are deliberately absent: an
-//! MCP connection is a stranger, not the operator.
+//! MCP connection is a stranger, not the operator. The one exception is the
+//! librarian's `library_remember`, the weakest write there is: a fact signed as
+//! this server's own agent, which waits as *unconfirmed* until the owner confirms
+//! it, and is refused if it looks like a secret. See `ferryman_channel::library`.
 //!
 //! This is the executable half of the MCP-agent designation in
 //! `ferryman_channel::discovery`: the designated agent is the one you point an
@@ -116,6 +119,7 @@ fn handle_line(route: &ProjectRoute, gateways: &mut [Gateway], line: &str) -> Op
 /// Ferryman's own tools plus every connected external server's prefixed tools.
 fn all_tools(gateways: &[Gateway]) -> Vec<Value> {
     let mut all = tools();
+    all.extend(crate::library::mcp_tools());
     for gateway in gateways {
         all.extend(gateway.tools.iter().cloned());
     }
@@ -235,6 +239,11 @@ fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
         "list_ledger" => list_ledger(route, &args),
         "list_learnings" => list_learnings(route, &args),
         "list_engines" => list_engines(route),
+        // The librarian: ask, search, one fact, and the one write (an unconfirmed fact,
+        // signed as this server's own agent and never as the master).
+        library if crate::library::is_mcp_tool(library) => {
+            crate::library::mcp_call(route, library, &args)
+        }
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
     match outcome {
@@ -665,5 +674,278 @@ done
         assert_eq!(result["content"][0]["text"], "fixture-ok");
         assert_eq!(result["isError"], false);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// The librarian's tools, over the same JSON-RPC the other tools use.
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+    use ferryman_channel::{AgentIdentity, AgentRoute, library};
+
+    const HOME: &str = "ferryman";
+
+    fn call(route: &ProjectRoute, tool: &str, arguments: &Value) -> (bool, Value) {
+        let request = json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        });
+        let response = handle_line(route, &mut [], &request.to_string()).unwrap();
+        let v: Value = serde_json::from_str(&response).unwrap();
+        let text = v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let failed = v["result"]["isError"] == true;
+        (
+            failed,
+            serde_json::from_str(&text).unwrap_or(Value::String(text)),
+        )
+    }
+
+    /// A home channel mastered by josh with `grouchly` on the roster, and an MCP workspace
+    /// whose own keys (and `agent.toml`) are `agent`'s.
+    fn world(dir: &std::path::Path, agent: &str) -> (ProjectRoute, AgentIdentity) {
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-cli-library-{}", std::process::id())),
+        );
+        let channel = dir.join("ferryman-ferryman");
+        std::fs::create_dir_all(&channel).unwrap();
+        let attachment = dir.join("workspace").join(".ferryman");
+        std::fs::create_dir_all(&attachment).unwrap();
+        std::fs::write(
+            attachment.join("agent.toml"),
+            format!("agent = \"{agent}\"\ncommand = \"claude\"\n"),
+        )
+        .unwrap();
+        let me = AgentIdentity::load_or_create(agent, &attachment).unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1; 32]);
+        let mut home_route = ProjectRoute {
+            project_id: HOME.into(),
+            workspace: dir.join("ferryman"),
+            attachment: dir.join("home-attachment"),
+            communications: channel.clone(),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        let mut members: Vec<&AgentIdentity> = vec![&josh];
+        if agent != "josh" {
+            members.push(&me);
+        }
+        for member in members {
+            let entry = AgentRoute {
+                name: member.name().into(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: Some(member.public_key_hex()),
+                encryption_key: None,
+            };
+            ferryman_channel::register_agent(&home_route, &entry).unwrap();
+            home_route.agents.push(entry);
+        }
+        ferryman_channel::master::initialize_master(&home_route, &josh, "josh").unwrap();
+        crate::library::TEST_HOME.with(|home| {
+            *home.borrow_mut() = Some(library::Home {
+                project: HOME.into(),
+                channel,
+                attachment: dir.join("home-attachment"),
+            });
+        });
+        let route = ProjectRoute {
+            project_id: "bullship".into(),
+            workspace: dir.join("workspace"),
+            attachment,
+            communications: dir.join("workspace-comms"),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        (route, josh)
+    }
+
+    #[test]
+    fn the_library_tools_are_listed_and_ask_search_remember_and_show_a_fact() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh) = world(dir.path(), "grouchly");
+        let home = crate::library::TEST_HOME
+            .with(|home| home.borrow().clone())
+            .unwrap();
+        // The master has written one fact already.
+        library::remember(
+            &home.channel,
+            HOME,
+            &josh,
+            None,
+            library::NewFact {
+                subject: "grouchly".into(),
+                text: "grouchly is the always-on Ubuntu box that runs n8n".into(),
+                source: "josh".into(),
+                ..library::NewFact::default()
+            },
+        )
+        .unwrap();
+
+        let listed: Value = serde_json::from_str(
+            &handle_line(
+                &route,
+                &mut [],
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let names: Vec<&str> = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        for tool in [
+            "library_ask",
+            "library_search",
+            "library_remember",
+            "library_fact",
+        ] {
+            assert!(names.contains(&tool), "{tool} in {names:?}");
+        }
+
+        // Remember: signed as the server's agent, unconfirmed.
+        let (failed, written) = call(
+            &route,
+            "library_remember",
+            &json!({"text": "the dashboard on grouchly listens on 7821", "subject": "dashboard port", "tags": ["ops"], "source": "bullship worker"}),
+        );
+        assert!(!failed, "{written}");
+        assert_eq!(written["status"], "unconfirmed");
+        assert_eq!(written["signed_by"], "grouchly");
+        let id = written["id"].as_str().unwrap().to_string();
+
+        // Search finds both, with standing and date.
+        let (failed, found) = call(
+            &route,
+            "library_search",
+            &json!({"query": "which machine is always on"}),
+        );
+        assert!(!failed);
+        assert_eq!(found[0]["subject"], "grouchly");
+        assert_eq!(found[0]["status"], "confirmed");
+        let (_, found) = call(
+            &route,
+            "library_search",
+            &json!({"query": "dashboard port"}),
+        );
+        assert_eq!(found[0]["id"], id.as_str());
+        assert_eq!(found[0]["status"], "unconfirmed");
+
+        // Fact: who wrote it, how it was claimed, whether it is confirmed.
+        let (failed, fact) = call(&route, "library_fact", &json!({"id": id}));
+        assert!(!failed);
+        assert_eq!(fact["fact"]["author"], "grouchly");
+        assert_eq!(fact["fact"]["status"], "unconfirmed");
+        assert!(fact["fact"]["source"].as_str().unwrap().contains("via MCP"));
+        assert!(
+            fact["fact"]["source"]
+                .as_str()
+                .unwrap()
+                .contains("bullship worker")
+        );
+        assert_eq!(fact["history"].as_array().unwrap().len(), 1);
+        assert!(call(&route, "library_fact", &json!({"id": "f-0000000000"})).0);
+
+        // Ask with no model: the facts, never an invented answer; nothing relevant, nothing.
+        let (failed, answer) = call(
+            &route,
+            "library_ask",
+            &json!({"question": "which machine is always on?", "no_model": true}),
+        );
+        assert!(!failed);
+        assert_eq!(answer["known"], true);
+        assert_eq!(answer["facts"][0]["subject"], "grouchly");
+        let (_, answer) = call(
+            &route,
+            "library_ask",
+            &json!({"question": "what is the capital of France?"}),
+        );
+        assert_eq!(answer["known"], false);
+        assert!(
+            answer["answer"]
+                .as_str()
+                .unwrap()
+                .starts_with("I don't know")
+        );
+        // Without a worker configuration at home there is no model to ask: facts only.
+        let (_, answer) = call(
+            &route,
+            "library_ask",
+            &json!({"question": "which machine is always on?"}),
+        );
+        assert_eq!(answer["known"], true);
+        assert_eq!(answer["answer"], "");
+
+        // A correction is a new fact that names the old one.
+        let (failed, fixed) = call(
+            &route,
+            "library_remember",
+            &json!({"text": "the dashboard on grouchly listens on 7822", "subject": "dashboard port", "supersedes": [id]}),
+        );
+        assert!(!failed, "{fixed}");
+        let (_, old) = call(&route, "library_fact", &json!({"id": id}));
+        assert_eq!(old["replaced_by"][0]["id"], fixed["id"]);
+    }
+
+    #[test]
+    fn a_secret_is_refused_over_mcp_and_never_echoed_and_the_master_is_never_impersonated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, _) = world(dir.path(), "grouchly");
+        let token = format!(
+            "ghp_{}",
+            ["q8Zr3LmX0", "vB2nC6dF9", "gH1jK4pT7", "wY5sA3eR8"].concat()
+        );
+        let (failed, refused) = call(
+            &route,
+            "library_remember",
+            &json!({"text": format!("use {token} for deploys")}),
+        );
+        assert!(failed);
+        let text = refused.as_str().unwrap();
+        assert!(text.contains("pointer") && !text.contains(&token), "{text}");
+        let home = crate::library::TEST_HOME
+            .with(|home| home.borrow().clone())
+            .unwrap();
+        assert!(library::Library::load(&home.channel, HOME).facts.is_empty());
+        for bad in [
+            json!({}),
+            json!({"text": ""}),
+            json!({"text": "x", "tags": ["Not A Tag"]}),
+        ] {
+            assert!(call(&route, "library_remember", &bad).0, "{bad}");
+        }
+        // A tool call cannot name another author.
+        let (_, written) = call(
+            &route,
+            "library_remember",
+            &json!({"text": "fine fact", "author": "josh", "signed_by": "josh"}),
+        );
+        assert_eq!(written["signed_by"], "grouchly");
+
+        // A server that holds the master's own key still writes no confirmed fact.
+        let other = tempfile::tempdir().unwrap();
+        let (master_route, _) = world(other.path(), "josh");
+        let (failed, refused) = call(
+            &master_route,
+            "library_remember",
+            &json!({"text": "from the master"}),
+        );
+        assert!(failed);
+        assert!(
+            refused
+                .as_str()
+                .unwrap()
+                .contains("never writes as the master"),
+            "{refused}"
+        );
     }
 }

@@ -410,6 +410,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
       <button data-page="learnings">Learnings</button>
       <button data-page="focus">Focus</button>
       <button data-page="suggestions">Suggestions <span class="pill num" id="count-suggestions">0</span></button>
+      <button data-page="library">Library <span class="pill num" id="count-library">0</span></button>
 <button data-page="engines">Engines</button>
       <button data-page="fleet">Fleet</button>
       <button data-page="vault">Vault</button>
@@ -2358,6 +2359,202 @@ function wireSuggestions() {
     });
   }
 }
+/* Library: the fleet's memory and front desk. Signed, append-only facts in the home project's
+   channel (a fact is never edited; a newer one supersedes it and the history stays), what
+   the master has confirmed and what still waits for them, generated pages read from live
+   state, and the shared agent inbox's mail desk. Everything in it is somebody's words - an
+   agent's, a stranger's - so it is only ever shown as escaped text. It gives advice and
+   never authority; confirming and retracting are the master's signed acts. */
+const LIB_STATUS = {
+  confirmed: ["Confirmed", "good"], unconfirmed: ["Unconfirmed", "warn"],
+  retracted: ["Retracted", "bad"], generated: ["Generated", ""],
+};
+function libBadge(status) {
+  const [word, tone] = LIB_STATUS[status] || [status, ""];
+  return `<span class="badge ${tone}">${esc(word)}</span>`;
+}
+function libDay(at) { return esc(String(at || "").slice(0, 10)); }
+function libFactRow(f, may) {
+  const replaced = (f.superseded_by || []).length ? ` <span class="badge">replaced by ${esc(f.superseded_by.join(", "))}</span>` : "";
+  return `<tr>
+    <td class="mono">${esc(f.id)}</td>
+    <td>${libDay(f.created_at)}</td>
+    <td><b>${esc(f.subject)}</b><div class="s" style="white-space:pre-wrap">${esc(f.text)}</div>
+      <div class="s" style="color:var(--dim)">${f.project ? "project " + esc(f.project) + " &middot; " : ""}${(f.tags || []).length ? "tags " + esc(f.tags.join(", ")) + " &middot; " : ""}${esc(f.source || "")}</div></td>
+    <td>${esc(f.on_behalf_of ? f.on_behalf_of + " via " + f.author : f.author)}</td>
+    <td>${libBadge(f.status)}${replaced}${f.confirmed_by ? `<div class="s" style="color:var(--dim)">by ${esc(f.confirmed_by)}</div>` : ""}</td>
+    <td style="white-space:nowrap"><button class="btn" data-lib-hist="${esc(f.id)}">History</button>
+      ${may && f.status === "unconfirmed" ? `<button class="btn primary" data-lib-confirm="${esc(f.id)}">Confirm</button>` : ""}
+      ${may && f.status !== "retracted" ? `<button class="btn" data-lib-retract="${esc(f.id)}">Retract</button>` : ""}</td>
+  </tr>`;
+}
+pages.library = async () => {
+  const qs = new URLSearchParams();
+  if (state.libQuery) qs.set("q", state.libQuery);
+  if (state.libAll) qs.set("all", "1");
+  let d = null;
+  try { d = await api(`/api/library${qs.toString() ? "?" + qs.toString() : ""}`); }
+  catch (err) {
+    return `<div class="head"><div><h1>Library</h1></div></div><div class="empty">Could not read the library: ${esc(err.message || err)}</div>`;
+  }
+  if (!d.available) {
+    return `<div class="head"><div><h1>Library</h1></div></div>
+      <div class="notice"><div><b>The library lives in ${esc(d.home)}&rsquo;s channel,</b> which is not on this machine, so there is nothing to show here.</div></div>`;
+  }
+  let mail = null;
+  try { mail = await api("/api/library/mail"); } catch (err) { mail = null; }
+  let detail = null;
+  if (state.libFact) {
+    try { detail = await api(`/api/library/fact?id=${encodeURIComponent(state.libFact)}`); } catch (err) { detail = null; }
+  }
+  const may = !!d.may_decide;
+  const c = d.counts || {};
+  const found = d.found;
+  const foundRows = (found || []).map((f) => `<tr>
+    <td class="mono">${esc(f.id)}</td><td>${libDay(f.date)}</td>
+    <td><b>${esc(f.subject)}</b><div class="s" style="white-space:pre-wrap">${esc(f.text)}</div></td>
+    <td>${libBadge(f.status)}</td><td class="s">${esc(f.by)}</td></tr>`).join("");
+  const waiting = (d.waiting || []).map((f) => libFactRow(f, may)).join("");
+  const facts = (d.facts || []).map((f) => libFactRow(f, may)).join("");
+  const conflicts = (d.conflicts || []).map((x) => `<div class="notice"><div><b>These disagree about &ldquo;${esc(x.subject)}&rdquo;:</b> ${esc(x.facts.join(" vs "))}.
+    <div class="s" style="color:var(--dim);margin-top:4px">Confirm the true one, retract the wrong one, or write a new fact that supersedes both.</div></div></div>`).join("");
+  const views = (d.views || []).map((v) => `<details style="margin:8px 0"><summary><b>${esc(v.view)}</b>
+    <span class="s" style="color:var(--dim)">generated ${esc(String(v.generated_at).slice(0, 16).replace("T", " "))} UTC by ${esc(v.generated_by)} on ${esc(v.machine)}</span></summary>
+    <ul class="s">${(v.rows || []).map((r) => `<li><span class="mono">${esc(r.id)}</span>: ${esc(r.text)}</li>`).join("")}</ul></details>`).join("");
+  const tagRows = Object.entries((d.tag_map || {}).map || {}).map(([tag, project]) => `<tr>
+    <td class="mono">[${esc(tag)}]</td><td>${esc(project)}</td>
+    ${may ? `<td><button class="btn" data-lib-tag-remove="${esc(tag)}">Remove</button></td>` : ""}</tr>`).join("");
+  const asking = ((mail && mail.waiting) || []).map((q) => `<div class="panel" style="padding:12px 14px;margin-bottom:10px">
+    <div class="s" style="white-space:pre-wrap">${esc(q.text)}</div>
+    <div class="s" style="color:var(--dim);margin-top:6px">${esc(q.id)} &middot; ${libDay(q.asked_at)} &middot; answer with a button in Telegram, or <span class="mono">ferry team answer</span>.</div></div>`).join("");
+  const items = ((mail && mail.items) || []).map((i) => `<tr>
+    <td class="mono">${esc(i.id)}</td><td>${esc(i.stage)}</td><td>${esc(i.project || "-")}</td>
+    <td>${esc(i.decision || "-")}</td><td class="s">${esc(i.subject)}</td><td class="s">${esc(i.summary || "")}</td></tr>`).join("");
+  const outbox = ((mail && mail.outbox) || []).map((o) => `<li><span class="mono">${esc(o.reply_id)}</span> (${esc(o.kind)}) for ${esc(o.mail_id)}</li>`).join("");
+  const ledger = ((mail && mail.ledger) || []).map((e) => `<li class="s">${esc(String(e.at).slice(0, 16).replace("T", " "))} &mdash; ${esc(e.summary)}</li>`).join("");
+  const history = detail && detail.fact ? `<div class="panel" style="padding:14px 16px;margin:14px 0">
+      <b>History of &ldquo;${esc(detail.fact.subject)}&rdquo;</b>
+      <table class="grid"><thead><tr><th>Id</th><th>Date</th><th>Fact</th><th>By</th><th>Standing</th><th></th></tr></thead>
+      <tbody>${(detail.history || []).map((f) => libFactRow(f, false)).join("")}</tbody></table>
+      <button class="btn" id="lib-hist-close" style="margin-top:8px">Close</button></div>` : "";
+  return `
+    <div class="head">
+      <div><h1>Library</h1><p>The fleet&rsquo;s memory, kept in ${esc(d.home)}&rsquo;s channel and signed. Anyone on the roster may add a fact; it waits as <i>unconfirmed</i> until the master confirms it. A fact is never edited: a newer one replaces it and the history stays. It never holds a secret, only where one lives. Advice only: nothing here changes code or settings.</p></div>
+    </div>
+    ${(d.notices || []).length ? `<div class="notice"><div><b>Warning:</b> ${(d.notices || []).map(esc).join("<br>")}<div class="s" style="color:var(--dim);margin-top:6px">This machine keeps using what it saw before. The master can settle it.</div></div></div>` : ""}
+    ${d.rejected ? `<div class="notice"><div>${esc(String(d.rejected))} line${d.rejected === 1 ? "" : "s"} in the library files were read and not believed (a bad signature, no authority, or something that looked like a secret).</div></div>` : ""}
+    ${conflicts}
+    <div class="cards">
+      <div class="card"><div class="k">Confirmed</div><div class="v num">${esc(String(c.confirmed || 0))}</div></div>
+      <div class="card"><div class="k">Waiting for the master</div><div class="v num">${esc(String(c.unconfirmed || 0))}</div><div class="s">${may ? "Decide below" : "Only the master decides"}</div></div>
+      <div class="card"><div class="k">Replaced</div><div class="v num">${esc(String(c.replaced || 0))}</div></div>
+      <div class="card"><div class="k">Retracted</div><div class="v num">${esc(String(c.retracted || 0))}</div></div>
+    </div>
+    <div class="panel" style="padding:14px 16px;margin:14px 0">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input type="text" id="lib-q" maxlength="600" placeholder="Search the library, or ask it a question" value="${esc(state.libQuery || "")}" style="flex:1;min-width:240px">
+        <button class="btn" id="lib-search">Search</button>
+        <button class="btn primary" id="lib-ask">Ask</button>
+        <label class="s"><input type="checkbox" id="lib-all" ${state.libAll ? "checked" : ""}> include replaced and retracted</label>
+      </div>
+      <div class="s" id="lib-answer" style="margin-top:10px;white-space:pre-wrap"></div>
+      <div class="s" style="color:var(--dim);margin-top:6px">Ask shows the best matching facts with their ids and dates, or &ldquo;I don&rsquo;t know&rdquo;. <span class="mono">ferry ask --library</span> puts them in words with a cheap model that has no tools.</div>
+    </div>
+    ${found ? `<h2 style="margin:18px 0 8px">Matches for &ldquo;${esc(state.libQuery)}&rdquo;</h2>${foundRows ? `<div class="panel scroll"><table class="grid"><thead><tr><th>Id</th><th>Date</th><th>Fact</th><th>Standing</th><th>By</th></tr></thead><tbody>${foundRows}</tbody></table></div>` : `<div class="empty">I don&rsquo;t know. The library has nothing on that.</div>`}` : ""}
+    ${history}
+    <span class="s" id="lib-msg" style="color:var(--dim)"></span>
+    ${waiting ? `<h2 style="margin:18px 0 8px">Waiting for the master</h2><div class="panel scroll"><table class="grid"><thead><tr><th>Id</th><th>Date</th><th>Fact</th><th>By</th><th>Standing</th><th></th></tr></thead><tbody>${waiting}</tbody></table></div>` : ""}
+    <h2 style="margin:18px 0 8px">Facts</h2>
+    <div class="panel scroll"><table class="grid"><thead><tr><th>Id</th><th>Date</th><th>Fact</th><th>By</th><th>Standing</th><th></th></tr></thead>
+      <tbody>${facts || `<tr><td colspan="6"><div class="empty">Nothing has been remembered yet. Write the first fact below, or run <span class="mono">ferry remember</span>.</div></td></tr>`}</tbody></table></div>
+    <h2 style="margin:18px 0 8px">Write a fact</h2>
+    <div class="panel" style="padding:14px 16px">
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input type="text" id="lib-subject" maxlength="120" placeholder="Subject" style="min-width:180px">
+        <input type="text" id="lib-project" maxlength="64" placeholder="Project (optional)" style="min-width:160px">
+        <input type="text" id="lib-tags" maxlength="120" placeholder="Tags, comma separated" style="min-width:180px">
+        <input type="text" id="lib-supersedes" maxlength="120" placeholder="Replaces fact ids (optional)" style="min-width:200px">
+      </div>
+      <textarea id="lib-text" maxlength="1000" rows="3" placeholder="The fact, up to 1000 characters. Never a secret: say where it lives (&ldquo;NVIDIA key: Custodly, name nvidiaapi&rdquo;)." style="width:100%;margin-top:8px"></textarea>
+      <div style="margin-top:8px"><button class="btn primary" id="lib-remember">Write it</button>
+        <span class="s" style="color:var(--dim)">${may ? "You are the master: it is confirmed at once." : "It waits for the master to confirm it."}</span></div>
+    </div>
+    <h2 style="margin:18px 0 8px">Generated pages</h2>
+    <div class="s" style="color:var(--dim);margin-bottom:6px">Read from live state by the librarian and refreshed every ten minutes: machines and their workers, engines, projects with their focus tier and self-improve, suggestion inboxes, where each secret lives (names only, never a value). Nobody confirms these.</div>
+    ${views || `<div class="empty">No generated pages yet: <span class="mono">ferry library views --refresh</span>, or run the librarian.</div>`}
+    <h2 style="margin:18px 0 8px">Mail desk</h2>
+    <div class="s" style="color:var(--dim);margin-bottom:8px">The shared agent inbox. n8n drops each mail in a folder; the librarian reads it as quoted data with a model that has no tools, files it, and drafts a fixed reply about the sender&rsquo;s own request (never a fact). Mail is never a reviewed suggestion: at most the sender is told how to submit one properly.</div>
+    ${asking ? `<h3 style="margin:12px 0 6px">Needs the master</h3>${asking}` : `<div class="empty">Nothing in the mail needs the master.</div>`}
+    ${mail && mail.desk_here ? `<h3 style="margin:12px 0 6px">On this machine&rsquo;s desk</h3>
+      <div class="panel scroll"><table class="grid"><thead><tr><th>Mail</th><th>Stage</th><th>Project</th><th>Decision</th><th>Subject</th><th>Reading</th></tr></thead><tbody>${items || `<tr><td colspan="6"><div class="empty">The desk is empty.</div></td></tr>`}</tbody></table></div>
+      ${outbox ? `<h3 style="margin:12px 0 6px">Replies waiting to be sent</h3><ul class="s">${outbox}</ul>` : ""}` : ""}
+    ${ledger ? `<h3 style="margin:12px 0 6px">Recent, from the signed ledger</h3><ul>${ledger}</ul>` : ""}
+    <h3 style="margin:12px 0 6px">Mail tags</h3>
+    <div class="s" style="color:var(--dim);margin-bottom:6px">A subject tag such as <span class="mono">[REDAKTLY]</span> routes a mail to a project. A tag that is not mapped goes to the master.</div>
+    <div class="panel scroll"><table class="grid"><tbody>${tagRows || `<tr><td><div class="empty">No tags are mapped.</div></td></tr>`}</tbody></table></div>
+    ${may ? `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><input type="text" id="lib-tag" maxlength="32" placeholder="tag"><input type="text" id="lib-tag-project" maxlength="64" placeholder="project"><button class="btn" id="lib-tag-add">Map it</button></div>` : ""}`;
+};
+function wireLibrary() {
+  const msg = (text) => { const m = $("#lib-msg"); if (m) m.textContent = String(text).slice(0, 300); };
+  const post = async (path, body) => {
+    try {
+      await api(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      await render();
+    } catch (err) { msg(err.message || err); }
+  };
+  const q = $("#lib-q");
+  const search = $("#lib-search");
+  if (search) search.addEventListener("click", async () => { state.libQuery = q.value.trim(); await render(); });
+  if (q) q.addEventListener("keydown", async (e) => { if (e.key === "Enter") { state.libQuery = q.value.trim(); await render(); } });
+  const all = $("#lib-all");
+  if (all) all.addEventListener("change", async () => { state.libAll = all.checked; await render(); });
+  const ask = $("#lib-ask");
+  if (ask) ask.addEventListener("click", async () => {
+    const out = $("#lib-answer");
+    try {
+      const a = await api("/api/library/ask", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ question: q.value }) });
+      out.textContent = a.known
+        ? (a.facts || []).map((f) => `${f.id} (${String(f.date)}, ${f.status}) ${f.subject}: ${f.text}`).join("\n")
+        : a.answer;
+    } catch (err) { out.textContent = String(err.message || err).slice(0, 300); }
+  });
+  for (const b of $$("[data-lib-hist]")) b.addEventListener("click", async () => { state.libFact = b.dataset.libHist; await render(); });
+  const close = $("#lib-hist-close");
+  if (close) close.addEventListener("click", async () => { state.libFact = null; await render(); });
+  for (const b of $$("[data-lib-confirm]")) b.addEventListener("click", () => post("/api/library/confirm", { id: b.dataset.libConfirm }));
+  for (const b of $$("[data-lib-retract]")) {
+    b.addEventListener("click", () => {
+      const reason = window.prompt("Why is it retracted? (optional, it stays in the history)", "") || "";
+      post("/api/library/retract", { id: b.dataset.libRetract, reason });
+    });
+  }
+  const remember = $("#lib-remember");
+  if (remember) remember.addEventListener("click", () => {
+    const list = (id) => $(id).value.split(",").map((s) => s.trim()).filter(Boolean);
+    post("/api/library/remember", {
+      text: $("#lib-text").value, subject: $("#lib-subject").value, project: $("#lib-project").value,
+      tags: list("#lib-tags"), supersedes: list("#lib-supersedes") });
+  });
+  const tagMap = () => {
+    const map = {};
+    for (const b of $$("[data-lib-tag-remove]")) map[b.dataset.libTagRemove] = b.closest("tr").children[1].textContent;
+    return map;
+  };
+  for (const b of $$("[data-lib-tag-remove]")) {
+    b.addEventListener("click", () => {
+      const map = tagMap();
+      delete map[b.dataset.libTagRemove];
+      post("/api/library/tags", { tags: map });
+    });
+  }
+  const add = $("#lib-tag-add");
+  if (add) add.addEventListener("click", () => {
+    const map = tagMap();
+    map[$("#lib-tag").value.trim().replace(/^\[|\]$/g, "").toLowerCase()] = $("#lib-tag-project").value.trim();
+    post("/api/library/tags", { tags: map });
+  });
+}
 pages.fleet = async () => {
   const d = await api("/api/fleet");
   const machines = d.machines || [];
@@ -2996,6 +3193,7 @@ async function render() {
   wireContracts();
   wireFocus();
   wireSuggestions();
+  wireLibrary();
   wireVault();
 }
 
@@ -3073,8 +3271,8 @@ function setSync(tone, text) {
 }
 
 async function refresh() {
-  const [tasks, roster, suggestions] = await Promise.allSettled([
-    api("/api/tasks"), api("/api/roster"), api("/api/suggestions")]);
+  const [tasks, roster, suggestions, library] = await Promise.allSettled([
+    api("/api/tasks"), api("/api/roster"), api("/api/suggestions"), api("/api/library")]);
 
   if (tasks.status === "fulfilled") {
     const d = tasks.value;
@@ -3096,6 +3294,10 @@ async function refresh() {
   $("#count-suggestions").textContent =
     suggestions.status === "fulfilled" && suggestions.value && suggestions.value.available
       ? Number(suggestions.value.waiting) || 0 : 0;
+  // Facts waiting for the master to confirm, plus mail that needs them.
+  $("#count-library").textContent =
+    library.status === "fulfilled" && library.value && library.value.available
+      ? (Number((library.value.counts || {}).unconfirmed) || 0) : 0;
   renderProjects();
 
   // The indicator reports what this page can see, not what Syncthing thinks.
