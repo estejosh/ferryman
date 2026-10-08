@@ -258,6 +258,29 @@ agent. `ferry loadmem`, `ferry channel status` and `ferry channel head` all prin
 who it is. When he names someone else, they are head agent from then on.
 `ferry channel head step-down` gives the role back.
 
+### Handing work in
+
+Only the head agent pushes. Every other agent hands its work in, and the head
+reviews it and pushes. A worker that finishes an order in its own worktree writes a
+signed patch into the project's work folder, `work\<project>` in the ferry root (or
+`handins` inside the channel folder when there is no root), which Syncthing carries
+to the head's machine. No worker needs a token that can write to the repository.
+
+```sh
+ferry work list                          # hand-ins waiting, accepted or rejected, and whether each signature checks out
+ferry work accept <order>                # head only: verify, apply in your checkout with git am, push
+ferry work accept <order> --no-push      # apply, but look before you push
+ferry work reject <order> --reason "..." # head only: send it back, with why
+ferry work hand-in --order <order>       # by hand, from any checkout (the worker loop does this itself)
+```
+
+`accept` refuses anyone who is not the head, refuses a patch whose signature or
+checksum does not match, and leaves your checkout untouched if the patch does not
+apply. The worker stays the author of the commits; the head is the committer; no
+trailers are added. `ferry doctor` shows the work folder and whether this machine
+pushes or hands in, and notes GitHub tokens that are missing, orphaned or broader
+than they need to be. It only advises. See `docs/adr/0023-agents-hand-in-heads-push.md`.
+
 ### Every week, once, from anywhere
 
 ```sh
