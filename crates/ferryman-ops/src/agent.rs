@@ -4332,11 +4332,19 @@ fn settle_worktree(
     payload: &mut Value,
     report: &dyn Progress,
 ) {
-    // Only the project's head pushes (ADR 0023). A head that cannot be read counts as not
-    // being the head: handing in is always safe, pushing on a guess is not.
-    let is_head =
-        ferryman_channel::head::is_head(&route.communications, &route.project_id, &config.agent)
-            .unwrap_or(false);
+    // Hand-in mode is on only when the project has a head (ADR 0023). With none named,
+    // or with the head unreadable, everyone behaves as before: push if `push` is set.
+    let role = match ferryman_channel::head::current(&route.communications, &route.project_id) {
+        Ok(Some(head)) if head.agent.eq_ignore_ascii_case(&config.agent) => Standing::Head,
+        Ok(Some(_)) => Standing::Worker,
+        Ok(None) => Standing::NoHead,
+        Err(error) => {
+            report.warn(&format!(
+                "  {id}: could not read who the head is ({error:#}); treating the project as having none"
+            ));
+            Standing::NoHead
+        }
+    };
     settle_worktree_as(
         route,
         config,
@@ -4347,15 +4355,27 @@ fn settle_worktree(
         workdir,
         payload,
         report,
-        is_head,
+        role,
     );
 }
 
-/// [`settle_worktree`], told whether this agent is the head rather than asking.
+/// Where this agent stands on pushing versus handing in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    /// The project has no head: behave as v0.5.26 did (push if `push` is set).
+    NoHead,
+    /// This agent is the head.
+    Head,
+    /// The project has a head and it is someone else.
+    Worker,
+}
+
+/// [`settle_worktree`], told its [`Standing`] rather than asking.
 ///
-/// The head with a `push` remote publishes the branch as it always has. Everyone else - and
-/// the head with nowhere to push - hands the branch in as a signed patch in the work folder,
-/// so finished work never stays on one disk and a worker never needs a write token.
+/// With no head named nothing changes. Once there is one, the head with a `push` remote
+/// publishes the branch as it always has; everyone else - and the head with nowhere to
+/// push - hands the branch in as a signed patch in the work folder, so finished work never
+/// stays on one disk and a worker never needs a write token.
 #[allow(clippy::too_many_arguments)]
 fn settle_worktree_as(
     route: &ProjectRoute,
@@ -4367,7 +4387,7 @@ fn settle_worktree_as(
     workdir: &Path,
     payload: &mut Value,
     report: &dyn Progress,
-    is_head: bool,
+    role: Standing,
 ) {
     let subject = commit_subject(id, &task.order);
     match ferryman_channel::worktree::commit_all(workdir, &config.agent, &subject) {
@@ -4390,8 +4410,8 @@ fn settle_worktree_as(
     match ferryman_channel::worktree::retire_worktree(&route.workspace, branch, base_commit) {
         Ok(true) => {
             payload["branch_kept"] = json!(true);
-            let push_to = config.push.as_ref().filter(|_| is_head);
-            if push_to.is_none() {
+            let push_to = config.push.as_ref().filter(|_| role != Standing::Worker);
+            if push_to.is_none() && role != Standing::NoHead {
                 hand_in(route, config, id, branch, base_commit, payload, report);
             }
             if let Some(remote) = push_to {
@@ -6298,7 +6318,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
-            true,
+            Standing::Head,
         );
 
         assert_eq!(payload["branch_kept"], json!(true));
@@ -6353,7 +6373,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
-            true,
+            Standing::Head,
         );
 
         assert!(payload.get("pushed").is_none(), "no work means no push");
@@ -6407,7 +6427,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
-            true,
+            Standing::Head,
         );
 
         assert_eq!(payload["branch_kept"], json!(true));
@@ -6460,7 +6480,7 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
-            false,
+            Standing::Worker,
         );
 
         assert_eq!(payload["branch_kept"], json!(true));
@@ -6514,10 +6534,65 @@ mod tests {
             &dir,
             &mut payload,
             &crate::Silent,
-            true,
+            Standing::Head,
         );
         assert!(payload["handin"].is_string());
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    /// With no head named, nothing changes from v0.5.26: `push` pushes, and with no `push`
+    /// the branch is left alone. No hand-in is written either way.
+    #[test]
+    fn with_no_head_named_agents_push_as_before_and_never_hand_in() {
+        hermetic_machine();
+        for (order, push) in [("NOHEAD-A", true), ("NOHEAD-B", false)] {
+            let repo = unique("ferryman-agent-nohead");
+            let remote = unique("ferryman-agent-nohead-remote.git");
+            fs::create_dir_all(&repo).unwrap();
+            run_git(&repo, &["init", "-q", "--template="]);
+            run_git(&repo, &["config", "user.email", "t@example.com"]);
+            run_git(&repo, &["config", "user.name", "tester"]);
+            fs::write(repo.join("f.txt"), "hello").unwrap();
+            run_git(&repo, &["add", "f.txt"]);
+            run_git(&repo, &["commit", "-q", "-m", "init"]);
+            init_bare(&remote);
+            run_git(
+                &repo,
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
+            let base = run_git(&repo, &["rev-parse", "HEAD"]);
+            let (dir, branch) =
+                ferryman_channel::worktree::create_worktree(&repo, order, "worker").unwrap();
+            fs::write(dir.join("answer.txt"), "x").unwrap();
+            let route = project_route(&repo);
+            let task = test_task(order);
+            let config = AgentConfig::parse(&format!(
+                "agent = \"worker\"\ncommand = \"claude\"\n{}",
+                if push { "push = \"origin\"\n" } else { "" }
+            ))
+            .unwrap();
+            let mut payload = json!({});
+            settle_worktree_as(
+                &route,
+                &config,
+                &task,
+                order,
+                &branch,
+                &base,
+                &dir,
+                &mut payload,
+                &crate::Silent,
+                Standing::NoHead,
+            );
+            assert!(payload.get("handin").is_none() && payload.get("handin_failed").is_none());
+            assert_eq!(payload.get("pushed").is_some(), push);
+            assert_eq!(
+                !run_git(&repo, &["ls-remote", "origin", branch.as_str()]).is_empty(),
+                push
+            );
+            let _ = fs::remove_dir_all(&repo);
+            let _ = fs::remove_dir_all(&remote);
+        }
     }
 
     /// Point this thread's machine state (keys, the pause marker) at a temporary

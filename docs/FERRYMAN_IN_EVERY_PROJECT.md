@@ -260,7 +260,7 @@ who it is. When he names someone else, they are head agent from then on.
 
 ### Handing work in
 
-Only the head agent pushes. Every other agent hands its work in, and the head
+Once a head agent is named, only the head pushes (until then, workers push as before). Every other agent hands its work in, and the head
 reviews it and pushes. A worker that finishes an order in its own worktree writes a
 signed patch into the project's work folder, `work\<project>` in the ferry root (or
 `handins` inside the channel folder when there is no root), which Syncthing carries

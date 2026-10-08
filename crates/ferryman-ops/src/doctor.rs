@@ -111,6 +111,19 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
+/// What the `handin_mode` check says: hand-ins switch on only once a head is named.
+#[must_use]
+pub fn handin_mode(head: Option<&str>, agent: &str, work: &Path) -> String {
+    match head {
+        None => {
+            "no head named - workers push as before; the master names a head to switch on hand-ins"
+                .to_string()
+        }
+        Some(head) if head.eq_ignore_ascii_case(agent) => "head - pushes reviewed work".to_string(),
+        Some(_) => format!("worker - hands in to {}", work.display()),
+    }
+}
+
 /// A secret as the token check sees it: its name and who it is sealed to. Never its value.
 #[derive(Debug, Clone)]
 pub struct SecretFact {
@@ -632,18 +645,11 @@ pub fn examine(start: &Path) -> Report {
         .ok()
         .flatten()
         .map(|head| head.agent);
-    let is_head = head
-        .as_deref()
-        .is_some_and(|head| head.eq_ignore_ascii_case(&config.agent));
     checks.push(check(
         "handin_mode",
         true,
         false,
-        if is_head {
-            "head - pushes reviewed work".to_string()
-        } else {
-            format!("worker - hands in to {}", work.display())
-        },
+        handin_mode(head.as_deref(), &config.agent, &work),
     ));
     checks.push(token_check(&route, &config.agent, head.as_deref()));
 
@@ -904,6 +910,17 @@ mod tests {
             .unwrap();
         assert!(!engine.ok);
         assert!(engine.detail.contains("agent.toml"), "{:?}", engine.detail);
+    }
+
+    #[test]
+    fn handin_mode_reads_head_worker_or_no_head() {
+        let work = Path::new("w");
+        assert!(handin_mode(None, "a", work).starts_with("no head named"));
+        assert_eq!(
+            handin_mode(Some("A"), "a", work),
+            "head - pushes reviewed work"
+        );
+        assert_eq!(handin_mode(Some("b"), "a", work), "worker - hands in to w");
     }
 
     fn secret(name: &str, to: &[&str]) -> SecretFact {
