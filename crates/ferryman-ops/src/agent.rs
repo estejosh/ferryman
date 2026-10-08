@@ -6948,7 +6948,8 @@ mod tests {
 
     #[test]
     fn the_files_a_commit_changed_are_recorded_and_a_stray_is_only_a_note() {
-        // Not the head, so the branch is handed in: keep that inside this test's machine.
+        // No head is named in this channel, so the branch is settled as before (no hand-in);
+        // the machine is hermetic anyway so nothing leaks onto the real one.
         hermetic_machine();
         let repo = unique("ferryman-agent-touched");
         fs::create_dir_all(&repo).unwrap();

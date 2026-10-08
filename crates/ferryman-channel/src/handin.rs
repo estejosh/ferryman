@@ -511,7 +511,9 @@ pub fn accept(
         );
     }
     if !git_text(workspace, &["remote"])?.is_empty() {
-        git_out(workspace, &["fetch"])?;
+        // Best effort, like the fast-forward below: an offline head can still apply and
+        // review with --no-push, and a real push will report the network itself.
+        let _ = git_out(workspace, &["fetch"]);
         // Catch up with upstream when that is a plain fast-forward; a checkout that has
         // diverged is left alone and `push` will say so.
         let _ = git_out(workspace, &["merge", "--ff-only", "--quiet", "@{upstream}"]);
