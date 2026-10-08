@@ -43,7 +43,7 @@ pub fn is_object_id(value: &str) -> bool {
 /// Refuse a value that git could read as an option or that cannot be one argument: empty,
 /// leading `-`, NUL or a newline. For revisions and refs this crate derives itself and
 /// still would not like to see turn into a flag.
-fn plain_argument(value: &str, what: &str) -> Result<()> {
+pub(crate) fn plain_argument(value: &str, what: &str) -> Result<()> {
     if value.trim().is_empty() || value.starts_with('-') || value.contains(['\0', '\n', '\r']) {
         bail!("{what} is not something to hand to git: {value:?}");
     }

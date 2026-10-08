@@ -1068,8 +1068,9 @@ fn order_text(
         let _ = writeln!(text, "- {check}");
     }
     text.push_str(
-        "\nWork on this task's own branch. Do not merge, push to a main branch, or bump the \
-         version: a reviewer checks the result and a person merges it.",
+        "\nWork on this task's own branch and commit it there. Do not merge, push, or bump \
+         the version: Ferryman hands your work in for review, and the head pushes what \
+         passes.",
     );
     text
 }

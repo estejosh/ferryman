@@ -250,6 +250,8 @@ fn master_of(channel: &Path, project_id: &str) -> Result<Option<(String, Vec<Age
 ///
 /// Anything that does not check out - not the master's words, not naming the agent, not
 /// signed by it - is passed over as though it were not there.
+///
+/// See also [`is_head`], for the yes/no question.
 pub fn current(channel: &Path, project_id: &str) -> Result<Option<Head>> {
     let dir = channel.join("head");
     if !dir.is_dir() {
@@ -276,6 +278,11 @@ pub fn current(channel: &Path, project_id: &str) -> Result<Option<Head>> {
         }
     }
     Ok(best)
+}
+
+/// Whether `agent` is the current head of this project.
+pub fn is_head(channel: &Path, project_id: &str, agent: &str) -> Result<bool> {
+    Ok(current(channel, project_id)?.is_some_and(|head| head.agent.eq_ignore_ascii_case(agent)))
 }
 
 fn json_files(dir: &Path) -> Vec<Vec<u8>> {
@@ -478,6 +485,20 @@ mod tests {
         let head = claim(&fleet.channel, "proj", &fleet.grouchly, None).unwrap();
         assert_eq!(head.order.words(), "grouchly, you're head agent for now");
         assert_eq!(head_of(&fleet).as_deref(), Some("grouchly"));
+    }
+
+    /// Head is a role: true for the one appointed, false for everyone else and for nobody.
+    #[test]
+    fn is_head_is_true_only_for_the_appointed_agent() {
+        let fleet = fleet();
+        assert!(!is_head(&fleet.channel, "proj", "grouchly").unwrap());
+        record_said(&fleet.channel, "proj", &fleet.josh, "grouchly is head").unwrap();
+        claim(&fleet.channel, "proj", &fleet.grouchly, None).unwrap();
+        assert!(is_head(&fleet.channel, "proj", "grouchly").unwrap());
+        assert!(is_head(&fleet.channel, "proj", "Grouchly").unwrap());
+        assert!(!is_head(&fleet.channel, "proj", "beastly").unwrap());
+        step_down(&fleet.channel, "grouchly").unwrap();
+        assert!(!is_head(&fleet.channel, "proj", "grouchly").unwrap());
     }
 
     /// "For now" ends when the master names someone else.

@@ -111,6 +111,155 @@ fn is_executable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|meta| meta.is_file())
 }
 
+/// What the `handin_mode` check says: hand-ins switch on only once a head is named.
+#[must_use]
+pub fn handin_mode(head: Option<&str>, agent: &str, work: &Path) -> String {
+    match head {
+        None => {
+            "no head named - workers push as before; the master names a head to switch on hand-ins"
+                .to_string()
+        }
+        Some(head) if head.eq_ignore_ascii_case(agent) => "head - pushes reviewed work".to_string(),
+        Some(_) => format!("worker - hands in to {}", work.display()),
+    }
+}
+
+/// A secret as the token check sees it: its name and who it is sealed to. Never its value.
+#[derive(Debug, Clone)]
+pub struct SecretFact {
+    pub name: String,
+    pub recipients: Vec<String>,
+}
+
+/// `GRP-1.local` becomes `GRP_1_LOCAL`: the part of `GH_RO_<MACHINE>` that names a machine.
+#[must_use]
+pub fn machine_token_suffix(host: &str) -> String {
+    host.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// What is wrong with a project's GitHub tokens, from names and recipients alone.
+///
+/// Pure and advisory: nothing here opens a secret, and the librarian never revokes or
+/// rotates. `machine` is the `<MACHINE>` of `GH_RO_<MACHINE>`; `live` is every roster
+/// name that is neither retired nor missing; `head` is the project's current head.
+#[must_use]
+pub fn token_notes(
+    machine: &str,
+    agent: &str,
+    head: Option<&str>,
+    live: &[String],
+    secrets: &[SecretFact],
+) -> Vec<String> {
+    let same = |a: &str, b: &str| a.eq_ignore_ascii_case(b);
+    let mut notes = Vec::new();
+
+    let mine = format!("GH_RO_{machine}");
+    let has_read_token = secrets.iter().any(|secret| {
+        same(&secret.name, &mine)
+            || (secret.name.to_ascii_uppercase().starts_with("GH_RO_")
+                && secret.recipients.iter().any(|who| same(who, agent)))
+    });
+    if !has_read_token {
+        notes.push(format!(
+            "missing: no {mine} (or other GH_RO_*) sealed to {agent}, so workers here cannot pull private repositories"
+        ));
+    }
+
+    for secret in secrets {
+        if secret
+            .recipients
+            .iter()
+            .all(|who| !live.iter().any(|live| same(live, who)))
+        {
+            notes.push(format!(
+                "orphaned: {} is sealed only to identities that are retired or not on the roster",
+                secret.name
+            ));
+        }
+    }
+
+    for secret in secrets {
+        let upper = secret.name.to_ascii_uppercase();
+        if upper == "GITHUB_TOKEN" || upper == "GH_TOKEN" {
+            notes.push(format!(
+                "over-scoped: {} cannot be told from its name to be read-only or write; \
+                 rename it by type, GH_RO_<MACHINE> or GH_RW_<PROJECT>",
+                secret.name
+            ));
+        } else if upper.starts_with("GH_RW_") {
+            let loose: Vec<&str> = secret
+                .recipients
+                .iter()
+                .filter(|who| !head.is_some_and(|head| same(head, who)))
+                .map(String::as_str)
+                .collect();
+            if !loose.is_empty() {
+                notes.push(format!(
+                    "over-scoped: {} is sealed to {}, who {} not the head; only the head needs write access",
+                    secret.name,
+                    loose.join(", "),
+                    if loose.len() == 1 { "is" } else { "are" }
+                ));
+            }
+        }
+    }
+    notes
+}
+
+fn token_check(route: &ferryman_channel::ProjectRoute, agent: &str, head: Option<&str>) -> Check {
+    let secrets = match ferryman_channel::secrets::list_secrets(route) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            return check(
+                "tokens",
+                false,
+                false,
+                format!("could not list secrets: {error:#}"),
+            );
+        }
+    };
+    let facts: Vec<SecretFact> = secrets
+        .into_iter()
+        .map(|secret| SecretFact {
+            name: secret.name,
+            recipients: secret.recipients,
+        })
+        .collect();
+    let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+    let live: Vec<String> = roster
+        .iter()
+        .filter(|member| {
+            !ferryman_channel::master::is_revoked_in(&route.communications, &roster, &member.name)
+        })
+        .map(|member| member.name.clone())
+        .collect();
+    let host = hostname::get()
+        .map(|host| host.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let notes = token_notes(&machine_token_suffix(&host), agent, head, &live, &facts);
+    if notes.is_empty() {
+        // TODO: warn at 14 and 3 days from GitHub's token-expiration header. That needs
+        // the token opened and a request to GitHub; this check deliberately does neither.
+        check(
+            "tokens",
+            true,
+            false,
+            format!("{} secret(s); expiry is not checked yet", facts.len()),
+        )
+    } else {
+        check("tokens", false, false, notes.join("; "))
+    }
+}
+
 fn check(name: &'static str, ok: bool, required: bool, detail: String) -> Check {
     Check {
         name,
@@ -477,6 +626,33 @@ pub fn examine(start: &Path) -> Report {
     let (level, detail) = version_skew(env!("CARGO_PKG_VERSION"), &fleet);
     checks.push(check("versions", level, false, detail));
 
+    // Hand-ins and tokens (ADR 0023). Advice only: none of this stops a machine working.
+    let work = ferryman_channel::handin::work_dir(&route);
+    checks.push(check(
+        "work_folder",
+        work.is_dir(),
+        false,
+        if work.is_dir() {
+            work.display().to_string()
+        } else {
+            format!(
+                "{} does not exist yet - 'ferry doctor --fix' creates it",
+                work.display()
+            )
+        },
+    ));
+    let head = ferryman_channel::head::current(&route.communications, &route.project_id)
+        .ok()
+        .flatten()
+        .map(|head| head.agent);
+    checks.push(check(
+        "handin_mode",
+        true,
+        false,
+        handin_mode(head.as_deref(), &config.agent, &work),
+    ));
+    checks.push(token_check(&route, &config.agent, head.as_deref()));
+
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {
         project: route.project_id,
@@ -734,5 +910,139 @@ mod tests {
             .unwrap();
         assert!(!engine.ok);
         assert!(engine.detail.contains("agent.toml"), "{:?}", engine.detail);
+    }
+
+    #[test]
+    fn handin_mode_reads_head_worker_or_no_head() {
+        let work = Path::new("w");
+        assert!(handin_mode(None, "a", work).starts_with("no head named"));
+        assert_eq!(
+            handin_mode(Some("A"), "a", work),
+            "head - pushes reviewed work"
+        );
+        assert_eq!(handin_mode(Some("b"), "a", work), "worker - hands in to w");
+    }
+
+    fn secret(name: &str, to: &[&str]) -> SecretFact {
+        SecretFact {
+            name: name.into(),
+            recipients: to.iter().map(|who| (*who).to_string()).collect(),
+        }
+    }
+
+    fn names(who: &[&str]) -> Vec<String> {
+        who.iter().map(|who| (*who).to_string()).collect()
+    }
+
+    #[test]
+    fn a_machine_suffix_is_the_hostname_in_capitals_with_underscores() {
+        assert_eq!(machine_token_suffix("grouchly"), "GROUCHLY");
+        assert_eq!(machine_token_suffix(" my-box.local "), "MY_BOX_LOCAL");
+    }
+
+    #[test]
+    fn a_machine_with_its_read_token_and_nothing_else_is_clean() {
+        let notes = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            Some("beastly"),
+            &names(&["grouchly", "beastly"]),
+            &[secret("GH_RO_GROUCHLY", &["grouchly"])],
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn a_missing_read_token_is_noted_unless_any_gh_ro_is_sealed_to_this_agent() {
+        let live = names(&["grouchly"]);
+        let none = token_notes("GROUCHLY", "grouchly", None, &live, &[]);
+        assert!(
+            none.iter().any(|note| note.starts_with("missing")),
+            "{none:?}"
+        );
+        let someone_elses = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            None,
+            &names(&["grouchly", "beastly"]),
+            &[secret("GH_RO_BEASTLY", &["beastly"])],
+        );
+        assert!(someone_elses.iter().any(|note| note.starts_with("missing")));
+        let shared = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            None,
+            &live,
+            &[secret("gh_ro_shared", &["grouchly"])],
+        );
+        assert!(shared.is_empty(), "{shared:?}");
+    }
+
+    #[test]
+    fn a_secret_only_retired_or_unrostered_identities_can_open_is_orphaned() {
+        let notes = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            None,
+            &names(&["grouchly"]),
+            &[
+                secret("GH_RO_GROUCHLY", &["grouchly"]),
+                secret("OLD_KEY", &["gone", "retired"]),
+                secret("MIXED", &["gone", "grouchly"]),
+            ],
+        );
+        let orphaned: Vec<_> = notes.iter().filter(|n| n.starts_with("orphaned")).collect();
+        assert_eq!(orphaned.len(), 1, "{notes:?}");
+        assert!(orphaned[0].contains("OLD_KEY"));
+    }
+
+    #[test]
+    fn write_tokens_belong_to_the_head_and_bare_names_hide_their_type() {
+        let live = names(&["grouchly", "beastly"]);
+        let ro = secret("GH_RO_GROUCHLY", &["grouchly"]);
+        let ok = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            Some("beastly"),
+            &live,
+            &[ro.clone(), secret("GH_RW_FERRYMAN", &["beastly"])],
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+
+        let loose = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            Some("beastly"),
+            &live,
+            &[
+                ro.clone(),
+                secret("GH_RW_FERRYMAN", &["beastly", "grouchly"]),
+            ],
+        );
+        assert_eq!(loose.len(), 1, "{loose:?}");
+        assert!(loose[0].starts_with("over-scoped") && loose[0].contains("grouchly"));
+
+        let no_head = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            None,
+            &live,
+            &[ro.clone(), secret("GH_RW_FERRYMAN", &["beastly"])],
+        );
+        assert_eq!(no_head.len(), 1, "{no_head:?}");
+
+        let bare = token_notes(
+            "GROUCHLY",
+            "grouchly",
+            None,
+            &live,
+            &[
+                ro,
+                secret("GITHUB_TOKEN", &["grouchly"]),
+                secret("gh_token", &["grouchly"]),
+            ],
+        );
+        assert_eq!(bare.len(), 2, "{bare:?}");
+        assert!(bare.iter().all(|note| note.contains("rename it by type")));
     }
 }

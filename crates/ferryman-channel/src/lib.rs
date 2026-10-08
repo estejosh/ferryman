@@ -31,6 +31,7 @@ pub mod ferry;
 pub mod focus;
 pub mod focus_suggest;
 pub mod gate;
+pub mod handin;
 pub mod head;
 pub mod hold;
 pub mod interface;
@@ -4788,6 +4789,50 @@ pub fn syncthing_register_folder(
     )
 }
 
+/// The Syncthing folder id for a project's hand-in folder (ADR 0023).
+#[must_use]
+pub fn work_folder_id(route: &ProjectRoute) -> String {
+    format!("{}-work", route.project_id)
+}
+
+/// Register a project's hand-in folder with the local Syncthing, shared with exactly the
+/// devices the channel folder is shared with. Each machine runs this for itself, which is
+/// also how the receiving side "accepts": it registers its own side of the same folder id.
+///
+/// Idempotent and quiet: when the folder is already registered at `path` with the same
+/// device set it writes nothing, so a worker can call it on every start.
+pub fn syncthing_register_work_folder(route: &ProjectRoute, path: &Path) -> Result<SyncthingSetup> {
+    let folder_id = work_folder_id(route);
+    let mut wanted = syncthing_folder_device_ids(route)?;
+    wanted.sort();
+    let state = syncthing_folder_state(&folder_id);
+    let in_step = state.is_some_and(|state| {
+        state.syncs(path)
+            && !state.registered_path.is_empty()
+            && folder_device_ids(&folder_id).is_ok_and(|mut have| {
+                have.sort();
+                have == wanted
+            })
+    });
+    if in_step {
+        return Ok(SyncthingSetup {
+            available: true,
+            folder_id,
+            folder_path: path.display().to_string(),
+            device_id: None,
+            shared_with: peers_for_ids(&wanted)?,
+            moved_from: None,
+            note: "work folder already registered and shared".to_string(),
+        });
+    }
+    register_folder(
+        &folder_id,
+        path,
+        &format!("{} ferryman work", route.project_id),
+        &peers_for_ids(&wanted)?,
+    )
+}
+
 /// Register the fleet channel, so identity and the device count actually travel.
 ///
 /// A fleet channel that only exists on one machine answers the same question the project
@@ -5049,7 +5094,11 @@ pub fn syncthing_channel_state(route: &ProjectRoute) -> Option<SyncthingFolderSt
 /// The device ids this project's channel folder is currently shared with
 /// (this machine excluded). Empty when the folder is not registered.
 pub fn syncthing_folder_device_ids(route: &ProjectRoute) -> Result<Vec<String>> {
-    let folder_id = channel_folder_id(route);
+    folder_device_ids(&channel_folder_id(route))
+}
+
+/// The device ids a Syncthing folder is shared with (this machine excluded).
+fn folder_device_ids(folder_id: &str) -> Result<Vec<String>> {
     let Some(key) = syncthing_api_key() else {
         return Ok(Vec::new());
     };
@@ -5067,7 +5116,7 @@ pub fn syncthing_folder_device_ids(route: &ProjectRoute) -> Result<Vec<String>> 
     let mut ids = Vec::new();
     if let Some(folders) = config.get("folders").and_then(Value::as_array) {
         for folder in folders {
-            if folder.get("id").and_then(Value::as_str) != Some(folder_id.as_str()) {
+            if folder.get("id").and_then(Value::as_str) != Some(folder_id) {
                 continue;
             }
             if let Some(devices) = folder.get("devices").and_then(Value::as_array) {

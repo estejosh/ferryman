@@ -247,6 +247,15 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// Hand finished work in, and (as the head) review and push it.
+    ///
+    /// A worker does not push. It hands its commits in as a signed patch in the synced
+    /// work folder; the head checks the signature, applies the patch in its own checkout
+    /// and pushes. The worker stays the author. See docs/adr/0023.
+    Work {
+        #[command(subcommand)]
+        command: WorkCommand,
+    },
     /// People on this project: invite one with a code, accept a code on a new machine.
     Team {
         #[command(subcommand)]
@@ -2501,6 +2510,51 @@ enum License {
 }
 
 #[derive(Subcommand, Clone)]
+enum WorkCommand {
+    /// Write a signed hand-in for the commits in a checkout: handin.patch and handin.json.
+    HandIn {
+        /// The order this work answers.
+        #[arg(long)]
+        order: String,
+        /// The commit the work started from. Defaults to where the checkout left the
+        /// project's default branch.
+        #[arg(long)]
+        base: Option<String>,
+        /// The git checkout holding the work. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// The hand-ins in the work folder: waiting, accepted or rejected, and whether each
+    /// signature checks out.
+    List {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Head only: verify a hand-in, apply it in your checkout and push it.
+    Accept {
+        /// The order to accept.
+        order: String,
+        /// Your checkout of the project. Defaults to where you are.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Apply it but do not push.
+        #[arg(long)]
+        no_push: bool,
+    },
+    /// Head only: send a hand-in back, with the reason.
+    Reject {
+        /// The order to reject.
+        order: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 enum Workers {
     Register {
         #[arg(long)]
@@ -4016,6 +4070,19 @@ async fn run(cli: Cli) -> Result<()> {
                     Err(_) => {}
                 }
             }
+            if fix && let Ok(route) = ferryman_channel::route_for(&start) {
+                match ferryman_channel::handin::ensure_work_ready(&route) {
+                    Ok(ready) if !json => println!(
+                        "  work folder {}{}: {}",
+                        ready.path.display(),
+                        if ready.created { " (created)" } else { "" },
+                        ready.sync
+                    ),
+                    Ok(_) => {}
+                    Err(err) if !json => println!("  could not prepare the work folder: {err:#}"),
+                    Err(_) => {}
+                }
+            }
             let report = ferryman_ops::doctor::examine(&start);
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -4045,6 +4112,7 @@ async fn run(cli: Cli) -> Result<()> {
                 bail!("readiness checks failed");
             }
         }
+        Command::Work { command } => work_command(command)?,
         Command::Team { command } => team_command(command).await?,
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
@@ -7238,6 +7306,9 @@ async fn run_fleet(
         let _ =
             ferryman_channel::licensing::refresh_device_version(route, env!("CARGO_PKG_VERSION"));
     }
+    // After an update nothing is run by a person: the first start on the new version makes
+    // the hand-in folders and shares them (ADR 0023).
+    prepare_work_folders(fleet.served.iter().map(|(route, _)| route), report);
     loop {
         // Keeping a long-running worker current.
         //
@@ -7616,6 +7687,7 @@ async fn agent_command(command: Agent) -> Result<()> {
             if let Some(window) = &config.claim_window {
                 report.info(&format!("  hours     claims work {}", window.describe()));
             }
+            prepare_work_folders([&route], &report);
             loop {
                 match agent::work_once(&route, &config, &report).await {
                     Ok(0) => {}
@@ -8281,6 +8353,133 @@ fn agent_name(value: &str) -> Result<String, String> {
         ));
     }
     Ok(folded)
+}
+
+/// `ferry work ...`: hand-ins (ADR 0023).
+fn work_command(command: WorkCommand) -> Result<()> {
+    use ferryman_channel::handin;
+    let here = |workspace: Option<PathBuf>| -> Result<PathBuf> {
+        match workspace {
+            Some(path) => Ok(path),
+            None => std::env::current_dir().context("read the current directory"),
+        }
+    };
+    match command {
+        WorkCommand::HandIn {
+            order,
+            base,
+            workspace,
+        } => {
+            let checkout = here(workspace)?;
+            let route = ferryman_channel::route_for(&checkout)?;
+            let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
+            // Best effort: the folder syncing is the worker loop's job, but a hand-in made
+            // by hand should not depend on the loop having run.
+            if let Err(error) = handin::ensure_work_ready(&route) {
+                eprintln!("note: could not prepare the work folder: {error:#}");
+            }
+            let folder = handin::create(
+                &route,
+                &identity,
+                &handin::work_dir(&route),
+                &order,
+                &handin::Cut {
+                    repo: &checkout,
+                    base: base.as_deref(),
+                    head: "HEAD",
+                    branch: &handin::branch_of(&checkout),
+                },
+            )?;
+            let (manifest, _, _) = handin::read(&route, &folder)?;
+            println!(
+                "handed in {order} as {agent}: {} file(s) against {}",
+                manifest.files.len(),
+                &manifest.base[..12.min(manifest.base.len())]
+            );
+            println!("  {}", folder.display());
+        }
+        WorkCommand::List { workspace, json } => {
+            let route = ferryman_channel::route_for(&here(workspace)?)?;
+            let entries = handin::list(&route, &handin::work_dir(&route))?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if entries.is_empty() {
+                println!("no hand-ins in {}", handin::work_dir(&route).display());
+            } else {
+                for entry in &entries {
+                    println!(
+                        "  {:<24} {:<9} signature {:<11} {} ({} file(s))",
+                        entry.order,
+                        entry.status.as_str(),
+                        entry.signature,
+                        entry.agent,
+                        entry.files
+                    );
+                }
+            }
+        }
+        WorkCommand::Accept {
+            order,
+            workspace,
+            no_push,
+        } => {
+            let checkout = here(workspace)?;
+            let route = ferryman_channel::route_for(&checkout)?;
+            let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let applied = handin::accept(
+                &route,
+                &handin::work_dir(&route),
+                &order,
+                &agent,
+                &checkout,
+                !no_push,
+            )?;
+            println!(
+                "accepted {order}: applied as {}{}",
+                &applied.commit[..12.min(applied.commit.len())],
+                if applied.pushed {
+                    ", pushed"
+                } else {
+                    ", not pushed"
+                }
+            );
+        }
+        WorkCommand::Reject {
+            order,
+            reason,
+            workspace,
+        } => {
+            let route = ferryman_channel::route_for(&here(workspace)?)?;
+            let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            handin::reject(&route, &handin::work_dir(&route), &order, &agent, &reason)?;
+            println!("rejected {order}: the worker will see why");
+        }
+    }
+    Ok(())
+}
+
+/// Before a worker's first pass: make sure each project it serves has its work folder
+/// and that Syncthing carries it. Idempotent; this is the whole migration (ADR 0023).
+fn prepare_work_folders<'a>(
+    routes: impl IntoIterator<Item = &'a ferryman_channel::ProjectRoute>,
+    report: &impl ferryman_ops::Progress,
+) {
+    for route in routes {
+        match ferryman_channel::handin::ensure_work_ready(route) {
+            Ok(ready) => report.info(&format!(
+                "{}: hand-in folder {}{} ({})",
+                route.project_id,
+                ready.path.display(),
+                if ready.created { ", created" } else { "" },
+                ready.sync
+            )),
+            Err(error) => report.warn(&format!(
+                "{}: could not prepare the hand-in folder: {error:#}",
+                route.project_id
+            )),
+        }
+    }
 }
 
 /// Sign as `name`, or establish that signing unsigned is honest here.
@@ -12857,5 +13056,51 @@ mod tests {
                 "names the bad one and who can: {err}"
             );
         }
+    }
+
+    /// `ferry work` takes the four hand-in verbs, and `accept` can be told not to push.
+    #[test]
+    fn the_work_verbs_parse() {
+        use clap::Parser;
+        let accept = super::Cli::try_parse_from([
+            "ferry",
+            "work",
+            "accept",
+            "t-api",
+            "--workspace",
+            "repo",
+            "--no-push",
+        ])
+        .unwrap();
+        let super::Command::Work {
+            command:
+                super::WorkCommand::Accept {
+                    order,
+                    workspace,
+                    no_push,
+                },
+        } = accept.command
+        else {
+            panic!("expected work accept");
+        };
+        assert_eq!(order, "t-api");
+        assert_eq!(workspace, Some(std::path::PathBuf::from("repo")));
+        assert!(no_push);
+
+        let hand_in = super::Cli::try_parse_from([
+            "ferry", "work", "hand-in", "--order", "t-api", "--base", "abc123",
+        ])
+        .unwrap();
+        assert!(matches!(
+            hand_in.command,
+            super::Command::Work {
+                command: super::WorkCommand::HandIn { base: Some(_), .. }
+            }
+        ));
+        assert!(
+            super::Cli::try_parse_from(["ferry", "work", "reject", "t-api"]).is_err(),
+            "a rejection needs its reason"
+        );
+        assert!(super::Cli::try_parse_from(["ferry", "work", "list", "--json"]).is_ok());
     }
 }
