@@ -431,6 +431,14 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/improve/decide", post(improve_decide))
         .route("/api/suggestions", get(suggestions_get))
         .route("/api/suggestions/decide", post(suggestions_decide))
+        .route("/api/library", get(library_get))
+        .route("/api/library/fact", get(library_fact))
+        .route("/api/library/ask", post(library_ask))
+        .route("/api/library/remember", post(library_remember))
+        .route("/api/library/confirm", post(library_confirm))
+        .route("/api/library/retract", post(library_retract))
+        .route("/api/library/tags", post(library_tags))
+        .route("/api/library/mail", get(library_mail))
         .route(
             "/api/delegations",
             get(delegations_get).post(delegations_set),
@@ -2823,6 +2831,494 @@ fn sign_focus(
         );
     }
     Ok(changed)
+}
+
+// --- the librarian -----------------------------------------------------------------------
+//
+// The fleet's memory and front desk (see `ferryman_channel::library`). It lives in the home
+// project's channel, the same one the focus lives in, so every route here acts on that and
+// never on the project the picker shows: the picker's `project` parameter is ignored. A
+// page of it is for anyone signed in; confirming, retracting and the mail tag map are the
+// master's, signed with the session's key.
+
+/// The home project's route for the library, with its roster as the channel holds it now.
+fn library_home(state: &DashboardState) -> Option<ProjectRoute> {
+    focus_home(state).map(|route| route_with_live_roster(&route))
+}
+
+/// Whether this session is the signed-in master of the home project.
+fn library_may_decide(state: &DashboardState, headers: &HeaderMap, home: &ProjectRoute) -> bool {
+    let master = ferryman_channel::ferry::master_of(&home.communications)
+        .ok()
+        .flatten();
+    !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()))
+}
+
+fn library_missing() -> DashboardError {
+    (
+        StatusCode::NOT_FOUND,
+        format!(
+            "the library lives in {}'s channel, which is not on this machine",
+            ferryman_channel::focus::home_project()
+        ),
+    )
+}
+
+/// Note a library action in the signed ledger, as the focus does.
+fn library_ledger(home: &ProjectRoute, who: &AgentIdentity, what: &str, id: &str) {
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        home,
+        who,
+        "library",
+        who.name(),
+        &format!("{} {what} {id}", who.name()),
+        Some(id),
+    );
+}
+
+#[derive(Deserialize, Default)]
+struct LibraryParams {
+    /// Words to search for.
+    #[serde(default)]
+    q: Option<String>,
+    /// Only this project's facts and the fleet-wide ones. (Not `project`: that is the
+    /// picker's, which the library ignores.)
+    #[serde(default, rename = "for")]
+    scope: Option<String>,
+    /// `1` includes facts that were replaced or retracted.
+    #[serde(default)]
+    all: Option<String>,
+}
+
+/// GET /api/library - the library as this fleet holds it: counts, the facts (newest first;
+/// the live ones unless `all=1`), what waits for the master, contradictions, the mail tag
+/// map, the generated views, and with `q` the best matches. `may_decide` is true only for
+/// the signed-in master of the home project. The facts are agents' and strangers' words: a
+/// screen shows them as text.
+async fn library_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<LibraryParams>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::library::ask::Reader;
+    let Some(home) = library_home(&state) else {
+        return Ok(Json(json!({
+            "available": false,
+            "home": ferryman_channel::focus::home_project(),
+            "may_decide": false,
+        })));
+    };
+    let reader = Reader::load(&home.communications, &home.project_id);
+    let library = &reader.library;
+    let (confirmed, unconfirmed, retracted, replaced) = library.counts();
+    let scope = params.scope.as_deref().filter(|scope| !scope.is_empty());
+    let all = params
+        .all
+        .as_deref()
+        .is_some_and(|flag| !matches!(flag, "" | "0" | "false"));
+    let mut facts: Vec<&ferryman_channel::library::Fact> = library
+        .facts
+        .iter()
+        .filter(|fact| all || fact.is_live())
+        .filter(|fact| {
+            scope.is_none_or(|scope| {
+                fact.project
+                    .as_deref()
+                    .is_none_or(|project| project.eq_ignore_ascii_case(scope))
+            })
+        })
+        .collect();
+    facts.reverse();
+    facts.truncate(200);
+    let found = params
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(|q| reader.search(q, scope, 20));
+    let mut views: std::collections::BTreeMap<String, Value> = std::collections::BTreeMap::new();
+    for row in &reader.rows {
+        let entry = views.entry(row.view.clone()).or_insert_with(|| {
+            json!({
+                "view": row.view,
+                "generated_at": row.generated_at,
+                "generated_by": row.generated_by,
+                "machine": row.machine,
+                "rows": [],
+            })
+        });
+        if let Some(rows) = entry["rows"].as_array_mut() {
+            rows.push(
+                json!({ "id": row.row.id, "subject": row.row.subject, "text": row.row.text }),
+            );
+        }
+    }
+    Ok(Json(json!({
+        "available": true,
+        "home": home.project_id,
+        "master": library.master,
+        "may_decide": library_may_decide(&state, &headers, &home),
+        "counts": {
+            "confirmed": confirmed,
+            "unconfirmed": unconfirmed,
+            "retracted": retracted,
+            "replaced": replaced,
+        },
+        "notices": library.notices,
+        "rejected": library.rejected.len(),
+        "conflicts": library.conflicts(),
+        "tag_map": library.tag_map,
+        "waiting": library.unconfirmed().collect::<Vec<_>>(),
+        "facts": facts,
+        "found": found,
+        "views": views.into_values().collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct LibraryFactParam {
+    id: String,
+}
+
+/// GET /api/library/fact?id= - one fact (or generated row) with who wrote it, whether the
+/// master has confirmed it, what it replaced and what replaced it, and the history of its
+/// subject. Unknown id: 404.
+async fn library_fact(
+    State(state): State<DashboardState>,
+    Query(params): Query<LibraryFactParam>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::library::ask::Reader;
+    let home = library_home(&state).ok_or_else(library_missing)?;
+    let reader = Reader::load(&home.communications, &home.project_id);
+    if let Some(row) = reader.rows.iter().find(|row| row.row.id == params.id) {
+        return Ok(Json(json!({ "generated": row })));
+    }
+    let Some(fact) = reader.library.fact(&params.id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("there is no fact {}", params.id),
+        ));
+    };
+    let named = |ids: &[String]| -> Vec<&ferryman_channel::library::Fact> {
+        ids.iter()
+            .filter_map(|id| reader.library.fact(id))
+            .collect()
+    };
+    Ok(Json(json!({
+        "fact": fact,
+        "replaces": named(&fact.supersedes),
+        "replaced_by": named(&fact.superseded_by),
+        "history": reader.library.history(&fact.subject),
+    })))
+}
+
+#[derive(Deserialize)]
+struct LibraryAskBody {
+    question: String,
+    #[serde(default)]
+    project: Option<String>,
+}
+
+/// POST /api/library/ask - the best facts for a question, with ids, dates and standing, or
+/// "I don't know" when nothing relevant is held. The dashboard asks no model; `ferry ask
+/// --library` puts the facts in words. Any signed-in person may ask.
+async fn library_ask(
+    State(state): State<DashboardState>,
+    Json(body): Json<LibraryAskBody>,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::library::ask::Reader;
+    let question = body.question.trim();
+    if question.is_empty() || question.chars().count() > 600 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "ask in a sentence of up to 600 characters".to_string(),
+        ));
+    }
+    let home = library_home(&state).ok_or_else(library_missing)?;
+    let reader = Reader::load(&home.communications, &home.project_id);
+    let answer = reader.facts_only(question, body.project.as_deref().filter(|p| !p.is_empty()));
+    Ok(Json(json!(answer)))
+}
+
+#[derive(Deserialize)]
+struct LibraryRememberBody {
+    text: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    supersedes: Vec<String>,
+}
+
+/// POST /api/library/remember - write a fact, signed with the session's key. The master's
+/// is confirmed on the spot; anyone else's waits for the master. Anything that looks like a
+/// secret is refused (400): store a pointer instead.
+async fn library_remember(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<LibraryRememberBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let home = library_home(&state).ok_or_else(library_missing)?;
+    let subject = body
+        .subject
+        .filter(|subject| !subject.trim().is_empty())
+        .unwrap_or_else(|| {
+            body.text
+                .split_whitespace()
+                .take(8)
+                .collect::<Vec<_>>()
+                .join(" ")
+        });
+    let written = ferryman_channel::library::remember(
+        &home.communications,
+        &home.project_id,
+        &current,
+        None,
+        ferryman_channel::library::NewFact {
+            subject,
+            text: body.text,
+            tags: body.tags,
+            project: body.project.filter(|project| !project.trim().is_empty()),
+            source: format!("{} via the dashboard", current.name()),
+            supersedes: body.supersedes,
+        },
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    library_ledger(&home, &current, "wrote", &written.event.id);
+    Ok(Json(json!({
+        "id": written.event.id,
+        "status": written.status.as_str(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct LibraryDecideBody {
+    id: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// The master's word on a fact: refused (403) for anyone else, 404 for a fact that is not
+/// there, 409 when it is already so.
+fn library_decide(
+    state: &DashboardState,
+    headers: &HeaderMap,
+    body: &LibraryDecideBody,
+    confirm: bool,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::library as lib;
+    let current = session_identity(state, headers)?;
+    let home = library_home(state).ok_or_else(library_missing)?;
+    let what = if confirm {
+        "confirm facts"
+    } else {
+        "retract facts"
+    };
+    ferryman_channel::ferry::require_master(&home.communications, &home.project_id, &current, what)
+        .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    let Some(fact) = lib::Library::load(&home.communications, &home.project_id)
+        .fact(&body.id)
+        .cloned()
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("there is no fact {}", body.id),
+        ));
+    };
+    let already = if confirm {
+        fact.status == lib::Status::Confirmed
+    } else {
+        fact.status == lib::Status::Retracted
+    };
+    if already {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{} is already {}",
+                body.id,
+                if confirm { "confirmed" } else { "retracted" }
+            ),
+        ));
+    }
+    let done = if confirm {
+        lib::confirm(
+            &home.communications,
+            &home.project_id,
+            &current,
+            None,
+            &body.id,
+        )
+    } else {
+        lib::retract(
+            &home.communications,
+            &home.project_id,
+            &current,
+            None,
+            &body.id,
+            &body.reason,
+        )
+    };
+    done.map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    library_ledger(
+        &home,
+        &current,
+        if confirm { "confirmed" } else { "retracted" },
+        &body.id,
+    );
+    Ok(Json(json!({
+        "id": body.id,
+        "status": if confirm { "confirmed" } else { "retracted" },
+    })))
+}
+
+/// POST /api/library/confirm - the master confirms a fact.
+async fn library_confirm(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<LibraryDecideBody>,
+) -> Result<Json<Value>, DashboardError> {
+    library_decide(&state, &headers, &body, true)
+}
+
+/// POST /api/library/retract - the master retracts a fact; it stays in the history.
+async fn library_retract(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<LibraryDecideBody>,
+) -> Result<Json<Value>, DashboardError> {
+    library_decide(&state, &headers, &body, false)
+}
+
+#[derive(Deserialize)]
+struct LibraryTagsBody {
+    tags: std::collections::BTreeMap<String, String>,
+}
+
+/// POST /api/library/tags - the master replaces the mail tag map (subject tag to project).
+async fn library_tags(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<LibraryTagsBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let home = library_home(&state).ok_or_else(library_missing)?;
+    ferryman_channel::ferry::require_master(
+        &home.communications,
+        &home.project_id,
+        &current,
+        "edit the mail tag map",
+    )
+    .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    ferryman_channel::library::set_tag_map(
+        &home.communications,
+        &home.project_id,
+        &current,
+        None,
+        body.tags,
+    )
+    .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    library_ledger(&home, &current, "changed the mail tags", "tag-map");
+    Ok(Json(json!({ "changed": true })))
+}
+
+/// GET /api/library/mail - the mail desk: what waits for the master (their questions, with
+/// the sender's words quoted), the mail on this machine's desk and the replies waiting to be
+/// sent, and the last mail lines in the signed ledger. Everything a sender wrote is text.
+async fn library_mail(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    use ferryman_channel::library::mail::Desk;
+    let home = library_home(&state).ok_or_else(library_missing)?;
+    let waiting: Vec<Value> = ferryman_channel::questions::pending(&home)
+        .into_iter()
+        .filter(|question| question.kind == ferryman_channel::questions::LIBRARY)
+        .map(|question| {
+            json!({
+                "id": question.id,
+                "text": question.text,
+                "options": question.options,
+                "asked_at": question.asked_at,
+            })
+        })
+        .collect();
+    let desk = Desk::default_dir().filter(|dir| dir.is_dir()).map(Desk::at);
+    let items: Vec<Value> = desk
+        .as_ref()
+        .map(|desk| {
+            desk.items()
+                .into_iter()
+                .rev()
+                .take(100)
+                .map(|item| {
+                    json!({
+                        "id": item.mail.id,
+                        "stage": item.stage,
+                        "project": item.mail.project,
+                        "decision": item.decision,
+                        "category": item.category,
+                        "summary": item.summary,
+                        "subject": item.mail.subject,
+                        "from": item.mail.from,
+                        "received_at": item.mail.received_at,
+                        "replies": item.replies,
+                        "question": item.question,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let outbox: Vec<Value> = desk
+        .as_ref()
+        .map(|desk| {
+            desk.outbox()
+                .into_iter()
+                .map(|draft| {
+                    json!({
+                        "reply_id": draft.reply_id,
+                        "mail_id": draft.mail_id,
+                        "kind": draft.kind,
+                        "created_at": draft.created_at,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let ledger: Vec<Value> = ferryman_channel::ledger::read_ledger(&home)
+        .map(|log| {
+            log.entries
+                .iter()
+                .rev()
+                .filter(|entry| entry.kind == "mail")
+                .take(30)
+                .map(|entry| {
+                    json!({
+                        "at": entry.created_at,
+                        "by": entry.actor,
+                        "summary": entry.summary,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Json(json!({
+        "available": true,
+        "may_decide": library_may_decide(&state, &headers, &home),
+        "desk_here": desk.is_some(),
+        "waiting": waiting,
+        "items": items,
+        "outbox": outbox,
+        "ledger": ledger,
+    })))
 }
 
 /// GET /api/improve/pending - improvements waiting on a key: the review engine's verdict,
@@ -5316,6 +5812,10 @@ mod tests {
             "/api/improve/pending",
             "/api/focus",
             "/api/suggestions",
+            "/api/library",
+            "/api/library?q=nvidia&for=bullship&all=1",
+            "/api/library/fact?id=f-0000000000",
+            "/api/library/mail",
         ] {
             let response = app
                 .clone()
@@ -5344,6 +5844,11 @@ mod tests {
                 "/api/suggestions/decide",
                 r#"{"issue":1,"choice":"accept"}"#,
             ),
+            ("/api/library/ask", r#"{"question":"where is the key"}"#),
+            ("/api/library/remember", r#"{"text":"anonymous"}"#),
+            ("/api/library/confirm", r#"{"id":"f-0000000000"}"#),
+            ("/api/library/retract", r#"{"id":"f-0000000000"}"#),
+            ("/api/library/tags", r#"{"tags":{"redaktly":"redaktly"}}"#),
         ] {
             let response = post(&app, path, body, None).await;
             assert_eq!(
@@ -6310,6 +6815,327 @@ mod tests {
         assert_eq!(view["set"], false, "{view}");
         assert_eq!(view["projects"][0]["tier"], "normal");
         assert!(set_path.exists(), "clearing is a newer, empty record");
+    }
+
+    /// The library from the browser: anyone signed in reads and asks, anyone on the roster
+    /// writes (unconfirmed), and only the master confirms, retracts and edits the mail
+    /// tags. A secret is refused and never echoed. Anonymous callers get 401 everywhere
+    /// (the loop in `every_non_public_endpoint_refuses_an_anonymous_caller`), and the
+    /// session header is the only credential, so a page on another origin has nothing to
+    /// ride on.
+    #[tokio::test]
+    async fn the_library_is_read_by_anyone_signed_in_and_decided_only_by_the_master() {
+        use ferryman_channel::library::{self, NewFact};
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-server-library-{}", std::process::id())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let alice = signed_in(&app, &dashboard_state).await;
+        let body_of = |response: axum::response::Response| async move {
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, String::from_utf8_lossy(&bytes).to_string())
+        };
+
+        // Nobody is master yet: it reads, nobody decides.
+        let before = get_json(&app, "/api/library", Some(&alice)).await;
+        assert_eq!(before["available"], true, "{before}");
+        assert_eq!(before["may_decide"], false);
+        assert_eq!(before["counts"]["unconfirmed"], 0);
+        let claimed = post(&app, "/api/master/init", "{}", Some(&alice)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+
+        // A second operator who is not the master, and an agent who writes a fact.
+        dashboard_state
+            .operators
+            .create("bob", "hunter2-secret")
+            .unwrap();
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"bob","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        let (_, login) = body_of(login).await;
+        let bob = serde_json::from_str::<Value>(&login).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let wisp = AgentIdentity::from_seed("wisp", [3; 32]);
+        ferryman_channel::register_agent(
+            &route,
+            &AgentRoute {
+                name: "wisp".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(wisp.public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        let channel = &route.communications;
+        let said = library::remember(
+            channel,
+            "ferryman",
+            &wisp,
+            None,
+            NewFact {
+                subject: "grouchly".into(),
+                text: "grouchly is a Windows box".into(),
+                source: "test".into(),
+                ..NewFact::default()
+            },
+        )
+        .unwrap();
+        let wisp_fact = said.event.id.clone();
+
+        // The master writes a fact of their own, confirmed on the spot; wisp's contradicts it.
+        let mine = post(
+            &app,
+            "/api/library/remember",
+            r#"{"text":"grouchly is the always-on Ubuntu box that runs n8n","subject":"grouchly","tags":["machines"]}"#,
+            Some(&alice),
+        )
+        .await;
+        let (status, text) = body_of(mine).await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let mine: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(mine["status"], "confirmed");
+        let my_fact = mine["id"].as_str().unwrap().to_string();
+
+        let view = get_json(&app, "/api/library", Some(&alice)).await;
+        assert_eq!(view["may_decide"], true, "{view}");
+        assert_eq!(view["master"], "alice");
+        assert_eq!(view["counts"]["confirmed"], 1);
+        assert_eq!(view["counts"]["unconfirmed"], 1);
+        assert_eq!(view["waiting"][0]["id"], wisp_fact.as_str());
+        assert_eq!(view["conflicts"].as_array().unwrap().len(), 1, "{view}");
+        let as_bob = get_json(&app, "/api/library?q=always%20on", Some(&bob)).await;
+        assert_eq!(
+            as_bob["may_decide"], false,
+            "anyone signed in reads, only the master decides"
+        );
+        assert_eq!(as_bob["found"][0]["id"], my_fact.as_str(), "{as_bob}");
+
+        // Bob: not the master, not on the roster. He cannot decide or write.
+        for (path, body) in [
+            ("/api/library/confirm", format!(r#"{{"id":"{wisp_fact}"}}"#)),
+            ("/api/library/retract", format!(r#"{{"id":"{wisp_fact}"}}"#)),
+            (
+                "/api/library/tags",
+                r#"{"tags":{"redaktly":"redaktly"}}"#.to_string(),
+            ),
+        ] {
+            let refused = post(&app, path, &body, Some(&bob)).await;
+            assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path}");
+        }
+        let (status, text) = body_of(
+            post(
+                &app,
+                "/api/library/remember",
+                r#"{"text":"bob says hi"}"#,
+                Some(&bob),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        assert!(text.contains("roster"), "{text}");
+        let after = get_json(&app, "/api/library", Some(&alice)).await;
+        assert_eq!(after["counts"]["unconfirmed"], 1, "nothing changed");
+
+        // A secret is refused, and the refusal does not repeat it.
+        let token = format!("ghp_{}", "q8Zr3LmX0vB2nC6dF9gH1jK4pT7wY5sA3eR8");
+        let (status, text) = body_of(
+            post(
+                &app,
+                "/api/library/remember",
+                &format!(r#"{{"text":"use {token} to deploy"}}"#),
+                Some(&alice),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(text.contains("pointer") && !text.contains(&token), "{text}");
+
+        // The master confirms once, and is told when it is already so or not there.
+        let confirm = format!(r#"{{"id":"{wisp_fact}"}}"#);
+        assert_eq!(
+            post(&app, "/api/library/confirm", &confirm, Some(&alice))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            post(&app, "/api/library/confirm", &confirm, Some(&alice))
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(
+                &app,
+                "/api/library/confirm",
+                r#"{"id":"f-0000000000"}"#,
+                Some(&alice)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+        let detail = get_json(
+            &app,
+            &format!("/api/library/fact?id={wisp_fact}"),
+            Some(&alice),
+        )
+        .await;
+        assert_eq!(detail["fact"]["status"], "confirmed");
+        assert_eq!(detail["fact"]["confirmed_by"], "alice");
+        assert_eq!(
+            detail["history"].as_array().unwrap().len(),
+            2,
+            "both claims about grouchly"
+        );
+
+        // Retract keeps it in the history; the live list drops it and `all=1` shows it.
+        let retract = post(
+            &app,
+            "/api/library/retract",
+            &format!(r#"{{"id":"{wisp_fact}","reason":"it moved"}}"#),
+            Some(&alice),
+        )
+        .await;
+        assert_eq!(retract.status(), StatusCode::OK);
+        let live = get_json(&app, "/api/library", Some(&alice)).await;
+        assert_eq!(live["facts"].as_array().unwrap().len(), 1);
+        assert_eq!(live["counts"]["retracted"], 1);
+        let everything = get_json(&app, "/api/library?all=1", Some(&alice)).await;
+        assert_eq!(everything["facts"].as_array().unwrap().len(), 2);
+
+        // Ask: the matching facts with ids and dates, or I don't know.
+        let (status, text) = body_of(
+            post(
+                &app,
+                "/api/library/ask",
+                r#"{"question":"which machine is always on?"}"#,
+                Some(&bob),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let answer: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(answer["known"], true);
+        assert_eq!(answer["facts"][0]["id"], my_fact.as_str());
+        assert!(answer["facts"][0]["date"].is_string());
+        let (_, text) = body_of(
+            post(
+                &app,
+                "/api/library/ask",
+                r#"{"question":"what is the capital of France?"}"#,
+                Some(&bob),
+            )
+            .await,
+        )
+        .await;
+        let answer: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(answer["known"], false);
+        assert!(
+            answer["answer"]
+                .as_str()
+                .unwrap()
+                .starts_with("I don't know")
+        );
+        assert_eq!(
+            post(&app, "/api/library/ask", r#"{"question":"  "}"#, Some(&bob))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // The mail tags: the master's to edit, and they must be plain.
+        assert_eq!(
+            post(
+                &app,
+                "/api/library/tags",
+                r#"{"tags":{"Not A Tag":"x"}}"#,
+                Some(&alice)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(
+                &app,
+                "/api/library/tags",
+                r#"{"tags":{"redaktly":"redaktly"}}"#,
+                Some(&alice)
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let tagged = get_json(&app, "/api/library", Some(&bob)).await;
+        assert_eq!(tagged["tag_map"]["map"]["redaktly"], "redaktly");
+
+        // The mail desk: what waits for the master, and the signed ledger's mail lines.
+        let live_route = route_with_live_roster(&route);
+        ferryman_channel::questions::ask(
+            &live_route,
+            &wisp,
+            "library-mail-m-0123456789",
+            ferryman_channel::questions::LIBRARY,
+            "Mail m-0123456789 needs you.\n| Could we talk about a partnership?",
+            &["Accept".to_string(), "Decline".to_string()],
+            None,
+        )
+        .unwrap();
+        ferryman_channel::library::mail::record(
+            &live_route,
+            &wisp,
+            &ferryman_channel::library::mail::intake(
+                br#"{"from":"Ann <ann@example.org>","subject":"hello","text":"hi"}"#,
+                Utc::now(),
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap(),
+            "taken in",
+        )
+        .unwrap();
+        let desk = get_json(&app, "/api/library/mail", Some(&bob)).await;
+        assert_eq!(
+            desk["waiting"][0]["id"], "library-mail-m-0123456789",
+            "{desk}"
+        );
+        assert_eq!(desk["waiting"][0]["options"][1], "Decline");
+        assert!(
+            desk["ledger"][0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("taken in"),
+            "{desk}"
+        );
+        assert!(
+            !desk["ledger"][0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("ann@example.org")
+        );
+        assert_eq!(desk["may_decide"], false);
+
+        // The ledger recorded who did what.
+        let log = ferryman_channel::ledger::read_ledger(&live_route).unwrap();
+        assert!(
+            log.entries
+                .iter()
+                .any(|e| e.kind == "library" && e.summary.contains("confirmed"))
+        );
     }
 
     /// Suggestions from outsiders, from the browser: the "needs me" list for anyone signed

@@ -50,8 +50,12 @@ pub const ORDERS: &str = "orders";
 pub const REVIEW: &str = "review";
 /// Switch self-improve on or off, and answer the improve loop's questions.
 pub const IMPROVE: &str = "improve";
+/// Confirm, retract and write confirmed facts in the fleet's library, and edit its mail tag
+/// map (see [`crate::library`]). Advice only: it never confers authority over code or
+/// settings.
+pub const LIBRARY: &str = "library";
 /// Every scope there is. Nothing outside this list can be delegated.
-pub const SCOPES: &[&str] = &[ORDERS, REVIEW, IMPROVE];
+pub const SCOPES: &[&str] = &[ORDERS, REVIEW, IMPROVE, LIBRARY];
 
 const DIR: &str = "delegations";
 

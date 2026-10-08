@@ -232,6 +232,7 @@ other. See its [README](crates/ferry-deadman/README.md).
 | [Writing a worker (server mode)](docs/WRITING_A_WORKER.md) | the lease-based worker protocol behind `ferryman-server` |
 | [Engine setup](docs/ENGINE_SETUP.md) | pointing the worker at Claude Code, OpenCode, Codex or anything else — including API keys via `credentials.json` |
 | [Focus](docs/FOCUS.md) | telling the swarm which projects matter this month: a signed tier per project that shares out the improve budget and the workers' attention |
+| [The librarian](docs/LIBRARIAN.md) | the fleet's memory and front desk: signed facts any agent can write and ask about, confirmed by the master, with the shared agent inbox handled as untrusted mail (advice only, never authority) |
 | [Dashboard team and agent access](docs/DASHBOARD_TEAM_ACCESS_MODEL.md) | how the dashboard models human teammates vs agents; what is enforced today vs previewed |
 | [Getting started](docs/GETTING_STARTED.md) | install → first task walkthrough |
 

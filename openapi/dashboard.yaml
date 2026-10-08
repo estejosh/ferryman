@@ -554,6 +554,173 @@ paths:
         '401': {description: no active session}
         '403': {description: read-only, not the master (or a delegate), nothing pending for that issue, or already answered}
         '409': {description: the project has no master}
+  /api/library:
+    get:
+      summary: The librarian's library - the fleet's memory
+      description: >
+        The signed, append-only facts kept in the home project's channel (`ferryman`, or
+        FERRYMAN_FOCUS_HOME - the same channel the focus lives in) and what they add up to.
+        A fact is never edited: a newer one supersedes it and the history stays. A fact the
+        master (or a delegate holding the `library` scope) wrote is `confirmed`; anyone
+        else's is `unconfirmed` until the master confirms it. `facts` are the live ones,
+        newest first (`all=1` includes replaced and retracted), `waiting` the unconfirmed,
+        `conflicts` live facts about one subject that say different things, `tag_map` the
+        master's mail routing (subject tag to project), `views` the generated pages (machines,
+        engines, projects, inboxes, where each secret lives - names only), and `found` the
+        best matches when `q` is given. `notices` says when this machine is holding on to an
+        earlier copy of a file. Nothing here ever holds a secret. The facts are agents' and
+        strangers' words: show them as text. `may_decide` is true only for the signed-in
+        master. The picker's `project` parameter is ignored; `for` filters by project. The
+        CLI equivalents are `ferry library show` and `ferry library search`.
+      parameters:
+        - {name: q, in: query, required: false, schema: {type: string}}
+        - {name: for, in: query, required: false, schema: {type: string}}
+        - {name: all, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'available and, when it is, home, master, may_decide, counts, notices, rejected, conflicts, tag_map, waiting, facts, found and views'}
+        '401': {description: no active session}
+  /api/library/fact:
+    get:
+      summary: One fact, its replacements and its history
+      description: >
+        A fact (or a generated row) by id: who wrote it, its standing, what it replaced
+        (`replaces`), what replaced it (`replaced_by`) and everything ever said about its
+        subject (`history`).
+      parameters:
+        - {name: id, in: query, required: true, schema: {type: string}}
+      responses:
+        '200': {description: 'fact, replaces, replaced_by and history; or generated for a generated row'}
+        '401': {description: no active session}
+        '404': {description: no such fact, or the home channel is not on this machine}
+  /api/library/ask:
+    post:
+      summary: Ask the library a question
+      description: >
+        The best matching facts and generated rows, each with its id, date and standing,
+        found by full-text search (SQLite FTS5) over the live facts, or "I don't know" when
+        nothing relevant is held (`known` false). The dashboard asks no model; `ferry ask
+        --library` (or the MCP tool `library_ask`) puts the facts in words, citing their
+        ids and dates. Anyone signed in may ask. Advice only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [question]
+              properties:
+                question: {type: string, maxLength: 600}
+                project: {type: string}
+      responses:
+        '200': {description: 'question, known, answer, cited, facts and note'}
+        '400': {description: an empty question, or one over 600 characters}
+        '401': {description: no active session}
+        '404': {description: the home channel is not on this machine}
+  /api/library/remember:
+    post:
+      summary: Write a fact
+      description: >
+        Signed with the session's key into the home channel's library. The master's fact is
+        confirmed on the spot; anyone else on the roster writes an unconfirmed one that waits
+        for the master. `supersedes` names the facts it replaces. A text that looks like a
+        secret (a token, a private key, a `key=` value, a long random string) is refused:
+        store where it lives instead. The CLI equivalent is `ferry remember`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: {type: string, maxLength: 1000}
+                subject: {type: string, maxLength: 120}
+                project: {type: string}
+                tags: {type: array, items: {type: string}, maxItems: 8}
+                supersedes: {type: array, items: {type: string}, maxItems: 8}
+      responses:
+        '200': {description: 'the fact id and its status (confirmed or unconfirmed)'}
+        '400': {description: a secret, a text that is too long, a fact that is not there to supersede, or a signer who is not on the roster}
+        '401': {description: no active session}
+        '403': {description: read-only}
+        '404': {description: the home channel is not on this machine}
+  /api/library/confirm:
+    post:
+      summary: The master confirms a fact
+      description: >
+        Signed with the session's key; only the master (or a delegate holding the `library`
+        scope, from Telegram) confirms. The CLI equivalent is `ferry library confirm`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: {type: string}
+      responses:
+        '200': {description: 'the id and its new status'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: no such fact}
+        '409': {description: already confirmed}
+  /api/library/retract:
+    post:
+      summary: The master retracts a fact
+      description: >
+        The fact stays in the history and is no longer an answer. Master only. The CLI
+        equivalent is `ferry library retract`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: {type: string}
+                reason: {type: string, maxLength: 200}
+      responses:
+        '200': {description: 'the id and its new status'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: no such fact}
+        '409': {description: already retracted}
+  /api/library/tags:
+    post:
+      summary: The master replaces the mail tag map
+      description: >
+        Which subject tag (`[REDAKTLY]`) the shared agent inbox's mail is routed to which
+        project. A tag the master has not mapped goes to the master. Master only. The CLI
+        equivalent is `ferry library tags`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tags]
+              properties:
+                tags: {type: object, additionalProperties: {type: string}}
+      responses:
+        '200': {description: changed}
+        '400': {description: a tag or project that is not plain}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+  /api/library/mail:
+    get:
+      summary: The mail desk
+      description: >
+        The shared agent inbox as the librarian handles it: `waiting` (questions put to the
+        master, the sender's words quoted), `items` (mail on this machine's desk with its
+        stage, project and what was decided), `outbox` (fixed-text replies waiting for n8n
+        to send), and `ledger` (the last mail lines in the signed ledger). Everything a
+        sender wrote is untrusted text. `desk_here` says whether this machine runs the desk.
+      responses:
+        '200': {description: 'available, may_decide, desk_here, waiting, items, outbox and ledger'}
+        '401': {description: no active session}
+        '404': {description: the home channel is not on this machine}
   /api/delegations:
     get:
       summary: Who may act for the master here, and whether each delegation counts
@@ -571,7 +738,7 @@ paths:
       summary: The master lets an agent act for them
       description: >
         Signs a delegation with the session's key: the named agent's current key may act
-        for the master in the listed scopes (orders, review, improve; all three when none
+        for the master in the listed scopes (orders, review, improve, library; all four when none
         are given), until revoked or, with `expires_days`, until it expires. `all` does
         this in every project in the ferry root the person is master of. Everything the
         delegate signs is recorded as "<master> via <delegate>". Master only.
@@ -586,7 +753,7 @@ paths:
               required: [delegate]
               properties:
                 delegate: {type: string}
-                scopes: {type: array, items: {type: string, enum: [orders, review, improve]}}
+                scopes: {type: array, items: {type: string, enum: [orders, review, improve, library]}}
                 expires_days: {type: integer}
                 all: {type: boolean}
       responses:

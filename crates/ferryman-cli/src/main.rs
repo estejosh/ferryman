@@ -3,6 +3,7 @@ mod adversary;
 mod enginepolicy;
 mod focus;
 mod gitanchor;
+mod library;
 mod license;
 mod licensor;
 mod mcp;
@@ -674,6 +675,33 @@ enum Command {
         /// Emit the claims as JSON instead of prose.
         #[arg(long)]
         json: bool,
+        /// Ask the fleet's library instead: the best facts, put in words by a cheap model
+        /// with no tools, citing fact ids and dates, or "I don't know". `--project` and
+        /// `--no-model` imply it. Without any of the three, `ask` is exactly what it was.
+        #[arg(long)]
+        library: bool,
+        /// Ask the library, about this project (its facts and the fleet-wide ones).
+        #[arg(long)]
+        project: Option<String>,
+        /// Ask the library and return the matching facts only; ask no model.
+        #[arg(long)]
+        no_model: bool,
+    },
+    /// Write a fact into the fleet's library: what any agent on any machine can later ask
+    /// for. A fact from an agent waits for the master to confirm it; one from the master is
+    /// confirmed. Never a secret: write where it lives ("NVIDIA key: Custodly, name
+    /// nvidiaapi"), and the library refuses anything that looks like one.
+    ///
+    ///   ferry remember "grouchly is the always-on Ubuntu box" --subject grouchly
+    ///   ferry remember "releases need two approvals" --project ferryman --supersedes f-0123456789
+    Remember(library::RememberArgs),
+    /// The fleet's memory and front desk: search and ask the library, confirm or retract
+    /// facts (the master), see the generated pages, route the shared inbox's mail, and run
+    /// the librarian. It gives advice, never authority: changes to code or settings still
+    /// need signed orders and the master's approval.
+    Library {
+        #[command(subcommand)]
+        command: library::LibraryCommand,
     },
 }
 #[derive(Subcommand, Clone)]
@@ -1707,7 +1735,9 @@ enum TeamCommand {
     Delegate {
         /// The agent, as it appears on the roster: telegram-grouchly, say.
         name: String,
-        /// What it may do: orders, review, improve (comma separated).
+        /// What it may do: orders, review, improve, library (comma separated). `library`
+        /// lets it confirm and retract the librarian's facts for you (Telegram's Library
+        /// button); it is not in the default.
         #[arg(long, value_delimiter = ',', default_value = "orders,review,improve")]
         scopes: Vec<String>,
         /// End it on its own after this many days. Without it, it lasts until revoked.
@@ -4606,10 +4636,23 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
         },
+        Command::Remember(args) => library::remember(args)?,
+        Command::Library { command } => library::command(command).await?,
+        Command::Ask {
+            question,
+            json,
+            library: from_library,
+            project,
+            no_model,
+            ..
+        } if from_library || project.is_some() || no_model => {
+            library::ask(&question, project.as_deref(), no_model, json).await?;
+        }
         Command::Ask {
             workspace,
             question,
             json,
+            ..
         } => {
             let start =
                 workspace.unwrap_or(std::env::current_dir().context("read the current directory")?);
@@ -7351,6 +7394,20 @@ async fn run_fleet(
             .await
             {
                 report.info(&format!("improve: {line}"));
+            }
+        }
+        // The librarian, on the machine that has it switched on (FERRYMAN_LIBRARIAN=1): the
+        // generated views, new contradictions put to the master, and the mail desk. It
+        // signs as this worker's agent and gives advice only.
+        if ferryman_ops::library::enabled()
+            && let Some((_, config)) = fleet.served.first()
+        {
+            let outcome = ferryman_ops::library::pass(config, chrono::Utc::now()).await;
+            for line in outcome.lines {
+                report.info(&format!("library: {line}"));
+            }
+            for warning in outcome.warnings {
+                report.warn(&format!("library: {warning}"));
             }
         }
         if once {

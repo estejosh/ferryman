@@ -26,6 +26,7 @@ pub mod fleet;
 pub mod governor;
 pub mod identity;
 pub mod improve;
+pub mod library;
 pub mod omniroute;
 pub mod priority;
 pub mod rescue;

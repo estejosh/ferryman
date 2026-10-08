@@ -41,6 +41,7 @@ pub mod known;
 pub mod learning;
 pub mod lease;
 pub mod ledger;
+pub mod library;
 pub mod licensing;
 pub mod marvin;
 pub mod master;

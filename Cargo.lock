@@ -1218,6 +1218,7 @@ dependencies = [
  "hkdf",
  "hostname",
  "rand 0.10.2",
+ "rusqlite",
  "serde",
  "serde_jcs",
  "serde_json",

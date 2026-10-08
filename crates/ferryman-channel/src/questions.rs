@@ -37,6 +37,9 @@ pub const ADVERSARY: &str = "adversary";
 /// An outside suggestion waiting for the master: accept, decline or ask more. Nothing is
 /// built from one until the master's signed answer says Accept; see [`crate::suggestions`].
 pub const SUGGESTION: &str = "suggestion";
+/// The librarian needs the master: two facts that disagree, or a piece of mail that is not
+/// the librarian's to settle. Advice and bookkeeping only; see [`crate::library`].
+pub const LIBRARY: &str = "library";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {

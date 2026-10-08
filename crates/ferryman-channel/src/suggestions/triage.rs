@@ -217,7 +217,7 @@ pub struct TriageInput<'a> {
 
 /// A block of untrusted text with every line marked as quotation, so that nothing in it can
 /// look like the instruction around it, whatever it says.
-fn quote(text: &str, max: usize) -> String {
+pub(crate) fn quote(text: &str, max: usize) -> String {
     let text = clean(text, max);
     let mut out = String::new();
     for line in text.lines() {
