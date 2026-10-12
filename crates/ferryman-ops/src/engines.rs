@@ -42,6 +42,7 @@ use ferryman_channel::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::{warn, info};
 
 /// How often each engine is probed.
 pub const PROBE_EVERY_SECS: i64 = 10 * 60;
@@ -1661,6 +1662,19 @@ pub async fn chat(
     let response = match run.await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
+        Ok(Err(error)) => {
+            return ChatRun {
+                if error.is_connect() || error.is_timeout() {
+                    warn!(error = %error, "Endpoint unreachable: check network and API status");
+                    detail: redact(&format!(\"Endpoint unreachable: check network and API status ({error})\"), key),
+                } else {
+                    warn!(error = %error, "Failed to reach engine");
+                    detail: redact(&format!(\"could not reach {base}: {error}\"), key);
+                }
+                unreachable: error.is_connect() || error.is_request(),
+                ..ChatRun::default()
+            };
+        }
             return ChatRun {
                 detail: redact(&format!("could not reach {base}: {error}"), key),
                 unreachable: error.is_connect() || error.is_request(),
@@ -1690,6 +1704,22 @@ pub async fn chat(
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|cost| cost.is_finite() && *cost >= 0.0);
     let text = response.text().await.unwrap_or_default();
+     if !status.is_success() {
+         if status.as_u16() == 401 {
+             warn!(status = %status, "Authentication failed: check API key");
+             return ChatRun {
+                 detail: redact(&format!(\"Authentication failed: check API key (HTTP 401)\"), key),
+                 ..ChatRun::default()
+             };
+         }
+         return ChatRun {
+             detail: redact(
+                 &format!(\"HTTP {}{retry}: {}\", status.as_u16(), clip(&text)),
+                 key,
+             ),
+             ..ChatRun::default()
+         };
+     }
     if !status.is_success() {
         return ChatRun {
             detail: redact(
@@ -1778,6 +1808,19 @@ pub(crate) fn slow_runs() -> &'static std::sync::Mutex<Vec<SlowRun>> {
 /// `quota` is the out-of-credit error, after the same wait).
 #[cfg(test)]
 async fn fake_chat(canned: &str, prompt: &str, body: &Value) -> ChatRun {
+    if canned == "error-401" {
+        return ChatRun {
+            detail: "Authentication failed: check API key".to_string(),
+            ..ChatRun::default()
+        };
+    }
+    if canned == "error-connection" {
+        return ChatRun {
+            detail: "Endpoint unreachable: check network and API status".to_string(),
+            unreachable: true,
+            ..ChatRun::default()
+        };
+    }
     if let Some(rest) = canned.strip_prefix("slow:") {
         let mut parts = rest.splitn(3, ':');
         let key = parts.next().unwrap_or_default().to_string();
@@ -1904,6 +1947,15 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
     let mut found = Probe::default();
     match request.send().await {
         Err(error) => {
+            if error.is_connect() || error.is_timeout() {
+                warn!(error = %error, "Endpoint unreachable: check network and API status");
+                found.down = Some(clip(&redact(&format!(\"Endpoint unreachable: check network and API status ({error})\"), key)));
+            } else {
+                warn!(error = %error, "Failed to reach engine");
+    
+             }
+             }
+            }
             found.down = Some(clip(&redact(&format!("unreachable: {error}"), key)));
         }
         Ok(response) => {
@@ -1930,6 +1982,10 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
                     }
                 }
                 402 => found.exhausted = Some(said),
+                 401 | 403 => {
+                    warn!(status = %status, "Authentication failed: check API key");
+                    found.down = Some(format!(\"Authentication failed: check API key (HTTP {status})\"));
+                }
                 401 | 403 => found.down = Some(format!("the key was refused (HTTP {status})")),
                 429 if quota_reset(&said, Utc::now()).is_some() => found.exhausted = Some(said),
                 429 => {}
@@ -1977,8 +2033,23 @@ fn model_ids(body: &str) -> Option<Vec<String>> {
 /// Read the balance, for the providers that publish one.
 async fn balance(http: &reqwest::Client, base: &str, key: &str, found: &mut Probe) {
     async fn get(http: &reqwest::Client, url: &str, key: &str) -> Option<Value> {
-        let response = http.get(url).bearer_auth(key).send().await.ok()?;
+        let response = match http.get(url).bearer_auth(key).send().await {
+            Ok(r) => r,
+            Err(error) => {
+                if error.is_connect() || error.is_timeout() {
+                    warn!(error = %error, "Endpoint unreachable: check network and API status");
+                } else {
+                    warn!(error = %error, "Failed to reach engine");
+                }
+                return None;
+            }
+        };
         if !response.status().is_success() {
+            if response.status().as_u16() == 401 {
+                warn!(status = %response.status(), "Authentication failed: check API key");
+            } else {
+                warn!(status = %response.status(), "Failed to reach engine");
+            }
             return None;
         }
         response.json::<Value>().await.ok()
@@ -2134,6 +2205,7 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
 /// What the engine policy ranks by, as this machine knows it.
 fn billing(
     spec: &EngineSpec,
+
     state: &EngineState,
     now: DateTime<Utc>,
 ) -> ferryman_channel::receipts::EngineBilling {
@@ -3114,4 +3186,160 @@ engine.local.tier = "chore"
         .expect("every engine failed once: try again, do not hold");
         assert!(again.reason.contains("tries again"), "{}", again.reason);
     }
+}
+
+#[cfg(test)]
+mod error_handling_tests {
+    use super::*;
+    use wiremock::matchers::{method, path, header};
+    use wiremock::{Mock, ResponseTemplate, MockServer};
+    use crate::omniroute;
+
+    #[tokio::test]
+    async fn chat_handles_http_401() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let spec = EngineSpec {
+            name: "test".into(),
+            kind: Kind::Http,
+            tier: Tier::Build,
+            paid: Paid::Prepaid,
+            command: "".into(),
+            args: vec![],
+            model: "test-model".into(),
+            base_url: Some(mock_server.uri()),
+            key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let result = chat(&spec, Some("test-key"), "hello", Duration::from_secs(5), None).await;
+        assert!(!result.ok);
+        assert!(result.detail.contains("Authentication failed: check API key"));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn chat_handles_timeout() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let spec = EngineSpec {
+            name: "test".into(),
+            kind: Kind::Http,
+            tier: Tier::Build,
+            paid: Paid::Prepaid,
+            command: "".into(),
+            args: vec![],
+            model: "test-model".into(),
+            base_url: Some(mock_server.uri()),
+            key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let result = chat(&spec, Some("test-key"), "hello", Duration::from_millis(1), None).await;
+        assert!(!result.ok);
+        assert!(result.detail.contains("Endpoint unreachable: check network and API status"));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn probe_handles_http_401() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let spec = EngineSpec {
+            name: "test".into(),
+            kind: Kind::Http,
+            tier: Tier::Build,
+            paid: Paid::Prepaid,
+            command: "".into(),
+            args: vec![],
+            model: "test-model".into(),
+            base_url: Some(mock_server.uri()),
+            key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let probe = probe(&spec, Some("test-key")).await;
+        assert!(probe.down.is_some());
+        let down = probe.down.as_ref().unwrap();
+        assert!(down.contains("Authentication failed: check API key"));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn probe_handles_connection_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let spec = EngineSpec {
+            name: "test".into(),
+            kind: Kind::Http,
+            tier: Tier::Build,
+            paid: Paid::Prepaid,
+            command: "".into(),
+            args: vec![],
+            model: "test-model".into(),
+            base_url: Some(mock_server.uri()),
+            key: Some("test-key".into()),
+            ..Default::default()
+        };
+        let probe = probe(&spec, Some("test-key")).await;
+        assert!(probe.down.is_some());
+        let down = probe.down.as_ref().unwrap();
+        assert!(down.contains("Endpoint unreachable: check network and API status"));
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn balance_handles_http_401() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/balance"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let mut probe = Probe::default();
+        let http = reqwest::Client::builder()
+            .build()
+            .expect("failed to build client");
+        balance(&http, mock_server.uri(), "test-key", &mut probe).await;
+        mock_server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn balance_handles_connection_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/user/balance"))
+            .respond_with(ResponseTemplate::new(200).delay(Duration::from_secs(10)))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        let mut probe = Probe::default();
+        let http = reqwest::Client::builder()
+            .build()
+            .expect("failed to build client");
+        balance(&http, mock_server.uri(), "test-key", &mut probe).await;
+        mock_server.verify().await;
+    }
+
+
 }
