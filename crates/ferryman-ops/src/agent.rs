@@ -3827,6 +3827,37 @@ pub async fn ask_costed(
     Ok((engine_answer(&run.stdout), cost))
 }
 
+/// Manifest file -> the language it marks, in the order they are checked.
+const LANGUAGE_MANIFESTS: &[(&str, &str)] = &[
+    ("Cargo.toml", "Rust"),
+    ("go.mod", "Go"),
+    ("package.json", "JavaScript/TypeScript"),
+    ("pyproject.toml", "Python"),
+];
+
+/// Refuse an order whose declared `language` is not the one the workspace's manifests show,
+/// before any engine is spent on it. An order that declares none, or a workspace with no
+/// known manifest, passes: this only catches a stated mismatch, it never guesses one.
+// ponytail: matches on the first word of the declared name; add aliases (golang, ts) if orders need them.
+fn check_language(workdir: &Path, payload: &Value) -> Result<()> {
+    let Some(expected) = payload.get("language").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let found: Vec<&str> = LANGUAGE_MANIFESTS
+        .iter()
+        .filter(|(file, _)| workdir.join(file).is_file())
+        .map(|(_, lang)| *lang)
+        .collect();
+    let wanted = expected.trim().to_lowercase();
+    if found.is_empty() || found.iter().any(|l| l.to_lowercase().contains(&wanted)) {
+        return Ok(());
+    }
+    bail!(
+        "Project language mismatch: expected {expected}, found {}",
+        found.join(", ")
+    )
+}
+
 #[tracing::instrument(name = "do_work", skip(route, config, identity, task, how, report), fields(order = %task.order.id, agent = %config.agent))]
 async fn do_work(
     route: &ProjectRoute,
@@ -3855,6 +3886,7 @@ async fn do_work(
     // any worktree exists or any interrupt is acknowledged, so an engine that cannot run
     // here leaves nothing behind and consumes nothing meant for the next one.
     let (credentials, key) = engine_credentials(route, config)?;
+    check_language(&route.workspace, &task.order.payload)?;
 
     // An operator may interrupt a running task mid-flight. This is Ferryman's
     // answer to groundcrew's live-terminal takeover: a signed order the worker
@@ -4830,6 +4862,18 @@ pub fn pending(route: &ProjectRoute) -> Result<Vec<(String, Recommendation)>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_preflight_catches_a_stated_mismatch_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let go = serde_json::json!({"language": "Go"});
+        assert!(super::check_language(dir.path(), &go).is_ok(), "no manifest: pass");
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        let err = super::check_language(dir.path(), &go).unwrap_err().to_string();
+        assert_eq!(err, "Project language mismatch: expected Go, found Rust");
+        assert!(super::check_language(dir.path(), &serde_json::json!({"language": "rust"})).is_ok());
+        assert!(super::check_language(dir.path(), &serde_json::json!({"task": "x"})).is_ok());
+    }
+
 
     /// A sandboxed agent must be able to reach the credential it authenticates with.
     ///
