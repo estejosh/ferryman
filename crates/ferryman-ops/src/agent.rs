@@ -1350,6 +1350,9 @@ impl Drop for TaskHeartbeat {
 
 /// stdout is the result. stderr is kept because a failed run's only explanation is
 /// usually there, and discarding it turns a diagnosable problem into a silent retry.
+/// How often a running engine logs that it is still going.
+const PROGRESS_EVERY: Duration = Duration::from_secs(60);
+
 async fn run_agent(
     config: &AgentConfig,
     workspace: &Path,
@@ -1430,6 +1433,7 @@ async fn run_agent(
     let mut poll = tokio::time::interval(Duration::from_millis(500));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let deadline = Instant::now() + config.timeout;
+    let mut next_progress = Instant::now() + PROGRESS_EVERY;
 
     loop {
         if let Some(status) = child.try_wait()? {
@@ -1452,6 +1456,21 @@ async fn run_agent(
                 + Duration::from_secs(ferryman_channel::HEARTBEAT_INTERVAL_SECS as u64);
         }
 
+        // Visibility: a long run says how long it has been going and how long since it
+        // last printed, so a stuck engine is visible in the log before it is killed.
+        if Instant::now() >= next_progress {
+            next_progress = Instant::now() + PROGRESS_EVERY;
+            let silent =
+                clock_start.elapsed().as_millis() as u64 - last_output.load(Ordering::Relaxed);
+            tracing::info!(
+                "'{}' still running after {}s (silent for {}s, timeout {}s)",
+                config.command,
+                clock_start.elapsed().as_secs(),
+                silent / 1000,
+                config.timeout.as_secs()
+            );
+        }
+
         // A frozen agent holds the claim forever while the machine stays busy for
         // nothing. Kill it; the task fails and can be retried by someone else.
         if !config.stall.is_zero() {
@@ -1472,6 +1491,11 @@ async fn run_agent(
         // An agent that keeps printing but never finishes must not hold the claim
         // forever either. This is the overall bound, distinct from the stall guard.
         if Instant::now() >= deadline {
+            tracing::error!(
+                "'{}' ran past {}s; cancelling it",
+                config.command,
+                config.timeout.as_secs()
+            );
             kill_child(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
@@ -6156,6 +6180,28 @@ mod tests {
             format!("{error}").contains("frozen"),
             "expected the stall watchdog, got: {error:#}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chatty_agent_that_never_finishes_is_killed_by_the_timeout() {
+        // Prints every 100ms so the stall guard never fires; only the overall timeout can.
+        let dir = std::env::temp_dir().join(format!("ferryman-timeout-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let config = AgentConfig::parse(
+            "agent = \"w\"\ncommand = \"sh\"\nargs = [\"-c\", \"while true; do echo tick; sleep 0.1; done\"]\nstall_secs = \"60\"\ntimeout_secs = \"2\"\n",
+        )
+        .unwrap();
+        let started = Instant::now();
+        let error = run_agent(&config, &dir, "hello", &[], None)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("ran past 2s"),
+            "expected the timeout, got: {error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
         let _ = fs::remove_dir_all(&dir);
     }
 
