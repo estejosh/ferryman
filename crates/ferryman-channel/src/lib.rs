@@ -2793,6 +2793,20 @@ mod portable_auth_route_tests {
     }
 
     #[test]
+    fn set_grants_required_flips_open_missing_and_is_idempotent() {
+        for before in ["project = \"p\"\ngrants = \"open\"\n", "project = \"p\"\n"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("bridge.toml"), before).unwrap();
+            assert!(set_grants_required(dir.path()).unwrap());
+            let text = std::fs::read_to_string(dir.path().join("bridge.toml")).unwrap();
+            assert_eq!(text.matches("grants").count(), 1);
+            assert!(text.contains("grants = \"required\""));
+            assert!(text.contains("project = \"p\""));
+            assert!(!set_grants_required(dir.path()).unwrap());
+        }
+    }
+
+    #[test]
     fn v2_message_verifies_against_the_route_trust_store() {
         let dir = tempfile::tempdir().unwrap();
         let route = test_route(dir.path());
