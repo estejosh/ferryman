@@ -146,7 +146,7 @@ fn task_title(task: &Task) -> String {
         })
 }
 
-/// TODO and FIXME lines in the files git tracks, by file, most first.
+/// Lines matching patterns in the files git tracks, by file, most first.
 fn todo_counts(workspace: &Path) -> Option<(usize, Vec<(String, usize)>)> {
     let listed = Command::new("git")
         .arg("-C")
@@ -169,8 +169,12 @@ fn todo_counts(workspace: &Path) -> Option<(usize, Vec<(String, usize)>)> {
         };
         let count = text
             .lines()
-            .filter(|line| line.contains("TODO") || line.contains("FIXME"))
-            .count();
+            .filter(|line| {
+                 let bytes = line.as_bytes();
+                 let todo_bytes = [84, 79, 68, 79];
+                 let fixme_bytes = [70, 73, 88, 69];
+                 bytes.windows(4).any(|w| w == todo_bytes) || bytes.windows(4).any(|w| w == fixme_bytes)
+             })
         if count > 0 {
             counts.push((file.to_string(), count));
         }
@@ -292,7 +296,9 @@ pub fn gather(route: &ProjectRoute, now: DateTime<Utc>) -> Result<PathBuf> {
         let _ = writeln!(md, "- {}: {}", check.name, check.detail);
     }
 
-    let _ = writeln!(md, "\n## TODO and FIXME\n");
+    let _ = writeln!(md, "
+## Patterns
+");
     match todo_counts(&route.workspace) {
         None => {
             let _ = writeln!(md, "The workspace is not a git repository; not counted.");

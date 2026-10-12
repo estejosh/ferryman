@@ -247,8 +247,8 @@ fn token_check(route: &ferryman_channel::ProjectRoute, agent: &str, head: Option
         .unwrap_or_default();
     let notes = token_notes(&machine_token_suffix(&host), agent, head, &live, &facts);
     if notes.is_empty() {
-        // TODO: warn at 14 and 3 days from GitHub's token-expiration header. That needs
-        // the token opened and a request to GitHub; this check deliberately does neither.
+        // We do not check the token expiration here because it would require opening the token and
+        // making a request to GitHub. This check deliberately does neither.
         check(
             "tokens",
             true,

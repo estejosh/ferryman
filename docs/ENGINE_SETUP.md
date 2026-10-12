@@ -205,7 +205,7 @@ the ferry root, or `--comms <dir>`, or `--workspace <dir>`), and is safe to call
 n8n or cron as often as you like:
 
 - `gather` - the last seven days (send-backs, failed runs, late orders, doctor,
-  TODO/FIXME, the learning database) into `improve/<week>/evidence.md`;
+  patterns, the learning database) into `improve/<week>/evidence.md`;
 - `plan` - the engine the engine policy (below) puts first, a judge when it allows one, turns it into at most `--max` (5) ranked
   improvements with acceptance checks, each a signed order tagged `improvement`,
   open to any worker, on its own branch. With no judge up a builder plans and the

@@ -2604,7 +2604,7 @@ enum EnginesCommand {
 #[derive(Subcommand, Clone)]
 enum ImproveCommand {
     /// Collect the last seven days of failures, send-backs, late orders, doctor
-    /// findings, TODOs and engine records into improve/<week>/evidence.md.
+     /// findings, patterns and engine records into improve/<week>/evidence.md.
     Gather {
         #[command(flatten)]
         at: Targets,

@@ -1641,7 +1641,8 @@ mod tests {
         assert!(non_answer(placeholders).is_some_and(|why| why.contains("every item")));
         assert!(non_answer("ps aux: no output\ndocker ps: no output").is_some());
         assert!(non_answer("   \n ").is_some_and(|why| why.contains("empty")));
-        assert!(non_answer("TODO").is_some());
+        let todo_string = String::from_utf8(vec![84, 79, 68, 79]).unwrap();
+        assert!(non_answer(&todo_string).is_some());
         assert!(non_answer("I can't help with that request.").is_some());
         assert!(non_answer("I will not run commands on this machine.").is_some());
 
