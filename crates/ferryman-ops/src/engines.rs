@@ -50,8 +50,29 @@ pub const PROBE_EVERY_SECS: i64 = 10 * 60;
 pub const DEFAULT_EXHAUSTED_HOURS: i64 = 6;
 /// A rate limit that asks for a wait this long is a quota, not a hiccup.
 const LONG_RETRY_SECS: u64 = 10 * 60;
-/// The most a probe may take. The free tier is slow to answer prompts, not to list models.
+/// The most a probe's side requests (balance, combos) may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an honest probe waits for a one-token completion. An engine that accepts the
+/// request and then sits on it for longer than this is not up: that is exactly how a model
+/// that listed fine and answered nothing was reported "up, 0.3 s" while every order sent to
+/// it timed out (grouchly, 2026-10-12).
+pub const PROVE_DEADLINE: Duration = Duration::from_secs(20);
+/// How long a CLI engine that wraps an API is given to answer a tiny prompt.
+pub const CLI_PROVE_DEADLINE: Duration = Duration::from_secs(45);
+/// The least time between two tiny-prompt probes of one CLI engine. A real prompt is a
+/// real request, so it is cached and rationed; a failed run asks for a fresh one at once.
+pub const CLI_PROBE_EVERY_SECS: i64 = 15 * 60;
+/// How long an engine is left alone after a run failed on it: 15 minutes, then an hour,
+/// then four, for each failure in a row. One run that works resets the ladder.
+pub const COOLOFF_STEPS_SECS: [i64; 3] = [15 * 60, 60 * 60, 4 * 60 * 60];
+/// Failures in a row after which the owner is told, unless agent.toml says otherwise
+/// (`engine_alert_after`).
+pub const DEFAULT_ALERT_AFTER: u32 = 2;
+/// The most engines one order is handed through in one attempt, unless agent.toml says
+/// otherwise (`max_engines_per_order`).
+pub const DEFAULT_ENGINES_PER_ORDER: usize = 3;
+/// How many orders an engine's record names as affected by its failures.
+const AFFECTED_ORDERS: usize = 10;
 /// How much of an engine's complaint is kept in the inventory.
 const REASON_CHARS: usize = 200;
 /// Refuted results, inside [`TRUST_WINDOW_DAYS`], that demote an engine to chore
@@ -555,7 +576,13 @@ pub fn parse_engines(
             None if base_url.as_deref().is_some_and(is_local_url) => Paid::Local,
             None => Paid::Unknown,
         };
-        let probe_chat = probe_with_chat(get("probe").as_deref(), base_url.as_deref());
+        // An http engine is probed by asking it for one token unless told `probe =
+        // "models"`: a model list proves nothing about whether it answers. A gateway
+        // keeps listing its models, which is how its routes are read.
+        let probe_chat = probe_with_chat(get("probe").as_deref(), base_url.as_deref())
+            || (kind == Kind::Http
+                && get("probe").is_none()
+                && provider.as_deref() != Some("omniroute"));
         out.push(EngineSpec {
             kind,
             tier: Tier::parse(&get("tier").unwrap_or_default())?,
@@ -670,6 +697,77 @@ pub struct EngineState {
     /// smart router's success estimate learns from. Published in the engine's trust line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outcomes: Vec<ferryman_channel::router::Outcome>,
+    /// What the last probe proved. `None` in a ledger written before probes said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<Proof>,
+    /// The last tiny-prompt run of a CLI engine that wraps an API.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_probe: Option<CliProbe>,
+    /// Runs that failed on this engine in a row (a timeout, a stall, no tokens, an
+    /// error). One run that works sets it back to nothing.
+    #[serde(default)]
+    pub fail_streak: u32,
+    /// Not given work until then, because runs failed on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooloff_until: Option<DateTime<Utc>>,
+    /// When the current cool-off began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooloff_started: Option<DateTime<Utc>>,
+    /// Why the last run failed, and on which model and when.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_model: Option<String>,
+    /// The last run on it that worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ok_at: Option<DateTime<Utc>>,
+    /// Orders its failures have touched since it last worked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_orders: Vec<String>,
+    /// The owner was told about the current cool-off, and by which question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerted_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_question: Option<String>,
+}
+
+/// What a probe proved about an engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Proof {
+    /// It returned a real completion to a request just now.
+    Answered,
+    /// Something answered at its address, but no completion was seen: a model list, a
+    /// rate limit, an accepted request that never finished.
+    Reachable,
+    /// Nothing was asked of it. A CLI that wraps no endpoint cannot be tried without
+    /// spending a real request, so it is only found on PATH.
+    #[default]
+    Unprobed,
+}
+
+impl Proof {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Reachable => "reachable",
+            Self::Unprobed => "unprobed",
+        }
+    }
+}
+
+/// One tiny-prompt run of a CLI engine that wraps an API.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CliProbe {
+    pub at: DateTime<Utc>,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl EngineState {
@@ -708,6 +806,9 @@ pub fn flag_free_tier(agent: &str, engine: &str, reason: &str, now: DateTime<Utc
 pub struct Ledger {
     #[serde(default)]
     pub engines: BTreeMap<String, EngineState>,
+    /// Questions to the owner whose signed answers this machine has already acted on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied: Vec<String>,
 }
 
 /// Where an agent's engine ledger lives on this machine.
@@ -837,12 +938,21 @@ pub fn next_week(now: DateTime<Utc>) -> DateTime<Utc> {
 /// Whether an engine can be given work.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Availability {
-    /// The last probe answered.
+    /// A probe got a real completion out of it, and nothing has failed on it since.
     Up,
     /// Never probed yet.
     Unknown,
+    /// Probed, but nothing proves it can answer: only reachable, never asked, or a run
+    /// failed on it since its last probe. Used, after everything that is proven.
+    Unproven(String),
     /// The last probe failed. Still tried, after everything that is up.
     Down(String),
+    /// Runs failed on it, so it is left alone until `until`; then it is probed again
+    /// before it is trusted. Not tried until then.
+    CoolingOff {
+        until: DateTime<Utc>,
+        reason: String,
+    },
     /// Out of credit, or over the operator's weekly cap. Not tried until `until`.
     Exhausted {
         until: DateTime<Utc>,
@@ -853,7 +963,7 @@ pub enum Availability {
 impl Availability {
     #[must_use]
     pub fn usable(&self) -> bool {
-        !matches!(self, Self::Exhausted { .. })
+        !matches!(self, Self::Exhausted { .. } | Self::CoolingOff { .. })
     }
 
     #[must_use]
@@ -861,13 +971,60 @@ impl Availability {
         match self {
             Self::Up => "up".to_string(),
             Self::Unknown => "not probed yet".to_string(),
+            Self::Unproven(why) => format!("not proven: {why}"),
             Self::Down(why) => format!("down: {why}"),
+            Self::CoolingOff { until, reason } => format!(
+                "cooling off until {}: {reason}",
+                until.format("%a %Y-%m-%d %H:%M UTC")
+            ),
             Self::Exhausted { until, reason } => format!(
                 "exhausted until {}: {reason}",
                 until.format("%a %Y-%m-%d %H:%M UTC")
             ),
         }
     }
+}
+
+/// Whether this engine's tiny-prompt run, not its endpoint, is what proves it: a CLI that
+/// wraps an API (it names a `base_url`).
+fn proved_by_cli(spec: &EngineSpec) -> bool {
+    spec.kind == Kind::Cli && spec.base_url.is_some()
+}
+
+/// When this engine was last probed in the way that proves it.
+fn proved_at(spec: &EngineSpec, state: &EngineState) -> Option<DateTime<Utc>> {
+    if proved_by_cli(spec) {
+        state.cli_probe.as_ref().map(|probe| probe.at)
+    } else {
+        state.checked_at
+    }
+}
+
+/// What the probes prove about the engine, as it is published: `answered`, `reachable` or
+/// `unprobed`. A run that failed since the proof was taken withdraws it.
+#[must_use]
+pub fn proof_of(spec: &EngineSpec, state: &EngineState) -> Proof {
+    let base = if proved_by_cli(spec) {
+        match &state.cli_probe {
+            Some(probe) if probe.ok => Proof::Answered,
+            Some(_) => Proof::Reachable,
+            None => match state.proof {
+                Some(Proof::Unprobed) | None => Proof::Unprobed,
+                Some(_) => Proof::Reachable,
+            },
+        }
+    } else {
+        state.proof.unwrap_or_default()
+    };
+    if base == Proof::Unprobed {
+        return base;
+    }
+    let failed_since = match (state.last_failure_at, proved_at(spec, state)) {
+        (Some(failed), Some(proved)) => failed > proved,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if failed_since { Proof::Reachable } else { base }
 }
 
 /// What the ledger and the caps say about one engine at `now`.
@@ -901,10 +1058,62 @@ pub fn availability(spec: &EngineSpec, state: &EngineState, now: DateTime<Utc>) 
             };
         }
     }
-    match (&state.down, state.checked_at) {
-        (Some(why), _) => Availability::Down(why.clone()),
-        (None, None) => Availability::Unknown,
-        (None, Some(_)) => Availability::Up,
+    // Runs failed on it: left alone until the cool-off ends, however its last probe went.
+    if let Some(until) = state.cooloff_until
+        && until > now
+    {
+        return Availability::CoolingOff {
+            until,
+            reason: state
+                .last_failure
+                .clone()
+                .unwrap_or_else(|| "runs failed on it".to_string()),
+        };
+    }
+    if let Some(why) = &state.down {
+        return Availability::Down(why.clone());
+    }
+    if proved_by_cli(spec)
+        && let Some(probe) = state.cli_probe.as_ref().filter(|probe| !probe.ok)
+    {
+        return Availability::Down(
+            probe
+                .reason
+                .clone()
+                .unwrap_or_else(|| "its tiny test prompt got no answer".to_string()),
+        );
+    }
+    if state.checked_at.is_none() && state.cli_probe.is_none() {
+        return Availability::Unknown;
+    }
+    match proof_of(spec, state) {
+        Proof::Answered => Availability::Up,
+        Proof::Reachable => Availability::Unproven(
+            if state
+                .last_failure_at
+                .is_some_and(|failed| proved_at(spec, state).is_none_or(|proved| failed > proved))
+            {
+                "a run failed on it since it was last probed".to_string()
+            } else {
+                "reachable only: no completion has been seen from it".to_string()
+            },
+        ),
+        Proof::Unprobed => Availability::Unproven(if spec.base_url.is_none() {
+            "unprobed: it cannot be tried without spending a real request".to_string()
+        } else {
+            "unprobed: not asked for a completion yet".to_string()
+        }),
+    }
+}
+
+/// Whether an engine goes behind every engine that is fine: its last probe failed, or it
+/// answered but never completed anything (or a run failed since). An engine that simply
+/// cannot be probed cheaply is not distrusted for that; it is shown as `unprobed`.
+fn distrusted(spec: &EngineSpec, state: &EngineState, available: &Availability) -> bool {
+    match available {
+        Availability::Down(_) => true,
+        Availability::Unproven(_) => proof_of(spec, state) == Proof::Reachable,
+        _ => false,
     }
 }
 
@@ -934,7 +1143,7 @@ pub fn pick<'a>(
             }
             let available = availability(spec, &state, now);
             available.usable().then(|| {
-                let down = matches!(available, Availability::Down(_));
+                let down = distrusted(spec, &state, &available);
                 ((tier as u8 - wanted as u8, down, index), spec)
             })
         })
@@ -958,10 +1167,8 @@ pub fn best_up<'a>(
     usable
         .iter()
         .find(|spec| {
-            !matches!(
-                availability(spec, &ledger.state(&spec.name), now),
-                Availability::Down(_)
-            )
+            let state = ledger.state(&spec.name);
+            !distrusted(spec, &state, &availability(spec, &state, now))
         })
         .or(usable.first())
         .copied()
@@ -1528,6 +1735,11 @@ fn parse_wait(text: &str) -> Option<Duration> {
     (any && total.is_finite() && total >= 0.0).then(|| Duration::from_secs_f64(total))
 }
 
+/// A failure reason shortened to what fits a ledger line or a notice.
+pub fn clip_reason(text: &str) -> String {
+    clip(text)
+}
+
 fn clip(text: &str) -> String {
     let text = text.trim();
     if text.chars().count() <= REASON_CHARS {
@@ -1607,6 +1819,8 @@ pub struct ChatRun {
     pub cost_usd: Option<f64>,
     /// Nothing answered at all.
     pub unreachable: bool,
+    /// The request was accepted and then not answered within the deadline.
+    pub timed_out: bool,
 }
 
 fn client(timeout: Duration) -> Result<reqwest::Client> {
@@ -1661,9 +1875,23 @@ pub async fn chat(
     let response = match run.await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) => {
+            // A request that was sent and never answered is not an endpoint that cannot
+            // be reached: it is a model that hangs, which is the engine's failure.
+            let timed_out = error.is_timeout();
             return ChatRun {
-                detail: redact(&format!("could not reach {base}: {error}"), key),
-                unreachable: error.is_connect() || error.is_request(),
+                detail: redact(
+                    &if timed_out {
+                        format!(
+                            "{base} took the request and returned no answer within {}s",
+                            timeout.as_secs()
+                        )
+                    } else {
+                        format!("could not reach {base}: {error}")
+                    },
+                    key,
+                ),
+                unreachable: !timed_out && (error.is_connect() || error.is_request()),
+                timed_out,
                 ..ChatRun::default()
             };
         }
@@ -1689,7 +1917,20 @@ pub async fn chat(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<f64>().ok())
         .filter(|cost| cost.is_finite() && *cost >= 0.0);
-    let text = response.text().await.unwrap_or_default();
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(error) if error.is_timeout() => {
+            return ChatRun {
+                detail: format!(
+                    "{base} started to answer and did not finish within {}s",
+                    timeout.as_secs()
+                ),
+                timed_out: true,
+                ..ChatRun::default()
+            };
+        }
+        Err(_) => String::new(),
+    };
     if !status.is_success() {
         return ChatRun {
             detail: redact(
@@ -1825,6 +2066,23 @@ async fn fake_chat(canned: &str, prompt: &str, body: &Value) -> ChatRun {
             unreachable: true,
             ..ChatRun::default()
         },
+        // Takes the request and never answers it: the deadline passes.
+        // (`hangrun` is the one that answered its probe and hangs on real work: the
+        // incident. `hang` hangs the probe too.)
+        "hang" | "hangrun" => {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            ChatRun {
+                detail: "fake://hang took the request and returned no answer within 300s"
+                    .to_string(),
+                timed_out: true,
+                ..ChatRun::default()
+            }
+        }
+        // Answers, with nothing in the answer: no tokens.
+        "silent" => ChatRun {
+            detail: "the reply carried no answer".to_string(),
+            ..ChatRun::default()
+        },
         other => ChatRun {
             ok: true,
             text: other.strip_prefix("ok:").unwrap_or(other).to_string(),
@@ -1847,17 +2105,54 @@ pub struct Probe {
     pub balance: Option<String>,
     /// What an OmniRoute gateway offers.
     pub catalog: Option<crate::omniroute::Catalog>,
+    /// What this probe proved: a real completion, an address that answered, or nothing.
+    pub proof: Proof,
 }
 
-/// Probe one engine: list its models (or ask for one token), and read its balance where
-/// the provider has an endpoint for that. A CLI engine with no endpoint is only looked
-/// for on PATH, because running it would cost a real request.
+/// Whether a chat-completions reply carries a completion: a well-formed `choices` entry
+/// and no error. With one token asked for, the text may be empty; the entry is the proof.
+fn completion_in(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    value.get("error").is_none() && value["choices"].as_array().is_some_and(|c| !c.is_empty())
+}
+
+/// What an engine that took a request and never finished it is called.
+fn not_proven(deadline: Duration) -> String {
+    format!(
+        "took the request but returned no completion within {}s",
+        deadline.as_secs().max(1)
+    )
+}
+
+/// Probe one engine, honestly: it is only called up when it has just returned a real
+/// completion. An endpoint is asked for one token (`probe = "chat"`, the default for an
+/// http engine and for NVIDIA); listing models proves only that something is there. A CLI
+/// engine with no endpoint is only looked for on PATH, because running it would cost a
+/// real request, and says so: unprobed. A CLI engine that wraps an endpoint gets its
+/// proof from [`crate::agent`]'s tiny-prompt run through the CLI itself; the endpoint
+/// answering never proves the CLI in front of it works.
 pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
+    probe_within(spec, key, PROVE_DEADLINE).await
+}
+
+/// [`probe`], waiting at most `deadline` for the completion.
+pub async fn probe_within(spec: &EngineSpec, key: Option<&str>, deadline: Duration) -> Probe {
+    let mut found = probe_endpoint(spec, key, deadline).await;
+    if proved_by_cli(spec) && found.proof == Proof::Answered {
+        found.proof = Proof::Reachable;
+    }
+    found
+}
+
+async fn probe_endpoint(spec: &EngineSpec, key: Option<&str>, deadline: Duration) -> Probe {
     let Some(base) = spec.base_url.as_deref() else {
         let found = Path::new(&spec.command).is_file()
             || crate::doctor::find_on_path(&spec.command).is_some();
         return Probe {
             down: (!found).then(|| format!("'{}' is not on PATH", spec.command)),
+            proof: Proof::Unprobed,
             ..Probe::default()
         };
     };
@@ -1869,14 +2164,33 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
             "empty" => Probe {
                 exhausted: Some("HTTP 402: Insufficient Balance".into()),
                 latency_ms: Some(5),
+                proof: Proof::Reachable,
                 ..Probe::default()
             },
             "down" => Probe {
                 down: Some("connection refused".into()),
                 ..Probe::default()
             },
+            // Reachable, takes the request, never completes it.
+            "hang" => {
+                // A fake never makes a test wait out a real deadline.
+                let wait = deadline.min(Duration::from_millis(50));
+                let _ = tokio::time::timeout(wait, std::future::pending::<()>()).await;
+                Probe {
+                    down: Some(not_proven(deadline)),
+                    proof: Proof::Reachable,
+                    ..Probe::default()
+                }
+            }
+            // Lists its models and nothing more.
+            "reach" => Probe {
+                latency_ms: Some(5),
+                proof: Proof::Reachable,
+                ..Probe::default()
+            },
             _ => Probe {
                 latency_ms: Some(5),
+                proof: Proof::Answered,
                 ..Probe::default()
             },
         };
@@ -1893,6 +2207,7 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
             "model": spec.model,
             "messages": [{"role": "user", "content": "ping"}],
             "max_tokens": 1,
+            "stream": false,
         }))
     } else {
         http.get(format!("{base}/models"))
@@ -1900,20 +2215,44 @@ pub async fn probe(spec: &EngineSpec, key: Option<&str>) -> Probe {
     let request = match key {
         Some(key) => request.bearer_auth(key),
         None => request,
-    };
+    }
+    .timeout(deadline);
     let mut found = Probe::default();
-    match request.send().await {
+    // Sending and reading the body are one deadline: a reply that starts and never ends
+    // is no completion either.
+    let reply = async {
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let body = response.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    }
+    .await;
+    match reply {
+        Err(error) if error.is_timeout() => {
+            found.down = Some(not_proven(deadline));
+            found.proof = Proof::Reachable;
+        }
         Err(error) => {
             found.down = Some(clip(&redact(&format!("unreachable: {error}"), key)));
         }
-        Ok(response) => {
+        Ok((status, body)) => {
             found.latency_ms =
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
             let said = clip(&redact(&format!("HTTP {status}: {body}"), key));
+            // Whatever answered, it was reachable; only a completion lifts it above that.
+            found.proof = Proof::Reachable;
             match status {
                 200..=299 => {
+                    if spec.probe_chat {
+                        if completion_in(&body) {
+                            found.proof = Proof::Answered;
+                        } else {
+                            found.down = Some(clip(&redact(
+                                &format!("HTTP {status} but no completion: {body}"),
+                                key,
+                            )));
+                        }
+                    }
                     if !spec.probe_chat && crate::omniroute::is_omniroute(spec) {
                         found.catalog = Some(crate::omniroute::Catalog {
                             models: crate::omniroute::parse_models(&body),
@@ -2034,6 +2373,7 @@ pub fn apply_probe(ledger: &mut Ledger, engine: &str, probe: &Probe, now: DateTi
     state.checked_at = Some(now);
     state.latency_ms = probe.latency_ms;
     state.down = probe.down.clone();
+    state.proof = Some(probe.proof);
     if probe.balance.is_some() {
         state.balance = probe.balance.clone();
     }
@@ -2054,6 +2394,24 @@ pub fn apply_probe(ledger: &mut Ledger, engine: &str, probe: &Probe, now: DateTi
     }
 }
 
+/// Whether an engine's endpoint is due a probe: never probed, probed [`PROBE_EVERY_SECS`]
+/// ago or more, or probed before a run failed on it or before its cool-off ended - so
+/// that an engine coming out of a cool-off is trusted again only on seeing it answer.
+/// Never while it is cooling off: nothing is spent on an engine that is being left alone.
+#[must_use]
+pub fn endpoint_probe_due(state: &EngineState, now: DateTime<Utc>) -> bool {
+    if state.cooloff_until.is_some_and(|until| until > now) {
+        return false;
+    }
+    state.checked_at.is_none_or(|at| {
+        let since = now.signed_duration_since(at);
+        since < chrono::Duration::zero()
+            || since >= chrono::Duration::seconds(PROBE_EVERY_SECS)
+            || state.cooloff_until.is_some_and(|until| at < until)
+            || state.last_failure_at.is_some_and(|failed| at < failed)
+    })
+}
+
 /// Probe every engine whose last probe is older than [`PROBE_EVERY_SECS`].
 ///
 /// An engine whose key this channel does not hold is skipped here rather than marked
@@ -2068,12 +2426,11 @@ pub async fn probe_due(
     let ledger = Ledger::load(agent);
     let mut results = Vec::new();
     for spec in specs {
-        let checked = ledger.state(&spec.name).checked_at;
-        let due = checked.is_none_or(|at| {
-            let since = now.signed_duration_since(at);
-            since < chrono::Duration::zero() || since >= chrono::Duration::seconds(PROBE_EVERY_SECS)
-        });
-        if !due {
+        let state = ledger.state(&spec.name);
+        // Nothing is spent on an engine that is cooling off; when the cool-off ends it is
+        // probed at once, however recently it was probed before, so it is trusted again
+        // only on seeing it answer.
+        if !endpoint_probe_due(&state, now) {
             continue;
         }
         let Ok(key) = engine_key(route, agent, spec) else {
@@ -2105,7 +2462,19 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
             let (status, until, reason) = match &available {
                 Availability::Up => ("up", None, None),
                 Availability::Unknown => ("unknown", None, None),
+                // Not proven is not up: said as unknown, with what is missing.
+                Availability::Unproven(why) => ("unknown", None, Some(why.clone())),
                 Availability::Down(why) => ("down", None, Some(why.clone())),
+                // Down, with the time it is expected back: a policy reads that as out of
+                // the running until then.
+                Availability::CoolingOff { until, reason } => (
+                    "down",
+                    Some(*until),
+                    Some(format!(
+                        "cooling off after {} failed run(s) in a row: {reason}",
+                        state.fail_streak.max(1)
+                    )),
+                ),
                 Availability::Exhausted { until, reason } => {
                     ("exhausted", Some(*until), Some(reason.clone()))
                 }
@@ -2126,9 +2495,186 @@ pub fn reports(specs: &[EngineSpec], ledger: &Ledger, now: DateTime<Utc>) -> Vec
                 billing: Some(billing(spec, &state, now)),
                 class: Some(spec.class().as_str().to_string()),
                 capabilities: Some(capabilities(spec)),
+                proof: Some(proof_of(spec, &state).as_str().to_string()),
             }
         })
         .collect()
+}
+
+// --- runs that fail: cool-off, and telling the owner ------------------------------------
+
+/// What one failed run did to its engine's record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Strike {
+    /// Failed runs in a row, this one included.
+    pub streak: u32,
+    /// The engine is left alone until then.
+    pub cooloff_until: DateTime<Utc>,
+    /// When this cool-off began; the owner is told once per cool-off.
+    pub cooloff_started: DateTime<Utc>,
+    /// Whether the owner should be told now: the streak reached `alert_after` and nobody
+    /// has been told about this cool-off.
+    pub alert: bool,
+    /// Orders its failures have touched since it last worked, oldest first.
+    pub orders: Vec<String>,
+}
+
+/// How long the `streak`th failure in a row leaves an engine alone.
+#[must_use]
+pub fn cooloff_for(streak: u32) -> chrono::Duration {
+    let step = usize::try_from(streak.saturating_sub(1)).map_or(2, |step| step.min(2));
+    chrono::Duration::seconds(COOLOFF_STEPS_SECS[step])
+}
+
+/// A run failed on this engine: it timed out, stalled, returned no tokens or errored.
+/// The engine is marked down with the reason and left alone for 15 minutes, then an
+/// hour, then four, for each failure in a row. A second failure that lands while the
+/// engine is already cooling off (two orders were running on it together) is recorded as
+/// affected but does not climb the ladder.
+pub fn record_run_failure(
+    agent: &str,
+    engine: &str,
+    (model, order): (Option<&str>, &str),
+    reason: &str,
+    alert_after: u32,
+    now: DateTime<Utc>,
+) -> Strike {
+    let mut strike = None;
+    update(agent, |ledger| {
+        let state = ledger.entry(engine);
+        let cooling = state.cooloff_until.is_some_and(|until| until > now);
+        if !cooling {
+            state.fail_streak = state.fail_streak.saturating_add(1);
+            state.cooloff_started = Some(now);
+            state.cooloff_until = Some(now + cooloff_for(state.fail_streak));
+        }
+        state.last_failure = Some(clip(reason));
+        state.last_failure_at = Some(now);
+        state.failed_model = model.map(str::to_string);
+        if !state.failed_orders.iter().any(|known| known == order) {
+            state.failed_orders.push(order.to_string());
+            let extra = state.failed_orders.len().saturating_sub(AFFECTED_ORDERS);
+            state.failed_orders.drain(..extra);
+        }
+        let started = state.cooloff_started.unwrap_or(now);
+        let alert = !cooling
+            && state.fail_streak >= alert_after.max(1)
+            && state.alerted_at.is_none_or(|told| told < started);
+        if alert {
+            state.alerted_at = Some(now);
+        }
+        strike = Some(Strike {
+            streak: state.fail_streak,
+            cooloff_until: state.cooloff_until.unwrap_or(now),
+            cooloff_started: started,
+            alert,
+            orders: state.failed_orders.clone(),
+        });
+    });
+    strike.unwrap_or_else(|| Strike {
+        streak: 1,
+        cooloff_until: now,
+        cooloff_started: now,
+        alert: false,
+        orders: Vec::new(),
+    })
+}
+
+/// A run worked on this engine: the ladder starts over.
+pub fn record_run_success(agent: &str, engine: &str, now: DateTime<Utc>) {
+    update(agent, |ledger| {
+        let state = ledger.entry(engine);
+        let was_failing = state.fail_streak > 0 || state.cooloff_until.is_some();
+        state.last_ok_at = Some(now);
+        if was_failing {
+            state.fail_streak = 0;
+            state.cooloff_until = None;
+            state.cooloff_started = None;
+            state.failed_orders.clear();
+            state.alerted_at = None;
+            state.alert_question = None;
+        }
+    });
+}
+
+/// The owner said to try this engine again: forget its cool-off. Its record of the last
+/// failure stays, so it still reads as unproven until a probe sees it answer.
+pub fn clear_cooloff(agent: &str, engine: &str) {
+    update(agent, |ledger| {
+        let state = ledger.entry(engine);
+        state.cooloff_until = None;
+        state.fail_streak = 0;
+        state.alerted_at = None;
+        // A probe is due at once: the failure is newer than the last one.
+    });
+}
+
+/// Note which question told the owner about this engine's cool-off.
+pub fn note_alert(agent: &str, engine: &str, question: &str) {
+    update(agent, |ledger| {
+        ledger.entry(engine).alert_question = Some(question.to_string());
+    });
+}
+
+/// Mark a question's answer as acted on, once.
+pub fn mark_applied(agent: &str, question: &str) {
+    update(agent, |ledger| {
+        if !ledger.applied.iter().any(|known| known == question) {
+            ledger.applied.push(question.to_string());
+            let extra = ledger.applied.len().saturating_sub(200);
+            ledger.applied.drain(..extra);
+        }
+    });
+}
+
+/// Runs failed on this engine since it last worked, recently enough to say so: what the
+/// watchdog sets beside an engine that says it is up. `None` when nothing has failed or
+/// it worked since.
+#[must_use]
+pub fn recent_failures(state: &EngineState, now: DateTime<Utc>) -> Option<String> {
+    let failed = state.last_failure_at?;
+    if now.signed_duration_since(failed) > chrono::Duration::hours(24) {
+        return None;
+    }
+    if state.last_ok_at.is_some_and(|ok| ok > failed) {
+        return None;
+    }
+    Some(format!(
+        "{} run(s) failed in a row, the last {} ago: {}",
+        state.fail_streak.max(1),
+        ferryman_channel::receipts::short_age(now.signed_duration_since(failed)),
+        state.last_failure.as_deref().unwrap_or("no reason given")
+    ))
+}
+
+/// Whether a CLI engine that wraps an API is due its tiny-prompt run: never run, run
+/// [`CLI_PROBE_EVERY_SECS`] ago or more, or a run has failed on it since. Not while it is
+/// cooling off: nothing is spent on an engine that is being left alone.
+#[must_use]
+pub fn cli_probe_due(spec: &EngineSpec, state: &EngineState, now: DateTime<Utc>) -> bool {
+    if !proved_by_cli(spec) || state.cooloff_until.is_some_and(|until| until > now) {
+        return false;
+    }
+    match &state.cli_probe {
+        None => true,
+        Some(last) => {
+            let since = now.signed_duration_since(last.at);
+            since < chrono::Duration::zero()
+                || since >= chrono::Duration::seconds(CLI_PROBE_EVERY_SECS)
+                || state.last_failure_at.is_some_and(|failed| failed > last.at)
+        }
+    }
+}
+
+/// Record the outcome of a CLI engine's tiny-prompt run.
+pub fn record_cli_probe(agent: &str, engine: &str, probe: CliProbe) {
+    update(agent, |ledger| {
+        let state = ledger.entry(engine);
+        if probe.ok {
+            state.latency_ms = probe.ms;
+        }
+        state.cli_probe = Some(probe);
+    });
 }
 
 /// What the engine policy ranks by, as this machine knows it.
@@ -3113,5 +3659,293 @@ engine.local.tier = "chore"
         )
         .expect("every engine failed once: try again, do not hold");
         assert!(again.reason.contains("tries again"), "{}", again.reason);
+    }
+
+    // --- honest probes, and runs that fail ----------------------------------------------
+
+    fn answering(name: &str, canned: &str) -> EngineSpec {
+        let mut spec = http(name, Tier::Build, &format!("fake://{canned}"));
+        spec.probe_chat = true;
+        spec
+    }
+
+    fn a_cli_engine(name: &str, base_url: Option<&str>) -> EngineSpec {
+        let mut spec = http(name, Tier::Build, "unused");
+        spec.kind = Kind::Cli;
+        spec.base_url = base_url.map(str::to_string);
+        spec.command = std::env::current_exe()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        spec.probe_chat = base_url.is_some();
+        spec
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_takes_the_request_and_never_completes_is_not_proven_and_the_router_skips_it()
+     {
+        let now = Utc::now();
+        let hung = answering("hung", "hang");
+        let reach = answering("reach", "reach");
+        let good = answering("good", "ok:fine");
+        let mut ledger = Ledger::default();
+        for spec in [&hung, &reach, &good] {
+            // A deadline of milliseconds: the fake never answers `hang`.
+            let found = probe_within(spec, None, Duration::from_millis(20)).await;
+            apply_probe(&mut ledger, &spec.name, &found, now);
+        }
+
+        assert_eq!(proof_of(&hung, &ledger.state("hung")), Proof::Reachable);
+        assert!(matches!(
+            availability(&hung, &ledger.state("hung"), now),
+            Availability::Down(why) if why.contains("no completion")
+        ));
+        assert!(matches!(
+            availability(&reach, &ledger.state("reach"), now),
+            Availability::Unproven(_)
+        ));
+        assert_eq!(
+            availability(&good, &ledger.state("good"), now),
+            Availability::Up
+        );
+
+        let specs = [hung, reach, good];
+        let reports = reports(&specs, &ledger, now);
+        let [hung, reach, good] = reports.as_slice() else {
+            panic!("three reports")
+        };
+        assert_eq!(hung.state, "down");
+        assert_eq!(reach.state, "unknown", "reachable is not up");
+        assert_eq!(reach.state_label(), "reachable only");
+        assert_eq!(good.state, "up");
+        assert!(
+            good.state_label().starts_with("up, answered in "),
+            "{}",
+            good.state_label()
+        );
+        // The hung engine is listed first, and is still not given the work.
+        let picked = pick(&specs, &ledger, now, Tier::Build, &[]).unwrap();
+        assert_eq!(picked.name, "good");
+    }
+
+    #[tokio::test]
+    async fn an_engine_that_cannot_be_probed_cheaply_says_unprobed_never_up() {
+        let now = Utc::now();
+        let shell = a_cli_engine("shell", None);
+        let found = probe(&shell, None).await;
+        assert_eq!(found.proof, Proof::Unprobed);
+        assert!(found.down.is_none(), "it is on PATH: {:?}", found.down);
+        let mut ledger = Ledger::default();
+        apply_probe(&mut ledger, "shell", &found, now);
+
+        assert!(matches!(
+            availability(&shell, &ledger.state("shell"), now),
+            Availability::Unproven(why) if why.starts_with("unprobed")
+        ));
+        let report = &reports(std::slice::from_ref(&shell), &ledger, now)[0];
+        assert_eq!(report.state, "unknown");
+        assert_eq!(report.proof.as_deref(), Some("unprobed"));
+        assert_eq!(report.state_label(), "unprobed");
+        // Unprobed is a thing to say, not a reason to refuse it work.
+        assert!(pick(&[shell], &ledger, now, Tier::Build, &[]).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_cli_that_wraps_an_api_is_proven_by_its_own_tiny_prompt_and_not_by_the_endpoint() {
+        let now = Utc::now();
+        let shim = a_cli_engine("shim", Some("fake://ok:fine"));
+        let found = probe_within(&shim, None, Duration::from_millis(20)).await;
+        assert_eq!(
+            found.proof,
+            Proof::Reachable,
+            "the endpoint answering says nothing about the shim in front of it"
+        );
+        let mut ledger = Ledger::default();
+        apply_probe(&mut ledger, "shim", &found, now);
+        assert!(matches!(
+            availability(&shim, &ledger.state("shim"), now),
+            Availability::Unproven(_)
+        ));
+        assert!(cli_probe_due(&shim, &ledger.state("shim"), now));
+
+        // Its tiny prompt came back.
+        let state = ledger.engines.get_mut("shim").unwrap();
+        state.cli_probe = Some(CliProbe {
+            at: now,
+            ok: true,
+            ms: Some(900),
+            reason: None,
+        });
+        state.latency_ms = Some(900);
+        assert_eq!(
+            availability(&shim, &ledger.state("shim"), now),
+            Availability::Up
+        );
+        let report = &reports(std::slice::from_ref(&shim), &ledger, now)[0];
+        assert_eq!(report.state_label(), "up, answered in 0.9 s");
+        // Cached and rationed: not again inside 15 minutes, again after.
+        let state = ledger.state("shim");
+        assert!(!cli_probe_due(
+            &shim,
+            &state,
+            now + chrono::Duration::minutes(14)
+        ));
+        assert!(cli_probe_due(
+            &shim,
+            &state,
+            now + chrono::Duration::minutes(16)
+        ));
+        // And at once after a run failed on it.
+        let mut failed = state.clone();
+        failed.last_failure_at = Some(now + chrono::Duration::minutes(1));
+        assert!(cli_probe_due(
+            &shim,
+            &failed,
+            now + chrono::Duration::minutes(2)
+        ));
+        assert_eq!(
+            proof_of(&shim, &failed),
+            Proof::Reachable,
+            "a failure withdraws the proof"
+        );
+        // A tiny prompt that got nothing is down, whatever the endpoint says.
+        let mut dead = state;
+        dead.cli_probe = Some(CliProbe {
+            at: now,
+            ok: false,
+            ms: None,
+            reason: Some("no answer to a tiny prompt before its deadline".into()),
+        });
+        assert!(matches!(
+            availability(&shim, &dead, now),
+            Availability::Down(_)
+        ));
+    }
+
+    #[test]
+    fn failed_runs_climb_the_cooloff_ladder_alert_once_per_cooloff_and_a_good_run_resets_it() {
+        let agent = "ladder-agent";
+        let spec = answering("e", "ok:fine");
+        let t0 = Utc::now();
+        let minutes = chrono::Duration::minutes;
+
+        let first = record_run_failure(agent, "e", (Some("m"), "o1"), "timed out", 2, t0);
+        assert_eq!(first.streak, 1);
+        assert_eq!(first.cooloff_until, t0 + minutes(15));
+        assert!(!first.alert, "one failed run is a bad run, not an engine");
+        let state = Ledger::load(agent).state("e");
+        assert!(matches!(
+            availability(&spec, &state, t0 + minutes(1)),
+            Availability::CoolingOff { .. }
+        ));
+        assert!(!availability(&spec, &state, t0 + minutes(1)).usable());
+        assert_eq!(state.failed_model.as_deref(), Some("m"));
+
+        // A second order failing together with the first does not climb the ladder.
+        let together = record_run_failure(
+            agent,
+            "e",
+            (Some("m"), "o2"),
+            "timed out",
+            2,
+            t0 + minutes(1),
+        );
+        assert_eq!(together.streak, 1);
+        assert!(!together.alert);
+        assert_eq!(together.orders, ["o1", "o2"]);
+
+        let t1 = t0 + minutes(16);
+        let second = record_run_failure(agent, "e", (Some("m"), "o3"), "timed out", 2, t1);
+        assert_eq!(second.streak, 2);
+        assert_eq!(second.cooloff_until, t1 + minutes(60));
+        assert!(second.alert, "two in a row tell the owner");
+        let again = record_run_failure(
+            agent,
+            "e",
+            (Some("m"), "o4"),
+            "timed out",
+            2,
+            t1 + minutes(1),
+        );
+        assert!(!again.alert, "once for this cool-off");
+
+        let t2 = t1 + minutes(61);
+        let third = record_run_failure(agent, "e", (Some("m"), "o5"), "timed out", 2, t2);
+        assert_eq!(third.streak, 3);
+        assert_eq!(third.cooloff_until, t2 + minutes(240));
+        let t3 = t2 + minutes(241);
+        let fourth = record_run_failure(agent, "e", (Some("m"), "o6"), "timed out", 2, t3);
+        assert_eq!(
+            fourth.cooloff_until,
+            t3 + minutes(240),
+            "four hours is the most"
+        );
+
+        record_run_success(agent, "e", t3 + minutes(1));
+        let state = Ledger::load(agent).state("e");
+        assert_eq!(state.fail_streak, 0);
+        assert!(state.cooloff_until.is_none() && state.failed_orders.is_empty());
+        assert!(availability(&spec, &state, t3 + minutes(2)).usable());
+    }
+
+    #[test]
+    fn when_the_cooloff_ends_the_engine_is_probed_again_before_it_is_trusted() {
+        let agent = "expiry-agent";
+        let spec = answering("e", "ok:fine");
+        let t0 = Utc::now();
+        let minutes = chrono::Duration::minutes;
+        let mut ledger = Ledger::default();
+        // It answered a probe a minute ago, then a run on it hung.
+        apply_probe(
+            &mut ledger,
+            "e",
+            &Probe {
+                latency_ms: Some(300),
+                proof: Proof::Answered,
+                ..Probe::default()
+            },
+            t0 - minutes(1),
+        );
+        ledger.save(agent).unwrap();
+        record_run_failure(agent, "e", (Some("m"), "o1"), "timed out", 2, t0);
+        let state = Ledger::load(agent).state("e");
+
+        assert!(
+            !endpoint_probe_due(&state, t0 + minutes(5)),
+            "nothing is spent on an engine that is being left alone"
+        );
+        let back = t0 + minutes(16);
+        assert!(
+            endpoint_probe_due(&state, back),
+            "the cool-off is over, so it is probed at once"
+        );
+        // The owner saying "retry now" lifts the cool-off early: due at once too, because
+        // the failure is newer than the last probe.
+        clear_cooloff(agent, "e");
+        let mut recent = Ledger::load(agent).state("e");
+        assert!(recent.cooloff_until.is_none());
+        recent.checked_at = Some(t0 - minutes(1));
+        assert!(endpoint_probe_due(&recent, t0 + minutes(2)));
+        // Until a probe sees it answer, it is not up.
+        assert!(matches!(
+            availability(&spec, &state, back),
+            Availability::Unproven(why) if why.contains("a run failed")
+        ));
+        let mut ledger = Ledger::load(agent);
+        apply_probe(
+            &mut ledger,
+            "e",
+            &Probe {
+                latency_ms: Some(300),
+                proof: Proof::Answered,
+                ..Probe::default()
+            },
+            back,
+        );
+        assert_eq!(
+            availability(&spec, &ledger.state("e"), back),
+            Availability::Up
+        );
+        assert!(!endpoint_probe_due(&ledger.state("e"), back + minutes(1)));
     }
 }
