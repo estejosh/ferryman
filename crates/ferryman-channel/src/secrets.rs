@@ -327,7 +327,7 @@ fn seal_value(
     name: &str,
     project_id: &str,
     recipient: &str,
-    value: &str,
+    value: &[u8],
 ) -> Result<RecipientSlot> {
     let shared = ephemeral.diffie_hellman(recipient_public);
     let cipher = slot_cipher(&shared, &XPublicKey::from(ephemeral), recipient_public)?;
@@ -337,7 +337,7 @@ fn seal_value(
         .encrypt(
             &XNonce::from(nonce),
             Payload {
-                msg: value.as_bytes(),
+                msg: value,
                 aad: &associated_data(name, project_id, recipient),
             },
         )
@@ -365,6 +365,39 @@ pub fn set_secret(
     if recipients.is_empty() {
         bail!("a secret needs at least one recipient (--to or the form's recipients)")
     }
+    let slots = seal_slots(route, name, value.as_bytes(), recipients)?;
+
+    let mut envelope = SecretEnvelope {
+        format: SECRET_FORMAT.to_string(),
+        name: name.to_string(),
+        project_id: route.project_id.clone(),
+        recipients: slots,
+        signed_by: None,
+        signature: None,
+        created_at: chrono::Utc::now(),
+    };
+    let payload = envelope.payload();
+    envelope.signed_by = Some(signer.name().to_string());
+    envelope.signature = Some(signer.sign_bytes(payload.as_bytes()));
+
+    let path = envelope_path(route, name);
+    crate::atomic_json(&path, &envelope)?;
+    Ok(path)
+}
+
+/// Seal `value` to each named recipient, one slot per recipient.
+///
+/// The one place recipients are resolved against the roster and sealed to, so a sealed
+/// secret and a sealed order file cannot drift apart in how they treat a recipient with
+/// no key. `aad_name` is bound into every seal: the secret's name, or for an order file
+/// the order and file it belongs to.
+pub(crate) fn seal_slots(
+    route: &ProjectRoute,
+    aad_name: &str,
+    value: &[u8],
+    recipients: &[String],
+) -> Result<Vec<RecipientSlot>> {
+    let name = aad_name;
     let roster = crate::read_agent_roster(&route.communications)?;
     let mut slots = Vec::with_capacity(recipients.len());
     for raw in recipients {
@@ -397,23 +430,44 @@ pub fn set_secret(
             value,
         )?);
     }
+    Ok(slots)
+}
 
-    let mut envelope = SecretEnvelope {
-        format: SECRET_FORMAT.to_string(),
-        name: name.to_string(),
-        project_id: route.project_id.clone(),
-        recipients: slots,
-        signed_by: None,
-        signature: None,
-        created_at: chrono::Utc::now(),
-    };
-    let payload = envelope.payload();
-    envelope.signed_by = Some(signer.name().to_string());
-    envelope.signature = Some(signer.sign_bytes(payload.as_bytes()));
+/// Open this machine's slot among `slots`: the counterpart of [`seal_slots`]. Refuses,
+/// specifically, when the agent is not a recipient or its key does not open the slot.
+pub(crate) fn open_slot(
+    slots: &[RecipientSlot],
+    aad_name: &str,
+    project_id: &str,
+    identity: &EncryptionIdentity,
+) -> Result<Vec<u8>> {
+    let slot = slots
+        .iter()
+        .find(|slot| slot.recipient.eq_ignore_ascii_case(identity.name()))
+        .ok_or_else(|| {
+            anyhow!(
+                "this machine's agent ('{}') is not a recipient of '{aad_name}'",
+                identity.name()
+            )
+        })?;
 
-    let path = envelope_path(route, name);
-    crate::atomic_json(&path, &envelope)?;
-    Ok(path)
+    let ephemeral = XPublicKey::from(hex_decode_32(&slot.ephemeral_public_hex)?);
+    let shared = identity.secret.diffie_hellman(&ephemeral);
+    let cipher = slot_cipher(&shared, &ephemeral, &identity.public())?;
+    let nonce = hex::decode(&slot.nonce_hex).context("nonce is not valid hex")?;
+    let nonce: [u8; 24] = nonce
+        .try_into()
+        .map_err(|_| anyhow!("nonce is the wrong length"))?;
+    let ciphertext = hex::decode(&slot.ciphertext_hex).context("ciphertext is not valid hex")?;
+    cipher
+        .decrypt(
+            &XNonce::from(nonce),
+            Payload {
+                msg: &ciphertext,
+                aad: &associated_data(aad_name, project_id, &slot.recipient),
+            },
+        )
+        .map_err(|_| anyhow!("'{aad_name}' could not be decrypted (key does not match)"))
 }
 
 /// List stored secrets as summaries. Values are never returned.
@@ -664,7 +718,7 @@ mod tests {
             "token",
             "ferryman",
             "them",
-            "hunter2",
+            b"hunter2",
         )
         .unwrap();
 

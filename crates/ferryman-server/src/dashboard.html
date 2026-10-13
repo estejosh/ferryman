@@ -758,6 +758,33 @@ function closeDrawer() {
 $("#drawer-close").addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeDrawer(); });
 
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// The files an order carries: name, size, the start of the hash the order's signature
+// covers, whether a worker has received them (and which), and anything wrong with them.
+function filesDetail(files) {
+  if (!files || !files.length) return "";
+  const word = { ready: "in the channel", missing: "not synced yet", mismatch: "does not match its hash", refused: "refused", removed: "removed after retention" };
+  const tone = { ready: "", missing: "warn", mismatch: "bad", refused: "bad", removed: "" };
+  return `
+    <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:20px 0 8px">Files</h3>
+    ${files.map((f) => `
+      <div class="row" style="padding:9px 0;border-bottom:1px solid var(--line)">
+        <div><div class="t">${esc(f.name)} ${f.sealed ? `<span class="badge accent" title="Encrypted to ${esc((f.recipients || []).join(", "))}">sealed</span>` : ""}</div>
+        <div class="m"><span>${esc(fmtBytes(f.size))}</span>
+          <span class="mono" title="${esc(f.sha256)}">sha256 ${esc(String(f.sha256 || "").slice(0, 12))}</span></div></div>
+        <div class="r">
+          <span class="badge ${tone[f.status] || ""}">${esc(word[f.status] || f.status || "")}</span>
+          ${f.delivered ? `<span class="badge good" title="A worker received it and signed a receipt">delivered${f.delivered_to ? " to " + esc([].concat(f.delivered_to).join(", ")) : ""}</span>` : `<span class="badge">not delivered</span>`}
+        </div>
+      </div>`).join("")}`;
+}
+
 async function showTask(id) {
   openDrawer(id, `<div class="empty">Loading…</div>`);
   let d;
@@ -784,6 +811,7 @@ async function showTask(id) {
     ${taskContractDetail(d)}
     <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:0 0 8px">The order</h3>
     <pre class="out">${esc(d.order || d.payload?.task || "—")}</pre>
+    ${filesDetail(d.files)}
     ${latest ? `
       <h3 style="font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--faint);margin:20px 0 8px">
         Result r${esc(latest.revision ?? 1)} by ${esc(latest.agent || "—")} ${sigBadge(latest.sig)}
@@ -846,6 +874,7 @@ function taskRow(t) {
           <span>${esc((t.task || "").slice(0, 110))}${(t.task || "").length > 110 ? "…" : ""}</span>
         </div>
         ${t.routing ? `<div class="m" title="Why this engine: the smart router's reason, recorded by the worker">${esc(t.routing)}</div>` : ""}
+        ${(t.files || []).length ? `<div class="m" title="Files this order carries">Files: ${esc((t.files || []).join(", "))}</div>` : ""}
       </div>
       <div class="r">
         ${t.holder ? `<span class="badge">${esc(t.holder)}</span>` : ""}
@@ -995,12 +1024,86 @@ pages.home = async () => {
     }</div>`;
 };
 
+let orderDone = null;
+let readOnly = false;
+
+// Give an order to the fleet, with files if it needs them. Each file goes up on its own
+// (raw bytes, so nothing is re-encoded), then the order names them; the server hashes them
+// into the channel and signs the list inside the order as you.
+function newOrderForm() {
+  if (readOnly) return "";
+  const sealable = state.roster.filter((a) => a.encryption_key);
+  const done = orderDone;
+  orderDone = null;
+  return `
+    ${done ? `<div class="notice" style="margin-bottom:18px"><div><b>Issued ${esc(done.id)}</b>${(done.files || []).length ? ` with ${done.files.length} file(s): ${esc(done.files.map((f) => f.name).join(", "))}` : ""}.</div></div>` : ""}
+    <details class="card" style="max-width:720px;margin-bottom:22px" id="order-form">
+      <summary class="k" style="cursor:pointer">New order</summary>
+      <label style="display:block;margin-top:12px">What to do
+        <textarea id="order-task" rows="4" style="width:100%" placeholder="Describe the work. Say what the attached files are for."></textarea>
+      </label>
+      <label style="display:block;margin-top:12px">Send it to
+        <select id="order-to" style="width:100%">
+          <option value="">whoever claims it first</option>
+          ${state.roster.map((a) => `<option value="${esc(a.name)}">${esc(a.name)}</option>`).join("")}
+        </select>
+      </label>
+      <label style="display:block;margin-top:12px">Files
+        <input id="order-files" type="file" multiple style="width:100%">
+      </label>
+      <div class="s" style="color:var(--dim)">Each file arrives in the worker's working directory under .ferryman-order-files/, checked against the hash signed into the order. Not for keys or passwords: use the Vault for those.</div>
+      ${sealable.length ? `
+        <div style="margin-top:12px">Encrypt the files so only these agents can open them (optional)</div>
+        ${sealable.map((a) => `<label style="display:block"><input type="checkbox" data-order-seal="${esc(a.name)}"> ${esc(a.name)}</label>`).join("")}` : ""}
+      <label style="display:block;margin-top:12px"><input type="checkbox" id="order-review"> Wait for my review before it counts as done</label>
+      <div style="margin-top:14px"><button class="btn primary" id="order-send">Send the order</button>
+        <span id="order-msg" class="s" style="margin-left:10px"></span></div>
+    </details>`;
+}
+
+function wireNewOrder() {
+  const send = $("#order-send");
+  if (!send) return;
+  const msg = (text) => { $("#order-msg").textContent = String(text).slice(0, 300); };
+  send.addEventListener("click", async () => {
+    const task = $("#order-task").value.trim();
+    const to = $("#order-to").value;
+    const files = Array.from($("#order-files").files || []);
+    const sealTo = $$("[data-order-seal]").filter((b) => b.checked).map((b) => b.dataset.orderSeal);
+    if (!task) return msg("Say what the work is.");
+    if (sealTo.length && !files.length) return msg("Pick the files to encrypt, or untick the agents.");
+    const names = files.map((f) => f.name);
+    if (new Set(names).size !== names.length) return msg("Two of the files have the same name.");
+    const id = "t-" + Math.random().toString(16).slice(2, 10);
+    send.disabled = true;
+    try {
+      for (const [i, f] of files.entries()) {
+        msg(`Sending ${f.name} (${i + 1} of ${files.length})...`);
+        await api(`/api/orders/${encodeURIComponent(id)}/files/${encodeURIComponent(f.name)}`, {
+          method: "PUT", headers: { "content-type": "application/octet-stream" }, body: f });
+      }
+      msg("Signing...");
+      orderDone = await api("/api/orders", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id, task, to: to || null, files: names, seal_to: sealTo,
+          requires_review: $("#order-review").checked }) });
+      $("#order-task").value = "";
+      $("#order-files").value = "";
+      await refresh();
+      await render();
+    } catch (err) {
+      send.disabled = false;
+      msg(err.message || err);
+    }
+  });
+}
+
 pages.tasks = async () => {
   const rows = state.tasks.filter((t) => matches(`${t.id} ${t.task} ${t.holder} ${t.state}`));
   return `
     <div class="head">
       <div><h1>Tasks</h1><p>Every order in this channel and where it has got to. State is derived from the files, never stored as a status anyone edits.</p></div>
     </div>
+    ${newOrderForm()}
     <div class="panel">${rows.length ? rows.map(taskRow).join("") : `<div class="empty">Nothing matches.</div>`}</div>`;
 };
 
@@ -2997,6 +3100,7 @@ async function render() {
   wireFocus();
   wireSuggestions();
   wireVault();
+  wireNewOrder();
 }
 
 $$("#nav-main button, #nav-system button").forEach((b) => {
@@ -3122,6 +3226,10 @@ function pageIsBusy() {
   const sel = window.getSelection && window.getSelection();
   if (sel && !sel.isCollapsed && main.contains(sel.anchorNode)) return true;
   if (main.querySelector("#tm-editor:not([hidden]), #tm-code:not([hidden])")) return true;
+  // A half-written order, or files picked and not yet sent, is not to be redrawn away.
+  const task = $("#order-task"), picked = $("#order-files");
+  if (task && task.value.trim()) return true;
+  if (picked && picked.files && picked.files.length) return true;
   return false;
 }
 
@@ -3132,6 +3240,7 @@ async function boot() {
   let status = { any_operators: false, seed_present: false, read_only: false, orphaned_operators: [] };
   try { status = await api("/api/auth/status"); } catch (_) {}
   firstRun = !status.any_operators;
+  readOnly = !!status.read_only;
   status_any = !!status.any_operators;
   orphaned = status.orphaned_operators || [];
   status_joining = status.joining || null;

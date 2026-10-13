@@ -522,6 +522,58 @@ pub struct Policy {
     /// Smart routing only; v2-only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub bias: BTreeMap<String, f64>,
+    /// How much an order may carry as files, and how long the channel keeps them. Unset
+    /// fields use the defaults in [`crate::order_files`]. v2-only: left out of the signed
+    /// JSON while all are unset, and never part of the v1 view, so a machine that does not
+    /// know about order files still verifies the file and keeps working.
+    #[serde(default, skip_serializing_if = "FileLimits::is_default")]
+    pub files: FileLimits,
+}
+
+/// The master's word on files carried by orders. See [`crate::order_files`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileLimits {
+    /// Megabytes one file may be.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_mb: Option<u64>,
+    /// Megabytes one order's files may come to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_order_mb: Option<u64>,
+    /// Days after an order is done or reviewed that its files stay in the channel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+}
+
+impl FileLimits {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn check(&self) -> Result<()> {
+        if let Some(mb) = self.max_file_mb
+            && !(1..=4096).contains(&mb)
+        {
+            bail!("the per-file limit must be from 1 to 4096 MB");
+        }
+        if let Some(mb) = self.max_order_mb
+            && !(1..=16384).contains(&mb)
+        {
+            bail!("the per-order limit must be from 1 to 16384 MB");
+        }
+        if let (Some(file), Some(order)) = (self.max_file_mb, self.max_order_mb)
+            && file > order
+        {
+            bail!(
+                "the per-file limit ({file} MB) cannot be above the per-order limit ({order} MB)"
+            );
+        }
+        if let Some(days) = self.retention_days
+            && !(1..=3650).contains(&days)
+        {
+            bail!("files must be kept for 1 to 3650 days");
+        }
+        Ok(())
+    }
 }
 
 impl Default for Policy {
@@ -543,6 +595,7 @@ impl Default for Policy {
             routing: Routing::Smart,
             thresholds: BTreeMap::new(),
             bias: BTreeMap::new(),
+            files: FileLimits::default(),
         }
     }
 }
@@ -550,6 +603,7 @@ impl Default for Policy {
 impl Policy {
     /// Refuse a policy with a role, selector or cap that means nothing.
     pub fn check(&self) -> Result<()> {
+        self.files.check()?;
         for (role, list) in &self.prefer {
             Role::parse(role)?;
             for selector in list {
@@ -859,6 +913,26 @@ impl Policy {
                     .map(|(selector, weight)| format!("{selector} {weight:+}"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ));
+        }
+        if !self.files.is_default() {
+            let show = |value: Option<u64>, default: u64| {
+                value.unwrap_or(default / (1024 * 1024)).to_string()
+            };
+            lines.push(format!(
+                "order files: up to {} MB each and {} MB per order, kept {} days once the \
+                 order is done",
+                show(
+                    self.files.max_file_mb,
+                    crate::order_files::DEFAULT_MAX_FILE_BYTES
+                ),
+                show(
+                    self.files.max_order_mb,
+                    crate::order_files::DEFAULT_MAX_ORDER_BYTES
+                ),
+                self.files
+                    .retention_days
+                    .unwrap_or(crate::order_files::DEFAULT_RETENTION_DAYS)
             ));
         }
         if self.never_applies_to == NeverScope::All {
@@ -2449,6 +2523,7 @@ impl Policy {
             routing: Routing::Smart,
             thresholds: BTreeMap::new(),
             bias: BTreeMap::new(),
+            files: FileLimits::default(),
             ..self.clone()
         };
         view.prefer.remove(Role::Adversary.as_str());
