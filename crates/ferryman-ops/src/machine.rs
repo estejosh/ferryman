@@ -26,6 +26,7 @@
 #[cfg(any(target_os = "linux", windows))]
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", windows))]
 use std::process::Command;
 
 /// How a worker was found.
