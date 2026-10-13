@@ -28,40 +28,108 @@ pub struct Folder {
 /// own and is never flagged for being elsewhere.
 const FERRYMAN_SUFFIXES: [&str; 2] = ["-ferryman", "-work"];
 
+/// A path as plain text for comparing: forward slashes, `.` and `..` resolved, no
+/// trailing slash, no Windows `\\?\` prefix, and lower case on Windows. Without the
+/// `..` step, `comms/../repos/x` would read as a place under `comms/`.
 fn normalise(path: &str) -> String {
     let p = path.trim().replace('\\', "/");
-    let p = p.trim_end_matches('/').to_string();
+    let p = p.strip_prefix("//?/").unwrap_or(&p);
+    let absolute = p.starts_with('/');
+    let mut parts: Vec<&str> = Vec::new();
+    for part in p.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let joined = parts.join("/");
+    let p = if absolute {
+        format!("/{joined}")
+    } else {
+        joined
+    };
     if cfg!(windows) { p.to_lowercase() } else { p }
 }
+
+/// The ways a path can be written: as given, and with symlinks (and Windows short names)
+/// resolved as far as the path exists. A link inside `comms/` that leads into `repos/`
+/// is `repos/` as far as Syncthing is concerned.
+fn forms(path: &Path) -> Vec<String> {
+    let mut found = vec![normalise(&path.display().to_string())];
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut at = path.to_path_buf();
+    loop {
+        if let Ok(real) = std::fs::canonicalize(&at) {
+            let mut full = real;
+            for part in tail.iter().rev() {
+                full.push(part);
+            }
+            let text = normalise(&full.display().to_string());
+            if !found.contains(&text) {
+                found.push(text);
+            }
+            break;
+        }
+        match (at.file_name().map(std::ffi::OsString::from), at.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                at = parent.to_path_buf();
+            }
+            _ => break,
+        }
+    }
+    found
+}
+
+/// The parts of a ferry root nothing may share besides `comms/`.
+const FORBIDDEN_UNDER_ROOT: [(&str, &str); 3] = [
+    ("repos", "is under repos/, which holds git clones"),
+    ("work", "is under work/, which holds git worktrees"),
+    (
+        "service",
+        "is under service/, which holds the worker's environment file",
+    ),
+];
 
 /// Whether `child` is `parent` or lies under it. Text comparison, like Syncthing's own
 /// config: the path may not exist on this machine, and separators and case may differ.
 fn within(child: &str, parent: &str) -> bool {
+    let parent = parent.trim_end_matches('/');
     child == parent
         || child
             .strip_prefix(parent)
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Why `path` may not be a Syncthing folder in this root, or `None` when it may.
-#[must_use]
-pub fn refusal(root: &Path, path: &Path) -> Option<String> {
-    let root_text = normalise(&root.display().to_string());
-    let target = normalise(&path.display().to_string());
+fn reason_for(root_text: &str, target: &str) -> Option<&'static str> {
     if root_text.is_empty() || target.is_empty() {
         return None;
     }
-    let reason = if target == root_text {
-        "is the ferry root itself, which holds repos and worktrees"
-    } else if within(&target, &format!("{root_text}/repos")) {
-        "is under repos/, which holds git clones"
-    } else if within(&target, &format!("{root_text}/work")) {
-        "is under work/, which holds git worktrees"
-    } else if within(&root_text, &target) {
-        "contains the ferry root, so it would carry repos/ and work/ as well"
-    } else {
-        return None;
-    };
+    if target == root_text {
+        return Some("is the ferry root itself, which holds repos and worktrees");
+    }
+    for (part, reason) in FORBIDDEN_UNDER_ROOT {
+        if within(target, &format!("{root_text}/{part}")) {
+            return Some(reason);
+        }
+    }
+    if within(root_text, target) {
+        return Some("contains the ferry root, so it would carry repos/ and work/ as well");
+    }
+    None
+}
+
+/// Why `path` may not be a Syncthing folder in this root, or `None` when it may.
+#[must_use]
+pub fn refusal(root: &Path, path: &Path) -> Option<String> {
+    let reason = forms(root).iter().find_map(|root_text| {
+        forms(path)
+            .iter()
+            .find_map(|target| reason_for(root_text, target))
+    })?;
     Some(format!(
         "{} {reason}. Only channel folders under {}/comms are ever shared; git carries the code",
         path.display(),
@@ -140,13 +208,15 @@ pub fn strays<'a>(root: &Path, folders: &'a [Folder]) -> Vec<&'a Folder> {
         .filter(|folder| {
             let path = Path::new(&folder.path);
             let target = normalise(&folder.path);
-            if folder.path.trim().is_empty() || within(&target, &comms) {
+            if folder.path.trim().is_empty() {
                 return false;
             }
+            // Where it really leads counts, so a link from comms/ into repos/ is a stray.
             refusal(root, path).is_some()
-                || FERRYMAN_SUFFIXES
-                    .iter()
-                    .any(|suffix| folder.id.ends_with(suffix))
+                || (!within(&target, &comms)
+                    && FERRYMAN_SUFFIXES
+                        .iter()
+                        .any(|suffix| folder.id.ends_with(suffix)))
         })
         .collect()
 }
@@ -213,6 +283,50 @@ mod tests {
         let root = std::path::PathBuf::from("/home/josh/ferry");
         assert!(refusal(&root, Path::new("/home/josh/ferry/")).is_some());
         assert!(refusal(&root, Path::new("/home/josh/ferry/work/x/")).is_some());
+    }
+
+    #[test]
+    fn dot_dot_cannot_walk_a_folder_out_of_comms_into_a_forbidden_place() {
+        let root = root();
+        let sneaky = root.join("comms").join("..").join("repos").join("pc");
+        assert!(refusal(&root, &sneaky).is_some(), "{}", sneaky.display());
+        let sneaky = root
+            .join("comms")
+            .join("x")
+            .join("..")
+            .join("..")
+            .join("work");
+        assert!(refusal(&root, &sneaky).is_some(), "{}", sneaky.display());
+        // The service folder holds the worker's environment file.
+        assert!(refusal(&root, &root.join("service")).is_some());
+        assert!(refusal(&root, &root.join("service").join("backups")).is_some());
+        // Walking up and back down to a real channel folder is fine.
+        let fine = root.join("comms").join("x").join("..").join("p-ferryman");
+        assert!(refusal(&root, &fine).is_none(), "{}", fine.display());
+        if cfg!(windows) {
+            let verbatim = format!(r"\\?\{}\repos\pc", root.display());
+            assert!(refusal(&root, Path::new(&verbatim)).is_some(), "{verbatim}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_comms_that_leads_into_repos_is_refused_and_flagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let clone = root.repos().join("pc");
+        std::fs::create_dir_all(&clone).unwrap();
+        std::fs::create_dir_all(root.comms()).unwrap();
+        let link = root.comms().join("pc-ferryman");
+        std::os::unix::fs::symlink(&clone, &link).unwrap();
+        assert!(refusal(&root.path, &link).is_some());
+        assert!(guard(&link).is_err());
+        let folders = vec![Folder {
+            id: "pc-ferryman".into(),
+            label: String::new(),
+            path: link.display().to_string(),
+        }];
+        assert_eq!(strays(&root.path, &folders).len(), 1);
     }
 
     #[test]

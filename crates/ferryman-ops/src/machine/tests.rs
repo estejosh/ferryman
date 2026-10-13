@@ -267,3 +267,38 @@ fn a_long_command_is_shortened_for_a_sentence() {
     assert!(shorten(&long).ends_with("..."));
     assert_eq!(shorten("ferry   agent\nrun"), "ferry agent run");
 }
+
+#[test]
+fn the_stop_commands_print_an_odd_unit_or_task_name_as_one_argument() {
+    let odd = unit("x; rm -rf ~.service", true, true, true);
+    let commands = odd.stop_commands();
+    assert_eq!(
+        commands,
+        ["systemctl --user disable --now 'x; rm -rf ~.service'"]
+    );
+    let quote = unit("it's.service", true, true, true);
+    assert_eq!(
+        quote.stop_commands(),
+        ["systemctl --user disable --now 'it'\\''s.service'"]
+    );
+    let plain = unit("ferryman-ichabod.service", true, true, true);
+    assert_eq!(
+        plain.stop_commands(),
+        ["systemctl --user disable --now ferryman-ichabod.service"]
+    );
+    let task = Worker {
+        kind: Kind::Task {
+            name: "\\Evil\" & calc \"x\n".into(),
+            enabled: true,
+            running: false,
+            scripts: Vec::new(),
+        },
+        all_projects: true,
+        identity: None,
+        command: String::new(),
+    };
+    for line in task.stop_commands() {
+        assert_eq!(line.matches('"').count(), 2, "{line}");
+        assert!(!line.contains('\n'), "{line:?}");
+    }
+}

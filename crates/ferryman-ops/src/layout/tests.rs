@@ -132,6 +132,26 @@ fn a_lock_naming_a_dead_process_is_reported_and_renamed_never_deleted() {
 }
 
 #[test]
+fn a_second_lock_from_a_reused_pid_is_kept_beside_the_first_not_deleted() {
+    let (dir, root) = setup();
+    let lock = with_lock(&root, dir.path(), "quantly", "999999999");
+    archive_stale(&stale_locks(&root));
+    // The same pid again: the first archive is still there and nothing is overwritten.
+    fs::write(&lock, "999999999").unwrap();
+    let done = archive_stale(&stale_locks(&root));
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(!lock.exists());
+    assert!(
+        lock.with_file_name("worker-fang.lock.stale-999999999")
+            .is_file()
+    );
+    assert!(
+        lock.with_file_name("worker-fang.lock.stale-999999999-1")
+            .is_file()
+    );
+}
+
+#[test]
 fn a_lock_naming_a_live_process_is_left_alone() {
     let (dir, root) = setup();
     let lock = with_lock(

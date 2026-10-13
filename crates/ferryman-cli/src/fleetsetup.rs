@@ -150,6 +150,7 @@ pub fn repos_command(command: ReposCommand) -> Result<()> {
             only: project,
             dry_run,
             no_fetch,
+            ..repos::Options::default()
         },
     )?;
     print_repo_rows(&rows, dry_run);
@@ -738,6 +739,7 @@ pub fn managed_clone_after_enable(project: &str, quiet: bool) {
         only: Some(project.to_owned()),
         dry_run: false,
         no_fetch: false,
+        ..repos::Options::default()
     };
     match repos::sync(&root, &options) {
         Ok(rows) => {

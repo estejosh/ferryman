@@ -23,6 +23,7 @@
 //! behind and is ignored. The process this check runs in, and the service or task it was
 //! started by, are never counted as "another" worker.
 
+#[cfg(any(target_os = "linux", windows))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -137,17 +138,42 @@ impl Worker {
                     vec![format!("kill {pid}")]
                 }
             }
-            Kind::Unit { unit, user, .. } => vec![if *user {
-                format!("systemctl --user disable --now {unit}")
-            } else {
-                format!("sudo systemctl disable --now {unit}")
-            }],
-            Kind::Task { name, .. } => vec![
-                format!("schtasks /End /TN \"{name}\""),
-                format!("schtasks /Change /TN \"{name}\" /DISABLE"),
-            ],
+            Kind::Unit { unit, user, .. } => {
+                let unit = shell_word(unit);
+                vec![if *user {
+                    format!("systemctl --user disable --now {unit}")
+                } else {
+                    format!("sudo systemctl disable --now {unit}")
+                }]
+            }
+            Kind::Task { name, .. } => {
+                // A task name is a path-like string the machine gave us; it is quoted, and a
+                // quote or a control character in it cannot end the quote.
+                let name: String = name
+                    .chars()
+                    .filter(|c| *c != '"' && !c.is_control())
+                    .collect();
+                vec![
+                    format!("schtasks /End /TN \"{name}\""),
+                    format!("schtasks /Change /TN \"{name}\" /DISABLE"),
+                ]
+            }
         }
     }
+}
+
+/// A word for a POSIX shell: as it is when it is plain, else single-quoted (with control
+/// characters dropped), so a unit file named `x; rm -rf ~.service` prints as one argument.
+fn shell_word(text: &str) -> String {
+    let plain = !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | ':'));
+    if plain {
+        return text.to_owned();
+    }
+    let kept: String = text.chars().filter(|c| !c.is_control()).collect();
+    format!("'{}'", kept.replace('\'', "'\\''"))
 }
 
 /// What a `ferry agent run` command line asks for.
@@ -513,6 +539,7 @@ pub fn doctor_line(scan: &Scan) -> (bool, String) {
 }
 
 /// A command run quietly, its standard output when it succeeded.
+#[cfg(any(target_os = "linux", windows))]
 fn quietly(program: &str, args: &[&str]) -> Option<String> {
     let mut command = Command::new(program);
     command.args(args);
@@ -568,7 +595,10 @@ pub fn scan() -> Scan {
     let mut scan = Scan::default();
     let mut service_pids: Vec<u32> = Vec::new();
 
-    let mut services = Vec::new();
+    // Only Linux (systemd units) and Windows (scheduled tasks) have services to list; elsewhere
+    // this stays empty.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(unused_mut))]
+    let mut services: Vec<Worker> = Vec::new();
     #[cfg(target_os = "linux")]
     services_linux(&mut services, &mut scan.notes);
     #[cfg(windows)]

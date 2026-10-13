@@ -25,8 +25,12 @@
 //!    something that exists. A link left at that path by an earlier `ferry root adopt` (it
 //!    points at a person's checkout) is removed - the link only, never what it pointed at -
 //!    and the checkout is remembered.
-//! 3. Fetches. Never merges, resets or cleans: workers branch from `origin`, so a fetch is
-//!    all a clone needs, and a clone with local changes keeps them.
+//! 3. Fetches. Never resets or cleans, and a clone with local changes keeps them. One thing
+//!    more, and only for a clone this command made (it leaves `.git/ferryman-managed` in
+//!    it): when the clone has no changes of its own and its branch is strictly behind its
+//!    upstream, the branch is fast-forwarded (`git merge --ff-only`), so the files the
+//!    worker reads from the clone - a project's `[policy]` files - are the merged ones and
+//!    not the ones from the day it was cloned. A clone someone else made is only fetched.
 //! 4. Attaches the clone to the channel the root already files for the project: its
 //!    `.ferryman/bridge.toml` names that channel, `/.ferryman/` goes in the clone's
 //!    `.git/info/exclude` (never a tracked file), and the root files the clone. No roster,
@@ -35,10 +39,16 @@
 //! # Which remote
 //!
 //! In this order: `[git.remotes]` for the project, the machine's `[git] remote_template`,
-//! then the `origin` of a checkout of it this machine already has. Each is tried until one
-//! clones. A password in any of them is refused, and the origin of a person's checkout has
-//! any credential stripped before it is used. Credentials are the machine's: a credential
-//! helper, an ssh alias, a read-only token the helper holds.
+//! its `[git] fallback_template`, then the `origin` of a checkout of it this machine already
+//! has. Each is tried until one clones. A password in any of them is refused, and the origin
+//! of a person's checkout has any credential stripped before it is used. Credentials are the
+//! machine's: a credential helper, an ssh alias, a read-only token the helper holds.
+//!
+//! A remote that needs a helper program git does not have is skipped with the reason, not
+//! tried: `sov://bucket/repo` (SovGit) needs `git-remote-sov` on PATH, and without it the
+//! next remote is used (the fallback template is the GitHub one), or, with none left, the
+//! project is reported as not synced and why. Ferryman knows nothing of SovGit beyond
+//! running `git clone` and `git fetch`; the helper does the rest.
 //!
 //! Safe to run again and again: it is what `ferry fleet setup` runs, and what the watchdog
 //! runs as "repair layout".
@@ -134,9 +144,17 @@ pub struct Options {
     pub dry_run: bool,
     /// Do not fetch (no network). Clones and attaches still happen.
     pub no_fetch: bool,
+    /// Folders searched for remote helpers (`git-remote-<scheme>`) before PATH, and put in
+    /// front of PATH for the git commands this runs. Empty in normal use.
+    pub helper_dirs: Vec<PathBuf>,
 }
 
-fn git(dir: Option<&Path>, args: &[&str]) -> std::io::Result<std::process::Output> {
+/// Run git, with `extra_path` folders in front of PATH so a remote helper in one is found.
+fn git_with(
+    dir: Option<&Path>,
+    args: &[&str],
+    extra_path: &[PathBuf],
+) -> std::io::Result<std::process::Output> {
     let mut command = Command::new("git");
     if let Some(dir) = dir {
         command.arg("-C").arg(dir);
@@ -147,6 +165,16 @@ fn git(dir: Option<&Path>, args: &[&str]) -> std::io::Result<std::process::Outpu
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .stdin(Stdio::null());
+    if !extra_path.is_empty() {
+        let existing = std::env::var_os("PATH").unwrap_or_default();
+        let folders = extra_path
+            .iter()
+            .cloned()
+            .chain(std::env::split_paths(&existing));
+        if let Ok(joined) = std::env::join_paths(folders) {
+            command.env("PATH", joined);
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -156,13 +184,94 @@ fn git(dir: Option<&Path>, args: &[&str]) -> std::io::Result<std::process::Outpu
 }
 
 fn git_ok(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    match git(dir, args) {
+    git_ok_with(dir, args, &[])
+}
+
+fn git_ok_with(
+    dir: Option<&Path>,
+    args: &[&str],
+    extra_path: &[PathBuf],
+) -> Result<String, String> {
+    match git_with(dir, args, extra_path) {
         Ok(out) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
         }
         Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_owned()),
         Err(error) => Err(format!("could not run git: {error}")),
     }
+}
+
+/// The remotes git can use on this machine, and the reasons it cannot use the others. A
+/// remote that needs a helper program is checked for it before git is asked.
+fn split_usable(remotes: Vec<String>, extra: &[PathBuf]) -> (Vec<String>, Vec<String>) {
+    let mut folders: Option<Vec<PathBuf>> = None;
+    let (mut usable, mut unusable) = (Vec::new(), Vec::new());
+    for remote in remotes {
+        if rootconfig::helper_scheme(&remote).is_none() {
+            usable.push(remote);
+            continue;
+        }
+        let folders = folders.get_or_insert_with(|| {
+            let mut folders = extra.to_vec();
+            folders.extend(rootconfig::helper_folders());
+            folders
+        });
+        match rootconfig::helper_missing_in(&remote, folders) {
+            Some(why) => unusable.push(why),
+            None => usable.push(remote),
+        }
+    }
+    (usable, unusable)
+}
+
+/// Marks a clone `ferry repos sync` made, so that only such a clone is ever fast-forwarded.
+const MANAGED_MARKER: &str = "ferryman-managed";
+
+/// Fast-forward a clone Ferryman made when that cannot lose anything: it has no changes to
+/// tracked files, and its branch is strictly behind its upstream. Returns what it did.
+fn advance(clone: &Path) -> Option<String> {
+    if !clone.join(".git").join(MANAGED_MARKER).is_file() {
+        return None;
+    }
+    if !git_ok(
+        Some(clone),
+        &["status", "--porcelain", "--untracked-files=no"],
+    )
+    .ok()?
+    .is_empty()
+    {
+        return None;
+    }
+    let branch = git_ok(Some(clone), &["symbolic-ref", "--quiet", "--short", "HEAD"]).ok()?;
+    let upstream = git_ok(
+        Some(clone),
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+    )
+    .ok()?;
+    let (head, tip) = (
+        git_ok(Some(clone), &["rev-parse", "HEAD"]).ok()?,
+        git_ok(Some(clone), &["rev-parse", "@{upstream}"]).ok()?,
+    );
+    if head == tip
+        || git_ok(
+            Some(clone),
+            &["merge-base", "--is-ancestor", "HEAD", "@{upstream}"],
+        )
+        .is_err()
+    {
+        return None;
+    }
+    git_ok(
+        Some(clone),
+        &["merge", "--ff-only", "--quiet", "@{upstream}"],
+    )
+    .ok()?;
+    Some(format!("fast-forwarded {branch} to {upstream}"))
 }
 
 /// The `origin` of a checkout, with any credential taken out.
@@ -188,6 +297,9 @@ fn candidates(entry: &Entry, config: &RootConfig, root: &Root) -> Vec<String> {
         push(remote.clone());
     }
     if let Some(template) = &config.remote_template {
+        push(template.replace("{project}", &entry.project_id));
+    }
+    if let Some(template) = &config.fallback_template {
         push(template.replace("{project}", &entry.project_id));
     }
     let managed = root.managed_clone(&entry.project_id);
@@ -294,9 +406,18 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
         }
     }
     if !have_clone {
-        let remotes = candidates(entry, config, root);
+        let (remotes, unusable) =
+            split_usable(candidates(entry, config, root), &options.helper_dirs);
+        details.extend(unusable.iter().map(|why| format!("skipped {why}")));
         if remotes.is_empty() {
-            return skipped(Skip::NoRemote);
+            return if unusable.is_empty() {
+                skipped(Skip::NoRemote)
+            } else {
+                skipped(Skip::Failed(format!(
+                    "no remote can be used here: {}",
+                    unusable.join("; ")
+                )))
+            };
         }
         if dry {
             details.push(format!(
@@ -316,17 +437,33 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
             let mut last = String::new();
             let mut cloned_from = None;
             for remote in &remotes {
-                match git_ok(None, &["clone", "--quiet", "--", remote, &target]) {
+                match git_ok_with(
+                    None,
+                    &["clone", "--quiet", "--", remote, &target],
+                    &options.helper_dirs,
+                ) {
                     Ok(_) => {
                         cloned_from = Some(remote.clone());
                         break;
                     }
-                    Err(error) => last = format!("{remote}: {error}"),
+                    Err(error) => {
+                        last = format!("{remote}: {error}");
+                        details.push(format!("could not clone {last}"));
+                    }
                 }
             }
             let Some(remote) = cloned_from else {
-                return skipped(Skip::Failed(format!("could not clone ({last})")));
+                return Row {
+                    project: id,
+                    status: Status::Skipped(Skip::Failed(format!("could not clone ({last})"))),
+                    details,
+                };
             };
+            // Only a clone made here is ever fast-forwarded: the mark says so.
+            let _ = fs::write(
+                managed.join(".git").join(MANAGED_MARKER),
+                "made by `ferry repos sync`; it may be fast-forwarded when it has no changes\n",
+            );
             details.push(format!("cloned {remote} into {}", managed.display()));
             steps.push("cloned");
         }
@@ -339,14 +476,26 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
         }
         // 3. Fetch. A clone just made is current. "fetched" means it brought something.
         if !options.no_fetch {
-            if dry {
+            let origin = git_ok(Some(&managed), &["remote", "get-url", "origin"]).ok();
+            let (_, unusable) = split_usable(origin.into_iter().collect(), &options.helper_dirs);
+            if let Some(why) = unusable.first() {
+                details.push(format!("not fetched - {why}"));
+            } else if dry {
                 details.push("would fetch".into());
             } else {
                 let before = remote_refs(&managed);
-                match git_ok(Some(&managed), &["fetch", "--quiet", "--prune", "origin"]) {
+                match git_ok_with(
+                    Some(&managed),
+                    &["fetch", "--quiet", "--prune", "origin"],
+                    &options.helper_dirs,
+                ) {
                     Ok(_) => {
                         if remote_refs(&managed) != before {
                             steps.push("fetched");
+                        }
+                        if let Some(done) = advance(&managed) {
+                            details.push(done);
+                            steps.push("advanced");
                         }
                     }
                     Err(error) => details.push(format!("fetch failed: {error}")),

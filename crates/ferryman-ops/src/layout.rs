@@ -147,11 +147,15 @@ pub fn archive_stale(locks: &[StaleLock]) -> Vec<String> {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         name.push_str(&format!(".stale-{pid}"));
-        let target = lock.path.with_file_name(name);
+        let mut target = lock.path.with_file_name(&name);
+        // A pid is reused, so the same name can already be taken by an earlier archive.
+        // Nothing is ever overwritten or deleted: this one gets a number.
+        let mut number = 1;
+        while target.exists() && number < 1000 {
+            target = lock.path.with_file_name(format!("{name}-{number}"));
+            number += 1;
+        }
         if target.exists() {
-            // Already archived once for this pid: the lock is a duplicate of that record.
-            let _ = fs::remove_file(&lock.path);
-            done.push(format!("{} (already archived)", lock.path.display()));
             continue;
         }
         if fs::rename(&lock.path, &target).is_ok() {

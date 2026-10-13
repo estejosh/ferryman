@@ -513,35 +513,94 @@ pub fn set_self_improve_as(
 /// does not enrol anyone in it. Signed by the project's master, in the channel, for the
 /// same reasons as [`ARCHIVED`] and [`SELF_IMPROVE`].
 ///
-/// Absent means on: a project is in the swarm unless its master said otherwise. That makes
-/// deleting the file the one unsigned thing a peer can do, and what it does is put the
-/// project back in the swarm - which is why a machine can also keep a project out on its
-/// own, in its root config (`[swarm] exclude`), which no peer can reach.
+/// Absent means on: a project is in the swarm unless its master said otherwise. A machine
+/// that has never seen the master's `off` (a new one, or one that was offline when it was
+/// written and when it was deleted) cannot know, so deleting the file is the one unsigned
+/// thing a peer can do to such a machine; a machine that has seen it keeps the newest
+/// setting it accepted, so neither deleting the file nor putting an older signed one back
+/// changes what it does (see [`SwarmSetting`]). A machine can also keep a project out on its
+/// own, in its root config (`[swarm] exclude`), which no peer can reach. Versions before
+/// this one do not read the file at all.
 pub const SWARM: &str = "SWARM";
 
 /// What the [`SWARM`] file holds.
+///
+/// `seq` is one more than the highest the master could see when signing, and it is covered
+/// by the signature. Each machine remembers the highest it has accepted (see
+/// [`swarm_setting`]), so an older signed file put back over a newer one, or the file
+/// deleted, does not change what that machine does. Without it, deleting the file or
+/// restoring an old `on` would put a project the master took out (a secrets repository) back
+/// in the swarm. Nothing that is not the newest the machine has seen is obeyed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SwarmSetting {
     pub project_id: String,
     /// `true` is `swarm = on`; `false` is `swarm = off`.
     pub on: bool,
+    #[serde(default)]
+    pub seq: u64,
     pub set_at: DateTime<Utc>,
     pub signed_by: String,
     pub signature: String,
 }
 
-fn swarm_payload(project_id: &str, on: bool, set_at: &DateTime<Utc>) -> String {
+fn swarm_payload(project_id: &str, on: bool, seq: u64, set_at: &DateTime<Utc>) -> String {
     format!(
-        "ferryman-swarm-v1\n{project_id}\n{}\n{}",
+        "ferryman-swarm-v2\n{project_id}\n{}\n{seq}\n{}",
         if on { "on" } else { "off" },
         set_at.to_rfc3339()
     )
 }
 
-/// The master's swarm setting for the project in `channel`, when there is one and it
-/// verifies as the master's. Anything else is `None`, which means on.
-#[must_use]
-pub fn swarm_setting(channel: &Path, project_id: &str) -> Option<SwarmSetting> {
+/// What this machine last accepted of a project's swarm setting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SwarmMemory {
+    high: u64,
+    good: Option<SwarmSetting>,
+}
+
+/// Where this machine remembers a channel's swarm setting: per channel, so two channels of
+/// one project name (or a test's temporary one) never share it.
+fn swarm_memory_path(channel: &Path, project_id: &str) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let dir = crate::licensing::machine_state_dir()?.join("swarm");
+    let place = std::fs::canonicalize(channel).unwrap_or_else(|_| channel.to_path_buf());
+    let digest = Sha256::digest(place.display().to_string().to_lowercase().as_bytes());
+    Some(dir.join(format!(
+        "{}-{}.json",
+        project_id
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+            .collect::<String>(),
+        &hex::encode(digest)[..16]
+    )))
+}
+
+fn read_swarm_memory(channel: &Path, project_id: &str) -> SwarmMemory {
+    swarm_memory_path(channel, project_id)
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Best effort: a machine that cannot write its memory still obeys the file it can read.
+fn remember_swarm(channel: &Path, project_id: &str, setting: &SwarmSetting) {
+    let Some(path) = swarm_memory_path(channel, project_id) else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = crate::atomic_json(
+        &path,
+        &SwarmMemory {
+            high: setting.seq,
+            good: Some(setting.clone()),
+        },
+    );
+}
+
+/// The swarm file in `channel` when it verifies as the project master's. No memory.
+fn swarm_file(channel: &Path, project_id: &str) -> Option<SwarmSetting> {
     let setting: SwarmSetting =
         serde_json::from_slice(&std::fs::read(channel.join(SWARM)).ok()?).ok()?;
     let roster = crate::read_agent_roster(channel).ok()?;
@@ -552,10 +611,49 @@ pub fn swarm_setting(channel: &Path, project_id: &str) -> Option<SwarmSetting> {
         && crate::check_signature(
             Some(&setting.signed_by),
             Some(&setting.signature),
-            &swarm_payload(&setting.project_id, setting.on, &setting.set_at),
+            &swarm_payload(
+                &setting.project_id,
+                setting.on,
+                setting.seq,
+                &setting.set_at,
+            ),
             &roster,
         ) == SignatureCheck::Valid)
         .then_some(setting)
+}
+
+/// The master's swarm setting for the project in `channel`: the newest this machine has
+/// seen that verifies as the master's. Anything else is `None`, which means on.
+///
+/// The channel's file counts when it verifies and its `seq` is at least the highest this
+/// machine has accepted, and it is then remembered. A file that is missing, does not
+/// verify, or is older than one already accepted does not count: the remembered setting
+/// stands. Only the master can move it forward, with a higher `seq`. A machine that has
+/// never seen a setting has nothing to remember and reads the file as it is.
+#[must_use]
+pub fn swarm_setting(channel: &Path, project_id: &str) -> Option<SwarmSetting> {
+    let file = swarm_file(channel, project_id);
+    let memory = read_swarm_memory(channel, project_id);
+    match (file, memory.good) {
+        (Some(file), good) => {
+            // A file that verifies was signed by the project's current master. One from a
+            // different master than the one remembered is a handover, not a rollback: the
+            // old master cannot have signed it, and it carries its own numbering.
+            let new_hand = good
+                .as_ref()
+                .is_none_or(|good| !good.signed_by.eq_ignore_ascii_case(&file.signed_by));
+            if file.seq > memory.high || new_hand {
+                remember_swarm(channel, project_id, &file);
+                Some(file)
+            } else if file.seq == memory.high {
+                // The same sequence number: what was accepted first stands.
+                good.or(Some(file))
+            } else {
+                good
+            }
+        }
+        (None, good) => good,
+    }
 }
 
 /// Whether the swarm may work the project in `channel`: on unless its master signed `off`.
@@ -579,25 +677,62 @@ pub fn set_swarm(
         );
     }
     require_master(channel, project_id, signer, "put it in or out of the swarm")?;
-    if swarm_enabled(channel, project_id) == on {
+    // What the channel itself says, and what this machine has seen: the new setting numbers
+    // above both, so every machine that has seen the old one takes it as newer.
+    let effective = swarm_setting(channel, project_id);
+    let on_file = swarm_file(channel, project_id);
+    if let (Some(file), Some(effective)) = (&on_file, &effective)
+        && file.on == on
+        && file.seq == effective.seq
+    {
         return Ok(false);
     }
-    let set_at = Utc::now();
+    if on_file.is_none() && effective.is_none() && on {
+        // Nothing was ever said and on is the default: there is nothing to sign.
+        return Ok(false);
+    }
+    let high = read_swarm_memory(channel, project_id)
+        .high
+        .max(on_file.as_ref().map_or(0, |file| file.seq))
+        .max(effective.as_ref().map_or(0, |setting| setting.seq));
+    let (set_at, seq) = (Utc::now(), high + 1);
     let setting = SwarmSetting {
         project_id: project_id.to_owned(),
         on,
+        seq,
         set_at,
         signed_by: signer.name().to_owned(),
         signature: hex::encode(
             signer
                 .signing
-                .sign(swarm_payload(project_id, on, &set_at).as_bytes())
+                .sign(swarm_payload(project_id, on, seq, &set_at).as_bytes())
                 .to_bytes(),
         ),
     };
     let path = channel.join(SWARM);
     crate::atomic_json(&path, &setting).with_context(|| format!("writing {}", path.display()))?;
+    remember_swarm(channel, project_id, &setting);
     Ok(true)
+}
+
+/// Whether two paths are the same place. Compared after resolving where they can be, folded
+/// on Windows (where `X:\Ferry` and `x:\ferry` are one directory, and a temporary folder has
+/// a short and a long spelling).
+fn same_place(a: &Path, b: &Path) -> bool {
+    let norm = |path: &Path| {
+        let resolved = std::fs::canonicalize(path).map_or_else(
+            |_| path.to_path_buf(),
+            |resolved| crate::real_path(&resolved),
+        );
+        let text = resolved.display().to_string().replace('\\', "/");
+        let text = text.trim_end_matches('/').to_owned();
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    };
+    norm(a) == norm(b)
 }
 
 impl Entry {
@@ -756,18 +891,27 @@ impl Root {
                         // Ferryman's own clone stays the one its workers use. A person's
                         // working copy that gets filed afterwards (an `enable`, an
                         // `attach`) is remembered beside it and nothing more.
-                        if !existing.human_checkouts.contains(&new_repo) {
+                        if !existing
+                            .human_checkouts
+                            .iter()
+                            .any(|known| same_place(known, &new_repo))
+                        {
                             existing.human_checkouts.push(new_repo);
                         }
                     } else {
                         if managed_new
                             && let Some(old) = existing.repo.take()
-                            && old != new_repo
-                            && !existing.human_checkouts.contains(&old)
+                            && !same_place(&old, &new_repo)
+                            && !existing
+                                .human_checkouts
+                                .iter()
+                                .any(|known| same_place(known, &old))
                         {
                             existing.human_checkouts.push(old);
                         }
-                        existing.human_checkouts.retain(|human| *human != new_repo);
+                        existing
+                            .human_checkouts
+                            .retain(|human| !same_place(human, &new_repo));
                         existing.repo = Some(new_repo);
                         existing.adopted = entry.adopted;
                     }
@@ -1056,12 +1200,17 @@ impl Root {
         };
         let before = entry.clone();
         if let Some(old) = entry.repo.take()
-            && old != managed
-            && !entry.human_checkouts.contains(&old)
+            && !same_place(&old, managed)
+            && !entry
+                .human_checkouts
+                .iter()
+                .any(|known| same_place(known, &old))
         {
             entry.human_checkouts.push(old);
         }
-        entry.human_checkouts.retain(|human| human != managed);
+        entry
+            .human_checkouts
+            .retain(|human| !same_place(human, managed));
         entry.repo = Some(managed.to_path_buf());
         entry.adopted = false;
         if *entry == before {
@@ -1082,8 +1231,14 @@ impl Root {
         else {
             return Ok(false);
         };
-        if entry.repo.as_deref() == Some(checkout)
-            || entry.human_checkouts.iter().any(|known| known == checkout)
+        if entry
+            .repo
+            .as_deref()
+            .is_some_and(|repo| same_place(repo, checkout))
+            || entry
+                .human_checkouts
+                .iter()
+                .any(|known| same_place(known, checkout))
         {
             return Ok(false);
         }
@@ -2095,6 +2250,7 @@ mod tests {
     #[test]
     fn the_swarm_is_on_by_default_and_only_the_master_takes_a_project_out() {
         let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
         let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
 
@@ -2118,25 +2274,129 @@ mod tests {
             "already out"
         );
 
-        // A peer can only put it back, by deleting the file, and that is the default.
+        // Deleting the file does not put it back on a machine that has seen the master say
+        // off: the remembered setting stands. (A machine that never saw it has nothing to
+        // remember and does read "on"; that is why a machine can also exclude on its own.)
+        let kept = std::fs::read(channel.join(SWARM)).unwrap();
         std::fs::remove_file(channel.join(SWARM)).unwrap();
+        assert!(
+            !swarm_enabled(&channel, "demo"),
+            "off survives a deleted file"
+        );
+        // Re-signing the same word republishes it under a higher number.
+        assert!(set_swarm(&channel, "demo", false, &josh()).unwrap());
+        assert_eq!(swarm_setting(&channel, "demo").unwrap().seq, 2);
+        assert_ne!(std::fs::read(channel.join(SWARM)).unwrap(), kept);
+
+        // Only the master moves it forward again.
+        assert!(set_swarm(&channel, "demo", true, &josh()).unwrap());
         assert!(swarm_enabled(&channel, "demo"));
-        assert!(set_swarm(&channel, "demo", true, &josh()).is_ok());
+        assert_eq!(swarm_setting(&channel, "demo").unwrap().seq, 3);
+    }
+
+    /// An old validly signed file put back over a newer one is a rollback, and a machine
+    /// that has seen the newer one does not take it. A machine that has not (a new one, or
+    /// one that was offline) has nothing to compare with and reads what is there.
+    #[test]
+    fn an_older_signed_swarm_file_put_back_is_not_obeyed() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
+        let path = channel.join(SWARM);
+
+        assert!(set_swarm(&channel, "demo", false, &josh()).unwrap());
+        let off = std::fs::read(&path).unwrap();
+        assert!(set_swarm(&channel, "demo", true, &josh()).unwrap());
+        let on = std::fs::read(&path).unwrap();
+        assert!(set_swarm(&channel, "demo", false, &josh()).unwrap());
+        let off_again = std::fs::read(&path).unwrap();
+        assert!(!swarm_enabled(&channel, "demo"));
+
+        // Somebody restores the master's old "on". It verifies, and it is older.
+        std::fs::write(&path, &on).unwrap();
+        assert!(
+            !swarm_enabled(&channel, "demo"),
+            "this machine already saw a newer off"
+        );
+        // And the older off over the newer on does not take a project out either.
+        std::fs::write(&path, &off_again).unwrap();
+        assert!(set_swarm(&channel, "demo", true, &josh()).unwrap());
+        std::fs::write(&path, &off).unwrap();
+        assert!(
+            swarm_enabled(&channel, "demo"),
+            "the master's newer on stands against an old off"
+        );
+
+        // A machine that never saw any of it simply reads the file that is there.
+        // (The state directory is chosen once per process, so "another machine" is this one
+        // with its memory of the channel gone.)
+        let state = crate::licensing::machine_state_dir().expect("a state directory");
+        let _ = std::fs::remove_dir_all(state.join("swarm"));
+        std::fs::write(&path, &off).unwrap();
+        assert!(!swarm_enabled(&channel, "demo"));
+    }
+
+    /// A file the master really signed, with a number lower than one this machine has already
+    /// accepted, is not taken, however it got into the channel; and a new number from the
+    /// same master is.
+    #[test]
+    fn the_masters_own_older_number_is_not_taken_and_a_higher_one_is() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let channel = mastered(dir.path(), "demo", &josh(), &[]);
+        assert!(set_swarm(&channel, "demo", false, &josh()).unwrap());
+        assert!(set_swarm(&channel, "demo", true, &josh()).unwrap());
+        assert!(set_swarm(&channel, "demo", false, &josh()).unwrap());
+        assert_eq!(swarm_setting(&channel, "demo").unwrap().seq, 3);
+        let signed = |on: bool, seq: u64| {
+            let set_at = Utc::now();
+            SwarmSetting {
+                project_id: "demo".into(),
+                on,
+                seq,
+                set_at,
+                signed_by: "josh".into(),
+                signature: hex::encode(
+                    josh()
+                        .signing
+                        .sign(swarm_payload("demo", on, seq, &set_at).as_bytes())
+                        .to_bytes(),
+                ),
+            }
+        };
+        crate::atomic_json(&channel.join(SWARM), &signed(true, 1)).unwrap();
+        assert!(!swarm_enabled(&channel, "demo"), "number 1 is behind 3");
+        // The number is part of what is signed: renumbering a real "on" does not work.
+        let mut renumbered = signed(true, 1);
+        renumbered.seq = 9;
+        crate::atomic_json(&channel.join(SWARM), &renumbered).unwrap();
+        assert!(
+            !swarm_enabled(&channel, "demo"),
+            "the signature no longer fits"
+        );
+        crate::atomic_json(&channel.join(SWARM), &signed(true, 4)).unwrap();
+        assert!(
+            swarm_enabled(&channel, "demo"),
+            "number 4 is the master's newest"
+        );
     }
 
     #[test]
     fn a_swarm_flag_the_master_did_not_sign_does_not_count() {
         let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
         let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
         let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
         let forge = |signer: &crate::AgentIdentity, project: &str, on: bool| {
             let set_at = Utc::now();
             let signature = signer
                 .signing
-                .sign(swarm_payload(project, on, &set_at).as_bytes());
+                .sign(swarm_payload(project, on, 1, &set_at).as_bytes());
             SwarmSetting {
                 project_id: project.into(),
                 on,
+                seq: 1,
                 set_at,
                 signed_by: signer.name().into(),
                 signature: hex::encode(signature.to_bytes()),

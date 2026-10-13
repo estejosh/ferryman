@@ -608,3 +608,106 @@ fn an_agent_config_and_key_in_a_persons_checkout_are_copied_not_moved() {
     );
     assert_eq!(machine.root.read().projects[0].human_checkouts.len(), 1);
 }
+
+#[test]
+fn quoting_keeps_a_path_inside_its_quotes_in_a_unit_and_in_a_script() {
+    // systemd: `$` and `%` would otherwise expand; a quote or a backslash would end the string.
+    let quoted = unit_quote(Path::new("/srv/a$HOME/b%h/c\"d\\e"));
+    assert_eq!(quoted, "\"/srv/a$$HOME/b%%h/c\\\"d\\\\e\"");
+    assert_eq!(unit_path(Path::new("/srv/50%/x")), "/srv/50%%/x");
+    // PowerShell: the typographic single quotes end a string too.
+    assert_eq!(ps_quote("it's"), "'it''s'");
+    assert_eq!(
+        ps_quote("a\u{2019}; calc; \u{2018}b"),
+        "'a\u{2019}\u{2019}; calc; \u{2018}\u{2018}b'"
+    );
+    // The script carries a byte-order mark so a path with an accent survives.
+    assert_eq!(&ps_bytes("x")[..3], &[0xEF, 0xBB, 0xBF]);
+}
+
+#[test]
+fn a_path_with_a_newline_in_it_is_not_written_into_a_service_file() {
+    assert!(plain_path(Path::new("/srv/ferry/repos/ok")).is_ok());
+    assert!(plain_path(Path::new("/srv/ferry\nExecStartPre=/bin/evil")).is_err());
+    assert!(plain_path(Path::new("C:\\a\r\nb")).is_err());
+}
+
+#[test]
+fn a_worker_name_that_is_not_a_plain_name_never_reaches_the_masters_lines() {
+    let machine = machine_with(&["quantly"]);
+    let mut opts = options(&machine);
+    opts.identity = None;
+    let scan = machine::Scan {
+        workers: vec![
+            unit_worker("ferryman-a.service", true, "good-old-swarm"),
+            unit_worker("ferryman-b.service", true, "evil; rm -rf ~"),
+        ],
+        notes: Vec::new(),
+    };
+    let mut run = |_: &str, _: &[String]| None;
+    let report = setup(&machine.root, &opts, &scan, &mut run).unwrap();
+    // The odd name cannot be the identity either: there are not two live names to choose from.
+    assert!(
+        ferryman_channel::is_safe_component(&report.identity),
+        "{}",
+        report.identity
+    );
+    for line in &report.signing {
+        assert!(!line.contains("rm -rf"), "{line}");
+        assert!(!line.contains(';'), "{line}");
+    }
+    assert!(
+        report.notes.iter().any(|n| n.contains("not plain names")),
+        "{:?}",
+        report.notes
+    );
+    let mut bad = options(&machine);
+    bad.retire = vec!["x y".into()];
+    assert!(setup(&machine.root, &bad, &machine::Scan::default(), &mut run).is_err());
+}
+
+#[test]
+fn a_preamble_path_that_climbs_out_of_the_checkout_is_not_followed() {
+    let machine = machine_with(&["quantly"]);
+    let human = machine.dir.path().join("human/quantly");
+    fs::create_dir_all(human.parent().unwrap()).unwrap();
+    let bare = machine.dir.path().join("origins/quantly.git");
+    git(
+        machine.dir.path(),
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            human.to_str().unwrap(),
+        ],
+    );
+    let attachment = human.join(".ferryman");
+    fs::create_dir_all(&attachment).unwrap();
+    let secret = machine.dir.path().join("human/secret.txt");
+    fs::write(&secret, "not for the clone").unwrap();
+    let mut text = AgentConfig::render(
+        "old-swarm",
+        "worker",
+        "claude",
+        &AgentConfig::default_args("claude"),
+        crate::agent::ReviewMode::Confirm,
+        None,
+        true,
+    );
+    text.push_str("preamble_file = \"../../secret.txt\"\n");
+    fs::write(attachment.join("agent.toml"), text).unwrap();
+    machine
+        .root
+        .adopt("quantly", &machine.root.comms_home("quantly"), Some(&human))
+        .unwrap();
+    let mut opts = options(&machine);
+    opts.identity = None;
+    opts.remote_template = None;
+    let mut run = |_: &str, _: &[String]| None;
+    setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    let managed = machine.root.managed_clone("quantly");
+    let leaked = snapshot(&managed)
+        .iter()
+        .any(|(path, bytes)| bytes == b"not for the clone" && path != &secret);
+    assert!(!leaked, "the file outside the checkout was copied in");
+}

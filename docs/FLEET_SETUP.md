@@ -43,6 +43,24 @@ Safe to run again. It reports "already" for what is there and changes nothing.
 | `--no-syncthing` | Do not run Syncthing as a service of its own |
 | `--no-fetch` | No network. Clones and attaches still happen |
 
+## Where clones come from (GitHub, SovGit)
+
+A project's remote is a per-machine setting in `<root>/ferry.toml`, not something in a channel: the channel is shared by every machine, and a machine without `git-remote-sov` must not be told to use `sov://`. (A master-signed `repo_remote` would put one machine's transport in every machine's face, and a forged or stale one is a way to point every clone at someone else's server; the local file has neither problem.)
+
+```toml
+[git]
+remote_template   = "https://github.com/estejosh/{project}.git"   # the default; GitHub
+# fallback_template = "https://github.com/estejosh/{project}.git" # tried when the first cannot be used
+
+[git.remotes]
+# One project that is on SovGit. git speaks sov:// through the helper `git-remote-sov`, which must be on PATH.
+quantly = "sov://my-bucket/quantly"
+```
+
+`ferry repos sync` tries, in order: the project's `[git.remotes]` entry, `remote_template`, `fallback_template`, then the `origin` of a checkout already on the machine (credentials stripped). A `sov://` remote whose helper is not installed is skipped with the reason in the row (`skipped sov://bucket/repo: git needs the program git-remote-sov for sov:// remotes and it is not installed`) and the next candidate is tried; if nothing else is usable the project is a failed row that says why, and nothing is written. The same check runs before every fetch: a clone whose `origin` needs a missing helper is reported as `not fetched - ...`, never as an error. A remote that runs a command (`ext::`, `fd::`) is always refused. Ferryman has no SovGit code; it calls `git`, and git calls the helper.
+
+`ferry repos sync` also moves Ferryman's own clone forward: after a fetch it fast-forwards `repos/<project>` when, and only when, the clone was made by `repos sync`, has no changes to tracked files, and is strictly behind its upstream. A diverged or edited clone is fetched and left alone. A person's checkout is never moved.
+
 ## One worker per machine
 
 Two workers on one machine claim the same orders, burn the same engines and race each other's worktrees. `ferry fleet setup --service` leaves exactly one:
@@ -66,6 +84,8 @@ ferry root swarm exclude pc-secrets               # this machine only, no signat
 ferry root swarm include pc-secrets
 ```
 
+The signed `SWARM` file carries a number that only goes up, and every machine remembers the highest it has accepted for each project. Putting an old signed file back (to switch a project on again) is therefore not obeyed, and neither is deleting the file: the remembered setting stands until the master signs a higher one. (Old peers, 0.5.26 and 0.5.27, do not read `SWARM` at all; they keep serving a project the master has taken out until they are updated.)
+
 The dashboard's Teammates page has the same switch for each project (master only). A project that is out is not cloned by `repos sync`, not served by `agent run --all-projects` (a running worker stops at its next pass), and not enrolled by `team approve --all`. Josh's two: `pc-secrets` and `phonehome`.
 
 ## Per-project policy in fleet mode
@@ -81,7 +101,7 @@ A fleet worker runs as one identity with one `agent.toml`, so one preamble cover
 
 2. `.ferryman/POLICY.md` in the managed clone: this machine's own addition, last, with the last word. It is not in git.
 
-The files are injected after the global preamble, into that project's prompts and no other project's. Each file is cut at 12 KiB and the whole policy at 32 KiB, with a marker where it was cut. A path must be relative, must not climb out with `..`, and must resolve to a regular file inside the repository; a link to `~/.ssh/id_ed25519` is a skipped note, not a prompt. A missing or refused file is a note, never a reason the worker does not start. Nothing is guessed: an `AGENTS.md` is not injected unless the project names it.
+The files are injected after the global preamble, into that project's prompts and no other project's. Each file is cut at 12 KiB and the whole policy at 32 KiB, with a marker where it was cut; `ferryman.toml` itself is read to 64 KiB, must be a file inside the repository, and names at most 8 files. The block says it can only narrow what the worker does and is not an instruction to run anything, and a line in a policy file that looks like the block's own frame (`--- ... ---`) is indented so a file cannot close the block early. A path must be relative, must not climb out with `..`, and must resolve to a regular file inside the repository; a link to `~/.ssh/id_ed25519` is a skipped note, not a prompt. A missing or refused file is a note, never a reason the worker does not start. Nothing is guessed: an `AGENTS.md` is not injected unless the project names it.
 
 `ferry agent run --all-projects --dry-run` and `ferry route explain` print a `policy: <files>` line per project, with what was left out and why.
 
@@ -105,7 +125,7 @@ ferry order reoffer <order> --to NEW [--project P] [--as master]
 
 - `team revoke --all` reaches every project the signing master owns, including those with no checkout here; projects someone else masters are left alone, and it refuses to revoke the signing master.
 - `order release` writes a signed release for each unfinished claim OLD holds, putting the order back in the queue. It refuses a name whose worker is alive on this machine.
-- `order reoffer` is for an order addressed to an identity that is gone. It does not edit the signed order: it writes a signed offer beside it (`offer.<signer>.<time>.json`) and a history line. The newest valid offer decides who may claim it. Only the order's issuer or the project's master can offer, and a forged offer file is ignored. `--queue` offers it to whoever is first.
+- `order reoffer` is for an order addressed to an identity that is gone. It does not edit the signed order: it writes a signed offer beside it (`offer.<signer>.<time>.json`) and a history line. The newest valid offer decides who may claim it. Only the order's issuer or the project's master can offer, and a forged offer file is ignored. An offer is signed together with its project and order, so a copy dropped into another project's folder is ignored, and one dated in the future is ignored too (it could not be outranked by a later real one). The reason is cut at 500 characters. `--queue` offers it to whoever is first.
 
 Nothing is deleted: the order, the claim and every earlier record stay.
 

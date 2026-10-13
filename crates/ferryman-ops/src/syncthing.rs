@@ -349,6 +349,12 @@ pub fn run_foreground() -> Result<std::process::ExitStatus> {
             );
         }
     }
+    // Two Syncthings on one home fight over its lock and its database. If one was already
+    // started detached (by `ferry syncthing start`, or by a worker before this service
+    // existed), this one waits behind it and takes over only when it is gone.
+    while managed_running() {
+        thread::sleep(Duration::from_secs(10));
+    }
     let mut command = Command::new(&binary);
     serve_args(&mut command, &home);
     command.stdin(Stdio::null());
@@ -378,12 +384,32 @@ pub fn run_foreground() -> Result<std::process::ExitStatus> {
 fn spawn_detached(binary: &Path, home: &Path) -> Result<()> {
     #[cfg(target_os = "linux")]
     if std::env::var_os("INVOCATION_ID").is_some() {
+        // When `ferry fleet setup` gave Syncthing a unit of its own, that unit is its
+        // supervisor: start it rather than make a second, competing one (a transient unit
+        // may not even take the name of a unit file that exists).
+        if std::env::var_os("HOME")
+            .map(|home| {
+                PathBuf::from(home)
+                    .join(".config/systemd/user")
+                    .join(crate::setup::SYNCTHING_UNIT)
+            })
+            .is_some_and(|file| file.is_file())
+            && Command::new("systemctl")
+                .args(["--user", "start", crate::setup::SYNCTHING_UNIT])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            return Ok(());
+        }
         let mut run = Command::new("systemd-run");
         run.args([
             "--user",
             "--collect",
             "--quiet",
-            "--unit=ferryman-syncthing",
+            "--unit=ferryman-syncthing-detached",
             "-p",
             "Restart=on-failure",
             "--",

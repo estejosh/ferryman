@@ -175,13 +175,235 @@ fn syncing_again_changes_nothing_and_a_new_commit_is_fetched() {
     let fetched = sync(&root, &Options::default()).unwrap();
     assert_eq!(
         row(&fetched, "quantly").status,
-        Status::Done(vec!["fetched"]),
+        Status::Done(vec!["fetched", "advanced"]),
         "{fetched:?}"
     );
-    // A fetch is all it does: the clone's own branch and files were not moved.
-    assert!(!managed.join("more.md").exists());
+    // Ferryman's own clean clone is moved forward, and only that: it was strictly behind.
+    assert!(managed.join("more.md").exists());
     let log = git_ok(Some(&managed), &["log", "--oneline", "origin/main"]).unwrap();
     assert_eq!(log.lines().count(), 2);
+    assert_eq!(
+        git_ok(Some(&managed), &["rev-parse", "HEAD"]),
+        git_ok(Some(&managed), &["rev-parse", "origin/main"])
+    );
+}
+
+fn push_commit(bare: &Path, seed: &Path, name: &str) {
+    fs::write(seed.join(name), name).unwrap();
+    run(seed, &["add", "-A"]);
+    run(seed, &["commit", "-q", "-m", name]);
+    run(seed, &["push", "-q", bare.to_str().unwrap(), "main"]);
+}
+
+#[test]
+fn a_clone_with_changes_or_commits_of_its_own_is_fetched_but_never_moved() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    let (bare, seed) = origin(dir.path(), "quantly");
+    with_template(&root, dir.path());
+    sync(&root, &Options::default()).unwrap();
+    let managed = root.managed_clone("quantly");
+
+    // Uncommitted change to a tracked file: nothing moves.
+    fs::write(managed.join("README.md"), "edited").unwrap();
+    push_commit(&bare, &seed, "one.md");
+    let rows = sync(&root, &Options::default()).unwrap();
+    assert_eq!(
+        row(&rows, "quantly").status,
+        Status::Done(vec!["fetched"]),
+        "{rows:?}"
+    );
+    assert_eq!(
+        fs::read_to_string(managed.join("README.md")).unwrap(),
+        "edited"
+    );
+    assert!(!managed.join("one.md").exists());
+    run(&managed, &["checkout", "--", "README.md"]);
+
+    // A commit of its own that the origin does not have: diverged, so nothing moves.
+    fs::write(managed.join("mine.md"), "mine").unwrap();
+    run(&managed, &["add", "-A"]);
+    run(&managed, &["commit", "-q", "-m", "mine"]);
+    push_commit(&bare, &seed, "two.md");
+    sync(&root, &Options::default()).unwrap();
+    assert!(managed.join("mine.md").exists());
+    assert!(!managed.join("two.md").exists());
+    let head = git_ok(Some(&managed), &["log", "--format=%s", "-1"]).unwrap();
+    assert_eq!(head, "mine");
+}
+
+#[test]
+fn a_checkout_that_was_not_made_by_sync_is_never_fast_forwarded() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    let (bare, seed) = origin(dir.path(), "quantly");
+    with_template(&root, dir.path());
+    sync(&root, &Options::default()).unwrap();
+    let managed = root.managed_clone("quantly");
+    // Without the mark that says `repos sync` made this clone, it is treated as a person's.
+    fs::remove_file(managed.join(".git").join(MANAGED_MARKER)).unwrap();
+    push_commit(&bare, &seed, "late.md");
+    let rows = sync(&root, &Options::default()).unwrap();
+    assert_eq!(
+        row(&rows, "quantly").status,
+        Status::Done(vec!["fetched"]),
+        "{rows:?}"
+    );
+    assert!(!managed.join("late.md").exists());
+}
+
+fn set_remote(root: &Root, project: &str, remote: &str) {
+    let path = rootconfig::path(root);
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    text.push_str(&format!(
+        "\n[git.remotes]\n{project} = \"{}\"\n",
+        remote.replace('\\', "/")
+    ));
+    fs::write(path, text).unwrap();
+}
+
+#[test]
+fn a_sov_remote_with_no_helper_is_skipped_with_a_reason_and_the_template_is_used() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    origin(dir.path(), "quantly");
+    with_template(&root, dir.path());
+    set_remote(&root, "quantly", "sovtest-absent://bucket/quantly");
+    let rows = sync(&root, &Options::default()).unwrap();
+    let r = row(&rows, "quantly");
+    assert_eq!(r.status, Status::Done(vec!["cloned", "attached"]), "{r:?}");
+    assert!(
+        r.details
+            .iter()
+            .any(|d| d.starts_with("skipped") && d.contains("git-remote-sovtest-absent")),
+        "{:?}",
+        r.details
+    );
+    assert!(root.managed_clone("quantly").join("README.md").is_file());
+}
+
+#[test]
+fn a_sov_remote_with_no_helper_and_nothing_else_says_why_and_writes_nothing() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    origin(dir.path(), "quantly");
+    set_remote(&root, "quantly", "sovtest-absent://bucket/quantly");
+    let before = snapshot(&root.path);
+    let rows = sync(
+        &root,
+        &Options {
+            dry_run: true,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    match &row(&rows, "quantly").status {
+        Status::Skipped(Skip::Failed(why)) => {
+            assert!(why.contains("git-remote-sovtest-absent"), "{why}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(snapshot(&root.path), before);
+    let rows = sync(&root, &Options::default()).unwrap();
+    assert!(matches!(
+        row(&rows, "quantly").status,
+        Status::Skipped(Skip::Failed(_))
+    ));
+    assert!(
+        !root.managed_clone("quantly").exists(),
+        "no half-made clone"
+    );
+}
+
+#[test]
+fn the_fallback_template_is_tried_when_the_first_remote_has_no_such_repo() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    origin(dir.path(), "quantly");
+    let missing = format!("{}/nowhere/{{project}}.git", dir.path().display());
+    rootconfig::set_remote_template(&root, &missing).unwrap();
+    let there = format!("{}/{{project}}.git", dir.path().join("origins").display());
+    rootconfig::set_fallback_template(&root, &there).unwrap();
+    let rows = sync(&root, &Options::default()).unwrap();
+    let r = row(&rows, "quantly");
+    assert_eq!(r.status, Status::Done(vec!["cloned", "attached"]), "{r:?}");
+    assert!(
+        r.details.iter().any(|d| d.starts_with("could not clone")),
+        "the first failure is said: {:?}",
+        r.details
+    );
+    assert!(root.managed_clone("quantly").join("README.md").is_file());
+}
+
+/// A remote helper for the scheme `sovtest-here`: it serves `<origins>/<repo>.git` for
+/// `sovtest-here://<bucket>/<repo>`, through git's own `connect` protocol, and records
+/// that it was asked. No Sov code, only what git needs of any helper.
+#[cfg(unix)]
+fn fake_helper(folder: &Path, origins: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(folder).unwrap();
+    let script = format!(
+        "#!/bin/sh\n\
+         echo \"$2\" >> '{log}'\n\
+         repo=\"${{2##*/}}\"\n\
+         while read cmd arg; do\n\
+         case \"$cmd\" in\n\
+         capabilities) printf 'connect\\n\\n' ;;\n\
+         connect) printf '\\n'; exec git \"${{arg#git-}}\" '{origins}'/\"$repo\".git ;;\n\
+         '') exit 0 ;;\n\
+         esac\n\
+         done\n",
+        log = folder.join("helper.log").display(),
+        origins = origins.display()
+    );
+    let path = folder.join("git-remote-sovtest-here");
+    fs::write(&path, script).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sov_remote_is_cloned_and_fetched_through_its_helper_alone() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    let (bare, seed) = origin(dir.path(), "quantly");
+    let helpers = dir.path().join("helpers");
+    fake_helper(&helpers, &dir.path().join("origins"));
+    set_remote(&root, "quantly", "sovtest-here://bucket/quantly");
+    let options = Options {
+        helper_dirs: vec![helpers.clone()],
+        ..Options::default()
+    };
+    let rows = sync(&root, &options).unwrap();
+    let r = row(&rows, "quantly");
+    assert_eq!(r.status, Status::Done(vec!["cloned", "attached"]), "{r:?}");
+    let managed = root.managed_clone("quantly");
+    assert!(managed.join("README.md").is_file());
+    assert_eq!(
+        git_ok(Some(&managed), &["remote", "get-url", "origin"]).unwrap(),
+        "sovtest-here://bucket/quantly"
+    );
+    push_commit(&bare, &seed, "next.md");
+    let rows = sync(&root, &options).unwrap();
+    assert_eq!(
+        row(&rows, "quantly").status,
+        Status::Done(vec!["fetched", "advanced"]),
+        "{rows:?}"
+    );
+    assert!(managed.join("next.md").exists());
+    let asked = fs::read_to_string(helpers.join("helper.log")).unwrap();
+    assert!(asked.contains("sovtest-here://bucket/quantly"), "{asked}");
+    // Without the helper the fetch is said not to have happened, and nothing else changes.
+    let rows = sync(&root, &Options::default()).unwrap();
+    let r = row(&rows, "quantly");
+    assert_eq!(r.status, Status::AlreadyOk, "{r:?}");
+    assert!(
+        r.details
+            .iter()
+            .any(|d| d.starts_with("not fetched") && d.contains("git-remote-sovtest-here")),
+        "{:?}",
+        r.details
+    );
 }
 
 #[test]
@@ -204,10 +426,12 @@ fn a_persons_working_copy_is_never_touched_and_is_remembered() {
     );
     fs::write(human.join("wip.rs"), "uncommitted").unwrap();
     attach::attach(&root, &human, Some("quantly"), false).unwrap();
-    assert_eq!(
-        root.read().projects[0].repo.as_deref(),
-        Some(human.as_path())
-    );
+    // Compared as places: Windows spells a temporary folder with a short name (RUNNER~1) in
+    // one place and its long name in another.
+    assert!(attach::same_path(
+        root.read().projects[0].repo.as_deref().unwrap(),
+        &human
+    ));
     with_template(&root, dir.path());
     let theirs = snapshot(&human);
 
@@ -229,10 +453,10 @@ fn a_persons_working_copy_is_never_touched_and_is_remembered() {
         Some(managed.as_path()),
         "workers use the clone"
     );
-    assert_eq!(
-        entry.human_checkouts,
-        vec![human.clone()],
-        "and the copy is remembered"
+    assert!(
+        entry.human_checkouts.len() == 1 && attach::same_path(&entry.human_checkouts[0], &human),
+        "and the copy is remembered: {:?}",
+        entry.human_checkouts
     );
     assert!(attach::same_path(
         &entry.route(&root).unwrap().0.communications,
@@ -243,7 +467,12 @@ fn a_persons_working_copy_is_never_touched_and_is_remembered() {
     root.adopt("quantly", &channel, Some(&human)).unwrap();
     let entry = &root.read().projects[0];
     assert_eq!(entry.repo.as_deref(), Some(managed.as_path()));
-    assert_eq!(entry.human_checkouts, vec![human]);
+    assert_eq!(
+        entry.human_checkouts.len(),
+        1,
+        "the same copy, not a second one: {:?}",
+        entry.human_checkouts
+    );
 }
 
 #[cfg(unix)]

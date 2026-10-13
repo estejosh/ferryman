@@ -33,6 +33,11 @@ use crate::{AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck};
 /// A signed statement of who an order is offered to from now on.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Offer {
+    /// The project the order is in. Signed, so an offer the master wrote for one project's
+    /// order cannot be copied into another project's channel that has an order with the
+    /// same id.
+    #[serde(default)]
+    pub project_id: String,
     pub order_id: String,
     /// Who it is offered to: an identity or a machine, as `assigned_to` is. `None` is the
     /// queue: whoever picks it up first.
@@ -53,7 +58,8 @@ pub struct Offer {
 
 fn payload(offer: &Offer) -> String {
     format!(
-        "ferryman-offer-v1\n{}\n{}\n{}\n{}\n{}\n{}",
+        "ferryman-offer-v2\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        offer.project_id,
         offer.order_id,
         offer.to.as_deref().unwrap_or(""),
         offer.offered_by,
@@ -63,10 +69,22 @@ fn payload(offer: &Offer) -> String {
     )
 }
 
+/// How far ahead of this machine's clock an offer may be dated and still be read. The
+/// newest offer decides, and a date is the signer's own word: an issuer who signs an offer
+/// dated years ahead would otherwise be the newest for good, and the master could never
+/// offer the order to anyone else.
+pub const CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The longest reason that is written (it goes into the ledger too).
+pub const REASON_CAP: usize = 500;
+
 /// Whether the offer's signature verifies against the roster.
 #[must_use]
 pub fn verify(offer: &Offer, roster: &[AgentRoute]) -> SignatureCheck {
     if offer.signed_by.as_deref() != Some(offer.offered_by.as_str()) {
+        return SignatureCheck::Invalid;
+    }
+    if offer.at > Utc::now() + CLOCK_SKEW {
         return SignatureCheck::Invalid;
     }
     crate::check_signature(
@@ -134,12 +152,18 @@ pub fn reoffer(
         }
         _ => {}
     }
+    let reason: String = reason
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(REASON_CAP)
+        .collect();
     let mut offer = Offer {
+        project_id: route.project_id.clone(),
         order_id: order_id.to_owned(),
         to: to.map(str::to_owned),
         offered_by: signer.name().to_owned(),
         from: task.assignee().map(str::to_owned),
-        reason: reason.to_owned(),
+        reason: reason.clone(),
         at: Utc::now(),
         signed_by: None,
         signature: None,

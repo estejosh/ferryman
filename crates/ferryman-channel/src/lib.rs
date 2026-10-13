@@ -1756,6 +1756,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         } else if name.starts_with("offer.")
             && let Ok(value) = serde_json::from_str::<offer::Offer>(&text)
             && value.order_id == order.id
+            && value.project_id == route.project_id
             && offer::verify(&value, &route.agents) == SignatureCheck::Valid
             && offer::may_offer(route, &order.issued_by, &value.offered_by)
         {

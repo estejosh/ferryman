@@ -254,7 +254,26 @@ fn unit_quote(path: &Path) -> String {
             .replace('\\', "\\\\")
             .replace('"', "\\\"")
             .replace('%', "%%")
+            .replace('$', "$$")
     )
+}
+
+/// A path as the `EnvironmentFile=` line takes it: `%` would start a specifier.
+fn unit_path(path: &Path) -> String {
+    path.display().to_string().replace('%', "%%")
+}
+
+/// Refuse a path that could break out of a line or a quote in a unit, a script or a task:
+/// a control character (a newline above all) has no business in a path Ferryman writes
+/// into a service file.
+fn plain_path(path: &Path) -> Result<()> {
+    if path.display().to_string().chars().any(char::is_control) {
+        bail!(
+            "{:?} has a control character in it, so it cannot be written into a service file",
+            path.display().to_string()
+        );
+    }
+    Ok(())
 }
 
 /// The systemd user unit for the worker.
@@ -300,7 +319,7 @@ pub fn systemd_unit(spec: &Spec, with_syncthing: bool) -> String {
          [Install]\n\
          WantedBy=default.target\n",
         workdir = unit_quote(&spec.workspace),
-        env = spec.env_file.display(),
+        env = unit_path(&spec.env_file),
         ferry = unit_quote(&spec.ferry),
         workspace = unit_quote(&spec.workspace),
     )
@@ -330,8 +349,27 @@ pub fn systemd_syncthing_unit(spec: &Spec) -> String {
     )
 }
 
+/// A PowerShell single-quoted string. PowerShell reads the typographic single quotes as
+/// quotes too, so each of them is doubled the same way a plain one is.
 fn ps_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "''"))
+    let mut out = String::from("'");
+    for c in text.chars() {
+        out.push(c);
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// The bytes of a PowerShell script: UTF-8 with a byte-order mark, because Windows
+/// PowerShell 5 reads a script without one as the ANSI code page and garbles any path
+/// with an accent in it.
+fn ps_bytes(text: &str) -> Vec<u8> {
+    let mut out = vec![0xEF, 0xBB, 0xBF];
+    out.extend_from_slice(text.as_bytes());
+    out
 }
 
 /// The PowerShell wrapper a scheduled task runs. It reads `KEY=VALUE` lines from the env
@@ -474,8 +512,24 @@ fn found_configs(root: &Root) -> Vec<Found> {
     found
 }
 
-/// The identity the worker runs as, and why.
+/// The identity the worker runs as, and why. The name ends up in file names, in an
+/// `agent.toml` and in commands printed for the master to paste, so whatever it came from
+/// (a process command line, a unit file, a checkout) it must be a plain name.
 fn choose_identity(options: &Options, scan: &Scan, found: &[Found]) -> Result<(String, String)> {
+    let (name, why) = choose_identity_raw(options, scan, found)?;
+    if !ferryman_channel::is_safe_component(&name) {
+        bail!(
+            "'{name}' is not a name: use letters, digits, '.', '-' and '_' (name one with --identity)"
+        );
+    }
+    Ok((name, why))
+}
+
+fn choose_identity_raw(
+    options: &Options,
+    scan: &Scan,
+    found: &[Found],
+) -> Result<(String, String)> {
     if let Some(name) = &options.identity {
         let name = ferryman_channel::canonical_agent_name(name);
         if !ferryman_channel::is_safe_component(&name) {
@@ -488,6 +542,7 @@ fn choose_identity(options: &Options, scan: &Scan, found: &[Found]) -> Result<(S
         .iter()
         .filter_map(|worker| worker.identity.clone())
         .map(|name| ferryman_channel::canonical_agent_name(&name))
+        .filter(|name| ferryman_channel::is_safe_component(name))
         .collect();
     running.sort();
     running.dedup();
@@ -500,7 +555,7 @@ fn choose_identity(options: &Options, scan: &Scan, found: &[Found]) -> Result<(S
     let mut swarm: Vec<String> = found
         .iter()
         .map(|f| ferryman_channel::canonical_agent_name(&f.agent))
-        .filter(|name| name.ends_with("-swarm"))
+        .filter(|name| name.ends_with("-swarm") && ferryman_channel::is_safe_component(name))
         .collect();
     swarm.sort();
     swarm.dedup();
@@ -618,6 +673,11 @@ pub fn setup(root: &Root, options: &Options, scan: &Scan, run: &mut Run<'_>) -> 
                 .push(format!("clone URL template set to {template}"));
         }
     }
+    for name in &options.retire {
+        if !ferryman_channel::is_safe_component(&ferryman_channel::canonical_agent_name(name)) {
+            bail!("--retire '{name}' is not a name: use letters, digits, '.', '-' and '_'");
+        }
+    }
     for project in &options.exclude {
         if !ferryman_channel::is_safe_component(project) {
             bail!("'{project}' is not a project id");
@@ -638,6 +698,7 @@ pub fn setup(root: &Root, options: &Options, scan: &Scan, run: &mut Run<'_>) -> 
         only: None,
         dry_run: dry,
         no_fetch: options.no_fetch,
+        ..repos::Options::default()
     };
     report.repos = repos::sync(root, &sync_options)?;
 
@@ -766,7 +827,9 @@ fn home_files(
             if let Some(source) = source
                 && let Ok(config) = AgentConfig::load(&source.attachment)
                 && let Some(preamble) = config.preamble_file
-                && !Path::new(&preamble).is_absolute()
+                && Path::new(&preamble)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))
             {
                 let from = source.attachment.join(&preamble);
                 let to = attachment.join(&preamble);
@@ -880,6 +943,17 @@ fn retired_identities(
         .collect();
     names.sort();
     names.dedup();
+    // These go into commands the master pastes, so only plain names get through.
+    let (names, odd): (Vec<String>, Vec<String>) = names
+        .into_iter()
+        .partition(|name| ferryman_channel::is_safe_component(name));
+    if !odd.is_empty() {
+        report.notes.push(format!(
+            "{} worker name(s) here are not plain names (letters, digits, '.', '-', '_') and \
+             were left out of the lines the master signs; revoke them by hand if they are real",
+            odd.len()
+        ));
+    }
     let mut others: Vec<String> = found
         .iter()
         .map(|f| ferryman_channel::canonical_agent_name(&f.agent))
@@ -936,6 +1010,9 @@ fn service(
         env_file: env_file.clone(),
         user: options.user.clone(),
     };
+    for path in [&spec.ferry, &spec.workspace, &spec.env_file] {
+        plain_path(path)?;
+    }
     if env_file.exists() {
         report.service.push(format!(
             "env file {} is there, untouched",
@@ -1194,7 +1271,7 @@ fn install_windows(
         }
         let changed = write_if_changed(
             &wrapper,
-            windows_wrapper(spec, command).as_bytes(),
+            &ps_bytes(&windows_wrapper(spec, command)),
             backup_dir,
         )?;
         report.service.push(format!(
@@ -1252,6 +1329,7 @@ fn signing_lines(
     let master = crate::fleet::dominant_master(root);
     let as_flag = master
         .as_deref()
+        .filter(|master| ferryman_channel::is_safe_component(master))
         .map(|master| format!(" --as {master}"))
         .unwrap_or_default();
     report
@@ -1272,6 +1350,9 @@ fn signing_lines(
     kept_out.dedup();
     let projects = root.read().projects;
     for project in kept_out {
+        if !ferryman_channel::is_safe_component(&project) {
+            continue;
+        }
         if let Some(entry) = projects.iter().find(|entry| entry.project_id == project)
             && !entry.swarm_off()
         {
@@ -1284,7 +1365,7 @@ fn signing_lines(
     for name in retired {
         let mut addressed: Vec<(String, String)> = Vec::new();
         for entry in &projects {
-            if entry.is_archived() {
+            if entry.is_archived() || !ferryman_channel::is_safe_component(&entry.project_id) {
                 continue;
             }
             let Ok((route, _)) = entry.route(root) else {
@@ -1296,6 +1377,7 @@ fn signing_lines(
             for task in tasks {
                 if let ferryman_channel::TaskState::Offered { to } = task.state()
                     && to.eq_ignore_ascii_case(name)
+                    && ferryman_channel::is_safe_component(&task.order.id)
                 {
                     addressed.push((entry.project_id.clone(), task.order.id.clone()));
                 }

@@ -297,7 +297,8 @@ fn services() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The layout facts: whether every live project has its clone, the folders are there, and\n/// what else the layout check would say. Read only.
+/// The layout facts: whether every live project has its clone, the folders are there, and
+/// what else the layout check would say. Read only.
 fn gather_layout(comms: &Path, facts: &mut Facts) {
     let Some(root) =
         ferryman_channel::ferry::find_root_from(comms).or_else(ferryman_channel::ferry::find_root)
