@@ -286,35 +286,155 @@ pub fn stop() -> Result<()> {
     ferryman_channel::syncthing_shutdown()
 }
 
-fn spawn_detached(binary: &Path, home: &Path) -> Result<()> {
-    let mut command = Command::new(binary);
+/// Whether this machine has a managed Syncthing home (so there is something to supervise).
+#[must_use]
+pub fn managed_home_exists() -> bool {
+    syncthing_managed_home().is_some_and(|home| home.join("config.xml").is_file())
+}
+
+/// The file the pid of a detached Syncthing is written to, in the managed home.
+#[must_use]
+pub fn pidfile(home: &Path) -> PathBuf {
+    home.join("ferryman-syncthing.pid")
+}
+
+/// The pid recorded when Ferryman last started the managed instance detached, if it is
+/// still running. A pidfile naming a dead process reads as `None`.
+#[must_use]
+pub fn recorded_pid() -> Option<u32> {
+    let home = syncthing_managed_home()?;
+    let pid = std::fs::read_to_string(pidfile(&home))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()?;
+    crate::agent::process_alive(pid).then_some(pid)
+}
+
+fn serve_args(command: &mut Command, home: &Path) {
     command
         .arg("serve")
         .arg("--home")
         .arg(home)
         .arg("--no-browser")
-        .arg("--no-restart")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .arg("--no-restart");
+}
+
+/// Run the managed Syncthing in the foreground until it exits, for a service manager to
+/// supervise (`ferry syncthing run`). The worker's service and this one are separate
+/// processes under separate supervision, so stopping or restarting the worker never takes
+/// the sync with it. Returns Syncthing's exit status.
+pub fn run_foreground() -> Result<std::process::ExitStatus> {
+    let Some(home) = syncthing_managed_home() else {
+        bail!("cannot work out where the managed Syncthing should live on this platform");
+    };
+    let binary = match find_binary() {
+        Some(binary) => binary,
+        None => install_binary()?,
+    };
+    if !home.join("config.xml").is_file() {
+        std::fs::create_dir_all(&home).with_context(|| format!("create {}", home.display()))?;
+        let generated = Command::new(&binary)
+            .arg("generate")
+            .arg("--home")
+            .arg(&home)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .context("run syncthing generate")?;
+        if !generated.status.success() {
+            bail!(
+                "syncthing generate failed: {}",
+                String::from_utf8_lossy(&generated.stderr).trim()
+            );
+        }
+    }
+    let mut command = Command::new(&binary);
+    serve_args(&mut command, &home);
+    command.stdin(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: outlives the
-        // ferry process that started it and never flashes a console.
-        command.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
+        command.creation_flags(0x0800_0000);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Its own process group, so a Ctrl-C to ferry does not take Syncthing with it.
-        // `process_group` is the safe std API for this; this crate forbids unsafe, and a
-        // raw setsid was what broke every non-Windows build of 0.5.8's first cut.
-        command.process_group(0);
-    }
-    command
+    let mut child = command
         .spawn()
         .with_context(|| format!("start {}", binary.display()))?;
+    let _ = std::fs::write(pidfile(&home), child.id().to_string());
+    child.wait().context("wait for syncthing")
+}
+
+/// Start Syncthing so that it outlives this process, and say how.
+///
+/// Three ways, in order. Under systemd, the unit's control group is killed with the unit,
+/// and a plain detached child is in it: a restart of the worker took the sync down with it.
+/// So when this process is a service, Syncthing is handed to the user manager as a unit of
+/// its own (`systemd-run --user`), which nothing about the worker's lifetime touches. On
+/// Windows a scheduled task runs in a job object that is closed when the task ends, which
+/// also ends every process in it, so the child asks to break away from the job. Anywhere
+/// else, or when those are refused, it is a detached process in its own group. The pid is
+/// written to a pidfile in the managed home, so `ferry doctor` and `ferry syncthing stop`
+/// can find it.
+fn spawn_detached(binary: &Path, home: &Path) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("INVOCATION_ID").is_some() {
+        let mut run = Command::new("systemd-run");
+        run.args([
+            "--user",
+            "--collect",
+            "--quiet",
+            "--unit=ferryman-syncthing",
+            "-p",
+            "Restart=on-failure",
+            "--",
+        ])
+        .arg(binary);
+        serve_args(&mut run, home);
+        if run
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Ok(());
+        }
+    }
+    let attempt = |breakaway: bool| -> std::io::Result<std::process::Child> {
+        let mut command = Command::new(binary);
+        serve_args(&mut command, home);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW: outlives the
+            // ferry process that started it and never flashes a console. With
+            // CREATE_BREAKAWAY_FROM_JOB it also leaves a scheduled task's job object.
+            let mut flags = 0x0000_0008 | 0x0000_0200 | 0x0800_0000;
+            if breakaway {
+                flags |= 0x0100_0000;
+            }
+            command.creation_flags(flags);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            // Its own process group, so a Ctrl-C to ferry does not take Syncthing with it.
+            // `process_group` is the safe std API for this; this crate forbids unsafe, and a
+            // raw setsid was what broke every non-Windows build of 0.5.8's first cut.
+            command.process_group(0);
+            let _ = breakaway;
+        }
+        command.spawn()
+    };
+    // A job that does not allow breakaway refuses the flag; the plain form still works.
+    let child = attempt(true)
+        .or_else(|_| attempt(false))
+        .with_context(|| format!("start {}", binary.display()))?;
+    let _ = std::fs::write(pidfile(home), child.id().to_string());
     Ok(())
 }
 

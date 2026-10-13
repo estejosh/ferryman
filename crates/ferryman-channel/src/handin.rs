@@ -25,32 +25,17 @@ use crate::{AgentIdentity, ProjectRoute, SignatureCheck, is_safe_component};
 /// The `format` tag in `handin.json`.
 pub const FORMAT: &str = "ferryman-handin/v1";
 
-/// Where a project's hand-ins live on this machine.
+/// Where a project's hand-ins live on this machine: `handins` inside the channel folder.
 ///
-/// In a ferry root, `<root>/work/<project>`. Without one, beside a `comms` folder, the
-/// sibling `work/<project>`. Otherwise inside the already-synced channel, so the hand-in
-/// still reaches the head's machine whatever the layout.
+/// Always inside the channel, so a hand-in reaches the head's machine on the folder that
+/// already syncs and no folder of its own is needed. It was once `work/<project>` in the
+/// ferry root, shared as a second Syncthing folder. That put the task worktrees under a
+/// shared folder, and `work/` and `repos/` are machine-local, so the Syncthing scope
+/// guard (`syncscope`) now refuses it.
 #[must_use]
 pub fn work_dir(route: &ProjectRoute) -> PathBuf {
-    work_dir_with(crate::ferry::find_root().as_ref(), route)
+    route.communications.join("handins")
 }
-
-/// [`work_dir`], with the ferry root given rather than looked for.
-#[must_use]
-pub fn work_dir_with(root: Option<&crate::ferry::Root>, route: &ProjectRoute) -> PathBuf {
-    if let Some(root) = root {
-        return root.work().join(&route.project_id);
-    }
-    let comms = &route.communications;
-    if let Some(parent) = comms.parent()
-        && parent.file_name().is_some_and(|name| name == "comms")
-        && let Some(base) = parent.parent()
-    {
-        return base.join("work").join(&route.project_id);
-    }
-    comms.join("handins")
-}
-
 /// Whether the hand-in folder lies inside the channel folder (and so syncs with it).
 #[must_use]
 pub fn is_in_channel(route: &ProjectRoute) -> bool {
@@ -630,28 +615,20 @@ mod tests {
     }
 
     #[test]
-    fn work_dir_follows_the_ferry_root_then_a_comms_sibling_then_the_channel() {
+    fn hand_ins_live_in_the_channel_so_no_folder_under_work_is_ever_shared() {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
 
-        // 1. A ferry root wins.
         let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
-        let route = route_at(&dir.path().join("elsewhere").join("proj-ferryman"));
-        assert_eq!(work_dir_with(Some(&root), &route), root.work().join("proj"));
+        let route = route_at(&root.comms().join("proj-ferryman"));
+        assert_eq!(work_dir(&route), route.communications.join("handins"));
+        assert!(is_in_channel(&route));
+        assert!(!work_dir(&route).starts_with(root.work()));
+        assert!(crate::syncscope::guard(&work_dir(&route)).is_ok());
 
-        // 2. No root, channel under a folder called `comms`: the sibling `work/<project>`.
-        let route = route_at(&dir.path().join("x").join("comms").join("proj-ferryman"));
-        assert_eq!(
-            work_dir_with(None, &route),
-            dir.path().join("x").join("work").join("proj")
-        );
-
-        // 3. Anything else: inside the channel, which already syncs.
+        // Wherever the channel is, the hand-in folder is inside it.
         let route = route_at(&dir.path().join("x").join("channels").join("proj-ferryman"));
-        assert_eq!(
-            work_dir_with(None, &route),
-            route.communications.join("handins")
-        );
+        assert_eq!(work_dir(&route), route.communications.join("handins"));
     }
 
     fn make(

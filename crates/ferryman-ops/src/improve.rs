@@ -3356,6 +3356,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         };
         let tasks = vec![
             task(

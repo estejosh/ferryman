@@ -424,7 +424,7 @@ pub fn progress_at(task: &Task, receipts: &Receipts, now: DateTime<Utc>) -> Opti
     ) {
         return None;
     }
-    let to = task.order.assigned_to.clone();
+    let to = task.assignee().map(str::to_owned);
     let counts = |agent: &str| {
         to.as_deref()
             .is_none_or(|assignee| assignee.eq_ignore_ascii_case(agent))

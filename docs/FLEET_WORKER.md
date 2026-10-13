@@ -9,6 +9,7 @@ ferry team approve <name> --all        # once: put the identity on every project
 ferry agent run --all-projects         # then: one worker serves all of them
 ```
 
+Setting a machine up for this is one command, `ferry fleet setup` (see [FLEET_SETUP.md](FLEET_SETUP.md)): it makes the fixed layout ([LAYOUT.md](LAYOUT.md)), gives every project its own clone in `repos/<project>`, picks the machine's one worker identity and, with `--service`, installs the one service that runs it. The rest of this page is what that worker does.
 ## Serving every project: `ferry agent run --all-projects`
 
 Run it next to the worker's own `agent.toml` (or pass `--workspace <dir>`):
@@ -32,7 +33,8 @@ A project is served when all of these hold, and otherwise skipped with one line 
 which and what to do:
 
 - its channel folder is here and it is not archived;
-- it has a checkout on this machine (a repository with `.ferryman` in it). A project that
+- its master has not signed `swarm = off` for it, and this machine does not exclude it (see below);
+- it has a checkout on this machine (a repository with `.ferryman` in it; `ferry repos sync` makes the managed clone, `repos/<project>`, which is the checkout a fleet worker uses, never a person's working copy). A project that
   is only a channel here has nowhere to do work. Clone it and run `ferry enable` in it;
 - the checkout's `bridge.toml` reads its channel from the folder the ferry root files the
   project under;
@@ -101,3 +103,15 @@ same public key, role worker) and your signed grant, and reports each project as
 A worker needs no grant to work (ADR 0014), so `may_work` passes for a worker once it is on
 the roster and not revoked. The grant is there for machines still on an older version and so
 the enrolment is visible in the channel's signed record.
+
+## One worker per machine
+
+Two workers on one machine claim the same orders and race each other. `ferry agent run --all-projects` looks for another live all-projects worker, and for a worker service or scheduled task that is enabled, before it starts. It refuses to be the second all-projects worker and names the other one (what is running, how it was started, how to stop it); `--allow-second-worker` overrides that, for a test. Any other worker is a warning. `ferry doctor` prints the same as a `workers` line, and `ferry doctor --layout` makes it a check. `ferry fleet setup --service` installs the one service and turns the others off without deleting them.
+
+## Keeping a project out of the swarm
+
+A project's master can sign `swarm = off` into its channel (`ferry root swarm off --project pc-secrets`, or the dashboard's Teammates page), and a machine can exclude a project for itself (`ferry root swarm exclude pc-secrets`). Either way the project is skipped here with the reason, a worker already running drops it at its next pass, `ferry repos sync` does not clone it and `ferry team approve --all` does not enrol anyone in it.
+
+## A project's own policy
+
+A project with binding rules of its own declares them in its repository, and the worker injects them into that project's prompts and no other project's: `[policy] files = [...]` in a `ferryman.toml` at the repository root, plus an optional `.ferryman/POLICY.md` in the clone that is this machine's own addition and comes last. Each file is cut at 12 KiB and the whole policy at 32 KiB; paths must stay inside the repository. `--dry-run` and `ferry route explain` print `policy: <files>` for each project. See [FLEET_SETUP.md](FLEET_SETUP.md#per-project-policy-in-fleet-mode).

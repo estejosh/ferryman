@@ -117,6 +117,12 @@ pub struct Entry {
     /// Recorded so nothing ever assumes it may be moved or removed.
     #[serde(default)]
     pub adopted: bool,
+    /// Working copies a person keeps of this project on this machine (`X:\ferryman`,
+    /// `~/code/fructly`) when `repo` is Ferryman's own managed clone under `repos/`.
+    /// Information only: Ferryman never moves, cleans or writes into them, and nothing
+    /// reads them to decide where work happens.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub human_checkouts: Vec<PathBuf>,
 }
 
 impl Entry {
@@ -240,6 +246,7 @@ pub fn is_archived(channel: &Path, project_id: &str) -> bool {
         channel: channel.to_path_buf(),
         repo: None,
         adopted: false,
+        human_checkouts: Vec::new(),
     }
     .is_archived()
 }
@@ -498,6 +505,109 @@ pub fn set_self_improve_as(
     Ok(true)
 }
 
+/// The setting, inside a channel, that keeps a project out of the swarm: `swarm = off`.
+///
+/// Some projects must not be worked by the fleet at all - a secrets repository, a third
+/// party's. The master says so once and every machine that syncs the channel hears it:
+/// `repos sync` does not clone it, `--all-projects` does not serve it, `team approve --all`
+/// does not enrol anyone in it. Signed by the project's master, in the channel, for the
+/// same reasons as [`ARCHIVED`] and [`SELF_IMPROVE`].
+///
+/// Absent means on: a project is in the swarm unless its master said otherwise. That makes
+/// deleting the file the one unsigned thing a peer can do, and what it does is put the
+/// project back in the swarm - which is why a machine can also keep a project out on its
+/// own, in its root config (`[swarm] exclude`), which no peer can reach.
+pub const SWARM: &str = "SWARM";
+
+/// What the [`SWARM`] file holds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwarmSetting {
+    pub project_id: String,
+    /// `true` is `swarm = on`; `false` is `swarm = off`.
+    pub on: bool,
+    pub set_at: DateTime<Utc>,
+    pub signed_by: String,
+    pub signature: String,
+}
+
+fn swarm_payload(project_id: &str, on: bool, set_at: &DateTime<Utc>) -> String {
+    format!(
+        "ferryman-swarm-v1\n{project_id}\n{}\n{}",
+        if on { "on" } else { "off" },
+        set_at.to_rfc3339()
+    )
+}
+
+/// The master's swarm setting for the project in `channel`, when there is one and it
+/// verifies as the master's. Anything else is `None`, which means on.
+#[must_use]
+pub fn swarm_setting(channel: &Path, project_id: &str) -> Option<SwarmSetting> {
+    let setting: SwarmSetting =
+        serde_json::from_slice(&std::fs::read(channel.join(SWARM)).ok()?).ok()?;
+    let roster = crate::read_agent_roster(channel).ok()?;
+    let master = crate::master::read_master_at(channel, &roster).ok()??;
+    (setting.project_id == project_id
+        && master.project_id == project_id
+        && setting.signed_by.eq_ignore_ascii_case(&master.master)
+        && crate::check_signature(
+            Some(&setting.signed_by),
+            Some(&setting.signature),
+            &swarm_payload(&setting.project_id, setting.on, &setting.set_at),
+            &roster,
+        ) == SignatureCheck::Valid)
+        .then_some(setting)
+}
+
+/// Whether the swarm may work the project in `channel`: on unless its master signed `off`.
+#[must_use]
+pub fn swarm_enabled(channel: &Path, project_id: &str) -> bool {
+    swarm_setting(channel, project_id).is_none_or(|setting| setting.on)
+}
+
+/// Switch the swarm on or off for the project in `channel`, signed by its master.
+/// Returns whether the setting changed.
+pub fn set_swarm(
+    channel: &Path,
+    project_id: &str,
+    on: bool,
+    signer: &AgentIdentity,
+) -> Result<bool> {
+    if !channel.is_dir() {
+        bail!(
+            "{project_id}'s channel is not on this machine ({})",
+            channel.display()
+        );
+    }
+    require_master(channel, project_id, signer, "put it in or out of the swarm")?;
+    if swarm_enabled(channel, project_id) == on {
+        return Ok(false);
+    }
+    let set_at = Utc::now();
+    let setting = SwarmSetting {
+        project_id: project_id.to_owned(),
+        on,
+        set_at,
+        signed_by: signer.name().to_owned(),
+        signature: hex::encode(
+            signer
+                .signing
+                .sign(swarm_payload(project_id, on, &set_at).as_bytes())
+                .to_bytes(),
+        ),
+    };
+    let path = channel.join(SWARM);
+    crate::atomic_json(&path, &setting).with_context(|| format!("writing {}", path.display()))?;
+    Ok(true)
+}
+
+impl Entry {
+    /// Whether the project's master has taken it out of the swarm.
+    #[must_use]
+    pub fn swarm_off(&self) -> bool {
+        !swarm_enabled(&self.channel, &self.project_id)
+    }
+}
+
 /// The latest week the self-improvement loop wrote anything for in `channel`, and which
 /// of its steps that week holds: `evidence`, `plan`, `review`, `report`. `None` when it
 /// has never run there. Read from `improve/<ISO week>/` in the channel.
@@ -622,6 +732,7 @@ impl Root {
             channel: channel.to_path_buf(),
             repo: repo.map(Path::to_path_buf),
             adopted,
+            human_checkouts: Vec::new(),
         };
         match manifest
             .projects
@@ -635,9 +746,31 @@ impl Root {
             // not learning anything, and it is silent, which is worse again.
             Some(existing) => {
                 existing.channel = entry.channel;
-                if entry.repo.is_some() {
-                    existing.repo = entry.repo;
-                    existing.adopted = entry.adopted;
+                if let Some(new_repo) = entry.repo {
+                    let managed_now = existing
+                        .repo
+                        .as_deref()
+                        .is_some_and(|repo| self.is_managed(repo));
+                    let managed_new = self.is_managed(&new_repo);
+                    if managed_now && !managed_new && existing.repo.as_ref() != Some(&new_repo) {
+                        // Ferryman's own clone stays the one its workers use. A person's
+                        // working copy that gets filed afterwards (an `enable`, an
+                        // `attach`) is remembered beside it and nothing more.
+                        if !existing.human_checkouts.contains(&new_repo) {
+                            existing.human_checkouts.push(new_repo);
+                        }
+                    } else {
+                        if managed_new
+                            && let Some(old) = existing.repo.take()
+                            && old != new_repo
+                            && !existing.human_checkouts.contains(&old)
+                        {
+                            existing.human_checkouts.push(old);
+                        }
+                        existing.human_checkouts.retain(|human| *human != new_repo);
+                        existing.repo = Some(new_repo);
+                        existing.adopted = entry.adopted;
+                    }
                 }
                 // The archive marker is deliberately not touched. Filing a project again
                 // is something `enable` does on its own, and a project quietly coming back
@@ -879,6 +1012,84 @@ impl Root {
             .into_iter()
             .filter(|entry| !entry.channel.is_dir())
             .collect()
+    }
+
+    /// Where Ferryman's own clone of a project lives: `repos/<project>`.
+    ///
+    /// The fixed place. Workers use it and nothing else of the project's, and a person's
+    /// working copy is never it. See `docs/LAYOUT.md`.
+    #[must_use]
+    pub fn managed_clone(&self, project_id: &str) -> PathBuf {
+        self.repos().join(project_id)
+    }
+
+    /// Whether `repo` is a managed clone: a folder directly under this root's `repos/`.
+    #[must_use]
+    pub fn is_managed(&self, repo: &Path) -> bool {
+        let fold = |path: &Path| {
+            let text = path.display().to_string().replace('\\', "/");
+            let text = text.trim_end_matches('/').to_string();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        };
+        repo.parent()
+            .is_some_and(|parent| fold(parent) == fold(&self.repos()))
+    }
+
+    /// Make `managed` the repository this project's workers use, and remember the one it
+    /// replaces as a human checkout. Nothing on disk moves. Returns whether the manifest
+    /// changed.
+    pub fn set_managed_repo(&self, project_id: &str, managed: &Path) -> Result<bool> {
+        let mut manifest = self.read();
+        let Some(entry) = manifest
+            .projects
+            .iter_mut()
+            .find(|entry| entry.project_id == project_id)
+        else {
+            bail!(
+                "no project '{project_id}' in {}",
+                self.manifest_path().display()
+            );
+        };
+        let before = entry.clone();
+        if let Some(old) = entry.repo.take()
+            && old != managed
+            && !entry.human_checkouts.contains(&old)
+        {
+            entry.human_checkouts.push(old);
+        }
+        entry.human_checkouts.retain(|human| human != managed);
+        entry.repo = Some(managed.to_path_buf());
+        entry.adopted = false;
+        if *entry == before {
+            return Ok(false);
+        }
+        self.write(&manifest)?;
+        Ok(true)
+    }
+
+    /// Remember a person's working copy of a project, for information. Returns whether the
+    /// manifest changed. Does nothing for the repository the workers use.
+    pub fn note_human_checkout(&self, project_id: &str, checkout: &Path) -> Result<bool> {
+        let mut manifest = self.read();
+        let Some(entry) = manifest
+            .projects
+            .iter_mut()
+            .find(|entry| entry.project_id == project_id)
+        else {
+            return Ok(false);
+        };
+        if entry.repo.as_deref() == Some(checkout)
+            || entry.human_checkouts.iter().any(|known| known == checkout)
+        {
+            return Ok(false);
+        }
+        entry.human_checkouts.push(checkout.to_path_buf());
+        self.write(&manifest)?;
+        Ok(true)
     }
 
     /// Put a link to an adopted repository in `repos/`, so the tidy view exists without
@@ -1876,5 +2087,114 @@ mod tests {
         // And the real thing.
         crate::atomic_json(&path, &forge(&josh(), "demo", true)).unwrap();
         assert!(self_improve_enabled(&channel, "demo"));
+    }
+
+    /// In the swarm until the master says otherwise; the master's word travels with the
+    /// channel; nobody else's counts, however it got there. Absent is on, so deleting the
+    /// file can only put a project back, never take one out.
+    #[test]
+    fn the_swarm_is_on_by_default_and_only_the_master_takes_a_project_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
+
+        assert!(swarm_enabled(&channel, "demo"), "in by default");
+        let error = set_swarm(&channel, "demo", false, &grouchly)
+            .expect_err("a member is not the master")
+            .to_string();
+        assert!(error.contains("only josh"), "{error}");
+        let impostor = crate::AgentIdentity::from_seed("josh", [9u8; 32]);
+        assert!(
+            set_swarm(&channel, "demo", false, &impostor).is_err(),
+            "the name is not the key"
+        );
+        assert!(!channel.join(SWARM).exists(), "nothing was written");
+
+        assert!(set_swarm(&channel, "demo", false, &josh()).unwrap());
+        assert!(!swarm_enabled(&channel, "demo"));
+        assert_eq!(swarm_setting(&channel, "demo").unwrap().signed_by, "josh");
+        assert!(
+            !set_swarm(&channel, "demo", false, &josh()).unwrap(),
+            "already out"
+        );
+
+        // A peer can only put it back, by deleting the file, and that is the default.
+        std::fs::remove_file(channel.join(SWARM)).unwrap();
+        assert!(swarm_enabled(&channel, "demo"));
+        assert!(set_swarm(&channel, "demo", true, &josh()).is_ok());
+    }
+
+    #[test]
+    fn a_swarm_flag_the_master_did_not_sign_does_not_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let grouchly = crate::AgentIdentity::from_seed("grouchly", [8u8; 32]);
+        let channel = mastered(dir.path(), "demo", &josh(), &[&grouchly]);
+        let forge = |signer: &crate::AgentIdentity, project: &str, on: bool| {
+            let set_at = Utc::now();
+            let signature = signer
+                .signing
+                .sign(swarm_payload(project, on, &set_at).as_bytes());
+            SwarmSetting {
+                project_id: project.into(),
+                on,
+                set_at,
+                signed_by: signer.name().into(),
+                signature: hex::encode(signature.to_bytes()),
+            }
+        };
+        let path = channel.join(SWARM);
+
+        // Validly signed "off", by a member who is not the master: the project stays in.
+        crate::atomic_json(&path, &forge(&grouchly, "demo", false)).unwrap();
+        assert!(swarm_enabled(&channel, "demo"));
+        // The master's "off" for another project, lifted into this one.
+        crate::atomic_json(&path, &forge(&josh(), "elsewhere", false)).unwrap();
+        assert!(swarm_enabled(&channel, "demo"));
+        // The master's "on", edited to "off".
+        let mut edited = forge(&josh(), "demo", true);
+        edited.on = false;
+        crate::atomic_json(&path, &edited).unwrap();
+        assert!(swarm_enabled(&channel, "demo"));
+        // Garbage.
+        std::fs::write(&path, "off").unwrap();
+        assert!(swarm_enabled(&channel, "demo"));
+        // And the real thing.
+        crate::atomic_json(&path, &forge(&josh(), "demo", false)).unwrap();
+        assert!(!swarm_enabled(&channel, "demo"));
+    }
+
+    #[test]
+    fn a_managed_clone_replaces_a_working_copy_and_the_working_copy_is_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let comms = channel(dir.path(), "demo");
+        let human = dir.path().join("X-ferryman");
+        root.adopt("demo", &comms, Some(&human)).unwrap();
+
+        let clone = root.managed_clone("demo");
+        assert_eq!(clone, root.repos().join("demo"));
+        assert!(root.is_managed(&clone));
+        assert!(!root.is_managed(&human));
+
+        assert!(root.set_managed_repo("demo", &clone).unwrap());
+        let entry = &root.projects()[0];
+        assert_eq!(entry.repo.as_deref(), Some(clone.as_path()));
+        assert_eq!(entry.human_checkouts, vec![human.clone()]);
+        assert!(
+            !root.set_managed_repo("demo", &clone).unwrap(),
+            "idempotent"
+        );
+
+        // Noting the human copy again, or the clone as one, changes nothing.
+        assert!(!root.note_human_checkout("demo", &human).unwrap());
+        assert!(!root.note_human_checkout("demo", &clone).unwrap());
+        let other = dir.path().join("another-copy");
+        assert!(root.note_human_checkout("demo", &other).unwrap());
+        assert_eq!(root.projects()[0].human_checkouts.len(), 2);
+        assert!(
+            !human.exists() && !clone.exists(),
+            "recording paths creates nothing"
+        );
     }
 }

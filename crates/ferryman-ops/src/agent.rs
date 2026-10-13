@@ -2075,7 +2075,7 @@ impl Drop for WorkerLock {
 /// A pid can be recycled, and a zombie still has an entry. Both err towards "alive",
 /// which is the safe direction: the cost is one worker declining to start, not two
 /// engines writing one result.
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
         Path::new(&format!("/proc/{pid}")).exists()
@@ -5573,6 +5573,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         }
     }
 
@@ -5667,6 +5668,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         }
     }
 
@@ -6270,6 +6272,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         }
     }
 

@@ -1297,6 +1297,7 @@ dependencies = [
  "system-idle-time",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

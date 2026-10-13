@@ -31,15 +31,18 @@ pub enum Action {
     Nothing,
     StartSyncthing,
     RepairChannels,
+    /// Run `repos sync` and rename aside locks that name dead processes. Never signs.
+    RepairLayout,
     RestartWorkers,
     AlertOnly,
 }
 
 impl Action {
-    pub const ALL: [Action; 5] = [
+    pub const ALL: [Action; 6] = [
         Action::Nothing,
         Action::StartSyncthing,
         Action::RepairChannels,
+        Action::RepairLayout,
         Action::RestartWorkers,
         Action::AlertOnly,
     ];
@@ -50,6 +53,7 @@ impl Action {
             Action::Nothing => "nothing",
             Action::StartSyncthing => "start_syncthing",
             Action::RepairChannels => "repair_channels",
+            Action::RepairLayout => "repair_layout",
             Action::RestartWorkers => "restart_workers",
             Action::AlertOnly => "alert_only",
         }
@@ -64,6 +68,9 @@ impl Action {
             Action::RepairChannels => {
                 "a channel is NOT SYNCED: the worker reads a different folder from the one \
                  Syncthing syncs"
+            }
+            Action::RepairLayout => {
+                "the fixed layout is incomplete: a live project has no repos/<project> clone, a folder is missing, or a worker lock names a dead process"
             }
             Action::RestartWorkers => "a Ferryman worker service has failed or stopped",
             Action::AlertOnly => {
@@ -107,6 +114,21 @@ pub struct Facts {
     pub channels: Vec<ChannelFact>,
     pub services: Vec<(String, String)>,
     pub engines: Vec<EngineFact>,
+    /// The ferry root, when this machine has one.
+    #[serde(default)]
+    pub root: Option<PathBuf>,
+    /// Live projects with no attached `repos/<project>`, with why.
+    #[serde(default)]
+    pub unsynced: Vec<String>,
+    /// Worker locks naming a process that is proven dead.
+    #[serde(default)]
+    pub dead_locks: usize,
+    /// A fixed folder (comms, repos, work) is missing.
+    #[serde(default)]
+    pub missing_folders: bool,
+    /// Layout problems no automatic action fixes (the worker count, the service).
+    #[serde(default)]
+    pub layout_notes: Vec<String>,
 }
 
 impl Facts {
@@ -124,6 +146,12 @@ impl Facts {
             .collect()
     }
 
+    /// Whether `repos sync` or a lock archive would change anything.
+    #[must_use]
+    pub fn layout_repairable(&self) -> bool {
+        !self.unsynced.is_empty() || self.dead_locks > 0 || self.missing_folders
+    }
+
     #[must_use]
     pub fn bad_engines(&self) -> Vec<&EngineFact> {
         self.engines
@@ -139,6 +167,7 @@ impl Facts {
             Action::Nothing => self.healthy(),
             Action::StartSyncthing => self.syncthing_down,
             Action::RepairChannels => self.split_channels() > 0,
+            Action::RepairLayout => self.layout_repairable(),
             Action::RestartWorkers => !self.failed_services().is_empty(),
             Action::AlertOnly => !self.healthy(),
         }
@@ -148,6 +177,8 @@ impl Facts {
     pub fn healthy(&self) -> bool {
         !self.syncthing_down
             && self.split_channels() == 0
+            && !self.layout_repairable()
+            && self.layout_notes.is_empty()
             && self.failed_services().is_empty()
             && self.bad_engines().is_empty()
     }
@@ -160,9 +191,11 @@ impl Facts {
             Action::StartSyncthing
         } else if self.split_channels() > 0 {
             Action::RepairChannels
+        } else if self.layout_repairable() {
+            Action::RepairLayout
         } else if !self.failed_services().is_empty() {
             Action::RestartWorkers
-        } else if !self.bad_engines().is_empty() {
+        } else if !self.bad_engines().is_empty() || !self.layout_notes.is_empty() {
             Action::AlertOnly
         } else {
             Action::Nothing
@@ -184,6 +217,18 @@ impl Facts {
         ));
         for c in split {
             out.push_str(&format!("  {}: {}\n", c.project, c.state));
+        }
+        for line in &self.unsynced {
+            out.push_str(&format!("layout: no clone for {line}\n"));
+        }
+        if self.dead_locks > 0 {
+            out.push_str(&format!(
+                "layout: {} worker lock(s) name a dead process\n",
+                self.dead_locks
+            ));
+        }
+        for line in &self.layout_notes {
+            out.push_str(&format!("layout: {line}\n"));
         }
         for (unit, state) in &self.services {
             out.push_str(&format!("service {unit}: {state}\n"));
@@ -252,6 +297,33 @@ fn services() -> Vec<(String, String)> {
         .collect()
 }
 
+/// The layout facts: whether every live project has its clone, the folders are there, and\n/// what else the layout check would say. Read only.
+fn gather_layout(comms: &Path, facts: &mut Facts) {
+    let Some(root) =
+        ferryman_channel::ferry::find_root_from(comms).or_else(ferryman_channel::ferry::find_root)
+    else {
+        return;
+    };
+    let report = crate::layout::inspect_live(&root, &crate::machine::scan());
+    facts.unsynced = crate::repos::unsynced(&root)
+        .into_iter()
+        .map(|(project, why)| format!("{project} ({why})"))
+        .collect();
+    facts.dead_locks = report
+        .stale
+        .iter()
+        .filter(|lock| lock.proven_dead())
+        .count();
+    facts.missing_folders = report.checks.iter().any(|c| c.name == "folders" && !c.ok);
+    facts.layout_notes = report
+        .checks
+        .iter()
+        .filter(|c| !c.ok && !matches!(c.name, "folders" | "repos" | "locks"))
+        .map(|c| format!("{}: {}", c.name, c.detail))
+        .collect();
+    facts.root = Some(root.path);
+}
+
 /// Gather the facts. Engines are probed with a real one-token request each, once per
 /// distinct endpoint and model, whatever their configured probe.
 pub async fn gather(comms: &Path) -> Facts {
@@ -274,6 +346,7 @@ pub async fn gather(comms: &Path) -> Facts {
             facts.syncthing_down = true;
         }
     }
+    gather_layout(comms, &mut facts);
     let mut seen: Vec<(String, String)> = Vec::new();
     for ws in workspaces(comms) {
         let attachment = ws.join(".ferryman");
@@ -451,6 +524,7 @@ pub fn act(facts: &Facts, action: Action) -> Vec<String> {
                 }
             }
         }
+        Action::RepairLayout => done.extend(repair_layout(facts)),
         Action::RestartWorkers => {
             for unit in facts.failed_services() {
                 let ok = Command::new("systemctl")
@@ -463,6 +537,45 @@ pub fn act(facts: &Facts, action: Action) -> Vec<String> {
                 ));
             }
         }
+    }
+    done
+}
+
+/// Put the layout back: make the three folders, run `repos sync` (clone, fetch and attach
+/// every live project; no roster, key, device or Syncthing folder is touched) and rename
+/// aside locks whose process is proven dead. Nothing is signed or deleted.
+fn repair_layout(facts: &Facts) -> Vec<String> {
+    let mut done = Vec::new();
+    let Some(root) = facts
+        .root
+        .as_deref()
+        .and_then(ferryman_channel::ferry::find_root_from)
+    else {
+        return vec!["no ferry root to repair a layout in".into()];
+    };
+    for folder in [root.comms(), root.repos(), root.work()] {
+        if !folder.is_dir() && std::fs::create_dir_all(&folder).is_ok() {
+            done.push(format!("made {}", folder.display()));
+        }
+    }
+    match crate::repos::sync(&root, &crate::repos::Options::default()) {
+        Ok(rows) => {
+            for row in rows {
+                match &row.status {
+                    crate::repos::Status::Done(_) => {
+                        done.push(format!("repos sync {}: {}", row.project, row.word()));
+                    }
+                    crate::repos::Status::Skipped(crate::repos::Skip::Failed(why)) => {
+                        done.push(format!("repos sync {} failed: {why}", row.project));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(error) => done.push(format!("repos sync failed: {error:#}")),
+    }
+    for line in crate::layout::archive_stale(&crate::layout::stale_locks(&root)) {
+        done.push(format!("archived a stale lock: {line}"));
     }
     done
 }
@@ -627,6 +740,71 @@ mod tests {
         assert!(text.contains("machine grouchly"));
         assert!(text.contains("engine deepseek (m): the key was refused"));
         assert!(text.len() < 2000);
+    }
+
+    #[test]
+    fn an_incomplete_layout_is_repaired_before_workers_are_restarted() {
+        let mut f = healthy();
+        f.services[0].1 = "failed".into();
+        assert_eq!(f.rule(), Action::RestartWorkers);
+        f.unsynced.push("quantly (not a clone)".into());
+        assert!(!f.healthy());
+        assert!(f.supports(Action::RepairLayout));
+        assert_eq!(f.rule(), Action::RepairLayout);
+        f.unsynced.clear();
+        f.dead_locks = 1;
+        assert_eq!(f.rule(), Action::RepairLayout);
+        assert!(f.as_text().contains("name a dead process"));
+    }
+
+    #[test]
+    fn a_healthy_layout_is_not_repaired_and_a_model_cannot_ask_for_it() {
+        let f = healthy();
+        assert!(!f.supports(Action::RepairLayout));
+    }
+
+    #[test]
+    fn layout_problems_nothing_repairs_are_only_reported() {
+        let mut f = healthy();
+        f.layout_notes
+            .push("one worker: 2 workers on this machine".into());
+        assert!(!f.healthy());
+        assert!(!f.supports(Action::RepairLayout));
+        assert_eq!(f.rule(), Action::AlertOnly);
+    }
+
+    #[test]
+    fn repairing_the_layout_makes_folders_and_renames_dead_locks_and_signs_nothing() {
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(
+            std::env::temp_dir().join(format!("ferryman-watchdog-selftest-{}", std::process::id())),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let root = ferryman_channel::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let channel = root.comms_home("quantly");
+        std::fs::create_dir_all(&channel).unwrap();
+        let repo = dir.path().join("human").join("quantly");
+        std::fs::create_dir_all(repo.join(".ferryman")).unwrap();
+        root.adopt("quantly", &channel, Some(&repo)).unwrap();
+        let lock = repo.join(".ferryman").join("worker-old.lock");
+        std::fs::write(&lock, "999999999").unwrap();
+        std::fs::remove_dir_all(root.work()).ok();
+        let mut f = healthy();
+        f.root = Some(root.path.clone());
+        f.missing_folders = true;
+        f.dead_locks = 1;
+
+        let done = act(&f, Action::RepairLayout);
+
+        assert!(root.work().is_dir(), "{done:?}");
+        assert!(!lock.exists());
+        assert!(
+            repo.join(".ferryman/worker-old.lock.stale-999999999")
+                .is_file(),
+            "{done:?}"
+        );
+        // Nothing was signed: no flag file, no roster entry appeared in the channel.
+        let entries: Vec<_> = std::fs::read_dir(&channel).unwrap().flatten().collect();
+        assert!(entries.is_empty(), "{entries:?}");
     }
 
     #[test]

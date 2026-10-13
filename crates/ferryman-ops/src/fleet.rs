@@ -141,6 +141,26 @@ fn keeps_keys_out_of_git(attachment: &Path, agent: &str) -> bool {
     }
 }
 
+/// Why the swarm must not work this project, when it must not: its master signed
+/// `swarm = off`, or this machine keeps it out in its own root config.
+#[must_use]
+pub fn out_of_the_swarm(entry: &Entry, machine: &crate::rootconfig::RootConfig) -> Option<String> {
+    if machine.excluded(&entry.project_id) {
+        return Some(
+            "this machine keeps it out of the swarm ([swarm] exclude in the root's ferry.toml)"
+                .to_owned(),
+        );
+    }
+    if entry.swarm_off() {
+        return Some(
+            "swarm = off: its master keeps it out of the swarm ('ferry root swarm <project> --on' \
+             brings it back)"
+                .to_owned(),
+        );
+    }
+    None
+}
+
 fn skip(why: impl Into<String>) -> Standing {
     Standing::Skips(why.into())
 }
@@ -178,12 +198,13 @@ pub fn plan_worker(
         );
     };
     let key = identity.public_key_hex();
+    let machine = crate::rootconfig::RootConfig::load(root);
     let rows = root
         .read()
         .projects
         .into_iter()
         .map(|entry| {
-            let standing = judge(root, &entry, config, &key)
+            let standing = judge(root, &entry, config, &key, &machine)
                 .unwrap_or_else(|error| skip(format!("{error:#}")));
             Row {
                 project: entry.project_id,
@@ -195,7 +216,13 @@ pub fn plan_worker(
     Ok((WorkerPlan { rows }, identity))
 }
 
-fn judge(root: &Root, entry: &Entry, config: &AgentConfig, key: &str) -> Result<Standing> {
+fn judge(
+    root: &Root,
+    entry: &Entry,
+    config: &AgentConfig,
+    key: &str,
+    machine: &crate::rootconfig::RootConfig,
+) -> Result<Standing> {
     let agent = config.agent.as_str();
     if !entry.channel.is_dir() {
         return Ok(skip("its channel folder is not on this machine"));
@@ -203,11 +230,14 @@ fn judge(root: &Root, entry: &Entry, config: &AgentConfig, key: &str) -> Result<
     if entry.is_archived() {
         return Ok(skip("archived, so nothing new is worked there"));
     }
+    if let Some(why) = out_of_the_swarm(entry, machine) {
+        return Ok(skip(why));
+    }
     if entry.attachment().is_none() {
         return Ok(skip(format!(
-            "no checkout of {} on this machine, so there is nowhere to do its work. Clone it \
-             here and run 'ferry enable' in it",
-            entry.project_id
+            "no checkout of {id} on this machine, so there is nowhere to do its work. \
+             'ferry repos sync --project {id}' clones it into repos/{id} and attaches it",
+            id = entry.project_id
         )));
     }
     let (route, _) = entry.route(root)?;
@@ -287,6 +317,9 @@ pub fn no_longer_served(route: &ProjectRoute, config: &AgentConfig) -> Option<St
     if ferryman_channel::ferry::is_archived(&route.communications, &route.project_id) {
         return Some("it has been archived".to_owned());
     }
+    if !ferryman_channel::ferry::swarm_enabled(&route.communications, &route.project_id) {
+        return Some("its master has taken it out of the swarm (swarm = off)".to_owned());
+    }
     match ferryman_channel::master::may_work(route, &config.agent, &config.role) {
         Ok(true) => None,
         Ok(false) => Some(format!(
@@ -353,7 +386,14 @@ pub fn serve(plan: WorkerPlan, identity: &AgentIdentity, config: &AgentConfig) -
                     ));
                     continue;
                 }
-                served.push((*route, config.clone()));
+                // The project's own binding rules go in front of every prompt for it, and
+                // for no other project. Read once, here, so the bytes cannot change under
+                // the prompt cache mid-run; a changed policy takes effect on restart.
+                let mut config = config.clone();
+                let declared = policy::read(&route.workspace, &route.attachment);
+                config.preamble =
+                    policy::with_policy(config.preamble.as_deref(), &route.project_id, &declared);
+                served.push((*route, config));
             }
             Standing::Skips(why) => skipped.push((row.channel, format!("{}: {why}", row.project))),
         }
@@ -502,6 +542,7 @@ pub fn enrol(
     as_master: &str,
     signer: &mut Signer<'_>,
 ) -> Vec<(String, Enrolment)> {
+    let machine = crate::rootconfig::RootConfig::load(root);
     root.read()
         .projects
         .into_iter()
@@ -510,6 +551,8 @@ pub fn enrol(
                 Enrolment::Skipped("its channel folder is not on this machine".into())
             } else if entry.is_archived() {
                 Enrolment::Skipped("archived".into())
+            } else if let Some(why) = out_of_the_swarm(&entry, &machine) {
+                Enrolment::Skipped(why)
             } else {
                 enrol_one(root, &entry, name, role, key, as_master, signer)
                     .unwrap_or_else(|error| Enrolment::Skipped(format!("{error:#}")))
@@ -630,6 +673,116 @@ fn enrol_one(
         grant: !granted,
     })
 }
+
+/// What revoking an identity did in one project.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Revocation {
+    /// A signed revocation was written now.
+    Revoked,
+    /// The master had already revoked it. Nothing was written and nobody was asked to sign.
+    AlreadyRevoked,
+    /// Another person masters it. Nothing was written.
+    NotMaster { master: String },
+    /// It has no master yet, so there is nobody who could sign. Nothing was written.
+    NoMaster,
+    /// The name was never on its roster and holds no grant there: there is nothing to end,
+    /// and a revocation file would be litter in a channel the identity never touched.
+    NotAMember,
+    /// Left alone, and why.
+    Skipped(String),
+}
+
+/// End `name`'s access in every project here that `as_master` is master of, with that
+/// master's signed revocation. The converse of [`enrol`], and held to the same rules.
+///
+/// Every project in the root is reached, channel-only ones and archived ones included: a
+/// revocation does not need a checkout (it is a signed file in the channel) and a finished
+/// project is exactly where a retired identity is forgotten about. `signer` is called only
+/// when something is about to be written, and the identity it hands back must be the key the
+/// project's roster knows the master by - the check `ferry root archive` makes, not just a
+/// name that matches.
+///
+/// Idempotent. Nothing is written for a project somebody else masters, for one the name
+/// never joined, or for one that already holds the revocation. A master is never revoked by
+/// this: ending the signer's own access everywhere is not a bulk operation.
+pub fn revoke_everywhere(
+    root: &Root,
+    name: &str,
+    reason: &str,
+    as_master: &str,
+    signer: &mut Signer<'_>,
+) -> Vec<(String, Revocation)> {
+    root.read()
+        .projects
+        .into_iter()
+        .map(|entry| {
+            let outcome = if !entry.channel.is_dir() {
+                Revocation::Skipped("its channel folder is not on this machine".into())
+            } else {
+                revoke_one(root, &entry, name, reason, as_master, signer)
+                    .unwrap_or_else(|error| Revocation::Skipped(format!("{error:#}")))
+            };
+            (entry.project_id, outcome)
+        })
+        .collect()
+}
+
+fn revoke_one(
+    root: &Root,
+    entry: &Entry,
+    name: &str,
+    reason: &str,
+    as_master: &str,
+    signer: &mut Signer<'_>,
+) -> Result<Revocation> {
+    let name = canonical_agent_name(name);
+    if !ferryman_channel::is_safe_component(&name) {
+        bail!("'{name}' is not a name: use letters, digits, '.', '-' and '_'");
+    }
+    // The channel and nothing else, whether or not a checkout is here: what is signed is a
+    // file in the channel, and a checkout whose bridge reads some other folder must not
+    // decide where it goes.
+    let (route, _) = Entry {
+        repo: None,
+        ..entry.clone()
+    }
+    .route(root)?;
+    let Some(declared) = ferryman_channel::master::read_master(&route)? else {
+        return Ok(Revocation::NoMaster);
+    };
+    if !declared.master.eq_ignore_ascii_case(as_master) {
+        return Ok(Revocation::NotMaster {
+            master: declared.master,
+        });
+    }
+    if declared.master.eq_ignore_ascii_case(&name) {
+        return Ok(Revocation::Skipped(format!(
+            "'{name}' is its master. Hand the project over first (it is not revoked in bulk)"
+        )));
+    }
+    if ferryman_channel::master::is_revoked(&route, &name)? {
+        return Ok(Revocation::AlreadyRevoked);
+    }
+    let on_roster = listed(&route.communications, &name).is_some();
+    let granted = ferryman_channel::master::member_grants(&route)?
+        .iter()
+        .any(|(grant, _)| grant.grantee.eq_ignore_ascii_case(&name));
+    if !on_roster && !granted {
+        return Ok(Revocation::NotAMember);
+    }
+    // Only now, with something to write, is the master asked for.
+    let master = signer(entry, &declared.master)?;
+    ferryman_channel::ferry::require_master(
+        &route.communications,
+        &route.project_id,
+        &master,
+        "end a member's access",
+    )?;
+    ferryman_channel::master::revoke_member(&route, &master, &name, reason)?;
+    Ok(Revocation::Revoked)
+}
+
+pub mod policy;
 
 #[cfg(test)]
 mod tests;

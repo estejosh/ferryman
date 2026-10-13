@@ -964,6 +964,7 @@ dependencies = [
  "sysinfo",
  "system-idle-time",
  "tokio",
+ "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

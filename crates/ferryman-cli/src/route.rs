@@ -173,11 +173,13 @@ pub(crate) async fn command(command: RouteCommand) -> Result<()> {
                 &context,
             );
             let recorded = recorded_decisions(&route, &task);
+            let declared = ferryman_ops::fleet::policy::read(&route.workspace, &route.attachment);
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&json!({
                         "order": task.order.id,
+                        "policy": declared.summary(),
                         "classification": classification,
                         "recorded": recorded
                             .iter()
@@ -201,6 +203,10 @@ pub(crate) async fn command(command: RouteCommand) -> Result<()> {
             }
             for line in lines(&route, &task.order, &classification, false) {
                 println!("{line}");
+            }
+            println!("{}", declared.summary());
+            for note in &declared.notes {
+                println!("  note: {note}");
             }
             if recorded.is_empty() {
                 println!(
@@ -505,6 +511,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         };
         let found = recorded_decisions(&route, &task);
         let who: Vec<&str> = found.iter().map(|(who, _)| who.as_str()).collect();

@@ -1,0 +1,610 @@
+use super::*;
+use crate::machine::{self, Worker};
+use ferryman_channel::{AgentIdentity, AgentRoute, ProjectRoute};
+
+fn hermetic() {
+    ferryman_channel::licensing::use_machine_state_dir_per_thread(
+        std::env::temp_dir().join(format!("ferryman-setup-selftest-{}", std::process::id())),
+    );
+}
+
+fn josh() -> AgentIdentity {
+    AgentIdentity::from_seed("josh", [7u8; 32])
+}
+
+fn filed(root: &Root, id: &str) -> PathBuf {
+    let channel = root.comms_home(id);
+    fs::create_dir_all(&channel).unwrap();
+    let master = josh();
+    let route = ProjectRoute {
+        project_id: id.into(),
+        workspace: channel.clone(),
+        attachment: channel.clone(),
+        communications: channel.clone(),
+        shared_remote: format!("{id}-ferryman"),
+        git_remote: String::new(),
+        git_visibility: String::new(),
+        agents: Vec::new(),
+    };
+    ferryman_channel::register_agent(
+        &route,
+        &AgentRoute {
+            name: "josh".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(master.public_key_hex()),
+            encryption_key: None,
+        },
+    )
+    .unwrap();
+    let route = ProjectRoute {
+        agents: ferryman_channel::read_agent_roster(&channel).unwrap(),
+        ..route
+    };
+    ferryman_channel::master::initialize_master(&route, &master, "josh").unwrap();
+    root.adopt(id, &channel, None).unwrap();
+    channel
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn origin(dir: &Path, name: &str) -> PathBuf {
+    let bare = dir.join("origins").join(format!("{name}.git"));
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "--bare", "-q", "-b", "main"]);
+    let seed = dir.join("seeds").join(name);
+    fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "-q", "-b", "main"]);
+    fs::write(seed.join("README.md"), "hello").unwrap();
+    git(&seed, &["add", "-A"]);
+    git(&seed, &["commit", "-q", "-m", "first"]);
+    git(&seed, &["push", "-q", bare.to_str().unwrap(), "main"]);
+    bare
+}
+
+fn template(dir: &Path) -> String {
+    format!("{}/{{project}}.git", dir.join("origins").display())
+}
+
+struct Machine {
+    dir: tempfile::TempDir,
+    root: Root,
+}
+
+fn machine_with(projects: &[&str]) -> Machine {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    for project in projects {
+        filed(&root, project);
+        origin(dir.path(), project);
+    }
+    Machine { dir, root }
+}
+
+fn options(machine: &Machine) -> Options {
+    Options {
+        identity: Some("ichabod-test-swarm".into()),
+        home: None,
+        retire: Vec::new(),
+        exclude: Vec::new(),
+        remote_template: Some(template(machine.dir.path())),
+        dry_run: false,
+        service: false,
+        with_syncthing: false,
+        no_fetch: false,
+        ferry: PathBuf::from("/opt/ferry/ferry"),
+        platform: Platform::Linux,
+        user_home: machine.dir.path().join("home"),
+        user: "josh".into(),
+    }
+}
+
+fn spec() -> Spec {
+    Spec {
+        ferry: PathBuf::from("/opt/ferry/ferry"),
+        workspace: PathBuf::from("/srv/ferry/repos/ferryman"),
+        env_file: PathBuf::from("/srv/ferry/service/worker.env"),
+        user: "josh".into(),
+    }
+}
+
+type Log = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+fn recorder() -> (Log, impl FnMut(&str, &[String]) -> Option<String>) {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let inner = log.clone();
+    (log, move |program: &str, args: &[String]| {
+        inner
+            .borrow_mut()
+            .push(format!("{program} {}", args.join(" ")));
+        Some(String::new())
+    })
+}
+
+fn unit_worker(name: &str, user: bool, identity: &str) -> Worker {
+    Worker {
+        kind: machine::Kind::Unit {
+            unit: name.into(),
+            file: PathBuf::from(format!("/nonexistent/{name}")),
+            user,
+            enabled: true,
+            active: true,
+            pid: Some(1),
+        },
+        all_projects: true,
+        identity: Some(identity.into()),
+        command: "ferry agent run --all-projects".into(),
+    }
+}
+
+fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push((path.clone(), fs::read(&path).unwrap_or_default()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, &mut out);
+    out.sort();
+    out
+}
+
+#[test]
+fn the_systemd_unit_is_one_worker_with_limits_and_no_inline_secrets() {
+    let text = systemd_unit(&spec(), true);
+    for needle in [
+        "Restart=on-failure",
+        "MemoryMax=",
+        "CPUQuota=",
+        "TasksMax=",
+        "EnvironmentFile=-/srv/ferry/service/worker.env",
+        "agent run --all-projects --workspace",
+        "ferryman-syncthing.service",
+    ] {
+        assert!(text.contains(needle), "missing {needle}:\n{text}");
+    }
+    assert!(!text.contains("API_KEY"), "{text}");
+    // Doctor reads it back as the one all-projects worker.
+    let (found, _) = machine::unit_worker(&text).expect("the unit runs a worker");
+    assert!(found.all_projects);
+    assert_eq!(
+        found.workspace.as_deref(),
+        Some("/srv/ferry/repos/ferryman")
+    );
+}
+
+#[test]
+fn syncthing_has_a_unit_of_its_own_that_is_not_a_worker() {
+    let text = systemd_syncthing_unit(&spec());
+    assert!(text.contains("syncthing run"));
+    assert!(text.contains("Restart=on-failure"));
+    assert!(machine::unit_worker(&text).is_none());
+}
+
+#[test]
+fn the_windows_wrapper_loads_its_environment_from_a_file_and_is_read_as_the_worker() {
+    let mut spec = spec();
+    spec.ferry = PathBuf::from(r"C:\Program Files\ferry\ferry.exe");
+    spec.workspace = PathBuf::from(r"X:\ferry\repos\ferryman");
+    spec.env_file = PathBuf::from(r"X:\ferry\service\worker.env");
+    let text = windows_wrapper(
+        &spec,
+        "agent run --all-projects --workspace 'X:\\ferry\\repos\\ferryman'",
+    );
+    assert!(
+        text.contains(r"$envFile = 'X:\ferry\service\worker.env'"),
+        "{text}"
+    );
+    assert!(text.contains("SetEnvironmentVariable"));
+    assert!(text.contains("exit $LASTEXITCODE"));
+    assert!(!text.contains("API_KEY"));
+    let (found, _) = machine::invocation_in_text(&text).expect("the wrapper runs a worker");
+    assert!(found.all_projects);
+}
+
+#[test]
+fn the_task_restarts_on_failure_and_runs_the_wrapper_not_ferry_directly() {
+    let xml = task_xml(
+        &spec(),
+        "worker",
+        Path::new(r"X:\ferry\service\ferryman-worker.ps1"),
+    );
+    assert!(xml.contains("<RestartOnFailure>"));
+    assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+    assert!(xml.contains("-File \"X:\\ferry\\service\\ferryman-worker.ps1\""));
+    assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+    assert!(
+        !xml.contains("--all-projects"),
+        "no command line, and so no secret, inline"
+    );
+    let bytes = utf16_le(&xml);
+    assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+}
+
+#[test]
+fn a_dry_run_changes_nothing_and_still_prints_the_masters_lines() {
+    let machine = machine_with(&["quantly"]);
+    let mut opts = options(&machine);
+    opts.dry_run = true;
+    opts.service = true;
+    let before = snapshot(machine.dir.path());
+    let (log, mut run) = recorder();
+    let report = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert_eq!(
+        before,
+        snapshot(machine.dir.path()),
+        "a dry run writes nothing"
+    );
+    assert!(
+        log.borrow().is_empty(),
+        "and runs nothing: {:?}",
+        log.borrow()
+    );
+    assert!(
+        report
+            .signing
+            .iter()
+            .any(|line| line.starts_with("ferry team approve ichabod-test-swarm --all")),
+        "{:?}",
+        report.signing
+    );
+    assert!(report.render().contains("dry run: nothing was written"));
+}
+
+#[test]
+fn setup_makes_the_layout_the_clone_and_the_identity_and_is_safe_to_repeat() {
+    let machine = machine_with(&["quantly"]);
+    let opts = options(&machine);
+    let mut run = |_: &str, _: &[String]| None;
+    let report = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    for folder in [
+        machine.root.comms(),
+        machine.root.repos(),
+        machine.root.work(),
+    ] {
+        assert!(folder.is_dir(), "{}", folder.display());
+    }
+    let clone = machine.root.managed_clone("quantly");
+    assert!(clone.join(".git").exists());
+    let attachment = clone.join(".ferryman");
+    assert!(
+        attachment.join("agent.toml").is_file(),
+        "{:?}",
+        report.identity_lines
+    );
+    let first = AgentIdentity::load_existing("ichabod-test-swarm", &attachment)
+        .unwrap()
+        .expect("a key")
+        .public_key_hex();
+    let config = AgentConfig::load(&attachment).unwrap();
+    assert_eq!(config.agent, "ichabod-test-swarm");
+    // Nothing was enrolled: the roster of the channel does not know the new name.
+    let roster = ferryman_channel::read_agent_roster(&machine.root.comms_home("quantly")).unwrap();
+    assert!(
+        !roster.iter().any(|a| a.name == "ichabod-test-swarm"),
+        "{roster:?}"
+    );
+
+    let text = fs::read_to_string(attachment.join("agent.toml")).unwrap();
+    setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert_eq!(
+        text,
+        fs::read_to_string(attachment.join("agent.toml")).unwrap()
+    );
+    let again = AgentIdentity::load_existing("ichabod-test-swarm", &attachment)
+        .unwrap()
+        .unwrap()
+        .public_key_hex();
+    assert_eq!(first, again, "the key is reused, never replaced");
+}
+
+#[test]
+fn without_service_nothing_is_installed_or_turned_off() {
+    let machine = machine_with(&["quantly"]);
+    let opts = options(&machine);
+    let (log, mut run) = recorder();
+    let scan = machine::Scan {
+        workers: vec![unit_worker("ferryman-ichabod.service", true, "old-swarm")],
+        notes: Vec::new(),
+    };
+    let report = setup(&machine.root, &opts, &scan, &mut run).unwrap();
+    assert!(log.borrow().is_empty(), "{:?}", log.borrow());
+    assert!(!opts.user_home.join(".config/systemd/user").exists());
+    assert!(report.service.iter().any(|l| l.contains("--service")));
+}
+
+#[test]
+fn the_service_replaces_the_others_by_disabling_them_and_keeping_a_copy() {
+    let machine = machine_with(&["quantly"]);
+    let mut opts = options(&machine);
+    opts.service = true;
+    // The old unit exists on disk, so it can be backed up.
+    let old = machine
+        .dir
+        .path()
+        .join("home/.config/systemd/user/ferryman-ichabod.service");
+    fs::create_dir_all(old.parent().unwrap()).unwrap();
+    fs::write(
+        &old,
+        "[Service]\nExecStart=/x/ferry agent run --all-projects\n",
+    )
+    .unwrap();
+    let mut old_worker = unit_worker("ferryman-ichabod.service", true, "old-swarm");
+    if let machine::Kind::Unit { file, .. } = &mut old_worker.kind {
+        file.clone_from(&old);
+    }
+    let system = unit_worker("ferryman-system.service", false, "sys-swarm");
+    let scan = machine::Scan {
+        workers: vec![old_worker, system],
+        notes: Vec::new(),
+    };
+    let (log, mut run) = recorder();
+    let report = setup(&machine.root, &opts, &scan, &mut run).unwrap();
+    let log = log.borrow().clone();
+
+    assert!(old.is_file(), "the old unit is disabled, never deleted");
+    let backups = machine.root.path.join("service/backup");
+    assert!(
+        snapshot(&backups)
+            .iter()
+            .any(|(path, bytes)| path.ends_with("ferryman-ichabod.service") && !bytes.is_empty()),
+        "a copy was kept"
+    );
+    assert!(
+        log.contains(&"systemctl --user disable --now ferryman-ichabod.service".to_string()),
+        "{log:?}"
+    );
+    assert!(
+        log.contains(&"systemctl --user enable --now ferryman-worker.service".to_string()),
+        "{log:?}"
+    );
+    // The system-wide unit needs elevation: printed, not attempted.
+    assert!(
+        !log.iter().any(|l| l.contains("ferryman-system.service")),
+        "{log:?}"
+    );
+    assert!(
+        report
+            .manual
+            .iter()
+            .any(|l| l.contains("sudo systemctl disable --now ferryman-system.service")),
+        "{:?}",
+        report.manual
+    );
+    let unit = opts
+        .user_home
+        .join(".config/systemd/user/ferryman-worker.service");
+    let text = fs::read_to_string(unit).unwrap();
+    assert!(
+        text.contains("repos/quantly") || text.contains("repos\\\\quantly"),
+        "{text}"
+    );
+    // The master's lines name both retired identities.
+    for name in ["old-swarm", "sys-swarm"] {
+        assert!(
+            report
+                .signing
+                .iter()
+                .any(|l| l.starts_with(&format!("ferry team revoke --name {name} --all"))),
+            "{:?}",
+            report.signing
+        );
+    }
+}
+
+#[test]
+fn a_running_process_is_never_stopped_and_holds_the_service_back() {
+    let machine = machine_with(&["quantly"]);
+    let mut opts = options(&machine);
+    opts.service = true;
+    let scan = machine::Scan {
+        workers: vec![Worker {
+            kind: machine::Kind::Process { pid: 4242 },
+            all_projects: true,
+            identity: Some("old-swarm".into()),
+            command: "ferry agent run --all-projects".into(),
+        }],
+        notes: Vec::new(),
+    };
+    let (log, mut run) = recorder();
+    let report = setup(&machine.root, &opts, &scan, &mut run).unwrap();
+    let log = log.borrow().clone();
+    assert!(!log.iter().any(|l| l.contains("kill")), "{log:?}");
+    assert!(
+        log.contains(&"systemctl --user enable ferryman-worker.service".to_string()),
+        "{log:?}"
+    );
+    assert!(!log.contains(&"systemctl --user enable --now ferryman-worker.service".to_string()));
+    assert!(
+        report
+            .manual
+            .iter()
+            .any(|l| l.contains("kill 4242") || l.contains("taskkill")),
+        "{:?}",
+        report.manual
+    );
+}
+
+#[test]
+fn the_env_file_is_made_once_and_never_overwritten() {
+    let machine = machine_with(&["quantly"]);
+    let mut opts = options(&machine);
+    opts.service = true;
+    let (_log, mut run) = recorder();
+    setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    let env = machine.root.path.join("service/worker.env");
+    let stub = fs::read_to_string(&env).unwrap();
+    assert!(
+        stub.lines()
+            .all(|l| l.starts_with('#') || l.trim().is_empty()),
+        "{stub}"
+    );
+    fs::write(&env, "OPENROUTER_API_KEY=placeholder\n").unwrap();
+    setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert_eq!(
+        fs::read_to_string(&env).unwrap(),
+        "OPENROUTER_API_KEY=placeholder\n"
+    );
+}
+
+#[test]
+fn on_windows_it_writes_a_wrapper_and_a_task_and_disables_the_old_task() {
+    let machine = machine_with(&["quantly"]);
+    let mut opts = options(&machine);
+    opts.service = true;
+    opts.platform = Platform::Windows;
+    opts.ferry = PathBuf::from(r"C:\ferry\ferry.exe");
+    let scan = machine::Scan {
+        workers: vec![Worker {
+            kind: machine::Kind::Task {
+                name: r"\Ferry Ichabod".into(),
+                enabled: true,
+                running: false,
+                scripts: Vec::new(),
+            },
+            all_projects: true,
+            identity: Some("old-swarm".into()),
+            command: "ferry agent run --all-projects".into(),
+        }],
+        notes: Vec::new(),
+    };
+    let (log, mut run) = recorder();
+    let report = setup(&machine.root, &opts, &scan, &mut run).unwrap();
+    let log = log.borrow().clone();
+    let service = machine.root.path.join("service");
+    assert!(service.join("ferryman-worker.ps1").is_file());
+    assert!(service.join("Ferryman_Worker.xml").is_file());
+    let xml = fs::read(service.join("Ferryman_Worker.xml")).unwrap();
+    assert_eq!(&xml[..2], &[0xFF, 0xFE]);
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("schtasks /Change /TN \\Ferry Ichabod /DISABLE")),
+        "{log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("schtasks /Create /TN Ferryman Worker /XML")),
+        "{log:?}"
+    );
+    assert!(
+        log.iter().any(|l| l == "schtasks /Run /TN Ferryman Worker"),
+        "{log:?}"
+    );
+    assert!(
+        report.disabled.iter().any(|l| l.contains("not deleted")),
+        "{:?}",
+        report.disabled
+    );
+    assert!(
+        fs::read_to_string(service.join("ferryman-worker.ps1"))
+            .unwrap()
+            .contains("repos"),
+        "the wrapper runs in the managed clone"
+    );
+}
+
+#[test]
+fn an_exclusion_is_written_locally_and_the_signed_flag_is_printed_not_signed() {
+    let machine = machine_with(&["quantly", "pc-secrets"]);
+    let mut opts = options(&machine);
+    opts.exclude = vec!["pc-secrets".into()];
+    let mut run = |_: &str, _: &[String]| None;
+    let report = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert!(rootconfig::RootConfig::load(&machine.root).excluded("pc-secrets"));
+    assert!(
+        !machine.root.managed_clone("pc-secrets").exists(),
+        "an excluded project is not cloned"
+    );
+    assert!(machine.root.managed_clone("quantly").join(".git").exists());
+    assert!(
+        report
+            .signing
+            .iter()
+            .any(|l| l.starts_with("ferry root swarm off --project pc-secrets")),
+        "{:?}",
+        report.signing
+    );
+    // Not signed: the channel has no SWARM file.
+    assert!(!machine.root.comms_home("pc-secrets").join("SWARM").exists());
+}
+
+#[test]
+fn an_agent_config_and_key_in_a_persons_checkout_are_copied_not_moved() {
+    let machine = machine_with(&["quantly"]);
+    // A person's working copy of the project, with the swarm's config and key in it.
+    let human = machine.dir.path().join("human/quantly");
+    fs::create_dir_all(human.parent().unwrap()).unwrap();
+    let bare = machine.dir.path().join("origins/quantly.git");
+    git(
+        machine.dir.path(),
+        &[
+            "clone",
+            "-q",
+            bare.to_str().unwrap(),
+            human.to_str().unwrap(),
+        ],
+    );
+    let attachment = human.join(".ferryman");
+    fs::create_dir_all(&attachment).unwrap();
+    fs::write(
+        attachment.join("agent.toml"),
+        AgentConfig::render(
+            "old-swarm",
+            "worker",
+            "claude",
+            &AgentConfig::default_args("claude"),
+            crate::agent::ReviewMode::Confirm,
+            None,
+            true,
+        ),
+    )
+    .unwrap();
+    let held = AgentIdentity::load_or_create("old-swarm", &attachment).unwrap();
+    machine
+        .root
+        .adopt("quantly", &machine.root.comms_home("quantly"), Some(&human))
+        .unwrap();
+    let mut opts = options(&machine);
+    opts.identity = None;
+    opts.remote_template = None;
+    let mut run = |_: &str, _: &[String]| None;
+    let report = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert_eq!(report.identity, "old-swarm", "{:?}", report.identity_lines);
+    let managed = machine.root.managed_clone("quantly").join(".ferryman");
+    let copied = AgentIdentity::load_existing("old-swarm", &managed)
+        .unwrap()
+        .expect("seated");
+    assert_eq!(copied.public_key_hex(), held.public_key_hex());
+    assert!(
+        attachment.join("agent.toml").is_file(),
+        "the original stays"
+    );
+    assert!(
+        AgentIdentity::load_existing("old-swarm", &attachment)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(machine.root.read().projects[0].human_checkouts.len(), 1);
+}

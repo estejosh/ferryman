@@ -1136,6 +1136,29 @@ function improvePanel(imp) {
     </div>`;
 }
 
+/* The swarm: which projects the fleet may work. In by default; the master signs a project
+   out (a secrets repository, someone else's code) and every machine hears it. */
+function swarmPanel(sw) {
+  const list = (sw && sw.projects) || [];
+  if (!list.length) return "";
+  const out = list.filter((p) => !p.on).length;
+  const rows = list.map((p) => {
+    const note = p.on ? "in the swarm" : `out of the swarm &mdash; signed by ${esc(p.set_by || "the master")}, ${esc(String(p.set_at || "").slice(0, 16).replace("T", " "))} UTC`;
+    const button = p.may_set
+      ? `<button class="btn${p.on ? "" : " primary"}" data-swarm="${esc(p.project)}" data-on="${p.on ? "0" : "1"}">${p.on ? "Take out" : "Put back in"}</button>`
+      : "";
+    return `<tr><td>${esc(p.project)}${p.archived ? ` <span class="badge">archived</span>` : ""}</td><td>${note}</td><td>${p.master ? esc(p.master) : "no master"}</td><td>${button}</td></tr>`;
+  });
+  return `
+    <div class="notice" style="margin-bottom:18px">
+      <div style="flex:1;min-width:0">
+        <b>Swarm:</b> ${list.length - out} of ${list.length} project${list.length === 1 ? "" : "s"} in${out ? `, ${out} out` : ""}.
+        <div class="s" style="color:var(--dim);margin-top:6px">A project that is out is not cloned by <code>ferry repos sync</code>, not served by an all-projects worker, and nobody is enrolled in it by <code>team approve --all</code>. Only a project&rsquo;s master can change it. A machine can also keep a project out on its own: <code>ferry root swarm exclude</code>.</div>
+        <div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>Project</th><th>State</th><th>Master</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table></div>
+        <span class="s" id="tm-swarm-msg" style="color:var(--dim)"></span>
+      </div>
+    </div>`;
+}
 /* Engine policy: which engines do this project's background work (self-improve plans,
    builds and reviews), in what order, never which, and on which machines. Signed by the
    master; with none signed the fleet runs on auto - local and free first, subscriptions
@@ -1610,6 +1633,8 @@ pages.teammates = async () => {
   try { imp = await api("/api/improve"); } catch (_) { imp = null; }
   let dl = null;
   try { dl = await api("/api/delegations"); } catch (_) { dl = null; }
+  let sw = null;
+  try { sw = await api("/api/swarm"); } catch (_) { sw = null; }
   let ep = null;
   try { ep = await api("/api/engine-policy"); } catch (_) { ep = null; }
   let pd = null;
@@ -1649,6 +1674,8 @@ pages.teammates = async () => {
     ${pd ? approvalsPanel(pd) : ""}
 
     ${imp ? improvePanel(imp) : ""}
+
+    ${sw ? swarmPanel(sw) : ""}
 
     ${ep ? policyPanel(ep) : ""}
 
@@ -1809,6 +1836,22 @@ function wireTeammates() {
     }
   });
 
+  for (const btn of document.querySelectorAll("[data-swarm]")) {
+    btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await api("/api/swarm", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ project: btn.dataset.swarm, on: btn.dataset.on === "1" }),
+        });
+        await render();
+      } catch (err) {
+        $("#tm-swarm-msg").textContent = String(err.message || err).slice(0, 300);
+        btn.disabled = false;
+      }
+    });
+  }
   for (const btn of document.querySelectorAll("[data-delegate]")) {
     btn.addEventListener("click", async () => {
       btn.disabled = true;
