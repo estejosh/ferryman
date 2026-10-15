@@ -1,0 +1,90 @@
+# The iroh lane: channels over QUIC, through our own relay
+
+Syncthing carries a channel well between machines on one network. Away from home it is
+only as good as its discovery and its public relays. The iroh lane carries the same
+channel folders a second way: over [iroh](https://www.iroh.computer) (QUIC, peers
+identified by ed25519 endpoint ids), through a relay we run ourselves, and directly
+between two machines whenever they can see each other.
+
+It runs **beside** Syncthing, not instead of it. Both write channel files the same way
+(temporary file, then rename) and both keep modification times, so a file that arrived by
+one lane is simply already there when the other looks.
+
+## Turning it on, per machine
+
+1. Add to the ferry root's `ferry.toml` (machine-local, never synced):
+
+   ```toml
+   [iroh]
+   enabled = true
+   relay_url = "https://162.35.10.46"
+   # The relay's self-signed certificate: this exact certificate and no other.
+   relay_cert_sha256 = "49:32:08:E4:6F:B8:E3:9B:FD:F2:8D:B8:0F:8C:33:F9:9F:2A:57:A0:A1:71:B3:52:4A:9D:11:67:AD:BD:C0:D1"
+   ```
+
+2. Put the relay's access token, and nothing else, in `iroh-relay.token` in the machine
+   state directory (`%LOCALAPPDATA%\Ferryman` on Windows, `~/.local/state/ferryman` on
+   Linux, or `$FERRYMAN_STATE_DIR`). `relay_token_file = "<path>"` points elsewhere.
+   The token is read, never printed, and never belongs in a channel or in `ferry.toml`.
+
+3. From the worker's home checkout (where its `agent.toml` is):
+
+   ```
+   ferry lane iroh init
+   ```
+
+   This makes the machine's iroh key once (`iroh.key`, beside the operator seed) and
+   writes `transports/<agent>.json` into every channel the all-projects worker serves.
+
+4. Restart the worker (`ferry agent run --all-projects`). Its startup line says
+   `iroh lane on as <endpoint id> over N channel(s), relay ...`.
+
+5. `ferry lane iroh status` shows the endpoint id, whether the relay lets us in (it dials
+   with a throwaway key, so it does not disturb the worker), and each peer the worker has
+   synced with: when, which projects, how many files each way, and the last error.
+
+Do this on every machine. A pair starts syncing once each has the other's record, and the
+records travel like any channel file: over Syncthing at first, over iroh after that.
+
+## Who may connect
+
+A peer is accepted only if its endpoint id is in a `transports/<agent>.json` that is
+signed by that agent, whose key the channel's roster pins, who has an entry in that
+channel's own `agents/`, and whom the master has not revoked. The project id is signed
+into the record, so it cannot be copied into another channel. Every connection from any
+other endpoint is closed as soon as it is accepted, before any channel is read. A peer is
+offered a channel only if it is trusted in that channel; being in one project does not
+open another, and a project only one side serves is skipped. Records are re-read on every
+connection and every round, so a revocation takes effect on the next one.
+
+## What moves, and what never does
+
+Every 30 seconds the worker sends each trusted peer, per shared project, a manifest
+(path, size, BLAKE3, modification time); the peer replies with what it lacks or has
+older, and the files go across and are written atomically.
+
+- The channel's `.stignore` exclusions apply both ways, on top of the built-in list
+  (`keys`, `*.key`, `*.seed`, executables, scripts, `local`, `*.tmp`).
+- Syncthing conflict copies, temporary files and Syncthing's own folders are never sent.
+- Nothing over 64 MiB.
+- Nothing is ever deleted.
+- Nothing is written outside the channel folder: `..`, absolute paths, drive letters,
+  backslashes and Windows device names are refused, and no folder on the path or file at
+  the end may be a symlink. Symlinks are never sent.
+- For a path whose contents differ, the newer modification time wins. Equal times keep
+  the local copy on both sides.
+
+## Not done yet
+
+- Files are checked by hash in transit, but not every file type's own signature is
+  audited on arrival. The readers that already verify signatures (orders, results,
+  policies, records) still do so when they read, exactly as for Syncthing.
+- Syncthing still runs. The lane is a second path, not the only one.
+- Newer-wins can lose an edit when two machines change the same file between rounds;
+  Syncthing would have kept a conflict copy. Channel writers are mostly one-writer,
+  write-once files, which is why this is acceptable for now.
+- No LAN discovery: peers are dialed by endpoint id and the relay URL in their record,
+  and iroh finds the direct path between them through that relay. With no relay
+  configured, the lane has no way to reach anyone.
+- The relay certificate is pinned by hash: rotating it means changing
+  `relay_cert_sha256` on every machine.

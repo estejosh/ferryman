@@ -13,6 +13,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 chrono.workspace = true
 ferryman-channel = { path = "../ferryman-channel" }
+ferryman-iroh = { path = "../ferryman-iroh" }
 ferryman-ops = { path = "../ferryman-ops" }
 ferryman-server = { path = "../ferryman-server" }
 clap.workspace = true
