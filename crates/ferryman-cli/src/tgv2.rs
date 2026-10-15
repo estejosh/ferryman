@@ -1012,6 +1012,9 @@ impl Bridge {
             String::new(),
             excerpt(&title_full(&task), 400),
         ];
+        if let Some(line) = files_line(&task) {
+            lines.push(line);
+        }
         if let Some(result) = task.results.iter().max_by_key(|result| result.revision) {
             lines.push(String::new());
             lines.push(format!("Result r{} by {}:", result.revision, result.agent));
@@ -1832,9 +1835,10 @@ impl Bridge {
                 actions.push(send(
                     home,
                     format!(
-                        "{} in {project} needs you - r{revision} by {by}:\n{}{}\n\n{result}{adversary}",
+                        "{} in {project} needs you - r{revision} by {by}:\n{}{}{}\n\n{result}{adversary}",
                         task.order.id,
                         excerpt(&title(&task), 200),
+                        files_line(&task).map(|line| format!("\n{line}")).unwrap_or_default(),
                         routing_line(Some(&task), revision)
                     ),
                     buttons,
@@ -2342,6 +2346,13 @@ fn where_it_is(route: &ProjectRoute, task: &ferryman_channel::Task, now: DateTim
         TaskState::Killed { by, .. } => format!("stopped by {by}"),
         _ => stage_of(route, task, now),
     }
+}
+
+/// The names of the files an order carries, for its card. Names only: the files themselves
+/// are on the dashboard and the CLI, and Telegram does not upload.
+fn files_line(task: &ferryman_channel::Task) -> Option<String> {
+    let names = ferryman_channel::order_files::names(&task.order);
+    (!names.is_empty()).then(|| format!("Files: {}", excerpt(&names.join(", "), 200)))
 }
 
 fn title_full(task: &ferryman_channel::Task) -> String {
@@ -2983,13 +2994,17 @@ mod tests {
     }
 
     fn awaiting_review_with(route: &ProjectRoute, id: &str, payload: Value) {
+        awaiting_review_of(route, id, json!({ "task": "rename the flag" }), payload);
+    }
+
+    fn awaiting_review_of(route: &ProjectRoute, id: &str, order_payload: Value, payload: Value) {
         let mut order = ferryman_channel::Order {
             id: id.into(),
             project_id: route.project_id.clone(),
             issued_by: "josh".into(),
             assigned_to: None,
             created_at: Utc::now(),
-            payload: json!({ "task": "rename the flag" }),
+            payload: order_payload,
             requires_review: true,
             requires_approval: true,
             depends_on: Vec::new(),
@@ -3098,6 +3113,35 @@ mod tests {
             !plain.contains("Routed:"),
             "work with no recorded decision reads as it did: {plain}"
         );
+    }
+
+    #[test]
+    fn an_order_card_names_the_files_the_order_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["orders", "review"]);
+        assert!(bridge.tick(Utc::now()).is_empty());
+        awaiting_review_of(
+            &ferryman,
+            "t-f",
+            json!({
+                "task": "set up the broker",
+                "files": [
+                    { "name": "sovgit", "size": 3, "sha256": "ab" },
+                    { "name": "sovgit-broker", "size": 4, "sha256": "cd" }
+                ]
+            }),
+            json!({ "output": "done" }),
+        );
+        awaiting_review(&ferryman, "t-n");
+        let posted = bridge.tick(Utc::now());
+        let cards = texts(&posted);
+        let with = cards.iter().find(|t| t.contains("t-f in")).unwrap();
+        assert!(with.contains("\nFiles: sovgit, sovgit-broker"), "{with}");
+        let without = cards.iter().find(|t| t.contains("t-n in")).unwrap();
+        assert!(!without.contains("Files:"), "{without}");
+        let details = bridge.handle(press(JOSH_TG, GROUP, 90, "det:ferryman:t-f"), Utc::now());
+        assert!(texts(&details)[0].contains("Files: sovgit, sovgit-broker"));
     }
 
     #[test]

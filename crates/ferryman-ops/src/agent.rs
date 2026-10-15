@@ -2727,7 +2727,11 @@ pub struct Plan {
 /// A failure to read the channel here is not a reason to refuse work: the checks are
 /// advisory, and a worker that stopped on every unreadable directory would be worse than
 /// one that occasionally started something it could have waited for.
-fn start_hold(route: &ProjectRoute, order: &ferryman_channel::Order) -> Option<String> {
+fn start_hold(
+    route: &ProjectRoute,
+    agent: &str,
+    order: &ferryman_channel::Order,
+) -> Option<String> {
     ferryman_channel::interface::hold_reason(route, order)
         .or_else(|| {
             ferryman_channel::overlap::claim_hold(route, order)
@@ -2741,6 +2745,12 @@ fn start_hold(route: &ProjectRoute, order: &ferryman_channel::Order) -> Option<S
         // project waits for the one running, and in a paused project does not start. A
         // person's own order is never held by it.
         .or_else(|| ferryman_channel::focus::hold_for(route, order))
+        // The files the order carries: not here yet, or here and not the ones it was signed
+        // with. Nothing is claimed on a promise that they will turn up; see
+        // `ferryman_channel::order_files`.
+        .or_else(|| {
+            ferryman_channel::order_files::hold_reason(route, agent, order, chrono::Utc::now())
+        })
 }
 
 /// Resolve the same things the worker resolves, and report them.
@@ -2752,7 +2762,7 @@ pub fn plan(route: &ProjectRoute, config: &AgentConfig) -> Result<Plan> {
             let id = task.order.id.clone();
             match task.state() {
                 TaskState::Open | TaskState::Offered { .. } => {
-                    if let Some(reason) = start_hold(route, &task.order) {
+                    if let Some(reason) = start_hold(route, &config.agent, &task.order) {
                         return Some((id, format!("hold off: {reason}")));
                     }
                     Some((id, "claim it, then run the agent".to_string()))
@@ -2842,6 +2852,15 @@ pub async fn work_once(
     // lets fm merge them: merged here, in the repository they were built in, before any
     // new work starts from the default branch.
     merge_approved(route, config, &identity, report);
+    // Files of orders that settled more than the retention period ago leave the channel -
+    // signed and in the ledger, at most once an hour. Best effort: a failure here must not
+    // stop the work.
+    for (id, files, bytes) in ferryman_channel::order_files::gc_when_due(route, &identity) {
+        report.info(&format!(
+            "  {id}: removed its {files} file(s), {bytes} bytes, from the channel after the \
+             retention period"
+        ));
+    }
     // Claimed, or already ours, and not yet run. With `max_parallel` 1 it never holds
     // more than the order just claimed, which is run before the next is looked at.
     let mut batch: Vec<Task> = Vec::new();
@@ -2890,7 +2909,7 @@ pub async fn work_once(
                 // interface contract the order builds to that the master has not locked,
                 // or another agent already working on the same files. Declined, not
                 // claimed - holding a claim on work nobody is doing would be the lie.
-                if let Some(reason) = start_hold(route, &task.order) {
+                if let Some(reason) = start_hold(route, &config.agent, &task.order) {
                     match ferryman_channel::hold::record(route, &identity, &id, &reason) {
                         Ok(true) => report.info(&format!("  {id}: holding off, {reason}")),
                         Ok(false) => {}
@@ -4518,6 +4537,35 @@ async fn do_work(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push((id.clone(), workdir.clone()));
 
+    // The order's files, checked against the hashes it was signed with and put where the
+    // agent can read them. One that does not match is never used: the attempt fails naming
+    // it, rather than the agent working from something else.
+    let files_text = {
+        let encryption = ferryman_channel::secrets::EncryptionIdentity::load_existing(
+            &config.agent,
+            &route.attachment,
+        )?;
+        match ferryman_channel::order_files::deliver(
+            route,
+            &task.order,
+            &workdir,
+            identity,
+            encryption.as_ref(),
+        )
+        .with_context(|| format!("the files of order {id} could not be delivered"))?
+        {
+            Some(delivery) => {
+                report.info(&format!(
+                    "  {id}: {} file(s) delivered to {}",
+                    delivery.files.len(),
+                    delivery.dir.display()
+                ));
+                delivery.prompt()
+            }
+            None => String::new(),
+        }
+    };
+
     // Task-matched skills: load the team's shared SKILL.md expertise and inject
     // only the skills whose description overlaps this task.
     let skills = ferryman_channel::skills::load_skills(route).unwrap_or_default();
@@ -4547,7 +4595,9 @@ async fn do_work(
     let mut prompt = work_prompt_with_skills(
         config,
         task,
-        &format!("{profile_text}{roster_text}{contract_text}{adversary_text}{skills_text}"),
+        &format!(
+            "{profile_text}{roster_text}{contract_text}{adversary_text}{files_text}{skills_text}"
+        ),
     );
     if let Some(note) = steer {
         prompt = format!(
@@ -7370,6 +7420,99 @@ mod tests {
         let task = ferryman_channel::read_task(&route, "t-ui").unwrap();
         assert_eq!(task.claims.len(), 1, "it runs once the contract is locked");
         assert!(ferryman_channel::hold::read(&route, "t-ui").is_empty());
+    }
+
+    /// Issue an order for wisp that carries `files` (name, bytes), staged in the channel and
+    /// signed by boss with their hashes in the payload.
+    fn issue_order_with_files(route: &ProjectRoute, id: &str, files: &[(&str, &[u8])]) {
+        let sources = tempfile::tempdir().unwrap();
+        let specs: Vec<_> = files
+            .iter()
+            .map(|(name, bytes)| {
+                let source = sources.path().join(name);
+                std::fs::write(&source, bytes).unwrap();
+                ferryman_channel::order_files::FileSpec {
+                    source,
+                    name: (*name).to_string(),
+                }
+            })
+            .collect();
+        let limits = ferryman_channel::order_files::limits(route);
+        let staged = ferryman_channel::order_files::stage(route, id, &specs, &[], &limits).unwrap();
+        let mut order = order(id);
+        order.project_id = route.project_id.clone();
+        order.issued_by = "boss".into();
+        order.assigned_to = Some("wisp".into());
+        order.requires_review = false;
+        ferryman_channel::order_files::attach(&mut order.payload, &staged).unwrap();
+        boss().sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order).unwrap();
+    }
+
+    /// An order that carries files is not claimed until they are in the channel and are the
+    /// ones it was signed with; the worker says why, and then takes it and delivers them.
+    #[tokio::test]
+    async fn an_order_with_files_waits_for_them_and_is_never_claimed_on_a_wrong_one() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        // A base order for somebody else, only to get an enabled channel with the roster.
+        let (route, config) =
+            channel_with_shaped_order_for_wisp(comms.path(), "t-base", NO_ENGINE, |order| {
+                order.assigned_to = Some("fang".into());
+            });
+        issue_order_with_files(&route, "t-files", &[("sovgit", b"binary one")]);
+        let stored = route
+            .communications
+            .join("files")
+            .join("orders")
+            .join("t-files")
+            .join("sovgit");
+
+        // The file has not synced yet: held, with the reason where everyone can read it.
+        let kept = std::fs::read(&stored).unwrap();
+        std::fs::remove_file(&stored).unwrap();
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert!(
+            ferryman_channel::read_task(&route, "t-files")
+                .unwrap()
+                .claims
+                .is_empty(),
+            "nothing is claimed on a promise that the files will turn up"
+        );
+        let holds = ferryman_channel::hold::read(&route, "t-files");
+        assert_eq!(holds.len(), 1, "{holds:?}");
+        assert!(
+            holds[0].reason.contains("waiting for files to sync"),
+            "{}",
+            holds[0].reason
+        );
+
+        // A file that is not the one that was signed is refused, and the claim says why.
+        std::fs::write(&stored, b"binary two").unwrap();
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert!(
+            ferryman_channel::read_task(&route, "t-files")
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        let holds = ferryman_channel::hold::read(&route, "t-files");
+        assert!(
+            holds[0].reason.contains("sovgit") && holds[0].reason.contains("do not match"),
+            "{}",
+            holds[0].reason
+        );
+
+        // The right file arrives: the order is claimed, the hold is gone and the delivery
+        // is on record.
+        std::fs::write(&stored, kept).unwrap();
+        work_once(&route, &config, &crate::Silent).await.unwrap();
+        let task = ferryman_channel::read_task(&route, "t-files").unwrap();
+        assert_eq!(task.claims.len(), 1, "claimed once the files are right");
+        assert!(ferryman_channel::hold::read(&route, "t-files").is_empty());
+        let view = ferryman_channel::order_files::view(&route, &task.order);
+        assert_eq!(view[0]["delivered"], true, "{view:?}");
+        assert_eq!(view[0]["status"], "ready");
     }
 
     /// An order for wisp that touches `touches`, and another order - for fang, who has

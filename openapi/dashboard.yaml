@@ -883,6 +883,39 @@ paths:
       responses:
         '200': {description: current operator, channel master, human teammates, and agents}
         '401': {description: no active session}
+  /api/orders:
+    post:
+      summary: Issue an order, optionally carrying files, signed by the session's operator
+      description: >
+        Each file is first sent with `PUT /api/orders/{id}/files/{name}` under the order id
+        the caller chose; this call then copies them into the channel, records their names,
+        sizes and sha256 in the signed payload, and issues the order. Caps and the refusal
+        of secret-looking files are the same as for `ferry channel order --file`.
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {type: object}}
+      responses:
+        '200': {description: the order id and the files it carries}
+        '400': {description: a file is refused (too large, secret-looking, unsafe name) or the order is malformed}
+        '401': {description: no active session}
+        '403': {description: dashboard is read-only}
+        '409': {description: the channel refused the order (an id already used, or not allowed to issue it)}
+  /api/orders/{id}/files/{name}:
+    put:
+      summary: Upload one file for an order that is about to be issued
+      description: >
+        The raw bytes are the request body. The file waits in the operator's upload area
+        until `POST /api/orders` names it, and is removed when the order is issued.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+        - {name: name, in: path, required: true, schema: {type: string}}
+      responses:
+        '204': {description: stored}
+        '400': {description: unsafe name}
+        '401': {description: no active session}
+        '403': {description: dashboard is read-only}
+        '413': {description: over the per-file cap}
   /api/tasks:
     get:
       summary: Summaries of every task, with signature status

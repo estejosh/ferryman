@@ -1132,6 +1132,9 @@ enum ContractCommand {
     },
 }
 
+// `order` has grown the most flags; the enum is parsed once at start-up and never copied in a
+// loop, so the size of its largest variant costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Clone)]
 enum Channel {
     /// Where the channel for this directory lives, and what state it is in.
@@ -1342,6 +1345,23 @@ enum Channel {
         /// The context window the work wants, in thousands of tokens.
         #[arg(long, value_name = "K")]
         min_context_k: Option<u32>,
+        /// Attach a file: --file <path>, or --file <path>=<name> to send it under another
+        /// name. Repeatable. The bytes travel in the channel beside the order and the
+        /// worker gets them, checked against the SHA-256 signed into the order, in
+        /// .ferryman-order-files/ in its working directory. Not for secrets - see
+        /// `ferry channel secret`.
+        #[arg(long, value_name = "PATH[=NAME]")]
+        file: Vec<String>,
+        /// Encrypt every attached file so only these agents can read it, e.g.
+        /// --seal-to grouchly. Comma-separated; each must have joined the channel.
+        #[arg(
+            long,
+            value_name = "AGENTS",
+            requires = "file",
+            value_delimiter = ',',
+            value_parser = agent_name
+        )]
+        seal_to: Vec<String>,
     },
     /// Import external work - an issue tracker export, a script's output - into
     /// signed orders. Each ticket becomes a signed order with a ledger entry.
@@ -1616,6 +1636,60 @@ enum Channel {
         workspace: Option<PathBuf>,
         #[command(subcommand)]
         command: SecretCommand,
+    },
+    /// The files orders carry: what the channel holds, what is in one order, and removing
+    /// those past their retention. Attach files with `ferry channel order --file`.
+    Files {
+        #[arg(long, global = true)]
+        workspace: Option<PathBuf>,
+        #[command(subcommand)]
+        command: FilesCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum FilesCommand {
+    /// Every order that has files in the channel: size, state, and when they go.
+    List {
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One order's files: name, size, SHA-256, whether each is here and right, and which
+    /// agents have delivered it.
+    Show {
+        /// The order id.
+        order: String,
+        /// Machine-readable output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the files of orders that were done or reviewed longer ago than the
+    /// retention period (7 days unless the master set another). Each removal is signed
+    /// and written to the ledger first.
+    Gc {
+        /// Say what would be removed, and remove nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Who is removing them. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
+    /// Show or set the limits: --max-file-mb, --max-order-mb, --retention-days. Setting
+    /// them is the master's, and is signed into the engine policy.
+    Policy {
+        /// Megabytes one file may be (default 50).
+        #[arg(long, value_name = "MB")]
+        max_file_mb: Option<u64>,
+        /// Megabytes one order's files may come to (default 200).
+        #[arg(long, value_name = "MB")]
+        max_order_mb: Option<u64>,
+        /// Days files stay once their order is done or reviewed (default 7).
+        #[arg(long, value_name = "DAYS")]
+        retention_days: Option<u32>,
+        /// Who is signing. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
     },
 }
 
@@ -9704,6 +9778,139 @@ fn secret_command(route: &ferryman_channel::ProjectRoute, command: SecretCommand
     Ok(())
 }
 
+fn files_command(route: &ferryman_channel::ProjectRoute, command: FilesCommand) -> Result<()> {
+    use ferryman_channel::order_files;
+    match command {
+        FilesCommand::List { json } => {
+            let held = order_files::stored(route)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&held)?);
+                return Ok(());
+            }
+            if held.is_empty() {
+                println!("no order has files in this channel");
+                return Ok(());
+            }
+            for order in &held {
+                println!(
+                    "{:<24} {:>3} file(s) {:>12} bytes  {:<18} {}",
+                    order.order_id,
+                    order.files,
+                    order.bytes,
+                    order.state,
+                    order.expires_at.map_or_else(
+                        || "kept while the order is live".to_string(),
+                        |at| format!("removed after {}", at.format("%Y-%m-%d %H:%M UTC"))
+                    )
+                );
+            }
+        }
+        FilesCommand::Show { order, json } => {
+            let task = ferryman_channel::read_task(route, &order)
+                .with_context(|| format!("there is no readable order {order}"))?;
+            let rows = order_files::view(route, &task.order);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("order {order} carries no files");
+                return Ok(());
+            }
+            println!("order {order}");
+            for row in &rows {
+                let text = |key: &str| row[key].as_str().unwrap_or("").to_string();
+                println!(
+                    "  {:<28} {:>12} bytes  {:<8} {}{}",
+                    text("name"),
+                    row["size"].as_u64().unwrap_or(0),
+                    text("status"),
+                    text("sha256"),
+                    if row["sealed"].as_bool().unwrap_or(false) {
+                        "  sealed"
+                    } else {
+                        ""
+                    }
+                );
+                let to: Vec<&str> = row["delivered_to"]
+                    .as_array()
+                    .map(|list| list.iter().filter_map(serde_json::Value::as_str).collect())
+                    .unwrap_or_default();
+                if to.is_empty() {
+                    println!("      not delivered yet");
+                } else {
+                    println!("      delivered to {}", to.join(", "));
+                }
+            }
+            if let Some(removed) = order_files::removal_of(route, &order) {
+                println!(
+                    "  removed from the channel by {} at {}: {}",
+                    removed.agent,
+                    removed.at.to_rfc3339(),
+                    removed.reason
+                );
+            }
+        }
+        FilesCommand::Gc { dry_run, agent } => {
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity = signing_identity(route, &agent)?;
+            let report = order_files::gc(route, &identity, chrono::Utc::now(), dry_run)?;
+            for (id, files, bytes) in &report.removed {
+                println!(
+                    "{} {id}: {files} file(s), {bytes} bytes",
+                    if dry_run { "would remove" } else { "removed" }
+                );
+            }
+            for (id, why) in &report.kept {
+                println!("kept {id}: {why}");
+            }
+            if report.removed.is_empty() {
+                println!("nothing past its retention");
+            }
+        }
+        FilesCommand::Policy {
+            max_file_mb,
+            max_order_mb,
+            retention_days,
+            agent,
+        } => {
+            let (mut policy, _) =
+                ferryman_channel::policy::effective(&route.communications, &route.project_id);
+            if max_file_mb.is_none() && max_order_mb.is_none() && retention_days.is_none() {
+                let limits = order_files::limits(route);
+                let mb = |bytes: u64| bytes / (1024 * 1024);
+                println!("per file     {} MB", mb(limits.max_file));
+                println!("per order    {} MB", mb(limits.max_order));
+                println!(
+                    "kept         {} days after the order is done or reviewed",
+                    limits.retention_days
+                );
+                return Ok(());
+            }
+            policy.files.max_file_mb = max_file_mb.or(policy.files.max_file_mb);
+            policy.files.max_order_mb = max_order_mb.or(policy.files.max_order_mb);
+            policy.files.retention_days = retention_days.or(policy.files.retention_days);
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity = signing_identity(route, &agent)?;
+            let changed = ferryman_channel::policy::set_policy(
+                &route.communications,
+                &route.project_id,
+                Some(policy),
+                &identity,
+            )?;
+            println!(
+                "{}",
+                if changed {
+                    "signed into the engine policy; it reaches every machine through the channel"
+                } else {
+                    "already so"
+                }
+            );
+        }
+    }
+    Ok(())
+}
+
 fn channel(command: Channel) -> Result<()> {
     let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
         let start = match workspace {
@@ -9717,6 +9924,10 @@ fn channel(command: Channel) -> Result<()> {
         Channel::Secret { workspace, command } => {
             let route = here(workspace)?;
             secret_command(&route, command)?;
+        }
+        Channel::Files { workspace, command } => {
+            let route = here(workspace)?;
+            files_command(&route, command)?;
         }
         Channel::Status { workspace } => {
             let route = here(workspace)?;
@@ -10170,6 +10381,8 @@ fn channel(command: Channel) -> Result<()> {
             needs,
             size,
             min_context_k,
+            file,
+            seal_to,
         } => {
             let route = here(workspace)?;
             let issuer = ferryman_ops::identity::resolve(agent, &route.attachment)?;
@@ -10205,10 +10418,29 @@ fn channel(command: Channel) -> Result<()> {
             if task.trim().is_empty() {
                 bail!("an order with no work in it cannot be acted on")
             }
-            let payload = if task.trim_start().starts_with('{') {
+            let mut payload = if task.trim_start().starts_with('{') {
                 serde_json::from_str(&task).context("--task looked like JSON but did not parse")?
             } else {
                 json!({ "task": task })
+            };
+            // Files go into the channel first and into the payload with their hashes, so the
+            // order's signature covers them. If the order is not issued after all, they are
+            // taken out again.
+            let attached = if file.is_empty() {
+                Vec::new()
+            } else {
+                let specs = file
+                    .iter()
+                    .map(|raw| ferryman_channel::order_files::parse_spec(raw))
+                    .collect::<Result<Vec<_>>>()?;
+                let limits = ferryman_channel::order_files::limits(&route);
+                let staged =
+                    ferryman_channel::order_files::stage(&route, &id, &specs, &seal_to, &limits)?;
+                if let Err(error) = ferryman_channel::order_files::attach(&mut payload, &staged) {
+                    ferryman_channel::order_files::discard(&route, &id);
+                    return Err(error);
+                }
+                staged
             };
             let mut order = ferryman_channel::Order {
                 id: id.clone(),
@@ -10236,24 +10468,70 @@ fn channel(command: Channel) -> Result<()> {
                 allow_overlap,
             };
             // Asked before the order exists, so it cannot find itself.
-            let overlapping = ferryman_channel::overlap::issue_warnings(&route, &order)?;
+            let overlapping = match ferryman_channel::overlap::issue_warnings(&route, &order) {
+                Ok(warnings) => warnings,
+                Err(error) => {
+                    ferryman_channel::order_files::discard(&route, &id);
+                    return Err(error);
+                }
+            };
             // Actually sign it. Setting signed_by without a signature would claim
             // attribution nothing could check, which is worse than claiming none.
-            if let Some(identity) = sign_as(&route, &issuer)? {
-                identity.sign_order(&mut order);
+            match sign_as(&route, &issuer) {
+                Ok(Some(identity)) => identity.sign_order(&mut order),
+                Ok(None) => {}
+                Err(error) => {
+                    ferryman_channel::order_files::discard(&route, &id);
+                    return Err(error);
+                }
             }
-            let path = ferryman_channel::issue_order(&route, &order)?;
+            let path = match ferryman_channel::issue_order(&route, &order) {
+                Ok(path) => path,
+                Err(error) => {
+                    ferryman_channel::order_files::discard(&route, &id);
+                    return Err(error);
+                }
+            };
             if let Some(identity) = sign_as(&route, &issuer)? {
                 let _ = ferryman_channel::ledger::append_ledger_entry(
                     &route,
                     &identity,
                     "order",
                     &issuer,
-                    &format!("issued order {id}"),
+                    &if attached.is_empty() {
+                        format!("issued order {id}")
+                    } else {
+                        format!(
+                            "issued order {id} with {} file(s): {}",
+                            attached.len(),
+                            attached
+                                .iter()
+                                .map(|file| format!("{} {}", file.name, &file.sha256[..12]))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
                     Some(&id),
                 );
             }
             println!("issued {id} -> {}", path.display());
+            for file in &attached {
+                println!(
+                    "  file: {} ({} bytes, sha256 {}){}",
+                    file.name,
+                    file.size,
+                    &file.sha256[..12],
+                    if file.sealed {
+                        format!(", sealed to {}", file.recipients.join(", "))
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            if !attached.is_empty() {
+                println!("  the signature covers the file hashes; a worker waits for every file");
+                println!("  and checks each one before it claims the order");
+            }
             if let Some(needs) = &order.needs {
                 println!("  needs: {} (signed into the order)", needs.describe());
             }
@@ -12556,6 +12834,69 @@ mod tests {
         );
         assert_eq!(slug_of(Path::new("/tmp/foo--bar--")), "foo-bar");
         assert_eq!(slug_of(Path::new("/")), "");
+    }
+
+    /// `--file` repeats and takes `path[=name]`; `--seal-to` needs a file; the `files`
+    /// subcommands parse.
+    #[test]
+    fn the_order_file_flags_and_the_files_commands_parse() {
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from([
+            "ferry",
+            "channel",
+            "order",
+            "--id",
+            "t-files",
+            "--task",
+            "set up the broker",
+            "--file",
+            "X:/bin/sovgit",
+            "--file",
+            "X:/bin/other=renamed",
+            "--seal-to",
+            "grouchly,wisp",
+        ])
+        .unwrap();
+        let super::Command::Channel {
+            command: super::Channel::Order { file, seal_to, .. },
+        } = parsed.command
+        else {
+            panic!("not an order");
+        };
+        assert_eq!(file, ["X:/bin/sovgit", "X:/bin/other=renamed"]);
+        assert_eq!(seal_to, ["grouchly", "wisp"]);
+
+        let sealed_nothing = super::Cli::try_parse_from([
+            "ferry",
+            "channel",
+            "order",
+            "--id",
+            "t-1",
+            "--task",
+            "x",
+            "--seal-to",
+            "grouchly",
+        ]);
+        assert!(sealed_nothing.is_err(), "sealing needs files to seal");
+
+        for words in [
+            &["ferry", "channel", "files", "list"][..],
+            &["ferry", "channel", "files", "show", "t-files"],
+            &["ferry", "channel", "files", "gc", "--dry-run"],
+            &[
+                "ferry",
+                "channel",
+                "files",
+                "policy",
+                "--retention-days",
+                "14",
+            ],
+        ] {
+            assert!(
+                super::Cli::try_parse_from(words.iter().copied()).is_ok(),
+                "{words:?}"
+            );
+        }
     }
 
     /// The new order flags parse the way the docs show them: `--touches` takes several
