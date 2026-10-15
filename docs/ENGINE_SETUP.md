@@ -182,14 +182,82 @@ suits judging, planning and chores, not building.
   `base_url` and `key` on a CLI engine are used only by the probe.
 - **Local models**: `engine.local.base_url = "http://localhost:1234/v1"` (LM Studio)
   or `http://localhost:11434/v1` (Ollama) is `paid = "local"` automatically.
-- **Probes**: every ten minutes the worker lists each endpoint's models (or asks
-  for one token), reads DeepSeek's and OpenRouter's balance endpoints when it has
-  their key, and checks a CLI is on PATH. A CLI is never run just to probe it.
+- **Probes**: an engine is `up` only when it has just returned a real completion.
+  See "An engine is up only when it answers" below. The worker also reads
+  DeepSeek's and OpenRouter's balance endpoints when it has their key.
 - **Budgets**: `weekly_requests` and `weekly_usd` (list prices, from the usage the
   engine reports) make an engine exhausted until Monday 00:00 UTC once reached.
 - **Where it shows**: each worker publishes a signed `engines/<agent>.json` beside
   its presence file, with no credentials in it. `ferry engines` shows the whole
   fleet; `ferry mcp serve` has a read-only `list_engines` tool.
+
+## An engine is up only when it answers
+
+Reaching an endpoint proves nothing about whether the model behind it finishes a
+request. A model that listed fine and then sat for five minutes on every order was
+once shown as `up, 0.3 s` while four orders timed out on it. So a probe now asks for a
+real completion, and `ferry engines` says what was proven.
+
+| Engine | How it is probed | Shown as |
+|---|---|---|
+| `kind = "http"` | One token (`max_tokens = 1`) through chat completions, waiting up to 20 s, every ten minutes. This is the default; `probe = "models"` goes back to listing models, which can only ever say `reachable only`. An OmniRoute gateway is still read through its model list. | `up, answered in 0.9 s`, or `down` with the reason (`took the request but returned no completion within 20s`) |
+| `kind = "cli"` with a `base_url` (a shim in front of an API, like `ferryman-cline`) | A tiny prompt (`Reply with the single word: ok`) run through the same command, with a 45 s limit. At most once every 15 minutes per engine, and again straight after a run failed on it. The endpoint answering a ping does not count: the shim is what hung. | `up, answered in 0.9 s`, `reachable only` until the first tiny prompt returns, or `down` |
+| `kind = "cli"` with no `base_url` | Found on PATH, never run: running it would spend a real request. | `unprobed` |
+
+Only `up, answered in ...` is up. `reachable only` and `unprobed` are reported to the
+fleet as state `unknown`, with `proof` saying which. A `reachable only` engine goes
+behind engines that are proven; an `unprobed` one is not held against, because it
+cannot be tried.
+
+### When a run fails
+
+A model call that times out, goes silent and is killed as frozen, returns no answer
+and no tokens, or errors (HTTP 408, 429, 404, 5xx, or nothing answering) is the
+engine's failure, not the order's. Straight away, in the same pass:
+
+1. The engine is marked `down` for that agent, machine, engine and model, with the
+   reason and a cool-off: **15 minutes, then 1 hour, then 4 hours** for each failure in
+   a row. Two orders failing together on it count once. One run that works resets
+   the ladder. While it cools off it is not given work and not probed; when the cool-off
+   ends it is probed at once and is trusted only on seeing it answer.
+2. The same order (same id, nothing counted against it) goes to the next engine the
+   router allows, by the same rules as running out of credit. The attempt is a signed
+   `engine-fault` line in the ledger under the order's id, naming the engine, the
+   reason, the cool-off and where the order went.
+3. An order goes through at most **3** engines in one attempt (`max_engines_per_order`
+   in agent.toml, 1 to 16). When they all fail it, or none is left, the worker lets go
+   of its claim with a signed release note naming each engine and why. The claim file and
+   every earlier result stay. The order is back in the queue for another machine, or this
+   one when an engine returns.
+
+Fault classes are narrow on purpose. A CLI that ran, spent tokens and said its tests
+failed has not timed out. Only a timeout, a stall, no tokens at all, a server error
+or an address nothing answers moves an engine.
+
+### Telling the owner
+
+After **2** failures in a row (`engine_alert_after` in agent.toml), one signed policy
+question goes to the master's needs-me queue: the same signed questions the engine
+policy and the other decisions use, which the master's Telegram bot posts with buttons.
+It names the engine, the model, the machine, the
+error, the orders it touched and when it is expected back, with the answers `Block
+<engine>`, `Retry now <engine>` and `Keep re-routing`. It is asked once per
+engine per cool-off, and not again while an earlier one is unanswered. Block is the
+usual engine-policy block. Retry now lifts the cool-off on the worker that raised it
+(only an answer signed by the master or a delegate is read), so the engine is probed
+and tried at once.
+
+When an order exhausts its engines the master gets one question per order and machine
+(`order-stuck-...`): `Retry now`, `Block <engine>` for each that failed it, or
+`Keep waiting`.
+
+### Stale claims
+
+On every poll a worker checks its own claims. One whose worker process is gone, or
+that has gone past `timeout` plus `claim_grace_secs` (default 120) with no live run
+behind it, is released with a signed note (`released as stale: ...`). Only its own
+claims, only with no result yet; nothing is deleted, so the history still reads
+claimed, released, claimed again.
 
 ## The weekly improvement loop
 

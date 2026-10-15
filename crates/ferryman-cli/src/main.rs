@@ -3372,7 +3372,7 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                 ("exhausted", Some(until)) => {
                     format!("exhausted until {}", until.format("%a %H:%M UTC"))
                 }
-                (state, _) => state.to_string(),
+                _ => engine.state_label(),
             };
             // Demoted engines get chore and canary work only, whatever their tier says.
             let state = if engine.trust.as_ref().is_some_and(|trust| trust.demoted) {
@@ -3380,10 +3380,14 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
             } else {
                 state
             };
-            let latency = engine
-                .latency_ms
-                .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
-                .unwrap_or_default();
+            // Said in the state column for an engine that answered; not repeated.
+            let latency = match (engine.state.as_str(), engine.proof.as_deref()) {
+                ("up", Some("answered")) => String::new(),
+                _ => engine
+                    .latency_ms
+                    .map(|ms| format!("{:.1}s", ms as f64 / 1000.0))
+                    .unwrap_or_default(),
+            };
             // The size class its worker declared, else guessed from the model's name.
             let class = engine.class.clone().unwrap_or_else(|| {
                 ferryman_channel::policy::guess_class(
@@ -3412,7 +3416,7 @@ fn engines_command(at: &Targets, as_json: bool) -> Result<()> {
                 latency,
                 engine.balance.as_deref().unwrap_or("")
             );
-            if engine.state != "up"
+            if (engine.state != "up" || engine.proof.as_deref() != Some("answered"))
                 && let Some(reason) = &engine.reason
             {
                 println!("  {:<12} {reason}", "");
