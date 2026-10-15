@@ -16,7 +16,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::Html,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
 };
 use ferryman_channel::seed::OperatorSeed;
 use ferryman_channel::{AgentIdentity, ProjectRoute, SignatureCheck, TaskState};
@@ -388,6 +388,8 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task_detail))
         .route("/api/tasks/{id}/review", post(review_task))
+        .route("/api/orders", post(new_order))
+        .route("/api/orders/{id}/files/{name}", put(upload_order_file))
         .route("/api/route/simulate", get(route_simulate))
         .route("/api/stats", get(stats))
         .route("/api/ledger", get(ledger))
@@ -3854,6 +3856,8 @@ async fn tasks(
                 "requires_review": task.order.requires_review,
                 "requires_approval": task.order.requires_approval,
                 "task": task.order.payload.get("task").and_then(Value::as_str).unwrap_or(""),
+                // The names of the files it carries, for the card; the detail has the rest.
+                "files": ferryman_channel::order_files::names(&task.order),
                 "depends_on": task.order.depends_on,
                 "contract_missing": task.contract_violations_in(&current).unwrap_or_default(),
                 "interface": task.order.interface,
@@ -4010,6 +4014,9 @@ async fn task_detail(
             "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
         },
         "holds": ferryman_channel::hold::read(&current, &task.order.id),
+        // The files it carries: name, size, signed hash, whether each is here and right,
+        // and which agents have delivered it.
+        "files": ferryman_channel::order_files::view(&current, &task.order),
         // The full classification, with the reasons, as `ferry route classify` shows it.
         "classification": ferryman_channel::work::classify_cached(&task.order, &route),
         "overlaps": ferryman_channel::overlap::overlap_map(
@@ -5178,6 +5185,196 @@ async fn review_task(
         "accepted": body.accept,
         "reviewer": verdict.reviewer,
         "path": path.display().to_string(),
+    })))
+}
+
+/// Where the files chosen for an order that is not issued yet wait: on this machine only,
+/// under the operator who chose them, never in the synced channel. Issuing the order copies
+/// them into the channel, hashed, and then this is cleared.
+fn upload_dir(route: &ProjectRoute, operator: &str, order_id: &str) -> PathBuf {
+    route
+        .attachment
+        .join("runtime")
+        .join("order-uploads")
+        .join(operator)
+        .join(order_id)
+}
+
+/// PUT /api/orders/{id}/files/{name} — one file for an order about to be issued, as the
+/// raw request body. The browser sends each file as it is rather than inside JSON, so
+/// nothing has to be re-encoded and the project's per-file limit is what stops it.
+async fn upload_order_file(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+    headers: HeaderMap,
+    Path((id, name)): Path<(String, String)>,
+    body: axum::body::Body,
+) -> Result<StatusCode, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    if !ferryman_channel::is_safe_component(&id) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "order id must be a path-safe identifier".to_string(),
+        ));
+    }
+    ferryman_channel::order_files::check_name(&name)
+        .map_err(|error| (StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+    let limits = ferryman_channel::order_files::limits(&route);
+    let bytes = axum::body::to_bytes(body, usize::try_from(limits.max_file).unwrap_or(usize::MAX))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "{name} is larger than the {} MB this project allows per file",
+                    limits.max_file / (1024 * 1024)
+                ),
+            )
+        })?;
+    let dir = upload_dir(&route, identity.name(), &id);
+    std::fs::create_dir_all(&dir).map_err(|e| internal(e.into()))?;
+    std::fs::write(dir.join(&name), &bytes).map_err(|e| internal(e.into()))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct NewOrderBody {
+    /// Left out, the dashboard picks one.
+    #[serde(default)]
+    id: Option<String>,
+    task: String,
+    /// A machine or agent; left out, whoever claims it first.
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    requires_review: bool,
+    /// Names of files already sent with `PUT /api/orders/{id}/files/{name}`.
+    #[serde(default)]
+    files: Vec<String>,
+    /// Agents to encrypt the files to; none sends them in the clear.
+    #[serde(default)]
+    seal_to: Vec<String>,
+}
+
+/// POST /api/orders — issue an order, signed by the operator who is signed in, carrying the
+/// files they attached. The same path `ferry channel order --file` takes: the files are
+/// hashed into the channel, the list goes into the payload where the order's signature
+/// covers it, and a refusal (a cap, a secret-looking file) leaves nothing behind.
+async fn new_order(
+    State(state): State<DashboardState>,
+    Query(params): Query<ProjectParam>,
+    headers: HeaderMap,
+    Json(body): Json<NewOrderBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = state.route_for(params.project.as_deref());
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    let identity = state.sessions.resolve(session_token(&headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))?;
+    let bad = |message: String| (StatusCode::BAD_REQUEST, message);
+    if body.task.trim().is_empty() {
+        return Err(bad("an order with no work in it cannot be acted on".into()));
+    }
+    let id = match body
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => id.to_string(),
+        None => format!("t-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+    };
+    if !ferryman_channel::is_safe_component(&id) {
+        return Err(bad("order id must be a path-safe identifier".into()));
+    }
+    let to = body
+        .to
+        .as_deref()
+        .map(str::trim)
+        .filter(|to| !to.is_empty())
+        .map(str::to_string);
+    if let Some(to) = &to
+        && !ferryman_channel::is_safe_component(to)
+    {
+        return Err(bad("the machine to do it must be a path-safe name".into()));
+    }
+
+    let mut payload = json!({ "task": body.task });
+    let uploads = upload_dir(&route, identity.name(), &id);
+    let specs = body
+        .files
+        .iter()
+        .map(|name| {
+            ferryman_channel::order_files::check_name(name)?;
+            let source = uploads.join(name);
+            if !source.is_file() {
+                anyhow::bail!("{name} was not uploaded for this order");
+            }
+            Ok(ferryman_channel::order_files::FileSpec {
+                source,
+                name: name.clone(),
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()
+        .map_err(|error| bad(format!("{error:#}")))?;
+    let seal_to: Vec<String> = body
+        .seal_to
+        .iter()
+        .map(|agent| ferryman_channel::canonical_agent_name(agent))
+        .collect();
+    let limits = ferryman_channel::order_files::limits(&route);
+    let staged = ferryman_channel::order_files::stage(&route, &id, &specs, &seal_to, &limits)
+        .map_err(|error| bad(format!("{error:#}")))?;
+    if let Err(error) = ferryman_channel::order_files::attach(&mut payload, &staged) {
+        ferryman_channel::order_files::discard(&route, &id);
+        return Err(bad(format!("{error:#}")));
+    }
+    let mut order = ferryman_channel::Order {
+        id: id.clone(),
+        project_id: route.project_id.clone(),
+        issued_by: identity.name().to_string(),
+        assigned_to: to,
+        created_at: chrono::Utc::now(),
+        payload,
+        requires_review: body.requires_review,
+        requires_approval: false,
+        depends_on: Vec::new(),
+        signed_by: None,
+        signature: None,
+        result_contract: None,
+        interface: None,
+        touches: Vec::new(),
+        needs: None,
+        allow_overlap: false,
+    };
+    identity.sign_order(&mut order);
+    if let Err(error) = ferryman_channel::issue_order(&route, &order) {
+        ferryman_channel::order_files::discard(&route, &id);
+        return Err((StatusCode::CONFLICT, format!("{error:#}")));
+    }
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &route,
+        &identity,
+        "order",
+        identity.name(),
+        &format!("issued order {id} with {} file(s)", staged.len()),
+        Some(&id),
+    );
+    let _ = std::fs::remove_dir_all(&uploads);
+    Ok(Json(json!({
+        "id": id,
+        "issued_by": identity.name(),
+        "files": ferryman_channel::order_files::view(&route, &order),
     })))
 }
 
@@ -8048,6 +8245,164 @@ mod tests {
         )
         .await;
         assert_eq!(trailing.status(), StatusCode::OK);
+    }
+
+    async fn put_file(
+        app: &Router,
+        uri: &str,
+        bytes: &[u8],
+        token: Option<&str>,
+    ) -> axum::response::Response {
+        let mut builder = Request::builder().method("PUT").uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("x-ferryman-dashboard-token", token);
+        }
+        app.clone()
+            .oneshot(builder.body(Body::from(bytes.to_vec())).unwrap())
+            .await
+            .unwrap()
+    }
+
+    /// An order made from the dashboard carries the files attached to it: they are in the
+    /// channel, their hashes are in the signed payload, the task shows them, and a refused
+    /// file leaves nothing behind.
+    #[tokio::test]
+    async fn an_order_from_the_dashboard_carries_the_files_attached_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+
+        let anonymous = put_file(&app, "/api/orders/o-1/files/tool.bin", b"abc", None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let anonymous = post(&app, "/api/orders", r#"{"task":"x"}"#, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let token = signed_in(&app, &dashboard_state).await;
+        let stored = put_file(
+            &app,
+            "/api/orders/o-1/files/tool.bin",
+            b"not really a binary",
+            Some(&token),
+        )
+        .await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+
+        let issued = post(
+            &app,
+            "/api/orders",
+            r#"{"id":"o-1","task":"install it","files":["tool.bin"]}"#,
+            Some(&token),
+        )
+        .await;
+        let status = issued.status();
+        let body = issued.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let issued: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(issued["files"][0]["name"], "tool.bin");
+
+        let in_channel = route
+            .communications
+            .join("files")
+            .join("orders")
+            .join("o-1")
+            .join("tool.bin");
+        assert_eq!(
+            std::fs::read(in_channel).unwrap(),
+            b"not really a binary".to_vec()
+        );
+        let task = ferryman_channel::read_task(&route, "o-1").unwrap();
+        assert_eq!(task.order.issued_by, "alice");
+        let listed = ferryman_channel::order_files::files_of(&task.order);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].size, 19);
+        assert!(
+            !upload_dir(&route, "alice", "o-1").exists(),
+            "the upload area is cleared once the order is issued"
+        );
+
+        let detail = get_json(&app, "/api/tasks/o-1", Some(&token)).await;
+        assert_eq!(detail["files"][0]["name"], "tool.bin");
+        assert_eq!(detail["files"][0]["sha256"], listed[0].sha256.as_str());
+        assert_eq!(detail["files"][0]["delivered"], false);
+        let all = get_json(&app, "/api/tasks", Some(&token)).await;
+        assert_eq!(all[0]["files"][0], "tool.bin");
+
+        // A secret-looking file is refused, with the way to send a secret, and the order
+        // is not issued nor any file left in the channel.
+        let stored = put_file(&app, "/api/orders/o-2/files/.env", b"K=v", Some(&token)).await;
+        assert_eq!(stored.status(), StatusCode::NO_CONTENT);
+        let refused = post(
+            &app,
+            "/api/orders",
+            r#"{"id":"o-2","task":"x","files":[".env"]}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let body = refused.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("ferry channel secret"));
+        assert!(ferryman_channel::read_task(&route, "o-2").is_err());
+        assert!(
+            !route
+                .communications
+                .join("files")
+                .join("orders")
+                .join("o-2")
+                .exists()
+        );
+
+        // A file that was never uploaded is named, not silently dropped.
+        let missing = post(
+            &app,
+            "/api/orders",
+            r#"{"id":"o-3","task":"x","files":["ghost.bin"]}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let body = missing.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&body).contains("ghost.bin"));
+
+        // An order with no files is an ordinary order.
+        let plain = post(
+            &app,
+            "/api/orders",
+            r#"{"id":"o-4","task":"just do it"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(plain.status(), StatusCode::OK);
+        let task = ferryman_channel::read_task(&route, "o-4").unwrap();
+        assert!(task.order.payload.get("files").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_read_only_dashboard_takes_no_orders_and_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let read_only = state(&route, true);
+        read_only
+            .operators
+            .create("alice", "hunter2-secret")
+            .unwrap();
+        let app = router(read_only);
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"alice","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let put = put_file(&app, "/api/orders/o-1/files/a.bin", b"x", Some(&token)).await;
+        assert_eq!(put.status(), StatusCode::FORBIDDEN);
+        let order = post(&app, "/api/orders", r#"{"task":"x"}"#, Some(&token)).await;
+        assert_eq!(order.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

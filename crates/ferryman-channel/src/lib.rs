@@ -49,6 +49,7 @@ pub mod memory;
 pub mod migration;
 pub mod models;
 pub mod offer;
+pub mod order_files;
 pub mod overlap;
 pub mod owner;
 pub mod policy;
@@ -5873,8 +5874,18 @@ pub fn snapshot_channel_to_git(route: &ProjectRoute) -> Result<()> {
     git.run(&route.communications, &["fetch", "--prune", "origin"])?;
     // Stage before pulling so a new local file is already tracked and cannot be
     // mistaken for an untracked collision with the remote.
-    git.run(&route.communications, &["add", "-A"])?;
-    let pending = git.output(&route.communications, &["status", "--porcelain"])?;
+    //
+    // Not `files/`: an order's attached files are binaries of up to hundreds of megabytes
+    // that Syncthing carries and a retention period removes, and a git history would keep
+    // every one of them for ever (and could not honour that removal).
+    git.run(
+        &route.communications,
+        &["add", "-A", "--", ".", ":(exclude)files"],
+    )?;
+    let pending = git.output(
+        &route.communications,
+        &["status", "--porcelain", "--", ".", ":(exclude)files"],
+    )?;
     if !pending.is_empty() {
         git.run(
             &route.communications,
