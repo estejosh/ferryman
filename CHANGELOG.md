@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.29 - 2026-10-15
 
 An all-projects worker on Linux starts again. v0.5.28 counted the worker's own threads as rival workers, because the Linux process table lists every thread under its own id, so `ferry agent run --all-projects` refused to start on grouchly and systemd kept restarting it. Threads are now skipped, and a test pins that a process's own threads are not read as processes.
 
