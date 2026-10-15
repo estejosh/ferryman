@@ -302,3 +302,32 @@ fn the_stop_commands_print_an_odd_unit_or_task_name_as_one_argument() {
         assert!(!line.contains('\n'), "{line:?}");
     }
 }
+
+/// v0.5.28 on grouchly refused to start: it read its own threads as rival workers,
+/// because the Linux process table lists every thread under its own id.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worker_s_own_threads_are_not_more_workers() {
+    let (stop, wait) = std::sync::mpsc::channel::<()>();
+    let helper = std::thread::spawn(move || {
+        let _ = wait.recv();
+    });
+    let me = sysinfo::get_current_pid().expect("own pid").as_u32();
+    let threads: Vec<u32> = std::fs::read_dir("/proc/self/task")
+        .expect("/proc/self/task")
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .filter(|tid| *tid != me)
+        .collect();
+    assert!(!threads.is_empty(), "the helper thread is there");
+    let system = process_table();
+    for tid in threads {
+        if let Some(process) = system.process(sysinfo::Pid::from_u32(tid)) {
+            assert!(
+                process.thread_kind().is_some(),
+                "thread {tid} is listed as a process of its own"
+            );
+        }
+    }
+    stop.send(()).expect("stop the helper");
+    helper.join().expect("helper");
+}
