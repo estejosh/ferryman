@@ -556,9 +556,8 @@ fn quietly(program: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Look at the process table, the unit files and the scheduler.
-#[must_use]
-pub fn scan() -> Scan {
+/// The process table, with each command line and working directory.
+fn process_table() -> sysinfo::System {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -568,6 +567,13 @@ pub fn scan() -> Scan {
             .with_cmd(UpdateKind::Always)
             .with_cwd(UpdateKind::Always),
     );
+    system
+}
+
+/// Look at the process table, the unit files and the scheduler.
+#[must_use]
+pub fn scan() -> Scan {
+    let system = process_table();
     let me = sysinfo::get_current_pid().ok();
     // This process and everything that started it: a service's worker is not "another".
     let mut family: Vec<sysinfo::Pid> = Vec::new();
@@ -643,6 +649,12 @@ pub fn scan() -> Scan {
         .collect();
     for (pid, process) in system.processes() {
         if family.contains(pid) || service_pids.contains(&pid.as_u32()) {
+            continue;
+        }
+        // On Linux the table also lists every thread, under its own id and with its
+        // process's command line. A worker's threads are not more workers: v0.5.28 read
+        // its own threads as rivals and refused to start.
+        if process.thread_kind().is_some() {
             continue;
         }
         let tokens: Vec<String> = process
