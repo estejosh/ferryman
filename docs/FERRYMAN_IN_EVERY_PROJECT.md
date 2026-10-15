@@ -21,10 +21,10 @@ mistake.
 X:\ferry\                     the root. One per machine. ADR 0019
   .ferry\.ferry               the manifest: every project, its channel, its repo
   comms\<project>-ferryman\   the channel. Signed state, carried by Syncthing
-  repos\<project>             a link to where the repository actually lives
-  work\                       per-task git worktrees, made and removed by the loop
+  repos\<project>             Ferryman's own clone of the project (`ferry repos sync`)
+  work\<project>\<order>      per-task git worktrees, made from that clone and removed by the loop
 
-<project>\                    the repository. Your code. Ferryman never touches it
+<project>\                    a person's working copy. Your code. Ferryman never touches it
   FERRYMAN.md                 written once by `ferry enable`, yours to edit
   .ferryman\                  machine-local, gitignored, never synced
     bridge.toml               project mapping
@@ -49,6 +49,13 @@ ledger.<agent>.jsonl   append-only, per identity, what that identity did
 
 The repository is where work happens. The channel is how machines agree on what
 the work was. Neither can be reconstructed from the other.
+
+On every machine the root has this same shape, and a person's working copy is never
+the worker's checkout: Ferryman works in its own clone under `repos\`, and notes the
+working copy as a `human_checkouts` entry in the manifest, for information. Only
+`comms\` is ever shared by Syncthing. See [LAYOUT.md](LAYOUT.md), and
+[FLEET_SETUP.md](FLEET_SETUP.md) for `ferry fleet setup`, which puts a machine in that
+shape, installs its one worker and prints what the master signs.
 
 **The channel is reached through the repository, not by its own path.** Point a
 command at a channel folder that has no project beside it and you get
@@ -231,6 +238,14 @@ ferry enable --master
 A project with no master takes no signed orders from an authority, and cannot be
 anchored to a git account at all.
 
+In a fleet, `ferry enable` is also safe to run again and again: it refuses when the
+checkout would read a different channel than the one the root already files for the
+project, or when Syncthing already syncs that folder id from somewhere else
+(`--force-new-channel` says you mean it), and `--no-enrol` makes the key and tells no
+roster. A newly enabled project gets its managed clone, so it arrives in the layout.
+`ferry root attach <folder>` attaches an existing clone to the channel the root already
+files, and `ferry doctor --layout` checks the whole machine.
+
 ### Every session, in any project
 
 ```sh
@@ -262,9 +277,11 @@ who it is. When he names someone else, they are head agent from then on.
 
 Once a head agent is named, only the head pushes (until then, workers push as before). Every other agent hands its work in, and the head
 reviews it and pushes. A worker that finishes an order in its own worktree writes a
-signed patch into the project's work folder, `work\<project>` in the ferry root (or
-`handins` inside the channel folder when there is no root), which Syncthing carries
-to the head's machine. No worker needs a token that can write to the repository.
+signed patch into the project's `handins` folder inside its channel, which Syncthing
+carries to the head's machine with the rest of the channel. (Before the layout rule that
+only `comms\` is shared, it was `work\<project>` shared as a second folder, which put
+the worktrees inside a shared folder; `ferry doctor --layout --fix` stops sharing that old
+folder.) No worker needs a token that can write to the repository.
 
 ```sh
 ferry work list                          # hand-ins waiting, accepted or rejected, and whether each signature checks out
@@ -277,7 +294,7 @@ ferry work hand-in --order <order>       # by hand, from any checkout (the worke
 `accept` refuses anyone who is not the head, refuses a patch whose signature or
 checksum does not match, and leaves your checkout untouched if the patch does not
 apply. The worker stays the author of the commits; the head is the committer; no
-trailers are added. `ferry doctor` shows the work folder and whether this machine
+trailers are added. `ferry doctor` shows the hand-in folder and whether this machine
 pushes or hands in, and notes GitHub tokens that are missing, orphaned or broader
 than they need to be. It only advises. See `docs/adr/0023-agents-hand-in-heads-push.md`.
 
@@ -309,6 +326,15 @@ Retiring is not deleting. The ledger keeps who held a task, who let it go, and
 why. An identity that simply stops appearing keeps its claims forever, and every
 task behind it is stranded — the most expensive version of this problem and the
 easiest to avoid.
+
+When the machine's old identity is replaced by a new one, the master retires it
+everywhere in three lines (see [FLEET_SETUP.md](FLEET_SETUP.md)); nothing is deleted:
+
+```sh
+ferry team revoke --name <old> --all                     # every project this master owns
+ferry order release --held-by <old> --all --dry-run      # its unfinished claims go back to the queue
+ferry order reoffer <order> --to <new>                   # an order addressed to the old name
+```
 
 ---
 

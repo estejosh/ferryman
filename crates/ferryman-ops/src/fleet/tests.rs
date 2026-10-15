@@ -796,3 +796,286 @@ fn the_fleet_visits_a_focus_project_before_a_normal_one() {
     in_focus_order(&mut fleet.served, &focus, now);
     assert_eq!(visited(&fleet), ["delta", "alpha", "zeta", "mike"]);
 }
+
+fn revoked_as<'a>(done: &'a [(String, Revocation)], id: &str) -> &'a Revocation {
+    &done.iter().find(|(project, _)| project == id).unwrap().1
+}
+
+/// The channel and nothing else, which is what a revocation is written into.
+fn channel_route(root: &Root, id: &str) -> ProjectRoute {
+    let entry = root
+        .read()
+        .projects
+        .into_iter()
+        .find(|entry| entry.project_id == id)
+        .unwrap();
+    Entry {
+        repo: None,
+        ..entry
+    }
+    .route(root)
+    .unwrap()
+    .0
+}
+
+#[test]
+fn revoking_reaches_every_project_the_signer_masters_with_or_without_a_checkout() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    let bob = AgentIdentity::from_seed("bob", [5u8; 32]);
+    project(dir.path(), &root, "alpha", &josh(), true);
+    project(dir.path(), &root, "beta", &josh(), false);
+    project(dir.path(), &root, "done", &josh(), false);
+    project(dir.path(), &root, "theirs", &bob, false);
+    enrolled_everywhere(&root);
+    // Enrolled nowhere else: the identity never joined this one.
+    project(dir.path(), &root, "never", &josh(), false);
+    root.archive("done", true, &josh()).unwrap();
+
+    let asked = Cell::new(0);
+    let done = revoke_everywhere(
+        &root,
+        "ichabod-test",
+        "retired",
+        "josh",
+        &mut as_josh(&asked),
+    );
+    for id in ["alpha", "beta", "done"] {
+        assert_eq!(revoked_as(&done, id), &Revocation::Revoked, "{id}");
+        let route = channel_route(&root, id);
+        assert!(
+            ferryman_channel::master::is_revoked(&route, "ichabod-test").unwrap(),
+            "{id}: signed by the master and verifying"
+        );
+        assert!(
+            !ferryman_channel::master::may_work(&route, "ichabod-test", "worker").unwrap(),
+            "{id}: it can no longer work there"
+        );
+    }
+    assert_eq!(
+        revoked_as(&done, "theirs"),
+        &Revocation::NotMaster {
+            master: "bob".into()
+        }
+    );
+    assert_eq!(revoked_as(&done, "never"), &Revocation::NotAMember);
+    assert_eq!(
+        asked.get(),
+        3,
+        "asked once per project written, and no more"
+    );
+    for left in ["theirs", "never"] {
+        assert!(
+            !root
+                .comms_home(left)
+                .join("grants")
+                .join("ichabod-test.revoked.json")
+                .exists(),
+            "{left}: nothing was written"
+        );
+    }
+
+    // Again: nothing to write, so nobody is asked to sign.
+    let asked = Cell::new(0);
+    let again = revoke_everywhere(
+        &root,
+        "ichabod-test",
+        "retired",
+        "josh",
+        &mut as_josh(&asked),
+    );
+    for id in ["alpha", "beta", "done"] {
+        assert_eq!(revoked_as(&again, id), &Revocation::AlreadyRevoked, "{id}");
+    }
+    assert_eq!(asked.get(), 0);
+}
+
+#[test]
+fn a_key_that_is_not_the_masters_revokes_nothing() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    project(dir.path(), &root, "alpha", &josh(), false);
+    enrolled_everywhere(&root);
+
+    // The right name, a key minted under it: nothing it signs would be honoured, so it is
+    // refused before a file is written - the check approve --all makes.
+    let mut impostor = |_: &Entry, _: &str| -> Result<AgentIdentity> {
+        Ok(AgentIdentity::from_seed("josh", [1u8; 32]))
+    };
+    let done = revoke_everywhere(&root, "ichabod-test", "x", "josh", &mut impostor);
+    let Revocation::Skipped(why) = revoked_as(&done, "alpha") else {
+        panic!("{done:?}")
+    };
+    assert!(why.contains("not the key"), "{why}");
+    assert!(
+        !ferryman_channel::master::is_revoked(&channel_route(&root, "alpha"), "ichabod-test")
+            .unwrap()
+    );
+
+    let mut locked = |_: &Entry, _: &str| -> Result<AgentIdentity> { bail!("wrong password") };
+    let done = revoke_everywhere(&root, "ichabod-test", "x", "josh", &mut locked);
+    let Revocation::Skipped(why) = revoked_as(&done, "alpha") else {
+        panic!("{done:?}")
+    };
+    assert!(why.contains("wrong password"), "{why}");
+    assert!(
+        !root
+            .comms_home("alpha")
+            .join("grants")
+            .join("ichabod-test.revoked.json")
+            .exists()
+    );
+}
+
+#[test]
+fn the_signing_master_is_not_revoked_by_a_bulk_command() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    project(dir.path(), &root, "alpha", &josh(), false);
+    let asked = Cell::new(0);
+    let done = revoke_everywhere(&root, "josh", "x", "josh", &mut as_josh(&asked));
+    let Revocation::Skipped(why) = revoked_as(&done, "alpha") else {
+        panic!("{done:?}")
+    };
+    assert!(why.contains("master"), "{why}");
+    assert_eq!(asked.get(), 0);
+}
+
+#[test]
+fn a_project_with_no_master_has_nobody_to_revoke_for() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    fs::create_dir_all(root.comms_home("bare")).unwrap();
+    root.adopt("bare", &root.comms_home("bare"), None).unwrap();
+    let asked = Cell::new(0);
+    let done = revoke_everywhere(&root, "ichabod-test", "x", "josh", &mut as_josh(&asked));
+    assert_eq!(revoked_as(&done, "bare"), &Revocation::NoMaster);
+    assert_eq!(asked.get(), 0);
+}
+
+#[test]
+fn a_project_out_of_the_swarm_is_not_served_not_enrolled_and_a_running_worker_drops_it() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    for id in ["alpha", "secrets", "private"] {
+        project(dir.path(), &root, id, &josh(), true);
+    }
+    // One is taken out by its master, signed in the channel; one by this machine alone.
+    ferryman_channel::ferry::set_swarm(&root.comms_home("secrets"), "secrets", false, &josh())
+        .unwrap();
+    crate::rootconfig::set_excluded(&root, "private", true).unwrap();
+
+    // Nobody is enrolled in either, and the master is not even asked to sign.
+    let asked = Cell::new(0);
+    let done = enrol(
+        &root,
+        "ichabod-test",
+        "worker",
+        &worker().public_key_hex(),
+        "josh",
+        &mut as_josh(&asked),
+    );
+    assert!(matches!(outcome(&done, "alpha"), Enrolment::Added { .. }));
+    for id in ["secrets", "private"] {
+        let Enrolment::Skipped(why) = outcome(&done, id) else {
+            panic!("{id} was enrolled: {done:?}")
+        };
+        assert!(why.contains("swarm"), "{why}");
+    }
+    assert_eq!(asked.get(), 1, "only alpha was signed for");
+
+    // Enrol them by hand, as an earlier version might have, and the worker still skips them.
+    let (home, config) = home(dir.path(), "");
+    for id in ["secrets", "private"] {
+        let route = root
+            .read()
+            .projects
+            .iter()
+            .find(|e| e.project_id == id)
+            .unwrap()
+            .route(&root)
+            .unwrap()
+            .0;
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "ichabod-test".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(worker().public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+    }
+    let (plan, identity) = plan_worker(&root, &home, &config).unwrap();
+    for id in ["secrets", "private"] {
+        let row = plan.rows.iter().find(|r| r.project == id).unwrap();
+        let Standing::Skips(why) = &row.standing else {
+            panic!("{id} is served")
+        };
+        assert!(why.contains("swarm"), "{why}");
+    }
+    let fleet = serve(plan, &identity, &config);
+    assert_eq!(fleet.served.len(), 1);
+    assert_eq!(fleet.served[0].0.project_id, "alpha");
+
+    // A worker already running stops at the next pass when its master signs the flag.
+    let (alpha, config) = &fleet.served[0];
+    assert_eq!(no_longer_served(alpha, config), None);
+    ferryman_channel::ferry::set_swarm(&alpha.communications, "alpha", false, &josh()).unwrap();
+    let why = no_longer_served(alpha, config).expect("taken out");
+    assert!(why.contains("swarm"), "{why}");
+}
+
+#[test]
+fn a_projects_policy_goes_into_that_projects_prompts_and_no_other() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    project(dir.path(), &root, "alpha", &josh(), true);
+    project(dir.path(), &root, "beta", &josh(), true);
+    enrolled_everywhere(&root);
+    for id in ["alpha", "beta"] {
+        fs::write(
+            dir.path().join("repos").join(id).join(".gitignore"),
+            "/.ferryman/\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        attachment_of(dir.path(), "alpha").join("POLICY.md"),
+        "Paper trading only. Rust only.",
+    )
+    .unwrap();
+    let (home, config) = home(dir.path(), "");
+
+    let (plan, identity) = plan_worker(&root, &home, &config).unwrap();
+    let fleet = serve(plan, &identity, &config);
+    assert_eq!(fleet.served.len(), 2);
+    let preamble = |id: &str| {
+        fleet
+            .served
+            .iter()
+            .find(|(route, _)| route.project_id == id)
+            .unwrap()
+            .1
+            .preamble
+            .clone()
+    };
+    let alpha = preamble("alpha").expect("alpha declared a policy");
+    assert!(alpha.contains("Paper trading only"), "{alpha}");
+    assert!(
+        alpha.contains("applies to every order in alpha and to no other"),
+        "{alpha}"
+    );
+    assert!(
+        preamble("beta").is_none_or(|text| !text.contains("Paper trading")),
+        "beta must not read alpha's policy"
+    );
+}

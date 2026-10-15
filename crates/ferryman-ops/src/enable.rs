@@ -70,6 +70,14 @@ pub struct Request {
     /// Its copy of the folder is empty only because nothing has synced yet, so the
     /// "first machine" reasoning must not apply: never declare a master here.
     pub joining: bool,
+    /// Make a new channel even though the ferry root already files this project with a
+    /// different one, or Syncthing already syncs the project's folder id somewhere else.
+    /// Without it `enable` refuses and points at `ferry root attach`.
+    pub force_new_channel: bool,
+    /// Create the key and the config, and do not make the identity a member anywhere: no
+    /// roster entry, no master declaration. For a key made ahead of the master's
+    /// `ferry team approve <name> --all`.
+    pub no_enrol: bool,
 }
 
 /// A file this run created, or found already correct.
@@ -196,6 +204,52 @@ fn person_identity_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Why making a channel at `communications` for `project` would split it from the one it
+/// already has, or `None` when nothing is in the way.
+///
+/// Two things say a project has a channel somewhere else: the ferry root files it under a
+/// different folder that is on this machine, or Syncthing already syncs the project's folder
+/// id at another path. Either way a second channel means the folder is deleted and made
+/// again where the new one is, and an identity enrolled where nothing else reads it. The
+/// remedy is `ferry root attach`, which names the channel that exists.
+#[must_use]
+pub fn split_risk(
+    project: &str,
+    filed: Option<&ferryman_channel::ferry::Entry>,
+    communications: &Path,
+    synced: Option<&ferryman_channel::SyncthingFolderState>,
+) -> Option<String> {
+    let remedy = format!(
+        "To use the channel that exists, attach this checkout to it:\n\
+         \x20   ferry root attach <this folder> --project {project}\n\
+         To really make a second channel (it will not be the one the fleet reads):\n\
+         \x20   ferry enable --force-new-channel"
+    );
+    if let Some(entry) = filed
+        && entry.channel.is_dir()
+        && !crate::attach::same_path(&entry.channel, communications)
+    {
+        return Some(format!(
+            "this machine already files '{project}' with a channel at {}, and this folder has \
+             no .ferryman/bridge.toml reading it. Enabling here would make a second, empty \
+             channel beside the real one.\n{remedy}",
+            entry.channel.display()
+        ));
+    }
+    if let Some(state) = synced
+        && !state.registered_path.is_empty()
+        && !state.syncs(communications)
+    {
+        return Some(format!(
+            "Syncthing already syncs the folder '{project}-ferryman' at {}. Enabling here would \
+             delete it and make it again at {}, which stops the real channel syncing.\n{remedy}",
+            state.registered_path,
+            communications.display()
+        ));
+    }
+    None
+}
+
 pub fn perform(request: Request) -> Result<Outcome> {
     let workspace = match request.workspace {
         Some(path) => path,
@@ -234,18 +288,46 @@ pub fn perform(request: Request) -> Result<Outcome> {
         bail!("agent name '{agent_name}' is not a path-safe identifier")
     }
     let review = ReviewMode::parse(&request.review)?;
+    if request.no_enrol && request.master {
+        bail!(
+            "--master and --no-enrol contradict each other: a master is on the roster. \
+             Drop one of them"
+        );
+    }
 
     let attachment = workspace.join(".ferryman");
     let communications = attachment.join("ferryman");
     let shared_remote = format!("{project}-ferryman");
     let mut steps = Vec::new();
 
+    // A clone with no bridge.toml is about to get a channel of its own. If this project
+    // already has one, that is a second, empty channel with the same name: the project's
+    // Syncthing folder is re-registered at the new path (deleted and recreated) and the
+    // identity is put on a roster nobody else reads. Refuse before anything is written.
+    let bridge = attachment.join("bridge.toml");
+    if !request.force_new_channel && !bridge.exists() {
+        let root = ferryman_channel::ferry::find_root();
+        let filed = root.as_ref().and_then(|root| {
+            root.read()
+                .projects
+                .into_iter()
+                .find(|e| e.project_id == project)
+        });
+        let synced = if request.no_syncthing {
+            None
+        } else {
+            ferryman_channel::syncthing_folder_state(&shared_remote)
+        };
+        if let Some(why) = split_risk(&project, filed.as_ref(), &communications, synced.as_ref()) {
+            bail!("{why}");
+        }
+    }
+
     fs::create_dir_all(&communications)
         .with_context(|| format!("create {}", communications.display()))?;
 
     // bridge.toml is what every other command discovers the project through, so it is
     // written first and never rewritten: an operator who edited it means it.
-    let bridge = attachment.join("bridge.toml");
     let bridge_created = !bridge.exists();
     if bridge_created {
         fs::write(
@@ -398,17 +480,28 @@ pub fn perform(request: Request) -> Result<Outcome> {
         .join("agents")
         .join(format!("{agent_name}.json"))
         .exists();
-    let roster_path = ferryman_channel::register_agent_key(&route, &roster_entry, &identity)?;
     steps.push(Step {
         what: "signing key",
         path: key_path,
         created: key_created,
     });
-    steps.push(Step {
-        what: "roster entry",
-        path: roster_path,
-        created: !roster_existed,
-    });
+    // `--no-enrol`: the key exists, and nobody has been told. The master's
+    // `ferry team approve <name> --all` is what puts it on a roster.
+    if request.no_enrol {
+        steps.push(Step {
+            what: "roster entry skipped (--no-enrol): the master enrols this identity with \
+                   `ferry team approve <name> --all`",
+            path: route.communications.join("agents"),
+            created: false,
+        });
+    } else {
+        let roster_path = ferryman_channel::register_agent_key(&route, &roster_entry, &identity)?;
+        steps.push(Step {
+            what: "roster entry",
+            path: roster_path,
+            created: !roster_existed,
+        });
+    }
 
     // Becoming the master is an explicit choice, not a silent default: the caller
     // asks "do you want to be master of this project?" and sets `master` from the
@@ -421,6 +514,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // one answer. On any other machine it stays explicit.
     let implicit_master = !request.master
         && !request.joining
+        && !request.no_enrol
         && ferryman_channel::master::read_master(&route)
             .ok()
             .flatten()
@@ -490,7 +584,7 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // the roster back the way a peer will.
     let loaded = AgentConfig::load(&route.attachment).context("the agent config is unreadable")?;
     let roster = ferryman_channel::read_agent_roster(&route.communications)?;
-    if !roster.iter().any(|a| a.name == agent_name) {
+    if !request.no_enrol && !roster.iter().any(|a| a.name == agent_name) {
         bail!("the agent was registered but is not in the roster; this is a bug")
     }
 
@@ -618,6 +712,9 @@ pub(crate) mod tests_support {
                 .unwrap()
                 .as_nanos()
         ));
+        // Its own folder, with the workspace inside it: the first enable makes a ferry root
+        // beside the workspace, which must not be a folder other tests share.
+        let dir = dir.join("ws");
         fs::create_dir_all(&dir).unwrap();
         hermetic_machine();
         perform(Request {
@@ -635,6 +732,8 @@ pub(crate) mod tests_support {
             sandbox: None,
             worktree: false,
             joining: false,
+            force_new_channel: false,
+            no_enrol: false,
         })
         .unwrap();
         dir
@@ -651,20 +750,30 @@ mod tests {
     /// compiled without it - which is how the suite came to write real signing keys into
     /// ~/.local/state. First call wins, so every test here shares one temporary machine.
     fn hermetic_machine() {
+        // One machine per test thread, not per process: enable files a project in the ferry
+        // root it finds through this directory's pointer, and the project guard refuses to file
+        // one name under two channels, so tests that share a pointer refuse each other.
         let dir = std::env::temp_dir().join(format!(
-            "ferryman-test-machine-{}-{}",
+            "ferryman-test-machine-{}-{}-{:?}",
             env!("CARGO_CRATE_NAME"),
-            std::process::id()
+            std::process::id(),
+            std::thread::current().id()
         ));
         let _ = std::fs::create_dir_all(&dir);
         ferryman_channel::licensing::use_machine_state_dir_per_thread(dir);
     }
 
     fn enable_in(dir: &std::path::Path) -> Result<()> {
+        enable_named(dir, "demo")
+    }
+
+    /// As `enable_in`, under another project name: the root now refuses a second clone of one
+    /// project that has no `bridge.toml`, so a test enabling several folders needs several names.
+    fn enable_named(dir: &std::path::Path, project: &str) -> Result<()> {
         hermetic_machine();
         perform(Request {
             workspace: Some(dir.to_path_buf()),
-            project: Some("demo".into()),
+            project: Some(project.into()),
             agent: Some("tester".into()),
             role: "worker".into(),
             email: "tester@example.com".into(),
@@ -677,6 +786,8 @@ mod tests {
             sandbox: None,
             worktree: false,
             joining: false,
+            force_new_channel: false,
+            no_enrol: false,
         })?;
         Ok(())
     }
@@ -762,11 +873,14 @@ mod tests {
     /// An operator who already excluded it, in any of the usual spellings, is left alone.
     #[test]
     fn an_existing_exclusion_is_respected_rather_than_duplicated() {
-        for spelling in [".ferryman", ".ferryman/", "/.ferryman"] {
+        for (n, spelling) in [".ferryman", ".ferryman/", "/.ferryman"]
+            .into_iter()
+            .enumerate()
+        {
             let dir = tempdir();
             fs::create_dir_all(dir.join(".git")).unwrap();
             fs::write(dir.join(".gitignore"), format!("target/\n{spelling}\n")).unwrap();
-            enable_in(&dir).unwrap();
+            enable_named(&dir, &format!("demo{n}")).unwrap();
             let ignored = fs::read_to_string(dir.join(".gitignore")).unwrap();
             assert!(
                 !ignored.contains("Ferryman's attachment"),
@@ -807,6 +921,8 @@ mod tests {
             sandbox: None,
             worktree: false,
             joining: false,
+            force_new_channel: false,
+            no_enrol: false,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome
@@ -858,6 +974,8 @@ mod tests {
             sandbox: None,
             worktree: false,
             joining: false,
+            force_new_channel: false,
+            no_enrol: false,
         })
         .unwrap();
         let config = fs::read_to_string(AgentConfig::path(&dir.join(".ferryman"))).unwrap();
@@ -886,6 +1004,8 @@ mod tests {
             sandbox: None,
             worktree: false,
             joining: false,
+            force_new_channel: false,
+            no_enrol: false,
         })
         .unwrap();
         assert!(
@@ -924,6 +1044,129 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("FERRYMAN.md")).unwrap(), mine);
     }
 
+    /// The mistake this exists for: a clone with no bridge.toml, of a project the root
+    /// already files with a real channel, gets a second empty channel beside it.
+    #[test]
+    fn enabling_a_clone_of_a_filed_project_is_refused_and_points_at_attach() {
+        let dir = tempdir();
+        hermetic_machine();
+        let root = ferryman_channel::ferry::Root::create(&dir.join("ferry")).unwrap();
+        let real = root.comms_home("demo");
+        fs::create_dir_all(&real).unwrap();
+        root.adopt("demo", &real, None).unwrap();
+        let clone = dir.join("clone");
+        fs::create_dir_all(&clone).unwrap();
+
+        let error = perform(request_in(&clone)).err().expect("refused");
+        let said = format!("{error:#}");
+        assert!(said.contains("ferry root attach"), "{said}");
+        assert!(said.contains("--force-new-channel"), "{said}");
+        assert!(said.contains(&real.display().to_string()), "{said}");
+        assert!(
+            !clone.join(".ferryman").exists(),
+            "refused before anything was written"
+        );
+        assert!(
+            fs::read_dir(&real).unwrap().next().is_none(),
+            "and the real channel was not touched"
+        );
+
+        // The explicit opt-out makes the second channel anyway.
+        perform(Request {
+            force_new_channel: true,
+            ..request_in(&clone)
+        })
+        .unwrap();
+        assert!(clone.join(".ferryman/bridge.toml").is_file());
+    }
+
+    #[test]
+    fn enabling_a_clone_already_attached_to_the_filed_channel_is_not_refused() {
+        let dir = tempdir();
+        hermetic_machine();
+        let root = ferryman_channel::ferry::Root::create(&dir.join("ferry")).unwrap();
+        let real = root.comms_home("demo");
+        fs::create_dir_all(&real).unwrap();
+        root.adopt("demo", &real, None).unwrap();
+        let clone = dir.join("clone");
+        fs::create_dir_all(clone.join(".git")).unwrap();
+        crate::attach::attach(&root, &clone, Some("demo"), false).unwrap();
+
+        // With a bridge.toml the channel is the one it names, so enable has nothing to split.
+        perform(request_in(&clone)).unwrap();
+        assert!(
+            !clone.join(".ferryman/ferryman/agents").exists(),
+            "the roster entry went to the filed channel, not a new one"
+        );
+        assert!(real.join("agents/tester.json").is_file());
+    }
+
+    #[test]
+    fn syncthing_already_syncing_the_folder_elsewhere_is_a_reason_to_refuse() {
+        let here = Path::new("/work/clone/.ferryman/ferryman");
+        let state = |path: &str| ferryman_channel::SyncthingFolderState {
+            folder_id: "demo-ferryman".into(),
+            state: "idle".into(),
+            error: String::new(),
+            registered_path: path.into(),
+        };
+        let said = split_risk(
+            "demo",
+            None,
+            here,
+            Some(&state("/ferry/comms/demo-ferryman")),
+        )
+        .expect("a folder synced elsewhere is a split");
+        assert!(said.contains("/ferry/comms/demo-ferryman"), "{said}");
+        assert!(said.contains("ferry root attach"), "{said}");
+        // The same folder, a folder Syncthing does not report a path for, nothing at all.
+        assert!(
+            split_risk(
+                "demo",
+                None,
+                here,
+                Some(&state("/work/clone/.ferryman/ferryman"))
+            )
+            .is_none()
+        );
+        assert!(split_risk("demo", None, here, Some(&state(""))).is_none());
+        assert!(split_risk("demo", None, here, None).is_none());
+    }
+
+    #[test]
+    fn no_enrol_makes_the_key_and_tells_nobody() {
+        let dir = tempdir();
+        hermetic_machine();
+        perform(Request {
+            no_enrol: true,
+            ..request_in(&dir)
+        })
+        .unwrap();
+        assert!(dir.join(".ferryman/keys/tester.key").is_file(), "the key");
+        assert!(dir.join(".ferryman/agent.toml").is_file(), "and its config");
+        let agents = dir.join(".ferryman/ferryman/agents");
+        assert!(
+            !agents.join("tester.json").exists(),
+            "but the identity is on no roster"
+        );
+        assert!(
+            !dir.join(".ferryman/ferryman/master.json").exists(),
+            "and is nobody's master"
+        );
+        // The master enrolling it later is what makes it a member.
+        perform(request_in(&dir)).unwrap();
+        assert!(agents.join("tester.json").is_file());
+
+        let error = perform(Request {
+            no_enrol: true,
+            master: true,
+            ..request_in(&dir)
+        })
+        .err()
+        .expect("contradiction");
+        assert!(format!("{error:#}").contains("contradict"), "{error:#}");
+    }
+
     /// The plain request the attribution tests share: no engine that exists, no
     /// Syncthing, nothing that reaches off this machine.
     fn request_in(dir: &Path) -> Request {
@@ -942,6 +1185,8 @@ mod tests {
             sandbox: None,
             worktree: false,
             joining: false,
+            force_new_channel: false,
+            no_enrol: false,
         }
     }
 
@@ -958,7 +1203,11 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir_all(&base).unwrap();
-        base
+        // A workspace of its own inside a folder of its own: the first enable on a machine
+        // makes a ferry root beside the workspace, and beside TEMP itself that root would be
+        // one folder every test, and every earlier run, shared.
+        let workspace = base.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        workspace
     }
 }

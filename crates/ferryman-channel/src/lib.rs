@@ -48,6 +48,7 @@ pub mod master;
 pub mod memory;
 pub mod migration;
 pub mod models;
+pub mod offer;
 pub mod order_files;
 pub mod overlap;
 pub mod owner;
@@ -63,6 +64,7 @@ pub mod seed;
 pub mod skills;
 pub mod source;
 pub mod suggestions;
+pub mod syncscope;
 pub mod tamper;
 pub mod trajectory;
 pub mod work;
@@ -999,9 +1001,25 @@ pub struct Task {
     /// [`TaskState::Killed`]. Acknowledgements are deliberately not consulted: an ack
     /// says a worker saw the kill, not that the order may run again.
     pub kills: Vec<crate::interrupt::Interrupt>,
+    /// Signed re-offers of the order, by its issuer or the project's master. The newest
+    /// decides who the order is offered to; the order itself is never edited. See [`offer`].
+    pub offers: Vec<offer::Offer>,
 }
 
 impl Task {
+    /// Who the order is offered to now: the newest valid re-offer's address (which may be
+    /// "the queue"), else the order's own `assigned_to`.
+    #[must_use]
+    pub fn assignee(&self) -> Option<&str> {
+        match self.offers.iter().max_by(|a, b| {
+            a.at.cmp(&b.at)
+                .then_with(|| a.offered_by.cmp(&b.offered_by))
+        }) {
+            Some(latest) => latest.to.as_deref(),
+            None => self.order.assigned_to.as_deref(),
+        }
+    }
+
     /// Whether the given agent's claim on this task has been released.
     ///
     /// A release counts against the claim it was made after, not against the agent
@@ -1097,7 +1115,7 @@ impl Task {
     /// `Offered`, so the holder must be recomputed as if that claim never existed.
     #[must_use]
     pub fn holder(&self) -> Option<&str> {
-        if let Some(assignee) = &self.order.assigned_to {
+        if let Some(assignee) = self.assignee() {
             // Addressed to a machine rather than an agent: the oldest claim by one of
             // that machine's agents holds it, by the same rule as an open order.
             let claimant = self
@@ -1109,7 +1127,7 @@ impl Task {
                         .then_with(|| a.agent.cmp(&b.agent))
                 })
                 .map(|claim| claim.agent.as_str());
-            return Some(claimant.unwrap_or(assignee.as_str()));
+            return Some(claimant.unwrap_or(assignee));
         }
         self.active_claims()
             .min_by(|a, b| {
@@ -1683,6 +1701,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let mut heartbeats = Vec::new();
     let mut releases = Vec::new();
     let mut kills = Vec::new();
+    let mut offers = Vec::new();
     for entry in fs::read_dir(&directory)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -1735,6 +1754,14 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             && verify_interrupt(&value, &route.agents) == SignatureCheck::Valid
         {
             kills.push(value);
+        } else if name.starts_with("offer.")
+            && let Ok(value) = serde_json::from_str::<offer::Offer>(&text)
+            && value.order_id == order.id
+            && value.project_id == route.project_id
+            && offer::verify(&value, &route.agents) == SignatureCheck::Valid
+            && offer::may_offer(route, &order.issued_by, &value.offered_by)
+        {
+            offers.push(value);
         }
     }
     results.sort_by_key(|r: &TaskResult| r.revision);
@@ -1749,6 +1776,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         heartbeats,
         releases,
         kills,
+        offers,
     })
 }
 
@@ -1843,9 +1871,7 @@ pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result
         match task.state() {
             TaskState::Open | TaskState::Offered { .. } => {
                 if task
-                    .order
-                    .assigned_to
-                    .as_deref()
+                    .assignee()
                     .is_none_or(|assignee| addressed_to(assignee, agent))
                 {
                     out.push(task);
@@ -4876,6 +4902,8 @@ fn register_folder(
     label: &str,
     share_with: &[SyncthingPeer],
 ) -> Result<SyncthingSetup> {
+    // Before anything is looked up or written: only channels travel (see `syncscope`).
+    syncscope::guard(path)?;
     let folder_id = folder_id.to_string();
     let folder_path = path.display().to_string();
     let unavailable = |note: &str| SyncthingSetup {

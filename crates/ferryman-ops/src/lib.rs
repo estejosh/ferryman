@@ -17,6 +17,7 @@
 
 pub mod adversary;
 pub mod agent;
+pub mod attach;
 pub mod console;
 pub mod doctor;
 pub mod enable;
@@ -26,11 +27,17 @@ pub mod fleet;
 pub mod governor;
 pub mod identity;
 pub mod improve;
+pub mod layout;
+pub mod machine;
 pub mod omniroute;
+pub mod orders;
 pub mod priority;
+pub mod repos;
 pub mod rescue;
+pub mod rootconfig;
 pub mod route;
 pub mod runlog;
+pub mod setup;
 pub mod soak;
 pub mod status;
 pub mod suggest;

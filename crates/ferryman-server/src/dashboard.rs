@@ -416,6 +416,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/cost/plan", post(cost_plan))
         .route("/api/improve", get(improve_get).post(improve_set))
         .route("/api/improve/all", post(improve_all))
+        .route("/api/swarm", get(swarm_get).post(swarm_set))
         .route(
             "/api/engine-policy",
             get(engine_policy_get).post(engine_policy_set),
@@ -1995,6 +1996,85 @@ async fn improve_all(
     })))
 }
 
+/// GET /api/swarm - which of this machine's projects the swarm may work.
+///
+/// The master's signed `swarm = on|off` for each project in the ferry root (or just the one
+/// on screen without a root), and whether the signed-in person may change it. A project is
+/// on unless its master signed `off`. A machine can also keep a project out on its own, in
+/// its root config; that is local to the machine and is shown by `ferry root swarm show`.
+async fn swarm_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    let me = state.sessions.resolve(session_token(&headers));
+    let projects: Vec<Value> = every_project(&state)
+        .into_iter()
+        .map(|(project, channel)| {
+            let setting = ferryman_channel::ferry::swarm_setting(&channel, &project);
+            let master = ferryman_channel::ferry::master_of(&channel).ok().flatten();
+            let may_set = !state.read_only
+                && me
+                    .as_ref()
+                    .zip(master.as_ref())
+                    .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+            json!({
+                "project": project,
+                "on": setting.as_ref().is_none_or(|s| s.on),
+                "set_by": setting.as_ref().map(|s| s.signed_by.clone()),
+                "set_at": setting.as_ref().map(|s| s.set_at),
+                "master": master,
+                "may_set": may_set,
+                "archived": ferryman_channel::ferry::is_archived(&channel, &project),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "projects": projects })))
+}
+
+#[derive(Deserialize)]
+struct SwarmBody {
+    project: String,
+    on: bool,
+}
+
+/// POST /api/swarm - the master puts a project in or out of the swarm.
+///
+/// Signed with the session's key into the channel, where every machine reads it; the same
+/// check as `ferry root swarm on|off`, so anyone but the project's master is refused.
+async fn swarm_set(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Json(body): Json<SwarmBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let (project, channel) = every_project(&state)
+        .into_iter()
+        .find(|(project, _)| project.eq_ignore_ascii_case(&body.project))
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("{} is not a project on this machine", body.project),
+        ))?;
+    let changed = ferryman_channel::ferry::set_swarm(&channel, &project, body.on, &current)
+        .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    if changed && project.eq_ignore_ascii_case(&state.route.project_id) {
+        let _ = ferryman_channel::ledger::append_ledger_entry(
+            &state.route,
+            &current,
+            "swarm",
+            current.name(),
+            &format!(
+                "{} put {} {} the swarm",
+                current.name(),
+                project,
+                if body.on { "in" } else { "out of" }
+            ),
+            None,
+        );
+    }
+    Ok(Json(
+        json!({ "project": project, "on": body.on, "changed": changed }),
+    ))
+}
 /// GET /api/engine-policy - the engine policy this project's background work runs under:
 /// who signed it (or auto), what it says, how it falls on the engines the fleet
 /// published - each role's engines in order, every blocked engine and why - and what
@@ -5508,6 +5588,7 @@ mod tests {
             "/api/memory",
             "/api/cost/rates",
             "/api/improve",
+            "/api/swarm",
             "/api/engine-policy",
             "/api/engine-policy/team",
             "/api/improve/pending",
@@ -7255,6 +7336,60 @@ mod tests {
         ));
     }
 
+    /// A project is in the swarm until its master takes it out, from the browser, and
+    /// nobody else can.
+    #[tokio::test]
+    async fn only_the_master_puts_a_project_out_of_the_swarm_from_the_browser() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        let project = route.project_id.clone();
+        let mine = |all: &Value| {
+            all["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["project"] == project.as_str())
+                .unwrap()
+                .clone()
+        };
+        let before = get_json(&app, "/api/swarm", Some(&token)).await;
+        assert_eq!(mine(&before)["on"], true, "in by default: {before}");
+        assert_eq!(mine(&before)["may_set"], false, "nobody is master yet");
+
+        let body = format!(r#"{{"project":"{}","on":false}}"#, route.project_id);
+        let refused = post(&app, "/api/swarm", &body, Some(&token)).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "not the master");
+        assert!(ferryman_channel::ferry::swarm_enabled(
+            &route.communications,
+            &route.project_id
+        ));
+
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let strange = post(
+            &app,
+            "/api/swarm",
+            r#"{"project":"nope","on":false}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(strange.status(), StatusCode::NOT_FOUND);
+        let off = post(&app, "/api/swarm", &body, Some(&token)).await;
+        assert_eq!(off.status(), StatusCode::OK);
+
+        let after = get_json(&app, "/api/swarm", Some(&token)).await;
+        assert_eq!(mine(&after)["on"], false, "{after}");
+        assert_eq!(mine(&after)["may_set"], true);
+        assert_eq!(mine(&after)["set_by"], "alice");
+        assert!(!ferryman_channel::ferry::swarm_enabled(
+            &route.communications,
+            &route.project_id
+        ));
+    }
     /// The Contracts page: a proposed contract is listed with its shapes and the orders on
     /// each side, only the master can lock it, a locked contract cannot be decided again,
     /// and the order cards carry the interface, the files and the overlap warning.

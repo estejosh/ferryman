@@ -214,6 +214,19 @@ fn belongs_to(dir: &Path, repo: &Path) -> bool {
 #[must_use]
 fn worktree_holder(repo: &Path) -> String {
     use sha2::{Digest, Sha256};
+    // Ferryman's own clone of a project (`<root>/repos/<project>`) is the fixed layout's
+    // one repository for that project, so its worktrees go in `<root>/work/<project>/`:
+    // the folder name already is the project and cannot clash with another repository's.
+    if let Some(root) = crate::ferry::find_root_from(repo)
+        && root.is_managed(repo)
+        && let Some(name) = repo
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(crate::source::slug)
+            .filter(|n| !n.is_empty())
+    {
+        return name;
+    }
     let name = repo
         .file_name()
         .and_then(|n| n.to_str())
@@ -1125,5 +1138,24 @@ mod tests {
         assert!(worktree_head(&repo, "--help").is_err());
         assert!(has_commits_beyond(&repo, "main", "--help"), "kept, not run");
         let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn a_managed_clone_has_a_plain_holder_and_any_other_checkout_a_hashed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+
+        // Ferryman's own clone: the holder is the project, so worktrees are
+        // `work/<project>/<order>` and the hand-in folder is nowhere near them.
+        assert_eq!(
+            worktree_holder(&root.managed_clone("pc-secrets")),
+            "pc-secrets"
+        );
+        // A person's working copy keeps the hashed holder that tells two apart.
+        let human = dir.path().join("X-ferryman");
+        let holder = worktree_holder(&human);
+        assert!(holder.starts_with("x-ferryman-"), "{holder}");
+        assert_ne!(holder, "x-ferryman");
     }
 }

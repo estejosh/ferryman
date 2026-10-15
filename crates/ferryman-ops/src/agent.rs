@@ -2266,7 +2266,7 @@ impl Drop for WorkerLock {
 /// A pid can be recycled, and a zombie still has an entry. Both err towards "alive",
 /// which is the safe direction: the cost is one worker declining to start, not two
 /// engines writing one result.
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
         Path::new(&format!("/proc/{pid}")).exists()
@@ -2310,6 +2310,56 @@ fn kill_pid(pid: u32) {
     let _ = pid;
 }
 
+/// Whether the process a heartbeat names is plausibly the engine this worker started.
+///
+/// A heartbeat is an unsigned file that travels with the channel, so its pid is only a
+/// claim, and on this machine the number can be anything: this process, a parent of it,
+/// somebody's editor, init. Nothing is killed unless the process is none of this worker's
+/// own family and its command line names the engine program (or Ferryman). If the process
+/// cannot be read, it is left alone.
+fn may_kill_orphan(pid: u32, engine_command: &str) -> bool {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    if pid <= 1 {
+        return false;
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let target = Pid::from_u32(pid);
+    let Some(process) = system.process(target) else {
+        return false;
+    };
+    // Never this process or anything that started it.
+    let mut at = sysinfo::get_current_pid().ok();
+    let mut hops = 0;
+    while let Some(parent) = at {
+        if parent == target {
+            return false;
+        }
+        hops += 1;
+        if hops > 64 {
+            break;
+        }
+        at = system.process(parent).and_then(sysinfo::Process::parent);
+    }
+    let engine = engine_command
+        .split_whitespace()
+        .next()
+        .and_then(|word| Path::new(word).file_stem())
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase())
+        .filter(|stem| !stem.is_empty());
+    let line = process
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy().to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    line.contains("ferry") || engine.is_some_and(|engine| line.contains(&engine))
+}
+
 /// Part 3 of ADR 0011: a worker kills and releases its own dead runs. A heartbeat
 /// under its own name whose pid is no longer alive is a run that died with its
 /// parent; an alive pid is an orphaned child that outlived it. Either way the run is
@@ -2328,7 +2378,7 @@ fn release_own_dead_runs(
         else {
             continue;
         };
-        if process_alive(heartbeat.pid) {
+        if process_alive(heartbeat.pid) && may_kill_orphan(heartbeat.pid, &config.command) {
             kill_pid(heartbeat.pid);
         }
         if task
@@ -6237,6 +6287,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         }
     }
 
@@ -6331,6 +6382,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         }
     }
 
@@ -6934,6 +6986,7 @@ mod tests {
             heartbeats: Vec::new(),
             releases: Vec::new(),
             kills: Vec::new(),
+            offers: Vec::new(),
         }
     }
 
@@ -9865,5 +9918,35 @@ mod engine_usage_tests {
     fn an_incomplete_usage_object_is_not_a_guessable_total() {
         let stdout = r#"{"usage":{"input_tokens":25}}"#;
         assert_eq!(usage(stdout), None);
+    }
+
+    #[test]
+    fn a_heartbeat_pid_is_only_killed_when_it_is_plausibly_the_engine() {
+        // Itself, init and a pid that does not exist are never killed.
+        assert!(!super::may_kill_orphan(std::process::id(), "anything"));
+        assert!(!super::may_kill_orphan(0, "anything"));
+        assert!(!super::may_kill_orphan(1, "anything"));
+        assert!(!super::may_kill_orphan(u32::MAX - 1, "anything"));
+        // A stranger's process, whatever its pid, is left alone.
+        let mut stranger = if cfg!(windows) {
+            std::process::Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        } else {
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap()
+        };
+        let program = if cfg!(windows) { "ping" } else { "sleep" };
+        // Give the process table a moment to show it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!super::may_kill_orphan(stranger.id(), "claude"));
+        // The same process is the engine when the worker's engine is that program.
+        assert!(super::may_kill_orphan(stranger.id(), program));
+        let _ = stranger.kill();
+        let _ = stranger.wait();
     }
 }

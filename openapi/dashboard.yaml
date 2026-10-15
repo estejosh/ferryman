@@ -148,6 +148,40 @@ paths:
         '200': {description: how many appointments were removed}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/swarm:
+    get:
+      summary: Which projects the swarm may work
+      description: >
+        For each project on this machine (the ferry root's, or just the one on screen),
+        whether the swarm may work it: the master's signed `swarm = on|off`, who signed
+        it and when, the project's master, whether the person signed in may change it
+        (`may_set`, true only for that master), and whether it is archived. A project is
+        in unless its master signed off.
+      responses:
+        '200': {description: 'projects: project, on, set_by, set_at, master, may_set, archived'}
+        '401': {description: no active session}
+    post:
+      summary: The master puts a project in or out of the swarm
+      description: >
+        Writes the master-signed SWARM setting into the project's channel, where every
+        machine that syncs it reads it. A project that is out is not cloned by
+        `ferry repos sync`, not served by an all-projects worker and not enrolled by
+        `team approve --all`. A setting anyone but the master signed is ignored. Master only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project, "on"]
+              properties:
+                project: {type: string}
+                "on": {type: boolean}
+      responses:
+        '200': {description: 'project, the new state, and whether it changed'}
+        '401': {description: no active session}
+        '403': {description: read-only, or not the master}
+        '404': {description: not a project on this machine}
   /api/improve:
     get:
       summary: Self-improve for this project, its last run, and every worker's engines

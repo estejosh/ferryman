@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod adversary;
 mod enginepolicy;
+mod fleetsetup;
 mod focus;
 mod gitanchor;
 mod license;
@@ -227,6 +228,20 @@ enum Command {
         /// master here. Set by `ferry team invite accept`.
         #[arg(long, hide = true)]
         joining: bool,
+        /// Make a new channel even if the ferry root already files this project with a
+        /// different one, or Syncthing already syncs the project's folder somewhere else.
+        ///
+        /// Without it, `enable` in a clone that has no `.ferryman/bridge.toml` of a project
+        /// the root already knows refuses, and points at `ferry root attach`: a second,
+        /// empty channel would take over the project's Syncthing folder (it is deleted and
+        /// made again at the new path) and enrol this identity where nobody reads.
+        #[arg(long)]
+        force_new_channel: bool,
+        /// Create the key and the config, and make the identity a member nowhere: no
+        /// roster entry and no master declaration. The master's `ferry team approve
+        /// <name> --all` is what enrols it.
+        #[arg(long, conflicts_with = "master")]
+        no_enrol: bool,
     },
     /// Check whether this machine is ready to run a task, before one fails.
     ///
@@ -246,6 +261,13 @@ enum Command {
         /// Syncthing when it is configured but not running.
         #[arg(long)]
         fix: bool,
+        /// Check this machine's layout instead of one project: `comms/`, `repos/` and
+        /// `work/` exist, every live project has its own clone attached, exactly one
+        /// worker runs, it is a service, and no worker lock names a dead process. With
+        /// `--fix`: make the folders, run `repos sync` and move dead locks aside (renamed,
+        /// never deleted). Nothing is signed.
+        #[arg(long)]
+        layout: bool,
     },
     /// Hand finished work in, and (as the head) review and push it.
     ///
@@ -635,6 +657,21 @@ enum Command {
         #[command(subcommand)]
         command: ReleaseCommand,
     },
+    /// Ferryman's own clone of every project, in the one fixed place (`repos/<project>`).
+    Repos {
+        #[command(subcommand)]
+        command: fleetsetup::ReposCommand,
+    },
+    /// Set a machine up: one layout, one worker, every repo.
+    Fleet {
+        #[command(subcommand)]
+        command: fleetsetup::FleetCommand,
+    },
+    /// Move orders off an identity that is retired: re-offer them, release its claims.
+    Order {
+        #[command(subcommand)]
+        command: fleetsetup::OrderCommand,
+    },
     /// The one place your Ferryman lives, and what is in it. ADR 0019.
     Root {
         #[command(subcommand)]
@@ -738,6 +775,43 @@ enum RootCommand {
     Adopt {
         /// The project directory or channel to adopt. Defaults to where you are.
         workspace: Option<PathBuf>,
+    },
+    /// Hang an existing checkout on the channel this root already files for its project.
+    ///
+    /// For a clone that has no `.ferryman/bridge.toml`. `ferry enable` there would make a
+    /// second, empty channel beside the real one, re-register the project's Syncthing folder
+    /// at the new path (deleting and recreating it) and enrol the identity where nobody
+    /// reads. This writes `.ferryman/bridge.toml` naming the channel the root files, keeps
+    /// `/.ferryman/` out of git through the clone's own `.git/info/exclude` (never a tracked
+    /// file) and files the checkout in the root.
+    ///
+    /// It touches no roster, no key, no device and no Syncthing folder, and signs nothing.
+    /// A checkout whose own `bridge.toml` reads some other channel is reported and left as
+    /// it is.
+    Attach {
+        /// The checkout. Defaults to where you are. With --all: the folder that holds your
+        /// clones.
+        folder: Option<PathBuf>,
+        /// The project, when the folder's own name is not it.
+        #[arg(long, conflicts_with = "all")]
+        project: Option<String>,
+        /// Say what would be done and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Attach every clone directly under the folder whose name is a project this root
+        /// files, and report each one: attached, already, or skipped (archived, no channel,
+        /// not a git repo, left out by name).
+        #[arg(long)]
+        all: bool,
+        /// With --all: folders or projects to leave out, comma separated.
+        #[arg(long, value_delimiter = ',', requires = "all")]
+        skip: Vec<String>,
+    },
+    /// Which projects the swarm works: the master's signed `swarm = off`, and this
+    /// machine's own exclusions.
+    Swarm {
+        #[command(subcommand)]
+        command: fleetsetup::SwarmCommand,
     },
     /// Move channels into `comms/`, so every channel lives in one place.
     ///
@@ -1834,7 +1908,7 @@ enum TeamCommand {
     /// machines and agents, from any of them - so a laptop that walked off is killed
     /// from the one still on your desk.
     Revoke {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "all")]
         workspace: Option<PathBuf>,
         /// The person, machine or agent to revoke.
         #[arg(long)]
@@ -1842,9 +1916,18 @@ enum TeamCommand {
         /// Why, kept in the ledger.
         #[arg(long, default_value = "revoked")]
         reason: String,
-        /// Sign as this operator. Defaults to this machine's agent.
+        /// Sign as this operator. Defaults to this machine's agent (with --all: whoever
+        /// masters the most projects in the ferry root).
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
+        /// End the name's access in every project in the ferry root that you are master
+        /// of, channel-only and archived ones included. The converse of `team approve
+        /// --all`, with the same rules: your master identity signs (your password, once,
+        /// and only when something is written), a project somebody else masters is
+        /// skipped, one the name never joined is left alone, and the key you sign with
+        /// must be the one the project's roster knows you by.
+        #[arg(long)]
+        all: bool,
     },
     /// Bind your Ferryman key to a git account, and check that the binding still holds.
     ///
@@ -2001,6 +2084,10 @@ enum ManagedSyncthingAction {
     Start,
     /// Ask the managed instance to shut down cleanly.
     Stop,
+    /// Run the managed instance in the foreground until it exits. For a service manager to
+    /// supervise: `ferry fleet setup --service` writes a unit or task that runs this, so
+    /// the sync outlives the worker's restarts.
+    Run,
     /// Which config is being read, whether it answers, and every device with its live
     /// connection state.
     Status {
@@ -2463,6 +2550,15 @@ enum Agent {
         /// first: two under one name run the same order twice.
         #[arg(long)]
         all_projects: bool,
+        /// Start even though another worker already serves every project on this machine.
+        ///
+        /// A machine is meant to have ONE worker: a second `--all-projects` polls every
+        /// channel again and runs the same orders as another identity, at several times
+        /// the cost. Without this flag it refuses and names what is already there and how
+        /// to stop it (`ferry fleet setup` writes the one service and turns the others
+        /// off). Any other worker beside a live one starts with a warning.
+        #[arg(long)]
+        allow_second_worker: bool,
     },
     /// Judge results that are waiting, as far as the config lets you.
     Review {
@@ -3955,6 +4051,8 @@ async fn run(cli: Cli) -> Result<()> {
             dashboard,
             dashboard_operator,
             joining,
+            force_new_channel,
+            no_enrol,
         } => {
             // Before anything is written: a machine may not be configured to be a person.
             if let Some(name) = &agent_name {
@@ -4007,6 +4105,8 @@ async fn run(cli: Cli) -> Result<()> {
                 sandbox,
                 worktree,
                 joining,
+                force_new_channel,
+                no_enrol,
             }) {
                 Ok(outcome) => outcome,
                 Err(err) => {
@@ -4026,6 +4126,11 @@ async fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
+            // A project enrolled here gets Ferryman's own clone in `repos/<project>`, so the
+            // layout holds from the first command and no agent has to remember to make it.
+            if !no_enrol {
+                fleetsetup::managed_clone_after_enable(&outcome.route.project_id, as_json);
+            }
             // A human at a terminal types the operator password here, privately.
             // An agent never sees or supplies it: it is told to hand the human a
             // browser, where the operator identity is created out of the agent's
@@ -4102,7 +4207,14 @@ async fn run(cli: Cli) -> Result<()> {
             workspace,
             json,
             fix,
+            layout,
         } => {
+            if layout {
+                if !fleetsetup::layout_command(fix, json)? {
+                    bail!("layout checks failed");
+                }
+                return Ok(());
+            }
             let start = match workspace {
                 Some(path) => path,
                 None => std::env::current_dir().context("read the current directory")?,
@@ -4162,9 +4274,18 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             let report = ferryman_ops::doctor::examine(&start);
+            let (workers_ok, workers) = fleetsetup::workers_line();
             if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
+                let mut value = serde_json::to_value(&report)?;
+                value["workers"] = json!({ "ok": workers_ok, "detail": workers });
+                println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
+                println!(
+                    "  {:<4} {:<17} {}",
+                    if workers_ok { "ok" } else { "note" },
+                    "workers",
+                    workers
+                );
                 for check in &report.checks {
                     // Informational checks are marked as such rather than as
                     // failures: a machine without Syncthing still works locally.
@@ -4369,6 +4490,12 @@ async fn run(cli: Cli) -> Result<()> {
                     health.peers.len(),
                     health.peers.iter().filter(|p| p.connected).count()
                 );
+            }
+            ManagedSyncthingAction::Run => {
+                let status = ferryman_ops::syncthing::run_foreground()?;
+                if !status.success() {
+                    bail!("syncthing exited with {status}");
+                }
             }
             ManagedSyncthingAction::Stop => {
                 ferryman_ops::syncthing::stop()?;
@@ -4714,6 +4841,9 @@ async fn run(cli: Cli) -> Result<()> {
         } => loadmem(workspace, project, agent, list_agents, record)?,
         Command::Update { check } => update_command(check).await?,
         Command::Root { command } => root_command(command)?,
+        Command::Repos { command } => fleetsetup::repos_command(command)?,
+        Command::Fleet { command } => fleetsetup::fleet_command(command)?,
+        Command::Order { command } => fleetsetup::order_command(command)?,
         Command::Release { command } => release_command(command)?,
         Command::Marvin { command } => marvin_command(command)?,
         Command::Mcp { command } => match command {
@@ -6002,6 +6132,152 @@ fn worker_progress() -> ferryman_ops::runlog::Logged<ferryman_ops::Stdout> {
     }
 }
 
+/// Hands a bulk command the master's identity for each project it is about to write into:
+/// the operator's, unlocked once with their password, or a machine master's key beside a
+/// checkout. Never called for a project that needs nothing written.
+fn bulk_signer(
+    root: &ferryman_channel::ferry::Root,
+) -> impl FnMut(&ferryman_channel::ferry::Entry, &str) -> Result<ferryman_channel::AgentIdentity> {
+    let attachments: Vec<PathBuf> = root
+        .read()
+        .projects
+        .iter()
+        .filter_map(ferryman_channel::ferry::Entry::attachment)
+        .chain([root.path.clone()])
+        .collect();
+    // A failed unlock is remembered: the same wrong password is not asked for once per
+    // project.
+    let mut failure: Option<String> = None;
+    move |entry: &ferryman_channel::ferry::Entry, declared: &str| {
+        if let Some(why) = &failure {
+            bail!("{why}");
+        }
+        if let Some(held) =
+            held_operator().filter(|held| held.name().eq_ignore_ascii_case(declared))
+        {
+            return Ok(held);
+        }
+        for attachment in entry.attachment().iter().chain(attachments.iter()) {
+            match hold_operator(attachment, declared) {
+                Ok(true) => {
+                    if let Some(held) = held_operator() {
+                        return Ok(held);
+                    }
+                }
+                Ok(false) => {
+                    if let Some(identity) =
+                        ferryman_channel::AgentIdentity::load_existing(declared, attachment)?
+                    {
+                        return Ok(identity);
+                    }
+                }
+                Err(error) => {
+                    failure = Some(format!("could not unlock '{declared}': {error:#}"));
+                    return Err(error);
+                }
+            }
+        }
+        bail!("this machine holds no signing key or operator identity for '{declared}'")
+    }
+}
+
+/// `ferry team revoke --name <name> --all`: end one identity's access in every project the
+/// signing master owns, channel-only and archived ones included.
+fn team_revoke_all(name: &str, reason: &str, as_master: Option<String>) -> Result<()> {
+    use ferryman_ops::fleet::{self, Revocation};
+    let root = ferryman_channel::ferry::find_root()
+        .context("no ferry root yet - make one with `ferry root init`")?;
+    let master = match as_master {
+        Some(master) => master,
+        None => fleet::dominant_master(&root).context(
+            "no project here has a master yet; claim them with 'ferry root master', or say \
+             who signs with --as",
+        )?,
+    };
+    println!("revoking '{name}' where {master} is master: {reason}");
+    let mut signer = bulk_signer(&root);
+    let done = fleet::revoke_everywhere(&root, name, reason, &master, &mut signer);
+    let (mut revoked, mut there, mut other) = (0, 0, 0);
+    for (project, outcome) in &done {
+        match outcome {
+            Revocation::Revoked => {
+                revoked += 1;
+                println!("  {project}: revoked (signed by {master})");
+                unshare_revoked_devices(&root, project, name);
+            }
+            Revocation::AlreadyRevoked => {
+                there += 1;
+                println!("  {project}: already revoked");
+            }
+            Revocation::NotMaster { master: theirs } => {
+                other += 1;
+                println!("  {project}: skipped - its master is {theirs}, not {master}");
+            }
+            Revocation::NoMaster => {
+                other += 1;
+                println!("  {project}: skipped - no master yet ('ferry root master')");
+            }
+            Revocation::NotAMember => {
+                other += 1;
+                println!("  {project}: nothing to revoke - '{name}' never joined it");
+            }
+            Revocation::Skipped(why) => {
+                other += 1;
+                println!("  {project}: skipped - {why}");
+            }
+        }
+    }
+    println!(
+        "'{name}': {revoked} revoked, {there} already revoked, {other} skipped or not a member"
+    );
+    println!("note: what already synced is on their disk; rotate any secret sealed to them");
+    Ok(())
+}
+
+/// Unshare a project's folder from the devices an invitation paired for `name`, as the
+/// single-project `team revoke` does. Best effort: the revocation is the part that counts.
+fn unshare_revoked_devices(root: &ferryman_channel::ferry::Root, project: &str, name: &str) {
+    use ferryman_channel::invite;
+    let Some(entry) = root
+        .read()
+        .projects
+        .into_iter()
+        .find(|entry| entry.project_id == project)
+    else {
+        return;
+    };
+    let Ok((route, _)) = (ferryman_channel::ferry::Entry {
+        repo: None,
+        ..entry
+    })
+    .route(root) else {
+        return;
+    };
+    let Ok(invites) = invite::list(&route) else {
+        return;
+    };
+    let devices: Vec<String> = invites
+        .into_iter()
+        .filter(|(i, _)| {
+            i.operator
+                .as_deref()
+                .is_some_and(|o| o.eq_ignore_ascii_case(name))
+                || invite::read_acceptance(&route, &i.id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|a| a.operator.eq_ignore_ascii_case(name))
+        })
+        .filter_map(|(i, _)| i.accepted_device)
+        .collect();
+    if devices.is_empty() {
+        return;
+    }
+    match ferryman_channel::syncthing_unshare_folder(&route, &devices) {
+        Ok(_) => println!("    folder unshared from {} device(s)", devices.len()),
+        Err(error) => println!("    could not unshare the folder: {error:#}"),
+    }
+}
+
 /// `ferry team approve <name> --all`: one identity, every project the signing master owns.
 fn team_approve_all(
     name: &str,
@@ -6049,49 +6325,7 @@ fn team_approve_all(
         "enrolling '{name}' as {role} ({}), signing as {master}",
         &key[..key.len().min(12)]
     );
-    let attachments: Vec<PathBuf> = root
-        .read()
-        .projects
-        .iter()
-        .filter_map(ferryman_channel::ferry::Entry::attachment)
-        .chain([root.path.clone()])
-        .collect();
-    // A failed unlock is remembered: the same wrong password is not asked for once per
-    // project.
-    let mut failure: Option<String> = None;
-    let mut signer = |entry: &ferryman_channel::ferry::Entry,
-                      declared: &str|
-     -> Result<ferryman_channel::AgentIdentity> {
-        if let Some(why) = &failure {
-            bail!("{why}");
-        }
-        if let Some(held) =
-            held_operator().filter(|held| held.name().eq_ignore_ascii_case(declared))
-        {
-            return Ok(held);
-        }
-        for attachment in entry.attachment().iter().chain(attachments.iter()) {
-            match hold_operator(attachment, declared) {
-                Ok(true) => {
-                    if let Some(held) = held_operator() {
-                        return Ok(held);
-                    }
-                }
-                Ok(false) => {
-                    if let Some(identity) =
-                        ferryman_channel::AgentIdentity::load_existing(declared, attachment)?
-                    {
-                        return Ok(identity);
-                    }
-                }
-                Err(error) => {
-                    failure = Some(format!("could not unlock '{declared}': {error:#}"));
-                    return Err(error);
-                }
-            }
-        }
-        bail!("this machine holds no signing key or operator identity for '{declared}'")
-    };
+    let mut signer = bulk_signer(&root);
     let done = fleet::enrol(&root, name, &role, &key, &master, &mut signer);
     let (mut added, mut there, mut not_master, mut other) = (0, 0, 0, 0);
     for (project, outcome) in &done {
@@ -6436,7 +6670,11 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             name,
             reason,
             signer,
+            all,
         } => {
+            if all {
+                return team_revoke_all(&name, &reason, signer);
+            }
             let route = here(workspace)?;
             let signer_name = match signer {
                 Some(s) => s,
@@ -7536,6 +7774,7 @@ async fn agent_command(command: Agent) -> Result<()> {
             once,
             dry_run,
             all_projects: true,
+            allow_second_worker,
         } => {
             let home = route_for(workspace)?;
             let config = agent::AgentConfig::load(&home.attachment)?;
@@ -7561,6 +7800,12 @@ async fn agent_command(command: Agent) -> Result<()> {
                     let ferryman_ops::fleet::Standing::Serves { route, .. } = &row.standing else {
                         continue;
                     };
+                    let declared =
+                        ferryman_ops::fleet::policy::read(&route.workspace, &route.attachment);
+                    println!("  {}", declared.summary());
+                    for note in &declared.notes {
+                        println!("    note: {note}");
+                    }
                     if agent::worker_alive(&route.attachment, &config.agent) {
                         println!(
                             "  a worker as '{}' is already running for it here; stop that one \
@@ -7586,6 +7831,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("nothing was claimed, written or sent");
                 return Ok(());
             }
+            fleetsetup::guard_worker_start(true, allow_second_worker)?;
             let report = worker_progress();
             let fleet = ferryman_ops::fleet::serve(plan, &identity, &config);
             for (path, why) in &fleet.skipped {
@@ -7618,6 +7864,7 @@ async fn agent_command(command: Agent) -> Result<()> {
             once,
             dry_run,
             all_projects: false,
+            allow_second_worker,
         } => {
             // Before the fleet resolves anything.
             //
@@ -7685,6 +7932,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 println!("nothing was claimed, written or sent");
                 return Ok(());
             }
+            fleetsetup::guard_worker_start(false, allow_second_worker)?;
             run_fleet(fleet, &comms, once, false, &report).await?;
         }
         Agent::Run {
@@ -7693,6 +7941,7 @@ async fn agent_command(command: Agent) -> Result<()> {
             once,
             dry_run,
             all_projects: false,
+            allow_second_worker,
         } => {
             let route = route_for(workspace)?;
             let config = agent::AgentConfig::load(&route.attachment)?;
@@ -7734,6 +7983,7 @@ async fn agent_command(command: Agent) -> Result<()> {
             // Recorded, not only printed: a worker that started and a worker that
             // failed on every pass look the same in an empty log, and "why did nothing
             // happen last night" is the question this has to be able to answer.
+            fleetsetup::guard_worker_start(false, allow_second_worker)?;
             let report = worker_progress();
             let _lock = match agent::WorkerLock::take(&route.attachment, &config.agent)? {
                 Some(lock) => lock,
@@ -12122,6 +12372,34 @@ fn root_command(command: RootCommand) -> Result<()> {
                     route.project_id, route.project_id
                 );
             }
+        }
+
+        RootCommand::Attach {
+            folder,
+            project,
+            dry_run,
+            all,
+            skip,
+        } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let folder = match folder {
+                Some(path) => path,
+                None => std::env::current_dir().context("read the current directory")?,
+            };
+            return fleetsetup::attach_command(
+                &root,
+                &folder,
+                project.as_deref(),
+                all,
+                &skip,
+                dry_run,
+            );
+        }
+
+        RootCommand::Swarm { command } => {
+            return fleetsetup::swarm_command(command);
         }
 
         RootCommand::Archive { project, restore } => {
