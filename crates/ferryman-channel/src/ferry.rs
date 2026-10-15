@@ -1115,6 +1115,15 @@ impl Root {
         // agent reads. Rewriting the index alone would leave the worker writing into a
         // directory that is no longer the channel.
         repoint_bridge(&from, &to)?;
+        // Other checkouts read the same channel through their own bridge.toml: the person's
+        // checkout the root files, and Ferryman's own clone in `repos/`. Left alone they keep
+        // naming the old path, and `repos sync` then refuses the clone as a second channel.
+        for checkout in [entry.repo.clone(), Some(self.repos().join(project_id))]
+            .into_iter()
+            .flatten()
+        {
+            repoint_bridge_if_reads(&checkout.join(".ferryman").join("bridge.toml"), &from, &to)?;
+        }
         self.adopt(project_id, &to, entry.repo.as_deref())?;
         gathered.moved = true;
         gathered.note = "moved".to_string();
@@ -1343,6 +1352,49 @@ fn repoint_bridge(old_channel: &Path, new_channel: &Path) -> Result<()> {
         out.push('\n');
     }
     std::fs::write(&bridge, out).with_context(|| format!("write {}", bridge.display()))
+}
+
+/// Point `bridge` at `new_channel` if, and only if, it reads `old_channel` now.
+///
+/// A checkout attached to some other channel is not this move's business, so it is left
+/// exactly as it is.
+fn repoint_bridge_if_reads(bridge: &Path, old_channel: &Path, new_channel: &Path) -> Result<()> {
+    let Ok(text) = std::fs::read_to_string(bridge) else {
+        return Ok(());
+    };
+    let fold = |path: &str| {
+        let text = path.replace('\\', "/").trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            text.to_lowercase()
+        } else {
+            text
+        }
+    };
+    let old = fold(&old_channel.display().to_string());
+    let reads_old = text.lines().any(|line| {
+        line.trim_start().starts_with("communications")
+            && line
+                .split_once('=')
+                .is_some_and(|(_, value)| fold(value.trim().trim_matches('"')) == old)
+    });
+    if !reads_old {
+        return Ok(());
+    }
+    let rewritten: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("communications") && line.contains('=') {
+                format!("communications = \"{}\"", new_channel.display())
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    let mut out = rewritten.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    std::fs::write(bridge, out).with_context(|| format!("write {}", bridge.display()))
 }
 
 /// Whether a path sits inside this machine's temporary directory.
@@ -1901,6 +1953,53 @@ mod tests {
         assert!(
             bridge.contains("grants = \"open\""),
             "the rest is untouched"
+        );
+    }
+
+    /// `ferry enable` also makes Ferryman's own clone in `repos/`, with a bridge.toml naming
+    /// the channel where it was then. Gathering must move that clone's pointer too, or
+    /// `repos sync` refuses the clone as a second channel.
+    #[test]
+    fn gathering_repoints_the_managed_clone_and_leaves_other_channels_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let root = root(dir.path());
+        let bridge = |at: &Path, channel: &Path| {
+            std::fs::create_dir_all(at.join(".ferryman")).unwrap();
+            std::fs::write(
+                at.join(".ferryman/bridge.toml"),
+                format!(
+                    "project = \"alpha\"\ncommunications = \"{}\"\n",
+                    channel.display()
+                ),
+            )
+            .unwrap();
+        };
+        let repo = dir.path().join("scattered/my-repo");
+        let scattered = repo.join(".ferryman/ferryman");
+        std::fs::create_dir_all(&scattered).unwrap();
+        bridge(&repo, &scattered);
+        let clone = root.repos().join("alpha");
+        bridge(&clone, &scattered);
+        let other = dir.path().join("elsewhere");
+        let unrelated = dir.path().join("some/other/channel");
+        bridge(&other, &unrelated);
+        root.adopt("alpha", &scattered, Some(&repo)).unwrap();
+
+        root.gather("alpha", false).unwrap();
+        let home = format!(
+            "communications = \"{}\"",
+            root.comms_home("alpha").display()
+        );
+        let read = |at: &Path| std::fs::read_to_string(at.join(".ferryman/bridge.toml")).unwrap();
+        assert!(read(&repo).contains(&home));
+        assert!(
+            read(&clone).contains(&home),
+            "the managed clone moved with it"
+        );
+        assert!(
+            read(&other).contains(&unrelated.display().to_string()),
+            "a checkout of another channel is not touched"
         );
     }
 
