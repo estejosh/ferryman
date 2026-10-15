@@ -1085,7 +1085,14 @@ mod tests {
 
     #[test]
     fn the_command_lines_hold_together() {
-        crate::Cli::command().debug_assert();
+        // `debug_assert` walks the whole command tree, which has outgrown a test thread's
+        // default stack on Windows. Give it the room `main` gives the parser.
+        std::thread::Builder::new()
+            .stack_size(crate::COMMAND_STACK)
+            .spawn(|| crate::Cli::command().debug_assert())
+            .expect("spawn")
+            .join()
+            .expect("the command tree is consistent");
         let cli = parse(&[
             "suggest",
             "new",
