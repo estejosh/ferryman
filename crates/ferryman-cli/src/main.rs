@@ -4,6 +4,7 @@ mod enginepolicy;
 mod fleetsetup;
 mod focus;
 mod gitanchor;
+mod lane;
 mod license;
 mod licensor;
 mod mcp;
@@ -291,6 +292,14 @@ enum Command {
     Syncthing {
         #[command(subcommand)]
         action: ManagedSyncthingAction,
+    },
+    /// The transports a channel travels by, beside Syncthing. `ferry lane iroh init` makes
+    /// this machine's iroh key and publishes it into every channel its worker serves;
+    /// `ferry lane iroh status` says whether the relay lets us in and who has synced.
+    /// See docs/IROH_LANE.md.
+    Lane {
+        #[command(subcommand)]
+        command: lane::LaneCommand,
     },
     /// Break-glass: a live terminal on one of your own machines, from anywhere, while a
     /// person on that machine keeps it open.
@@ -4727,6 +4736,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Engines { at, json, .. } => engines_command(&at, json)?,
         Command::Improve { command } => improve_command(command).await?,
         Command::Focus { command } => focus::command(command)?,
+        Command::Lane { command } => lane::command(command).await?,
         Command::Suggest { project, command } => suggest::suggest(project, command).await?,
         Command::Suggestions { project, command } => {
             suggest::suggestions(project, command).await?;
@@ -7491,6 +7501,7 @@ async fn run_fleet(
     watching: &std::path::Path,
     once: bool,
     serving_everywhere: bool,
+    iroh: Option<lane::WorkerLane>,
     report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
 ) -> Result<()> {
     // One worker per identity per channel. Two under one name resume each other's
@@ -7625,6 +7636,16 @@ async fn run_fleet(
     // After an update nothing is run by a person: the first start on the new version makes
     // the hand-in folders and shares them (ADR 0023).
     prepare_work_folders(fleet.served.iter().map(|(route, _)| route), report);
+    // The iroh lane, when this machine has it on: the channels as repaired above, served
+    // and synced in the background beside Syncthing for as long as this worker runs.
+    if let Some(iroh) = iroh {
+        let routes = fleet
+            .served
+            .iter()
+            .map(|(route, _)| route.clone())
+            .collect();
+        iroh.start(routes, report).await;
+    }
     loop {
         // Keeping a long-running worker current.
         //
@@ -7853,7 +7874,8 @@ async fn agent_command(command: Agent) -> Result<()> {
                 ferryman_ops::fleet::engines_line(&config),
                 config.max_parallel
             ));
-            run_fleet(fleet, &root.comms(), once, true, &report).await?;
+            let iroh = lane::for_worker(&root, identity, &report);
+            run_fleet(fleet, &root.comms(), once, true, iroh, &report).await?;
         }
         Agent::Run {
             // Without `--all-projects`, `--comms` and `--workspace` are mutually
@@ -7933,7 +7955,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 return Ok(());
             }
             fleetsetup::guard_worker_start(false, allow_second_worker)?;
-            run_fleet(fleet, &comms, once, false, &report).await?;
+            run_fleet(fleet, &comms, once, false, None, &report).await?;
         }
         Agent::Run {
             workspace,

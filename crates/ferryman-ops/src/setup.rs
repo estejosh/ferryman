@@ -318,7 +318,9 @@ pub fn systemd_unit(spec: &Spec, with_syncthing: bool) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        workdir = unit_quote(&spec.workspace),
+        // systemd takes WorkingDirectory= literally: quotes there make the path relative
+        // and the whole unit fails to load ("path is not absolute").
+        workdir = unit_path(&spec.workspace),
         env = unit_path(&spec.env_file),
         ferry = unit_quote(&spec.ferry),
         workspace = unit_quote(&spec.workspace),
