@@ -250,6 +250,26 @@ pub fn split_risk(
     None
 }
 
+/// Where a brand-new channel for `project` is made.
+///
+/// In the ferry root's `comms/` when this machine has a root and the root does not file the
+/// project yet, so every channel lives in one place from its first command (ADR 0019).
+/// Without that, channels were made inside each project and had to be moved later with
+/// `ferry root gather`, and in practice they were not. Otherwise inside the project, as
+/// before: with no root there is no one place yet, and a project the root already files is
+/// a clone, which `split_risk` refuses unless `--force-new-channel` says to make a second.
+#[must_use]
+pub fn new_channel_home(
+    root: Option<&ferryman_channel::ferry::Root>,
+    filed: Option<&ferryman_channel::ferry::Entry>,
+    attachment: &Path,
+    project: &str,
+) -> PathBuf {
+    match (root, filed) {
+        (Some(root), None) => root.comms_home(project),
+        _ => attachment.join("ferryman"),
+    }
+}
 pub fn perform(request: Request) -> Result<Outcome> {
     let workspace = match request.workspace {
         Some(path) => path,
@@ -296,23 +316,32 @@ pub fn perform(request: Request) -> Result<Outcome> {
     }
 
     let attachment = workspace.join(".ferryman");
-    let communications = attachment.join("ferryman");
     let shared_remote = format!("{project}-ferryman");
     let mut steps = Vec::new();
+    let bridge = attachment.join("bridge.toml");
+    let root = ferryman_channel::ferry::find_root();
+    let filed = root.as_ref().and_then(|root| {
+        root.read()
+            .projects
+            .into_iter()
+            .find(|e| e.project_id == project)
+    });
+    let communications = if bridge.exists() {
+        // Already set up: the channel is wherever bridge.toml says, which after
+        // `ferry root gather` is not inside the project. Making `.ferryman/ferryman`
+        // here again would leave an empty stray channel beside the real one.
+        ferryman_channel::route_for(&workspace)
+            .map(|route| route.communications)
+            .unwrap_or_else(|_| attachment.join("ferryman"))
+    } else {
+        new_channel_home(root.as_ref(), filed.as_ref(), &attachment, &project)
+    };
 
     // A clone with no bridge.toml is about to get a channel of its own. If this project
     // already has one, that is a second, empty channel with the same name: the project's
     // Syncthing folder is re-registered at the new path (deleted and recreated) and the
     // identity is put on a roster nobody else reads. Refuse before anything is written.
-    let bridge = attachment.join("bridge.toml");
     if !request.force_new_channel && !bridge.exists() {
-        let root = ferryman_channel::ferry::find_root();
-        let filed = root.as_ref().and_then(|root| {
-            root.read()
-                .projects
-                .into_iter()
-                .find(|e| e.project_id == project)
-        });
         let synced = if request.no_syncthing {
             None
         } else {
@@ -323,6 +352,8 @@ pub fn perform(request: Request) -> Result<Outcome> {
         }
     }
 
+    // The channel may now live outside the project, so its config directory is made on its own.
+    fs::create_dir_all(&attachment).with_context(|| format!("create {}", attachment.display()))?;
     fs::create_dir_all(&communications)
         .with_context(|| format!("create {}", communications.display()))?;
 
@@ -678,10 +709,13 @@ pub fn perform(request: Request) -> Result<Outcome> {
 /// ~/.local/state. First call wins, so every test here shares one temporary machine.
 #[cfg(test)]
 fn hermetic_machine() {
+    // Per thread, so no test inherits another's ferry root: enable now makes channels in a
+    // root it finds, and a shared or real root is somewhere a test must never write.
     let dir = std::env::temp_dir().join(format!(
-        "ferryman-test-machine-{}-{}",
+        "ferryman-test-machine-{}-{}-{:?}",
         env!("CARGO_CRATE_NAME"),
-        std::process::id()
+        std::process::id(),
+        std::thread::current().id()
     ));
     let _ = std::fs::create_dir_all(&dir);
     ferryman_channel::licensing::use_machine_state_dir_per_thread(dir);
@@ -761,6 +795,14 @@ mod tests {
         ));
         let _ = std::fs::create_dir_all(&dir);
         ferryman_channel::licensing::use_machine_state_dir_per_thread(dir);
+    }
+
+    /// Every test here runs on a hermetic machine, including the ones that forgot to ask:
+    /// without it a test finds the developer's real ferry root, and enable now makes the
+    /// channel there.
+    fn perform(request: Request) -> Result<Outcome> {
+        hermetic_machine();
+        super::perform(request)
     }
 
     fn enable_in(dir: &std::path::Path) -> Result<()> {
@@ -1169,6 +1211,78 @@ mod tests {
 
     /// The plain request the attribution tests share: no engine that exists, no
     /// Syncthing, nothing that reaches off this machine.
+    /// A new project on a machine that has a ferry root gets its channel in `comms/` from the
+    /// first command, not inside the project waiting for a `ferry root gather` nobody runs.
+    #[test]
+    fn a_new_project_on_a_machine_with_a_root_gets_its_channel_in_comms() {
+        let dir = tempdir();
+        hermetic_machine();
+        let root = ferryman_channel::ferry::Root::create(&dir.join("ferry")).unwrap();
+        let project = dir.join("fresh");
+        fs::create_dir_all(&project).unwrap();
+
+        perform(Request {
+            project: Some("fresh".into()),
+            ..request_in(&project)
+        })
+        .unwrap();
+        let home = root.comms_home("fresh");
+        assert!(home.join(".stignore").is_file(), "channel made in comms/");
+        assert!(
+            home.join("agents/tester.json").is_file(),
+            "and enrolled there"
+        );
+        assert!(
+            !project.join(".ferryman/ferryman").exists(),
+            "no channel inside the project"
+        );
+        assert!(
+            project.join(".ferryman/keys/tester.key").is_file(),
+            "keys stay in the project, never in the synced folder"
+        );
+
+        // Running it again changes nothing and still makes no stray channel.
+        perform(Request {
+            project: Some("fresh".into()),
+            ..request_in(&project)
+        })
+        .unwrap();
+        assert!(!project.join(".ferryman/ferryman").exists());
+    }
+
+    /// After `ferry root gather` moved a channel out, enabling again must not make an empty
+    /// `.ferryman/ferryman` beside the real one.
+    #[test]
+    fn re_enabling_a_gathered_project_does_not_recreate_the_old_channel() {
+        let dir = tempdir();
+        hermetic_machine();
+        let project = dir.join("moved");
+        fs::create_dir_all(&project).unwrap();
+        let project = ferryman_channel::real_path(&project.canonicalize().unwrap());
+        fs::create_dir_all(&project).unwrap();
+        let elsewhere = dir.join("comms-elsewhere/moved-ferryman");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let attachment = project.join(".ferryman");
+        fs::create_dir_all(&attachment).unwrap();
+        fs::write(
+            attachment.join("bridge.toml"),
+            format!(
+                "project = \"moved\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\nshared_remote = \"moved-ferryman\"\ngrants = \"open\"\n",
+                project.display(),
+                attachment.display(),
+                elsewhere.display(),
+            ),
+        )
+        .unwrap();
+
+        perform(Request {
+            project: Some("moved".into()),
+            ..request_in(&project)
+        })
+        .unwrap();
+        assert!(!attachment.join("ferryman").exists(), "no stray channel");
+        assert!(elsewhere.join(".stignore").is_file());
+    }
     fn request_in(dir: &Path) -> Request {
         Request {
             workspace: Some(dir.to_path_buf()),
