@@ -2152,6 +2152,7 @@ mod tests {
                 billing: None,
                 class: None,
                 capabilities: None,
+                proof: None,
             })
             .collect();
         crate::receipts::refresh_engines(route, who, machine, "0.0.0", reports, Utc::now())

@@ -17,8 +17,21 @@ Plain code gathers the facts:
 - whether this machine's Syncthing is running
 - whether every channel's worker reads the folder Syncthing actually syncs
 - whether the Ferryman worker services are up (Linux, systemd user units)
-- every engine, with a real one-token request - not a model listing, which can name
-  models an account cannot run
+- every engine, read the way `ferry engines` reads it (see ENGINE_SETUP.md, "An engine
+  is up only when it answers"). An endpoint gets a real one-token request - not a model
+  listing, which can name models an account cannot run - and must return a completion
+  within 20 s. A CLI that wraps an API is proven by the worker's own tiny-prompt run
+  through that CLI, not by its endpoint answering. The report says:
+  - `ok (850ms)`: something returned a real completion.
+  - `reachable only: ...`: an address answered but no completion was seen. This counts
+    as a fault.
+  - `unprobed`: it cannot be tried without spending a real request (a CLI with no
+    endpoint). Not a fault.
+  - `says up, but recent runs failed: ...`: the engine proved itself, yet runs on it
+    timed out, stalled, returned nothing or errored since it last worked, per the
+    worker's engine ledger and within 24 hours. This is reported as a fact of its own,
+    because it is exactly the shape a hung model has: it answers a ping all day and
+    sits on every order.
 
 ## What it may do
 

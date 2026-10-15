@@ -284,6 +284,15 @@ pub struct AgentConfig {
     /// How hard the engine this config is running now is asked to think, set by
     /// [`Self::with_engine_effort`]. `None` asks nothing.
     pub effort: Option<ferryman_channel::policy::Effort>,
+    /// Runs that must fail on one engine in a row before the owner is told (once per
+    /// cool-off). Default 2: one failure is a bad run, two is an engine.
+    pub engine_alert_after: u32,
+    /// The most engines one order is handed through in one attempt before it is let go of
+    /// and the owner told. Default 3.
+    pub max_engines_per_order: usize,
+    /// How far past `timeout` a claimed run may go on before its claim is read as stale
+    /// and released with a note.
+    pub claim_grace: Duration,
 }
 
 /// The most orders one worker may run at once, whatever `max_parallel` says.
@@ -563,6 +572,30 @@ impl AgentConfig {
                 ),
             },
             effort: None,
+            engine_alert_after: match number(
+                "engine_alert_after",
+                u64::from(crate::engines::DEFAULT_ALERT_AFTER),
+            )? {
+                n @ 1..=100 => u32::try_from(n).unwrap_or(100),
+                other => bail!(
+                    "engine_alert_after is how many failed runs in a row tell the owner, 1 to \
+                     100 - not {other}"
+                ),
+            },
+            max_engines_per_order: match usize::try_from(number(
+                "max_engines_per_order",
+                crate::engines::DEFAULT_ENGINES_PER_ORDER as u64,
+            )?) {
+                Ok(n @ 1..=16) => n,
+                _ => bail!(
+                    "max_engines_per_order is how many engines one order is handed through, 1 \
+                     to 16 - not '{}'",
+                    fields
+                        .get("max_engines_per_order")
+                        .map_or("", String::as_str)
+                ),
+            },
+            claim_grace: Duration::from_secs(number("claim_grace_secs", 120)?),
             claim_window: match fields.get("claim_window").map(String::as_str) {
                 None | Some("") => None,
                 Some(value) => Some(crate::governor::Window::parse(value)?),
@@ -831,6 +864,157 @@ struct AgentRun {
     cost_usd: Option<f64>,
     /// An HTTP engine that nothing answered for.
     unreachable: bool,
+    /// An HTTP engine that took the request and never finished answering it.
+    timed_out: bool,
+}
+
+/// How a run failed on the engine rather than on the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultKind {
+    /// It ran past the time it was given.
+    TimedOut,
+    /// It went silent and was killed as frozen.
+    Stalled,
+    /// It finished with nothing: no answer and no tokens.
+    NoAnswer,
+    /// It answered with a server error.
+    Errored,
+    /// Nothing answered at its address.
+    Unreachable,
+}
+
+impl FaultKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed out",
+            Self::Stalled => "stalled",
+            Self::NoAnswer => "returned nothing",
+            Self::Errored => "errored",
+            Self::Unreachable => "was unreachable",
+        }
+    }
+}
+
+/// A run the worker had to cut short: it ran past its time or went silent. Kept as its
+/// own error, with the very words it always had, so the engine can be told from the work.
+#[derive(Debug)]
+struct RunFault {
+    kind: FaultKind,
+    message: String,
+}
+
+impl std::fmt::Display for RunFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for RunFault {}
+
+/// The engine, not the order, failed: a model call that timed out, stalled, returned no
+/// tokens or errored. The order is not at fault, so nothing is counted against it; the
+/// engine is marked down with a cool-off and the same order goes at once to the next
+/// engine the router allows.
+#[derive(Debug, Clone)]
+pub struct EngineFault {
+    pub engine: String,
+    pub model: Option<String>,
+    pub kind: FaultKind,
+    pub reason: String,
+}
+
+impl std::fmt::Display for EngineFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "engine '{}' {}: {}",
+            self.engine,
+            self.kind.as_str(),
+            self.reason
+        )
+    }
+}
+
+impl std::error::Error for EngineFault {}
+
+/// Whether a run that did not succeed failed on its engine, and how. Only what the engine
+/// itself did counts: a timeout, a stall, a reply with no tokens, a server error, an
+/// address nothing answers. A CLI that printed a failing test's name has not timed out.
+fn fault_of(config: &AgentConfig, run: &AgentRun) -> Option<(FaultKind, String)> {
+    let usage = run.usage.or_else(|| engine_usage(&run.stdout));
+    let no_tokens = usage.is_none_or(|usage| usage.completion_tokens == 0);
+    if run.ok {
+        // Success with nothing in it, from an engine that says it spent no tokens.
+        let empty = engine_answer(&run.stdout).trim().is_empty();
+        return (empty && usage.is_some_and(|usage| usage.completion_tokens == 0)).then(|| {
+            (
+                FaultKind::NoAnswer,
+                "it finished with an empty answer and 0 tokens".to_string(),
+            )
+        });
+    }
+    let detail = engine_failure_detail(run);
+    if run.timed_out {
+        return Some((FaultKind::TimedOut, detail));
+    }
+    if run.unreachable {
+        return Some((FaultKind::Unreachable, detail));
+    }
+    if no_tokens && mentions_timeout(run) {
+        return Some((FaultKind::TimedOut, detail));
+    }
+    if run.stdout.trim().is_empty() && run.stderr.trim().is_empty() {
+        return Some((
+            FaultKind::NoAnswer,
+            "it exited without printing anything (0 tokens)".to_string(),
+        ));
+    }
+    let http = config
+        .active
+        .as_ref()
+        .is_some_and(|engine| engine.kind == crate::engines::Kind::Http);
+    if http && run.stderr.contains("carried no answer") {
+        return Some((FaultKind::NoAnswer, detail));
+    }
+    if http && server_refused(&run.stderr) {
+        return Some((FaultKind::Errored, detail));
+    }
+    None
+}
+
+/// Whether the last few lines a CLI printed say it timed out.
+fn mentions_timeout(run: &AgentRun) -> bool {
+    const MARKERS: [&str; 5] = [
+        "timed out",
+        "timeout",
+        "time out",
+        "deadline exceeded",
+        "etimedout",
+    ];
+    [&run.stderr, &run.stdout].iter().any(|text| {
+        let lines: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let start = lines.len().saturating_sub(3);
+        let tail = lines[start..].join("\n").to_ascii_lowercase();
+        MARKERS.iter().any(|marker| tail.contains(marker))
+    })
+}
+
+/// Whether an HTTP engine's complaint is a server error or a rate limit: the engine's
+/// failure, to be routed around. A 4xx about the request itself is not.
+fn server_refused(said: &str) -> bool {
+    let Some(at) = said.find("HTTP ") else {
+        return false;
+    };
+    let code: String = said[at + 5..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    matches!(code.parse::<u16>(), Ok(404 | 408 | 429 | 500..=599))
 }
 
 /// Run whichever engine `config` is set to: its CLI, or one request to its endpoint.
@@ -864,6 +1048,7 @@ async fn run_engine(
                 usage: run.usage,
                 cost_usd: run.cost_usd,
                 unreachable: run.unreachable,
+                timed_out: run.timed_out,
             })
         }
         None => run_agent(config, workspace, prompt, credentials, heartbeat).await,
@@ -1461,11 +1646,14 @@ async fn run_agent(
                 kill_child(&mut child).await;
                 let _ = stdout_task.await;
                 let _ = stderr_task.await;
-                bail!(
-                    "'{}' printed nothing for {}s and was killed as frozen",
-                    config.command,
-                    config.stall.as_secs()
-                );
+                return Err(anyhow::Error::new(RunFault {
+                    kind: FaultKind::Stalled,
+                    message: format!(
+                        "'{}' printed nothing for {}s and was killed as frozen",
+                        config.command,
+                        config.stall.as_secs()
+                    ),
+                }));
             }
         }
 
@@ -1475,11 +1663,14 @@ async fn run_agent(
             kill_child(&mut child).await;
             let _ = stdout_task.await;
             let _ = stderr_task.await;
-            bail!(
-                "'{}' ran past {}s and was killed",
-                config.command,
-                config.timeout.as_secs()
-            );
+            return Err(anyhow::Error::new(RunFault {
+                kind: FaultKind::TimedOut,
+                message: format!(
+                    "'{}' ran past {}s and was killed",
+                    config.command,
+                    config.timeout.as_secs()
+                ),
+            }));
         }
 
         // There is deliberately NO memory check here. See the note below.
@@ -2215,6 +2406,100 @@ fn release_own_dead_runs(
     Ok(released)
 }
 
+/// Whether a claim this worker holds has outlived any run that could still be on it, and
+/// if so why.
+///
+/// `timeout + grace` is the longest a healthy run can take, so a heartbeat or a claim
+/// older than that belongs to nothing alive. A heartbeat whose process is gone is over
+/// at once. `None` means the claim is fine, or is not this worker's to judge.
+fn stale_reason(
+    task: &Task,
+    agent: &str,
+    limit: chrono::Duration,
+    now: chrono::DateTime<chrono::Utc>,
+    alive: impl Fn(u32) -> bool,
+) -> Option<&'static str> {
+    // A task that has a result has progressed; it is waiting on a review, not stuck.
+    if task.latest_revision().is_some() {
+        return None;
+    }
+    // Only a real, unreleased claim by this agent: an order merely addressed to it is
+    // not held, and another machine's claim is never this machine's to judge.
+    let claim = task
+        .claims
+        .iter()
+        .filter(|claim| claim.agent.eq_ignore_ascii_case(agent))
+        .max_by_key(|claim| claim.claimed_at)?;
+    if task.released(agent) || !task.holder().is_some_and(|h| h.eq_ignore_ascii_case(agent)) {
+        return None;
+    }
+    let beat = task
+        .heartbeats
+        .iter()
+        .find(|beat| beat.agent.eq_ignore_ascii_case(agent));
+    match beat {
+        Some(beat) if !alive(beat.pid) => Some("the worker process died mid-run"),
+        Some(beat) if now - beat.at > limit => Some("the run went past its timeout plus grace"),
+        None if now - claim.claimed_at > limit => {
+            Some("the claim is older than a run can last and nothing is running it")
+        }
+        _ => None,
+    }
+}
+
+/// Release this worker's own claims that no run is behind any more, on every poll.
+///
+/// The startup recovery only sees what a previous incarnation left. A run that wedged
+/// inside a live worker, or a worker that died and came back under another pid
+/// mid-session, left a claim nothing would ever look at again: the order sat "claimed" for
+/// days and nobody was told. The release is the same signed, ledgered one the startup
+/// pass writes; the claim file and every earlier result stay where they are, and the
+/// order goes back to the queue with the reason on it. Only this agent's own claims are
+/// judged, by the authority a worker already has over itself.
+fn release_stale_runs(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    tasks: &[Task],
+    report: &dyn Progress,
+) -> usize {
+    let Ok(limit) = chrono::Duration::from_std(config.timeout + config.claim_grace) else {
+        return 0;
+    };
+    let now = chrono::Utc::now();
+    let mut released = 0;
+    for task in tasks {
+        let id = &task.order.id;
+        let Some(why) = stale_reason(task, &config.agent, limit, now, process_alive) else {
+            continue;
+        };
+        if let Some(beat) = ferryman_channel::read_heartbeat(route, id, &config.agent)
+            .ok()
+            .flatten()
+            && process_alive(beat.pid)
+        {
+            kill_pid(beat.pid);
+        }
+        match ferryman_channel::release_own_claim(
+            route,
+            id,
+            &config.agent,
+            &format!("released as stale: {why}"),
+            identity,
+        ) {
+            Ok(_) => {
+                // The old heartbeat would make the next claim of this order look stale
+                // before its run had begun.
+                ferryman_channel::remove_heartbeat(route, id, &config.agent);
+                report.info(&format!("  {id}: released as stale ({why})"));
+                released += 1;
+            }
+            Err(error) => report.warn(&format!("  {id}: could not release stale claim: {error:#}")),
+        }
+    }
+    released
+}
+
 /// Part 4 of ADR 0011: a worker reclaims its own orphans at startup. A claim under
 /// its own name, with no result and no live run, is released so the task returns to
 /// the pool - and then the normal loop may re-claim it, which is the "resume" half of
@@ -2562,6 +2847,12 @@ pub async fn work_once(
     // ADR 0011: at startup, and only at startup, a worker adjudicates what its own
     // previous incarnation left behind - a claim with no result and no live run.
     recover_own_tasks(route, config, &identity, report)?;
+    // And on every poll after that: a claim of mine that nothing is running any more -
+    // its process gone, or its run past timeout plus grace - goes back to the queue with
+    // the reason on it, rather than sitting "claimed" for good.
+    if let Ok(all) = ferryman_channel::list_tasks(route) {
+        release_stale_runs(route, config, &identity, &all, report);
+    }
     // Always-on imports: any running worker re-polls the project's configured
     // sources and turns new external tickets into signed orders. This is what
     // makes an idle-but-running fleet pick work up without a human issuing it.
@@ -3114,8 +3405,10 @@ async fn note_engines(
     report: &dyn Progress,
 ) {
     let now = chrono::Utc::now();
+    apply_owner_answers(route, config, report);
     if crate::governor::paused().is_none() {
         crate::engines::probe_due(route, &config.agent, &config.engines, now).await;
+        prove_cli_engines(route, config, report).await;
         run_due_canaries(route, config, report).await;
     }
     let ledger = crate::engines::Ledger::load(&config.agent);
@@ -3132,6 +3425,136 @@ async fn note_engines(
         now,
     ) {
         report.warn(&format!("could not write this worker's engines: {error:#}"));
+    }
+}
+
+/// Act on the owner's "Retry now" to an engine-down or order-stuck notice this worker
+/// raised: lift the cool-off, so the engine is probed and tried again at once.
+///
+/// "Block <engine>" is not handled here: it is a change to the engine policy, which the
+/// places that answer a policy question already make, signed for the master. A question
+/// is acted on once. Only an answer that verifies is ever seen (see `questions::answer_to`).
+fn apply_owner_answers(route: &ProjectRoute, config: &AgentConfig, report: &dyn Progress) {
+    let agent = ferryman_channel::canonical_agent_name(&config.agent);
+    let down = format!("engine-down-{agent}-");
+    let stuck = format!("order-stuck-{agent}-");
+    let applied = crate::engines::Ledger::load(&config.agent).applied;
+    for (question, answer) in ferryman_channel::questions::list(route) {
+        let Some(answer) = answer else { continue };
+        let is_down = question.id.starts_with(&down);
+        if !(is_down || question.id.starts_with(&stuck)) || applied.contains(&question.id) {
+            continue;
+        }
+        let retry = ferryman_channel::policy::RETRY_NOW;
+        let Some(rest) = answer.answer.strip_prefix(retry) else {
+            crate::engines::mark_applied(&config.agent, &question.id);
+            continue;
+        };
+        let named = rest.trim();
+        for spec in &config.engines {
+            if named.is_empty() || spec.name.eq_ignore_ascii_case(named) {
+                crate::engines::clear_cooloff(&config.agent, &spec.name);
+            }
+        }
+        crate::engines::mark_applied(&config.agent, &question.id);
+        report.info(&format!(
+            "{} said to retry {}: the cool-off is lifted",
+            answer.from(),
+            if named.is_empty() {
+                "the engines"
+            } else {
+                named
+            }
+        ));
+    }
+}
+
+/// The prompt a CLI engine that wraps an API is proved with: one word back, no tools.
+const CLI_PROVE_PROMPT: &str = "Reply with the single word: ok";
+
+/// Prove, with a tiny prompt through the very command that does the work, each CLI engine
+/// that wraps an API and is due.
+///
+/// Reaching the endpoint says nothing about whether the shim behind it completes: the
+/// engine that hung for five minutes and produced no tokens answered a ping in 0.3 s.
+/// So this runs the command, with a short deadline, and calls the engine proven only if
+/// it exited well and printed something. At most every [`CLI_PROBE_EVERY_SECS`] per
+/// engine, and straight after a run failed on it, so a revived engine is found without
+/// waiting and a dead one costs one tiny prompt a quarter of an hour, not an order.
+async fn prove_cli_engines(route: &ProjectRoute, config: &AgentConfig, report: &dyn Progress) {
+    let ledger = crate::engines::Ledger::load(&config.agent);
+    let now = chrono::Utc::now();
+    let due: Vec<crate::engines::EngineSpec> = config
+        .engines
+        .iter()
+        .filter(|spec| crate::engines::cli_probe_due(spec, &ledger.state(&spec.name), now))
+        .cloned()
+        .collect();
+    for spec in due {
+        let probe = prove_cli_engine(route, config, &spec).await;
+        if !probe.ok {
+            report.warn(&format!(
+                "{} did not answer a tiny test prompt: {}",
+                spec.name,
+                probe.reason.as_deref().unwrap_or("no answer")
+            ));
+        }
+        crate::engines::record_cli_probe(&config.agent, &spec.name, probe);
+    }
+}
+
+/// One tiny-prompt run of one CLI engine, within [`crate::engines::CLI_PROVE_DEADLINE`].
+async fn prove_cli_engine(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    spec: &crate::engines::EngineSpec,
+) -> crate::engines::CliProbe {
+    let started = Instant::now();
+    let mut probe_config = config.with_engine(spec);
+    probe_config.timeout = crate::engines::CLI_PROVE_DEADLINE;
+    probe_config.stall = crate::engines::CLI_PROVE_DEADLINE;
+    let outcome = async {
+        let (credentials, key) =
+            engine_credentials(route, &probe_config).map_err(|error| format!("{error:#}"))?;
+        let dir = std::env::temp_dir().join(format!(
+            "ferryman-prove-{}-{}",
+            std::process::id(),
+            ferryman_channel::new_run_id()
+        ));
+        fs::create_dir_all(&dir).map_err(|error| format!("{error:#}"))?;
+        let run = tokio::time::timeout(
+            crate::engines::CLI_PROVE_DEADLINE + Duration::from_secs(5),
+            run_engine(
+                &probe_config,
+                &dir,
+                CLI_PROVE_PROMPT,
+                &credentials,
+                key.as_deref(),
+                None,
+            ),
+        )
+        .await;
+        let _ = fs::remove_dir_all(&dir);
+        match run {
+            Err(_) => Err("no answer to a tiny prompt before its deadline".to_string()),
+            Ok(Err(error)) => Err(format!("{error:#}")),
+            Ok(Ok(run)) if run.timed_out => {
+                Err("no answer to a tiny prompt before its deadline".to_string())
+            }
+            Ok(Ok(run)) if !run.ok => Err(engine_failure_detail(&run)),
+            Ok(Ok(run)) if run.stdout.trim().is_empty() => {
+                Err("it ran, and printed nothing: no tokens came back".to_string())
+            }
+            Ok(Ok(_)) => Ok(()),
+        }
+    }
+    .await;
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    crate::engines::CliProbe {
+        at: chrono::Utc::now(),
+        ok: outcome.is_ok(),
+        ms: Some(ms),
+        reason: outcome.err().map(|why| crate::engines::clip_reason(&why)),
     }
 }
 
@@ -3366,6 +3789,10 @@ async fn attempt(
     // failed attempt: it is marked, and the same order goes straight to the next engine
     // at its tier or above. Each engine is tried at most once per attempt, so this ends.
     let mut tried: Vec<String> = Vec::new();
+    // Engines whose model call failed on this order in this attempt - timed out, stalled,
+    // returned no tokens, errored - each with why. Each is marked down and the same order
+    // goes straight on, up to `max_engines_per_order` of them.
+    let mut faults: Vec<(String, String)> = Vec::new();
     // What kind of work this is, once per order: when the rules are unsure a model labels
     // it (cached, so a later attempt does not ask again) and the router reads the label.
     let improvement = crate::improve::is_improvement(task);
@@ -3373,6 +3800,15 @@ async fn attempt(
     let result = loop {
         let (engine, routing) = match next_routed(route, config, task, &tried) {
             Ok(chosen) => chosen,
+            Err(why) if !faults.is_empty() => {
+                // Engines failed this order and there is none left to hand it to. Not left
+                // sitting on a worker that cannot run it: let go of, with a note.
+                report.warn(&format!(
+                    "  {id}: {why}; every engine it was handed to failed"
+                ));
+                release_after_faults(route, config, identity, id, &faults, report);
+                return false;
+            }
             Err(why) => {
                 report.warn(&format!(
                     "  {id}: {why}; it waits, and nothing is counted against it"
@@ -3424,6 +3860,29 @@ async fn attempt(
                     report.warn(&format!("  {id}: {skip}; trying the next engine"));
                 }
             }
+            // The model call itself failed. The engine is marked down with a cool-off and
+            // the same order - same id, nothing counted against it - goes at once to the
+            // next engine the router allows.
+            Err(error) if error.downcast_ref::<EngineFault>().is_some() => {
+                if let Some(fault) = error.downcast_ref::<EngineFault>() {
+                    faults.push((
+                        fault.engine.clone(),
+                        format!("{}: {}", fault.kind.as_str(), fault.reason),
+                    ));
+                    let next = next_routed(route, config, task, &tried)
+                        .ok()
+                        .map(|(next, _)| next.name);
+                    note_fault(route, config, identity, id, fault, next.as_deref(), report);
+                    if faults.len() >= config.max_engines_per_order {
+                        report.warn(&format!(
+                            "  {id}: {} engines have failed it; letting go of it",
+                            faults.len()
+                        ));
+                        release_after_faults(route, config, identity, id, &faults, report);
+                        return false;
+                    }
+                }
+            }
             other => break other,
         }
     };
@@ -3459,6 +3918,128 @@ async fn attempt(
             }
             false
         }
+    }
+}
+
+/// A model call failed on `fault.engine`: mark the engine down with the reason and a
+/// cool-off (15 minutes, an hour, four, for each failure in a row), write the attempt into
+/// the signed ledger under the order's id - the order's history - and, when the engine has
+/// now failed `engine_alert_after` times in a row, tell the owner once for this cool-off.
+/// Best effort throughout: the order is handed on whether or not any of it is written.
+fn note_fault(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    id: &str,
+    fault: &EngineFault,
+    next: Option<&str>,
+    report: &dyn Progress,
+) {
+    let now = chrono::Utc::now();
+    let machine = ferryman_channel::receipts::machine_label();
+    let strike = crate::engines::record_run_failure(
+        &config.agent,
+        &fault.engine,
+        (fault.model.as_deref(), id),
+        &format!("{}: {}", fault.kind.as_str(), fault.reason),
+        config.engine_alert_after,
+        now,
+    );
+    let handed = next.map_or_else(
+        || "no engine left to hand it to".to_string(),
+        |next| format!("handed on to {next}"),
+    );
+    let note = format!(
+        "{} {} on {id} ({}); left alone until {} (failure {} in a row); {handed}",
+        fault.engine,
+        fault.kind.as_str(),
+        crate::engines::clip_reason(&fault.reason),
+        strike.cooloff_until.format("%a %H:%M UTC"),
+        strike.streak,
+    );
+    report.warn(&format!("  {id}: {note}"));
+    if let Err(error) = ferryman_channel::ledger::append_ledger_entry(
+        route,
+        identity,
+        "engine-fault",
+        &config.agent,
+        &note,
+        Some(id),
+    ) {
+        report.warn(&format!(
+            "  {id}: could not record the failed attempt: {error:#}"
+        ));
+    }
+    if !strike.alert {
+        return;
+    }
+    let down = ferryman_channel::policy::EngineDown {
+        engine: &fault.engine,
+        model: fault.model.as_deref(),
+        machine: &machine,
+        failures: strike.streak,
+        error: &fault.reason,
+        orders: &strike.orders,
+        started: strike.cooloff_started,
+        until: strike.cooloff_until,
+    };
+    match ferryman_channel::policy::ask_engine_down(route, identity, &down) {
+        Ok(true) => {
+            crate::engines::note_alert(
+                &config.agent,
+                &fault.engine,
+                &format!(
+                    "{}{}",
+                    ferryman_channel::policy::engine_down_prefix(&config.agent, &fault.engine),
+                    strike.cooloff_started.timestamp()
+                ),
+            );
+            report.warn(&format!(
+                "  {}: failed {} runs in a row; the owner has been asked what to do",
+                fault.engine, strike.streak
+            ));
+        }
+        Ok(false) => {}
+        Err(error) => report.warn(&format!(
+            "could not tell the owner about {}: {error:#}",
+            fault.engine
+        )),
+    }
+}
+
+/// Every engine an order was handed to failed it, or the most it may go through did: let go
+/// of its claim - signed, with a note naming each engine and why, the claim file and the
+/// history kept - so it is not left sitting on a worker that cannot run it, and tell the
+/// owner once. Another machine takes it, or this one when an engine is back.
+fn release_after_faults(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    identity: &AgentIdentity,
+    id: &str,
+    faults: &[(String, String)],
+    report: &dyn Progress,
+) {
+    let engines: Vec<&str> = faults.iter().map(|(engine, _)| engine.as_str()).collect();
+    let note = format!(
+        "every engine it was handed to failed ({}); released so another machine or a recovered \
+         engine can take it",
+        engines.join(", ")
+    );
+    if let Err(error) =
+        ferryman_channel::release_own_claim(route, id, &config.agent, &note, identity)
+    {
+        report.warn(&format!(
+            "  {id}: could not release the claim with a note ({error:#}); letting go of it"
+        ));
+        let _ = ferryman_channel::interrupt::abandon_claim(route, id, &config.agent);
+    }
+    let machine = ferryman_channel::receipts::machine_label();
+    match ferryman_channel::policy::ask_order_stuck(route, identity, id, &machine, faults) {
+        Ok(true) => report.warn(&format!(
+            "  {id}: the owner has been asked what to do about it"
+        )),
+        Ok(false) => {}
+        Err(error) => report.warn(&format!("  {id}: could not tell the owner: {error:#}")),
     }
 }
 
@@ -4047,7 +4628,7 @@ async fn do_work(
     let git_before = ferryman_channel::evidence::before(&workdir);
     let started_at = chrono::Utc::now();
     let clock = std::time::Instant::now();
-    let run = run_engine(
+    let run = match run_engine(
         config,
         &workdir,
         &prompt,
@@ -4055,7 +4636,24 @@ async fn do_work(
         key.as_deref(),
         Some(heartbeat),
     )
-    .await?;
+    .await
+    {
+        Ok(run) => run,
+        // The engine ran past its time or went silent and was killed: its failure, not
+        // the order's. Handed on to the next engine by the caller.
+        Err(error) => {
+            return Err(match error.downcast_ref::<RunFault>() {
+                Some(cut) => EngineFault {
+                    engine: config.engine().name,
+                    model: config.engine().model,
+                    kind: cut.kind,
+                    reason: cut.message.clone(),
+                }
+                .into(),
+                None => error,
+            });
+        }
+    };
     let ran = (started_at, clock.elapsed().as_secs());
     // What the engine says it spent, when it says anything. Recorded twice on
     // purpose: into the trajectory (what the cost aggregator reads) and into
@@ -4094,8 +4692,24 @@ async fn do_work(
     // next engine is handed the same checkout, with whatever the last one got done.
     if !run.ok
         && let Some(skip) = unavailable(config, &run)
+        && skip.until.is_some()
     {
         return Err(skip.into());
+    }
+    // The engine itself failed: it timed out, returned no tokens, errored, or nothing
+    // answered. Also not this order's failure, and not left for the next pass to find
+    // out: the caller marks the engine down and hands the same order to the next one.
+    if let Some((kind, reason)) = fault_of(config, &run) {
+        return Err(EngineFault {
+            engine: engine.name.clone(),
+            model: engine.model.clone().or_else(|| config.model.clone()),
+            kind,
+            reason,
+        }
+        .into());
+    }
+    if run.ok {
+        crate::engines::record_run_success(&config.agent, &engine.name, chrono::Utc::now());
     }
 
     let machine = ferryman_channel::receipts::machine_label();
@@ -8716,6 +9330,347 @@ engine.coder.model = "big-coder"
                 .any(|line| line.contains("sw8-b") && line.contains("panicked")),
             "the panic is recorded against its order: {warnings:?}"
         );
+    }
+
+    // --- engines that hang: marked down, the order goes on, the owner is told ------------
+
+    /// Two endpoint engines: the first answers its probe and then hangs on real work (the
+    /// 2026-10-12 incident, in miniature); the second works.
+    const HANGS_THEN_WORKS: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+         engines = [\"hung\", \"free\"]\n\
+         engine.hung.base_url = \"fake://hangrun\"\n\
+         engine.hung.model = \"deepseek-v4.1-flash\"\n\
+         engine.free.base_url = \"fake://ok:the work is done\"\nengine.free.model = \"m\"\n";
+
+    /// Three engines that all hang on real work.
+    const ALL_HANG: &str = "agent = \"wisp\"\ncommand = \"ferryman-no-such-engine\"\n\
+         pause_while_active = \"false\"\nmin_free_ram_mb = \"0\"\n\
+         engines = [\"h1\", \"h2\", \"h3\"]\n\
+         engine.h1.base_url = \"fake://hangrun\"\nengine.h1.model = \"m1\"\n\
+         engine.h2.base_url = \"fake://hangrun\"\nengine.h2.model = \"m2\"\n\
+         engine.h3.base_url = \"fake://hangrun\"\nengine.h3.model = \"m3\"\n";
+
+    fn fault_entries(route: &ProjectRoute) -> Vec<ferryman_channel::ledger::LedgerEntry> {
+        ferryman_channel::ledger::read_ledger(route)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.kind == "engine-fault")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_runtime_timeout_marks_the_engine_down_and_hands_the_same_order_on_in_the_same_pass()
+    {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-hung", HANGS_THEN_WORKS);
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 1, "the order was done in the same pass");
+        let task = ferryman_channel::read_task(&route, "t-hung").unwrap();
+        assert_eq!(task.order.id, "t-hung", "the same order, not a copy");
+        assert_eq!(task.results.len(), 1);
+        assert_eq!(task.results[0].payload["engine"], "free");
+        let now = chrono::Utc::now();
+        let ledger = crate::engines::Ledger::load("wisp");
+        let hung = ledger.state("hung");
+        assert_eq!(hung.fail_streak, 1);
+        assert!(hung.cooloff_until.is_some_and(|until| until > now));
+        assert_eq!(hung.failed_model.as_deref(), Some("deepseek-v4.1-flash"));
+        assert!(
+            hung.last_failure
+                .as_deref()
+                .is_some_and(|why| why.contains("timed out") && why.contains("no answer")),
+            "{:?}",
+            hung.last_failure
+        );
+        assert_eq!(hung.failed_orders, ["t-hung"]);
+        // The engine reads as down, with the reason and when it is expected back.
+        let spec = &config.engines[0];
+        assert!(!crate::engines::availability(spec, &hung, now).usable());
+        let report = &crate::engines::reports(&config.engines, &ledger, now)[0];
+        assert_eq!(report.state, "down");
+        assert!(report.until.is_some());
+        assert!(
+            report
+                .reason
+                .as_deref()
+                .is_some_and(|why| why.contains("cooling off")),
+            "{:?}",
+            report.reason
+        );
+        // The attempt is in the order's history, signed, under the order's id.
+        let faults = fault_entries(&route);
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].reference.as_deref(), Some("t-hung"));
+        assert!(
+            faults[0].summary.contains("hung timed out"),
+            "{}",
+            faults[0].summary
+        );
+        assert!(
+            faults[0].summary.contains("handed on to free"),
+            "{}",
+            faults[0].summary
+        );
+        // Nothing is counted against the order for its engine's failure.
+        let key = (route.project_id.clone(), "t-hung".to_string());
+        assert!(!attempt_ledger().lock().unwrap().failures.contains_key(&key));
+        // One failed run is a bad run: the owner is not told yet.
+        assert!(ferryman_channel::questions::pending(&route).is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_order_that_exhausts_its_engines_is_released_with_a_note_and_the_owner_is_told_once()
+    {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_order_for_wisp(comms.path(), "t-stuck", ALL_HANG);
+        assert_eq!(config.max_engines_per_order, 3);
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 0);
+        let task = ferryman_channel::read_task(&route, "t-stuck").unwrap();
+        assert!(task.results.is_empty());
+        assert!(task.released("wisp"), "back in the queue");
+        assert_eq!(
+            task.claims.len(),
+            1,
+            "the claim is kept; history is never deleted"
+        );
+        assert!(
+            task.releases
+                .last()
+                .is_some_and(|release| release.reason.contains("h1, h2, h3")),
+            "{:?}",
+            task.releases
+        );
+        assert_eq!(fault_entries(&route).len(), 3, "each attempt is recorded");
+        let stuck: Vec<_> = ferryman_channel::questions::pending(&route)
+            .into_iter()
+            .filter(|question| question.id.starts_with("order-stuck-"))
+            .collect();
+        assert_eq!(stuck.len(), 1);
+        for needle in ["t-stuck", "h1", "h2", "h3", "timed out"] {
+            assert!(
+                stuck[0].text.contains(needle),
+                "{needle}: {}",
+                stuck[0].text
+            );
+        }
+        assert_eq!(stuck[0].order_id.as_deref(), Some("t-stuck"));
+        for option in ["Retry now", "Block h1", "Keep waiting"] {
+            assert!(
+                stuck[0].options.iter().any(|o| o.starts_with(option)),
+                "{option}"
+            );
+        }
+
+        // The engines are cooling off, so the next pass holds the order and posts nothing
+        // new: one notice, however often the worker comes round.
+        let again = work_once(&route, &config, &crate::Silent).await.unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(fault_entries(&route).len(), 3, "no engine was tried again");
+        assert_eq!(ferryman_channel::questions::pending(&route).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn two_failures_in_a_row_tell_the_owner_once_per_cooloff_and_retry_now_lifts_it() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) =
+            channel_with_order_for_wisp(comms.path(), "t-twice", HANGS_THEN_WORKS);
+        // The engine hung on an order twenty minutes ago and its first cool-off is over.
+        let before = chrono::Utc::now() - chrono::Duration::minutes(20);
+        crate::engines::record_run_failure(
+            "wisp",
+            "hung",
+            (Some("deepseek-v4.1-flash"), "t-earlier"),
+            "timed out: the model call sat for 300 s",
+            2,
+            before,
+        );
+
+        let acted = work_once(&route, &config, &crate::Silent).await.unwrap();
+
+        assert_eq!(acted, 1, "handed on to the next engine all the same");
+        let hung = crate::engines::Ledger::load("wisp").state("hung");
+        assert_eq!(hung.fail_streak, 2);
+        assert!(
+            hung.cooloff_until
+                .is_some_and(|until| until > chrono::Utc::now() + chrono::Duration::minutes(50)),
+            "the second failure leaves it alone for an hour: {:?}",
+            hung.cooloff_until
+        );
+        let pending = ferryman_channel::questions::pending(&route);
+        let down: Vec<_> = pending
+            .iter()
+            .filter(|question| question.id.starts_with("engine-down-wisp-hung-"))
+            .collect();
+        assert_eq!(down.len(), 1, "{pending:?}");
+        for needle in [
+            "hung",
+            "deepseek-v4.1-flash",
+            "2 run(s) in a row",
+            "t-earlier",
+            "t-twice",
+        ] {
+            assert!(down[0].text.contains(needle), "{needle}: {}", down[0].text);
+        }
+        assert!(down[0].options.contains(&"Block hung".to_string()));
+        assert!(down[0].options.contains(&"Retry now hung".to_string()));
+        assert!(
+            down[0]
+                .options
+                .contains(&ferryman_channel::policy::KEEP_REROUTING.to_string())
+        );
+        assert_eq!(hung.alert_question.as_deref(), Some(down[0].id.as_str()));
+        // Asking again for the same cool-off posts nothing.
+        let identity = AgentIdentity::from_seed("wisp", [7; 32]);
+        let info = ferryman_channel::policy::EngineDown {
+            engine: "hung",
+            model: None,
+            machine: "m",
+            failures: 2,
+            error: "again",
+            orders: &[],
+            started: hung.cooloff_started.unwrap(),
+            until: hung.cooloff_until.unwrap(),
+        };
+        assert!(!ferryman_channel::policy::ask_engine_down(&route, &identity, &info).unwrap());
+
+        // The owner says retry: only a verified answer from the master counts.
+        ferryman_channel::master::initialize_master(&route, &boss(), "boss").unwrap();
+        ferryman_channel::questions::answer(&route, &down[0].id, "Retry now hung", "boss", &boss())
+            .unwrap();
+        apply_owner_answers(&route, &config, &crate::Silent);
+        let hung = crate::engines::Ledger::load("wisp").state("hung");
+        assert!(hung.cooloff_until.is_none() && hung.fail_streak == 0);
+        assert!(
+            crate::engines::availability(&config.engines[0], &hung, chrono::Utc::now()).usable()
+        );
+        assert!(
+            crate::engines::Ledger::load("wisp")
+                .applied
+                .contains(&down[0].id)
+        );
+    }
+
+    #[test]
+    fn a_claim_with_nothing_running_it_is_stale_only_once_it_has_outlived_a_run() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, _) = channel_with_order_for_wisp(comms.path(), "t-stale", NO_ENGINE);
+        ferryman_channel::claim_order(&route, "t-stale", "wisp").unwrap();
+        let task = ferryman_channel::read_task(&route, "t-stale").unwrap();
+        let now = chrono::Utc::now();
+        let limit = chrono::Duration::seconds(420);
+        let later = now + chrono::Duration::seconds(500);
+
+        assert_eq!(stale_reason(&task, "wisp", limit, now, |_| true), None);
+        assert!(
+            stale_reason(&task, "wisp", limit, later, |_| true)
+                .is_some_and(|why| why.contains("older than a run can last"))
+        );
+        // Another worker's claim is never this one's to judge.
+        assert_eq!(stale_reason(&task, "ember", limit, later, |_| true), None);
+
+        let beat = ferryman_channel::Heartbeat {
+            order_id: "t-stale".into(),
+            agent: "wisp".into(),
+            run: "r1".into(),
+            pid: 4242,
+            at: now,
+        };
+        ferryman_channel::write_heartbeat(&route, &beat).unwrap();
+        let task = ferryman_channel::read_task(&route, "t-stale").unwrap();
+        assert_eq!(
+            stale_reason(&task, "wisp", limit, now, |_| false),
+            Some("the worker process died mid-run")
+        );
+        assert_eq!(stale_reason(&task, "wisp", limit, now, |_| true), None);
+        assert!(
+            stale_reason(&task, "wisp", limit, later, |_| true)
+                .is_some_and(|why| why.contains("timeout plus grace"))
+        );
+    }
+
+    #[test]
+    fn a_stale_claim_goes_back_to_the_queue_with_a_note_and_nothing_is_deleted() {
+        hermetic_machine();
+        let comms = tempfile::tempdir().unwrap();
+        let (route, mut config) = channel_with_order_for_wisp(comms.path(), "t-old", NO_ENGINE);
+        ferryman_channel::claim_order(&route, "t-old", "wisp").unwrap();
+        config.timeout = Duration::from_millis(5);
+        config.claim_grace = Duration::ZERO;
+        std::thread::sleep(Duration::from_millis(60));
+        let wisp = AgentIdentity::from_seed("wisp", [7; 32]);
+        let tasks = ferryman_channel::list_tasks(&route).unwrap();
+
+        assert_eq!(
+            release_stale_runs(&route, &config, &wisp, &tasks, &crate::Silent),
+            1
+        );
+
+        let task = ferryman_channel::read_task(&route, "t-old").unwrap();
+        assert!(task.released("wisp"));
+        assert_eq!(task.claims.len(), 1, "the claim is still on record");
+        assert!(
+            task.releases
+                .last()
+                .is_some_and(|release| release.reason.starts_with("released as stale")),
+            "{:?}",
+            task.releases
+        );
+        // Released once: the next poll finds nothing left to release.
+        let tasks = ferryman_channel::list_tasks(&route).unwrap();
+        assert_eq!(
+            release_stale_runs(&route, &config, &wisp, &tasks, &crate::Silent),
+            0
+        );
+    }
+
+    #[test]
+    fn only_what_the_engine_did_counts_as_the_engines_fault() {
+        let config = AgentConfig::parse(NO_ENGINE).unwrap();
+        let run = |ok: bool, stdout: &str, stderr: &str| AgentRun {
+            ok,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            ..AgentRun::default()
+        };
+        // The shim that sat for 300 s and printed only that it timed out.
+        let shim = fault_of(&config, &run(false, "", "The operation timed out"));
+        assert!(matches!(shim, Some((FaultKind::TimedOut, _))), "{shim:?}");
+        // Exited without a word.
+        let silent = fault_of(&config, &run(false, "", ""));
+        assert!(
+            matches!(silent, Some((FaultKind::NoAnswer, _))),
+            "{silent:?}"
+        );
+        // A CLI that ran, did its job badly and says so: the work's failure, not the engine's.
+        assert!(
+            fault_of(
+                &config,
+                &run(false, "3 tests failed\nsee above", "error: build failed")
+            )
+            .is_none()
+        );
+        // A run that finished with an answer is no fault.
+        assert!(fault_of(&config, &run(true, "done", "")).is_none());
+        // Spent tokens, then mentioned a timeout of its own in passing: not a hung model.
+        let spent = AgentRun {
+            usage: Some(ferryman_channel::trajectory::TokenUsage {
+                prompt_tokens: 10,
+                completion_tokens: 50,
+            }),
+            ..run(false, "the test hit a timeout", "")
+        };
+        assert!(fault_of(&config, &spent).is_none());
     }
 }
 

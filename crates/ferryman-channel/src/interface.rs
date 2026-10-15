@@ -987,6 +987,7 @@ mod tests {
                 billing: None,
                 class: None,
                 capabilities: None,
+                proof: None,
             };
             crate::receipts::refresh_engines(
                 &route,

@@ -7475,6 +7475,7 @@ mod tests {
                     billing: None,
                     class: None,
                     capabilities: None,
+                    proof: None,
                 }],
                 Utc::now(),
             )
