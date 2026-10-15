@@ -79,6 +79,26 @@ const MAX_COMMITS: usize = 50;
 const MAX_PATHS: usize = 50;
 /// How many committed paths are listed.
 const MAX_TOUCHED: usize = 200;
+/// How many notes are kept. Notes are for a reviewer to read; a long answer must not be
+/// able to push a hundred of them into every machine's ledger entry.
+const MAX_NOTES: usize = 20;
+/// How many words back to look for the word that *names* a hash.
+///
+/// `the sha256 of the log is 3f2a...` names the hash four words before it, and
+/// `commit 1a2b3c4d and the image digest sha256:9f8e...` names the second one right next
+/// to it. Six words covers both without reaching across into a neighbouring hash's
+/// sentence.
+const NAMING_WINDOW: usize = 6;
+/// The words before a hash that say what it is a digest *of*, and so that it is not a
+/// commit this channel can look up: a file, a log, an archive, a container image.
+///
+/// A hierarchy of digests is not a git history, and a worker that reported one was not
+/// claiming to have committed anything. Reading one as a commit id is how an honest result
+/// came back "Refuted" from a fleet.
+const DIGEST_WORDS: [&str; 11] = [
+    "md5", "sha1", "sha224", "sha256", "sha384", "sha512", "digest", "checksum", "tarball",
+    "archive", "image",
+];
 
 /// What the evidence says about the claim.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -901,25 +921,46 @@ fn clip(text: &str, chars: usize) -> String {
 /// Commit hashes an answer names: a run of 7 to 40 hex digits with both a digit and a
 /// letter in it, in an answer that talks about commits. Words like `deadbeef` or
 /// `facade` never count - they have no digit.
+///
+/// A hash a nearby word names as a *digest* - `sha256`, `md5`, `checksum`, of a log, a
+/// tarball or an image - is not one of these. It is not a claim about git history, and it
+/// cannot be looked up in one, so counting it turned a report of a file's checksum into a
+/// commit the workspace "does not have".
 #[must_use]
 pub fn claimed_hashes(answer: &str) -> Vec<String> {
     if !answer.to_lowercase().contains("commit") {
         return Vec::new();
     }
+    let words: Vec<&str> = answer
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
     let mut found: Vec<String> = Vec::new();
-    for token in answer.split(|c: char| !c.is_ascii_alphanumeric()) {
+    for (index, token) in words.iter().enumerate() {
         let hex = token.chars().all(|c| c.is_ascii_hexdigit());
         let digit = token.chars().any(|c| c.is_ascii_digit());
         let letter = token.chars().any(|c| c.is_ascii_alphabetic());
-        if hex && digit && letter && (7..=40).contains(&token.len()) {
-            let hash = token.to_ascii_lowercase();
-            if !found.contains(&hash) {
-                found.push(hash);
-            }
+        if !(hex && digit && letter && (7..=40).contains(&token.len())) {
+            continue;
+        }
+        let before = &words[index.saturating_sub(NAMING_WINDOW)..index];
+        if before.iter().any(|word| digest_word(word)) {
+            continue;
+        }
+        let hash = token.to_ascii_lowercase();
+        if !found.contains(&hash) {
+            found.push(hash);
         }
     }
     found.truncate(20);
     found
+}
+
+/// Whether one word names a hash as a digest rather than as a commit.
+fn digest_word(word: &str) -> bool {
+    DIGEST_WORDS
+        .iter()
+        .any(|digest| word.eq_ignore_ascii_case(digest))
 }
 
 /// Look up every commit hash the answer names in the workspace at `dir`.
@@ -1083,12 +1124,36 @@ pub fn judge(evidence: &mut Evidence, payload: &Value, answer: &str) {
                 .to_string(),
         );
     }
+    // A commit hash the workspace does not have.
+    //
+    // This used to be a flat refutation, and that was wrong in the way that costs a fleet
+    // most: it branded a *finished, honest* result a lie and held the work. Two real cases
+    // from a fleet - a hash quoted from the sibling repository, and a hash that was a
+    // digest of a file, in an answer that also said "commit" somewhere. Neither is a claim
+    // about this repository's history, and neither is a claim that nothing was done.
+    //
+    // The distinction that matters is whether the branch has anything to show. Work with a
+    // real commit or a real diff is not refuted by a mis-cited id in its prose: it is
+    // noted, prominently, and the reviewer reads the diff. Work with nothing behind it is
+    // still refuted - by the rule above, and here. `notes` counts for nothing in `status`,
+    // so this can only ever move a result *out* of "refuted", never into it.
     for claimed in evidence.claimed_commits.iter().filter(|c| !c.exists) {
-        refuted.push(format!(
-            "names commit {}, which the workspace does not have",
-            claimed.hash
-        ));
+        if changed {
+            evidence.notes.push(format!(
+                "names commit {}, which this repository does not have: probably a hash from \
+                 another repository, or a digest of a file. The {} commit(s) on the branch are \
+                 what the work is read from.",
+                claimed.hash,
+                evidence.commits.len()
+            ));
+        } else {
+            refuted.push(format!(
+                "names commit {}, which the workspace does not have",
+                claimed.hash
+            ));
+        }
     }
+    evidence.notes.truncate(MAX_NOTES);
     if is_verification(payload) {
         if evidence.verdict.is_none() {
             unverified
@@ -1622,6 +1687,60 @@ mod tests {
             "words made of hex letters are not hashes"
         );
         assert!(claimed_hashes("abc1234 with no mention").is_empty());
+    }
+
+    #[test]
+    fn a_mis_cited_hash_does_not_refute_work_the_branch_shows() {
+        // The field report that started this: an honest, finished order quoted a commit id
+        // belonging to the *other* repository, and came back "refuted: names commit ...,
+        // which the workspace does not have" - with the work sitting on the branch.
+        let dir = repo();
+        let before = before(dir.path());
+        std::fs::write(dir.path().join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        git(dir.path(), &["add", "a.txt"]).unwrap();
+        git(dir.path(), &["commit", "-q", "-m", "the work"]).unwrap();
+        let mut evidence = after(dir.path(), before.as_ref());
+        assert!(evidence.changed(), "the branch shows the work");
+        let answer = "Done. Committed in ferryman-comms as 4f2a9c1e1f0b3d7a";
+        check_claimed_commits(&mut evidence, dir.path(), answer);
+        assert_eq!(evidence.claimed_commits.len(), 1, "{evidence:?}");
+        assert!(
+            !evidence.claimed_commits[0].exists,
+            "that id is not in this repository"
+        );
+        judge(&mut evidence, &json!({ "task": "x" }), answer);
+        assert_eq!(evidence.status, Status::Verified, "{:?}", evidence.reasons);
+        assert!(evidence.reasons.is_empty(), "{:?}", evidence.reasons);
+        assert_eq!(evidence.notes.len(), 1, "{:?}", evidence.notes);
+        assert!(
+            evidence.notes[0].contains("4f2a9c1e1f0b3d7a")
+                && evidence.notes[0].contains("another repository"),
+            "{:?}",
+            evidence.notes
+        );
+    }
+
+    #[test]
+    fn a_hash_named_as_a_digest_is_not_a_commit_the_workspace_must_have() {
+        // The other half of the field report: the answer said "commit" somewhere, and also
+        // reported a checksum of a file. Reading the checksum as a commit id invented a
+        // commit that could not exist.
+        let log = "the sha256 of the log is 3f2a1b9c8d7e6f5a4b3c2d1e0f9a8b7c";
+        assert!(claimed_hashes(log).is_empty(), "{:?}", claimed_hashes(log));
+        let image = "no commit was needed; the image digest is sha256:9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        assert!(
+            claimed_hashes(image).is_empty(),
+            "{:?}",
+            claimed_hashes(image)
+        );
+        // A digest beside a real claim must not swallow the real claim.
+        let mixed = "commit 1a2b3c4d, and the tarball md5 is 9f8e7d6c5b4a39281706f5e4d3c2b1a0";
+        assert_eq!(
+            claimed_hashes(mixed),
+            vec!["1a2b3c4d".to_string()],
+            "{:?}",
+            claimed_hashes(mixed)
+        );
     }
 
     /// The real result that started this: ichabod on grouchly, 12 seconds after the
