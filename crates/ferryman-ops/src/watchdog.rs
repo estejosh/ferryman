@@ -128,7 +128,7 @@ impl Facts {
     pub fn bad_engines(&self) -> Vec<&EngineFact> {
         self.engines
             .iter()
-            .filter(|e| !e.state.starts_with("ok"))
+            .filter(|e| !e.state.starts_with("ok") && !e.state.starts_with("unprobed"))
             .collect()
     }
 
@@ -252,6 +252,51 @@ fn services() -> Vec<(String, String)> {
         .collect()
 }
 
+/// What the watchdog says about one engine: the same honest reading `ferry engines`
+/// gives, and the runs that failed on it.
+///
+/// `ok (850ms)` only when something returned a real completion - the one-token request
+/// for an endpoint, the worker's own tiny-prompt run for a CLI that wraps one. An
+/// endpoint that merely answered is "reachable only", an engine that cannot be tried
+/// cheaply is "unprobed", and an engine that proved itself but has failed real runs
+/// since is "says up, but recent runs failed" - a fact in its own right, because that is
+/// the shape the hung model had.
+#[must_use]
+pub(crate) fn engine_state_text(
+    spec: &crate::engines::EngineSpec,
+    probe: &crate::engines::Probe,
+    state: &crate::engines::EngineState,
+    failing: Option<&str>,
+) -> String {
+    use crate::engines::Proof;
+    // A CLI in front of an endpoint is proved by running the CLI, which the worker does
+    // and records; the endpoint answering says nothing about it.
+    let proof = if spec.kind == crate::engines::Kind::Cli && spec.base_url.is_some() {
+        crate::engines::proof_of(spec, state)
+    } else {
+        probe.proof
+    };
+    let headline = match (&probe.down, &probe.exhausted) {
+        (Some(why), _) => return failing.map_or_else(|| why.clone(), |f| format!("{why}; {f}")),
+        (None, Some(why)) => return format!("out of quota: {why}"),
+        (None, None) => match proof {
+            Proof::Answered => format!(
+                "ok ({}ms)",
+                probe.latency_ms.or(state.latency_ms).unwrap_or_default()
+            ),
+            Proof::Reachable => "reachable only: no completion has been seen from it".to_string(),
+            Proof::Unprobed => "unprobed".to_string(),
+        },
+    };
+    match failing {
+        Some(failed) if proof == Proof::Answered => {
+            format!("says up, but recent runs failed: {failed}")
+        }
+        Some(failed) => format!("{headline}; recent runs failed: {failed}"),
+        None => headline,
+    }
+}
+
 /// Gather the facts. Engines are probed with a real one-token request each, once per
 /// distinct endpoint and model, whatever their configured probe.
 pub async fn gather(comms: &Path) -> Facts {
@@ -304,8 +349,20 @@ pub async fn gather(comms: &Path) -> Facts {
         let Ok(config) = crate::agent::AgentConfig::load(&attachment) else {
             continue;
         };
+        let ledger = crate::engines::Ledger::load(&config.agent);
+        let now = chrono::Utc::now();
         for spec in &config.engines {
+            // What the worker has seen of this engine's real runs, which a probe cannot
+            // say: an engine can answer a one-token request all day and still hang on work.
+            let failing = crate::engines::recent_failures(&ledger.state(&spec.name), now);
             let (Some(base), Some(model)) = (&spec.base_url, &spec.model) else {
+                if let Some(failed) = failing {
+                    facts.engines.push(EngineFact {
+                        engine: spec.name.clone(),
+                        model: spec.model.clone().unwrap_or_default(),
+                        state: format!("recent runs failed: {failed}"),
+                    });
+                }
                 continue;
             };
             let id = (base.clone(), model.clone());
@@ -319,12 +376,8 @@ pub async fn gather(comms: &Path) -> Facts {
             let mut chat = spec.clone();
             chat.probe_chat = true;
             let probe = crate::engines::probe(&chat, key.as_deref()).await;
-            let state = match (&probe.down, &probe.exhausted, probe.latency_ms) {
-                (Some(why), _, _) => why.clone(),
-                (None, Some(why), _) => format!("out of quota: {why}"),
-                (None, None, Some(ms)) => format!("ok ({ms}ms)"),
-                (None, None, None) => "no answer".to_string(),
-            };
+            let state =
+                engine_state_text(spec, &probe, &ledger.state(&spec.name), failing.as_deref());
             facts.engines.push(EngineFact {
                 engine: spec.name.clone(),
                 model: model.clone(),
@@ -585,6 +638,72 @@ mod tests {
         assert!(f.supports(Action::Nothing));
         assert!(!f.supports(Action::StartSyncthing));
         assert!(!f.supports(Action::RestartWorkers));
+    }
+
+    #[test]
+    fn an_engine_that_says_up_while_its_recent_runs_failed_is_a_fact_of_its_own() {
+        use crate::engines::{EngineSpec, EngineState, Kind, Paid, Probe, Proof, Tier};
+        let spec = EngineSpec {
+            name: "deepseek".into(),
+            kind: Kind::Http,
+            tier: Tier::Build,
+            paid: Paid::Prepaid,
+            command: String::new(),
+            args: Vec::new(),
+            model: Some("m".into()),
+            base_url: Some("fake://ok:fine".into()),
+            key: None,
+            env: Vec::new(),
+            probe_chat: true,
+            weekly_requests: None,
+            weekly_usd: None,
+            provider: None,
+            route: Vec::new(),
+            class: None,
+            effort_args: std::collections::BTreeMap::new(),
+            supports_effort: false,
+            declared: ferryman_channel::capability::Declared::default(),
+        };
+        let answered = Probe {
+            latency_ms: Some(300),
+            proof: Proof::Answered,
+            ..Probe::default()
+        };
+        let state = EngineState::default();
+        let say =
+            |probe: &Probe, failing: Option<&str>| engine_state_text(&spec, probe, &state, failing);
+
+        assert_eq!(say(&answered, None), "ok (300ms)");
+        let lying = say(&answered, Some("2 run(s) failed in a row: timed out"));
+        assert!(
+            lying.starts_with("says up, but recent runs failed"),
+            "{lying}"
+        );
+        let reachable = Probe {
+            proof: Proof::Reachable,
+            ..Probe::default()
+        };
+        assert!(say(&reachable, None).starts_with("reachable only"));
+        let unprobed = Probe {
+            proof: Proof::Unprobed,
+            ..Probe::default()
+        };
+        assert_eq!(say(&unprobed, None), "unprobed");
+
+        // Each of those is read right: only a real completion is ok, and unprobed is not a
+        // fault in itself, but the other two are.
+        let facts = |state: String| Facts {
+            engines: vec![EngineFact {
+                engine: "deepseek".into(),
+                model: "m".into(),
+                state,
+            }],
+            ..Facts::default()
+        };
+        assert!(facts(say(&answered, None)).healthy());
+        assert!(facts(say(&unprobed, None)).healthy());
+        assert!(!facts(say(&reachable, None)).healthy());
+        assert!(!facts(lying).healthy());
     }
 
     #[test]

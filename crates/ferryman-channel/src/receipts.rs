@@ -749,6 +749,12 @@ pub struct EngineReport {
     /// A v2-only field, like `class`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<crate::capability::Capabilities>,
+    /// What its probe proved: `answered` (it returned a real completion), `reachable` (an
+    /// address answered but no completion was seen) or `unprobed` (nothing cheap can be
+    /// asked of it). Only `answered` goes with state `up`. `None` from a worker older than
+    /// honest probes. A v2-only field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<String>,
 }
 
 /// How one engine is billed, as far as the worker running it can tell. Never a
@@ -846,6 +852,30 @@ impl EngineTrust {
 }
 
 impl EngineReport {
+    /// What `ferry engines` says in the state column: `up` only with the proof that earns
+    /// it, and the other cases in the words for what is actually known.
+    ///
+    /// - `up, answered in 0.9 s`: a real completion came back from it.
+    /// - `reachable only`: an address answered; nothing has completed.
+    /// - `unprobed`: nothing cheap can be asked of it.
+    /// - `up (unverified)`: a worker older than honest probes said `up`.
+    #[must_use]
+    pub fn state_label(&self) -> String {
+        let seconds = self
+            .latency_ms
+            .map(|ms| format!("{:.1} s", ms as f64 / 1000.0));
+        match (self.state.as_str(), self.proof.as_deref()) {
+            ("up", Some("answered")) => match seconds {
+                Some(seconds) => format!("up, answered in {seconds}"),
+                None => "up, answered".to_string(),
+            },
+            ("up", None) => "up (unverified)".to_string(),
+            (_, Some("reachable")) if self.state == "unknown" => "reachable only".to_string(),
+            (_, Some("unprobed")) if self.state == "unknown" => "unprobed".to_string(),
+            (state, _) => state.to_string(),
+        }
+    }
+
     /// The report without what changes on every probe, for deciding whether anything
     /// worth telling the fleet has changed.
     fn settled(&self) -> Self {
@@ -886,6 +916,7 @@ impl EngineInventory {
         self.engines.iter().any(|e| {
             e.class.is_some()
                 || e.capabilities.is_some()
+                || e.proof.is_some()
                 || e.trust
                     .as_ref()
                     .is_some_and(|trust| !trust.kinds.is_empty())
@@ -907,6 +938,7 @@ fn engines_v1_json(engines: &[EngineReport]) -> String {
             };
             engine.remove("class");
             engine.remove("capabilities");
+            engine.remove("proof");
             if let Some(trust) = engine.get_mut("trust").and_then(|t| t.as_object_mut()) {
                 trust.remove("kinds");
             }
@@ -1551,6 +1583,7 @@ mod tests {
             billing: None,
             class: None,
             capabilities: None,
+            proof: None,
         }
     }
 

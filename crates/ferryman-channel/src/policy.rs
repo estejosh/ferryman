@@ -1138,7 +1138,13 @@ impl Candidate {
     }
 
     fn usable(&self) -> bool {
-        self.state != "exhausted"
+        self.state != "exhausted" && !self.cooling_off()
+    }
+
+    /// Down with a time it is expected back: runs failed on it, so it is left alone until
+    /// then (a probe that failed says `down` with no time and is still tried, last).
+    fn cooling_off(&self) -> bool {
+        self.state == "down" && self.until.is_some()
     }
 
     fn trust_score(&self) -> Option<u64> {
@@ -1393,6 +1399,10 @@ fn rank_in(policy: &Policy, role: Role, tier: &str, work: Work, engines: &[Candi
             ranking.out.push((
                 index,
                 match engine.until {
+                    Some(until) if engine.cooling_off() => format!(
+                        "is cooling off until {} after runs failed on it",
+                        until.format("%a %H:%M UTC")
+                    ),
                     Some(until) => format!("is out until {}", until.format("%a %H:%M UTC")),
                     None => "is out of credit".to_string(),
                 },
@@ -3718,6 +3728,136 @@ pub fn ask_free_tier(
         ),
         &[format!("Block {engine}"), "Keep using it".to_string()],
         None,
+    )
+}
+
+/// The owner's answer to "an engine keeps failing": leave the cool-off alone, orders keep
+/// going to the next engine.
+pub const KEEP_REROUTING: &str = "Keep re-routing";
+/// The owner's answer to a stuck order: let it wait for the engines to come back.
+pub const KEEP_WAITING: &str = "Keep waiting";
+/// The answer that lifts a cool-off: try the engine (or the engines that failed an order)
+/// again at once.
+pub const RETRY_NOW: &str = "Retry now";
+
+/// What the owner is told when an engine fails run after run.
+#[derive(Debug, Clone)]
+pub struct EngineDown<'a> {
+    pub engine: &'a str,
+    pub model: Option<&'a str>,
+    pub machine: &'a str,
+    /// Failed runs in a row.
+    pub failures: u32,
+    pub error: &'a str,
+    /// Orders its failures have touched.
+    pub orders: &'a [String],
+    /// When the cool-off began, and when it ends.
+    pub started: DateTime<Utc>,
+    pub until: DateTime<Utc>,
+}
+
+/// The question id for one engine's cool-off: one per cool-off, so the owner is told
+/// once however many orders it touches.
+#[must_use]
+pub fn engine_down_prefix(agent: &str, engine: &str) -> String {
+    format!(
+        "engine-down-{}-{}-",
+        crate::canonical_agent_name(agent),
+        engine.to_ascii_lowercase()
+    )
+}
+
+/// Tell the master an engine failed run after run and is being left alone: which engine,
+/// which model, on which machine, the error and the orders it touched. The orders have
+/// been handed to the next engine already; the buttons are for what comes next. Once per
+/// cool-off, and not again while an earlier notice about the same engine is unanswered.
+/// Returns whether it was asked now.
+pub fn ask_engine_down(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    down: &EngineDown<'_>,
+) -> Result<bool> {
+    let prefix = engine_down_prefix(identity.name(), down.engine);
+    if crate::questions::pending(route)
+        .iter()
+        .any(|question| question.id.starts_with(&prefix))
+    {
+        return Ok(false);
+    }
+    let model = down
+        .model
+        .map_or(String::new(), |model| format!(" (model {model})"));
+    crate::questions::ask(
+        route,
+        identity,
+        &format!("{prefix}{}", down.started.timestamp()),
+        crate::questions::POLICY,
+        &format!(
+            "Engine {}{model} on {} failed {} run(s) in a row: {}\n\nOrders it touched: {}.\n\n\
+             It is left alone until {}, and those orders have gone to the next engine. Block \
+             it for background work, retry it now, or leave it cooling off and keep \
+             re-routing.",
+            down.engine,
+            down.machine,
+            down.failures,
+            down.error,
+            if down.orders.is_empty() {
+                "none yet".to_string()
+            } else {
+                down.orders.join(", ")
+            },
+            down.until.format("%a %H:%M UTC"),
+        ),
+        &[
+            format!("Block {}", down.engine),
+            format!("{RETRY_NOW} {}", down.engine),
+            KEEP_REROUTING.to_string(),
+        ],
+        None,
+    )
+}
+
+/// Tell the master an order went through the most engines it may and none finished it:
+/// each engine and why, and that the order was let go so another machine - or this one,
+/// when an engine is back - can take it. Once per order and machine. Returns whether it
+/// was asked now.
+pub fn ask_order_stuck(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    order_id: &str,
+    machine: &str,
+    attempts: &[(String, String)],
+) -> Result<bool> {
+    let mut options: Vec<String> = vec![RETRY_NOW.to_string()];
+    for (engine, _) in attempts {
+        let block = format!("Block {engine}");
+        if !options.contains(&block) {
+            options.push(block);
+        }
+    }
+    options.push(KEEP_WAITING.to_string());
+    let lines: Vec<String> = attempts
+        .iter()
+        .map(|(engine, why)| format!("- {engine}: {why}"))
+        .collect();
+    crate::questions::ask(
+        route,
+        identity,
+        &format!(
+            "order-stuck-{}-{}",
+            crate::canonical_agent_name(identity.name()),
+            order_id.to_ascii_lowercase()
+        ),
+        crate::questions::POLICY,
+        &format!(
+            "Order {order_id} could not be finished on {machine}: every engine it was handed \
+             to failed.\n{}\n\nThe order was let go of, with a note, so it is not left \
+             sitting on a worker. It runs again when an engine is back or another machine \
+             takes it. Retry the engines now, block one, or keep waiting.",
+            lines.join("\n")
+        ),
+        &options,
+        Some(order_id),
     )
 }
 
@@ -6363,6 +6503,7 @@ mod tests {
                 billing: None,
                 class: None,
                 capabilities: None,
+                proof: None,
             }],
             Utc::now(),
         )

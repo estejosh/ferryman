@@ -2709,6 +2709,7 @@ mod tests {
                 billing: None,
                 class: None,
                 capabilities: None,
+                proof: None,
             }],
             Utc::now(),
         );
@@ -3585,6 +3586,7 @@ mod tests {
             billing: None,
             class: None,
             capabilities: None,
+            proof: None,
         };
         let now = Utc::now();
         ferryman_channel::receipts::refresh_engines(
@@ -3638,6 +3640,7 @@ mod tests {
                 billing: None,
                 class: None,
                 capabilities: None,
+                proof: None,
             };
         ferryman_channel::receipts::refresh_engines(
             route,

@@ -184,7 +184,9 @@ pub fn pick_classifier<'a>(assist: &Assist<'a>) -> std::result::Result<&'a Engin
         }
         let state = assist.ledger.state(&spec.name);
         let availability = engines::availability(spec, &state, assist.now);
-        if let Availability::Exhausted { reason, .. } = &availability {
+        if let Availability::Exhausted { reason, .. } | Availability::CoolingOff { reason, .. } =
+            &availability
+        {
             why.push(format!("{}: {reason}", spec.name));
             continue;
         }
