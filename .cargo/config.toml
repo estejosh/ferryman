@@ -1,0 +1,5 @@
+[env]
+# A test thread gets 2 MB of stack by default. `Cli` is a large clap enum, and parsing it
+# in a debug build on Windows needs more than that. `main` already runs the parser on a
+# 16 MB thread; this gives tests the same room.
+RUST_MIN_STACK = "16777216"
