@@ -650,6 +650,45 @@ paths:
         '200': {description: 'how many delegations were revoked'}
         '401': {description: no active session}
         '403': {description: read-only, or not the master}
+  /api/questions:
+    get:
+      summary: What the fleet is waiting on the master for
+      description: >
+        Rename requests (from an AI session, or anyone who cannot sign as the master) and
+        clarifying questions still unanswered, oldest first, each with its `options`.
+        Questions that have a page of their own (contracts, suggestions, engine policy, the
+        adversary) are not listed. `may_answer` is true only for the signed-in master.
+      parameters:
+        - {name: project, in: query, required: false, schema: {type: string}}
+      responses:
+        '200': {description: 'questions, master and may_answer'}
+        '401': {description: no active session}
+  /api/questions/{id}/answer:
+    post:
+      summary: The master answers a question
+      description: >
+        Signed with the signed-in master's key. A rename request takes one of its options
+        (`Rename` or `Keep <name>`). Once it says Rename, the machine that asked writes the
+        name: here at once when that is this machine (`renamed`), otherwise on its worker's
+        next pass; every machine then moves its folders and no device re-pairs (ADR 0024).
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+        - {name: project, in: query, required: false, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answer]
+              properties:
+                answer: {type: string}
+      responses:
+        '200': {description: 'the id, the answer, and the new name when it was written here'}
+        '400': {description: not one of a rename request's options}
+        '401': {description: no active session}
+        '403': {description: not the master, or already answered}
+        '404': {description: no such question to answer here}
   /api/contracts:
     get:
       summary: Every interface contract in the project

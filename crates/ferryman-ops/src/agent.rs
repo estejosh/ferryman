@@ -3457,6 +3457,23 @@ fn apply_owner_answers(route: &ProjectRoute, config: &AgentConfig, report: &dyn 
     let agent = ferryman_channel::canonical_agent_name(&config.agent);
     let down = format!("engine-down-{agent}-");
     let stuck = format!("order-stuck-{agent}-");
+    // A rename this machine asked its master for, now approved: write the name (ADR 0024).
+    // The folders follow at the next start or watchdog pass, while nothing holds them.
+    let mut key_dirs = vec![route.attachment.clone()];
+    if let Some(parent) = route.communications.parent() {
+        key_dirs.push(parent.to_path_buf());
+    }
+    if let Some(root) = ferryman_channel::ferry::find_root() {
+        key_dirs.push(root.path);
+    }
+    if let Some(named) = ferryman_channel::naming::apply_approved(route, &key_dirs) {
+        report.info(&format!(
+            "{} approved the rename: {} is now called {}",
+            named.authority(),
+            route.project_id,
+            named.name
+        ));
+    }
     let applied = crate::engines::Ledger::load(&config.agent).applied;
     for (question, answer) in ferryman_channel::questions::list(route) {
         let Some(answer) = answer else { continue };

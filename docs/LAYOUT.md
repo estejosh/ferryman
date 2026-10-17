@@ -79,4 +79,4 @@ Either way: `repos sync` does not clone it, an all-projects worker does not serv
 
 ## Renaming a project
 
-`<project>` in the paths above is the project's name, which is its id until its master renames it. `ferry root rename <project> <name>` signs a `NAME` record into the channel; each machine then moves its own `comms/` and `repos/` folders to the new name, keeping the Syncthing folder id (`<id>-ferryman`), so nothing re-pairs. See ADR 0024.
+`<project>` in the paths above is the project's name, which is its id until its master renames it. `ferry root rename <project> <name>` signs a `NAME` record into the channel; each machine then moves its own `comms/` and `repos/` folders to the new name, keeping the Syncthing folder id (`<id>-ferryman`), so nothing re-pairs. Nobody has to type it: ask any AI session to rename the project and it runs the command; it cannot sign as the master, so it asks them, they tap Rename on the dashboard or Telegram, and the machine that asked does the rest. See ADR 0024.

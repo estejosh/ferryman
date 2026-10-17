@@ -43,6 +43,26 @@ that holds something, a folder in use is tried again next time, and nothing is d
 worker's home (the clone holding its `agent.toml`) is named in its service unit or scheduled
 task, so it keeps its folder until `ferry fleet setup --service` runs again.
 
+Nobody has to type the command. A person tells whatever AI they are working with ("rename
+fructly to fm-comms") and it runs `ferry root rename` itself. An AI session cannot sign as
+the master, because a person's key is sealed under their password, so the command asks
+instead: the session's machine, under its own key on the roster, files a `rename` question
+for the master with two buttons, Rename and `Keep <name>`. The master taps one on the
+dashboard's Home page or on Telegram. The tap is their signature, the same rule as naming a
+head agent: the master's signed word is the proof. Once the answer says Rename, the machine
+that asked writes `NAME` with its own key and carries the question and the master's answer in
+it (`approval`), so every machine checks the master approved exactly that name at exactly
+that step. The question's id is `rename-<name>-<seq>`, so one tap approves one rename and
+nothing else. The machine that asked writes it on its worker's next pass (at once when the
+dashboard that took the answer is on that machine), and the watchdog moves the folders on
+every machine when it sees a name its folders do not carry yet. The watchdog never signs. A
+person at a terminal can still sign at once with `--as <master>`.
+
+An answer a delegate gave (the Telegram bridge, under the master's `improve` delegation) is
+checked as questions are: the delegation has to hold now. A machine that accepted such a name
+keeps it if the delegation later ends; a machine that never saw it falls back to the id until
+the master renames again.
+
 Every command that asks for a project accepts its id, its name or an old name. An id wins
 over a name and a name over an old name; two projects can never be given one name.
 Renaming to the id undoes a rename.

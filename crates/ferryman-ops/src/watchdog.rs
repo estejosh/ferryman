@@ -126,6 +126,9 @@ pub struct Facts {
     /// A fixed folder (comms, repos, work) is missing.
     #[serde(default)]
     pub missing_folders: bool,
+    /// Projects renamed by their master whose folders here still carry the old name.
+    #[serde(default)]
+    pub renamed: Vec<String>,
     /// Layout problems no automatic action fixes (the worker count, the service).
     #[serde(default)]
     pub layout_notes: Vec<String>,
@@ -149,7 +152,10 @@ impl Facts {
     /// Whether `repos sync` or a lock archive would change anything.
     #[must_use]
     pub fn layout_repairable(&self) -> bool {
-        !self.unsynced.is_empty() || self.dead_locks > 0 || self.missing_folders
+        !self.unsynced.is_empty()
+            || self.dead_locks > 0
+            || self.missing_folders
+            || !self.renamed.is_empty()
     }
 
     #[must_use]
@@ -225,6 +231,11 @@ impl Facts {
             out.push_str(&format!(
                 "layout: {} worker lock(s) name a dead process\n",
                 self.dead_locks
+            ));
+        }
+        for line in &self.renamed {
+            out.push_str(&format!(
+                "layout: folders still carry the old name of {line}\n"
             ));
         }
         for line in &self.layout_notes {
@@ -316,6 +327,12 @@ fn gather_layout(comms: &Path, facts: &mut Facts) {
         .filter(|lock| lock.proven_dead())
         .count();
     facts.missing_folders = report.checks.iter().any(|c| c.name == "folders" && !c.ok);
+    facts.renamed = root
+        .follow_names(true)
+        .into_iter()
+        .filter(ferryman_channel::naming::Followed::moved)
+        .map(|followed| format!("{} ({})", followed.name, followed.project_id))
+        .collect();
     facts.layout_notes = report
         .checks
         .iter()
@@ -888,6 +905,16 @@ mod tests {
         f.dead_locks = 1;
         assert_eq!(f.rule(), Action::RepairLayout);
         assert!(f.as_text().contains("name a dead process"));
+    }
+
+    /// A project its master renamed: the watchdog moves the folders without being asked.
+    #[test]
+    fn a_renamed_project_is_followed() {
+        let mut f = healthy();
+        f.renamed.push("fm-comms (fructly)".into());
+        assert!(!f.healthy());
+        assert_eq!(f.rule(), Action::RepairLayout);
+        assert!(f.as_text().contains("old name of fm-comms (fructly)"));
     }
 
     #[test]

@@ -838,12 +838,17 @@ enum RootCommand {
     /// channel. Syncthing keeps the folder id, so nothing re-pairs, nothing is re-approved
     /// and no old signature breaks. The old name keeps working everywhere a project is
     /// asked for. Renaming to the id undoes a rename.
+    ///
+    /// Run by an AI session (or anyone who cannot sign as the master), it asks instead:
+    /// the master taps Rename on the dashboard or Telegram and this machine's worker does
+    /// the rest. Nobody has to type anything else.
     Rename {
         /// The project: its id, its name, or an old name.
         project: String,
         /// The new name: lowercase letters, digits and '-'.
         name: String,
-        /// Who signs. Default: the project's master.
+        /// Sign now as the master (asks for their password at a terminal). Without it, a
+        /// session that cannot sign as the master asks them to approve instead.
         #[arg(long = "as", value_parser = agent_name)]
         as_master: Option<String>,
     },
@@ -7806,8 +7811,12 @@ async fn agent_command(command: Agent) -> Result<()> {
                  'ferry root init'",
             )?;
             // Projects renamed elsewhere (ADR 0024): move this machine's folders to their
-            // names before planning, while no task holds them. Nothing here signs.
+            // names before planning, while no task holds them. A rename this machine asked
+            // for and the master approved is written first, signed with the key it asked with.
             if !dry_run {
+                for (id, name) in root.apply_approved_renames() {
+                    println!("{id}: its master approved the rename to {name}");
+                }
                 for followed in root.follow_names(false) {
                     for (what, moved) in [("channel", &followed.channel), ("clone", &followed.repo)]
                     {
@@ -9467,6 +9476,23 @@ fn new_operator_password(name: &str) -> anyhow::Result<String> {
 /// nobody watching, and a prompt in that setting is a hang rather than a question. It is
 /// read once, here, and never placed in a child process's environment - `send` signs in
 /// this process and passes on the signature, not the secret.
+/// Whether this process can sign as `master` here without anyone else: their key is a
+/// file on this machine, or they are a person whose password this process can get (from
+/// the environment, or typed at a terminal). An AI session has neither, so it asks.
+fn can_sign_as(attachment: &std::path::Path, master: &str) -> bool {
+    if held_operator().is_some_and(|held| held.name().eq_ignore_ascii_case(master)) {
+        return true;
+    }
+    if ferryman_server::operators::OperatorStore::new(attachment).exists(master) {
+        return std::env::var("FERRYMAN_OPERATOR_PASSWORD").is_ok_and(|p| !p.is_empty())
+            || std::io::IsTerminal::is_terminal(&std::io::stdin());
+    }
+    ferryman_channel::AgentIdentity::load_existing(master, attachment)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 fn operator_password(name: &str) -> anyhow::Result<String> {
     if let Ok(password) = std::env::var("FERRYMAN_OPERATOR_PASSWORD")
         && !password.is_empty()
@@ -12555,6 +12581,43 @@ fn root_command(command: RootCommand) -> Result<()> {
                 workspace: None,
                 all: false,
             })?;
+            let master = ferry::master_of(&channel)?;
+            let sign_now = as_master.is_some()
+                || master
+                    .as_deref()
+                    .is_some_and(|master| can_sign_as(&attachment, master));
+            if !sign_now {
+                // An AI session, or anyone without the master's key: ask, and let the
+                // master's tap be the signature (ADR 0024).
+                let prefer = ferryman_ops::identity::machine_name().ok();
+                let asker = root.asker(&id, prefer.as_deref())?;
+                let old = root.resolve(&id)?.name();
+                match root.ask_rename(&id, &name, &asker)? {
+                    None => println!("{id} is already called {name}"),
+                    Some(request) => {
+                        let master = master.unwrap_or_else(|| "the master".into());
+                        println!(
+                            "asked {master} to rename {old} to {name} ({request}, from {})",
+                            asker.name()
+                        );
+                        println!();
+                        println!(
+                            "  {master} gets Rename / Keep on the dashboard's Home page and on Telegram."
+                        );
+                        println!(
+                            "  Once they tap Rename, {}'s worker writes the name and every machine",
+                            asker.name()
+                        );
+                        println!(
+                            "  moves its folders. Nothing else to do, and no device re-pairs."
+                        );
+                        println!(
+                            "  (At a terminal, {master} can sign it now instead with --as {master}.)"
+                        );
+                    }
+                }
+                return Ok(());
+            }
             let (master, identity) = mastered_signer(&channel, &attachment, as_master.as_deref())?;
             let (changed, followed) = root.rename(&id, &name, &identity)?;
             if changed {
@@ -12577,6 +12640,11 @@ fn root_command(command: RootCommand) -> Result<()> {
             let Some(root) = ferry::find_root() else {
                 bail!("no ferry root yet - make one with `ferry root init`")
             };
+            if !dry_run {
+                for (id, name) in root.apply_approved_renames() {
+                    println!("{id}: its master approved the rename to {name}");
+                }
+            }
             let all = root.follow_names(dry_run);
             if all.is_empty() {
                 println!("every project's folders already carry its name");

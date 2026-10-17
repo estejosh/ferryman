@@ -37,6 +37,9 @@ pub const ADVERSARY: &str = "adversary";
 /// An outside suggestion waiting for the master: accept, decline or ask more. Nothing is
 /// built from one until the master's signed answer says Accept; see [`crate::suggestions`].
 pub const SUGGESTION: &str = "suggestion";
+/// Someone asked to rename the project. Answered Rename or Keep; the machine that asked
+/// writes the name once the master's answer says Rename. See [`crate::naming`].
+pub const RENAME: &str = "rename";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {
@@ -187,6 +190,13 @@ fn answer_holds(route: &ProjectRoute, question: &Question, answer: &Answer) -> b
             &answer_payload(answer),
             &route.agents,
         ) == SignatureCheck::Valid
+}
+
+/// Whether `question` was asked by someone on the roster and `answer` is the master's,
+/// both signed as they claim. For a record that carries the pair as its proof.
+#[must_use]
+pub fn holds(route: &ProjectRoute, question: &Question, answer: &Answer) -> bool {
+    question_holds(route, question) && answer_holds(route, question, answer)
 }
 
 /// One question by id, when it verifies.

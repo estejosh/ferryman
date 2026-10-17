@@ -1942,6 +1942,8 @@ impl Bridge {
                     format!("{project} - engine policy")
                 } else if question.kind == questions::CONTRACT {
                     format!("{project} - interface contract, waiting for your lock")
+                } else if question.kind == questions::RENAME {
+                    format!("{project} - rename request, waiting for you")
                 } else if question.kind == questions::SUGGESTION {
                     // The buttons are Accept, Decline and Ask more: the same signed answer
                     // `ferry suggestions accept` gives. Everything below the heading is the
