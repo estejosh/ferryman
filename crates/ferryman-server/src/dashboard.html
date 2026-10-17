@@ -996,11 +996,25 @@ pages.home = async () => {
   const waiting = (counts.AwaitingReview || 0) + (counts.ChangesRequested || 0);
   const open = (counts.Open || 0) + (counts.Offered || 0);
   const stale = (counts.Stale || 0);
+  // What the fleet is waiting on the master for: a rename asked for by an AI session, a
+  // question while planning. Only the master gets buttons; the tap is their signature.
+  let asked = { questions: [], may_answer: false };
+  try { asked = await api("/api/questions"); } catch (_) { /* older server: nothing to show */ }
 
   return `
     <div class="head">
       <div><h1>Home</h1><p>What the fleet is doing right now, read from the channel.</p></div>
     </div>
+    ${(asked.questions || []).map((q) => `
+      <div class="notice question-row" style="display:block">
+        <b>${q.kind === "rename" ? "Rename request" : "A question"} from ${esc(q.asked_by)}</b>
+        <span style="color:var(--faint)"> ${esc(ago(q.asked_at))}</span>
+        <div style="white-space:pre-wrap;margin-top:4px">${esc(q.text)}</div>
+        ${asked.may_answer ? `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap">
+          ${(q.options || []).map((o) => `<button class="btn" data-question="${esc(q.id)}" data-answer="${esc(o)}">${esc(o)}</button>`).join("")}
+        </div>` : `<div class="s" style="color:var(--dim);margin-top:6px">Waiting for ${esc(asked.master || "the master")} to answer.</div>`}
+        <div class="question-msg" style="color:var(--faint)"></div>
+      </div>`).join("")}
     ${unverified ? `<div class="notice"><b>Attention</b><div>${unverified}
       ${unverified === 1 ? "record does" : "records do"} not carry a valid signature.
       Anything unverifiable is shown as it is, never treated as fine.</div></div>` : ""}
@@ -2603,6 +2617,23 @@ pages.contracts = async () => {
       </div>`).join("") : `<div class="empty">No contract has been proposed. Propose one with <span class="mono">ferry contract propose &lt;file.json&gt;</span>.</div>`}</div>`;
 };
 
+function wireQuestions() {
+  $$("[data-question]").forEach((b) => b.addEventListener("click", async () => {
+    const row = b.closest(".question-row");
+    row.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+    try {
+      await api(`/api/questions/${encodeURIComponent(b.dataset.question)}/answer`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ answer: b.dataset.answer }),
+      });
+      await render();
+    } catch (err) {
+      row.querySelector(".question-msg").textContent = String(err.message || err).slice(0, 200);
+      row.querySelectorAll("button").forEach((x) => { x.disabled = false; });
+    }
+  }));
+}
+
 function wireContracts() {
   const decide = (attr, verb) => $$(`[${attr}]`).forEach((b) => b.addEventListener("click", async () => {
     b.disabled = true;
@@ -3140,6 +3171,7 @@ async function render() {
   wireTeammates();
   wireAgents();
   wireContracts();
+  wireQuestions();
   wireFocus();
   wireSuggestions();
   wireVault();

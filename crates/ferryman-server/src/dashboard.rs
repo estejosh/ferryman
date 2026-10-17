@@ -439,6 +439,8 @@ pub fn router(state: DashboardState) -> Router {
             get(delegations_get).post(delegations_set),
         )
         .route("/api/delegations/revoke", post(delegations_revoke))
+        .route("/api/questions", get(questions_get))
+        .route("/api/questions/{id}/answer", post(question_answer))
         .route("/api/contracts", get(contracts_get))
         .route("/api/contracts/{reference}/lock", post(contract_lock))
         .route("/api/contracts/{reference}/reject", post(contract_reject))
@@ -3245,6 +3247,107 @@ fn contract_order_row(task: &ferryman_channel::Task) -> Value {
 /// locked or rejected), its shapes, who proposed and locked it, and the orders on each
 /// side, with the reason any of them is being held. `may_decide` is true only for the
 /// master, the one person whose Lock counts.
+/// The kinds of question the Home page answers with their own buttons. The others have
+/// pages of their own (contracts, suggestions, engine policy, the adversary), where an
+/// answer also does what that page does.
+const ANSWERED_ON_HOME: [&str; 2] = [
+    ferryman_channel::questions::RENAME,
+    ferryman_channel::questions::CLARIFY,
+];
+
+/// GET /api/questions - what the fleet is waiting on the master for: rename requests and
+/// clarifying questions, oldest first. `may_answer` is true only for the signed-in master.
+async fn questions_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+) -> Result<Json<Value>, DashboardError> {
+    let route = with_current_roster(&state.route_for(params.project.as_deref()));
+    let master = ferryman_channel::master::read_master(&route)
+        .ok()
+        .flatten()
+        .map(|declaration| declaration.master);
+    let may_answer = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .zip(master.as_ref())
+            .is_some_and(|(me, master)| master.eq_ignore_ascii_case(me.name()));
+    let questions: Vec<Value> = ferryman_channel::questions::pending(&route)
+        .into_iter()
+        .filter(|question| ANSWERED_ON_HOME.contains(&question.kind.as_str()))
+        .map(|question| {
+            json!({
+                "id": question.id,
+                "kind": question.kind,
+                "text": question.text,
+                "options": question.options,
+                "asked_by": question.asked_by,
+                "asked_at": question.asked_at,
+            })
+        })
+        .collect();
+    Ok(Json(
+        json!({ "questions": questions, "master": master, "may_answer": may_answer }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct AnswerBody {
+    answer: String,
+}
+
+/// POST /api/questions/{id}/answer - the master's answer, signed with their key. A rename
+/// is answered with one of its buttons; once it says Rename, the machine that asked writes
+/// the name (here at once, when that is this machine) and every machine follows.
+async fn question_answer(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Path(id): Path<String>,
+    Json(body): Json<AnswerBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let route = with_current_roster(&state.route_for(params.project.as_deref()));
+    let Some(question) = ferryman_channel::questions::read(&route, &id)
+        .filter(|question| ANSWERED_ON_HOME.contains(&question.kind.as_str()))
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no question {id} to answer here"),
+        ));
+    };
+    let answer = body.answer.trim().to_string();
+    if question.kind == ferryman_channel::questions::RENAME && !question.options.contains(&answer) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("answer with one of: {}", question.options.join(", ")),
+        ));
+    }
+    ferryman_channel::questions::answer(&route, &id, &answer, current.name(), &current)
+        .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &route,
+        &current,
+        "question",
+        current.name(),
+        &format!("answered {id}: {answer}"),
+        None,
+    );
+    let mut renamed = None;
+    if question.kind == ferryman_channel::questions::RENAME {
+        let mut key_dirs = vec![route.attachment.clone()];
+        if let Some(parent) = route.communications.parent() {
+            key_dirs.push(parent.to_path_buf());
+        }
+        renamed =
+            ferryman_channel::naming::apply_approved(&route, &key_dirs).map(|named| named.name);
+    }
+    Ok(Json(
+        json!({ "id": id, "answer": answer, "renamed": renamed }),
+    ))
+}
+
 async fn contracts_get(
     State(state): State<DashboardState>,
     headers: HeaderMap,
@@ -7393,6 +7496,66 @@ mod tests {
     /// The Contracts page: a proposed contract is listed with its shapes and the orders on
     /// each side, only the master can lock it, a locked contract cannot be decided again,
     /// and the order cards carry the interface, the files and the overlap warning.
+    /// An AI session asks to rename the project; the master sees Rename / Keep on Home,
+    /// only one of those answers is taken, and Rename renames it on this machine at once.
+    #[tokio::test]
+    async fn the_master_approves_a_rename_from_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        assert_eq!(
+            post(&app, "/api/master/init", "{}", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let bot = ferryman_channel::AgentIdentity::from_seed("bot", [3u8; 32]);
+        bot.seat_in(&route.attachment).unwrap();
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "bot".into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(bot.public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        let fresh = with_current_roster(&route);
+        let id = ferryman_channel::naming::ask_rename(&fresh, "renamed-one", &[], &bot)
+            .unwrap()
+            .unwrap();
+
+        let asked = get_json(&app, "/api/questions", Some(&token)).await;
+        assert_eq!(asked["may_answer"], true, "{asked}");
+        assert_eq!(asked["questions"][0]["id"], id.as_str(), "{asked}");
+        assert_eq!(asked["questions"][0]["options"][0], "Rename", "{asked}");
+        let path = format!("/api/questions/{id}/answer");
+        assert_eq!(
+            post(&app, &path, r#"{"answer":"sure"}"#, Some(&token))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            post(&app, &path, r#"{"answer":"Rename"}"#, None)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let done = post(&app, &path, r#"{"answer":"Rename"}"#, Some(&token)).await;
+        assert_eq!(done.status(), StatusCode::OK);
+        assert_eq!(
+            ferryman_channel::naming::display_name(&route.communications, &route.project_id),
+            "renamed-one"
+        );
+        let after = get_json(&app, "/api/questions", Some(&token)).await;
+        assert_eq!(after["questions"].as_array().unwrap().len(), 0, "{after}");
+    }
+
     #[tokio::test]
     async fn the_master_locks_a_contract_from_the_browser_and_nobody_else_can() {
         use ferryman_channel::interface::{self, InterfaceRef, Side};

@@ -561,8 +561,14 @@ struct SwarmMemory {
 /// Where this machine remembers a channel's swarm setting: per channel, so two channels of
 /// one project name (or a test's temporary one) never share it.
 fn swarm_memory_path(channel: &Path, project_id: &str) -> Option<PathBuf> {
+    memory_path("swarm", channel, project_id)
+}
+
+/// Where this machine remembers the newest signed `kind` record (swarm, name) it accepted
+/// for a channel: per channel, so two channels of one project id never share it.
+pub(crate) fn memory_path(kind: &str, channel: &Path, project_id: &str) -> Option<PathBuf> {
     use sha2::{Digest, Sha256};
-    let dir = crate::licensing::machine_state_dir()?.join("swarm");
+    let dir = crate::licensing::machine_state_dir()?.join(kind);
     let place = std::fs::canonicalize(channel).unwrap_or_else(|_| channel.to_path_buf());
     let digest = Sha256::digest(place.display().to_string().to_lowercase().as_bytes());
     Some(dir.join(format!(
@@ -718,7 +724,7 @@ pub fn set_swarm(
 /// Whether two paths are the same place. Compared after resolving where they can be, folded
 /// on Windows (where `X:\Ferry` and `x:\ferry` are one directory, and a temporary folder has
 /// a short and a long spelling).
-fn same_place(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_place(a: &Path, b: &Path) -> bool {
     let norm = |path: &Path| {
         let resolved = std::fs::canonicalize(path).map_or_else(
             |_| path.to_path_buf(),
@@ -1047,7 +1053,8 @@ impl Root {
     /// Where this project's channel belongs once it lives in the root.
     #[must_use]
     pub fn comms_home(&self, project_id: &str) -> PathBuf {
-        self.comms().join(format!("{project_id}-ferryman"))
+        self.comms()
+            .join(format!("{}-ferryman", self.folder_name(project_id)))
     }
 
     /// Move one project's channel into `comms/`, so every channel lives in one place.
@@ -1158,13 +1165,14 @@ impl Root {
             .collect()
     }
 
-    /// Where Ferryman's own clone of a project lives: `repos/<project>`.
+    /// Where Ferryman's own clone of a project lives: `repos/<name>`, which is
+    /// `repos/<id>` until the project is renamed (ADR 0024).
     ///
     /// The fixed place. Workers use it and nothing else of the project's, and a person's
     /// working copy is never it. See `docs/LAYOUT.md`.
     #[must_use]
     pub fn managed_clone(&self, project_id: &str) -> PathBuf {
-        self.repos().join(project_id)
+        self.repos().join(self.folder_name(project_id))
     }
 
     /// Whether `repo` is a managed clone: a folder directly under this root's `repos/`.
@@ -1290,7 +1298,7 @@ pub struct Gathered {
 /// primitive, so the copy is done first and the original removed only once every file
 /// arrived - a crash in the middle leaves both, which is recoverable, rather than
 /// neither, which is not.
-fn move_directory(from: &Path, to: &Path) -> Result<()> {
+pub(crate) fn move_directory(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }

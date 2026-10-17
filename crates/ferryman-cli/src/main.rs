@@ -829,6 +829,39 @@ enum RootCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Rename a project: a new name for people, the same id for every machine.
+    ///
+    /// The id is what devices pair on and what every signature names, so it never
+    /// changes. The name is what you see and type. The master signs a `NAME` record into
+    /// the channel; this machine moves its folders now (`comms/<name>-ferryman`,
+    /// `repos/<name>`) and every other machine does the same when it next reads the
+    /// channel. Syncthing keeps the folder id, so nothing re-pairs, nothing is re-approved
+    /// and no old signature breaks. The old name keeps working everywhere a project is
+    /// asked for. Renaming to the id undoes a rename.
+    ///
+    /// Run by an AI session (or anyone who cannot sign as the master), it asks instead:
+    /// the master taps Rename on the dashboard or Telegram and this machine's worker does
+    /// the rest. Nobody has to type anything else.
+    Rename {
+        /// The project: its id, its name, or an old name.
+        project: String,
+        /// The new name: lowercase letters, digits and '-'.
+        name: String,
+        /// Sign now as the master (asks for their password at a terminal). Without it, a
+        /// session that cannot sign as the master asks them to approve instead.
+        #[arg(long = "as", value_parser = agent_name)]
+        as_master: Option<String>,
+    },
+    /// Move this machine's folders to every project's current name.
+    ///
+    /// Workers and the watchdog do this on their own; this is the same step by hand.
+    /// Only Ferryman's folders move (a channel in `comms/`, a clone in `repos/`), a folder
+    /// in use is tried again later, and nothing is moved onto something or deleted.
+    Follow {
+        /// Say what would move and move nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Remove a project from the manifest. Nothing on disk is touched.
     ///
     /// The index recorded projects and never released them, and the gap did not show:
@@ -3021,17 +3054,8 @@ fn improve_project(which: &ImproveProject) -> Result<(String, PathBuf, PathBuf)>
     if let Some(project) = &which.project {
         let root = ferryman_channel::ferry::find_root()
             .context("no ferry root yet - make one with `ferry root init`, or pass --workspace")?;
-        let entry = root
-            .read()
-            .projects
-            .into_iter()
-            .find(|entry| entry.project_id == *project)
-            .with_context(|| {
-                format!(
-                    "no project '{project}' in {}",
-                    root.manifest_path().display()
-                )
-            })?;
+        // The id, the project's name, or one of its old names (ADR 0024).
+        let entry = root.resolve(project)?;
         // As for `ferry root archive`: a channel-only project has no repository here,
         // so the ferry root stands in for where the keys are.
         let attachment = entry
@@ -3040,7 +3064,7 @@ fn improve_project(which: &ImproveProject) -> Result<(String, PathBuf, PathBuf)>
             .map(|repo| repo.join(".ferryman"))
             .filter(|attachment| attachment.is_dir())
             .unwrap_or_else(|| root.path.clone());
-        return Ok((project.clone(), entry.channel, attachment));
+        return Ok((entry.project_id, entry.channel, attachment));
     }
     let start = match &which.workspace {
         Some(workspace) => workspace.clone(),
@@ -7786,6 +7810,36 @@ async fn agent_command(command: Agent) -> Result<()> {
                 "no ferry root found. Point --comms at its folder, or make one with \
                  'ferry root init'",
             )?;
+            // Projects renamed elsewhere (ADR 0024): move this machine's folders to their
+            // names before planning, while no task holds them. A rename this machine asked
+            // for and the master approved is written first, signed with the key it asked with.
+            if !dry_run {
+                for (id, name) in root.apply_approved_renames() {
+                    println!("{id}: its master approved the rename to {name}");
+                }
+                for followed in root.follow_names(false) {
+                    for (what, moved) in [("channel", &followed.channel), ("clone", &followed.repo)]
+                    {
+                        if let Some((from, to)) = moved {
+                            println!(
+                                "{} is now {}: {what} moved {} -> {}",
+                                followed.project_id,
+                                followed.name,
+                                from.display(),
+                                to.display()
+                            );
+                        }
+                    }
+                    for note in &followed.notes {
+                        println!("{}: {note}", followed.project_id);
+                    }
+                    if let Some(note) =
+                        ferryman_channel::naming::reregister_moved_channel(&root, &followed)
+                    {
+                        println!("{}: syncthing {note}", followed.project_id);
+                    }
+                }
+            }
             let (plan, identity) =
                 ferryman_ops::fleet::plan_worker(&root, &home.attachment, &config)?;
             if dry_run {
@@ -9422,6 +9476,23 @@ fn new_operator_password(name: &str) -> anyhow::Result<String> {
 /// nobody watching, and a prompt in that setting is a hang rather than a question. It is
 /// read once, here, and never placed in a child process's environment - `send` signs in
 /// this process and passes on the signature, not the secret.
+/// Whether this process can sign as `master` here without anyone else: their key is a
+/// file on this machine, or they are a person whose password this process can get (from
+/// the environment, or typed at a terminal). An AI session has neither, so it asks.
+fn can_sign_as(attachment: &std::path::Path, master: &str) -> bool {
+    if held_operator().is_some_and(|held| held.name().eq_ignore_ascii_case(master)) {
+        return true;
+    }
+    if ferryman_server::operators::OperatorStore::new(attachment).exists(master) {
+        return std::env::var("FERRYMAN_OPERATOR_PASSWORD").is_ok_and(|p| !p.is_empty())
+            || std::io::IsTerminal::is_terminal(&std::io::stdin());
+    }
+    ferryman_channel::AgentIdentity::load_existing(master, attachment)
+        .ok()
+        .flatten()
+        .is_some()
+}
+
 fn operator_password(name: &str) -> anyhow::Result<String> {
     if let Ok(password) = std::env::var("FERRYMAN_OPERATOR_PASSWORD")
         && !password.is_empty()
@@ -11931,6 +12002,31 @@ fn channel(command: Channel) -> Result<()> {
     Ok(())
 }
 
+/// One project's folders following its name, and Syncthing told where the channel went.
+fn print_followed(
+    root: &ferryman_channel::ferry::Root,
+    followed: &ferryman_channel::naming::Followed,
+    dry_run: bool,
+) {
+    let verb = if dry_run { "would move" } else { "moved" };
+    if followed.moved() || !followed.notes.is_empty() {
+        println!("{:<24} {}", followed.project_id, followed.name);
+    }
+    for (what, moved) in [("channel", &followed.channel), ("clone", &followed.repo)] {
+        if let Some((from, to)) = moved {
+            println!("  {what} {verb}  {}  ->  {}", from.display(), to.display());
+        }
+    }
+    for note in &followed.notes {
+        println!("  note: {note}");
+    }
+    if !dry_run
+        && let Some(note) = ferryman_channel::naming::reregister_moved_channel(root, followed)
+    {
+        println!("  syncthing: {note}");
+    }
+}
+
 fn print_syncthing_setup(setup: &ferryman_channel::SyncthingSetup) {
     println!("folder  {}", setup.folder_id);
     println!("path    {}", setup.folder_path);
@@ -12189,7 +12285,7 @@ fn root_command(command: RootCommand) -> Result<()> {
                 return Ok(());
             };
             let wanted: Vec<String> = match project {
-                Some(one) => vec![one],
+                Some(one) => vec![root.resolve(&one)?.project_id],
                 None => root
                     .read()
                     .projects
@@ -12278,9 +12374,18 @@ fn root_command(command: RootCommand) -> Result<()> {
                 }
                 return Ok(());
             }
+            // A renamed project shows its name, and its id beside it (ADR 0024).
+            let label = |entry: &ferry::Entry| {
+                let name = entry.name();
+                if name == entry.project_id {
+                    name
+                } else {
+                    format!("{name} (id {})", entry.project_id)
+                }
+            };
             let width = projects
                 .iter()
-                .map(|entry| entry.project_id.chars().count())
+                .map(|entry| label(entry).chars().count())
                 .max()
                 .unwrap_or(0);
             for entry in projects {
@@ -12291,7 +12396,7 @@ fn root_command(command: RootCommand) -> Result<()> {
                 };
                 println!(
                     "  {:width$}  {}{mark}",
-                    entry.project_id,
+                    label(&entry),
                     entry.channel.display()
                 );
                 match entry.repo {
@@ -12406,17 +12511,8 @@ fn root_command(command: RootCommand) -> Result<()> {
             let Some(root) = ferry::find_root() else {
                 bail!("no ferry root yet - make one with `ferry root init`")
             };
-            let filed = root
-                .read()
-                .projects
-                .into_iter()
-                .find(|entry| entry.project_id == project)
-                .with_context(|| {
-                    format!(
-                        "no project '{project}' in {}",
-                        root.manifest_path().display()
-                    )
-                })?;
+            let filed = root.resolve(&project)?;
+            let project = filed.project_id.clone();
             if !filed.channel.is_dir() {
                 bail!(
                     "{project}'s channel is not on this machine ({}) - archive it from one that has it",
@@ -12469,6 +12565,96 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                 }
                 (true, false) => println!("{project} was not archived"),
+            }
+        }
+
+        RootCommand::Rename {
+            project,
+            name,
+            as_master,
+        } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let (id, channel, attachment) = improve_project(&ImproveProject {
+                project: Some(project.clone()),
+                workspace: None,
+                all: false,
+            })?;
+            let master = ferry::master_of(&channel)?;
+            let sign_now = as_master.is_some()
+                || master
+                    .as_deref()
+                    .is_some_and(|master| can_sign_as(&attachment, master));
+            if !sign_now {
+                // An AI session, or anyone without the master's key: ask, and let the
+                // master's tap be the signature (ADR 0024).
+                let prefer = ferryman_ops::identity::machine_name().ok();
+                let asker = root.asker(&id, prefer.as_deref())?;
+                let old = root.resolve(&id)?.name();
+                match root.ask_rename(&id, &name, &asker)? {
+                    None => println!("{id} is already called {name}"),
+                    Some(request) => {
+                        let master = master.unwrap_or_else(|| "the master".into());
+                        println!(
+                            "asked {master} to rename {old} to {name} ({request}, from {})",
+                            asker.name()
+                        );
+                        println!();
+                        println!(
+                            "  {master} gets Rename / Keep on the dashboard's Home page and on Telegram."
+                        );
+                        println!(
+                            "  Once they tap Rename, {}'s worker writes the name and every machine",
+                            asker.name()
+                        );
+                        println!(
+                            "  moves its folders. Nothing else to do, and no device re-pairs."
+                        );
+                        println!(
+                            "  (At a terminal, {master} can sign it now instead with --as {master}.)"
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            let (master, identity) = mastered_signer(&channel, &attachment, as_master.as_deref())?;
+            let (changed, followed) = root.rename(&id, &name, &identity)?;
+            if changed {
+                println!("{project} is now called {name}, signed by {master} (id {id}, unchanged)");
+            } else {
+                println!("{id} was already called {name}");
+            }
+            print_followed(&root, &followed, false);
+            if changed {
+                println!();
+                println!(
+                    "  Every other machine moves its own folders when it next reads the channel."
+                );
+                println!("  No device re-pairs: the Syncthing folder id is still {id}-ferryman.");
+                println!("  The old name keeps working in every command.");
+            }
+        }
+
+        RootCommand::Follow { dry_run } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            if !dry_run {
+                for (id, name) in root.apply_approved_renames() {
+                    println!("{id}: its master approved the rename to {name}");
+                }
+            }
+            let all = root.follow_names(dry_run);
+            if all.is_empty() {
+                println!("every project's folders already carry its name");
+            }
+            for followed in &all {
+                print_followed(&root, followed, dry_run);
+            }
+            if dry_run && !all.is_empty() {
+                println!();
+                println!("  Nothing moved. Run it without --dry-run to do it.");
             }
         }
 
