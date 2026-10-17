@@ -631,6 +631,19 @@ fn repair_layout(facts: &Facts) -> Vec<String> {
     for line in crate::layout::archive_stale(&crate::layout::stale_locks(&root)) {
         done.push(format!("archived a stale lock: {line}"));
     }
+    // Projects renamed by their master (ADR 0024): folders follow the name. Nothing signed.
+    for followed in root.follow_names(false) {
+        if followed.moved() {
+            done.push(format!(
+                "{} follows its name {}",
+                followed.project_id, followed.name
+            ));
+            if let Some(note) = ferryman_channel::naming::reregister_moved_channel(&root, &followed)
+            {
+                done.push(format!("{}: syncthing {note}", followed.project_id));
+            }
+        }
+    }
     done
 }
 

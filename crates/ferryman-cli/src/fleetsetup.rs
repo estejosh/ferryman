@@ -659,7 +659,7 @@ pub fn swarm_command(command: SwarmCommand) -> Result<()> {
         SwarmCommand::On { project, as_master } => swarm_switch(&project, true, as_master),
         SwarmCommand::Off { project, as_master } => swarm_switch(&project, false, as_master),
         SwarmCommand::Exclude { project } => {
-            require_project(&root, &project)?;
+            let project = require_project(&root, &project)?;
             if rootconfig::set_excluded(&root, &project, true)? {
                 println!(
                     "{project} is out of the swarm on this machine ({})",
@@ -681,20 +681,9 @@ pub fn swarm_command(command: SwarmCommand) -> Result<()> {
     }
 }
 
-fn require_project(root: &Root, project: &str) -> Result<()> {
-    if root
-        .read()
-        .projects
-        .iter()
-        .any(|entry| entry.project_id == project)
-    {
-        Ok(())
-    } else {
-        bail!(
-            "no project '{project}' in {}",
-            root.manifest_path().display()
-        )
-    }
+/// The id of the project `project` names: its id, its name or an old name (ADR 0024).
+fn require_project(root: &Root, project: &str) -> Result<String> {
+    Ok(root.resolve(project)?.project_id)
 }
 
 /// `swarm on` / `swarm off`: the master's signed setting.

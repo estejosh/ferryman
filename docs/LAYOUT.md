@@ -76,3 +76,7 @@ Some projects must not be worked by the fleet: a secrets repository, someone els
 - A machine can also exclude a project for itself (`ferry root swarm exclude pc-secrets`), written to `[swarm] exclude` in `<root>/ferry.toml`. Nobody else can reach it.
 
 Either way: `repos sync` does not clone it, an all-projects worker does not serve it (and a running one stops at its next pass), and `team approve --all` does not enrol anyone in it. `ferry root swarm show` lists both.
+
+## Renaming a project
+
+`<project>` in the paths above is the project's name, which is its id until its master renames it. `ferry root rename <project> <name>` signs a `NAME` record into the channel; each machine then moves its own `comms/` and `repos/` folders to the new name, keeping the Syncthing folder id (`<id>-ferryman`), so nothing re-pairs. See ADR 0024.
