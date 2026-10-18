@@ -99,8 +99,18 @@ channel's devices.
   It is not a local setting: a machine that wants more access cannot give it to itself, and a
   forged or edited grant fails its signature. A grant has a sequence number, and a machine
   never accepts an older one than it has seen.
-- With no grant an agent is a Member (existing fleets change nothing). The master and the
-  named head are Orchestrators.
+- With no Worker in the project an agent with no grant is a Member (existing fleets change
+  nothing). The master and the named head are Orchestrators. The roster is unsigned and is
+  trusted on first use, so being on it admits nobody: once the project has a Worker grant,
+  a roster name the master has not admitted (a signed grant in `access/` or `grants/`) is a
+  Worker too. A Worker that registers a fresh name and key therefore gains nothing. Setting
+  the first Worker admits every agent already on the roster as a signed Member in the same
+  step, so nobody is demoted by it. The master signs the admission; the head can read it,
+  not issue it.
+- A Worker's writes to `agents/` and `devices/` (its own roster entry and device records) are
+  refused by the receiver like its other channel files; a file in `grants/` or `access/`
+  signed by a Worker is refused, and one signed by anyone else has to verify as the master's
+  to count.
 - A Worker's channel writes are refused by the machine that **receives** them: every peer's
   iroh lane and every reader of the channel refuses a channel file authored by a worker-level
   agent, whether the file is signed or not. Its writes are accepted only from
@@ -112,6 +122,15 @@ channel's devices.
 - Credential loading is by path. Worker and Member read the project's `.env` and nothing
   under `secrets/`. Only an Orchestrator reads `secrets/`. Paths are resolved first (symlinks
   followed, `..` applied), so a link or a custom placement cannot lead a lower level in.
+- **This isolation is advisory.** Every agent subprocess on a machine runs as the same
+  operating-system user as Ferryman and as every other agent there, so a Worker's process
+  can read `secrets/` straight from disk, or the environment of its siblings. The levels
+  decide what Ferryman loads for an agent and what other machines accept from it. They do
+  not sandbox a process that chooses to go around Ferryman. Real isolation needs a separate
+  OS user or container per level, which this ADR does not provide; keep a secret that must
+  never reach a Worker off any machine a Worker runs on. Where both the scoped store (the
+  project `.env`, and `secrets/` for an Orchestrator) and the older credential store name
+  the same key, the scoped one wins.
 - The levels are enforced only when hand-ins are kept apart from the channel. Where they are
   inside it (a version-1 project), a Worker has nowhere else to write, so the level is
   recorded and shown, and refuses nothing. `ferry access show` says which.
@@ -133,6 +152,24 @@ worker, a live worker lock or a live worktree, and says what blocks it. It never
 a move supersedes goes to `<root>/_to_delete/`. It writes `<root>/logs/migrate-<UTC>.md`. It is
 idempotent. The manifest becomes version 2 only when every managed project has moved.
 
+A project is judged on its own, not by the root's version, which stays 1 until the last
+project moves: the managed clone, worktrees and folders of a project that moved are found
+where its manifest entry says, so `repos sync` and `doctor --fix` never re-clone it. A
+worktree is *live* (and blocks the project) only when a running order's heartbeat on this
+machine names it; any other registered worktree is stale, listed as "would prune", and moved
+to `_to_delete` only with `--prune-stale-worktrees`.
+
+With Syncthing the order of the steps matters. The channel's folder is paused before
+anything moves and stays paused while `handins/` leaves it, `handins` is added to the
+channel's `.stignore`, and `<id>-handins` is registered; only then is the folder pointed at its
+new path and resumed. Resuming earlier would announce the hand-ins as deleted to a peer that
+has not migrated. The channel's new place is written to the manifest and the bridges right
+after it moves, Syncthing is resumed on every way out, and a rerun that finds the channel at
+`comms/` with the manifest still naming the old place finishes the record. Hand-ins are read
+from `handins/` in the project folder and, while any are left there, from the old
+`<channel>/handins`. The iroh lane keeps `handins/` out of the channel share in a layout-2
+project, so an unmigrated peer cannot re-create it there.
+
 ## Consequences
 
 - One folder per project can be handed to an LLM. A custom project can be handed over by its
@@ -143,17 +180,23 @@ idempotent. The manifest becomes version 2 only when every managed project has m
 - Version-1 roots keep working, and mixed fleets work: an older peer refuses the
   `<id>+handins` share it does not know and the rest syncs as before.
 - A migration moves a Syncthing folder's path on each machine separately. Peers match on the
-  folder id, so nothing re-pairs, but a machine that has not migrated yet will see
-  `handins/` leave its channel folder when its neighbour moves it. Migrate the fleet together,
-  or pause the folder first.
-- `accepted.json` and `rejected.json` are accepted over iroh only from the head or the
-  master. They are not yet signed, so under Syncthing the head's folder is trusted as before.
+  folder id, so nothing re-pairs. The folder is held paused and `handins` ignored before the
+  hand-ins leave it (see Migration), so a machine that has not migrated does not see them
+  deleted. Its own hand-ins are not carried to a migrated peer through the channel; they
+  reach it once that machine migrates too, so migrate the fleet together.
+- `accepted.json` and `rejected.json` are signed by the head or the master over the order,
+  the patch digest and the verdict, and `ferry work list` and `accept` ignore one that is
+  unsigned, signed by anyone else, or for another patch. Syncthing cannot filter by author,
+  so the check is on read, not on the wire; over iroh they are also accepted only from the
+  head or the master. A verdict written before they were signed reads as waiting.
 
 ## Follow-ups
 
 - Worker git by bundle: an order that carries a signed git bundle so a Worker needs no
   repository credential at all.
-- Sign `accepted.json` and `rejected.json`.
+- Sign claims and heartbeats. Today a Worker-originated claim or heartbeat is accepted only
+  from `handins/<agent>/`, bound to the folder it sits in and to the agent field inside it.
+- An Orchestrator (not only the master) signing an admission.
 - A non-head peer relaying the head's verdicts is not accepted over iroh. The mesh is full
   today, so nothing is lost.
 - A master-only control for levels on the dashboard's Teammates page.
