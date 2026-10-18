@@ -1145,18 +1145,19 @@ pages.agents = async () => {
     </div>
     <div class="panel scroll">
       <table class="grid">
-        <thead><tr><th>Agent</th><th>Role</th><th>Access</th><th>Engine</th><th>Runs</th><th>Accepted</th><th>Key</th><th>Last active</th></tr></thead>
+        <thead><tr><th>Agent</th><th>Role</th><th title="Signed by the project master: worker, member or orchestrator (ferry access set)">Level</th><th>Access</th><th>Engine</th><th>Runs</th><th>Accepted</th><th>Key</th><th>Last active</th></tr></thead>
         <tbody>${rows.length ? rows.map((a) => `
           <tr>
             <td class="lead">${esc(a.name)}</td>
             <td>${esc(a.role || "—")}</td>
+            <td><span class="badge ${a.level === "worker" ? "warn" : "good"}" title="${a.level_enforced ? "enforced" : "recorded only: this project's hand-ins sit inside its channel"}">${esc(a.level || "member")}</span></td>
             <td>${agentAccess(a, team)}</td>
             <td>${esc(a.engine || "—")}</td>
             <td class="num">${esc(a.runs ?? 0)}</td>
             <td class="num">${esc(a.accepted ?? 0)}</td>
             <td>${a.key ? `<span class="badge good">keyed</span>` : `<span class="badge warn">no key yet</span>`}</td>
             <td>${esc(a.last_active || "—")}</td>
-          </tr>`).join("") : `<tr><td colspan="8"><div class="empty">Nobody has joined yet.</div></td></tr>`}
+          </tr>`).join("") : `<tr><td colspan="9"><div class="empty">Nobody has joined yet.</div></td></tr>`}
         </tbody>
       </table>
     </div>`;
