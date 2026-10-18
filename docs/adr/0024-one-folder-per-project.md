@@ -107,6 +107,12 @@ channel's devices.
   the first Worker admits every agent already on the roster as a signed Member in the same
   step, so nobody is demoted by it. The master signs the admission; the head can read it,
   not issue it.
+- A name that registers after the first Worker was set is **not** admitted automatically, on
+  any later `access set` or otherwise: a Worker registering a fresh key is exactly the case
+  this guards, and an automatic admission would hand it Member. It waits as a Worker until
+  the master looks at the list and admits it: `ferry access admit <project>` lists who is
+  waiting, `ferry access admit <project> NAME...` or `--all` signs them in as Members.
+  `ferry access show` and `ferry doctor` (the `admission` line) say who is waiting.
 - A Worker's writes to `agents/` and `devices/` (its own roster entry and device records) are
   refused by the receiver like its other channel files; a file in `grants/` or `access/`
   signed by a Worker is refused, and one signed by anyone else has to verify as the master's
@@ -170,6 +176,33 @@ from `handins/` in the project folder and, while any are left there, from the ol
 `<channel>/handins`. The iroh lane keeps `handins/` out of the channel share in a layout-2
 project, so an unmigrated peer cannot re-create it there.
 
+A marker, `projects/<id>/.migrating`, is written before the first step and removed after the
+last, and records whether the person had the folder paused. A rerun after a failure at any
+point finishes whatever it stands for (ignoring `handins`, registering `<id>-handins`,
+re-pointing Syncthing) even when there were no hand-ins, and gives the folder back paused if
+it was paused. If Syncthing cannot be pointed at the new place, the folder is resumed at its
+old path only when the old path still holds the channel; otherwise it stays paused and the
+report says what path to set. A failed step makes the project Failed and the manifest stays
+at version 1.
+
+`--prune-stale-worktrees` moves only worktrees under `work/` or `projects/<id>/work` that
+nothing uses, have no uncommitted changes and no commit that is on no remote. It skips adopted
+projects, lists in the plan exactly what it will move (and the reason for each it will not),
+and also works on projects that moved earlier. A worktree somebody made elsewhere is never
+touched; after the clone moves, `git worktree repair` from it reconnects it.
+
+### 7. A mixed fleet
+
+The channel of a migrated machine no longer carries `handins/`: it is in `.stignore` and kept
+out of the iroh share. A peer that has not migrated writes its hand-ins to the old place, so
+they never reach a migrated machine, and nothing else fails to tell anyone. There is no bridge
+between the two layouts. The order is: **migrate every machine in the same window, with the
+workers stopped.** To make a gap visible, each worker's presence record carries the layout it
+keeps the channel in (`layout`, outside the signed fields so older machines still verify the
+record). `ferry root migrate` names the peers that still report the old layout in the plan,
+and `ferry doctor` (the `layout_peers` line) says, per peer, "peer X has not migrated; its
+hand-ins are not received". A peer from before this field counts as not migrated.
+
 ## Consequences
 
 - One folder per project can be handed to an LLM. A custom project can be handed over by its
@@ -185,15 +218,30 @@ project, so an unmigrated peer cannot re-create it there.
   deleted. Its own hand-ins are not carried to a migrated peer through the channel; they
   reach it once that machine migrates too, so migrate the fleet together.
 - `accepted.json` and `rejected.json` are signed by the head or the master over the order,
-  the patch digest and the verdict, and `ferry work list` and `accept` ignore one that is
-  unsigned, signed by anyone else, or for another patch. Syncthing cannot filter by author,
-  so the check is on read, not on the wire; over iroh they are also accepted only from the
-  head or the master. A verdict written before they were signed reads as waiting.
+  the patch digest and the verdict, and `ferry work list` does not count one that is
+  unsigned, signed by someone without standing, or for another patch. Syncthing cannot filter
+  by author, so the check is on read, not on the wire; over iroh they are also accepted only
+  from the head or the master. A signer has standing if it is the master, the head now, or
+  held the head appointment when it gave the verdict (`head/` keeps past appointments), so a
+  verdict survives the head role being passed on. (A head who steps down, or whose
+  appointment is revoked, has its appointment file removed; its earlier verdicts then read
+  as unverified.)
+- A verdict file that is there but cannot be verified is **unverified**, not waiting: the
+  old unsigned `accepted.json` and `rejected.json` that v0.5.30 wrote, a forged one, or one
+  from a signer without standing. `accept` and `reject` refuse such a hand-in without
+  `--force` (an old accepted one applied again would apply twice, and an old rejected one
+  would be applied by mistake), and `ferry work list` shows `unverified`. Once, after
+  reading the list, the master or head runs `ferry work adopt-verdicts` (a listing) and
+  `ferry work adopt-verdicts --yes` to sign the old ones as their own, keeping what they said
+  and when.
 
 ## Follow-ups
 
 - Worker git by bundle: an order that carries a signed git bundle so a Worker needs no
   repository credential at all.
+- Anti-replay memory is keyed by project id plus the channel's identity (its master's
+  declaration), so a project re-created under the same name starts fresh and a moved channel
+  does not forget.
 - Sign claims and heartbeats. Today a Worker-originated claim or heartbeat is accepted only
   from `handins/<agent>/`, bound to the folder it sits in and to the agent field inside it.
 - An Orchestrator (not only the master) signing an admission.
