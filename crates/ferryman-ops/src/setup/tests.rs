@@ -51,6 +51,11 @@ fn git(dir: &Path, args: &[&str]) {
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+        // No background maintenance: after a push, git can start `maintenance run
+        // --auto` detached in the bare repo, and the lock it later removes made the
+        // dry-run snapshot differ by a file Ferryman never touched (flaky on Linux/macOS).
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
+        .args(["-c", "receive.autoGc=false"])
         .args(args)
         .output()
         .unwrap();
