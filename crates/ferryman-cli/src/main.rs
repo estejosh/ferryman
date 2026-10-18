@@ -8732,7 +8732,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
             let folder = handin::create(
                 &route,
                 &identity,
-                &handin::work_dir(&route),
+                &handin::write_dir(&route, &agent),
                 &order,
                 &handin::Cut {
                     repo: &checkout,

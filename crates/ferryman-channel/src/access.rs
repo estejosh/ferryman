@@ -365,6 +365,45 @@ pub fn refused_authors(channel: &Path, project_id: &str) -> BTreeSet<String> {
     workers
 }
 
+/// Whether every agent of `local` that is on this project's roster is a Worker, so this
+/// machine must not publish the channel (its own copy is receive-only). False when none of
+/// them is on the roster, when any is a Member or above, and for a project that does not
+/// separate hand-ins.
+#[must_use]
+pub fn machine_is_worker_only(channel: &Path, project_id: &str, local: &[String]) -> bool {
+    if !enforced(channel, project_id) {
+        return false;
+    }
+    let levels = levels(channel, project_id);
+    let mine: Vec<Level> = local
+        .iter()
+        .filter_map(|name| levels.get(&canonical_agent_name(name)).copied())
+        .collect();
+    !mine.is_empty() && mine.iter().all(|level| *level == Level::Worker)
+}
+
+/// Whether any of `agents` may write the head's verdict files (`accepted.json`,
+/// `rejected.json`) beside a hand-in: the named head, or the master.
+#[must_use]
+pub fn may_write_verdicts(
+    channel: &Path,
+    project_id: &str,
+    agents: &std::collections::BTreeSet<String>,
+) -> bool {
+    let named = |who: &str| agents.iter().any(|a| canonical_agent_name(a) == canonical_agent_name(who));
+    if crate::head::current(channel, project_id)
+        .ok()
+        .flatten()
+        .is_some_and(|head| named(&head.agent))
+    {
+        return true;
+    }
+    crate::read_agent_roster(channel)
+        .ok()
+        .and_then(|roster| crate::master::read_master_at(channel, &roster).ok().flatten())
+        .is_some_and(|master| named(&master.master))
+}
+
 /// The folder a Worker-level agent's own writes go in (`<handins>/<agent>`), or `None` when
 /// the agent writes the channel like everyone else: it is not a Worker, or the project has
 /// nowhere else to put what it writes.

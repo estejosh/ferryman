@@ -113,8 +113,8 @@ pub struct WorkReady {
 }
 
 /// Make sure this machine can hand work in or receive it: the work folder exists and, when
-/// it is not inside the channel, Syncthing syncs it as `<project>-work` with the same
-/// devices as the channel. Idempotent; safe to call on every worker start and from
+/// it is not inside the channel, Syncthing syncs it as `<project>-handins` with the same
+/// devices as the channel (the fallback for the iroh lane, which syncs it too). Idempotent; safe to call on every worker start and from
 /// `doctor --fix`. A Syncthing that is down or missing is reported, never an error.
 pub fn ensure_work_ready(route: &ProjectRoute) -> Result<WorkReady> {
     let path = work_dir(route);

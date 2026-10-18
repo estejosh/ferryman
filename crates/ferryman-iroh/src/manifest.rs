@@ -76,9 +76,34 @@ const TEMP_SUFFIX: &str = ".iroh.tmp";
 pub struct Rules {
     /// Lowercased: excluding a file whose name differs only in case is the safe mistake.
     patterns: Vec<String>,
+    /// Worker-level agents (ADR 0024): a channel file authored by one is not carried and
+    /// not let in, whoever offers it. Empty for a hand-ins folder, which is where their
+    /// files belong.
+    refused_authors: std::collections::BTreeSet<String>,
+    /// Hand-ins folders only: `accepted.json` and `rejected.json` are the head's alone, so
+    /// from a peer that is not the head they are neither wanted nor let in.
+    no_verdicts: bool,
 }
 
+/// The head's verdict files, written beside a hand-in.
+const VERDICT_FILES: [&str; 2] = ["accepted.json", "rejected.json"];
+
 impl Rules {
+    /// Refuse files authored by these Worker-level agents (a channel's rules).
+    #[must_use]
+    pub fn refusing_authors(mut self, workers: std::collections::BTreeSet<String>) -> Self {
+        self.refused_authors = workers;
+        self
+    }
+
+    /// Refuse the head's verdict files (a hand-ins folder, shared with a peer that is not
+    /// the head).
+    #[must_use]
+    pub fn refusing_verdicts(mut self, refuse: bool) -> Self {
+        self.no_verdicts = refuse;
+        self
+    }
+
     /// The built-in list and the channel's `.stignore`.
     ///
     /// Only the parts of the `.stignore` syntax that exclude are used. A negation (`!`) is
@@ -103,7 +128,24 @@ impl Rules {
                 patterns.push(line.trim_start_matches('/').to_ascii_lowercase());
             }
         }
-        Self { patterns }
+        Self {
+            patterns,
+            refused_authors: std::collections::BTreeSet::new(),
+            no_verdicts: false,
+        }
+    }
+
+    /// Whether `path` is not let in from the peer: everything [`Rules::excludes`] keeps
+    /// out, and the head's verdict files when the peer is not the head. What this side
+    /// offers is not held to the second rule - its own head's verdicts must go out.
+    #[must_use]
+    pub fn excludes_incoming(&self, path: &str) -> bool {
+        self.excludes(path)
+            || (self.no_verdicts
+                && path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|name| VERDICT_FILES.contains(&name.to_ascii_lowercase().as_str())))
     }
 
     /// Whether `path` (relative, `/`-separated) stays where it is.
@@ -112,6 +154,12 @@ impl Rules {
         let lower = path.to_ascii_lowercase();
         let components: Vec<&str> = lower.split('/').collect();
         if components.iter().any(|name| machine_local(name)) {
+            return true;
+        }
+        if !self.refused_authors.is_empty()
+            && ferryman_channel::access::comms_author_refused(path, None, &self.refused_authors)
+                .is_some()
+        {
             return true;
         }
         self.patterns.iter().any(|pattern| {
@@ -273,7 +321,7 @@ pub fn plan(theirs: &[Entry], ours: &BTreeMap<String, Entry>, rules: &Rules) -> 
     for entry in theirs {
         if entry.size > MAX_FILE
             || safe_relative(&entry.path).is_err()
-            || rules.excludes(&entry.path)
+            || rules.excludes_incoming(&entry.path)
             || !seen.insert(entry.path.as_str())
         {
             continue;
@@ -334,7 +382,7 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The path or the contents break a rule, or the file cannot be written.
 pub fn write_received(channel: &Path, rules: &Rules, entry: &Entry, bytes: &[u8]) -> Result<bool> {
     let components = safe_relative(&entry.path)?;
-    if rules.excludes(&entry.path) {
+    if rules.excludes_incoming(&entry.path) {
         bail!("'{}' is excluded from this channel", entry.path);
     }
     if bytes.len() as u64 != entry.size || entry.size > MAX_FILE {
@@ -342,6 +390,20 @@ pub fn write_received(channel: &Path, rules: &Rules, entry: &Entry, bytes: &[u8]
     }
     if blake3::hash(bytes).to_hex().as_str() != entry.hash {
         bail!("'{}' does not match its hash", entry.path);
+    }
+    // By content as well as by name (ADR 0024): a file in a channel that says a Worker-level
+    // agent wrote it was not written there by that agent, whatever it is called.
+    if !rules.refused_authors.is_empty()
+        && let Some(worker) = ferryman_channel::access::comms_author_refused(
+            &entry.path,
+            Some(bytes),
+            &rules.refused_authors,
+        )
+    {
+        bail!(
+            "'{}' is authored by {worker}, a Worker, which writes to its hand-ins and never the channel",
+            entry.path
+        );
     }
     let (file_name, parents) = components.split_last().context("a path with no name")?;
     let mut dir = channel.to_path_buf();

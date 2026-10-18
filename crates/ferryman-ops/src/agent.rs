@@ -5168,7 +5168,7 @@ fn hand_in(
         ferryman_channel::handin::create(
             route,
             &who,
-            &ferryman_channel::handin::work_dir(route),
+            &ferryman_channel::handin::write_dir(route, &config.agent),
             id,
             &ferryman_channel::handin::Cut {
                 repo: &route.workspace,
