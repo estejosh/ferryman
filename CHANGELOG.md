@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.30 - 2026-10-18
 
 Channels can sync between machines over iroh (QUIC), through our own relay, beside Syncthing. With `[iroh] enabled = true`, a relay URL and the relay certificate's SHA-256 pin in the ferry root's `ferry.toml`, and the relay's access token in `iroh-relay.token` in the machine state directory, `ferry agent run --all-projects` serves and syncs every channel it serves with every trusted peer every 30 seconds: a manifest (path, size, BLAKE3, mtime) per shared project, then only what is missing or older, written atomically. `ferry lane iroh init` makes the machine's iroh key once (beside the operator seed, never in a channel) and publishes a signed `transports/<agent>.json` into each served channel; a peer is let in only if its endpoint id is in such a record signed by an agent on that channel's roster who is not revoked, and is offered only the channels it is trusted in. The channel's `.stignore` exclusions apply both ways, conflict copies, temporary files and files over 64 MiB never move, nothing is deleted, nothing is written outside the channel (no `..`, absolute paths or symlinks), and the newer mtime wins. The relay's self-signed certificate is trusted by its pinned hash and no other; no n0 relay or DNS is used. `ferry lane iroh status` shows the endpoint id, whether the relay accepts us, and each peer's last sync and file counts. Off by default. See docs/IROH_LANE.md.
 
