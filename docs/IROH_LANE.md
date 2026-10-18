@@ -67,13 +67,18 @@ older, and the files go across and are written atomically.
   (`keys`, `*.key`, `*.seed`, executables, scripts, `local`, `*.tmp`).
 - Syncthing conflict copies, temporary files and Syncthing's own folders are never sent.
 - Nothing over 64 MiB.
-- Nothing is ever deleted.
+- Nothing is ever deleted. (erry root migrate moves a channel on disk; the lane then sees new paths under the root, and a peer that has not moved its own copy yet receives nothing deleted.)
 - Nothing is written outside the channel folder: `..`, absolute paths, drive letters,
   backslashes and Windows device names are refused, and no folder on the path or file at
   the end may be a symlink. Symlinks are never sent.
 - For a path whose contents differ, the newer modification time wins. Equal times keep
   the local copy on both sides.
 
+## Hand-ins, and who may write the channel (layout 2)
+
+In a layout-2 project (docs/LAYOUT.md) the lane exchanges two folders per project with each trusted peer: the channel (`projects/<id>/comms`) and the hand-ins folder (`projects/<id>/handins`, or the path the manifest records). The second is a separate share under the key `<id>+handins`, on the same trust rules (the peer's endpoint id must be in a roster-signed `transports` record) and the same safety rules: the `.stignore` exclusions, no deletes, no `..`, absolute paths or symlinks, the 64 MiB cap. A peer that predates this refuses the share it does not know, and the channel syncs as before.
+
+Access levels (ADR 0024) are enforced by the machine that **receives** a file. A channel file authored by a Worker-level agent, by its name or by the `signed_by`, `sender` or `from` inside it, is dropped on arrival, signed or not; a Worker's files are accepted only from `handins/<agent>/`. `accepted.json` and `rejected.json` in the hand-ins folder are accepted only from the project's head or master. On a Worker's own machine the lane listens to the channel and publishes none of it (`Lane::set_local_agents`); under Syncthing the same machine's channel folder is made receive-only by `ferry access set`. A Worker's `transports` record is written to its hand-ins folder and honoured from there only.
 ## Not done yet
 
 - Files are checked by hash in transit, but not every file type's own signature is
