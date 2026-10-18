@@ -75,12 +75,24 @@ pub fn known() -> Vec<KnownProject> {
     out
 }
 
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop [`remember`] from writing anything (the usage index, and filing in the ferry root)
+/// for the rest of this process. For a command that promises to change nothing, such as the
+/// dry run of `ferry root migrate`: looking up a route is otherwise a write.
+pub fn read_only() {
+    READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Note that this machine used this project. Best-effort and silent on failure.
 ///
 /// Called from the one place every command already funnels through, so no command has to
 /// remember to do it - a discovery feature that depends on being called correctly is one
 /// that will be wrong exactly when it matters.
 pub fn remember(route: &ProjectRoute) {
+    if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // First, always. This used to run at the end, after the index's hourly rate limit had
     // already returned - so a project seen in the last hour was never filed, which meant
     // the projects this machine uses MOST were the ones missing from the manifest. It is

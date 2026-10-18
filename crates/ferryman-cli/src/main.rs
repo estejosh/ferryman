@@ -12420,6 +12420,10 @@ fn root_command(command: RootCommand) -> Result<()> {
                 println!("no ferry root yet, so there is nothing to migrate.");
                 return Ok(());
             };
+            // Looking at the workers resolves their routes, and resolving a route files the
+            // project in the root and updates the usage index. A migration, and above all
+            // its dry run, changes only what it reports.
+            ferryman_channel::known::read_only();
             let scan = ferryman_ops::machine::scan();
             let options = ferryman_ops::migrate::Options {
                 apply,
