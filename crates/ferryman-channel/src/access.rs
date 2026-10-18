@@ -132,8 +132,30 @@ fn grant_file(channel: &Path, agent: &str) -> PathBuf {
 /// What this machine last accepted, per agent, for one channel.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Memory {
+    /// Which channel this was learned from: its master's name and when they declared
+    /// themselves. A project id alone is not an identity (a project can be made again under
+    /// the same name), and what one channel's master signed says nothing about another's.
+    #[serde(default)]
+    channel: String,
     #[serde(default)]
     agents: BTreeMap<String, AccessGrant>,
+}
+
+/// The channel's own identity for [`Memory`]: its verified master declaration. Empty when
+/// it has none yet.
+fn channel_identity(channel: &Path) -> String {
+    let roster = crate::read_agent_roster(channel).unwrap_or_default();
+    crate::master::read_master_at(channel, &roster)
+        .ok()
+        .flatten()
+        .map(|declaration| {
+            format!(
+                "{}@{}",
+                declaration.master,
+                declaration.created_at.to_rfc3339()
+            )
+        })
+        .unwrap_or_default()
 }
 
 /// Keyed by the project and not by where its channel is: `root migrate` moves the channel,
@@ -152,10 +174,17 @@ fn memory_path(_channel: &Path, project_id: &str) -> Option<PathBuf> {
 }
 
 fn read_memory(channel: &Path, project_id: &str) -> Memory {
-    memory_path(channel, project_id)
+    let memory: Memory = memory_path(channel, project_id)
         .and_then(|path| fs::read(path).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Learned from another channel that had this project id: not this one's history. A
+    // memory from before channels were told apart is kept and claimed by this one.
+    let here = channel_identity(channel);
+    if !here.is_empty() && !memory.channel.is_empty() && memory.channel != here {
+        return Memory::default();
+    }
+    memory
 }
 
 static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -177,7 +206,12 @@ fn write_memory(channel: &Path, project_id: &str, memory: &Memory) {
     if let Some(dir) = path.parent() {
         let _ = fs::create_dir_all(dir);
     }
-    let _ = crate::atomic_json(&path, memory);
+    let mut memory = memory.clone();
+    let here = channel_identity(channel);
+    if !here.is_empty() {
+        memory.channel = here;
+    }
+    let _ = crate::atomic_json(&path, &memory);
 }
 
 /// The grant in `access/<agent>.json` when it verifies as the project master's. No memory.
@@ -296,6 +330,51 @@ fn resolve_levels(channel: &Path, project_id: &str, names: &[String]) -> BTreeMa
         .collect()
 }
 
+/// The roster names that are Workers only because the master has not admitted them: a name
+/// registered after the first Worker was set. They stay Workers until the master looks at
+/// the list and admits them (`ferry access admit`); nothing admits them on its own, since
+/// a Worker registering a fresh key is exactly what this is there to catch.
+#[must_use]
+pub fn pending_admission(channel: &Path, project_id: &str) -> Vec<String> {
+    let granted = grants(channel, project_id);
+    worker_agents(channel, project_id)
+        .into_iter()
+        .filter(|name| !granted.contains_key(name))
+        .collect()
+}
+
+/// Admit `names` (canonical or not), which must be roster names waiting in
+/// [`pending_admission`], as Members. Master only.
+///
+/// # Errors
+/// As [`set_level`], or a name that is not waiting.
+pub fn admit(
+    route: &ProjectRoute,
+    master: &AgentIdentity,
+    names: &[String],
+) -> Result<Vec<String>> {
+    crate::ferry::require_master(
+        &route.communications,
+        &route.project_id,
+        master,
+        "admit agents",
+    )?;
+    let waiting = pending_admission(&route.communications, &route.project_id);
+    let mut done = Vec::new();
+    for name in names {
+        let name = canonical_agent_name(name);
+        if !waiting.contains(&name) {
+            bail!(
+                "{name} is not waiting for admission on {}",
+                route.project_id
+            );
+        }
+        set_level(route, master, &name, Level::Member)?;
+        done.push(name);
+    }
+    Ok(done)
+}
+
 /// Every level in the project, for the agents on the roster: explicit, or the default.
 #[must_use]
 pub fn levels(channel: &Path, project_id: &str) -> BTreeMap<String, Level> {
@@ -338,6 +417,19 @@ pub fn set_level(
     agent: &str,
     level: Level,
 ) -> Result<AccessGrant> {
+    set_level_with(route, master, agent, level, true)
+}
+
+/// [`set_level`], with the paused-anchor check optional. Admitting the people already
+/// working here, as part of the first Worker grant, keeps what they have and is not a
+/// widening, so it must not be refused for being one.
+fn set_level_with(
+    route: &ProjectRoute,
+    master: &AgentIdentity,
+    agent: &str,
+    level: Level,
+    pause_check: bool,
+) -> Result<AccessGrant> {
     let channel = &route.communications;
     if !is_safe_component(agent) {
         bail!("agent name must be a path-safe identifier");
@@ -358,7 +450,7 @@ pub fn set_level(
         bail!("the master is always an orchestrator; hand the role over first");
     }
     // Widening is held back with the rest of what a master with a failing anchor may do.
-    if level != Level::Worker {
+    if level != Level::Worker && pause_check {
         crate::anchor::refuse_if_paused(route, master.name(), "widen access")?;
     }
     // The first Worker makes "on the roster" mean nothing (a name nobody admitted is a
@@ -386,7 +478,7 @@ pub fn set_level(
             {
                 continue;
             }
-            set_level(route, master, &other, Level::Member)?;
+            set_level_with(route, master, &other, Level::Member, false)?;
         }
     }
     let held = read_memory(channel, &route.project_id)
@@ -591,9 +683,13 @@ const AUTHOR_KEYS: [&str; 7] = [
 /// heartbeat, result or receipt (elsewhere it names who a file is about: a grant, a roster entry).
 fn authors_in(value: &serde_json::Value, relative_name: &str) -> Vec<String> {
     let name = relative_name.to_ascii_lowercase();
+    // The kind, then a separator: `readme.json` is not a `read`, nor `results.json` a `result`.
     let about_self = ["claim", "heartbeat", "result", "delivered", "read"]
         .iter()
-        .any(|kind| name.starts_with(kind));
+        .any(|kind| {
+            name.strip_prefix(kind)
+                .is_some_and(|rest| rest.starts_with(['.', '-', '_']))
+        });
     AUTHOR_KEYS
         .iter()
         .filter(|key| **key != "agent" || about_self)
@@ -1177,6 +1273,72 @@ mod tests {
             memory_path(&f.route.communications, "demo"),
             memory_path(&f.route.communications, "other")
         );
+    }
+
+    #[test]
+    fn what_one_channel_taught_the_machine_is_not_held_against_another_with_the_same_project_id() {
+        let f = fixture();
+        let channel = &f.route.communications;
+        set_level(&f.route, &f.master, "wisp", Level::Worker).unwrap();
+        assert_eq!(
+            read_memory(channel, "demo").agents.len(),
+            2,
+            "wisp and fang"
+        );
+        let remembered = read_memory(channel, "demo");
+        assert!(
+            remembered.channel.starts_with("josh@"),
+            "{}",
+            remembered.channel
+        );
+
+        // The same project id, but the memory was learned from a different channel.
+        let mut other = remembered.clone();
+        other.channel = "josh@2001-01-01T00:00:00+00:00".into();
+        for grant in other.agents.values_mut() {
+            grant.seq = 99;
+        }
+        let path = memory_path(channel, "demo").unwrap();
+        crate::atomic_json(&path, &other).unwrap();
+        assert!(read_memory(channel, "demo").agents.is_empty());
+        // This channel's own grants are not refused for the other one's higher numbers.
+        assert_eq!(level_of(channel, "demo", "wisp"), Level::Worker);
+
+        // A memory from before channels were told apart is kept, and claimed.
+        let mut legacy = remembered;
+        legacy.channel = String::new();
+        crate::atomic_json(&path, &legacy).unwrap();
+        assert_eq!(read_memory(channel, "demo").agents.len(), 2);
+    }
+
+    #[test]
+    fn only_a_kind_followed_by_a_separator_makes_agent_mean_the_author() {
+        let value = serde_json::json!({ "agent": "wisp" });
+        assert_eq!(authors_in(&value, "claim.json"), vec!["wisp"]);
+        assert_eq!(authors_in(&value, "heartbeat-x.json"), vec!["wisp"]);
+        assert_eq!(authors_in(&value, "result_1.json"), vec!["wisp"]);
+        assert!(authors_in(&value, "readme.json").is_empty());
+        assert!(authors_in(&value, "ready.json").is_empty());
+        assert!(authors_in(&value, "results.json").is_empty());
+        assert!(authors_in(&value, "claimed.json").is_empty());
+    }
+
+    #[test]
+    fn admitting_after_the_first_worker_is_the_masters_call() {
+        let f = fixture();
+        let channel = &f.route.communications;
+        set_level(&f.route, &f.master, "wisp", Level::Worker).unwrap();
+        let alias = AgentIdentity::from_seed("wisp-two", [10u8; 32]);
+        enrol(&f.route, &alias, "worker");
+        assert_eq!(pending_admission(channel, "demo"), vec!["wisp-two"]);
+        // Nothing admits it on its own: another Worker grant does not either.
+        set_level(&f.route, &f.master, "wisp", Level::Worker).unwrap();
+        assert_eq!(pending_admission(channel, "demo"), vec!["wisp-two"]);
+
+        assert!(admit(&f.route, &f.master, &["fang".to_string()]).is_err());
+        assert!(admit(&f.route, &f.master, &["wisp-two".to_string()]).is_ok());
+        assert!(pending_admission(channel, "demo").is_empty());
+        assert_eq!(level_of(channel, "demo", "wisp-two"), Level::Member);
     }
 
     #[test]
