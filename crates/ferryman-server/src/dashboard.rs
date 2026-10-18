@@ -14,8 +14,8 @@ use anyhow::{Error, bail};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode},
-    response::Html,
+    http::{HeaderMap, StatusCode, header::CONTENT_SECURITY_POLICY},
+    response::{Html, IntoResponse, Response},
     routing::{delete, get, post, put},
 };
 use ferryman_channel::seed::OperatorSeed;
@@ -453,6 +453,7 @@ pub fn router(state: DashboardState) -> Router {
             require_session,
         ))
         .layer(axum::middleware::from_fn(loopback_host_guard))
+        .layer(axum::middleware::from_fn(default_csp))
         .with_state(state)
 }
 
@@ -5390,7 +5391,7 @@ async fn new_order(
 /// GET / — the single-page app, with the project id and mode injected so the
 /// browser knows how to behave. The session token is never embedded: it only
 /// exists after the operator signs in, and it stays in the tab's memory.
-async fn index(State(state): State<DashboardState>) -> Html<String> {
+async fn index(State(state): State<DashboardState>) -> Response {
     let html = DASHBOARD_HTML
         .replace("__PROJECT__", &state.route.project_id)
         .replace(
@@ -5405,7 +5406,60 @@ async fn index(State(state): State<DashboardState>) -> Html<String> {
                 "false"
             },
         );
-    Html(html)
+    let policy = page_csp(&html);
+    ([(CONTENT_SECURITY_POLICY, policy)], Html(html)).into_response()
+}
+
+/// The Content-Security-Policy for the page itself.
+///
+/// The page is one inline `<script>` and one inline `<style>` with a lot of `style="..."`
+/// attributes, and nothing loaded from anywhere else. So scripts are allowed by hash of
+/// exactly the inline script served (not `'unsafe-inline'`): markup injected into the page
+/// cannot run, and nothing can load a script from another origin. The hash is taken from
+/// the served text, because `index` substitutes the project id into it. Styles keep
+/// `'unsafe-inline'`: hashes cannot cover the attributes, and style injection cannot run code.
+fn page_csp(html: &str) -> axum::http::HeaderValue {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    // A browser hashes the script text after newline normalisation.
+    let normalised = html.replace("\r\n", "\n").replace('\r', "\n");
+    let mut scripts = String::new();
+    let mut rest = normalised.as_str();
+    while let Some(start) = rest.find("<script>") {
+        let body = &rest[start + "<script>".len()..];
+        let Some(end) = body.find("</script>") else {
+            break;
+        };
+        let digest = sha2::Sha256::digest(&body.as_bytes()[..end]);
+        scripts.push_str(&format!(
+            " 'sha256-{}'",
+            base64::engine::general_purpose::STANDARD.encode(digest)
+        ));
+        rest = &body[end..];
+    }
+    let policy = format!(
+        "default-src 'self'; script-src{scripts}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
+         form-action 'self'; frame-ancestors 'none'"
+    );
+    axum::http::HeaderValue::from_str(&policy)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static("default-src 'none'"))
+}
+
+/// Every response that did not set its own policy gets the strictest one: the API answers
+/// JSON and is never a page, so it may load nothing and may not be framed.
+async fn default_csp(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(request).await;
+    response
+        .headers_mut()
+        .entry(CONTENT_SECURITY_POLICY)
+        .or_insert(axum::http::HeaderValue::from_static(
+            "default-src 'none'; frame-ancestors 'none'",
+        ));
+    response
 }
 
 /// JSON representation of a task state. The shape is intentionally flat and
@@ -8438,5 +8492,34 @@ mod tests {
             sessions.resolve(&token).is_none(),
             "idle session must expire"
         );
+    }
+}
+
+#[cfg(test)]
+mod csp_tests {
+    use super::*;
+
+    #[test]
+    fn the_page_policy_allows_exactly_its_own_inline_script_and_cannot_be_framed() {
+        let html = "<html><script>alert(1)</script></html>";
+        let policy = page_csp(html);
+        let policy = policy.to_str().unwrap();
+        // sha256 of "alert(1)", base64.
+        assert!(
+            policy.contains("script-src 'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='; ")
+        );
+        assert!(!policy.contains("script-src 'unsafe-inline'"));
+        assert!(policy.contains("frame-ancestors 'none'"));
+        assert!(policy.contains("default-src 'self'"));
+    }
+
+    #[test]
+    fn the_real_page_has_one_inline_script_and_loads_nothing_remote() {
+        assert_eq!(DASHBOARD_HTML.matches("<script").count(), 1);
+        assert!(!DASHBOARD_HTML.contains("<script src"));
+        assert!(!DASHBOARD_HTML.contains("<link"));
+        // Newlines are normalised before hashing, so a CRLF checkout hashes the same.
+        let crlf = DASHBOARD_HTML.replace('\n', "\r\n");
+        assert_eq!(page_csp(DASHBOARD_HTML), page_csp(&crlf));
     }
 }

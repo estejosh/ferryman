@@ -16,6 +16,8 @@
   p { margin:.5rem 0; color:var(--mut); }
   code { background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:0 .3rem; }
   button { margin-top:1.25rem; width:100%; font:inherit; font-weight:600; padding:.7rem 1rem; border:0; border-radius:8px; background:var(--acc); color:var(--accfg); cursor:pointer; }
+  button.second { margin-top:.6rem; background:transparent; color:var(--mut); border:1px solid var(--line); font-weight:500; }
+  button[hidden] { display:none; }
   button[disabled] { opacity:.6; cursor:default; }
   #err { color:#c0392b; }
 </style>
@@ -26,7 +28,8 @@
   <div id="body"></div>
   <p id="err" role="alert"></p>
   <button id="action" type="button"></button>
+  <button id="other" type="button" class="second" hidden></button>
 </main>
-<script src="setup.js"></script>
+<script type="module" src="setup.js"></script>
 </body>
 </html>

@@ -116,3 +116,19 @@ Verification is computed against the copy GitHub holds, not the copy in this
 repository, so a UID added locally changes nothing until that copy is replaced.
 Adding a UID does not change the key or its fingerprint, and tags signed before
 the change still verify.
+
+## Version bump checklist
+
+The workspace version is in the root `Cargo.toml` (`[workspace.package]`). Two crates are
+outside the workspace and carry their own version and lockfile, so a bump does not reach
+them by itself:
+
+- [ ] `Cargo.toml`: `[workspace.package] version`
+- [ ] `crates/ferryman-desktop/Cargo.toml`: `version` must equal the workspace version (CI's
+      `desktop` job fails if it does not). Installers are named after it. Then
+      `cargo update -p ferryman-desktop --manifest-path crates/ferryman-desktop/Cargo.toml`
+      so its `Cargo.lock` follows.
+- [ ] `crates/ferryman-tray/Cargo.lock`: the workspace crates' versions, by hand
+- [ ] `CHANGELOG.md`, and `bridge-release.toml` for the updater
+- [ ] The desktop installers are built by `desktop-bundle.yml` on the tag. To check them
+      without a release, run it from the Actions tab.

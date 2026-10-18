@@ -24,6 +24,11 @@
 mod boot;
 mod tray;
 
+use std::sync::{
+    Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+
 use tauri::{
     AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, WindowEvent,
     webview::NewWindowResponse,
@@ -43,35 +48,46 @@ const PAGE_SCRIPT: &str = r#"
 (function () {
   if (window.__ferrymanDesktop) return;
   window.__ferrymanDesktop = true;
-  var wentToFleet = false;
-  setInterval(function () {
+  // Watches the page change rather than polling it, and stops for good once it has taken
+  // the person to the Fleet: after that the page is entirely the dashboard's own.
+  var observer = new MutationObserver(function () {
     var label = document.getElementById("auth-setup-label");
     if (label && !label.dataset.desktop) {
       label.dataset.desktop = "1";
       label.textContent = "Setup token (shown when the app opened; tray menu > First-time setup token)";
     }
-    if (!wentToFleet) {
-      var button = document.querySelector('#nav-system button[data-page="fleet"]');
-      if (button && button.offsetParent !== null) {
-        wentToFleet = true;
-        button.click();
-      }
+    var button = document.querySelector('#nav-system button[data-page="fleet"]');
+    if (button && button.offsetParent !== null) {
+      observer.disconnect();
+      button.click();
     }
-  }, 250);
+  });
+  observer.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
 })();
 "#;
 
 /// Set by the first successful boot; there is exactly one dashboard server per process.
 struct Running(tauri::async_runtime::Mutex<Option<boot::Server>>);
 
+/// Whether a tray icon exists. With none (a Linux desktop with no indicator host), hiding
+/// the window would leave a running app nobody can reach, so closing must quit instead.
+struct HasTray(AtomicBool);
+
+/// The setup token this app last put on the clipboard, so it can be taken off again.
+struct Copied(Mutex<Option<String>>);
+
+/// How long a copied setup token may stay on the clipboard.
+const CLIPBOARD_SECONDS: u64 = 60;
+
 enum Outcome {
     Ready,
     NoRoot,
     NoProjects(String),
+    Unreachable(String),
 }
 
 fn main() {
-    let app = tauri::Builder::default()
+    let built = tauri::Builder::default()
         // First, so a second launch is handled before anything else in it starts.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             open_window(app);
@@ -79,18 +95,31 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .manage(Running(tauri::async_runtime::Mutex::new(None)))
+        .manage(HasTray(AtomicBool::new(false)))
+        .manage(Copied(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![set_up_here, check_again])
         .on_window_event(|window, event| {
-            // Closing the window leaves the app in the tray. Quit is in the tray menu.
+            // Closing the window leaves the app in the tray, and Quit is in the tray menu.
+            // Without a tray there is nothing to come back from, so the close goes through.
             if window.label() == MAIN
                 && let WindowEvent::CloseRequested { api, .. } = event
+                && window
+                    .app_handle()
+                    .state::<HasTray>()
+                    .0
+                    .load(Ordering::Relaxed)
             {
                 api.prevent_close();
                 let _ = window.hide();
             }
         })
         .setup(|app| {
-            tray::build(app.handle())?;
+            match tray::build(app.handle()) {
+                Ok(()) => app.state::<HasTray>().0.store(true, Ordering::Relaxed),
+                Err(error) => eprintln!(
+                    "ferryman-desktop: no tray icon, closing the window will quit: {error}"
+                ),
+            }
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 let first = boot_window(&handle).await;
@@ -100,10 +129,54 @@ fn main() {
             });
             Ok(())
         })
-        .build(tauri::generate_context!())
-        .expect("could not start Ferryman");
+        .build(tauri::generate_context!());
 
-    app.run(|_, _| {});
+    let app = match built {
+        Ok(app) => app,
+        Err(error) => {
+            // No window system to ask, so ask the OS directly. A process that dies without
+            // a word is indistinguishable from one that never started.
+            rfd::MessageDialog::new()
+                .set_level(rfd::MessageLevel::Error)
+                .set_title("Ferryman")
+                .set_description(format!("Ferryman could not start.\n\n{error}"))
+                .show();
+            std::process::exit(1);
+        }
+    };
+
+    app.run(|app, event| {
+        // A token left on the clipboard is cleared on the way out as well.
+        if let tauri::RunEvent::Exit = event {
+            clear_clipboard_if_still(app, None);
+        }
+    });
+}
+
+/// Empty the clipboard if it still holds the setup token this app copied. With `only`,
+/// only when it holds exactly that; with `None`, whatever token was last copied. Anything
+/// else on the clipboard is somebody's own and is left alone.
+fn clear_clipboard_if_still(app: &AppHandle, only: Option<&str>) {
+    let Some(copied) = app
+        .state::<Copied>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+    else {
+        return;
+    };
+    if only.is_some_and(|token| token != copied) {
+        return;
+    }
+    if app.clipboard().read_text().is_ok_and(|now| now == copied) {
+        let _ = app.clipboard().clear();
+    }
+    if let Ok(mut slot) = app.state::<Copied>().0.lock()
+        && slot.as_deref() == Some(copied.as_str())
+    {
+        *slot = None;
+    }
 }
 
 /// Show the dashboard if there is one, otherwise whatever it takes to get one.
@@ -156,6 +229,11 @@ async fn boot_window(app: &AppHandle) -> Outcome {
             let path = path.display().to_string();
             show_setup(app, "no_projects", &path);
             Outcome::NoProjects(path)
+        }
+        boot::Found::Unreachable(path) => {
+            let path = path.display().to_string();
+            show_setup(app, "unreachable", &path);
+            Outcome::Unreachable(path)
         }
     }
 }
@@ -219,6 +297,7 @@ fn outcome_json(outcome: &Outcome) -> String {
         Outcome::Ready => ("ready", String::new()),
         Outcome::NoRoot => ("no_root", String::new()),
         Outcome::NoProjects(path) => ("no_projects", path.clone()),
+        Outcome::Unreachable(path) => ("unreachable", path.clone()),
     };
     serde_json::json!({ "state": state, "path": path }).to_string()
 }
@@ -233,9 +312,13 @@ fn only_setup(window: &WebviewWindow) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn set_up_here(window: WebviewWindow, app: AppHandle) -> Result<String, String> {
+async fn set_up_here(
+    window: WebviewWindow,
+    app: AppHandle,
+    replace: bool,
+) -> Result<String, String> {
     only_setup(&window)?;
-    boot::create_root().map_err(|error| format!("{error:#}"))?;
+    boot::create_root(replace).map_err(|error| format!("{error:#}"))?;
     Ok(outcome_json(&boot_window(&app).await))
 }
 
@@ -290,7 +373,7 @@ fn offer_token(app: &AppHandle, token: String, first_run: bool) {
         "This is the one-time setup token for creating the first operator.\n\n"
     };
     let message = format!(
-        "{intro}{token}\n\nPaste it into the sign-up form. It stops working as soon as one operator exists. Copying puts it on your clipboard."
+        "{intro}{token}\n\nPaste it into the sign-up form. It stops working as soon as one operator exists. Copying puts it on your clipboard for one minute."
     );
     let handle = app.clone();
     app.dialog()
@@ -301,8 +384,17 @@ fn offer_token(app: &AppHandle, token: String, first_run: bool) {
             "Close".into(),
         ))
         .show(move |copy| {
-            if copy {
-                let _ = handle.clipboard().write_text(token);
+            if !copy || handle.clipboard().write_text(token.clone()).is_err() {
+                return;
             }
+            if let Ok(mut slot) = handle.state::<Copied>().0.lock() {
+                *slot = Some(token.clone());
+            }
+            // A secret does not stay on the clipboard: taken off after a minute, and only
+            // if it is still the token (anything the person copied since is theirs).
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(CLIPBOARD_SECONDS));
+                clear_clipboard_if_still(&handle, Some(&token));
+            });
         });
 }

@@ -38,6 +38,17 @@ pub enum Found {
     NoRoot,
     /// A root, but nothing filed in it that can be read yet.
     NoProjects(PathBuf),
+    /// This machine remembers a root that it cannot find: an unmounted drive, an offline
+    /// share. Not the same as having none, and never to be answered by making a new one.
+    Unreachable(PathBuf),
+}
+
+/// The root this machine has been told to use, if it has been told one at all.
+fn remembered_root() -> Option<PathBuf> {
+    let pointer = ferryman_channel::licensing::machine_state_dir()?.join("ferry-root");
+    let text = std::fs::read_to_string(pointer).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| PathBuf::from(text))
 }
 
 /// Look for a root, then for a project in it to open on.
@@ -47,7 +58,12 @@ pub enum Found {
 /// Ties are broken by name so the choice is the same every launch.
 pub fn locate() -> Found {
     let Some(root) = ferry::find_root() else {
-        return Found::NoRoot;
+        // `find_root` says "none" both when nothing was ever set up and when the remembered
+        // folder has gone away. Only the first may offer to set up.
+        return match remembered_root() {
+            Some(path) => Found::Unreachable(path),
+            None => Found::NoRoot,
+        };
     };
     let mut entries = root.projects();
     entries.sort_by(|a, b| {
@@ -72,7 +88,13 @@ pub fn default_root_path() -> Result<PathBuf> {
 }
 
 /// Make the layout and remember it, exactly as `ferry root init` does. Safe to repeat.
-pub fn create_root() -> Result<PathBuf> {
+///
+/// Refuses while the machine remembers a root it cannot reach, unless `replace` says the
+/// person chose to start over: remembering a new folder forgets the old one.
+pub fn create_root(replace: bool) -> Result<PathBuf> {
+    if !replace && ferry::find_root().is_none() && remembered_root().is_some() {
+        anyhow::bail!("this computer already remembers a Ferryman folder that is not reachable");
+    }
     let root = Root::create(&default_root_path()?)?;
     Ok(root.path)
 }

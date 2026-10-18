@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-channel"
-version = "0.5.30"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
@@ -1451,7 +1451,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-core"
-version = "0.5.30"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1469,13 +1469,14 @@ dependencies = [
 
 [[package]]
 name = "ferryman-desktop"
-version = "0.5.30"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "axum",
  "ferryman-channel",
  "ferryman-ops",
  "ferryman-server",
+ "rfd",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -1487,7 +1488,7 @@ dependencies = [
 
 [[package]]
 name = "ferryman-ops"
-version = "0.5.30"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1513,12 +1514,13 @@ dependencies = [
 
 [[package]]
 name = "ferryman-server"
-version = "0.5.30"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
  "clap",
