@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Channels can sync between machines over iroh (QUIC), through our own relay, beside Syncthing. With `[iroh] enabled = true`, a relay URL and the relay certificate's SHA-256 pin in the ferry root's `ferry.toml`, and the relay's access token in `iroh-relay.token` in the machine state directory, `ferry agent run --all-projects` serves and syncs every channel it serves with every trusted peer every 30 seconds: a manifest (path, size, BLAKE3, mtime) per shared project, then only what is missing or older, written atomically. `ferry lane iroh init` makes the machine's iroh key once (beside the operator seed, never in a channel) and publishes a signed `transports/<agent>.json` into each served channel; a peer is let in only if its endpoint id is in such a record signed by an agent on that channel's roster who is not revoked, and is offered only the channels it is trusted in. The channel's `.stignore` exclusions apply both ways, conflict copies, temporary files and files over 64 MiB never move, nothing is deleted, nothing is written outside the channel (no `..`, absolute paths or symlinks), and the newer mtime wins. The relay's self-signed certificate is trusted by its pinned hash and no other; no n0 relay or DNS is used. `ferry lane iroh status` shows the endpoint id, whether the relay accepts us, and each peer's last sync and file counts. Off by default. See docs/IROH_LANE.md.
+
+`ferry fleet setup --service` on Linux writes a worker unit that loads. It quoted the `WorkingDirectory=` path, which systemd reads literally, so the unit failed with "path is not absolute" and the worker never started.
+
 ## v0.5.29 - 2026-10-15
 
 An all-projects worker on Linux starts again. v0.5.28 counted the worker's own threads as rival workers, because the Linux process table lists every thread under its own id, so `ferry agent run --all-projects` refused to start on grouchly and systemd kept restarting it. Threads are now skipped, and a test pins that a process's own threads are not read as processes.

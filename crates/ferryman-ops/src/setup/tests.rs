@@ -180,6 +180,7 @@ fn the_systemd_unit_is_one_worker_with_limits_and_no_inline_secrets() {
         "CPUQuota=",
         "TasksMax=",
         "EnvironmentFile=-/srv/ferry/service/worker.env",
+        "\nWorkingDirectory=/srv/ferry/repos/ferryman\n",
         "agent run --all-projects --workspace",
         "ferryman-syncthing.service",
     ] {
