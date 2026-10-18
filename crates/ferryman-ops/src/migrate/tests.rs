@@ -212,6 +212,16 @@ fn a_running_worker_blocks_the_move_and_says_so() {
         1,
         "not bumped while a project is left behind"
     );
+    let alpha = report
+        .projects
+        .iter()
+        .find(|p| p.project == "alpha")
+        .unwrap();
+    assert!(
+        alpha.steps.iter().any(|step| step.starts_with("channel ")),
+        "a blocked project still shows what would move: {:?}",
+        alpha.steps
+    );
     assert!(
         f.root
             .comms()

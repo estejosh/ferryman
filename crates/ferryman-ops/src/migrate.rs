@@ -131,7 +131,7 @@ impl Report {
             }
         }
         if !self.stale_worktrees.is_empty() {
-            out.push_str("stale worktrees left under work/ (not touched):\n");
+            out.push_str("worktrees under work/ left where they are (a stale one is yours to remove; a live one blocks its project):\n");
             for line in &self.stale_worktrees {
                 out.push_str(&format!("  {line}\n"));
             }
@@ -287,7 +287,7 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
     let move_repo = entry
         .repo
         .as_ref()
-        .filter(|repo| repo.is_dir() && same_place(repo, &root.repos().join(&id)))
+        .filter(|repo| movable_clone(root, entry, repo))
         .cloned();
 
     if !move_channel && !move_handins && move_repo.is_none() {
@@ -326,10 +326,6 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
     if move_repo.is_some() && non_empty(&repo_to) {
         blocked.push(format!("{} already holds something", repo_to.display()));
     }
-    if !blocked.is_empty() {
-        rep.status = Status::Blocked(blocked);
-        return rep;
-    }
 
     let folder = format!("{id}-ferryman");
     let in_syncthing =
@@ -357,6 +353,12 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
             repo.display(),
             repo_to.display()
         ));
+    }
+    // Blocked projects still show what would move once the block is gone, so the plan can
+    // be read before anything is stopped.
+    if !blocked.is_empty() {
+        rep.status = Status::Blocked(blocked);
+        return rep;
     }
     if !ctx.apply {
         rep.status = Status::Planned;
@@ -471,7 +473,7 @@ fn perform(
     if let Some(repo) = entry
         .repo
         .as_ref()
-        .filter(|repo| repo.is_dir() && same_place(repo, &root.repos().join(id)))
+        .filter(|repo| movable_clone(root, entry, repo))
     {
         fs::create_dir_all(&dir)?;
         safe_move(repo, &repo_to, ctx)?;
@@ -499,6 +501,15 @@ fn perform(
     }
     let _ = options;
     Ok(())
+}
+
+/// Ferryman's own clone at `repos/<id>`, and nothing else: not an adopted repository, not a
+/// link to somebody's checkout, not a folder that merely resolves elsewhere.
+fn movable_clone(root: &Root, entry: &Entry, repo: &Path) -> bool {
+    !entry.adopted
+        && repo.is_dir()
+        && !fs::symlink_metadata(repo).is_ok_and(|meta| meta.file_type().is_symlink())
+        && same_place(repo, &root.repos().join(&entry.project_id))
 }
 
 fn non_empty(dir: &Path) -> bool {
