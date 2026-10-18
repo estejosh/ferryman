@@ -6,6 +6,11 @@
 name: desktop-bundle
 
 on:
+  # TEMPORARY proof trigger (removed in the next commit): a workflow that is not yet on the
+  # default branch cannot be dispatched, so this runs it from the branch instead.
+  push:
+    branches: [desktop-app]
+    paths: ['.github/workflows/desktop-bundle.yml']
   workflow_dispatch:
     inputs:
       ref:
