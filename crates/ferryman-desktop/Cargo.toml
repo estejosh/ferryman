@@ -1,0 +1,43 @@
+[package]
+name = "ferryman-desktop"
+version = "0.5.30"
+edition = "2024"
+license = "LicenseRef-Ferryman-Source-Available"
+repository = "https://github.com/estejosh/ferryman"
+description = "Ferryman as a desktop app: the dashboard in a native window, with a tray."
+publish = false
+
+# Deliberately NOT a member of the workspace, for the same reason the tray is not: it needs
+# desktop libraries (WebView2 on Windows, webkit2gtk and GTK on Linux) and a web-view stack
+# that is several hundred crates, and `cargo test --workspace` on a headless agent box is
+# the build that matters most. Built per platform by its own CI job and by the release job.
+
+[dependencies]
+anyhow = "1.0"
+axum = "0.8"
+ferryman-channel = { path = "../ferryman-channel" }
+ferryman-ops = { path = "../ferryman-ops" }
+ferryman-server = { path = "../ferryman-server" }
+serde_json = "1.0"
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tokio = { version = "1.47", features = ["net", "rt-multi-thread"] }
+
+[build-dependencies]
+tauri-build = "2"
+
+[features]
+# Tauri's own switch: without it the build looks for a dev server instead of using the embedded UI.
+# On by default so a plain `cargo build --release` makes a working app, not only `tauri build`.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+# Both the `tauri build` bundler and plain `cargo build --release` end up here, so the
+# profile is the same either way.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

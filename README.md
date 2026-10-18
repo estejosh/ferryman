@@ -50,6 +50,17 @@ No Rust toolchain, no compile. Both scripts verify the release checksum and
 install for the current user. Ferryman needs [Syncthing](https://syncthing.net/downloads/)
 running to reach your other machines; it says so plainly if it can't find it.
 
+### Desktop app (beta, Windows and Linux)
+
+`crates/ferryman-desktop` is the dashboard in its own window, for people who would
+rather not run `ferry dashboard` in the right folder and open a browser. It finds your
+Ferryman folder by itself, opens on the Fleet, stays in the system tray when you close
+the window, and a second launch focuses the first. It is the same dashboard, served from
+the same code on a loopback port, with the same sign-in. The release page carries a
+Windows installer (`.exe`, `.msi`) and Linux `.deb` and AppImage packages. They are
+unsigned for now, so Windows SmartScreen will warn. It does not install the `ferry`
+command, so adding a project (`ferry enable`) still needs the terminal.
+
 **Or don't run it yourself.** [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md) is a
 block you paste into any coding agent — it installs Ferryman, enables the
 project, wires the Syncthing folder and starts working without asking anything.
@@ -362,10 +373,10 @@ them loses work or leaks anything.
   code reads it. Nothing sends automatically anyway — the check-in only ever runs
   when you run `ferry license checkin` — so leaving the URL unset is the control
   that actually works.
-- **The SBOM omits the tray.** `sbom.cdx.json` covers the workspace, and
-  `ferryman-tray` is excluded from the workspace with its own lockfile, so its
-  dependencies are missing from it. The tray is optional and not installed by the
-  install scripts.
+- **The SBOM omits the tray and the desktop app.** `sbom.cdx.json` covers the
+  workspace, and `ferryman-tray` and `ferryman-desktop` are excluded from it with
+  their own lockfiles, so their dependencies are missing from it. Both are optional
+  and not installed by the install scripts.
 - **`ferry bench --timeout-secs` is accepted and ignored.** The benchmark uses a
   fixed 300s per task.
 - **The MCP client has no timeouts.** An external MCP server that hangs will block
