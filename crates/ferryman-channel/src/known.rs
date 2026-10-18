@@ -250,7 +250,7 @@ mod tests {
     fn using_a_project_files_it_in_the_ferry_root_without_being_asked() {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
 
         // Somebody just uses a project. They run no filing command.
         let route = route(dir.path(), "alpha");
@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(known().len(), 1);
 
         // The root appears afterwards, and the project is simply used again.
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
         assert!(root.projects().is_empty());
         remember(&route);
 
@@ -292,7 +292,7 @@ mod tests {
     fn filing_moves_nothing_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
 
         let route = route(dir.path(), "alpha");
         std::fs::write(route.workspace.join("mine.txt"), "untouched").unwrap();

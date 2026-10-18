@@ -193,18 +193,19 @@ pub fn machine_label() -> String {
 }
 
 fn delivered_path(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
-    task_dir(route, order_id).join(format!("delivered.{agent}.json"))
+    crate::agent_task_dir(route, order_id, agent).join(format!("delivered.{agent}.json"))
 }
 
 fn read_path(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
-    task_dir(route, order_id).join(format!("read.{agent}.json"))
+    crate::agent_task_dir(route, order_id, agent).join(format!("read.{agent}.json"))
 }
 
 fn presence_path(route: &ProjectRoute, agent: &str) -> PathBuf {
-    route
-        .communications
-        .join("presence")
-        .join(format!("{agent}.json"))
+    crate::access::out_path(
+        route,
+        agent,
+        &Path::new("presence").join(format!("{agent}.json")),
+    )
 }
 
 /// Write a receipt that must never change once written.
@@ -322,14 +323,38 @@ pub struct Receipts {
 /// invalid rather than counted, because it was copied there by something.
 pub fn read_receipts(route: &ProjectRoute, order_id: &str) -> Result<Receipts> {
     let mut receipts = Receipts::default();
-    let Ok(entries) = fs::read_dir(task_dir(route, order_id)) else {
-        return Ok(receipts);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // The channel's folder, then each Worker-level agent's own copy of it in its hand-ins
+    // folder (ADR 0024): a Worker's receipts are taken from there and nowhere else.
+    let workers = crate::access::refused_authors(&route.communications, &route.project_id);
+    let mut places: Vec<(Option<String>, PathBuf)> = vec![(None, task_dir(route, order_id))];
+    for (worker, dir) in crate::access::overlay_dirs(&route.communications, &route.project_id) {
+        places.push((Some(worker), dir.join("tasks").join(order_id)));
+    }
+    let entries: Vec<(Option<String>, PathBuf)> = places
+        .into_iter()
+        .filter_map(|(from, dir)| fs::read_dir(dir).ok().map(|entries| (from, entries)))
+        .flat_map(|(from, entries)| {
+            entries
+                .flatten()
+                .map(move |entry| (from.clone(), entry.path()))
+        })
+        .collect();
+    for (from, path) in entries {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        let refused = match from.as_deref() {
+            Some(worker) => !crate::access::overlay_file_is_theirs(worker, name),
+            None => crate::access::comms_author_refused(
+                &format!("tasks/{order_id}/{name}"),
+                None,
+                &workers,
+            )
+            .is_some(),
+        };
+        if refused {
+            continue;
+        }
         if !Path::new(name)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
@@ -585,19 +610,36 @@ pub fn refresh_presence(
 /// Conflict copies are read too, and for each agent the newest *valid* record wins; an
 /// agent with no valid record is shown by its newest one, still marked unverified.
 pub fn list_presence(route: &ProjectRoute) -> Result<Vec<(Presence, SignatureCheck)>> {
-    let Ok(entries) = fs::read_dir(route.communications.join("presence")) else {
-        return Ok(Vec::new());
-    };
-    let mut all: Vec<(Presence, SignatureCheck)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
+    // The channel's `presence/`, minus any Worker-level agent's file; each Worker's own
+    // record is read from its hand-ins folder (ADR 0024).
+    let workers = crate::access::refused_authors(&route.communications, &route.project_id);
+    let mut places: Vec<(Option<String>, PathBuf)> =
+        vec![(None, route.communications.join("presence"))];
+    for (worker, dir) in crate::access::overlay_dirs(&route.communications, &route.project_id) {
+        places.push((Some(worker), dir.join("presence")));
+    }
+    let mut all: Vec<(Presence, SignatureCheck)> = places
+        .into_iter()
+        .filter_map(|(from, dir)| fs::read_dir(dir).ok().map(|entries| (from, entries)))
+        .flat_map(|(from, entries)| {
+            entries
+                .flatten()
+                .map(move |entry| (from.clone(), entry.path()))
+        })
+        .filter(|(_, path)| {
             path.extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
         })
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .filter_map(|text| serde_json::from_str::<Presence>(&text).ok())
-        .map(|presence| {
+        .filter_map(|(from, path)| Some((from, fs::read_to_string(path).ok()?)))
+        .filter_map(|(from, text)| Some((from, serde_json::from_str::<Presence>(&text).ok()?)))
+        .filter(|(from, presence)| {
+            let who = crate::canonical_agent_name(&presence.agent);
+            match from {
+                Some(worker) => &who == worker,
+                None => !workers.contains(&who),
+            }
+        })
+        .map(|(_, presence)| {
             let check = verify_presence(&presence, &route.agents);
             (presence, check)
         })

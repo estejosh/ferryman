@@ -80,7 +80,13 @@ pub struct LedgerLog {
 /// machines was never real anyway: it was an artifact of whoever's write landed first.
 /// Reading merges the files by timestamp, exactly as `read_agent_roster` merges rosters.
 fn ledger_path(route: &ProjectRoute, signer: &str) -> PathBuf {
-    route.communications.join(format!("ledger.{signer}.jsonl"))
+    // A Worker-level signer writes `handins/<signer>/ledger.<signer>.jsonl`, never the
+    // channel (ADR 0024); everyone else writes the channel as before.
+    crate::access::out_path(
+        route,
+        signer,
+        std::path::Path::new(&format!("ledger.{signer}.jsonl")),
+    )
 }
 
 /// The single-file ledger this project may still carry from before per-agent files.
@@ -98,14 +104,28 @@ fn ledger_files(route: &ProjectRoute) -> Vec<PathBuf> {
     if legacy.is_file() {
         files.push(legacy);
     }
+    // A Worker-level agent's ledger is read from its own hand-ins folder, and a ledger file
+    // of theirs found in the channel is not taken (ADR 0024).
+    let workers = crate::access::refused_authors(&route.communications, &route.project_id);
+    let overlays = crate::access::overlay_dirs(&route.communications, &route.project_id);
+    let mut per_agent: Vec<PathBuf> = overlays
+        .into_iter()
+        .map(|(worker, dir)| dir.join(format!("ledger.{worker}.jsonl")))
+        .filter(|path| path.is_file())
+        .collect();
     if let Ok(entries) = fs::read_dir(&route.communications) {
-        let mut per_agent: Vec<PathBuf> = entries
+        let channel_files: Vec<PathBuf> = entries
             .flatten()
             .map(|entry| entry.path())
             .filter(|path| {
                 let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                     return false;
                 };
+                if !workers.is_empty()
+                    && crate::access::comms_author_refused(name, None, &workers).is_some()
+                {
+                    return false;
+                }
                 // `ledger.<agent>.jsonl`, and not a Syncthing conflict copy of one - those
                 // are duplicates of records already counted, and reading them would report
                 // a broken chain for a file that is merely a copy.
@@ -114,9 +134,10 @@ fn ledger_files(route: &ProjectRoute) -> Vec<PathBuf> {
                     && !name.contains(".sync-conflict-")
             })
             .collect();
-        per_agent.sort();
-        files.extend(per_agent);
+        per_agent.extend(channel_files);
     }
+    per_agent.sort();
+    files.extend(per_agent);
     files
 }
 

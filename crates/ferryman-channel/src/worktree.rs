@@ -297,7 +297,13 @@ pub fn create_worktree(repo: &Path, order_id: &str, agent: &str) -> Result<(Path
                 // reuse it, and an agent would run a whole task - and commit - in the
                 // wrong repository. Centralising `work/` is what introduced that, so
                 // centralising `work/` is what has to pay for it.
-                let work = root.work().join(worktree_holder(repo));
+                //
+                // In layout 2 the project already is the folder (`projects/<id>/work`),
+                // so there is nothing to disambiguate and no holder subdirectory; a
+                // project placed by hand keeps the work folder it recorded.
+                let work = root
+                    .worktrees_for_repo(repo)
+                    .unwrap_or_else(|| root.work().join(worktree_holder(repo)));
                 std::fs::create_dir_all(&work)
                     .with_context(|| format!("create {}", work.display()))?;
                 work.join(&branch)
@@ -1144,7 +1150,16 @@ mod tests {
     fn a_managed_clone_has_a_plain_holder_and_any_other_checkout_a_hashed_one() {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
+
+        // Layout 2: the project is the folder, so its worktrees need no holder and sit in
+        // the project's own `work/`.
+        let v2 = crate::ferry::Root::create_with_layout(&dir.path().join("ferry2"), 2).unwrap();
+        let clone = v2.managed_clone("pc-secrets");
+        assert_eq!(
+            v2.worktrees_for_repo(&clone),
+            Some(v2.worktrees("pc-secrets"))
+        );
 
         // Ferryman's own clone: the holder is the project, so worktrees are
         // `work/<project>/<order>` and the hand-in folder is nowhere near them.

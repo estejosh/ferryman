@@ -25,21 +25,81 @@ use crate::{AgentIdentity, ProjectRoute, SignatureCheck, is_safe_component};
 /// The `format` tag in `handin.json`.
 pub const FORMAT: &str = "ferryman-handin/v1";
 
-/// Where a project's hand-ins live on this machine: `handins` inside the channel folder.
+/// Where a project's hand-ins live on this machine.
 ///
-/// Always inside the channel, so a hand-in reaches the head's machine on the folder that
-/// already syncs and no folder of its own is needed. It was once `work/<project>` in the
-/// ferry root, shared as a second Syncthing folder. That put the task worktrees under a
-/// shared folder, and `work/` and `repos/` are machine-local, so the Syncthing scope
-/// guard (`syncscope`) now refuses it.
+/// In a layout-2 root that is `projects/<id>/handins`, a folder of its own beside the channel
+/// (or the path a person recorded for it with `ferry enable --handins`). It is synced like
+/// the channel, by the same lanes, and it is what makes a read-only channel workable: a
+/// worker whose channel it may not write hands in, and says everything else it has to say,
+/// through here. Each agent writes only `handins/<agent>/`.
+///
+/// In a layout-1 root, and for a project whose channel was placed by hand with no hand-in
+/// folder recorded, it is still `handins` inside the channel folder, which already syncs.
+/// (It was once `work/<project>` in the ferry root, shared as a second Syncthing folder.
+/// That put the task worktrees under a shared folder, and `work/` and `repos/` are
+/// machine-local, so the Syncthing scope guard (`syncscope`) refuses it.)
 #[must_use]
 pub fn work_dir(route: &ProjectRoute) -> PathBuf {
-    route.communications.join("handins")
+    crate::ferry::handins_dir_for(&route.communications, &route.project_id)
 }
 /// Whether the hand-in folder lies inside the channel folder (and so syncs with it).
 #[must_use]
 pub fn is_in_channel(route: &ProjectRoute) -> bool {
     work_dir(route).starts_with(&route.communications)
+}
+
+/// The folder `agent` writes its own hand-ins into: `handins/<agent>` when the folder is
+/// separate from the channel, and the folder itself when it is inside the channel (layout 1,
+/// where hand-ins were `handins/<order>`).
+#[must_use]
+pub fn write_dir(route: &ProjectRoute, agent: &str) -> PathBuf {
+    let dir = work_dir(route);
+    if dir.starts_with(&route.communications) {
+        dir
+    } else {
+        dir.join(crate::canonical_agent_name(agent))
+    }
+}
+
+/// The folder of hand-in `order_id` under `dir`: `dir/<order>`, or `dir/<agent>/<order>`.
+/// `None` when there is none, and an error when two agents handed in the same order id and
+/// the caller has to say which.
+fn locate(dir: &Path, order_id: &str) -> Result<Option<PathBuf>> {
+    let direct = dir.join(order_id);
+    if direct.join("handin.json").is_file() {
+        return Ok(Some(direct));
+    }
+    let mut found = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(dir) {
+        for item in read_dir.flatten() {
+            let agent_dir = item.path();
+            if agent_dir.is_dir() && agent_dir.join(order_id).join("handin.json").is_file() {
+                found.push(agent_dir.join(order_id));
+            }
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => bail!(
+            "more than one agent handed in order {order_id}; accept or reject each from its \
+             own folder under {}",
+            dir.display()
+        ),
+    }
+}
+
+/// For a hand-in under an agent's folder (`dir/<agent>/<order>`), whether the folder is the
+/// agent the hand-in says it is from: only the assigned agent writes in its own subfolder.
+fn in_its_agents_folder(dir: &Path, folder: &Path, manifest: &Manifest) -> bool {
+    match folder.parent() {
+        Some(parent) if parent == dir => true,
+        Some(parent) => parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| crate::canonical_agent_name(&manifest.agent) == name),
+        None => false,
+    }
 }
 
 /// What [`ensure_work_ready`] found and did.
@@ -393,8 +453,25 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
     let Ok(read_dir) = fs::read_dir(dir) else {
         return Ok(entries);
     };
+    // `dir/<order>` (hand-ins inside the channel) and `dir/<agent>/<order>` (a separate
+    // hand-ins folder, one subfolder per agent).
+    let mut folders: Vec<PathBuf> = Vec::new();
     for item in read_dir.flatten() {
         let folder = item.path();
+        if folder.join("handin.json").is_file() {
+            folders.push(folder);
+        } else if folder.is_dir()
+            && let Ok(inner) = fs::read_dir(&folder)
+        {
+            folders.extend(
+                inner
+                    .flatten()
+                    .map(|item| item.path())
+                    .filter(|path| path.join("handin.json").is_file()),
+            );
+        }
+    }
+    for folder in folders {
         let Some(order) = folder
             .file_name()
             .and_then(|n| n.to_str())
@@ -402,7 +479,7 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
         else {
             continue;
         };
-        if !folder.join("handin.json").is_file() || !is_safe_component(&order) {
+        if !is_safe_component(&order) {
             continue;
         }
         let Some(manifest) = fs::read_to_string(folder.join("handin.json"))
@@ -412,6 +489,8 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
             continue;
         };
         let signature = match read(route, &folder) {
+            // A hand-in found in some other agent's folder is not that agent's to write.
+            Ok(_) if !in_its_agents_folder(dir, &folder, &manifest) => "invalid",
             Ok((_, check, _)) => signature_label(&check),
             Err(_) => "invalid",
         };
@@ -467,11 +546,18 @@ pub fn accept(
     if !is_safe_component(order_id) {
         bail!("order id must be a path-safe identifier");
     }
-    let folder = dir.join(order_id);
-    if !folder.join("handin.json").is_file() {
+    let Some(folder) = locate(dir, order_id)? else {
         bail!("no hand-in for order {order_id} under {}", dir.display());
-    }
+    };
     let (manifest, check, _patch) = read(route, &folder)?;
+    if !in_its_agents_folder(dir, &folder, &manifest) {
+        bail!(
+            "the hand-in at {} says it is from {}, but it is in another agent's folder; only \
+             the assigned agent writes there",
+            folder.display(),
+            manifest.agent
+        );
+    }
     if check != SignatureCheck::Valid {
         bail!(
             "the hand-in for {order_id} is not validly signed ({}); not applying it",
@@ -580,10 +666,9 @@ pub fn reject(
     if reason.trim().is_empty() {
         bail!("say why: a rejection without a reason sends the worker in the dark");
     }
-    let folder = dir.join(order_id);
-    if !folder.join("handin.json").is_file() {
+    let Some(folder) = locate(dir, order_id)? else {
         bail!("no hand-in for order {order_id} under {}", dir.display());
-    }
+    };
     let path = folder.join("rejected.json");
     write_atomic(
         &path,

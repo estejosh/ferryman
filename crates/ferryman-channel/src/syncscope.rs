@@ -26,7 +26,7 @@ pub struct Folder {
 
 /// Ids Ferryman itself gives folders. Anything else in a Syncthing config is somebody's
 /// own and is never flagged for being elsewhere.
-const FERRYMAN_SUFFIXES: [&str; 2] = ["-ferryman", "-work"];
+const FERRYMAN_SUFFIXES: [&str; 3] = ["-ferryman", "-handins", "-work"];
 
 /// A path as plain text for comparing: forward slashes, `.` and `..` resolved, no
 /// trailing slash, no Windows `\\?\` prefix, and lower case on Windows. Without the
@@ -85,13 +85,15 @@ fn forms(path: &Path) -> Vec<String> {
 }
 
 /// The parts of a ferry root nothing may share besides `comms/`.
-const FORBIDDEN_UNDER_ROOT: [(&str, &str); 3] = [
+const FORBIDDEN_UNDER_ROOT: [(&str, &str); 5] = [
     ("repos", "is under repos/, which holds git clones"),
     ("work", "is under work/, which holds git worktrees"),
     (
         "service",
         "is under service/, which holds the worker's environment file",
     ),
+    ("secrets", "is under secrets/, which holds credentials"),
+    ("logs", "is under logs/, which holds this machine's logs"),
 ];
 
 /// Whether `child` is `parent` or lies under it. Text comparison, like Syncthing's own
@@ -102,6 +104,37 @@ fn within(child: &str, parent: &str) -> bool {
         || child
             .strip_prefix(parent)
             .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a path names an environment file (`.env`, `fleet.env`, `deploy.env`): the files
+/// that hold keys. Nothing that is one is ever a Syncthing folder.
+fn is_env_file(target: &str) -> bool {
+    target
+        .rsplit('/')
+        .next()
+        .is_some_and(|name| name == ".env" || name.ends_with(".env"))
+}
+
+/// Layout 2: under `projects/` only `<id>/comms` and `<id>/handins` may be shared.
+fn layout_two_reason(projects: &str, target: &str) -> Option<&'static str> {
+    if !within(target, projects) {
+        return None;
+    }
+    let rest = target
+        .strip_prefix(projects)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let mut parts = rest.split('/').filter(|part| !part.is_empty());
+    match (parts.next(), parts.next()) {
+        (None, _) => Some("is projects/, which holds every project's repo, worktrees and keys"),
+        (Some(_), None) => Some(
+            "is a project folder, which holds its repo, worktrees, scratch and keys as well as its channel",
+        ),
+        (Some(_), Some("comms" | "handins")) => None,
+        (Some(_), Some(_)) => Some(
+            "is inside a project folder but is not its comms or handins; repo, work, tmp and .env stay on the machine",
+        ),
+    }
 }
 
 fn reason_for(root_text: &str, target: &str) -> Option<&'static str> {
@@ -115,6 +148,12 @@ fn reason_for(root_text: &str, target: &str) -> Option<&'static str> {
         if within(target, &format!("{root_text}/{part}")) {
             return Some(reason);
         }
+    }
+    if let Some(reason) = layout_two_reason(&format!("{root_text}/projects"), target) {
+        return Some(reason);
+    }
+    if is_env_file(target) {
+        return Some("is an environment file, which holds keys and never leaves the machine");
     }
     if within(root_text, target) {
         return Some("contains the ferry root, so it would carry repos/ and work/ as well");
@@ -131,10 +170,38 @@ pub fn refusal(root: &Path, path: &Path) -> Option<String> {
             .find_map(|target| reason_for(root_text, target))
     })?;
     Some(format!(
-        "{} {reason}. Only channel folders under {}/comms are ever shared; git carries the code",
+        "{} {reason}. Only channel folders (a project's comms and handins, under {}) are ever shared; git carries the code",
         path.display(),
         root.display()
     ))
+}
+
+/// Why `path` may not be shared because of what it would carry along: a folder that contains
+/// a project's `.env`, its repo, or the root's `secrets/` is refused even when it is not
+/// inside the root (a custom placement can put a channel anywhere, and a person can point a
+/// folder at a parent of it). Uses the places the manifest records.
+fn carries(root: &Root, path: &Path) -> Option<String> {
+    let target = forms(path);
+    let holds = |inner: &Path| {
+        forms(inner)
+            .iter()
+            .any(|inner| target.iter().any(|outer| within(inner, outer)))
+    };
+    if holds(&root.secrets()) {
+        return Some("would carry secrets/".to_string());
+    }
+    for entry in root.projects() {
+        if let Some(env) = entry.env.as_deref().filter(|env| holds(env)) {
+            return Some(format!(
+                "would carry {}'s environment file {}",
+                entry.project_id,
+                env.display()
+            ));
+        }
+    }
+    // The default `projects/<id>/.env` is covered by the structural rules above: a folder
+    // that holds it is the project folder or something above it.
+    None
 }
 
 /// Refuse a Syncthing folder outside the roots this path or this machine belongs to.
@@ -153,8 +220,25 @@ pub fn guard(path: &Path) -> Result<()> {
         if let Some(why) = refusal(&root.path, path) {
             bail!("refusing to share this with Syncthing: {why}");
         }
+        if let Some(why) = carries(root, path) {
+            bail!(
+                "refusing to share {} with Syncthing: it {why}. Only a project's channel and hand-ins are ever shared",
+                path.display()
+            );
+        }
     }
     Ok(())
+}
+
+/// Whether the manifest records `folder_path` as a project's channel or hand-ins: a custom
+/// placement is a place a person chose, so a Ferryman folder id there is not a stray.
+fn is_recorded(root: &Root, folder_path: &str) -> bool {
+    let target = normalise(folder_path);
+    root.projects().iter().any(|entry| {
+        [entry.channel.clone(), entry.handins_path(root)]
+            .iter()
+            .any(|recorded| normalise(&recorded.display().to_string()) == target)
+    })
 }
 
 /// Every folder the local Syncthing has configured. `None` when it cannot be reached,
@@ -194,15 +278,24 @@ pub fn folders_in(config: &Value) -> Vec<Folder> {
         .unwrap_or_default()
 }
 
-/// The configured folders that sit outside `comms/` and should not.
+/// The configured folders that sit where Ferryman never shares and should not.
 ///
-/// Two kinds. Any folder at the root, above it, or under `repos/` or `work/`, whoever
-/// made it. And a folder with one of Ferryman's own ids (`<project>-ferryman`,
-/// `<project>-work`) that is anywhere other than under `comms/`. A folder a person set
-/// up for their own purposes elsewhere is theirs and is left alone.
+/// Two kinds. Any folder at the root, above it, or under a place nothing may share
+/// (`repos/`, `work/`, `secrets/`, a project's repo, work, tmp or `.env`), whoever made it.
+/// And a folder with one of Ferryman's own ids (`<project>-ferryman`, `<project>-handins`,
+/// legacy `<project>-work`) that is not in a place the layout or the manifest gives it:
+/// `comms/` (layout 1), `projects/<id>/comms` or `projects/<id>/handins` (layout 2), or a
+/// path the manifest records for the project (a custom placement is a person's choice and
+/// is respected). A folder a person set up for their own purposes elsewhere is theirs and
+/// is left alone.
 #[must_use]
 pub fn strays<'a>(root: &Path, folders: &'a [Folder]) -> Vec<&'a Folder> {
-    let comms = format!("{}/comms", normalise(&root.display().to_string()));
+    let base = normalise(&root.display().to_string());
+    let comms = format!("{base}/comms");
+    let projects = format!("{base}/projects");
+    let manifest = Root {
+        path: root.to_path_buf(),
+    };
     folders
         .iter()
         .filter(|folder| {
@@ -212,11 +305,16 @@ pub fn strays<'a>(root: &Path, folders: &'a [Folder]) -> Vec<&'a Folder> {
                 return false;
             }
             // Where it really leads counts, so a link from comms/ into repos/ is a stray.
-            refusal(root, path).is_some()
-                || (!within(&target, &comms)
-                    && FERRYMAN_SUFFIXES
-                        .iter()
-                        .any(|suffix| folder.id.ends_with(suffix)))
+            if refusal(root, path).is_some() {
+                return true;
+            }
+            let ours = FERRYMAN_SUFFIXES
+                .iter()
+                .any(|suffix| folder.id.ends_with(suffix));
+            let in_a_place = within(&target, &comms)
+                || (within(&target, &projects) && layout_two_reason(&projects, &target).is_none())
+                || is_recorded(&manifest, &folder.path);
+            ours && !in_a_place
         })
         .collect()
 }
@@ -376,6 +474,113 @@ mod tests {
             "not in a forbidden place"
         );
         assert!(!is_ours_to_unshare(&root, &folders[4]), "not a Ferryman id");
+    }
+
+    #[test]
+    fn layout_two_shares_only_comms_and_handins() {
+        let root = root();
+        let project = root.join("projects").join("pc");
+        // Allowed: the channel and the hand-ins, and what is inside them.
+        for allowed in [
+            project.join("comms"),
+            project.join("handins"),
+            project.join("handins").join("nebra"),
+            project.join("comms").join("tasks"),
+        ] {
+            assert!(
+                refusal(&root, &allowed).is_none(),
+                "{} should be allowed",
+                allowed.display()
+            );
+        }
+        // Refused: the root, projects/, the project folder, and everything else in it.
+        for refused in [
+            root.clone(),
+            root.join("projects"),
+            project.clone(),
+            project.join("repo"),
+            project.join("repo").join("src"),
+            project.join("work"),
+            project.join("work").join("order-1"),
+            project.join("tmp"),
+            project.join(".env"),
+            root.join("secrets"),
+            root.join("secrets").join("fleet.env"),
+            root.join("service"),
+            root.join("logs"),
+            // A .env is never a folder, wherever it is.
+            std::path::PathBuf::from("/srv/custom/.env"),
+            std::path::PathBuf::from("/srv/custom/deploy.env"),
+        ] {
+            assert!(refusal(&root, &refused).is_some(), "{}", refused.display());
+        }
+        // `..` cannot walk out of comms into repo.
+        let sneaky = project.join("comms").join("..").join("repo");
+        assert!(refusal(&root, &sneaky).is_some(), "{}", sneaky.display());
+    }
+
+    #[test]
+    fn a_folder_that_would_carry_the_secrets_or_a_recorded_env_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 2).unwrap();
+        // A custom project keeps its keys beside its channel, outside the root.
+        let mine = dir.path().join("mine");
+        std::fs::create_dir_all(mine.join("comms")).unwrap();
+        root.record_custom(
+            "pc",
+            &crate::ferry::CustomPlaces {
+                channel: mine.join("comms"),
+                repo: None,
+                handins: Some(mine.join("handins")),
+                env: Some(mine.join("keys.env")),
+                work: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            guard(&mine.join("comms")).is_ok(),
+            "the channel itself is fine"
+        );
+        assert!(guard(&mine.join("handins")).is_ok());
+        // The folder around the key is not.
+        let error = guard(&mine).unwrap_err().to_string();
+        assert!(error.contains("environment file"), "{error}");
+        // And the secrets folder never.
+        assert!(guard(&root.secrets()).is_err());
+        assert!(guard(&root.project_dir("pc").join("repo")).is_err());
+        assert!(guard(&root.comms_home("pc")).is_ok());
+        assert!(guard(&root.handins_dir("pc")).is_ok());
+    }
+
+    #[test]
+    fn layout_two_strays_and_a_custom_placement_that_is_recorded() {
+        let root = root();
+        let at = |id: &str, path: std::path::PathBuf| Folder {
+            id: id.to_string(),
+            label: String::new(),
+            path: path.display().to_string(),
+        };
+        let project = root.join("projects").join("p");
+        let folders = vec![
+            at("p-ferryman", project.join("comms")),
+            at("p-handins", project.join("handins")),
+            // The old work folder id, sitting where it was.
+            at("p-work", root.join("work").join("p")),
+            // A handins folder pointed at the project's worktrees.
+            at("p-handins", project.join("work")),
+            // A Ferryman id somewhere nothing records: flagged.
+            at("q-ferryman", std::path::PathBuf::from("/srv/old/q-comms")),
+        ];
+        let found: Vec<&str> = strays(&root, &folders)
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert!(
+            !found
+                .iter()
+                .any(|p| p.ends_with("comms") && p.contains("projects"))
+        );
     }
 
     #[test]
