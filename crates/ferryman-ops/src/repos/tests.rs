@@ -695,3 +695,80 @@ fn unsynced_lists_what_a_sync_would_fix_and_nothing_once_it_has() {
     sync(&root, &Options::default()).unwrap();
     assert!(unsynced(&root).is_empty(), "{:?}", unsynced(&root));
 }
+
+#[test]
+fn a_half_migrated_root_keeps_the_clone_of_the_project_that_moved() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
+    filed(&root, "alpha");
+    filed(&root, "beta");
+    origin(dir.path(), "alpha");
+    origin(dir.path(), "beta");
+    with_template(&root, dir.path());
+    let rows = sync(&root, &Options::default()).unwrap();
+    assert!(matches!(row(&rows, "alpha").status, Status::Done(_)));
+    assert!(matches!(row(&rows, "beta").status, Status::Done(_)));
+
+    // beta has a live worker lock (this process), so only alpha moves and the manifest
+    // stays in the old layout.
+    let beta = root.repos().join("beta");
+    fs::write(
+        beta.join(".ferryman").join("worker-test.lock"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+    let report = crate::migrate::run(
+        &root,
+        &crate::migrate::Options {
+            apply: true,
+            ..crate::migrate::Options::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(
+            report
+                .projects
+                .iter()
+                .find(|p| p.project == "alpha")
+                .unwrap()
+                .status,
+            crate::migrate::Status::Migrated
+        ),
+        "{}",
+        report.render()
+    );
+    assert_eq!(root.layout_version(), 1, "beta is left behind");
+    let moved = root.project_dir("alpha").join("repo");
+    assert!(moved.join(".git").exists());
+    assert!(!root.repos().join("alpha").exists());
+
+    // `repos sync` must find the clone where it is, not make a new one beside it.
+    let rows = sync(&root, &Options::default()).unwrap();
+    let alpha = row(&rows, "alpha");
+    assert!(
+        !matches!(&alpha.status, Status::Done(steps) if steps.contains(&"cloned")),
+        "{alpha:?}"
+    );
+    assert!(!root.repos().join("alpha").exists(), "no second clone");
+    let entry = root
+        .read()
+        .projects
+        .into_iter()
+        .find(|e| e.project_id == "alpha")
+        .unwrap();
+    assert_eq!(entry.repo.as_deref(), Some(moved.as_path()));
+    assert!(
+        entry.human_checkouts.is_empty(),
+        "{:?}",
+        entry.human_checkouts
+    );
+
+    // And the doctor's fix leaves the layout alone.
+    let _ = crate::layout::make_project_folders(&root);
+    assert!(!root.repos().join("alpha").exists());
+    let after = crate::layout::inspect(&root, &crate::machine::Scan::default());
+    let folders = after.checks.iter().find(|c| c.name == "projects").unwrap();
+    assert!(folders.ok, "{}", after.render());
+}

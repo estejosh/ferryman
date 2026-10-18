@@ -865,6 +865,11 @@ enum RootCommand {
         /// Leave Ferryman's Syncthing alone (the move still repoints bridge.toml).
         #[arg(long)]
         no_syncthing: bool,
+        /// Also move the registered worktrees that no running order uses to _to_delete
+        /// and run `git worktree prune`. Without it they are listed as "would prune" and
+        /// left where they are.
+        #[arg(long)]
+        prune_stale_worktrees: bool,
     },
     /// Move channels into `comms/`, so every channel lives in one place.
     ///
@@ -6473,6 +6478,10 @@ fn access_command(command: AccessCommand) -> Result<()> {
     use ferryman_channel::access;
     match command {
         AccessCommand::Show { project } => {
+            // Showing changes nothing: no filing of the project in the root, no update of
+            // what this machine remembers of the master's grants.
+            ferryman_channel::known::read_only();
+            access::read_only();
             let routes = match project {
                 Some(project) => vec![access_route(&project)?],
                 None => {
@@ -6507,6 +6516,8 @@ fn access_command(command: AccessCommand) -> Result<()> {
                 for (agent, level) in access::levels(channel, &route.project_id) {
                     let source = if grants.contains_key(&agent) {
                         "granted by the master"
+                    } else if level == access::Level::Worker {
+                        "not admitted by the master, so a Worker"
                     } else {
                         "default"
                     };
@@ -8981,11 +8992,12 @@ fn work_command(command: WorkCommand) -> Result<()> {
             let checkout = here(workspace)?;
             let route = ferryman_channel::route_for(&checkout)?;
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
             let applied = handin::accept(
                 &route,
                 &handin::work_dir(&route),
                 &order,
-                &agent,
+                &identity,
                 &checkout,
                 !no_push,
             )?;
@@ -9006,7 +9018,14 @@ fn work_command(command: WorkCommand) -> Result<()> {
         } => {
             let route = ferryman_channel::route_for(&here(workspace)?)?;
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
-            handin::reject(&route, &handin::work_dir(&route), &order, &agent, &reason)?;
+            let identity = signing_identity(&route, &agent)?;
+            handin::reject(
+                &route,
+                &handin::work_dir(&route),
+                &order,
+                &identity,
+                &reason,
+            )?;
             println!("rejected {order}: the worker will see why");
         }
     }
@@ -12415,6 +12434,7 @@ fn root_command(command: RootCommand) -> Result<()> {
         RootCommand::Migrate {
             apply,
             no_syncthing,
+            prune_stale_worktrees,
         } => {
             let Some(root) = ferry::find_root() else {
                 println!("no ferry root yet, so there is nothing to migrate.");
@@ -12428,6 +12448,8 @@ fn root_command(command: RootCommand) -> Result<()> {
             let options = ferryman_ops::migrate::Options {
                 apply,
                 syncthing: !no_syncthing,
+                backend: None,
+                prune_stale_worktrees,
                 machine_blockers: ferryman_ops::migrate::blockers_from_scan(&scan),
             };
             let report = ferryman_ops::migrate::run(&root, &options)?;

@@ -106,7 +106,7 @@ pub fn stale_locks(root: &Root) -> Vec<StaleLock> {
             continue;
         }
         let mut places: Vec<PathBuf> = Vec::new();
-        places.push(root.managed_clone(&entry.project_id));
+        places.push(entry.managed_clone_path(root));
         places.extend(entry.repo.iter().cloned());
         places.extend(entry.human_checkouts.iter().cloned());
         for place in places {
@@ -382,13 +382,18 @@ fn live(root: &Root) -> Vec<Entry> {
 fn project_folders(root: &Root) -> Check {
     let mut problems = Vec::new();
     let (mut managed, mut custom) = (0_usize, 0_usize);
+    let whole = root.layout_version() >= 2;
     for entry in live(root) {
         let id = &entry.project_id;
+        // Part-way through `root migrate` only the projects that moved have this shape.
+        if !whole && !entry.is_v2_placed(root) {
+            continue;
+        }
         let mut wanted: Vec<(&str, PathBuf)> = vec![("comms", entry.channel.clone())];
         match entry.placement_in(root) {
             Placement::Managed => {
                 managed += 1;
-                wanted.push(("repo", root.managed_clone(id)));
+                wanted.push(("repo", entry.managed_clone_path(root)));
                 wanted.push(("handins", entry.handins_path(root)));
                 wanted.push(("work", entry.work_path(root)));
             }
@@ -439,11 +444,14 @@ fn project_folders(root: &Root) -> Check {
 /// project. Returns what was made.
 pub fn make_project_folders(root: &Root) -> Vec<String> {
     let mut made = Vec::new();
-    if root.layout_version() < 2 {
-        return made;
-    }
+    let whole = root.layout_version() >= 2;
     for entry in live(root) {
         if entry.placement_in(root) != Placement::Managed {
+            continue;
+        }
+        // A root part-way through `root migrate` is still layout 1 as a whole; the
+        // projects that moved already have their folders and get any that are missing.
+        if !whole && !entry.is_v2_placed(root) {
             continue;
         }
         for path in [
@@ -653,7 +661,15 @@ pub fn inspect_with(root: &Root, scan: &Scan, folders: Option<&[Folder]>) -> Rep
         lock_check,
         syncthing_scope(root, folders),
     ];
-    if root.layout_version() >= 2 {
+    // Also for a root part-way through `root migrate`: the projects that moved are in
+    // layout 2 already, whatever the manifest as a whole says.
+    if root.layout_version() >= 2
+        || root
+            .read()
+            .projects
+            .iter()
+            .any(|entry| !entry.is_archived() && entry.is_v2_placed(root))
+    {
         checks.push(project_folders(root));
     }
     checks.push(keys_and_levels(root, folders.is_some()));

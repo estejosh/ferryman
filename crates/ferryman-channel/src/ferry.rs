@@ -246,10 +246,41 @@ impl Entry {
             return path.clone();
         }
         if self.is_v2_placed(root) || root.layout_version() >= 2 {
-            root.worktrees(&self.project_id)
+            root.project_dir(&self.project_id).join("work")
         } else {
             root.work().join(&self.project_id)
         }
+    }
+
+    /// Where Ferryman's own clone of this project is, judged for the project and not for the
+    /// root. The manifest stays in the old layout until every project has moved, so asking
+    /// the root would send a migrated project's `repos sync` to a fresh clone at
+    /// `repos/<id>` and demote the real one to a human checkout. In order: the recorded repo
+    /// when it is one of the two managed places; `projects/<id>/repo` for a project whose
+    /// channel is in its project folder; else the root's own default.
+    #[must_use]
+    pub fn managed_clone_path(&self, root: &Root) -> PathBuf {
+        let places = root.managed_clone_places(&self.project_id);
+        // Compared as written, not as resolved: `root adopt` leaves a link at the managed
+        // place that points at a person's checkout, and that checkout is not the clone.
+        let fold = |path: &Path| {
+            let text = path.display().to_string().replace('\\', "/");
+            let text = text.trim_end_matches('/').to_owned();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        };
+        if let Some(repo) = &self.repo
+            && places.iter().any(|place| fold(place) == fold(repo))
+        {
+            return repo.clone();
+        }
+        if self.is_v2_placed(root) {
+            return places[0].clone();
+        }
+        root.managed_clone(&self.project_id)
     }
 
     /// Whether the hand-in folder is separate from the channel, which is when a worker-level
@@ -994,6 +1025,20 @@ impl Root {
         }
     }
 
+    /// Where Ferryman's own clone of `project_id` is: [`Entry::managed_clone_path`] for the
+    /// project's manifest entry, else the root's default.
+    #[must_use]
+    pub fn managed_clone_of(&self, project_id: &str) -> PathBuf {
+        self.read()
+            .projects
+            .iter()
+            .find(|entry| entry.project_id == project_id)
+            .map_or_else(
+                || self.managed_clone(project_id),
+                |entry| entry.managed_clone_path(self),
+            )
+    }
+
     /// Both places a managed clone can be, whichever layout the root is in. For finding
     /// one that exists; a root part-way through a migration has both kinds.
     #[must_use]
@@ -1216,7 +1261,15 @@ impl Root {
             // repository path it had already learned. Losing what you knew is worse than
             // not learning anything, and it is silent, which is worse again.
             Some(existing) => {
-                existing.channel = entry.channel;
+                // A `bridge.toml` that still names the channel's old place (a checkout
+                // `root migrate` did not rewrite, or a machine that has not caught up) must
+                // not drag a migrated entry back to a folder that is no longer there.
+                let stale = !same_place(&entry.channel, &existing.channel)
+                    && existing.channel.is_dir()
+                    && (existing.is_v2_placed(self) || !entry.channel.is_dir());
+                if !stale {
+                    existing.channel = entry.channel;
+                }
                 if let Some(new_repo) = entry.repo {
                     let managed_now = existing
                         .repo
@@ -1734,16 +1787,39 @@ pub fn move_directory(from: &Path, to: &Path) -> Result<()> {
     std::fs::remove_dir_all(from).with_context(|| format!("remove {}", from.display()))
 }
 
+/// Copy a directory tree, keeping each file's modified time (a copy that stamps "now"
+/// would make a moved clone or channel look edited, and a sync tool would re-send it).
+///
+/// A symlinked or junctioned directory is refused rather than followed: copying through it
+/// would duplicate (or escape into) somebody else's tree. A symlinked file is copied as the
+/// file it points to.
+///
+/// # Errors
+/// A directory link is met, or a file cannot be read or written.
 pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
         let entry = entry?;
+        let path = entry.path();
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
+        let kind = entry.file_type()?;
+        let linked = kind.is_symlink() || std::fs::read_link(&path).is_ok();
+        if linked && std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            bail!(
+                "{} is a link to a directory; it is not copied. Move the folder by hand, \
+                 or remove the link and run this again",
+                path.display()
+            );
+        }
+        if kind.is_dir() && !linked {
+            copy_tree(&path, &target)?;
         } else {
-            std::fs::copy(entry.path(), &target)
-                .with_context(|| format!("copy {}", entry.path().display()))?;
+            std::fs::copy(&path, &target).with_context(|| format!("copy {}", path.display()))?;
+            if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified())
+                && let Ok(file) = std::fs::OpenOptions::new().write(true).open(&target)
+            {
+                let _ = file.set_modified(modified);
+            }
         }
     }
     Ok(())

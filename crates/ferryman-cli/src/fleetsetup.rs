@@ -757,7 +757,7 @@ pub fn managed_clone_after_enable(project: &str, quiet: bool) {
                     _ => println!(
                         "  managed clone: {} ({})",
                         row.word(),
-                        root.managed_clone(project).display()
+                        root.managed_clone_of(project).display()
                     ),
                 }
             }

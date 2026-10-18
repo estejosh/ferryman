@@ -10,9 +10,12 @@
 //! - the channel to `projects/<id>/comms` (the folder and channel id do not change, so no
 //!   other machine re-pairs); every `bridge.toml` that named the old path is rewritten,
 //!   which is also how the worker and its iroh lane find the channel;
-//! - the Syncthing folder, when Syncthing still has it: paused, its PATH changed through
-//!   Ferryman's own REST with the id kept, resumed;
-//! - hand-ins from `<channel>/handins` to `projects/<id>/handins`;
+//! - the Syncthing folder, when Syncthing still has it: paused before anything moves and
+//!   held paused while the hand-ins move out (`<channel>/handins` to
+//!   `projects/<id>/handins`), `handins` is added to the channel's `.stignore` and
+//!   `<id>-handins` is registered; only then is its PATH changed through Ferryman's own REST
+//!   with the id kept, and the folder resumed. Resuming earlier would announce the hand-ins
+//!   as deleted to a peer that has not migrated;
 //! - Ferryman's own clone, `repos/<id>` to `projects/<id>/repo`, and `git worktree prune`.
 //!
 //! What never moves: a custom project (a person placed it; ADR 0019 and 0024), a human
@@ -40,9 +43,65 @@ pub struct Options {
     /// Update Ferryman's Syncthing for folders it still has. Off in tests, which must not
     /// touch a running service.
     pub syncthing: bool,
+    /// The Syncthing to drive instead of Ferryman's own (tests). With `syncthing` off and
+    /// no backend, Syncthing is not touched.
+    pub backend: Option<std::sync::Arc<dyn Syncthing>>,
+    /// Move the registered worktrees that no running order uses to `_to_delete` and run
+    /// `git worktree prune`. Without it they are listed ("would prune") and left.
+    pub prune_stale_worktrees: bool,
     /// Why nothing may move on this machine right now (a running worker). Applies to
     /// every project, since one worker serves them all.
     pub machine_blockers: Vec<String>,
+}
+
+/// The parts of Syncthing a migration drives, so the order of the calls can be tested
+/// against a stand-in.
+pub trait Syncthing: std::fmt::Debug + Send + Sync {
+    /// Whether Syncthing has the folder.
+    fn has_folder(&self, id: &str) -> bool;
+    /// Pause or resume a folder.
+    ///
+    /// # Errors
+    /// The call to Syncthing failed.
+    fn pause(&self, id: &str, paused: bool) -> Result<()>;
+    /// Point the folder at `to` and resume it. `false` when it could not be re-pointed.
+    ///
+    /// # Errors
+    /// The call to Syncthing failed.
+    fn move_folder(&self, id: &str, to: &Path) -> Result<bool>;
+    /// Register the project's hand-ins folder as `<id>-handins`.
+    ///
+    /// # Errors
+    /// The call to Syncthing failed.
+    fn register_handins(&self, route: &ferryman_channel::ProjectRoute, dir: &Path) -> Result<()>;
+}
+
+/// Ferryman's own Syncthing (127.0.0.1:8385, never the person's).
+#[derive(Debug)]
+struct Live;
+
+impl Syncthing for Live {
+    fn has_folder(&self, id: &str) -> bool {
+        ferryman_channel::syncthing_folder_state(id).is_some()
+    }
+    fn pause(&self, id: &str, paused: bool) -> Result<()> {
+        ferryman_channel::syncthing_pause_folder(id, paused).map(|_| ())
+    }
+    fn move_folder(&self, id: &str, to: &Path) -> Result<bool> {
+        ferryman_channel::syncthing_move_folder(id, to)
+    }
+    fn register_handins(&self, route: &ferryman_channel::ProjectRoute, dir: &Path) -> Result<()> {
+        ferryman_channel::syncthing_register_work_folder(route, dir).map(|_| ())
+    }
+}
+
+fn syncthing_for(options: &Options) -> Option<std::sync::Arc<dyn Syncthing>> {
+    if let Some(backend) = &options.backend {
+        return Some(backend.clone());
+    }
+    options
+        .syncthing
+        .then(|| std::sync::Arc::new(Live) as std::sync::Arc<dyn Syncthing>)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +118,12 @@ pub enum Status {
     Blocked(Vec<String>),
     /// The channel is not on this machine, so there is nothing here to move.
     NotHere,
-    /// A step failed. Earlier steps are recorded in the manifest, so the project is
-    /// consistent and a second run continues.
+    /// A step failed. Syncthing's folder is resumed on the way out. The channel's new place
+    /// is written to the manifest and bridges straight after it moves, and a rerun that
+    /// finds the channel at `projects/<id>/comms` with the manifest still naming the old
+    /// place finishes that record, so a second run continues from where this one stopped.
+    /// The exception is a copy that could not be set aside after a cross-volume move: both
+    /// copies exist, the message says which to remove, and the project waits for you.
     Failed(String),
 }
 
@@ -282,15 +345,25 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
 
     let channel_here = entry.channel.is_dir();
     let move_channel = channel_here && !same_place(&entry.channel, &comms_to);
-    let handins_from_now = entry.channel.join("handins");
-    let move_handins = channel_here && non_empty(&handins_from_now);
+    // A run that died after the channel moved and before the manifest was told: the old
+    // place is gone and the new one holds the channel. Finishing it is recording where it is.
+    let repair = !channel_here && non_empty(&comms_to) && !same_place(&entry.channel, &comms_to);
+    let current = if channel_here {
+        entry.channel.clone()
+    } else if repair {
+        comms_to.clone()
+    } else {
+        entry.channel.clone()
+    };
+    let handins_from_now = current.join("handins");
+    let move_handins = (channel_here || repair) && non_empty(&handins_from_now);
     let move_repo = entry
         .repo
         .as_ref()
         .filter(|repo| movable_clone(root, entry, repo))
         .cloned();
 
-    if !move_channel && !move_handins && move_repo.is_none() {
+    if !move_channel && !repair && !move_handins && move_repo.is_none() {
         rep.status = if channel_here || entry.repo.is_some() {
             Status::AlreadyDone
         } else {
@@ -303,13 +376,18 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
     let mut blocked: Vec<String> = options.machine_blockers.clone();
     let mut places: Vec<PathBuf> = Vec::new();
     places.extend(entry.repo.iter().cloned());
+    let mut stale_registered: Vec<PathBuf> = Vec::new();
     for place in &places {
         blocked.extend(live_locks(place));
-        match live_worktrees(place) {
-            Ok(list) => {
-                for tree in list {
-                    blocked.push(format!("a live worktree at {}", tree.display()));
+        match worktrees_of(place, &current) {
+            Ok(trees) => {
+                for tree in trees.live {
+                    blocked.push(format!(
+                        "a worktree at {} is running an order",
+                        tree.display()
+                    ));
                 }
+                stale_registered.extend(trees.stale);
             }
             Err(why) => blocked.push(format!(
                 "worktrees of {} unreadable: {why}",
@@ -328,8 +406,10 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
     }
 
     let folder = format!("{id}-ferryman");
-    let in_syncthing =
-        options.syncthing && ferryman_channel::syncthing_folder_state(&folder).is_some();
+    let syncthing = syncthing_for(options);
+    let in_syncthing = syncthing
+        .as_ref()
+        .is_some_and(|syncthing| syncthing.has_folder(&folder));
 
     if move_channel {
         rep.steps.push(format!(
@@ -337,11 +417,18 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
             entry.channel.display(),
             comms_to.display()
         ));
-        if in_syncthing {
-            rep.steps.push(format!(
-                "syncthing folder {folder}: pause, set path, resume (id kept)"
-            ));
-        }
+    }
+    if repair {
+        rep.steps.push(format!(
+            "an earlier run moved the channel to {}; record it in the manifest and bridges",
+            comms_to.display()
+        ));
+    }
+    if in_syncthing && (move_channel || repair || move_handins) {
+        rep.steps.push(format!(
+            "syncthing folder {folder}: held paused while the hand-ins move out and `handins` \
+             is added to the channel's .stignore, then set path, resume (id kept)"
+        ));
     }
     if move_handins {
         rep.steps
@@ -354,6 +441,20 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
             repo_to.display()
         ));
     }
+    for tree in &stale_registered {
+        rep.steps.push(if options.prune_stale_worktrees {
+            format!(
+                "stale worktree {}: would move to _to_delete, then git worktree prune",
+                tree.display()
+            )
+        } else {
+            format!(
+                "stale worktree {}: would prune (left where it is; --prune-stale-worktrees \
+                 moves it to _to_delete)",
+                tree.display()
+            )
+        });
+    }
     // Blocked projects still show what would move once the block is gone, so the plan can
     // be read before anything is stopped.
     if !blocked.is_empty() {
@@ -365,88 +466,127 @@ fn project(root: &Root, entry: &Entry, options: &Options, ctx: &mut Ctx) -> Proj
         return rep;
     }
 
-    match perform(root, entry, options, ctx, in_syncthing, &mut rep) {
+    let syncthing = syncthing.filter(|_| in_syncthing);
+    if options.prune_stale_worktrees {
+        for place in &places {
+            if let Err(error) = prune_stale(place, &current, ctx, &mut rep) {
+                rep.status = Status::Failed(format!("{error:#}"));
+                return rep;
+            }
+        }
+    }
+    match perform(root, entry, ctx, syncthing.as_deref(), &mut rep) {
         Ok(()) => rep.status = Status::Migrated,
         Err(error) => rep.status = Status::Failed(format!("{error:#}")),
     }
     rep
 }
 
-fn perform(
+/// Keep the channel's `handins` out of what Syncthing sends: the hand-ins live beside the
+/// channel now, and a copy moved out of it must not read as a deletion on a peer that has
+/// not migrated. (`.stignore` is never synced, so this is this machine's alone.)
+fn ignore_handins(channel: &Path) -> Result<()> {
+    let path = channel.join(".stignore");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    if text.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "/handins" | "handins" | "/handins/" | "handins/"
+        )
+    }) {
+        return Ok(());
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(
+        "// layout 2: hand-ins live in projects/<id>/handins, beside the channel\n/handins\n",
+    );
+    fs::write(&path, text).with_context(|| format!("write {}", path.display()))
+}
+
+/// Rewrite the bridges (the attachment's and any human checkout's) that name `old`, and the
+/// manifest, to the channel at `to`.
+fn record_channel(root: &Root, entry: &Entry, old: &Path, to: &Path) -> Result<()> {
+    root.update_entry(&entry.project_id, |e| e.channel = to.to_path_buf())?;
+    let old = old.display().to_string();
+    let mut bridges: Vec<PathBuf> = entry.attachment().into_iter().collect();
+    for human in &entry.human_checkouts {
+        let attachment = human.join(".ferryman");
+        if fs::read_to_string(attachment.join("bridge.toml")).is_ok_and(|text| text.contains(&old))
+        {
+            bridges.push(attachment);
+        }
+    }
+    for attachment in bridges {
+        ferry::repoint_bridge_in(&attachment, &[("communications", to)])?;
+    }
+    Ok(())
+}
+
+/// The channel and its hand-ins. While Syncthing has the channel's folder it is held paused
+/// from before the first change until the last one that could read as a deletion: the
+/// hand-ins have left, `handins` is ignored, and `<id>-handins` is registered. Only then is
+/// the folder pointed at its new path and resumed, and it is given back on every way out,
+/// so a failure never leaves it paused.
+fn perform_channel(
     root: &Root,
     entry: &Entry,
-    options: &Options,
     ctx: &mut Ctx,
-    in_syncthing: bool,
+    syncthing: Option<&dyn Syncthing>,
     rep: &mut ProjectReport,
 ) -> Result<()> {
     let id = &entry.project_id;
     let dir = root.project_dir(id);
     let comms_to = dir.join("comms");
     let handins_to = dir.join("handins");
-    let repo_to = dir.join("repo");
     let folder = format!("{id}-ferryman");
-    let mut channel_now = entry.channel.clone();
 
-    if !ctx.backed_up {
-        backup_manifest(root, ctx);
+    let moving = entry.channel.is_dir() && !same_place(&entry.channel, &comms_to);
+    let repairing = !entry.channel.is_dir() && non_empty(&comms_to);
+    let current = if moving || !repairing {
+        entry.channel.clone()
+    } else {
+        comms_to.clone()
+    };
+    let has_handins = non_empty(&current.join("handins"));
+    if !moving && !repairing && !has_handins {
+        return Ok(());
     }
 
-    if entry.channel.is_dir() && !same_place(&entry.channel, &comms_to) {
-        fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        if in_syncthing {
-            let _ = ferryman_channel::syncthing_pause_folder(&folder, true);
-        }
-        if let Err(error) = safe_move(&entry.channel, &comms_to, ctx) {
-            if in_syncthing {
-                let _ = ferryman_channel::syncthing_pause_folder(&folder, false);
-            }
-            return Err(error);
-        }
-        let old = entry.channel.display().to_string();
-        let mut bridges: Vec<PathBuf> = entry.attachment().into_iter().collect();
-        for human in &entry.human_checkouts {
-            let attachment = human.join(".ferryman");
-            if fs::read_to_string(attachment.join("bridge.toml"))
-                .is_ok_and(|text| text.contains(&old))
-            {
-                bridges.push(attachment);
-            }
-        }
-        for attachment in bridges {
-            ferry::repoint_bridge_in(&attachment, &[("communications", &comms_to)])?;
-        }
-        root.update_entry(id, |e| e.channel = comms_to.clone())?;
-        channel_now = comms_to.clone();
-        if in_syncthing {
-            match ferryman_channel::syncthing_move_folder(&folder, &comms_to) {
-                Ok(true) => rep.notes.push(format!(
-                    "syncthing folder {folder} now at {}",
-                    comms_to.display()
-                )),
-                Ok(false) | Err(_) => {
-                    let _ = ferryman_channel::syncthing_pause_folder(&folder, false);
-                    rep.notes.push(format!(
-                        "syncthing folder {folder} could not be re-pointed; fix its path in \
-                         Ferryman's Syncthing (127.0.0.1:8385) to {}",
-                        comms_to.display()
-                    ));
-                }
-            }
-        }
-        rep.notes.push(
-            "the iroh lane reads this channel from bridge.toml (rewritten): restart the worker"
-                .to_string(),
-        );
+    if let Some(syncthing) = syncthing {
+        syncthing
+            .pause(&folder, true)
+            .with_context(|| format!("pause syncthing folder {folder}"))?;
     }
-
-    let handins_from = channel_now.join("handins");
-    if non_empty(&handins_from) {
-        if handins_to.exists() && !non_empty(&handins_to) {
-            fs::remove_dir(&handins_to)?;
+    // Where the channel is now, for pointing Syncthing at it afterwards.
+    let mut at = current.clone();
+    let result = (|| -> Result<()> {
+        if moving {
+            fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+            safe_move(&entry.channel, &comms_to, ctx)?;
+            at.clone_from(&comms_to);
         }
-        safe_move(&handins_from, &handins_to, ctx)?;
-        if in_syncthing {
+        if moving || repairing {
+            // Straight after the move: the manifest and bridges say where the channel is,
+            // so a failure from here on leaves a project a rerun can finish.
+            record_channel(root, entry, &entry.channel, &comms_to)?;
+            at.clone_from(&comms_to);
+            rep.notes.push(
+                "the iroh lane reads this channel from bridge.toml (rewritten): restart the worker"
+                    .to_string(),
+            );
+        }
+        // Before anything leaves the folder Syncthing is watching.
+        ignore_handins(&at)?;
+        let handins_from = at.join("handins");
+        if non_empty(&handins_from) {
+            if handins_to.exists() && !non_empty(&handins_to) {
+                fs::remove_dir(&handins_to)?;
+            }
+            safe_move(&handins_from, &handins_to, ctx)?;
+        }
+        if let Some(syncthing) = syncthing {
             let fresh = root
                 .read()
                 .projects
@@ -455,9 +595,7 @@ fn perform(
                 .unwrap_or_else(|| entry.clone());
             match fresh.route(root) {
                 Ok((route, _)) => {
-                    if let Err(error) =
-                        ferryman_channel::syncthing_register_work_folder(&route, &handins_to)
-                    {
+                    if let Err(error) = syncthing.register_handins(&route, &handins_to) {
                         rep.notes.push(format!(
                             "syncthing folder {id}-handins not registered: {error:#}"
                         ));
@@ -468,7 +606,48 @@ fn perform(
                 )),
             }
         }
+        Ok(())
+    })();
+
+    // Give the folder back, where the channel is now, whatever happened above.
+    if let Some(syncthing) = syncthing {
+        if !same_place(&at, &entry.channel) {
+            match syncthing.move_folder(&folder, &at) {
+                Ok(true) => rep
+                    .notes
+                    .push(format!("syncthing folder {folder} now at {}", at.display())),
+                Ok(false) | Err(_) => {
+                    let _ = syncthing.pause(&folder, false);
+                    rep.notes.push(format!(
+                        "syncthing folder {folder} could not be re-pointed; fix its path in \
+                         Ferryman's Syncthing (127.0.0.1:8385) to {}",
+                        at.display()
+                    ));
+                }
+            }
+        } else {
+            let _ = syncthing.pause(&folder, false);
+        }
     }
+    result
+}
+
+fn perform(
+    root: &Root,
+    entry: &Entry,
+    ctx: &mut Ctx,
+    syncthing: Option<&dyn Syncthing>,
+    rep: &mut ProjectReport,
+) -> Result<()> {
+    let id = &entry.project_id;
+    let dir = root.project_dir(id);
+    let repo_to = dir.join("repo");
+
+    if !ctx.backed_up {
+        backup_manifest(root, ctx);
+    }
+
+    perform_channel(root, entry, ctx, syncthing, rep)?;
 
     if let Some(repo) = entry
         .repo
@@ -499,7 +678,6 @@ fn perform(
     for name in ["work", "tmp"] {
         fs::create_dir_all(dir.join(name))?;
     }
-    let _ = options;
     Ok(())
 }
 
@@ -547,17 +725,36 @@ fn safe_move(from: &Path, to: &Path, ctx: &mut Ctx) -> Result<()> {
         return Ok(());
     }
     if let Err(error) = ferry::copy_tree(from, to) {
-        park(to, ctx);
-        return Err(error.context(format!("copy {} to {}", from.display(), to.display())));
+        // A partial copy is set aside so a rerun starts clean; if even that fails, say so,
+        // because the half copy is then still in the way.
+        return Err(match park(to, ctx) {
+            Ok(()) => error.context(format!("copy {} to {}", from.display(), to.display())),
+            Err(why) => error.context(format!(
+                "copy {} to {} failed, and the partial copy could not be set aside ({why:#}); \
+                 remove {} by hand before running this again",
+                from.display(),
+                to.display(),
+                to.display()
+            )),
+        });
     }
-    park(from, ctx);
-    Ok(())
+    // Copied. The original has to leave its place, or there are two. Not deleting is the
+    // rule, so it goes to `_to_delete`; if that fails the project stops here, with both.
+    park(from, ctx).with_context(|| {
+        format!(
+            "{} was copied to {} but the original could not be moved to {}; both exist now. \
+             Move or remove {} by hand, then run this again",
+            from.display(),
+            to.display(),
+            ctx.park.display(),
+            from.display()
+        )
+    })
 }
 
-fn park(path: &Path, ctx: &mut Ctx) {
-    if fs::create_dir_all(&ctx.park).is_err() {
-        return;
-    }
+/// Move `path` into `_to_delete` under a name that is not taken.
+fn park(path: &Path, ctx: &mut Ctx) -> Result<()> {
+    fs::create_dir_all(&ctx.park).with_context(|| format!("create {}", ctx.park.display()))?;
     let name = path
         .file_name()
         .map_or_else(|| "dir".to_string(), |n| n.to_string_lossy().into_owned());
@@ -568,9 +765,10 @@ fn park(path: &Path, ctx: &mut Ctx) {
         candidate = ctx.park.join(format!("{name}-{}-{n}", ctx.stamp));
         n += 1;
     }
-    if fs::rename(path, &candidate).is_ok() {
-        ctx.parked.push(candidate);
-    }
+    fs::rename(path, &candidate)
+        .with_context(|| format!("move {} to {}", path.display(), candidate.display()))?;
+    ctx.parked.push(candidate);
+    Ok(())
 }
 
 /// Worker locks in a checkout whose process is alive.
@@ -598,10 +796,60 @@ fn live_locks(repo: &Path) -> Vec<String> {
     out
 }
 
-/// Registered worktrees of `repo` other than the checkout itself whose directory exists.
-fn live_worktrees(repo: &Path) -> std::result::Result<Vec<PathBuf>, String> {
+/// The registered worktrees of a clone, other than the checkout itself, whose directory
+/// still exists: the ones a running order is using, and the ones nothing is.
+#[derive(Debug, Default)]
+struct Trees {
+    live: Vec<PathBuf>,
+    stale: Vec<PathBuf>,
+}
+
+/// Branches of the orders running on this machine now: a heartbeat in the channel whose
+/// process is alive here and recent. (A heartbeat's pid means something only on the
+/// machine that wrote it, which is exactly where this runs.)
+fn running_branches(channel: &Path) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let mut dirs = vec![channel.join("tasks")];
+    let mut depth = 0;
+    while depth < 3 && !dirs.is_empty() {
+        let mut next = Vec::new();
+        for dir in dirs.drain(..) {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    next.push(path);
+                } else if name.starts_with("heartbeat.")
+                    && name.ends_with(".json")
+                    && let Some(beat) = fs::read_to_string(&path).ok().and_then(|text| {
+                        serde_json::from_str::<ferryman_channel::Heartbeat>(&text).ok()
+                    })
+                    && (chrono::Utc::now() - beat.at).num_seconds().abs() < 900
+                    && crate::agent::process_alive(beat.pid)
+                {
+                    out.insert(ferryman_channel::worktree::branch_name(
+                        &beat.order_id,
+                        &beat.agent,
+                    ));
+                }
+            }
+        }
+        dirs = next;
+        depth += 1;
+    }
+    out
+}
+
+/// Registered worktrees of `repo` other than the checkout itself whose directory exists,
+/// split by whether a running order uses them. A worktree nothing is using is stale, not
+/// live, and does not hold a project back.
+fn worktrees_of(repo: &Path, channel: &Path) -> std::result::Result<Trees, String> {
+    let mut trees = Trees::default();
     if !repo.join(".git").exists() {
-        return Ok(Vec::new());
+        return Ok(trees);
     }
     let output = Command::new("git")
         .arg("-C")
@@ -612,13 +860,55 @@ fn live_worktrees(repo: &Path) -> std::result::Result<Vec<PathBuf>, String> {
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
+    let running = running_branches(channel);
     let text = String::from_utf8_lossy(&output.stdout);
-    Ok(text
-        .lines()
-        .filter_map(|line| line.strip_prefix("worktree "))
-        .map(PathBuf::from)
-        .filter(|tree| !same_place(tree, repo) && tree.exists())
-        .collect())
+    for block in text.split("\n\n") {
+        let mut path: Option<PathBuf> = None;
+        let mut branch: Option<String> = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                path = Some(PathBuf::from(p.trim()));
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(b.trim().trim_start_matches("refs/heads/").to_string());
+            }
+        }
+        let Some(path) = path else { continue };
+        if same_place(&path, repo) || !path.exists() {
+            continue;
+        }
+        if branch.as_ref().is_some_and(|b| running.contains(b)) {
+            trees.live.push(path);
+        } else {
+            trees.stale.push(path);
+        }
+    }
+    Ok(trees)
+}
+
+/// Move each stale worktree of `repo` to `_to_delete` (never deleting it) and prune.
+fn prune_stale(repo: &Path, channel: &Path, ctx: &mut Ctx, rep: &mut ProjectReport) -> Result<()> {
+    let trees = worktrees_of(repo, channel).map_err(anyhow::Error::msg)?;
+    if trees.stale.is_empty() {
+        return Ok(());
+    }
+    for path in &trees.stale {
+        park(path, ctx)
+            .with_context(|| format!("set aside the stale worktree {}", path.display()))?;
+        rep.notes.push(format!(
+            "stale worktree {} moved to _to_delete",
+            path.display()
+        ));
+    }
+    let pruned = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "prune"])
+        .output();
+    if !pruned.is_ok_and(|o| o.status.success()) {
+        rep.notes
+            .push("git worktree prune did not run; run it in the clone".to_string());
+    }
+    Ok(())
 }
 
 /// Directories under `work/` (one or two levels down) whose `.git` file points into

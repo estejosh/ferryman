@@ -308,7 +308,7 @@ fn candidates(entry: &Entry, config: &RootConfig, root: &Root) -> Vec<String> {
     if let Some(template) = &config.fallback_template {
         push(template.replace("{project}", &entry.project_id));
     }
-    let managed = root.managed_clone(&entry.project_id);
+    let managed = entry.managed_clone_path(root);
     for checkout in entry
         .repo
         .iter()
@@ -380,7 +380,7 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
     if entry.placement_in(root) == ferryman_channel::ferry::Placement::Custom {
         return skipped(Skip::Custom);
     }
-    let managed = root.managed_clone(&id);
+    let managed = entry.managed_clone_path(root);
     let mut steps: Vec<&'static str> = Vec::new();
     let mut details: Vec<String> = Vec::new();
     let dry = options.dry_run;
@@ -631,7 +631,7 @@ pub fn unsynced(root: &Root) -> Vec<(String, String)> {
         {
             continue;
         }
-        let managed = root.managed_clone(&entry.project_id);
+        let managed = entry.managed_clone_path(root);
         let problem = if !managed.join(".git").exists() {
             Some(format!("{} is not a clone", managed.display()))
         } else if entry.repo.as_deref() != Some(managed.as_path())

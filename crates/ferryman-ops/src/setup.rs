@@ -491,7 +491,7 @@ struct Found {
 fn found_configs(root: &Root) -> Vec<Found> {
     let mut found: Vec<Found> = Vec::new();
     for entry in root.read().projects {
-        let mut places = vec![root.managed_clone(&entry.project_id)];
+        let mut places = vec![entry.managed_clone_path(root)];
         places.extend(entry.repo.iter().cloned());
         places.extend(entry.human_checkouts.iter().cloned());
         for place in places {
@@ -738,7 +738,7 @@ pub fn setup(root: &Root, options: &Options, scan: &Scan, run: &mut Run<'_>) -> 
             .identity_lines
             .push("no live project to hold the worker's home; nothing more to do for it".into()),
         Some(project) => {
-            let clone = root.managed_clone(&project);
+            let clone = root.managed_clone_of(&project);
             let attachment = clone.join(".ferryman");
             report
                 .identity_lines

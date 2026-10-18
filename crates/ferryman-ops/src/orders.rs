@@ -150,7 +150,7 @@ fn release_in(
             )),
         )]);
     }
-    let mut places = vec![root.managed_clone(&entry.project_id)];
+    let mut places = vec![entry.managed_clone_path(root)];
     places.extend(entry.repo.iter().cloned());
     places.extend(entry.human_checkouts.iter().cloned());
     if places
