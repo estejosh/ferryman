@@ -1251,7 +1251,10 @@ mod tests {
     fn a_layout_two_root_gets_the_channel_in_the_project_folder() {
         let dir = tempdir();
         hermetic_machine();
-        let root = ferryman_channel::ferry::Root::create(&dir.join("ferry")).unwrap();
+        // The root sits beside the workspace, as it does for real; inside it the channel
+        // would be refused as work in a synced folder.
+        let beside = dir.parent().unwrap().to_path_buf();
+        let root = ferryman_channel::ferry::Root::create(&beside.join("ferry")).unwrap();
         assert_eq!(root.layout_version(), 2);
         let done = perform(request_in(&dir)).unwrap();
         let home = root.comms_home("demo");
@@ -1270,9 +1273,10 @@ mod tests {
     fn a_channel_placed_by_hand_is_recorded_as_custom_and_respected() {
         let dir = tempdir();
         hermetic_machine();
-        let root = ferryman_channel::ferry::Root::create(&dir.join("ferry")).unwrap();
-        let chosen = dir.join("my-channel");
-        let handins = dir.join("my-handins");
+        let beside = dir.parent().unwrap().to_path_buf();
+        let root = ferryman_channel::ferry::Root::create(&beside.join("ferry")).unwrap();
+        let chosen = beside.join("my-channel");
+        let handins = beside.join("my-handins");
         perform(Request {
             channel: Some(chosen.clone()),
             handins: Some(handins.clone()),
