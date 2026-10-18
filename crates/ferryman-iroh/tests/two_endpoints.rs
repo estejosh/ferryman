@@ -369,10 +369,22 @@ fn put(dir: &Path, path: &str, text: &str) {
 async fn the_handins_folder_syncs_beside_the_channel_and_verdicts_come_from_the_head_only() {
     let l = levels().await;
     // The Worker hands work in; the head (fang, the master) writes a verdict beside it.
-    put(&l.b_handins, "wisp/ord-1/handin.json", "{\"from\":\"wisp\"}");
-    put(&l.a_handins, "wisp/ord-1/accepted.json", "{\"by\":\"fang\"}");
+    put(
+        &l.b_handins,
+        "wisp/ord-1/handin.json",
+        "{\"from\":\"wisp\"}",
+    );
+    put(
+        &l.a_handins,
+        "wisp/ord-1/accepted.json",
+        "{\"by\":\"fang\"}",
+    );
     // And the Worker writes a verdict of its own, which is not its to write.
-    put(&l.b_handins, "wisp/ord-2/accepted.json", "{\"by\":\"wisp\"}");
+    put(
+        &l.b_handins,
+        "wisp/ord-2/accepted.json",
+        "{\"by\":\"wisp\"}",
+    );
 
     l.a.round().await;
 
@@ -380,7 +392,11 @@ async fn the_handins_folder_syncs_beside_the_channel_and_verdicts_come_from_the_
     let peer = &status.peers[&endpoint_hex(&l.b.endpoint().id())];
     assert!(peer.last_error.is_none(), "{:?}", peer.last_error);
     assert!(peer.projects.contains(&"demo".to_owned()));
-    assert!(peer.projects.contains(&"demo+handins".to_owned()), "{:?}", peer.projects);
+    assert!(
+        peer.projects.contains(&"demo+handins".to_owned()),
+        "{:?}",
+        peer.projects
+    );
     assert_eq!(
         fs::read_to_string(l.a_handins.join("wisp/ord-1/handin.json")).unwrap(),
         "{\"from\":\"wisp\"}",
@@ -422,14 +438,21 @@ async fn a_workers_channel_files_are_refused_on_arrival_by_name_and_by_content()
     assert!(!a.join("tasks/t-1/claim.wisp.json").exists(), "by name");
     assert!(!a.join("presence/wisp.json").exists(), "by name");
     assert!(!a.join("messages/demo/m-1.json").exists(), "by content");
-    assert_eq!(fs::read_to_string(a.join("notes/readme.txt")).unwrap(), "ok");
+    assert_eq!(
+        fs::read_to_string(a.join("notes/readme.txt")).unwrap(),
+        "ok"
+    );
 }
 
 #[tokio::test]
 async fn a_workers_own_machine_listens_to_the_channel_and_publishes_none_of_it() {
     let l = levels().await;
     l.b.set_local_agents(vec!["wisp".to_owned()]);
-    put(&l.a_route.communications, "tasks/t-9/order.json", "{\"from\":\"a\"}");
+    put(
+        &l.a_route.communications,
+        "tasks/t-9/order.json",
+        "{\"from\":\"a\"}",
+    );
     put(&l.b_route.communications, "notes/local.txt", "b only");
 
     // Either side may dial; the Worker's machine must give nothing from the channel.

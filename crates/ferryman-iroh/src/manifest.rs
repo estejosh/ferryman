@@ -142,10 +142,9 @@ impl Rules {
     pub fn excludes_incoming(&self, path: &str) -> bool {
         self.excludes(path)
             || (self.no_verdicts
-                && path
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|name| VERDICT_FILES.contains(&name.to_ascii_lowercase().as_str())))
+                && path.rsplit('/').next().is_some_and(|name| {
+                    VERDICT_FILES.contains(&name.to_ascii_lowercase().as_str())
+                }))
     }
 
     /// Whether `path` (relative, `/`-separated) stays where it is.

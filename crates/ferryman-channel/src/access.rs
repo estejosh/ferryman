@@ -390,7 +390,11 @@ pub fn may_write_verdicts(
     project_id: &str,
     agents: &std::collections::BTreeSet<String>,
 ) -> bool {
-    let named = |who: &str| agents.iter().any(|a| canonical_agent_name(a) == canonical_agent_name(who));
+    let named = |who: &str| {
+        agents
+            .iter()
+            .any(|a| canonical_agent_name(a) == canonical_agent_name(who))
+    };
     if crate::head::current(channel, project_id)
         .ok()
         .flatten()
@@ -400,7 +404,11 @@ pub fn may_write_verdicts(
     }
     crate::read_agent_roster(channel)
         .ok()
-        .and_then(|roster| crate::master::read_master_at(channel, &roster).ok().flatten())
+        .and_then(|roster| {
+            crate::master::read_master_at(channel, &roster)
+                .ok()
+                .flatten()
+        })
         .is_some_and(|master| named(&master.master))
 }
 
@@ -631,6 +639,19 @@ fn inside(child: &Path, parent: &Path) -> bool {
     child == parent || child.starts_with(&format!("{parent}/"))
 }
 
+/// Whether `child` is `parent` or lies under it, after resolving links and `..` as far as
+/// the paths exist. The comparison every "is this key file in a shared folder" question uses.
+#[must_use]
+pub fn path_within(child: &Path, parent: &Path) -> bool {
+    inside(&resolve(child), &resolve(parent))
+}
+
+/// Whether a file name is an environment file (`.env`, `.env.local`, `fleet.env`).
+#[must_use]
+pub fn looks_like_env_file(path: &Path) -> bool {
+    is_env_file(path)
+}
+
 fn is_env_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -739,6 +760,26 @@ pub fn credential_scope(route: &ProjectRoute, agent: &str) -> Option<CredentialS
     })?;
     let level = level_of(&route.communications, &route.project_id, agent);
     Some(CredentialScope::new(&root, &entry, level))
+}
+
+/// What this scope loads: the project's `.env`, and for an Orchestrator the write credentials
+/// in `secrets/` over it. Sorted by name, so the result is stable.
+#[must_use]
+pub fn load_scoped(scope: &CredentialScope) -> Vec<(String, String)> {
+    let mut merged = scope.project_env();
+    if scope.level().reads_secrets() {
+        merged.extend(scope.write_credentials().unwrap_or_default());
+    }
+    let mut pairs: Vec<(String, String)> = merged.into_iter().collect();
+    pairs.sort();
+    pairs
+}
+
+/// The credentials `agent` may load for the project in `route`: [`load_scoped`] through
+/// [`credential_scope`]. Empty when this machine's ferry root does not file the project.
+#[must_use]
+pub fn scoped_credentials(route: &ProjectRoute, agent: &str) -> Vec<(String, String)> {
+    credential_scope(route, agent).map_or_else(Vec::new, |scope| load_scoped(&scope))
 }
 
 /// A dotenv file's `KEY=value` lines: comments, blank lines and `export ` ignored, one pair
@@ -1201,6 +1242,12 @@ mod tests {
                 Some("read")
             );
             assert!(scope.write_credentials().is_err());
+            let loaded = load_scoped(&scope);
+            assert!(loaded.iter().any(|(key, _)| key == "GH_RO"));
+            assert!(
+                !loaded.iter().any(|(key, _)| key.starts_with("GH_RW")),
+                "{level:?} loaded a write credential"
+            );
             for sneaky in [
                 f.root.secrets().join("fleet.env"),
                 f.root.secrets().join("demo.env"),
@@ -1222,6 +1269,9 @@ mod tests {
         let loaded = boss.write_credentials().unwrap();
         assert_eq!(loaded.get("GH_RW_X").map(String::as_str), Some("write"));
         assert_eq!(loaded.get("GH_RW_DEMO").map(String::as_str), Some("write2"));
+        let everything = load_scoped(&boss);
+        assert!(everything.iter().any(|(key, _)| key == "GH_RW_X"));
+        assert!(everything.iter().any(|(key, _)| key == "GH_RO"));
     }
 
     #[cfg(unix)]

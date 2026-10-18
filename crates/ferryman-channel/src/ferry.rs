@@ -1050,6 +1050,19 @@ impl Root {
         self.path.join("logs")
     }
 
+    /// Where files shared by every project here sit: `comms/` in layout 1 (a fleet-wide
+    /// `agent.toml` was kept there), the root itself in layout 2 (which has no `comms/`).
+    /// Also what a command that wants "the folder of channels" starts from; the channels
+    /// themselves are listed by [`Root::channel_dirs`].
+    #[must_use]
+    pub fn shared_home(&self) -> PathBuf {
+        if self.layout_version() >= 2 {
+            self.path.clone()
+        } else {
+            self.comms()
+        }
+    }
+
     /// The folders this root's layout has at its top, for `create` and the layout check.
     #[must_use]
     pub fn top_folders(&self) -> Vec<(&'static str, PathBuf)> {
@@ -1721,7 +1734,7 @@ pub fn move_directory(from: &Path, to: &Path) -> Result<()> {
     std::fs::remove_dir_all(from).with_context(|| format!("remove {}", from.display()))
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
         let entry = entry?;

@@ -1765,41 +1765,41 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let mut ingest = |name: &str, text: &str| {
         // A single unreadable file must not hide the rest of the task.
         if name.starts_with("claim.")
-            && let Ok(value) = serde_json::from_str(&text)
+            && let Ok(value) = serde_json::from_str(text)
         {
             claims.push(value);
         } else if name.starts_with("result.")
-            && let Ok(value) = serde_json::from_str::<TaskResult>(&text)
+            && let Ok(value) = serde_json::from_str::<TaskResult>(text)
             && verify_result(&value, &route.agents) == SignatureCheck::Valid
         {
             results.push(value);
         } else if name.starts_with("review.")
-            && let Ok(value) = serde_json::from_str::<Review>(&text)
+            && let Ok(value) = serde_json::from_str::<Review>(text)
             && verify_review(&value, &route.agents) == SignatureCheck::Valid
             && review_authority(route, &value).allowed()
         {
             reviews.push(value);
         } else if name.starts_with("recommendation.")
-            && let Ok(value) = serde_json::from_str::<Recommendation>(&text)
+            && let Ok(value) = serde_json::from_str::<Recommendation>(text)
             && verify_recommendation(&value, &route.agents) == SignatureCheck::Valid
         {
             recommendations.push(value);
         } else if name.starts_with("heartbeat.")
-            && let Ok(value) = serde_json::from_str::<Heartbeat>(&text)
+            && let Ok(value) = serde_json::from_str::<Heartbeat>(text)
         {
             // Heartbeats are unsigned local truth; the pid is only meaningful to the
             // machine that wrote it, and no signature is checked here for the same
             // reason a claim carries none - it is a marker, not an assertion of work.
             heartbeats.push(value);
         } else if name.starts_with("release.")
-            && let Ok(value) = serde_json::from_str::<Release>(&text)
+            && let Ok(value) = serde_json::from_str::<Release>(text)
             && verify_release(&value, &route.agents) == SignatureCheck::Valid
         {
             releases.push(value);
         } else if name.starts_with("interrupt.")
             // Acknowledgements share the prefix and are not interrupts.
             && !name.ends_with(".acked.json")
-            && let Ok(value) = serde_json::from_str::<crate::interrupt::Interrupt>(&text)
+            && let Ok(value) = serde_json::from_str::<crate::interrupt::Interrupt>(text)
             && value.action == crate::interrupt::InterruptAction::Kill
             // Trust boundary: any peer can write into the synced folder, so an
             // unsigned kill is a forged one. Killing an order is destructive - it
@@ -1808,7 +1808,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         {
             kills.push(value);
         } else if name.starts_with("offer.")
-            && let Ok(value) = serde_json::from_str::<offer::Offer>(&text)
+            && let Ok(value) = serde_json::from_str::<offer::Offer>(text)
             && value.order_id == order.id
             && value.project_id == route.project_id
             && offer::verify(&value, &route.agents) == SignatureCheck::Valid
@@ -5003,6 +5003,29 @@ pub fn syncthing_folder_type(folder_id: &str) -> Option<String> {
         .get("type")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+/// Pause or resume one Syncthing folder. `Ok(false)` when Syncthing is not running or does
+/// not have the folder. Used by `ferry root migrate` to hold a folder still while its
+/// directory is moved, so Syncthing never looks at a half-moved tree.
+pub fn syncthing_pause_folder(folder_id: &str, paused: bool) -> Result<bool> {
+    let Some(key) = syncthing_api_key() else {
+        return Ok(false);
+    };
+    let base = syncthing_api_base();
+    let url = format!("/rest/config/folders/{folder_id}");
+    if syncthing_get(&base, &url, &key)?.is_none() {
+        return Ok(false);
+    }
+    let body = if paused {
+        r#"{"paused":true}"#
+    } else {
+        r#"{"paused":false}"#
+    };
+    Ok(matches!(
+        syncthing_patch(&base, &url, &key, body)?,
+        Some(code) if (200..300).contains(&code)
+    ))
 }
 
 /// Point an existing Syncthing folder at a new path, keeping its id, so no other machine
