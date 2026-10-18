@@ -92,7 +92,7 @@ struct Machine {
 fn machine_with(projects: &[&str]) -> Machine {
     hermetic();
     let dir = tempfile::tempdir().unwrap();
-    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    let root = Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
     for project in projects {
         filed(&root, project);
         origin(dir.path(), project);

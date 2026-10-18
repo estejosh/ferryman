@@ -73,6 +73,9 @@ pub enum Skip {
     Excluded,
     /// The root files it, but its channel folder is not here.
     NoChannel,
+    /// Placed by hand (`placement: custom`): Ferryman works from the paths recorded for it and
+    /// does not make a clone of its own beside them.
+    Custom,
     /// Nothing says where to clone it from.
     NoRemote,
     /// `repos/<project>` holds something that is not a git clone.
@@ -92,6 +95,9 @@ impl Skip {
                 "excluded on this machine ([swarm] exclude in the root's ferry.toml)".into()
             }
             Self::NoChannel => "its channel folder is not on this machine".into(),
+            Self::Custom => "placed by hand (custom): Ferryman uses the paths recorded for it \
+                              and keeps no clone of its own"
+                .into(),
             Self::NoRemote => "no known remote: set [git] remote_template (or [git.remotes]) in \
                                the root's ferry.toml"
                 .into(),
@@ -369,6 +375,11 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
     if !entry.channel.is_dir() {
         return skipped(Skip::NoChannel);
     }
+    // The layout is what Ferryman does when nobody decides; a project someone placed is
+    // left as they recorded it, and nothing here assumes it sits under projects/<id>.
+    if entry.placement_in(root) == ferryman_channel::ferry::Placement::Custom {
+        return skipped(Skip::Custom);
+    }
     let managed = root.managed_clone(&id);
     let mut steps: Vec<&'static str> = Vec::new();
     let mut details: Vec<String> = Vec::new();
@@ -427,10 +438,13 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
             ));
             steps.push("cloned");
         } else {
-            if let Err(error) = fs::create_dir_all(root.repos()) {
+            let holder = managed
+                .parent()
+                .map_or_else(|| root.repos(), Path::to_path_buf);
+            if let Err(error) = fs::create_dir_all(&holder) {
                 return skipped(Skip::Failed(format!(
                     "create {}: {error}",
-                    root.repos().display()
+                    holder.display()
                 )));
             }
             let target = managed.to_string_lossy().into_owned();
@@ -586,7 +600,7 @@ pub fn sync(root: &Root, options: &Options) -> Result<Vec<Row>> {
         );
     }
     if !options.dry_run {
-        for dir in [root.comms(), root.repos(), root.work()] {
+        for (_, dir) in root.top_folders() {
             fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         }
     }
@@ -613,6 +627,7 @@ pub fn unsynced(root: &Root) -> Vec<(String, String)> {
             || config.excluded(&entry.project_id)
             || !entry.channel.is_dir()
             || entry.swarm_off()
+            || entry.placement_in(root) == ferryman_channel::ferry::Placement::Custom
         {
             continue;
         }

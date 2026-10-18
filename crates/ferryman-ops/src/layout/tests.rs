@@ -11,7 +11,7 @@ fn hermetic() {
 fn setup() -> (tempfile::TempDir, Root) {
     hermetic();
     let dir = tempfile::tempdir().unwrap();
-    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    let root = Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
     for folder in [root.comms(), root.repos(), root.work()] {
         fs::create_dir_all(folder).unwrap();
     }

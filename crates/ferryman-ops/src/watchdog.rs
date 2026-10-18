@@ -607,11 +607,12 @@ fn repair_layout(facts: &Facts) -> Vec<String> {
     else {
         return vec!["no ferry root to repair a layout in".into()];
     };
-    for folder in [root.comms(), root.repos(), root.work()] {
+    for (_, folder) in root.top_folders() {
         if !folder.is_dir() && std::fs::create_dir_all(&folder).is_ok() {
             done.push(format!("made {}", folder.display()));
         }
     }
+    done.extend(crate::layout::make_project_folders(&root));
     match crate::repos::sync(&root, &crate::repos::Options::default()) {
         Ok(rows) => {
             for row in rows {
@@ -899,7 +900,8 @@ mod tests {
             std::env::temp_dir().join(format!("ferryman-watchdog-selftest-{}", std::process::id())),
         );
         let dir = tempfile::tempdir().unwrap();
-        let root = ferryman_channel::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = ferryman_channel::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1)
+            .unwrap();
         let channel = root.comms_home("quantly");
         std::fs::create_dir_all(&channel).unwrap();
         let repo = dir.path().join("human").join("quantly");

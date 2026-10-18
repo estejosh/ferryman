@@ -4169,6 +4169,14 @@ fn engine_credentials(route: &ProjectRoute, config: &AgentConfig) -> Result<Engi
         ferryman_channel::secrets::resolve_credentials(route, loaded, encryption.as_ref())?
             .into_iter()
             .collect();
+    // The project's own `.env`, and for an Orchestrator the write credentials in `secrets/`.
+    // Judged by path (see `access::CredentialScope`), so a Worker or Member never loads
+    // from `secrets/`, wherever the project was placed. A key the operator already set wins.
+    for (name, value) in ferryman_channel::access::scoped_credentials(route, &config.agent) {
+        if !credentials.iter().any(|(have, _)| *have == name) {
+            credentials.push((name, value));
+        }
+    }
     let Some(engine) = &config.active else {
         return Ok((credentials, None));
     };

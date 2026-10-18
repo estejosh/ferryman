@@ -638,11 +638,7 @@ pub fn setup(root: &Root, options: &Options, scan: &Scan, run: &mut Run<'_>) -> 
     let dry = options.dry_run;
 
     // 1. folders
-    for (name, path) in [
-        ("comms", root.comms()),
-        ("repos", root.repos()),
-        ("work", root.work()),
-    ] {
+    for (name, path) in root.top_folders() {
         if path.is_dir() {
             report
                 .folders
