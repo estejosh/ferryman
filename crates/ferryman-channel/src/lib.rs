@@ -5032,6 +5032,19 @@ pub fn syncthing_pause_folder(folder_id: &str, paused: bool) -> Result<bool> {
     ))
 }
 
+/// Whether Syncthing has this folder paused. `None` when Syncthing is not running or does
+/// not have the folder.
+#[must_use]
+pub fn syncthing_folder_paused(folder_id: &str) -> Option<bool> {
+    let key = syncthing_api_key()?;
+    let base = syncthing_api_base();
+    syncthing_get(&base, &format!("/rest/config/folders/{folder_id}"), &key)
+        .ok()
+        .flatten()?
+        .get("paused")
+        .and_then(Value::as_bool)
+}
+
 /// Point an existing Syncthing folder at a new path, keeping its id, so no other machine
 /// re-pairs: pause it, change `path`, resume. `Ok(false)` when Syncthing is not running or
 /// does not have the folder. The directory must already be at `new_path` (moved whole, with

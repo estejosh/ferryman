@@ -93,21 +93,43 @@ fn options(apply: bool) -> Options {
     }
 }
 
+/// What the stand-in does when asked.
+#[derive(Debug, Clone, Default)]
+struct Behaviour {
+    pause_fails: bool,
+    move_result: Move,
+    /// The folder was already paused by its owner.
+    paused_before: bool,
+    /// Where it says Syncthing has the folder.
+    old_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Move {
+    #[default]
+    Works,
+    Declined,
+    Errors,
+}
+
 /// A Syncthing stand-in that records the calls it gets and, when the folder is resumed,
 /// whether the hand-ins had already left the channel and `handins` was already ignored.
 #[derive(Debug)]
 struct Mock {
     comms: PathBuf,
     calls: std::sync::Mutex<Vec<String>>,
-    move_ok: bool,
+    behaviour: Behaviour,
 }
 
 impl Mock {
     fn new(comms: PathBuf) -> std::sync::Arc<Self> {
+        Self::behaving(comms, Behaviour::default())
+    }
+    fn behaving(comms: PathBuf, behaviour: Behaviour) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             comms,
             calls: std::sync::Mutex::new(Vec::new()),
-            move_ok: true,
+            behaviour,
         })
     }
     fn note(&self, call: &str) {
@@ -122,38 +144,52 @@ impl Mock {
             && fs::read_to_string(self.comms.join(".stignore"))
                 .is_ok_and(|text| text.lines().any(|line| line.trim() == "/handins"))
     }
+    fn label(&self, what: &str) -> String {
+        format!(
+            "{what} ({})",
+            if self.safe_to_resume() {
+                "safe"
+            } else {
+                "EARLY"
+            }
+        )
+    }
 }
 
 impl Syncthing for Mock {
     fn has_folder(&self, _: &str) -> bool {
         true
     }
+    fn is_paused(&self, _: &str) -> bool {
+        self.behaviour.paused_before
+    }
+    fn path_of(&self, _: &str) -> Option<PathBuf> {
+        self.behaviour.old_path.clone()
+    }
     fn pause(&self, _: &str, paused: bool) -> Result<()> {
         if paused {
             self.note("pause");
+            if self.behaviour.pause_fails {
+                bail!("syncthing refused");
+            }
         } else {
-            self.note(if self.safe_to_resume() {
-                "resume (safe)"
-            } else {
-                "resume (EARLY)"
-            });
+            self.note(&self.label("resume"));
         }
         Ok(())
     }
     fn move_folder(&self, _: &str, _: &Path) -> Result<bool> {
-        self.note(if self.safe_to_resume() {
-            "move+resume (safe)"
-        } else {
-            "move+resume (EARLY)"
-        });
-        Ok(self.move_ok)
+        self.note(&self.label("move+resume"));
+        match self.behaviour.move_result {
+            Move::Works => Ok(true),
+            Move::Declined => Ok(false),
+            Move::Errors => bail!("syncthing is gone"),
+        }
     }
     fn register_handins(&self, _: &ferryman_channel::ProjectRoute, _: &Path) -> Result<()> {
         self.note("register");
         Ok(())
     }
 }
-
 #[test]
 fn a_dry_run_writes_nothing_at_all() {
     let f = fixture();
@@ -350,16 +386,9 @@ fn a_failure_after_the_move_resumes_syncthing_and_a_rerun_finishes_the_job() {
         report.render()
     );
     // Syncthing was given back (pointed at the channel's new place), not left paused.
-    let calls = mock.calls();
-    assert_eq!(
-        calls.first().map(String::as_str),
-        Some("pause"),
-        "{calls:?}"
-    );
-    assert!(
-        calls.iter().any(|c| c.starts_with("move+resume")),
-        "resumed on the way out: {calls:?}"
-    );
+    // Paused, then given back in one call, at the channel's new place; the hand-ins were never
+    // touched, so resuming before they were ignored announced nothing.
+    assert_eq!(mock.calls(), vec!["pause", "move+resume (EARLY)"]);
     // The manifest and the bridge already say where the channel is.
     let entry = f
         .root
@@ -524,4 +553,446 @@ fn a_stale_bridge_does_not_drag_a_migrated_entry_back_to_the_old_channel() {
         .find(|e| e.project_id == "alpha")
         .unwrap();
     assert_eq!(entry.channel, home.join("comms"));
+}
+
+fn entry_of(f: &Fixture, id: &str) -> Entry {
+    f.root
+        .read()
+        .projects
+        .into_iter()
+        .find(|e| e.project_id == id)
+        .unwrap()
+}
+
+#[test]
+fn a_pause_that_fails_changes_nothing_and_resumes_nothing() {
+    let f = fixture();
+    let old = f.root.comms().join("alpha-ferryman");
+    let comms = f.root.project_dir("alpha").join("comms");
+    let mock = Mock::behaving(
+        comms,
+        Behaviour {
+            pause_fails: true,
+            ..Behaviour::default()
+        },
+    );
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(mock.clone()),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert!(matches!(status(&report, "alpha"), Status::Failed(_)));
+    assert_eq!(
+        mock.calls(),
+        vec!["pause"],
+        "no resume of what it never paused"
+    );
+    assert!(
+        old.join("agents/wisp.json").is_file(),
+        "the channel did not move"
+    );
+    assert!(!f.root.project_dir("alpha").join(MARKER).exists());
+    assert_eq!(entry_of(&f, "alpha").channel, old);
+}
+
+#[test]
+fn a_folder_syncthing_will_not_repoint_is_left_paused_and_a_rerun_gives_it_back() {
+    for how in [Move::Declined, Move::Errors] {
+        let f = fixture();
+        let comms = f.root.project_dir("alpha").join("comms");
+        let mock = Mock::behaving(
+            comms.clone(),
+            Behaviour {
+                move_result: how,
+                ..Behaviour::default()
+            },
+        );
+        let report = run(
+            &f.root,
+            &Options {
+                backend: Some(mock.clone()),
+                ..options(true)
+            },
+        )
+        .unwrap();
+        let Status::Failed(why) = status(&report, "alpha") else {
+            panic!("{}", report.render());
+        };
+        assert!(why.contains("left paused"), "{why}");
+        // The old place is empty now: resuming there would sync nothing and look healthy.
+        assert_eq!(
+            mock.calls(),
+            vec!["pause", "register", "move+resume (safe)"],
+            "{how:?}"
+        );
+        assert!(f.root.project_dir("alpha").join(MARKER).is_file());
+
+        let again = Mock::new(comms.clone());
+        let report = run(
+            &f.root,
+            &Options {
+                backend: Some(again.clone()),
+                ..options(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            status(&report, "alpha"),
+            &Status::Migrated,
+            "{}",
+            report.render()
+        );
+        assert_eq!(
+            again.calls(),
+            vec!["pause", "register", "move+resume (safe)"]
+        );
+        assert!(!f.root.project_dir("alpha").join(MARKER).exists());
+    }
+}
+
+#[test]
+fn a_folder_syncthing_will_not_repoint_resumes_at_its_old_path_only_if_the_channel_is_there() {
+    let f = fixture();
+    let comms = f.root.project_dir("alpha").join("comms");
+    // Syncthing says it still has the folder at a place that holds a channel.
+    let still_there = f.dir.path().join("elsewhere").join("mine-comms");
+    let mock = Mock::behaving(
+        comms,
+        Behaviour {
+            move_result: Move::Declined,
+            old_path: Some(still_there),
+            ..Behaviour::default()
+        },
+    );
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(mock.clone()),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert!(matches!(status(&report, "alpha"), Status::Failed(_)));
+    assert_eq!(
+        mock.calls().last().map(String::as_str),
+        Some("resume (safe)"),
+        "{:?}",
+        mock.calls()
+    );
+}
+
+#[test]
+fn a_failure_while_moving_the_hand_ins_is_finished_by_a_rerun() {
+    let f = fixture();
+    let dir = f.root.project_dir("alpha");
+    let comms = dir.join("comms");
+    // A file where the hand-ins folder should go.
+    write(&dir.join("handins"), "in the way");
+    let mock = Mock::new(comms.clone());
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(mock.clone()),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert!(
+        matches!(status(&report, "alpha"), Status::Failed(_)),
+        "{}",
+        report.render()
+    );
+    // `handins` was already ignored when the move stopped, so giving the folder back
+    // announces nothing.
+    assert_eq!(mock.calls(), vec!["pause", "move+resume (EARLY)"]);
+    assert_eq!(entry_of(&f, "alpha").channel, comms);
+    assert!(
+        comms.join("handins/wisp/o1/handin.json").is_file(),
+        "nothing was lost"
+    );
+    assert!(
+        fs::read_to_string(comms.join(".stignore"))
+            .unwrap()
+            .lines()
+            .any(|l| l.trim() == "/handins")
+    );
+
+    fs::remove_file(dir.join("handins")).unwrap();
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(Mock::new(comms.clone())),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        status(&report, "alpha"),
+        &Status::Migrated,
+        "{}",
+        report.render()
+    );
+    assert!(dir.join("handins/wisp/o1/handin.json").is_file());
+    assert!(!comms.join("handins").exists());
+    assert!(!dir.join(MARKER).exists());
+}
+
+#[test]
+fn a_rerun_ignores_and_registers_the_hand_ins_even_when_there_were_none() {
+    let f = fixture();
+    let channel = f.root.comms().join("alpha-ferryman");
+    fs::remove_dir_all(channel.join("handins")).unwrap();
+    // The step after the move cannot write `.stignore` over a directory.
+    fs::create_dir_all(channel.join(".stignore")).unwrap();
+    let comms = f.root.project_dir("alpha").join("comms");
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(Mock::new(comms.clone())),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert!(matches!(status(&report, "alpha"), Status::Failed(_)));
+    assert_eq!(entry_of(&f, "alpha").channel, comms);
+
+    fs::remove_dir(comms.join(".stignore")).unwrap();
+    let mock = Mock::new(comms.clone());
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(mock.clone()),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        status(&report, "alpha"),
+        &Status::Migrated,
+        "{}",
+        report.render()
+    );
+    assert_eq!(
+        mock.calls(),
+        vec!["pause", "register", "move+resume (safe)"]
+    );
+    assert!(
+        fs::read_to_string(comms.join(".stignore"))
+            .unwrap()
+            .lines()
+            .any(|l| l.trim() == "/handins")
+    );
+}
+
+#[test]
+fn a_folder_its_owner_had_paused_is_given_back_paused() {
+    let f = fixture();
+    let comms = f.root.project_dir("alpha").join("comms");
+    let mock = Mock::behaving(
+        comms,
+        Behaviour {
+            paused_before: true,
+            ..Behaviour::default()
+        },
+    );
+    let report = run(
+        &f.root,
+        &Options {
+            backend: Some(mock.clone()),
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        status(&report, "alpha"),
+        &Status::Migrated,
+        "{}",
+        report.render()
+    );
+    assert_eq!(
+        mock.calls(),
+        vec!["pause", "register", "move+resume (safe)", "pause"],
+        "paused again after the move, as the person had it"
+    );
+}
+
+#[test]
+fn a_peer_still_on_the_old_layout_is_named_in_the_plan() {
+    let f = fixture();
+    let channel = f.root.comms().join("alpha-ferryman");
+    write(
+        &channel.join("presence").join("bob.json"),
+        &format!(
+            r#"{{"agent":"bob","machine":"b","seen_at":"{}","ferry_version":"0.5.30","paused":false}}"#,
+            chrono::Utc::now().to_rfc3339()
+        ),
+    );
+    let report = run(&f.root, &options(false)).unwrap();
+    let text = report.render();
+    assert!(
+        text.contains("peers still on the old layout (bob)"),
+        "{text}"
+    );
+    assert!(text.contains("same window"), "{text}");
+}
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Ferryman's clone of `alpha` as a git repo whose only commit is on a remote.
+fn pushed_clone(f: &Fixture) -> PathBuf {
+    let repo = f.root.repos().join("alpha");
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "tester"]);
+    git(&repo, &["config", "commit.gpgsign", "false"]);
+    write(&repo.join("f.txt"), "x\n");
+    git(&repo, &["add", "f.txt"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let bare = f.dir.path().join("remote.git");
+    fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "-q", "--bare"]);
+    git(
+        &repo,
+        &["remote", "add", "origin", &bare.display().to_string()],
+    );
+    git(&repo, &["push", "-q", "-u", "origin", "main"]);
+    repo
+}
+
+fn parked(f: &Fixture) -> Vec<String> {
+    fs::read_dir(f.root.path.join("_to_delete"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn pruning_moves_only_clean_pushed_worktrees_under_work_and_leaves_the_rest() {
+    let f = fixture();
+    let repo = pushed_clone(&f);
+    let stale = f.root.work().join("stale");
+    let dirty = f.root.work().join("dirty");
+    let human = f.dir.path().join("elsewhere").join("my-worktree");
+    for (branch, path) in [("stale", &stale), ("dirty", &dirty), ("mine", &human)] {
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                branch,
+                &path.display().to_string(),
+            ],
+        );
+    }
+    write(&dirty.join("scratch.txt"), "not committed\n");
+
+    let options = Options {
+        prune_stale_worktrees: true,
+        ..options(false)
+    };
+    // The plan names exactly what would move, and why the rest stays.
+    let plan = run(&f.root, &options).unwrap().render();
+    assert!(plan.contains("stale: would move"), "{plan}");
+    assert!(
+        plan.contains("dirty") && plan.contains("uncommitted changes"),
+        "{plan}"
+    );
+    assert!(
+        plan.contains("my-worktree") && plan.contains("not under work/"),
+        "{plan}"
+    );
+    assert!(!plan.contains("my-worktree: would"), "{plan}");
+
+    let report = run(
+        &f.root,
+        &Options {
+            apply: true,
+            ..options
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        status(&report, "alpha"),
+        &Status::Migrated,
+        "{}",
+        report.render()
+    );
+    let moved = parked(&f);
+    assert!(moved.iter().any(|n| n.starts_with("stale-")), "{moved:?}");
+    assert!(
+        !moved
+            .iter()
+            .any(|n| n.starts_with("dirty-") || n.starts_with("my-worktree")),
+        "{moved:?}"
+    );
+    assert!(dirty.join("scratch.txt").is_file());
+    assert!(human.is_dir());
+}
+
+#[test]
+fn pruning_also_reaches_a_project_that_was_already_migrated() {
+    let f = fixture();
+    pushed_clone(&f);
+    let report = run(&f.root, &options(true)).unwrap();
+    assert_eq!(
+        status(&report, "alpha"),
+        &Status::Migrated,
+        "{}",
+        report.render()
+    );
+    let repo = entry_of(&f, "alpha").repo.unwrap();
+    let stale = f.root.project_dir("alpha").join("work").join("old");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "old",
+            &stale.display().to_string(),
+        ],
+    );
+
+    let again = run(
+        &f.root,
+        &Options {
+            prune_stale_worktrees: true,
+            ..options(true)
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        status(&again, "alpha"),
+        &Status::AlreadyDone,
+        "{}",
+        again.render()
+    );
+    assert!(
+        parked(&f).iter().any(|n| n.starts_with("old-")),
+        "{:?}",
+        parked(&f)
+    );
 }

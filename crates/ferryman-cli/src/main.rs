@@ -2770,6 +2770,9 @@ enum WorkCommand {
         /// Apply it but do not push.
         #[arg(long)]
         no_push: bool,
+        /// Go ahead although a verdict file beside it cannot be verified.
+        #[arg(long)]
+        force: bool,
     },
     /// Head only: send a hand-in back, with the reason.
     Reject {
@@ -2779,6 +2782,18 @@ enum WorkCommand {
         reason: String,
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Replace a verdict file that cannot be verified.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Master or head only, once: sign the verdicts written before they were signed
+    /// (v0.5.30 and earlier). Lists them; nothing changes until you pass --yes.
+    AdoptVerdicts {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Sign what the list shows.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -6453,6 +6468,17 @@ enum AccessCommand {
         /// worker, member or orchestrator.
         level: String,
     },
+    /// Admit agents that registered after the first Worker was set, as Members. They stay
+    /// Workers until you do; with no names this only lists who is waiting.
+    Admit {
+        /// The project id.
+        project: String,
+        /// Who to admit.
+        agents: Vec<String>,
+        /// Admit everyone on the list (read the list first).
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn access_route(project: &str) -> Result<ferryman_channel::ProjectRoute> {
@@ -6523,7 +6549,40 @@ fn access_command(command: AccessCommand) -> Result<()> {
                     };
                     println!("  {agent:<24} {:<13} {source}", level.as_str());
                 }
+                let waiting = access::pending_admission(channel, &route.project_id);
+                if !waiting.is_empty() {
+                    println!(
+                        "  waiting for the master to admit: {} (ferry access admit {})",
+                        waiting.join(", "),
+                        route.project_id
+                    );
+                }
             }
+        }
+        AccessCommand::Admit {
+            project,
+            agents,
+            all,
+        } => {
+            let route = access_route(&project)?;
+            let waiting = access::pending_admission(&route.communications, &route.project_id);
+            if agents.is_empty() && !all {
+                if waiting.is_empty() {
+                    println!("nobody is waiting for admission on {project}");
+                } else {
+                    println!("waiting for admission on {project}: {}", waiting.join(", "));
+                    println!("admit by name, or all of them with --all");
+                }
+                return Ok(());
+            }
+            let names = if all { waiting } else { agents };
+            let Some(master) = ferryman_channel::master::read_master(&route)?.map(|d| d.master)
+            else {
+                bail!("{project} has no master yet; claim it with 'ferry root master'");
+            };
+            let identity = signing_identity(&route, &master)?;
+            let done = access::admit(&route, &identity, &names)?;
+            println!("admitted as Members on {project}: {}", done.join(", "));
         }
         AccessCommand::Set {
             project,
@@ -8974,7 +9033,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
             } else {
                 for entry in &entries {
                     println!(
-                        "  {:<24} {:<9} signature {:<11} {} ({} file(s))",
+                        "  {:<24} {:<10} signature {:<11} {} ({} file(s))",
                         entry.order,
                         entry.status.as_str(),
                         entry.signature,
@@ -8988,6 +9047,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
             order,
             workspace,
             no_push,
+            force,
         } => {
             let checkout = here(workspace)?;
             let route = ferryman_channel::route_for(&checkout)?;
@@ -9000,6 +9060,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
                 &identity,
                 &checkout,
                 !no_push,
+                force,
             )?;
             println!(
                 "accepted {order}: applied as {}{}",
@@ -9015,6 +9076,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
             order,
             reason,
             workspace,
+            force,
         } => {
             let route = ferryman_channel::route_for(&here(workspace)?)?;
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
@@ -9025,8 +9087,32 @@ fn work_command(command: WorkCommand) -> Result<()> {
                 &order,
                 &identity,
                 &reason,
+                force,
             )?;
             println!("rejected {order}: the worker will see why");
+        }
+        WorkCommand::AdoptVerdicts { workspace, yes } => {
+            let route = ferryman_channel::route_for(&here(workspace)?)?;
+            let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
+            let found = handin::adopt_verdicts(&route, &handin::work_dir(&route), &identity, yes)?;
+            if found.is_empty() {
+                println!("no old unsigned verdicts");
+            }
+            for old in &found {
+                println!("  {:<24} {}", old.order, old.kind);
+            }
+            if !found.is_empty() {
+                if yes {
+                    println!("signed {} verdict(s) as {agent}", found.len());
+                } else {
+                    println!(
+                        "{} old verdict(s). Check each against `git log` and `ferry work list`, \
+                         then run again with --yes to sign them as {agent}.",
+                        found.len()
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -12452,6 +12538,38 @@ fn root_command(command: RootCommand) -> Result<()> {
                 prune_stale_worktrees,
                 machine_blockers: ferryman_ops::migrate::blockers_from_scan(&scan),
             };
+            if apply && prune_stale_worktrees {
+                // The exact list, before anything moves.
+                let plan = ferryman_ops::migrate::run(
+                    &root,
+                    &ferryman_ops::migrate::Options {
+                        apply: false,
+                        ..options.clone()
+                    },
+                )?;
+                let lines: Vec<String> = plan
+                    .projects
+                    .iter()
+                    .flat_map(|p| {
+                        p.steps
+                            .iter()
+                            .filter(|step| step.starts_with("stale worktree"))
+                            .map(move |step| format!("  {}: {step}", p.project))
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    println!("no stale worktrees to move.");
+                } else {
+                    println!(
+                        "moving these to _to_delete (under work/, clean, pushed, used by no \
+                         order; a blocked project is skipped):"
+                    );
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                println!();
+            }
             let report = ferryman_ops::migrate::run(&root, &options)?;
             print!("{}", report.render());
             if !apply {
@@ -13984,6 +14102,7 @@ mod tests {
                     order,
                     workspace,
                     no_push,
+                    ..
                 },
         } = accept.command
         else {

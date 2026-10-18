@@ -653,12 +653,56 @@ pub fn examine(start: &Path) -> Report {
     ));
     checks.push(token_check(&route, &config.agent, head.as_deref()));
 
+    // Fleet-wide, advice only (ADR 0024). On the v2 layout the channel no longer carries
+    // `handins/`, so a peer still on v1 hands in to a folder this machine is never sent.
+    let (mixed_ok, mixed) = layout_peers(&route, &config.agent);
+    checks.push(check("layout_peers", mixed_ok, false, mixed));
+    let waiting =
+        ferryman_channel::access::pending_admission(&route.communications, &route.project_id);
+    checks.push(check(
+        "admission",
+        waiting.is_empty(),
+        false,
+        if waiting.is_empty() {
+            "nobody is waiting for the master to admit them".to_string()
+        } else {
+            format!(
+                "{} registered after the first Worker was set and stay Workers until the \
+                 master admits them: 'ferry access admit {}'",
+                waiting.join(", "),
+                route.project_id
+            )
+        },
+    ));
+
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {
         project: route.project_id,
         ready,
         checks,
     }
+}
+
+/// What the `layout_peers` check says: on the v2 layout, which peers have not migrated.
+fn layout_peers(route: &ferryman_channel::ProjectRoute, me: &str) -> (bool, String) {
+    if ferryman_channel::receipts::channel_layout(route) < 2 {
+        return (true, "this channel is on the v1 layout".to_string());
+    }
+    let old = ferryman_channel::receipts::peers_on_old_layout(route, me);
+    if old.is_empty() {
+        return (true, "no peer reports the old layout".to_string());
+    }
+    let lines: Vec<String> = old
+        .iter()
+        .map(|peer| {
+            format!(
+                "peer {} has not migrated; its hand-ins are not received (last seen {})",
+                peer.agent,
+                peer.seen_at.format("%Y-%m-%d %H:%M")
+            )
+        })
+        .collect();
+    (false, lines.join("; "))
 }
 
 /// What the `versions` check should say, given this machine's version and what every

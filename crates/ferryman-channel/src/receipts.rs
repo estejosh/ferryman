@@ -88,10 +88,46 @@ pub struct Presence {
     /// missing grant. Absent when it is free to work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
+    /// The layout this machine keeps the channel in (ADR 0024): 2 once migrated. Absent on
+    /// a machine older than that. A hint for `doctor` and `root migrate` and deliberately
+    /// outside what the signature covers, so a machine that does not know the field still
+    /// verifies the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+/// Which layout this channel sits in on this machine: 2 for `projects/<id>/comms`, else 1.
+#[must_use]
+pub fn channel_layout(route: &ProjectRoute) -> u32 {
+    let channel = &route.communications;
+    let is_comms = channel.file_name().is_some_and(|name| name == "comms");
+    let under_projects = channel
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "projects");
+    if is_comms && under_projects { 2 } else { 1 }
+}
+
+/// Other agents in this channel whose latest presence says they are not on the v2 layout,
+/// or is from a version that does not know there is one. Their hand-ins do not reach a
+/// machine that has migrated (the channel no longer carries `handins/`), so this is what
+/// `doctor` and `root migrate` warn about. Newest first; `me` is left out.
+#[must_use]
+pub fn peers_on_old_layout(route: &ProjectRoute, me: &str) -> Vec<Presence> {
+    let mut old: Vec<Presence> = list_presence(route)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(presence, _)| presence)
+        .filter(|presence| !presence.agent.eq_ignore_ascii_case(me))
+        .filter(|presence| presence.layout.is_none_or(|layout| layout < 2))
+        .collect();
+    old.sort_by_key(|presence| std::cmp::Reverse(presence.seen_at));
+    old
 }
 
 fn delivered_payload(receipt: &OrderDelivered) -> String {
@@ -602,6 +638,7 @@ pub fn refresh_presence(
         ferry_version: ferry_version.to_string(),
         paused,
         held,
+        layout: Some(channel_layout(route)),
         signed_by: Some(agent.to_string()),
         signature: None,
     };
@@ -1561,12 +1598,29 @@ mod tests {
             ferry_version: "0".into(),
             paused: false,
             held: None,
+            layout: None,
             signed_by: None,
             signature: None,
         };
         write_task_file(&presence_path(&route, "nebra"), &fake).unwrap();
         let presence = list_presence(&route).unwrap();
         assert_eq!(presence[0].1, SignatureCheck::Unsigned);
+        // A record from a machine that does not know about layouts is a machine that has not
+        // migrated; one that says 2 is not.
+        let old = peers_on_old_layout(&route, "someone-else");
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(old[0].agent, "nebra");
+        let mut fake = fake;
+        fake.layout = Some(2);
+        write_task_file(&presence_path(&route, "nebra"), &fake).unwrap();
+        assert!(peers_on_old_layout(&route, "someone-else").is_empty());
+        fake.layout = Some(1);
+        write_task_file(&presence_path(&route, "nebra"), &fake).unwrap();
+        assert!(
+            peers_on_old_layout(&route, "nebra").is_empty(),
+            "me is left out"
+        );
+        assert_eq!(peers_on_old_layout(&route, "x").len(), 1);
         let absent = absent_at(&route.agents, &presence, Utc::now());
         assert!(absent.iter().any(|a| a.agent == "nebra"));
     }
