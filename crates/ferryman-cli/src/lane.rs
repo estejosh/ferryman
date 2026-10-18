@@ -301,6 +301,9 @@ impl WorkerLane {
             self.config.relay_url.clone(),
             Some(machine.join(ferryman_iroh::STATUS_FILE)),
         );
+        // Who this machine's worker is, so a Worker-level agent here listens to a channel
+        // and publishes none of it (its writes go out through its hand-ins folder).
+        lane.set_local_agents(vec![self.identity.name().to_owned()]);
         tokio::spawn(lane.run(ferryman_iroh::lane::ROUND_EVERY));
         Ok(())
     }

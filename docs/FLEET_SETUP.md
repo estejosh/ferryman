@@ -17,7 +17,7 @@ Then run the lines it prints under "run these as the project master", on the mac
 
 ## What `ferry fleet setup` does
 
-1. **Layout.** Makes `comms/`, `repos/` and `work/` under the ferry root (`--root <folder>` makes the root first when there is none).
+1. **Layout.** Makes the root's folders (`projects/`, `secrets/`, `logs/` in layout 2; `comms/`, `repos/`, `work/` in layout 1) (`--root <folder>` makes the root first when there is none).
 2. **Settings.** `--remote-template` writes where clones come from to `<root>/ferry.toml`; `--exclude <project>` keeps a project out of the swarm on this machine only. Both are optional, both are local.
 3. **Clones.** Runs `ferry repos sync`: every live project gets `repos/<project>`, attached to its channel. A person's working copy is not touched, and is remembered in the manifest as a `human_checkouts` entry.
 4. **Identity.** Picks the machine's one worker identity: `--identity` if given, else the identity a worker here already runs as, else the only `*-swarm` identity found, else `ichabod-<machine>-swarm`. Its `agent.toml` and key live in a managed clone (`--home <project>` chooses which). A key already on this machine is copied, never regenerated and never moved: a second key under a name the rosters know reads as an impostor everywhere.
@@ -61,6 +61,19 @@ quantly = "sov://my-bucket/quantly"
 
 `ferry repos sync` also moves Ferryman's own clone forward: after a fetch it fast-forwards `repos/<project>` when, and only when, the clone was made by `repos sync`, has no changes to tracked files, and is strictly behind its upstream. A diverged or edited clone is fetched and left alone. A person's checkout is never moved.
 
+## Layout 2 and moving to it
+
+A new root is layout 2: `projects/<id>/{repo,comms,handins,work,tmp,.env}`, `secrets/` and `logs/` (docs/LAYOUT.md, ADR 0024). `ferry fleet setup` makes the folders of whichever layout the root is in and clones into `projects/<id>/repo` in layout 2. `ferry enable` files a new project's channel at `projects/<id>/comms`; pass `--channel`, `--repo`, `--handins` or `--env` to place any of them yourself, and Ferryman records the project as custom and leaves it where you put it.
+
+An existing machine moves with one command, once per machine, with the worker stopped:
+
+```sh
+ferry root migrate            # dry run: says what would move and what blocks it; writes nothing
+ferry root migrate --apply    # does it, logs to <root>/logs/migrate-<UTC>.md
+ferry agent run --all-projects   # start the worker again; the iroh lane re-reads bridge.toml
+```
+
+A project with a running worker, a worker lock or a live worktree is refused, and the line names what blocks it. Custom projects and your own checkouts are listed as left in place. Nothing is deleted: superseded copies go to `<root>/_to_delete/`. Where Ferryman's Syncthing has a project's folder, its path is changed and the folder id kept, so no other machine re-pairs; migrate the fleet together, or pause the folder on the machines that have not moved yet. Run it on grouchly the same way (root `/mnt/nvme-storage/repos/ferry`). Then `ferry access show` lists each agent's level and `ferry access set <project> <agent> worker|member|orchestrator` (the master's command) changes one.
 ## One worker per machine
 
 Two workers on one machine claim the same orders, burn the same engines and race each other's worktrees. `ferry fleet setup --service` leaves exactly one:

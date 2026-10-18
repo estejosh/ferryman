@@ -47,6 +47,9 @@ use crate::{AgentIdentity, SignatureCheck};
 /// The file that marks a ferry root and describes what is in it.
 pub const MANIFEST: &str = ".ferry";
 
+/// The manifest `version` of the one-folder-per-project layout (ADR 0024).
+pub const LAYOUT_V2: u32 = 2;
+
 /// The marker, inside a channel, that says its project is finished.
 ///
 /// It lives in the channel and not in the manifest because the manifest is machine-local
@@ -102,8 +105,45 @@ pub fn master_of(channel: &Path) -> Result<Option<String>> {
     Ok(crate::master::read_master_at(channel, &roster)?.map(|declaration| declaration.master))
 }
 
+/// Whether Ferryman chose where a project's folders are, or a person did.
+///
+/// The layout is what Ferryman does when nobody decides. A person who decides (a different
+/// drive, a folder they already organise by hand) is respected: the manifest's recorded
+/// paths are the truth, and nothing here assumes a project sits under `projects/<id>`.
+/// Migration never moves a custom project.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Placement {
+    /// Ferryman put it where the layout says.
+    #[default]
+    Managed,
+    /// A person put it somewhere, and said so (`ferry enable --channel ...`), or it was
+    /// adopted where it stood.
+    Custom,
+}
+
+impl Placement {
+    #[must_use]
+    pub fn is_managed(self) -> bool {
+        self == Self::Managed
+    }
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Managed => "managed",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+// serde's `skip_serializing_if` hands a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn placement_is_managed(placement: &Placement) -> bool {
+    placement.is_managed()
+}
+
 /// One project, and where its two halves live on this machine.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub project_id: String,
     /// The channel directory - the thing Syncthing carries.
@@ -123,6 +163,132 @@ pub struct Entry {
     /// reads them to decide where work happens.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub human_checkouts: Vec<PathBuf>,
+    /// Managed (the layout's places) or custom (a person's). Absent means managed; whether
+    /// the recorded paths really are the layout's is judged by [`Entry::placement_in`].
+    #[serde(default, skip_serializing_if = "placement_is_managed")]
+    pub placement: Placement,
+    /// Where hand-ins and a worker's own signed writes live, when not the default
+    /// (`projects/<id>/handins` in a v2 root, `<channel>/handins` otherwise).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handins: Option<PathBuf>,
+    /// The project's `.env` (project-scoped keys only), when not the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<PathBuf>,
+    /// Where this project's task worktrees go, when not the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work: Option<PathBuf>,
+}
+
+impl Entry {
+    /// Whether this project is in the layout's places or a person's own.
+    ///
+    /// Custom when it says so, or when its channel is neither of the two places the layout
+    /// would have put it (`comms/<id>-ferryman`, `projects/<id>/comms`). An older manifest
+    /// has no `placement`, and a channel adopted from outside the root is custom by this
+    /// reading: nothing that was placed by hand is ever treated as ours to move.
+    #[must_use]
+    pub fn placement_in(&self, root: &Root) -> Placement {
+        if self.placement == Placement::Custom {
+            return Placement::Custom;
+        }
+        let standard = [
+            root.comms().join(format!("{}-ferryman", self.project_id)),
+            root.project_dir(&self.project_id).join("comms"),
+        ];
+        if standard
+            .iter()
+            .any(|place| same_place(place, &self.channel))
+        {
+            Placement::Managed
+        } else {
+            Placement::Custom
+        }
+    }
+
+    /// Whether the channel is at `projects/<id>/comms`, so the rest of the project's
+    /// folders default to its siblings.
+    #[must_use]
+    pub fn is_v2_placed(&self, root: &Root) -> bool {
+        self.placement != Placement::Custom
+            && same_place(
+                &root.project_dir(&self.project_id).join("comms"),
+                &self.channel,
+            )
+    }
+
+    /// Where hand-ins live: the recorded path; else beside the channel in `projects/<id>/`
+    /// when the channel is there; else inside the channel, as before.
+    #[must_use]
+    pub fn handins_path(&self, root: &Root) -> PathBuf {
+        if let Some(path) = &self.handins {
+            return path.clone();
+        }
+        if self.is_v2_placed(root) {
+            root.project_dir(&self.project_id).join("handins")
+        } else {
+            self.channel.join("handins")
+        }
+    }
+
+    /// Where the project's `.env` is: the recorded path, else `projects/<id>/.env`.
+    #[must_use]
+    pub fn env_path(&self, root: &Root) -> PathBuf {
+        self.env
+            .clone()
+            .unwrap_or_else(|| root.project_env(&self.project_id))
+    }
+
+    /// Where task worktrees go: the recorded path, else `projects/<id>/work` for a v2
+    /// project, else the root's `work/<id>`.
+    #[must_use]
+    pub fn work_path(&self, root: &Root) -> PathBuf {
+        if let Some(path) = &self.work {
+            return path.clone();
+        }
+        if self.is_v2_placed(root) || root.layout_version() >= 2 {
+            root.project_dir(&self.project_id).join("work")
+        } else {
+            root.work().join(&self.project_id)
+        }
+    }
+
+    /// Where Ferryman's own clone of this project is, judged for the project and not for the
+    /// root. The manifest stays in the old layout until every project has moved, so asking
+    /// the root would send a migrated project's `repos sync` to a fresh clone at
+    /// `repos/<id>` and demote the real one to a human checkout. In order: the recorded repo
+    /// when it is one of the two managed places; `projects/<id>/repo` for a project whose
+    /// channel is in its project folder; else the root's own default.
+    #[must_use]
+    pub fn managed_clone_path(&self, root: &Root) -> PathBuf {
+        let places = root.managed_clone_places(&self.project_id);
+        // Compared as written, not as resolved: `root adopt` leaves a link at the managed
+        // place that points at a person's checkout, and that checkout is not the clone.
+        let fold = |path: &Path| {
+            let text = path.display().to_string().replace('\\', "/");
+            let text = text.trim_end_matches('/').to_owned();
+            if cfg!(windows) {
+                text.to_lowercase()
+            } else {
+                text
+            }
+        };
+        if let Some(repo) = &self.repo
+            && places.iter().any(|place| fold(place) == fold(repo))
+        {
+            return repo.clone();
+        }
+        if self.is_v2_placed(root) {
+            return places[0].clone();
+        }
+        root.managed_clone(&self.project_id)
+    }
+
+    /// Whether the hand-in folder is separate from the channel, which is when a worker-level
+    /// agent can be kept out of the channel: it has somewhere else to write.
+    #[must_use]
+    pub fn handins_separate(&self, root: &Root) -> bool {
+        !self.handins_path(root).starts_with(&self.channel)
+    }
 }
 
 impl Entry {
@@ -247,6 +413,7 @@ pub fn is_archived(channel: &Path, project_id: &str) -> bool {
         repo: None,
         adopted: false,
         human_checkouts: Vec::new(),
+        ..Entry::default()
     }
     .is_archived()
 }
@@ -718,7 +885,7 @@ pub fn set_swarm(
 /// Whether two paths are the same place. Compared after resolving where they can be, folded
 /// on Windows (where `X:\Ferry` and `x:\ferry` are one directory, and a temporary folder has
 /// a short and a long spelling).
-fn same_place(a: &Path, b: &Path) -> bool {
+pub fn same_place(a: &Path, b: &Path) -> bool {
     let norm = |path: &Path| {
         let resolved = std::fs::canonicalize(path).map_or_else(
             |_| path.to_path_buf(),
@@ -812,22 +979,235 @@ impl Root {
         self.path.join(MANIFEST)
     }
 
-    /// Create the layout and an empty manifest. Safe to run again.
+    /// The layout this root is in: 2 for `projects/<id>/...`, 1 for the older
+    /// `comms/ repos/ work/`.
+    ///
+    /// From the manifest's `version`. A root whose manifest is missing is judged by what is
+    /// on disk, because deleting `.ferry` was meant to cost only the index.
+    #[must_use]
+    pub fn layout_version(&self) -> u32 {
+        if self.manifest_path().is_file() {
+            return if self.read().version >= LAYOUT_V2 {
+                2
+            } else {
+                1
+            };
+        }
+        if self.projects_dir().is_dir() && !self.comms().is_dir() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// `projects/`: one folder per project (layout 2).
+    #[must_use]
+    pub fn projects_dir(&self) -> PathBuf {
+        self.path.join("projects")
+    }
+
+    /// `projects/<id>/`: the one folder to hand to anything that should see this project
+    /// and nothing else.
+    #[must_use]
+    pub fn project_dir(&self, project_id: &str) -> PathBuf {
+        self.projects_dir().join(project_id)
+    }
+
+    /// Where Ferryman's own clone of a project goes by default: `projects/<id>/repo` in a
+    /// layout-2 root, `repos/<id>` in layout 1. A project's real clone is whatever its
+    /// manifest entry records.
+    #[must_use]
+    pub fn managed_clone(&self, project_id: &str) -> PathBuf {
+        if self.layout_version() >= 2 {
+            self.project_dir(project_id).join("repo")
+        } else {
+            self.repos().join(project_id)
+        }
+    }
+
+    /// Where Ferryman's own clone of `project_id` is: [`Entry::managed_clone_path`] for the
+    /// project's manifest entry, else the root's default.
+    #[must_use]
+    pub fn managed_clone_of(&self, project_id: &str) -> PathBuf {
+        self.read()
+            .projects
+            .iter()
+            .find(|entry| entry.project_id == project_id)
+            .map_or_else(
+                || self.managed_clone(project_id),
+                |entry| entry.managed_clone_path(self),
+            )
+    }
+
+    /// Both places a managed clone can be, whichever layout the root is in. For finding
+    /// one that exists; a root part-way through a migration has both kinds.
+    #[must_use]
+    pub fn managed_clone_places(&self, project_id: &str) -> [PathBuf; 2] {
+        [
+            self.project_dir(project_id).join("repo"),
+            self.repos().join(project_id),
+        ]
+    }
+
+    /// Where task worktrees for a project go by default: `projects/<id>/work` (layout 2) or
+    /// `work/<id>` (layout 1).
+    #[must_use]
+    pub fn worktrees(&self, project_id: &str) -> PathBuf {
+        if self.layout_version() >= 2 {
+            self.project_dir(project_id).join("work")
+        } else {
+            self.work().join(project_id)
+        }
+    }
+
+    /// Hand-ins by default: `projects/<id>/handins` (layout 2), or inside the channel.
+    #[must_use]
+    pub fn handins_dir(&self, project_id: &str) -> PathBuf {
+        if self.layout_version() >= 2 {
+            self.project_dir(project_id).join("handins")
+        } else {
+            self.comms_home(project_id).join("handins")
+        }
+    }
+
+    /// Scratch space for a project; machine-local.
+    #[must_use]
+    pub fn project_tmp(&self, project_id: &str) -> PathBuf {
+        self.project_dir(project_id).join("tmp")
+    }
+
+    /// The project's `.env`: project-scoped keys only, never synced.
+    #[must_use]
+    pub fn project_env(&self, project_id: &str) -> PathBuf {
+        self.project_dir(project_id).join(".env")
+    }
+
+    /// `secrets/`: write credentials and fleet-wide keys. Never synced, and only an
+    /// orchestrator-level agent may read from it.
+    #[must_use]
+    pub fn secrets(&self) -> PathBuf {
+        self.path.join("secrets")
+    }
+
+    /// `logs/`.
+    #[must_use]
+    pub fn logs(&self) -> PathBuf {
+        self.path.join("logs")
+    }
+
+    /// Where files shared by every project here sit: `comms/` in layout 1 (a fleet-wide
+    /// `agent.toml` was kept there), the root itself in layout 2 (which has no `comms/`).
+    /// Also what a command that wants "the folder of channels" starts from; the channels
+    /// themselves are listed by [`Root::channel_dirs`].
+    #[must_use]
+    pub fn shared_home(&self) -> PathBuf {
+        if self.layout_version() >= 2 {
+            self.path.clone()
+        } else {
+            self.comms()
+        }
+    }
+
+    /// The folders this root's layout has at its top, for `create` and the layout check.
+    #[must_use]
+    pub fn top_folders(&self) -> Vec<(&'static str, PathBuf)> {
+        if self.layout_version() >= 2 {
+            vec![
+                ("projects", self.projects_dir()),
+                ("secrets", self.secrets()),
+                ("logs", self.logs()),
+            ]
+        } else {
+            vec![
+                ("comms", self.comms()),
+                ("repos", self.repos()),
+                ("work", self.work()),
+            ]
+        }
+    }
+
+    /// Every channel directory of a project filed here, from the manifest, whichever layout
+    /// they sit in. Not a scan of `comms/`.
+    #[must_use]
+    pub fn channel_dirs(&self) -> Vec<PathBuf> {
+        self.read()
+            .projects
+            .into_iter()
+            .map(|entry| entry.channel)
+            .collect()
+    }
+
+    /// Where task worktrees of `repo` go when `repo` is one of the root's, or recorded in it:
+    /// the entry's work folder. `None` when the root knows nothing of this repository.
+    #[must_use]
+    pub fn worktrees_for_repo(&self, repo: &Path) -> Option<PathBuf> {
+        let manifest = self.read();
+        for entry in &manifest.projects {
+            let is_it = entry
+                .repo
+                .as_deref()
+                .is_some_and(|known| same_place(known, repo));
+            if is_it && (entry.work.is_some() || self.layout_version() >= 2) {
+                return Some(entry.work_path(self));
+            }
+        }
+        // A managed clone of layout 2 is `projects/<id>/repo`; its work folder is the
+        // sibling, even if the manifest does not list it yet.
+        if self.is_managed(repo) && repo.file_name().is_some_and(|name| name == "repo") {
+            return repo.parent().map(|parent| parent.join("work"));
+        }
+        None
+    }
+
+    /// Create a root, in layout 2 when it is new. An existing root keeps the layout it has
+    /// (see [`Root::layout_version`]); safe to run again.
     pub fn create(path: &Path) -> Result<Self> {
         let root = Self {
             path: path.to_path_buf(),
         };
-        for dir in [root.comms(), root.repos(), root.work()] {
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+        let existing = root.manifest_path().is_file() || root.comms().is_dir();
+        let version = if existing {
+            root.layout_version()
+        } else {
+            LAYOUT_V2
+        };
+        Self::create_with_layout(path, version)
+    }
+
+    /// Create a root in a named layout (1 or 2). A new v1 root is for tests and for a
+    /// machine that has to stay on the older shape; nothing else asks for one.
+    pub fn create_with_layout(path: &Path, version: u32) -> Result<Self> {
+        let root = Self {
+            path: path.to_path_buf(),
+        };
         if !root.manifest_path().is_file() {
+            std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
             root.write(&Manifest {
-                version: manifest_version(),
+                version: if version >= LAYOUT_V2 {
+                    LAYOUT_V2
+                } else {
+                    manifest_version()
+                },
                 projects: Vec::new(),
             })?;
         }
+        for (_, dir) in root.top_folders() {
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+        }
         remember_root(&root.path);
         Ok(root)
+    }
+
+    /// Mark the root as layout 2. Only when every project in it has been migrated; the
+    /// caller checks.
+    pub fn set_layout_v2(&self) -> Result<()> {
+        let mut manifest = self.read();
+        manifest.version = LAYOUT_V2;
+        self.write(&manifest)?;
+        for (_, dir) in self.top_folders() {
+            std::fs::create_dir_all(&dir)?;
+        }
+        Ok(())
     }
 
     /// Read the manifest. A missing or unreadable one is an empty manifest, never an
@@ -868,6 +1248,7 @@ impl Root {
             repo: repo.map(Path::to_path_buf),
             adopted,
             human_checkouts: Vec::new(),
+            ..Entry::default()
         };
         match manifest
             .projects
@@ -880,7 +1261,15 @@ impl Root {
             // repository path it had already learned. Losing what you knew is worse than
             // not learning anything, and it is silent, which is worse again.
             Some(existing) => {
-                existing.channel = entry.channel;
+                // A `bridge.toml` that still names the channel's old place (a checkout
+                // `root migrate` did not rewrite, or a machine that has not caught up) must
+                // not drag a migrated entry back to a folder that is no longer there.
+                let stale = !same_place(&entry.channel, &existing.channel)
+                    && existing.channel.is_dir()
+                    && (existing.is_v2_placed(self) || !entry.channel.is_dir());
+                if !stale {
+                    existing.channel = entry.channel;
+                }
                 if let Some(new_repo) = entry.repo {
                     let managed_now = existing
                         .repo
@@ -1044,10 +1433,15 @@ impl Root {
             .collect()
     }
 
-    /// Where this project's channel belongs once it lives in the root.
+    /// Where this project's channel belongs once it lives in the root: `projects/<id>/comms`
+    /// in a layout-2 root, `comms/<id>-ferryman` in a layout-1 root.
     #[must_use]
     pub fn comms_home(&self, project_id: &str) -> PathBuf {
-        self.comms().join(format!("{project_id}-ferryman"))
+        if self.layout_version() >= 2 {
+            self.project_dir(project_id).join("comms")
+        } else {
+            self.comms().join(format!("{project_id}-ferryman"))
+        }
     }
 
     /// Move one project's channel into `comms/`, so every channel lives in one place.
@@ -1121,6 +1515,55 @@ impl Root {
         Ok(gathered)
     }
 
+    /// Change one entry in place and write the manifest. Returns whether anything changed;
+    /// an unknown project is an error. Nothing on disk but the manifest is touched.
+    pub fn update_entry(&self, project_id: &str, change: impl FnOnce(&mut Entry)) -> Result<bool> {
+        let mut manifest = self.read();
+        let Some(entry) = manifest
+            .projects
+            .iter_mut()
+            .find(|entry| entry.project_id == project_id)
+        else {
+            bail!(
+                "no project '{project_id}' in {}",
+                self.manifest_path().display()
+            );
+        };
+        let before = entry.clone();
+        change(entry);
+        if *entry == before {
+            return Ok(false);
+        }
+        self.write(&manifest)?;
+        Ok(true)
+    }
+
+    /// Record a project whose places a person chose (`ferry enable --channel ...`). Every
+    /// path given is recorded as is and marks the project custom; nothing is created or
+    /// moved. A path left out takes the default for the project's layout.
+    pub fn record_custom(&self, project_id: &str, places: &CustomPlaces) -> Result<()> {
+        let repo = places.repo.as_deref();
+        self.adopt(project_id, &places.channel, repo)?;
+        self.update_entry(project_id, |entry| {
+            entry.placement = Placement::Custom;
+            entry.channel = places.channel.clone();
+            if places.repo.is_some() {
+                entry.repo = places.repo.clone();
+                entry.adopted = true;
+            }
+            if places.handins.is_some() {
+                entry.handins = places.handins.clone();
+            }
+            if places.env.is_some() {
+                entry.env = places.env.clone();
+            }
+            if places.work.is_some() {
+                entry.work = places.work.clone();
+            }
+        })?;
+        Ok(())
+    }
+
     /// Remove one project from the manifest. Nothing on disk is touched.
     ///
     /// The index could be added to and never subtracted from, and the omission was not
@@ -1158,16 +1601,9 @@ impl Root {
             .collect()
     }
 
-    /// Where Ferryman's own clone of a project lives: `repos/<project>`.
-    ///
-    /// The fixed place. Workers use it and nothing else of the project's, and a person's
-    /// working copy is never it. See `docs/LAYOUT.md`.
-    #[must_use]
-    pub fn managed_clone(&self, project_id: &str) -> PathBuf {
-        self.repos().join(project_id)
-    }
-
-    /// Whether `repo` is a managed clone: a folder directly under this root's `repos/`.
+    /// Whether `repo` is a managed clone: a folder directly under this root's `repos/`
+    /// (layout 1), or `projects/<id>/repo` (layout 2). Both are recognised in either
+    /// layout, so a root part-way through a migration reads each project correctly.
     #[must_use]
     pub fn is_managed(&self, repo: &Path) -> bool {
         let fold = |path: &Path| {
@@ -1179,8 +1615,17 @@ impl Root {
                 text
             }
         };
-        repo.parent()
+        if repo
+            .parent()
             .is_some_and(|parent| fold(parent) == fold(&self.repos()))
+        {
+            return true;
+        }
+        repo.file_name().is_some_and(|name| name == "repo")
+            && repo
+                .parent()
+                .and_then(Path::parent)
+                .is_some_and(|projects| fold(projects) == fold(&self.projects_dir()))
     }
 
     /// Make `managed` the repository this project's workers use, and remember the one it
@@ -1272,6 +1717,50 @@ impl Root {
     }
 }
 
+/// The places a person chose for a project; see [`Root::record_custom`].
+#[derive(Debug, Clone, Default)]
+pub struct CustomPlaces {
+    pub channel: PathBuf,
+    pub repo: Option<PathBuf>,
+    pub handins: Option<PathBuf>,
+    pub env: Option<PathBuf>,
+    pub work: Option<PathBuf>,
+}
+
+/// Where a project's hand-ins are, given only its channel.
+///
+/// For callers that hold a route and not a root entry (`handin::work_dir`). In order: the
+/// ferry root's entry for the project, when one is found and its channel is this one; the
+/// layout-2 default (`projects/<id>/handins` beside `projects/<id>/comms`); else inside the
+/// channel, which is where hand-ins were before layout 2.
+#[must_use]
+pub fn handins_dir_for(channel: &Path, project_id: &str) -> PathBuf {
+    let candidates = find_root_from(channel).into_iter().chain(find_root());
+    for root in candidates {
+        if let Some(entry) = root
+            .read()
+            .projects
+            .into_iter()
+            .find(|entry| entry.project_id == project_id && same_place(&entry.channel, channel))
+        {
+            return entry.handins_path(&root);
+        }
+    }
+    if channel.file_name().is_some_and(|name| name == "comms")
+        && let Some(project_dir) = channel.parent()
+        && project_dir
+            .file_name()
+            .is_some_and(|name| name == project_id)
+        && project_dir
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "projects")
+    {
+        return project_dir.join("handins");
+    }
+    channel.join("handins")
+}
+
 /// What gathering one project did, or would do.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gathered {
@@ -1290,7 +1779,7 @@ pub struct Gathered {
 /// primitive, so the copy is done first and the original removed only once every file
 /// arrived - a crash in the middle leaves both, which is recoverable, rather than
 /// neither, which is not.
-fn move_directory(from: &Path, to: &Path) -> Result<()> {
+pub fn move_directory(from: &Path, to: &Path) -> Result<()> {
     if std::fs::rename(from, to).is_ok() {
         return Ok(());
     }
@@ -1298,16 +1787,39 @@ fn move_directory(from: &Path, to: &Path) -> Result<()> {
     std::fs::remove_dir_all(from).with_context(|| format!("remove {}", from.display()))
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
+/// Copy a directory tree, keeping each file's modified time (a copy that stamps "now"
+/// would make a moved clone or channel look edited, and a sync tool would re-send it).
+///
+/// A symlinked or junctioned directory is refused rather than followed: copying through it
+/// would duplicate (or escape into) somebody else's tree. A symlinked file is copied as the
+/// file it points to.
+///
+/// # Errors
+/// A directory link is met, or a file cannot be read or written.
+pub fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     std::fs::create_dir_all(to).with_context(|| format!("create {}", to.display()))?;
     for entry in std::fs::read_dir(from).with_context(|| format!("read {}", from.display()))? {
         let entry = entry?;
+        let path = entry.path();
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_tree(&entry.path(), &target)?;
+        let kind = entry.file_type()?;
+        let linked = kind.is_symlink() || std::fs::read_link(&path).is_ok();
+        if linked && std::fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+            bail!(
+                "{} is a link to a directory; it is not copied. Move the folder by hand, \
+                 or remove the link and run this again",
+                path.display()
+            );
+        }
+        if kind.is_dir() && !linked {
+            copy_tree(&path, &target)?;
         } else {
-            std::fs::copy(entry.path(), &target)
-                .with_context(|| format!("copy {}", entry.path().display()))?;
+            std::fs::copy(&path, &target).with_context(|| format!("copy {}", path.display()))?;
+            if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified())
+                && let Ok(file) = std::fs::OpenOptions::new().write(true).open(&target)
+            {
+                let _ = file.set_modified(modified);
+            }
         }
     }
     Ok(())
@@ -1322,6 +1834,14 @@ fn repoint_bridge(old_channel: &Path, new_channel: &Path) -> Result<()> {
     let Some(attachment) = old_channel.parent() else {
         return Ok(());
     };
+    repoint_bridge_in(attachment, &[("communications", new_channel)])
+}
+
+/// Rewrite named path lines of `<attachment>/bridge.toml` (`communications`, `workspace`,
+/// `attachment`), leaving every other line as it was. Nothing happens when there is no
+/// `bridge.toml` there. Used by `gather` and by `ferry root migrate`, which moves a managed
+/// clone and so must rewrite the `workspace` and `attachment` lines with it.
+pub fn repoint_bridge_in(attachment: &Path, updates: &[(&str, &Path)]) -> Result<()> {
     let bridge = attachment.join("bridge.toml");
     if !bridge.is_file() {
         return Ok(());
@@ -1331,10 +1851,12 @@ fn repoint_bridge(old_channel: &Path, new_channel: &Path) -> Result<()> {
     let rewritten: Vec<String> = text
         .lines()
         .map(|line| {
-            if line.trim_start().starts_with("communications") && line.contains('=') {
-                format!("communications = \"{}\"", new_channel.display())
-            } else {
-                line.to_string()
+            let key = line.split('=').next().unwrap_or_default().trim();
+            match updates.iter().find(|(name, _)| *name == key) {
+                Some((name, path)) if line.contains('=') => {
+                    format!("{name} = \"{}\"", path.display())
+                }
+                _ => line.to_string(),
             }
         })
         .collect();
@@ -1413,7 +1935,11 @@ pub fn find_root() -> Option<Root> {
 /// answered "no ferry root yet" while comms, repos and work sat there full of things. An
 /// index whose loss destroys the thing it indexes is not an index.
 fn looks_like_root(dir: &Path) -> bool {
-    dir.join(MANIFEST).is_file() || (dir.join("comms").is_dir() && dir.join("work").is_dir())
+    dir.join(MANIFEST).is_file()
+        || (dir.join("comms").is_dir() && dir.join("work").is_dir())
+        || (dir.join("projects").is_dir()
+            && dir.join("secrets").is_dir()
+            && dir.join("logs").is_dir())
 }
 
 /// Walk up from a directory looking for a root, so being anywhere inside one is enough.
@@ -1436,7 +1962,11 @@ mod tests {
     use super::*;
 
     fn root(dir: &Path) -> Root {
-        Root::create(&dir.join("ferry")).unwrap()
+        Root::create_with_layout(&dir.join("ferry"), 1).unwrap()
+    }
+
+    fn root_v2(dir: &Path) -> Root {
+        Root::create_with_layout(&dir.join("ferry"), 2).unwrap()
     }
 
     fn channel(dir: &Path, id: &str) -> PathBuf {
@@ -2455,6 +2985,109 @@ mod tests {
         assert!(
             !human.exists() && !clone.exists(),
             "recording paths creates nothing"
+        );
+    }
+
+    #[test]
+    fn a_new_root_is_layout_two_with_one_folder_per_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ferry");
+        let root = Root::create(&path).unwrap();
+        assert_eq!(root.layout_version(), 2);
+        for top in ["projects", "secrets", "logs"] {
+            assert!(path.join(top).is_dir(), "{top} exists");
+        }
+        assert!(!path.join("comms").exists() && !path.join("repos").exists());
+        assert!(looks_like_root(&path));
+
+        let project = path.join("projects").join("demo");
+        assert_eq!(root.project_dir("demo"), project);
+        assert_eq!(root.comms_home("demo"), project.join("comms"));
+        assert_eq!(root.managed_clone("demo"), project.join("repo"));
+        assert_eq!(root.worktrees("demo"), project.join("work"));
+        assert_eq!(root.handins_dir("demo"), project.join("handins"));
+        assert_eq!(root.project_tmp("demo"), project.join("tmp"));
+        assert_eq!(root.project_env("demo"), project.join(".env"));
+        assert_eq!(root.secrets(), path.join("secrets"));
+        assert_eq!(root.logs(), path.join("logs"));
+        // Both clone places are managed.
+        assert!(root.is_managed(&project.join("repo")));
+        assert!(root.is_managed(&path.join("repos").join("demo")));
+        assert!(!root.is_managed(&dir.path().join("elsewhere")));
+        // Creating again keeps the layout.
+        assert_eq!(Root::create(&path).unwrap().layout_version(), 2);
+    }
+
+    #[test]
+    fn a_layout_one_root_keeps_working_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root(dir.path());
+        assert_eq!(root.layout_version(), 1);
+        assert_eq!(root.comms_home("demo"), root.comms().join("demo-ferryman"));
+        assert_eq!(root.managed_clone("demo"), root.repos().join("demo"));
+        assert!(!root.path.join("projects").exists());
+        // Creating again does not upgrade it behind anyone's back.
+        let again = Root::create(&root.path).unwrap();
+        assert_eq!(again.layout_version(), 1);
+        assert!(!root.path.join("projects").exists());
+    }
+
+    #[test]
+    fn a_project_placed_by_hand_is_custom_and_nothing_assumes_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_v2(dir.path());
+        let mine = root.path.join("hand-placed").join("comms");
+        std::fs::create_dir_all(&mine).unwrap();
+        root.record_custom(
+            "demo",
+            &CustomPlaces {
+                channel: mine.clone(),
+                repo: Some(root.path.join("hand-placed").join("code")),
+                handins: Some(root.path.join("hand-placed").join("handins")),
+                env: Some(root.path.join("hand-placed").join("secrets.env")),
+                work: None,
+            },
+        )
+        .unwrap();
+        let entry = root.projects().remove(0);
+        assert_eq!(entry.placement_in(&root), Placement::Custom);
+        assert_eq!(entry.channel, mine);
+        assert_eq!(
+            entry.handins_path(&root),
+            root.path.join("hand-placed").join("handins")
+        );
+        assert_eq!(
+            entry.env_path(&root),
+            root.path.join("hand-placed").join("secrets.env")
+        );
+        assert_eq!(
+            handins_dir_for(&mine, "demo"),
+            root.path.join("hand-placed").join("handins"),
+            "a route finds the recorded place, not the layout's"
+        );
+        // And a default project in the same root is managed.
+        let managed = root.comms_home("other");
+        std::fs::create_dir_all(&managed).unwrap();
+        root.adopt("other", &managed, None).unwrap();
+        let other = root
+            .projects()
+            .into_iter()
+            .find(|e| e.project_id == "other")
+            .unwrap();
+        assert_eq!(other.placement_in(&root), Placement::Managed);
+        assert_eq!(other.handins_path(&root), root.handins_dir("other"));
+    }
+
+    #[test]
+    fn an_adopted_project_outside_the_root_is_custom() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_v2(dir.path());
+        let elsewhere = channel(dir.path(), "demo");
+        root.adopt("demo", &elsewhere, None).unwrap();
+        assert_eq!(
+            root.projects()[0].placement_in(&root),
+            Placement::Custom,
+            "it was adopted where it stood"
         );
     }
 }

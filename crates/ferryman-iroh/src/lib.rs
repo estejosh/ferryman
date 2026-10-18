@@ -27,6 +27,21 @@
 //! channel is read. And a peer is offered a channel only if it is trusted in THAT
 //! channel: being in one project does not open another.
 //!
+//! # Two folders per project, and who may write what (ADR 0024)
+//!
+//! A project in layout 2 has two synced folders and the lane carries both: the channel
+//! (`projects/<id>/comms`, exchanged as `<id>`) and the hand-ins folder
+//! (`projects/<id>/handins`, exchanged as `<id>+handins`), under the same trust, the same
+//! exclusions and the same safety rules. A peer that predates the hand-ins folder refuses
+//! its key and the channel still syncs.
+//!
+//! A Worker-level agent (a level the project master signs) does not write the channel. The
+//! receiving side holds that line, not the writer: a channel file authored by a Worker is
+//! neither offered nor let in, by its name or by what it says it was signed by, and a Worker's
+//! own files are taken from `handins/<agent>/` only. Beyond that, on a machine where every
+//! agent is a Worker the lane listens to the channel and publishes none of it. The head's
+//! `accepted.json` and `rejected.json` beside a hand-in are let in only from the head.
+//!
 //! # What moves
 //!
 //! See [`manifest`] for the rules: the channel's `.stignore` exclusions, no conflict

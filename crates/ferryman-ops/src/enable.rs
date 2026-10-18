@@ -78,6 +78,13 @@ pub struct Request {
     /// roster entry, no master declaration. For a key made ahead of the master's
     /// `ferry team approve <name> --all`.
     pub no_enrol: bool,
+    /// Place the project by hand instead of in the ferry root's layout. Each is optional
+    /// and recorded in the root's manifest as a custom placement, which Ferryman then
+    /// respects: it neither moves nor assumes anything about those paths.
+    pub channel: Option<PathBuf>,
+    pub repo: Option<PathBuf>,
+    pub handins: Option<PathBuf>,
+    pub env: Option<PathBuf>,
 }
 
 /// A file this run created, or found already correct.
@@ -296,7 +303,24 @@ pub fn perform(request: Request) -> Result<Outcome> {
     }
 
     let attachment = workspace.join(".ferryman");
-    let communications = attachment.join("ferryman");
+    let bridge_exists = attachment.join("bridge.toml").exists();
+    // Where the channel goes. A path the caller chose is theirs. Otherwise a layout-2 ferry
+    // root has a place for it (projects/<id>/comms), used for a project that has no channel
+    // yet; an existing project keeps the one it has.
+    let communications = if let Some(chosen) = &request.channel {
+        chosen.clone()
+    } else if !bridge_exists
+        && let Some(root) = ferryman_channel::ferry::find_root()
+        && root.layout_version() >= 2
+    {
+        root.comms_home(&project)
+    } else {
+        attachment.join("ferryman")
+    };
+    let custom = request.channel.is_some()
+        || request.repo.is_some()
+        || request.handins.is_some()
+        || request.env.is_some();
     let shared_remote = format!("{project}-ferryman");
     let mut steps = Vec::new();
 
@@ -318,13 +342,24 @@ pub fn perform(request: Request) -> Result<Outcome> {
         } else {
             ferryman_channel::syncthing_folder_state(&shared_remote)
         };
-        if let Some(why) = split_risk(&project, filed.as_ref(), &communications, synced.as_ref()) {
+        // Judged against the channel this clone would have made for itself, not the
+        // layout's default: a root that already files the project has put its channel at
+        // that default, and "it is the same place" must not read as "nothing to refuse".
+        let would_make = if request.channel.is_some() {
+            communications.clone()
+        } else {
+            attachment.join("ferryman")
+        };
+        if let Some(why) = split_risk(&project, filed.as_ref(), &would_make, synced.as_ref()) {
             bail!("{why}");
         }
     }
 
     fs::create_dir_all(&communications)
         .with_context(|| format!("create {}", communications.display()))?;
+    // The channel may sit anywhere (a layout-2 root files it under projects/<id>/comms), so
+    // the checkout's own `.ferryman/` is made on its own.
+    fs::create_dir_all(&attachment).with_context(|| format!("create {}", attachment.display()))?;
 
     // bridge.toml is what every other command discovers the project through, so it is
     // written first and never rewritten: an operator who edited it means it.
@@ -651,6 +686,23 @@ pub fn perform(request: Request) -> Result<Outcome> {
     {
         let _ = ferryman_channel::ferry::Root::create(&beside.join("ferry"));
     }
+    // A hand-placed project is recorded as such, so the root never assumes it lives under
+    // projects/<id> and erry root migrate leaves it where it is.
+    if custom && let Some(root) = ferryman_channel::ferry::find_root() {
+        let places = ferryman_channel::ferry::CustomPlaces {
+            channel: route.communications.clone(),
+            repo: request.repo.clone(),
+            handins: request.handins.clone(),
+            env: request.env.clone(),
+            work: None,
+        };
+        root.record_custom(&project, &places)?;
+        steps.push(Step {
+            what: "custom placement recorded in the ferry root",
+            path: root.manifest_path(),
+            created: true,
+        });
+    }
 
     // A test must not depend on what happens to listen on this machine.
     let omniroute_unused = !cfg!(test)
@@ -734,6 +786,10 @@ pub(crate) mod tests_support {
             joining: false,
             force_new_channel: false,
             no_enrol: false,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
         })
         .unwrap();
         dir
@@ -788,6 +844,10 @@ mod tests {
             joining: false,
             force_new_channel: false,
             no_enrol: false,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
         })?;
         Ok(())
     }
@@ -923,6 +983,10 @@ mod tests {
             joining: false,
             force_new_channel: false,
             no_enrol: false,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome
@@ -976,6 +1040,10 @@ mod tests {
             joining: false,
             force_new_channel: false,
             no_enrol: false,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
         })
         .unwrap();
         let config = fs::read_to_string(AgentConfig::path(&dir.join(".ferryman"))).unwrap();
@@ -1006,6 +1074,10 @@ mod tests {
             joining: false,
             force_new_channel: false,
             no_enrol: false,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
         })
         .unwrap();
         assert!(
@@ -1139,6 +1211,10 @@ mod tests {
         hermetic_machine();
         perform(Request {
             no_enrol: true,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
             ..request_in(&dir)
         })
         .unwrap();
@@ -1159,12 +1235,68 @@ mod tests {
 
         let error = perform(Request {
             no_enrol: true,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
             master: true,
             ..request_in(&dir)
         })
         .err()
         .expect("contradiction");
         assert!(format!("{error:#}").contains("contradict"), "{error:#}");
+    }
+
+    #[test]
+    fn a_layout_two_root_gets_the_channel_in_the_project_folder() {
+        let dir = tempdir();
+        hermetic_machine();
+        // The root sits beside the workspace, as it does for real; inside it the channel
+        // would be refused as work in a synced folder.
+        let beside = dir.parent().unwrap().to_path_buf();
+        let root = ferryman_channel::ferry::Root::create(&beside.join("ferry")).unwrap();
+        assert_eq!(root.layout_version(), 2);
+        let done = perform(request_in(&dir)).unwrap();
+        let home = root.comms_home("demo");
+        assert!(ferryman_channel::ferry::same_place(
+            &done.route.communications,
+            &home
+        ));
+        assert!(
+            home.join("agents").is_dir(),
+            "the roster is in projects/demo/comms"
+        );
+        assert!(dir.join(".ferryman").join("bridge.toml").is_file());
+    }
+
+    #[test]
+    fn a_channel_placed_by_hand_is_recorded_as_custom_and_respected() {
+        let dir = tempdir();
+        hermetic_machine();
+        let beside = dir.parent().unwrap().to_path_buf();
+        let root = ferryman_channel::ferry::Root::create(&beside.join("ferry")).unwrap();
+        let chosen = beside.join("my-channel");
+        let handins = beside.join("my-handins");
+        perform(Request {
+            channel: Some(chosen.clone()),
+            handins: Some(handins.clone()),
+            ..request_in(&dir)
+        })
+        .unwrap();
+        let entry = root
+            .read()
+            .projects
+            .into_iter()
+            .find(|e| e.project_id == "demo")
+            .unwrap();
+        assert_eq!(entry.placement, ferryman_channel::ferry::Placement::Custom);
+        assert!(ferryman_channel::ferry::same_place(&entry.channel, &chosen));
+        assert_eq!(entry.handins, Some(handins));
+        assert!(chosen.join("agents").is_dir());
+        assert!(
+            !root.project_dir("demo").join("comms").exists(),
+            "nothing was put in projects/demo: the person decided"
+        );
     }
 
     /// The plain request the attribution tests share: no engine that exists, no
@@ -1187,6 +1319,10 @@ mod tests {
             joining: false,
             force_new_channel: false,
             no_enrol: false,
+            channel: None,
+            repo: None,
+            handins: None,
+            env: None,
         }
     }
 

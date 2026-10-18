@@ -25,21 +25,127 @@ use crate::{AgentIdentity, ProjectRoute, SignatureCheck, is_safe_component};
 /// The `format` tag in `handin.json`.
 pub const FORMAT: &str = "ferryman-handin/v1";
 
-/// Where a project's hand-ins live on this machine: `handins` inside the channel folder.
+/// Where a project's hand-ins live on this machine.
 ///
-/// Always inside the channel, so a hand-in reaches the head's machine on the folder that
-/// already syncs and no folder of its own is needed. It was once `work/<project>` in the
-/// ferry root, shared as a second Syncthing folder. That put the task worktrees under a
-/// shared folder, and `work/` and `repos/` are machine-local, so the Syncthing scope
-/// guard (`syncscope`) now refuses it.
+/// In a layout-2 root that is `projects/<id>/handins`, a folder of its own beside the channel
+/// (or the path a person recorded for it with `ferry enable --handins`). It is synced like
+/// the channel, by the same lanes, and it is what makes a read-only channel workable: a
+/// worker whose channel it may not write hands in, and says everything else it has to say,
+/// through here. Each agent writes only `handins/<agent>/`.
+///
+/// In a layout-1 root, and for a project whose channel was placed by hand with no hand-in
+/// folder recorded, it is still `handins` inside the channel folder, which already syncs.
+/// (It was once `work/<project>` in the ferry root, shared as a second Syncthing folder.
+/// That put the task worktrees under a shared folder, and `work/` and `repos/` are
+/// machine-local, so the Syncthing scope guard (`syncscope`) refuses it.)
 #[must_use]
 pub fn work_dir(route: &ProjectRoute) -> PathBuf {
-    route.communications.join("handins")
+    crate::ferry::handins_dir_for(&route.communications, &route.project_id)
 }
 /// Whether the hand-in folder lies inside the channel folder (and so syncs with it).
 #[must_use]
 pub fn is_in_channel(route: &ProjectRoute) -> bool {
     work_dir(route).starts_with(&route.communications)
+}
+
+/// The folder `agent` writes its own hand-ins into: `handins/<agent>` when the folder is
+/// separate from the channel, and the folder itself when it is inside the channel (layout 1,
+/// where hand-ins were `handins/<order>`).
+#[must_use]
+pub fn write_dir(route: &ProjectRoute, agent: &str) -> PathBuf {
+    let dir = work_dir(route);
+    if dir.starts_with(&route.communications) {
+        dir
+    } else {
+        dir.join(crate::canonical_agent_name(agent))
+    }
+}
+
+/// A real directory: not a symlink or junction to one. A hand-ins folder is written by
+/// workers, and a link in it would make the head read (or `accept` apply) something from
+/// outside it.
+pub(crate) fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        && fs::read_link(path).is_err()
+}
+
+/// A regular file, not a link.
+fn is_real_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// The folders hand-ins are looked for in, for `dir` (normally [`work_dir`]): `dir`, then,
+/// while a peer or an interrupted `ferry root migrate` may still have left hand-ins in the
+/// old place, the `handins` folder inside the channel. The first is where new ones go.
+fn search_dirs(route: &ProjectRoute, dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![dir.to_path_buf()];
+    let legacy = route.communications.join("handins");
+    if crate::ferry::same_place(dir, &work_dir(route))
+        && !crate::ferry::same_place(&legacy, dir)
+        && is_real_dir(&legacy)
+    {
+        dirs.push(legacy);
+    }
+    dirs
+}
+
+/// The folder of hand-in `order_id` under `dir`: `dir/<order>`, or `dir/<agent>/<order>`.
+/// `None` when there is none, and an error when two agents handed in the same order id and
+/// the caller has to say which. Links are not followed.
+fn locate(dir: &Path, order_id: &str) -> Result<Option<PathBuf>> {
+    let direct = dir.join(order_id);
+    if is_real_dir(&direct) && is_real_file(&direct.join("handin.json")) {
+        return Ok(Some(direct));
+    }
+    let mut found = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(dir) {
+        for item in read_dir.flatten() {
+            let agent_dir = item.path();
+            let inner = agent_dir.join(order_id);
+            if is_real_dir(&agent_dir)
+                && is_real_dir(&inner)
+                && is_real_file(&inner.join("handin.json"))
+            {
+                found.push(inner);
+            }
+        }
+    }
+    match found.len() {
+        0 => Ok(None),
+        1 => Ok(found.pop()),
+        _ => bail!(
+            "more than one agent handed in order {order_id}; accept or reject each from its \
+             own folder under {}",
+            dir.display()
+        ),
+    }
+}
+
+/// [`locate`] over [`search_dirs`]: the folder, and the directory it was found under.
+fn locate_anywhere(
+    route: &ProjectRoute,
+    dir: &Path,
+    order_id: &str,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    for base in search_dirs(route, dir) {
+        if let Some(folder) = locate(&base, order_id)? {
+            return Ok(Some((base, folder)));
+        }
+    }
+    Ok(None)
+}
+
+/// For a hand-in under an agent's folder (`dir/<agent>/<order>`), whether the folder is the
+/// agent the hand-in says it is from: only the assigned agent writes in its own subfolder.
+fn in_its_agents_folder(dir: &Path, folder: &Path, manifest: &Manifest) -> bool {
+    match folder.parent() {
+        Some(parent) if parent == dir => true,
+        Some(parent) => parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| crate::canonical_agent_name(&manifest.agent) == name),
+        None => false,
+    }
 }
 
 /// What [`ensure_work_ready`] found and did.
@@ -53,8 +159,8 @@ pub struct WorkReady {
 }
 
 /// Make sure this machine can hand work in or receive it: the work folder exists and, when
-/// it is not inside the channel, Syncthing syncs it as `<project>-work` with the same
-/// devices as the channel. Idempotent; safe to call on every worker start and from
+/// it is not inside the channel, Syncthing syncs it as `<project>-handins` with the same
+/// devices as the channel (the fallback for the iroh lane, which syncs it too). Idempotent; safe to call on every worker start and from
 /// `doctor --fix`. A Syncthing that is down or missing is reported, never an error.
 pub fn ensure_work_ready(route: &ProjectRoute) -> Result<WorkReady> {
     let path = work_dir(route);
@@ -308,6 +414,10 @@ pub enum Status {
     Waiting,
     Accepted,
     Rejected,
+    /// A verdict file is there but cannot be verified: written before verdicts were
+    /// signed, or not by the master or a head. Neither accepted nor rejected, and neither
+    /// `accept` nor `reject` acts on it without `--force`.
+    Unverified,
 }
 
 impl Status {
@@ -317,6 +427,7 @@ impl Status {
             Self::Waiting => "waiting",
             Self::Accepted => "accepted",
             Self::Rejected => "rejected",
+            Self::Unverified => "unverified",
         }
     }
 }
@@ -332,6 +443,13 @@ pub struct Accepted {
     pub patch_sha256: String,
     #[serde(default)]
     pub pushed: bool,
+    /// The head's (or master's) signature over the verdict. A verdict without a valid one is
+    /// ignored: the file sits in a folder that syncs, and anyone who can write it could
+    /// otherwise mark a hand-in accepted or rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 /// `rejected.json`, written by the head; the order goes back for revision.
@@ -340,26 +458,237 @@ pub struct Rejected {
     pub by: String,
     pub at: DateTime<Utc>,
     pub reason: String,
+    /// Which patch was rejected (empty on a verdict written before they were signed).
+    #[serde(default)]
+    pub patch_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
-fn status_of(folder: &Path, manifest: &Manifest) -> Status {
-    if let Some(done) = fs::read_to_string(folder.join("accepted.json"))
+/// What a verdict's signature covers.
+fn verdict_payload(
+    kind: &str,
+    order: &str,
+    patch_sha256: &str,
+    by: &str,
+    at: &DateTime<Utc>,
+    detail: &str,
+) -> String {
+    format!(
+        "ferryman-verdict-v1\n{kind}\n{order}\n{patch_sha256}\n{by}\n{}\n{detail}",
+        at.to_rfc3339()
+    )
+}
+
+/// Whether a verdict was signed by `by` itself and `by` had the standing to give it: the
+/// master, the head now, or the agent that held the head appointment when the verdict was
+/// given. The last keeps a verdict good after the head role is passed on.
+fn verdict_valid(
+    route: &ProjectRoute,
+    by: &str,
+    signed_by: Option<&String>,
+    signature: Option<&String>,
+    payload: &str,
+    at: &DateTime<Utc>,
+) -> bool {
+    signed_by.is_some_and(|signer| signer.eq_ignore_ascii_case(by))
+        && crate::check_signature(signed_by, signature, payload, &crate::gate::roster(route))
+            == SignatureCheck::Valid
+        && (crate::access::level_of(&route.communications, &route.project_id, by)
+            == crate::access::Level::Orchestrator
+            || crate::head::held_at(&route.communications, &route.project_id, by, *at))
+}
+
+/// `Some(true)` for an accepted.json that checks out, `Some(false)` for one that is there
+/// about this hand-in but cannot be verified (written before verdicts were signed, forged,
+/// or from a signer without standing), `None` for none or one about another patch.
+fn accepted_state(route: &ProjectRoute, folder: &Path, manifest: &Manifest) -> Option<bool> {
+    let path = folder.join("accepted.json");
+    if !is_real_file(&path) {
+        return None;
+    }
+    let Some(done) = fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Accepted>(&text).ok())
-        && done.patch_sha256 == manifest.patch_sha256
-    {
-        return Status::Accepted;
+    else {
+        return Some(false);
+    };
+    if !done.patch_sha256.is_empty() && done.patch_sha256 != manifest.patch_sha256 {
+        return None;
     }
-    // A rejection only counts against the hand-in it answered; a revision made after it
-    // is waiting again.
-    if let Some(no) = fs::read_to_string(folder.join("rejected.json"))
+    Some(
+        !done.patch_sha256.is_empty()
+            && verdict_valid(
+                route,
+                &done.by,
+                done.signed_by.as_ref(),
+                done.signature.as_ref(),
+                &verdict_payload(
+                    "accepted",
+                    &manifest.order,
+                    &done.patch_sha256,
+                    &done.by,
+                    &done.at,
+                    &done.commit,
+                ),
+                &done.at,
+            ),
+    )
+}
+
+/// Like [`accepted_state`], for rejected.json. A rejection only counts against the
+/// hand-in it answered; a revision made after it is waiting again.
+fn rejected_state(route: &ProjectRoute, folder: &Path, manifest: &Manifest) -> Option<bool> {
+    let path = folder.join("rejected.json");
+    if !is_real_file(&path) {
+        return None;
+    }
+    let Some(no) = fs::read_to_string(&path)
         .ok()
         .and_then(|text| serde_json::from_str::<Rejected>(&text).ok())
-        && no.at >= manifest.created_at
+    else {
+        return Some(false);
+    };
+    if no.at < manifest.created_at
+        || (!no.patch_sha256.is_empty() && no.patch_sha256 != manifest.patch_sha256)
     {
+        return None;
+    }
+    Some(
+        !no.patch_sha256.is_empty()
+            && verdict_valid(
+                route,
+                &no.by,
+                no.signed_by.as_ref(),
+                no.signature.as_ref(),
+                &verdict_payload(
+                    "rejected",
+                    &manifest.order,
+                    &no.patch_sha256,
+                    &no.by,
+                    &no.at,
+                    &no.reason,
+                ),
+                &no.at,
+            ),
+    )
+}
+
+fn status_of(route: &ProjectRoute, folder: &Path, manifest: &Manifest) -> Status {
+    let accepted = accepted_state(route, folder, manifest);
+    if accepted == Some(true) {
+        return Status::Accepted;
+    }
+    let rejected = rejected_state(route, folder, manifest);
+    if rejected == Some(true) {
         return Status::Rejected;
     }
+    if accepted == Some(false) || rejected == Some(false) {
+        return Status::Unverified;
+    }
     Status::Waiting
+}
+
+/// A legacy verdict `adopt_verdicts` found (or re-signed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyVerdict {
+    pub order: String,
+    /// `accepted` or `rejected`.
+    pub kind: &'static str,
+}
+
+/// The verdicts written before they were signed (v0.5.30 and earlier): each sits as an
+/// unverifiable `accepted.json` / `rejected.json`. With `apply`, the master or head `signer`
+/// signs them as their own, keeping what they said and when; without it, only the list.
+/// A person should read the list first: signing says "yes, this was decided".
+///
+/// Verdicts that carry a signature that does not check out are not touched: those are not
+/// legacy, and `accept` / `reject` `--force` is the way past them.
+pub fn adopt_verdicts(
+    route: &ProjectRoute,
+    dir: &Path,
+    signer: &AgentIdentity,
+    apply: bool,
+) -> Result<Vec<LegacyVerdict>> {
+    let name = signer.name();
+    if apply
+        && crate::access::level_of(&route.communications, &route.project_id, name)
+            != crate::access::Level::Orchestrator
+    {
+        bail!("only the master or the head re-signs old verdicts; '{name}' is neither");
+    }
+    let mut found = Vec::new();
+    for entry in list(route, dir)? {
+        if entry.status != Status::Unverified {
+            continue;
+        }
+        let (manifest, _, _) = read(route, &entry.path)?;
+        let path = entry.path.join("accepted.json");
+        if accepted_state(route, &entry.path, &manifest) == Some(false)
+            && let Some(mut done) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Accepted>(&text).ok())
+            && done.signature.is_none()
+        {
+            found.push(LegacyVerdict {
+                order: entry.order.clone(),
+                kind: "accepted",
+            });
+            if apply {
+                done.by = name.to_string();
+                done.patch_sha256.clone_from(&manifest.patch_sha256);
+                done.signed_by = Some(name.to_string());
+                done.signature = Some(
+                    signer.sign_bytes(
+                        verdict_payload(
+                            "accepted",
+                            &manifest.order,
+                            &done.patch_sha256,
+                            name,
+                            &done.at,
+                            &done.commit,
+                        )
+                        .as_bytes(),
+                    ),
+                );
+                write_atomic(&path, &serde_json::to_vec_pretty(&done)?)?;
+            }
+        }
+        let path = entry.path.join("rejected.json");
+        if rejected_state(route, &entry.path, &manifest) == Some(false)
+            && let Some(mut no) = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Rejected>(&text).ok())
+            && no.signature.is_none()
+        {
+            found.push(LegacyVerdict {
+                order: entry.order.clone(),
+                kind: "rejected",
+            });
+            if apply {
+                no.by = name.to_string();
+                no.patch_sha256.clone_from(&manifest.patch_sha256);
+                no.signed_by = Some(name.to_string());
+                no.signature = Some(
+                    signer.sign_bytes(
+                        verdict_payload(
+                            "rejected",
+                            &manifest.order,
+                            &no.patch_sha256,
+                            name,
+                            &no.at,
+                            &no.reason,
+                        )
+                        .as_bytes(),
+                    ),
+                );
+                write_atomic(&path, &serde_json::to_vec_pretty(&no)?)?;
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// One row of `ferry work list`.
@@ -390,11 +719,37 @@ fn signature_label(check: &SignatureCheck) -> &'static str {
 /// invalid signature, not skipped, so a damaged hand-in is seen rather than lost.
 pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
+    for base in search_dirs(route, dir) {
+        list_one(route, &base, &mut entries);
+    }
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
+    Ok(entries)
+}
+
+fn list_one(route: &ProjectRoute, dir: &Path, entries: &mut Vec<Entry>) {
     let Ok(read_dir) = fs::read_dir(dir) else {
-        return Ok(entries);
+        return;
     };
+    // `dir/<order>` (hand-ins inside the channel) and `dir/<agent>/<order>` (a separate
+    // hand-ins folder, one subfolder per agent). Links are skipped, not followed.
+    let mut folders: Vec<PathBuf> = Vec::new();
     for item in read_dir.flatten() {
         let folder = item.path();
+        if !is_real_dir(&folder) {
+            continue;
+        }
+        if is_real_file(&folder.join("handin.json")) {
+            folders.push(folder);
+        } else if let Ok(inner) = fs::read_dir(&folder) {
+            folders.extend(
+                inner
+                    .flatten()
+                    .map(|item| item.path())
+                    .filter(|path| is_real_dir(path) && is_real_file(&path.join("handin.json"))),
+            );
+        }
+    }
+    for folder in folders {
         let Some(order) = folder
             .file_name()
             .and_then(|n| n.to_str())
@@ -402,7 +757,7 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
         else {
             continue;
         };
-        if !folder.join("handin.json").is_file() || !is_safe_component(&order) {
+        if !is_safe_component(&order) {
             continue;
         }
         let Some(manifest) = fs::read_to_string(folder.join("handin.json"))
@@ -412,11 +767,13 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
             continue;
         };
         let signature = match read(route, &folder) {
+            // A hand-in found in some other agent's folder is not that agent's to write.
+            Ok(_) if !in_its_agents_folder(dir, &folder, &manifest) => "invalid",
             Ok((_, check, _)) => signature_label(&check),
             Err(_) => "invalid",
         };
         entries.push(Entry {
-            status: status_of(&folder, &manifest),
+            status: status_of(route, &folder, &manifest),
             order,
             agent: manifest.agent.clone(),
             signature,
@@ -426,8 +783,6 @@ pub fn list(route: &ProjectRoute, dir: &Path) -> Result<Vec<Entry>> {
             path: folder,
         });
     }
-    entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
-    Ok(entries)
 }
 
 fn require_head(route: &ProjectRoute, agent: &str) -> Result<()> {
@@ -459,29 +814,46 @@ pub fn accept(
     route: &ProjectRoute,
     dir: &Path,
     order_id: &str,
-    agent: &str,
+    signer: &AgentIdentity,
     workspace: &Path,
     push: bool,
+    force: bool,
 ) -> Result<Applied> {
+    let agent = signer.name();
     require_head(route, agent)?;
     if !is_safe_component(order_id) {
         bail!("order id must be a path-safe identifier");
     }
-    let folder = dir.join(order_id);
-    if !folder.join("handin.json").is_file() {
+    let Some((dir, folder)) = locate_anywhere(route, dir, order_id)? else {
         bail!("no hand-in for order {order_id} under {}", dir.display());
-    }
+    };
+    let dir = dir.as_path();
     let (manifest, check, _patch) = read(route, &folder)?;
+    if !in_its_agents_folder(dir, &folder, &manifest) {
+        bail!(
+            "the hand-in at {} says it is from {}, but it is in another agent's folder; only \
+             the assigned agent writes there",
+            folder.display(),
+            manifest.agent
+        );
+    }
     if check != SignatureCheck::Valid {
         bail!(
             "the hand-in for {order_id} is not validly signed ({}); not applying it",
             signature_label(&check)
         );
     }
-    match status_of(&folder, &manifest) {
+    match status_of(route, &folder, &manifest) {
         Status::Accepted => bail!("{order_id} was already accepted"),
         Status::Rejected => bail!("{order_id} was rejected; it needs a revised hand-in"),
         Status::Waiting => {}
+        Status::Unverified if force => {}
+        Status::Unverified => bail!(
+            "{order_id} has a verdict file that cannot be verified (an old unsigned one, or not \
+             from the master or a head). If it was accepted, applying it again would apply it \
+             twice: check `git log` first. Re-sign old verdicts with `ferry work adopt-verdicts`, \
+             or pass --force to go ahead anyway"
+        ),
     }
 
     if !git_text(
@@ -535,12 +907,27 @@ pub fn accept(
         );
     }
     let commit = git_text(workspace, &["rev-parse", "HEAD"])?;
+    let at = Utc::now();
     let mut done = Accepted {
         by: agent.to_string(),
-        at: Utc::now(),
+        at,
         commit: commit.clone(),
         patch_sha256: manifest.patch_sha256.clone(),
         pushed: false,
+        signed_by: Some(agent.to_string()),
+        signature: Some(
+            signer.sign_bytes(
+                verdict_payload(
+                    "accepted",
+                    &manifest.order,
+                    &manifest.patch_sha256,
+                    agent,
+                    &at,
+                    &commit,
+                )
+                .as_bytes(),
+            ),
+        ),
     };
     write_atomic(
         &folder.join("accepted.json"),
@@ -570,9 +957,11 @@ pub fn reject(
     route: &ProjectRoute,
     dir: &Path,
     order_id: &str,
-    agent: &str,
+    signer: &AgentIdentity,
     reason: &str,
+    force: bool,
 ) -> Result<PathBuf> {
+    let agent = signer.name();
     require_head(route, agent)?;
     if !is_safe_component(order_id) {
         bail!("order id must be a path-safe identifier");
@@ -580,17 +969,40 @@ pub fn reject(
     if reason.trim().is_empty() {
         bail!("say why: a rejection without a reason sends the worker in the dark");
     }
-    let folder = dir.join(order_id);
-    if !folder.join("handin.json").is_file() {
+    let Some((_, folder)) = locate_anywhere(route, dir, order_id)? else {
         bail!("no hand-in for order {order_id} under {}", dir.display());
+    };
+    let (manifest, _, _) = read(route, &folder)?;
+    if status_of(route, &folder, &manifest) == Status::Unverified && !force {
+        bail!(
+            "{order_id} has a verdict file that cannot be verified; `ferry work adopt-verdicts` \
+             re-signs old ones, or pass --force to replace it"
+        );
     }
     let path = folder.join("rejected.json");
+    let at = Utc::now();
+    let reason = reason.trim().to_string();
     write_atomic(
         &path,
         &serde_json::to_vec_pretty(&Rejected {
             by: agent.to_string(),
-            at: Utc::now(),
-            reason: reason.trim().to_string(),
+            at,
+            patch_sha256: manifest.patch_sha256.clone(),
+            signed_by: Some(agent.to_string()),
+            signature: Some(
+                signer.sign_bytes(
+                    verdict_payload(
+                        "rejected",
+                        &manifest.order,
+                        &manifest.patch_sha256,
+                        agent,
+                        &at,
+                        &reason,
+                    )
+                    .as_bytes(),
+                ),
+            ),
+            reason,
         })?,
     )?;
     Ok(path)
@@ -816,11 +1228,19 @@ mod tests {
         repo_with_commit(&mine);
         let before = git(&mine, &["rev-parse", "HEAD"]);
 
-        let refused = accept(&fleet.route, &work, "o-5", "worker", &mine, false);
+        let refused = accept(
+            &fleet.route,
+            &work,
+            "o-5",
+            &fleet.worker,
+            &mine,
+            false,
+            false,
+        );
         assert!(refused.unwrap_err().to_string().contains("not the head"));
         assert_eq!(git(&mine, &["rev-parse", "HEAD"]), before);
 
-        let applied = accept(&fleet.route, &work, "o-5", "josh", &mine, false).unwrap();
+        let applied = accept(&fleet.route, &work, "o-5", &fleet.josh, &mine, false, false).unwrap();
         assert!(!applied.pushed);
         assert!(mine.join("new.txt").is_file());
         assert_eq!(
@@ -832,8 +1252,108 @@ mod tests {
         assert_eq!(row.status, Status::Accepted);
         assert_eq!(row.signature, "valid");
 
-        let twice = accept(&fleet.route, &work, "o-5", "josh", &mine, false);
+        let twice = accept(&fleet.route, &work, "o-5", &fleet.josh, &mine, false, false);
         assert!(twice.unwrap_err().to_string().contains("already accepted"));
+    }
+
+    #[test]
+    fn an_unsigned_or_forged_verdict_is_ignored() {
+        let fleet = fleet();
+        let (repo, base) = worker_checkout(&fleet);
+        let work = fleet.dir.path().join("work").join("proj");
+        let folder = make(&fleet, &fleet.worker, "o-8", &repo, Some(&base)).unwrap();
+        let (manifest, _, _) = read(&fleet.route, &folder).unwrap();
+
+        // Unsigned: anyone who can write the folder could have put it there.
+        let forged = Accepted {
+            by: "josh".into(),
+            at: Utc::now(),
+            commit: "abc".into(),
+            patch_sha256: manifest.patch_sha256.clone(),
+            pushed: false,
+            signed_by: None,
+            signature: None,
+        };
+        fs::write(
+            folder.join("accepted.json"),
+            serde_json::to_vec(&forged).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Unverified
+        );
+
+        // Signed, but by an agent that is not the head or the master.
+        let at = Utc::now();
+        let payload = verdict_payload(
+            "rejected",
+            "o-8",
+            &manifest.patch_sha256,
+            "worker",
+            &at,
+            "no",
+        );
+        let by_worker = Rejected {
+            by: "worker".into(),
+            at,
+            reason: "no".into(),
+            patch_sha256: manifest.patch_sha256.clone(),
+            signed_by: Some("worker".into()),
+            signature: Some(fleet.worker.sign_bytes(payload.as_bytes())),
+        };
+        fs::write(
+            folder.join("rejected.json"),
+            serde_json::to_vec(&by_worker).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Unverified
+        );
+
+        // The head's own, signed, counts.
+        reject(
+            &fleet.route,
+            &work,
+            "o-8",
+            &fleet.josh,
+            "wrong approach",
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Rejected
+        );
+    }
+
+    #[test]
+    fn a_linked_folder_in_the_hand_ins_is_skipped() {
+        let fleet = fleet();
+        let (repo, base) = worker_checkout(&fleet);
+        let work = fleet.dir.path().join("work").join("proj");
+        let folder = make(&fleet, &fleet.worker, "o-9", &repo, Some(&base)).unwrap();
+        let outside = fleet.dir.path().join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        // A copy of the hand-in reached through a link under another name.
+        let linked = work.join("sneaky");
+        let made = {
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(folder.parent().unwrap(), &linked).is_ok()
+            }
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(folder.parent().unwrap(), &linked).is_ok()
+            }
+        };
+        if !made {
+            return; // no permission to make links on this machine
+        }
+        let rows = list(&fleet.route, &work).unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(!is_real_dir(&linked));
     }
 
     #[test]
@@ -851,7 +1371,8 @@ mod tests {
         git(&mine, &["commit", "-q", "-m", "collide"]);
         let before = git(&mine, &["rev-parse", "HEAD"]);
 
-        let failed = accept(&fleet.route, &work, "o-6", "josh", &mine, false).unwrap_err();
+        let failed =
+            accept(&fleet.route, &work, "o-6", &fleet.josh, &mine, false, false).unwrap_err();
         assert!(
             failed.to_string().contains("did not apply cleanly"),
             "{failed}"
@@ -871,9 +1392,17 @@ mod tests {
         let work = fleet.dir.path().join("work").join("proj");
         make(&fleet, &fleet.worker, "o-7", &repo, Some(&base)).unwrap();
 
-        assert!(reject(&fleet.route, &work, "o-7", "worker", "no").is_err());
-        assert!(reject(&fleet.route, &work, "o-7", "josh", "  ").is_err());
-        reject(&fleet.route, &work, "o-7", "josh", "wrong approach").unwrap();
+        assert!(reject(&fleet.route, &work, "o-7", &fleet.worker, "no", false).is_err());
+        assert!(reject(&fleet.route, &work, "o-7", &fleet.josh, "  ", false).is_err());
+        reject(
+            &fleet.route,
+            &work,
+            "o-7",
+            &fleet.josh,
+            "wrong approach",
+            false,
+        )
+        .unwrap();
         assert_eq!(
             list(&fleet.route, &work).unwrap()[0].status,
             Status::Rejected
@@ -887,6 +1416,208 @@ mod tests {
         assert_eq!(
             list(&fleet.route, &work).unwrap()[0].status,
             Status::Waiting
+        );
+    }
+
+    fn legacy_rejected(folder: &Path, by: &str) {
+        let old = Rejected {
+            by: by.into(),
+            at: Utc::now(),
+            reason: "wrong approach".into(),
+            patch_sha256: String::new(),
+            signed_by: None,
+            signature: None,
+        };
+        fs::write(
+            folder.join("rejected.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn an_old_unsigned_rejection_is_unverified_and_is_not_applied() {
+        let fleet = fleet();
+        let (repo, base) = worker_checkout(&fleet);
+        let work = fleet.dir.path().join("work").join("proj");
+        let folder = make(&fleet, &fleet.worker, "o-10", &repo, Some(&base)).unwrap();
+        legacy_rejected(&folder, "josh");
+        let status = || list(&fleet.route, &work).unwrap()[0].status;
+        assert_eq!(status(), Status::Unverified);
+
+        // Not applied by accident, and not silently replaced.
+        let mine = fleet.dir.path().join("head-repo");
+        repo_with_commit(&mine);
+        let before = git(&mine, &["rev-parse", "HEAD"]);
+        let refused = accept(
+            &fleet.route,
+            &work,
+            "o-10",
+            &fleet.josh,
+            &mine,
+            false,
+            false,
+        );
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be verified")
+        );
+        assert_eq!(git(&mine, &["rev-parse", "HEAD"]), before);
+        assert!(reject(&fleet.route, &work, "o-10", &fleet.josh, "again", false).is_err());
+
+        // Listing is read-only; only a master or head signs, and only on request.
+        let found = adopt_verdicts(&fleet.route, &work, &fleet.josh, false).unwrap();
+        assert_eq!(
+            found,
+            vec![LegacyVerdict {
+                order: "o-10".into(),
+                kind: "rejected"
+            }]
+        );
+        assert_eq!(status(), Status::Unverified);
+        assert!(adopt_verdicts(&fleet.route, &work, &fleet.worker, true).is_err());
+        adopt_verdicts(&fleet.route, &work, &fleet.josh, true).unwrap();
+        assert_eq!(status(), Status::Rejected);
+    }
+
+    #[test]
+    fn an_old_unsigned_acceptance_is_unverified_so_it_is_not_applied_twice() {
+        let fleet = fleet();
+        let (repo, base) = worker_checkout(&fleet);
+        let work = fleet.dir.path().join("work").join("proj");
+        let folder = make(&fleet, &fleet.worker, "o-11", &repo, Some(&base)).unwrap();
+        let old = Accepted {
+            by: "josh".into(),
+            at: Utc::now(),
+            commit: "abc123".into(),
+            patch_sha256: String::new(),
+            pushed: true,
+            signed_by: None,
+            signature: None,
+        };
+        fs::write(
+            folder.join("accepted.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        let status = || list(&fleet.route, &work).unwrap()[0].status;
+        assert_eq!(status(), Status::Unverified);
+
+        let mine = fleet.dir.path().join("head-repo");
+        repo_with_commit(&mine);
+        let before = git(&mine, &["rev-parse", "HEAD"]);
+        let refused = accept(
+            &fleet.route,
+            &work,
+            "o-11",
+            &fleet.josh,
+            &mine,
+            false,
+            false,
+        );
+        assert!(refused.unwrap_err().to_string().contains("twice"));
+        assert_eq!(git(&mine, &["rev-parse", "HEAD"]), before);
+
+        adopt_verdicts(&fleet.route, &work, &fleet.josh, true).unwrap();
+        assert_eq!(status(), Status::Accepted);
+        let again = accept(
+            &fleet.route,
+            &work,
+            "o-11",
+            &fleet.josh,
+            &mine,
+            false,
+            false,
+        );
+        assert!(again.unwrap_err().to_string().contains("already accepted"));
+    }
+
+    #[test]
+    fn force_goes_past_an_unverified_verdict() {
+        let fleet = fleet();
+        let (repo, base) = worker_checkout(&fleet);
+        let work = fleet.dir.path().join("work").join("proj");
+        let folder = make(&fleet, &fleet.worker, "o-12", &repo, Some(&base)).unwrap();
+        legacy_rejected(&folder, "josh");
+        reject(&fleet.route, &work, "o-12", &fleet.josh, "still no", true).unwrap();
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Rejected
+        );
+    }
+
+    #[test]
+    fn a_verdict_outlives_the_head_who_gave_it() {
+        let mut fleet = fleet();
+        let (repo, base) = worker_checkout(&fleet);
+        let work = fleet.dir.path().join("work").join("proj");
+        let channel = fleet.route.communications.clone();
+        let kit = AgentIdentity::from_seed("kit", [11u8; 32]);
+        let agent = AgentRoute {
+            name: "kit".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(kit.public_key_hex()),
+            encryption_key: None,
+        };
+        crate::register_agent(&fleet.route, &agent).unwrap();
+        fleet.route.agents.push(agent);
+
+        // The master names kit head; kit rejects a hand-in.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::head::record_said(&channel, "proj", &fleet.josh, "kit is head").unwrap();
+        crate::head::claim(&channel, "proj", &kit, None).unwrap();
+        make(&fleet, &fleet.worker, "o-13", &repo, Some(&base)).unwrap();
+        reject(&fleet.route, &work, "o-13", &kit, "not like this", false).unwrap();
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Rejected
+        );
+
+        // The master moves the role to the worker; kit is nobody now.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::head::record_said(&channel, "proj", &fleet.josh, "worker is head").unwrap();
+        crate::head::claim(&channel, "proj", &fleet.worker, None).unwrap();
+        assert!(!crate::head::is_head(&channel, "proj", "kit").unwrap());
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Rejected,
+            "kit held the head appointment when it spoke"
+        );
+
+        // But kit cannot speak for a time it no longer held it.
+        let folder = list(&fleet.route, &work).unwrap()[0].path.clone();
+        let (manifest, _, _) = read(&fleet.route, &folder).unwrap();
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let payload = verdict_payload(
+            "accepted",
+            "o-13",
+            &manifest.patch_sha256,
+            "kit",
+            &later,
+            "abc",
+        );
+        let after = Accepted {
+            by: "kit".into(),
+            at: later,
+            commit: "abc".into(),
+            patch_sha256: manifest.patch_sha256.clone(),
+            pushed: false,
+            signed_by: Some("kit".into()),
+            signature: Some(kit.sign_bytes(payload.as_bytes())),
+        };
+        // (Its rejection stands on its own; take it away to see only this.)
+        fs::remove_file(folder.join("rejected.json")).unwrap();
+        fs::write(
+            folder.join("accepted.json"),
+            serde_json::to_vec(&after).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            list(&fleet.route, &work).unwrap()[0].status,
+            Status::Unverified
         );
     }
 }

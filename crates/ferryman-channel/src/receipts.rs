@@ -88,10 +88,46 @@ pub struct Presence {
     /// missing grant. Absent when it is free to work.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
+    /// The layout this machine keeps the channel in (ADR 0024): 2 once migrated. Absent on
+    /// a machine older than that. A hint for `doctor` and `root migrate` and deliberately
+    /// outside what the signature covers, so a machine that does not know the field still
+    /// verifies the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+/// Which layout this channel sits in on this machine: 2 for `projects/<id>/comms`, else 1.
+#[must_use]
+pub fn channel_layout(route: &ProjectRoute) -> u32 {
+    let channel = &route.communications;
+    let is_comms = channel.file_name().is_some_and(|name| name == "comms");
+    let under_projects = channel
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "projects");
+    if is_comms && under_projects { 2 } else { 1 }
+}
+
+/// Other agents in this channel whose latest presence says they are not on the v2 layout,
+/// or is from a version that does not know there is one. Their hand-ins do not reach a
+/// machine that has migrated (the channel no longer carries `handins/`), so this is what
+/// `doctor` and `root migrate` warn about. Newest first; `me` is left out.
+#[must_use]
+pub fn peers_on_old_layout(route: &ProjectRoute, me: &str) -> Vec<Presence> {
+    let mut old: Vec<Presence> = list_presence(route)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(presence, _)| presence)
+        .filter(|presence| !presence.agent.eq_ignore_ascii_case(me))
+        .filter(|presence| presence.layout.is_none_or(|layout| layout < 2))
+        .collect();
+    old.sort_by_key(|presence| std::cmp::Reverse(presence.seen_at));
+    old
 }
 
 fn delivered_payload(receipt: &OrderDelivered) -> String {
@@ -193,18 +229,19 @@ pub fn machine_label() -> String {
 }
 
 fn delivered_path(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
-    task_dir(route, order_id).join(format!("delivered.{agent}.json"))
+    crate::agent_task_dir(route, order_id, agent).join(format!("delivered.{agent}.json"))
 }
 
 fn read_path(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
-    task_dir(route, order_id).join(format!("read.{agent}.json"))
+    crate::agent_task_dir(route, order_id, agent).join(format!("read.{agent}.json"))
 }
 
 fn presence_path(route: &ProjectRoute, agent: &str) -> PathBuf {
-    route
-        .communications
-        .join("presence")
-        .join(format!("{agent}.json"))
+    crate::access::out_path(
+        route,
+        agent,
+        &Path::new("presence").join(format!("{agent}.json")),
+    )
 }
 
 /// Write a receipt that must never change once written.
@@ -322,14 +359,38 @@ pub struct Receipts {
 /// invalid rather than counted, because it was copied there by something.
 pub fn read_receipts(route: &ProjectRoute, order_id: &str) -> Result<Receipts> {
     let mut receipts = Receipts::default();
-    let Ok(entries) = fs::read_dir(task_dir(route, order_id)) else {
-        return Ok(receipts);
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // The channel's folder, then each Worker-level agent's own copy of it in its hand-ins
+    // folder (ADR 0024): a Worker's receipts are taken from there and nowhere else.
+    let workers = crate::access::refused_authors(&route.communications, &route.project_id);
+    let mut places: Vec<(Option<String>, PathBuf)> = vec![(None, task_dir(route, order_id))];
+    for (worker, dir) in crate::access::overlay_dirs(&route.communications, &route.project_id) {
+        places.push((Some(worker), dir.join("tasks").join(order_id)));
+    }
+    let entries: Vec<(Option<String>, PathBuf)> = places
+        .into_iter()
+        .filter_map(|(from, dir)| fs::read_dir(dir).ok().map(|entries| (from, entries)))
+        .flat_map(|(from, entries)| {
+            entries
+                .flatten()
+                .map(move |entry| (from.clone(), entry.path()))
+        })
+        .collect();
+    for (from, path) in entries {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        let refused = match from.as_deref() {
+            Some(worker) => !crate::access::overlay_file_is_theirs(worker, name),
+            None => crate::access::comms_author_refused(
+                &format!("tasks/{order_id}/{name}"),
+                None,
+                &workers,
+            )
+            .is_some(),
+        };
+        if refused {
+            continue;
+        }
         if !Path::new(name)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
@@ -339,6 +400,11 @@ pub fn read_receipts(route: &ProjectRoute, order_id: &str) -> Result<Receipts> {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
+        if let Some(worker) = from.as_deref()
+            && !crate::access::overlay_content_is_theirs(worker, name, text.as_bytes())
+        {
+            continue;
+        }
         if name.starts_with("delivered.")
             && let Ok(value) = serde_json::from_str::<OrderDelivered>(&text)
         {
@@ -572,6 +638,7 @@ pub fn refresh_presence(
         ferry_version: ferry_version.to_string(),
         paused,
         held,
+        layout: Some(channel_layout(route)),
         signed_by: Some(agent.to_string()),
         signature: None,
     };
@@ -585,19 +652,36 @@ pub fn refresh_presence(
 /// Conflict copies are read too, and for each agent the newest *valid* record wins; an
 /// agent with no valid record is shown by its newest one, still marked unverified.
 pub fn list_presence(route: &ProjectRoute) -> Result<Vec<(Presence, SignatureCheck)>> {
-    let Ok(entries) = fs::read_dir(route.communications.join("presence")) else {
-        return Ok(Vec::new());
-    };
-    let mut all: Vec<(Presence, SignatureCheck)> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
+    // The channel's `presence/`, minus any Worker-level agent's file; each Worker's own
+    // record is read from its hand-ins folder (ADR 0024).
+    let workers = crate::access::refused_authors(&route.communications, &route.project_id);
+    let mut places: Vec<(Option<String>, PathBuf)> =
+        vec![(None, route.communications.join("presence"))];
+    for (worker, dir) in crate::access::overlay_dirs(&route.communications, &route.project_id) {
+        places.push((Some(worker), dir.join("presence")));
+    }
+    let mut all: Vec<(Presence, SignatureCheck)> = places
+        .into_iter()
+        .filter_map(|(from, dir)| fs::read_dir(dir).ok().map(|entries| (from, entries)))
+        .flat_map(|(from, entries)| {
+            entries
+                .flatten()
+                .map(move |entry| (from.clone(), entry.path()))
+        })
+        .filter(|(_, path)| {
             path.extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
         })
-        .filter_map(|path| fs::read_to_string(path).ok())
-        .filter_map(|text| serde_json::from_str::<Presence>(&text).ok())
-        .map(|presence| {
+        .filter_map(|(from, path)| Some((from, fs::read_to_string(path).ok()?)))
+        .filter_map(|(from, text)| Some((from, serde_json::from_str::<Presence>(&text).ok()?)))
+        .filter(|(from, presence)| {
+            let who = crate::canonical_agent_name(&presence.agent);
+            match from {
+                Some(worker) => &who == worker,
+                None => !workers.contains(&who),
+            }
+        })
+        .map(|(_, presence)| {
             let check = verify_presence(&presence, &route.agents);
             (presence, check)
         })
@@ -1514,12 +1598,29 @@ mod tests {
             ferry_version: "0".into(),
             paused: false,
             held: None,
+            layout: None,
             signed_by: None,
             signature: None,
         };
         write_task_file(&presence_path(&route, "nebra"), &fake).unwrap();
         let presence = list_presence(&route).unwrap();
         assert_eq!(presence[0].1, SignatureCheck::Unsigned);
+        // A record from a machine that does not know about layouts is a machine that has not
+        // migrated; one that says 2 is not.
+        let old = peers_on_old_layout(&route, "someone-else");
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert_eq!(old[0].agent, "nebra");
+        let mut fake = fake;
+        fake.layout = Some(2);
+        write_task_file(&presence_path(&route, "nebra"), &fake).unwrap();
+        assert!(peers_on_old_layout(&route, "someone-else").is_empty());
+        fake.layout = Some(1);
+        write_task_file(&presence_path(&route, "nebra"), &fake).unwrap();
+        assert!(
+            peers_on_old_layout(&route, "nebra").is_empty(),
+            "me is left out"
+        );
+        assert_eq!(peers_on_old_layout(&route, "x").len(), 1);
         let absent = absent_at(&route.agents, &presence, Utc::now());
         assert!(absent.iter().any(|a| a.agent == "nebra"));
     }

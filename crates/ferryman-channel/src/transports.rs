@@ -85,11 +85,14 @@ fn payload(record: &Transports) -> String {
     )
 }
 
+/// Where an agent's own record lives: the channel's `transports/`, or for a Worker-level
+/// agent (which never writes the channel) `handins/<agent>/transports/`.
 fn path(route: &ProjectRoute, agent: &str) -> PathBuf {
-    route
-        .communications
-        .join(DIR)
-        .join(format!("{}.json", canonical_agent_name(agent)))
+    crate::access::out_path(
+        route,
+        agent,
+        &std::path::Path::new(DIR).join(format!("{}.json", canonical_agent_name(agent))),
+    )
 }
 
 /// Write `identity`'s record into this channel: it can be reached at `endpoint_id`.
@@ -181,22 +184,38 @@ fn honoured(route: &ProjectRoute, record: &Transports) -> bool {
 /// holding another's.
 #[must_use]
 pub fn honoured_records(route: &ProjectRoute) -> Vec<Transports> {
-    let Ok(entries) = fs::read_dir(route.communications.join(DIR)) else {
-        return Vec::new();
-    };
-    let mut found: Vec<Transports> = entries
-        .flatten()
-        .filter_map(|entry| {
+    // A Worker-level agent's record is taken from its own hand-ins folder, never from the
+    // channel: the channel is not where a Worker writes (ADR 0024), so a Worker's record
+    // found there is not its own.
+    let workers = crate::access::refused_authors(&route.communications, &route.project_id);
+    let mut found: Vec<Transports> = Vec::new();
+    let mut take = |dir: &std::path::Path, only: Option<&str>| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let stem = name.strip_suffix(".json")?;
-            if stem.contains(".sync-conflict-") {
-                return None;
+            let Some(stem) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if stem.contains(".sync-conflict-") || only.is_some_and(|only| only != stem) {
+                continue;
             }
-            let record = read_one(&entry.path())?;
-            (canonical_agent_name(&record.agent) == stem && honoured(route, &record))
-                .then_some(record)
-        })
-        .collect();
+            if only.is_none() && workers.contains(stem) {
+                continue;
+            }
+            let Some(record) = read_one(&entry.path()) else {
+                continue;
+            };
+            if canonical_agent_name(&record.agent) == stem && honoured(route, &record) {
+                found.push(record);
+            }
+        }
+    };
+    take(&route.communications.join(DIR), None);
+    for (worker, dir) in crate::access::overlay_dirs(&route.communications, &route.project_id) {
+        take(&dir.join(DIR), Some(&worker));
+    }
     found.sort_by(|a, b| a.agent.cmp(&b.agent));
     found
 }

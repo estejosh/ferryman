@@ -285,6 +285,29 @@ pub fn is_head(channel: &Path, project_id: &str, agent: &str) -> Result<bool> {
     Ok(current(channel, project_id)?.is_some_and(|head| head.agent.eq_ignore_ascii_case(agent)))
 }
 
+/// Whether `agent` held the appointment at `at`: the newest appointment that checks out
+/// and was made no later than `at` is theirs. Appointments stay in `head/` after the role
+/// moves on, so this is how a verdict a former head gave stays good. (An appointment that
+/// was stepped down from or revoked is gone from the folder, and so is its standing.)
+pub fn held_at(channel: &Path, project_id: &str, agent: &str, at: DateTime<Utc>) -> bool {
+    let dir = channel.join("head");
+    let Ok(Some((master, roster))) = master_of(channel, project_id) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .filter_map(|path| fs::read(path).ok())
+        .filter_map(|bytes| serde_json::from_slice::<Head>(&bytes).ok())
+        .filter(|head| holds(head, project_id, &master, &roster) && head.order.at() <= at)
+        .max_by_key(|head| head.order.at())
+        .is_some_and(|head| head.agent.eq_ignore_ascii_case(agent))
+}
+
 fn json_files(dir: &Path) -> Vec<Vec<u8>> {
     fs::read_dir(dir)
         .map(|entries| {

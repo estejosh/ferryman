@@ -29,6 +29,7 @@ pub mod identity;
 pub mod improve;
 pub mod layout;
 pub mod machine;
+pub mod migrate;
 pub mod omniroute;
 pub mod orders;
 pub mod priority;

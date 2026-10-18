@@ -4169,6 +4169,15 @@ fn engine_credentials(route: &ProjectRoute, config: &AgentConfig) -> Result<Engi
         ferryman_channel::secrets::resolve_credentials(route, loaded, encryption.as_ref())?
             .into_iter()
             .collect();
+    // The project's own `.env`, and for an Orchestrator the write credentials in `secrets/`.
+    // Judged by path (see `access::CredentialScope`), so a Worker or Member never loads
+    // from `secrets/`, wherever the project was placed. These win over a same-named key the
+    // older credential store resolved above: the level's scope is the narrower, and it must
+    // not be possible to get past it by naming a key the other store also has.
+    for (name, value) in ferryman_channel::access::scoped_credentials(route, &config.agent) {
+        credentials.retain(|(have, _)| *have != name);
+        credentials.push((name, value));
+    }
     let Some(engine) = &config.active else {
         return Ok((credentials, None));
     };
@@ -5168,7 +5177,7 @@ fn hand_in(
         ferryman_channel::handin::create(
             route,
             &who,
-            &ferryman_channel::handin::work_dir(route),
+            &ferryman_channel::handin::write_dir(route, &config.agent),
             id,
             &ferryman_channel::handin::Cut {
                 repo: &route.workspace,

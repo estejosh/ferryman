@@ -12,6 +12,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub mod access;
 pub mod adversary;
 pub mod anchor;
 pub mod ask;
@@ -721,6 +722,48 @@ fn message_path(root: &Path, message: &Message) -> PathBuf {
         .join(format!("{}.json", message.id))
 }
 
+/// Where a message from `message.sender` is written in this channel: the inbox for everyone,
+/// the sender's own `handins/<sender>/messages/...` when it is a Worker-level agent (ADR 0024).
+fn delivery_path(route: &ProjectRoute, message: &Message) -> PathBuf {
+    match access::worker_out_dir(route, &message.sender) {
+        Some(out) => out
+            .join("messages")
+            .join(&message.project_id)
+            .join(format!("{}.json", message.id)),
+        None => message_path(&route.communications, message),
+    }
+}
+
+/// The inbox folders a reader looks in: the channel's, and each Worker's own hand-ins
+/// copy of it. The flag is the Worker the folder belongs to; `None` is the channel's.
+fn inbox_dirs(route: &ProjectRoute) -> Vec<(Option<String>, PathBuf)> {
+    let mut dirs = vec![(
+        None,
+        route
+            .communications
+            .join("messages")
+            .join(&route.project_id),
+    )];
+    for (worker, dir) in access::overlay_dirs(&route.communications, &route.project_id) {
+        dirs.push((Some(worker), dir.join("messages").join(&route.project_id)));
+    }
+    dirs
+}
+
+/// Whether a message found in `from` (see [`inbox_dirs`]) from `sender` is accepted: the
+/// channel's inbox refuses a Worker's messages, and a Worker's folder holds only its own.
+fn inbox_accepts(
+    workers: &std::collections::BTreeSet<String>,
+    from: Option<&str>,
+    sender: &str,
+) -> bool {
+    let sender = canonical_agent_name(sender);
+    match from {
+        Some(worker) => sender == worker,
+        None => !workers.contains(&sender),
+    }
+}
+
 fn acknowledgement_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
     route
         .communications
@@ -1352,6 +1395,16 @@ pub(crate) fn task_dir(route: &ProjectRoute, order_id: &str) -> PathBuf {
     tasks_root(route).join(order_id)
 }
 
+/// Where `agent` writes its own files for a task: the channel's task folder for everyone,
+/// `handins/<agent>/tasks/<order>` for a Worker-level agent, which never writes the channel
+/// (ADR 0024). Readers look in both ([`read_task`]).
+pub(crate) fn agent_task_dir(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
+    match access::worker_out_dir(route, agent) {
+        Some(out) => out.join("tasks").join(order_id),
+        None => task_dir(route, order_id),
+    }
+}
+
 /// Write a file nobody else writes, atomically.
 ///
 /// Temp-then-rename because Syncthing may copy the directory at any instant, and a
@@ -1413,7 +1466,7 @@ pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<
         agent: agent.to_string(),
         claimed_at: Utc::now(),
     };
-    let path = task_dir(route, order_id).join(format!("claim.{agent}.json"));
+    let path = agent_task_dir(route, order_id, agent).join(format!("claim.{agent}.json"));
     // Re-claiming keeps the ORIGINAL timestamp: refreshing it would let a latecomer
     // win a race it already lost by simply claiming again.
     //
@@ -1428,11 +1481,11 @@ pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<
 }
 
 fn heartbeat_path(route: &ProjectRoute, order_id: &str, agent: &str) -> PathBuf {
-    task_dir(route, order_id).join(format!("heartbeat.{agent}.json"))
+    agent_task_dir(route, order_id, agent).join(format!("heartbeat.{agent}.json"))
 }
 
 fn release_path(route: &ProjectRoute, order_id: &str, releaser: &str) -> PathBuf {
-    task_dir(route, order_id).join(format!("release.{releaser}.json"))
+    agent_task_dir(route, order_id, releaser).join(format!("release.{releaser}.json"))
 }
 
 /// Write (or rewrite) this agent's heartbeat for a task. One writer per path.
@@ -1565,7 +1618,7 @@ pub fn submit_result(route: &ProjectRoute, result: &TaskResult) -> Result<PathBu
     if !is_safe_component(&result.order_id) {
         bail!("order id must be a path-safe identifier")
     }
-    let path = task_dir(route, &result.order_id).join(format!(
+    let path = agent_task_dir(route, &result.order_id, &result.agent).join(format!(
         "result.{}.{:03}.json",
         result.agent, result.revision
     ));
@@ -1673,10 +1726,11 @@ pub fn submit_recommendation(
     if recommendation.reasoning.trim().is_empty() {
         bail!("a recommendation must say why, or it is just a rubber stamp waiting to happen")
     }
-    let path = task_dir(route, &recommendation.order_id).join(format!(
-        "recommendation.{}.{:03}.json",
-        recommendation.reviewer, recommendation.revision
-    ));
+    let path =
+        agent_task_dir(route, &recommendation.order_id, &recommendation.reviewer).join(format!(
+            "recommendation.{}.{:03}.json",
+            recommendation.reviewer, recommendation.revision
+        ));
     write_task_file(&path, recommendation)?;
     Ok(path)
 }
@@ -1703,51 +1757,49 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     let mut releases = Vec::new();
     let mut kills = Vec::new();
     let mut offers = Vec::new();
-    for entry in fs::read_dir(&directory)? {
-        let path = entry?.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let Ok(text) = fs::read_to_string(&path) else {
-            continue;
-        };
+    // Worker-level agents never write the channel (ADR 0024), so a channel file by one is
+    // refused on the way in, wherever it came from: a synced copy, a hand-copied file, a
+    // tool that ignored the rule. Their own signed files are read from `handins/<agent>/`
+    // below, as if they were here. Both lists are empty for nearly every project.
+    let workers = access::refused_authors(&route.communications, &route.project_id);
+    let mut ingest = |name: &str, text: &str| {
         // A single unreadable file must not hide the rest of the task.
         if name.starts_with("claim.")
-            && let Ok(value) = serde_json::from_str(&text)
+            && let Ok(value) = serde_json::from_str(text)
         {
             claims.push(value);
         } else if name.starts_with("result.")
-            && let Ok(value) = serde_json::from_str::<TaskResult>(&text)
+            && let Ok(value) = serde_json::from_str::<TaskResult>(text)
             && verify_result(&value, &route.agents) == SignatureCheck::Valid
         {
             results.push(value);
         } else if name.starts_with("review.")
-            && let Ok(value) = serde_json::from_str::<Review>(&text)
+            && let Ok(value) = serde_json::from_str::<Review>(text)
             && verify_review(&value, &route.agents) == SignatureCheck::Valid
             && review_authority(route, &value).allowed()
         {
             reviews.push(value);
         } else if name.starts_with("recommendation.")
-            && let Ok(value) = serde_json::from_str::<Recommendation>(&text)
+            && let Ok(value) = serde_json::from_str::<Recommendation>(text)
             && verify_recommendation(&value, &route.agents) == SignatureCheck::Valid
         {
             recommendations.push(value);
         } else if name.starts_with("heartbeat.")
-            && let Ok(value) = serde_json::from_str::<Heartbeat>(&text)
+            && let Ok(value) = serde_json::from_str::<Heartbeat>(text)
         {
             // Heartbeats are unsigned local truth; the pid is only meaningful to the
             // machine that wrote it, and no signature is checked here for the same
             // reason a claim carries none - it is a marker, not an assertion of work.
             heartbeats.push(value);
         } else if name.starts_with("release.")
-            && let Ok(value) = serde_json::from_str::<Release>(&text)
+            && let Ok(value) = serde_json::from_str::<Release>(text)
             && verify_release(&value, &route.agents) == SignatureCheck::Valid
         {
             releases.push(value);
         } else if name.starts_with("interrupt.")
             // Acknowledgements share the prefix and are not interrupts.
             && !name.ends_with(".acked.json")
-            && let Ok(value) = serde_json::from_str::<crate::interrupt::Interrupt>(&text)
+            && let Ok(value) = serde_json::from_str::<crate::interrupt::Interrupt>(text)
             && value.action == crate::interrupt::InterruptAction::Kill
             // Trust boundary: any peer can write into the synced folder, so an
             // unsigned kill is a forged one. Killing an order is destructive - it
@@ -1756,13 +1808,56 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         {
             kills.push(value);
         } else if name.starts_with("offer.")
-            && let Ok(value) = serde_json::from_str::<offer::Offer>(&text)
+            && let Ok(value) = serde_json::from_str::<offer::Offer>(text)
             && value.order_id == order.id
             && value.project_id == route.project_id
             && offer::verify(&value, &route.agents) == SignatureCheck::Valid
             && offer::may_offer(route, &order.issued_by, &value.offered_by)
         {
             offers.push(value);
+        }
+    };
+    for entry in fs::read_dir(&directory)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if !workers.is_empty()
+            && access::comms_author_refused(
+                &format!("tasks/{order_id}/{name}"),
+                Some(text.as_bytes()),
+                &workers,
+            )
+            .is_some()
+        {
+            continue;
+        }
+        ingest(name, &text);
+    }
+    for (worker, dir) in access::overlay_dirs(&route.communications, &route.project_id) {
+        let Ok(files) = fs::read_dir(dir.join("tasks").join(order_id)) else {
+            continue;
+        };
+        for entry in files.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Only what that worker wrote, under its own name.
+            if !access::overlay_file_is_theirs(&worker, name) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(&path) else {
+                continue;
+            };
+            // And naming itself inside: a claim "from" somebody else is not its claim.
+            if !access::overlay_content_is_theirs(&worker, name, text.as_bytes()) {
+                continue;
+            }
+            ingest(name, &text);
         }
     }
     results.sort_by_key(|r: &TaskResult| r.revision);
@@ -4142,7 +4237,7 @@ impl MessageTransport for LocalFilesystemTransport {
     }
 
     fn deliver(&mut self, route: &ProjectRoute, message: &Message) -> Result<()> {
-        persist_message(&message_path(&route.communications, message), message)
+        persist_message(&delivery_path(route, message), message)
     }
 }
 
@@ -4817,15 +4912,24 @@ pub fn syncthing_register_folder(
     )
 }
 
-/// The Syncthing folder id for a project's hand-in folder (ADR 0023).
+/// The Syncthing folder id for a project's hand-ins folder (ADR 0023, 0024): `<id>-handins`.
+///
+/// It was `<id>-work` while the folder was `work/<project>`; that folder held task worktrees
+/// as well, and the scope guard refuses it. The old id is still recognised, so a machine that
+/// registered it shows it in `doctor --layout` and `--fix` stops sharing it.
 #[must_use]
 pub fn work_folder_id(route: &ProjectRoute) -> String {
-    format!("{}-work", route.project_id)
+    format!("{}-handins", route.project_id)
 }
 
-/// Register a project's hand-in folder with the local Syncthing, shared with exactly the
-/// devices the channel folder is shared with. Each machine runs this for itself, which is
-/// also how the receiving side "accepts": it registers its own side of the same folder id.
+/// Register a project's hand-ins folder (`projects/<id>/handins`, or the path recorded for
+/// it) with the local Syncthing as `<id>-handins`, shared with exactly the devices the
+/// channel folder is shared with. Each machine runs this for itself, which is also how the
+/// receiving side "accepts": it registers its own side of the same folder id.
+///
+/// This is the Syncthing fallback for the hand-ins folder, kept until the iroh lane (which
+/// syncs the same folder) proves solid. The path must pass the scope guard: only a project's
+/// `comms` and `handins` may be shared, never its repo, work, tmp or `.env`.
 ///
 /// Idempotent and quiet: when the folder is already registered at `path` with the same
 /// device set it writes nothing, so a worker can call it on every start.
@@ -4856,9 +4960,119 @@ pub fn syncthing_register_work_folder(route: &ProjectRoute, path: &Path) -> Resu
     register_folder(
         &folder_id,
         path,
-        &format!("{} ferryman work", route.project_id),
+        &format!("{} ferryman handins", route.project_id),
         &peers_for_ids(&wanted)?,
     )
+}
+
+/// Make a Syncthing folder `receiveonly` (a Worker's channel: it hears the fleet and can
+/// say nothing back through it) or `sendreceive` again.
+///
+/// Through Ferryman's own Syncthing's REST, one PATCH of the folder's `type`. `Ok(false)`
+/// when Syncthing is not running or does not know the folder: not an error, since the lane
+/// and the receiving machines refuse a Worker's channel writes regardless.
+pub fn syncthing_set_folder_type(folder_id: &str, receive_only: bool) -> Result<bool> {
+    let Some(key) = syncthing_api_key() else {
+        return Ok(false);
+    };
+    let base = syncthing_api_base();
+    let Some(current) = syncthing_get(&base, &format!("/rest/config/folders/{folder_id}"), &key)?
+    else {
+        return Ok(false);
+    };
+    let wanted = if receive_only {
+        "receiveonly"
+    } else {
+        "sendreceive"
+    };
+    if current.get("type").and_then(Value::as_str) == Some(wanted) {
+        return Ok(true);
+    }
+    let body = serde_json::to_string(&json!({ "type": wanted }))?;
+    Ok(matches!(
+        syncthing_patch(&base, &format!("/rest/config/folders/{folder_id}"), &key, &body)?,
+        Some(code) if (200..300).contains(&code)
+    ))
+}
+
+/// The `type` Syncthing has for a folder (`sendreceive`, `receiveonly`, `sendonly`), or
+/// `None` when it cannot be asked.
+#[must_use]
+pub fn syncthing_folder_type(folder_id: &str) -> Option<String> {
+    let key = syncthing_api_key()?;
+    let base = syncthing_api_base();
+    syncthing_get(&base, &format!("/rest/config/folders/{folder_id}"), &key)
+        .ok()
+        .flatten()?
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Pause or resume one Syncthing folder. `Ok(false)` when Syncthing is not running or does
+/// not have the folder. Used by `ferry root migrate` to hold a folder still while its
+/// directory is moved, so Syncthing never looks at a half-moved tree.
+pub fn syncthing_pause_folder(folder_id: &str, paused: bool) -> Result<bool> {
+    let Some(key) = syncthing_api_key() else {
+        return Ok(false);
+    };
+    let base = syncthing_api_base();
+    let url = format!("/rest/config/folders/{folder_id}");
+    if syncthing_get(&base, &url, &key)?.is_none() {
+        return Ok(false);
+    }
+    let body = if paused {
+        r#"{"paused":true}"#
+    } else {
+        r#"{"paused":false}"#
+    };
+    Ok(matches!(
+        syncthing_patch(&base, &url, &key, body)?,
+        Some(code) if (200..300).contains(&code)
+    ))
+}
+
+/// Whether Syncthing has this folder paused. `None` when Syncthing is not running or does
+/// not have the folder.
+#[must_use]
+pub fn syncthing_folder_paused(folder_id: &str) -> Option<bool> {
+    let key = syncthing_api_key()?;
+    let base = syncthing_api_base();
+    syncthing_get(&base, &format!("/rest/config/folders/{folder_id}"), &key)
+        .ok()
+        .flatten()?
+        .get("paused")
+        .and_then(Value::as_bool)
+}
+
+/// Point an existing Syncthing folder at a new path, keeping its id, so no other machine
+/// re-pairs: pause it, change `path`, resume. `Ok(false)` when Syncthing is not running or
+/// does not have the folder. The directory must already be at `new_path` (moved whole, with
+/// its `.stfolder` marker) - this changes what Syncthing believes, not the disk.
+///
+/// The change goes through the scope guard like any other registration.
+pub fn syncthing_move_folder(folder_id: &str, new_path: &Path) -> Result<bool> {
+    syncscope::guard(new_path)?;
+    let Some(key) = syncthing_api_key() else {
+        return Ok(false);
+    };
+    let base = syncthing_api_base();
+    let url = format!("/rest/config/folders/{folder_id}");
+    if syncthing_get(&base, &url, &key)?.is_none() {
+        return Ok(false);
+    }
+    ensure_folder_marker(new_path)?;
+    let ok = |code: Option<u16>| matches!(code, Some(code) if (200..300).contains(&code));
+    let paused = syncthing_patch(&base, &url, &key, r#"{"paused":true}"#)?;
+    if !ok(paused) {
+        return Ok(false);
+    }
+    let body = serde_json::to_string(&json!({ "path": new_path.display().to_string() }))?;
+    let moved = syncthing_patch(&base, &url, &key, &body)?;
+    // Resumed whether or not the path changed: a folder left paused is a channel that
+    // silently stopped.
+    let resumed = syncthing_patch(&base, &url, &key, r#"{"paused":false}"#)?;
+    Ok(ok(moved) && ok(resumed))
 }
 
 /// Register the fleet channel, so identity and the device count actually travel.
@@ -5562,10 +5776,10 @@ impl<P: SharedHealthProbe> MessageTransport for SharedFolderTransport<P> {
     fn deliver(&mut self, route: &ProjectRoute, message: &Message) -> Result<()> {
         // Syncthing observes this inner root. Replacing the already-local message is
         // unnecessary; successful probe means the durable inner write is shared.
-        if message_path(&route.communications, message).is_file() {
+        if delivery_path(route, message).is_file() {
             Ok(())
         } else {
-            persist_message(&message_path(&route.communications, message), message)
+            persist_message(&delivery_path(route, message), message)
         }
     }
 }
@@ -5962,7 +6176,7 @@ impl<G: GitRunner> MessageTransport for PrivateGitTransport<G> {
         let relative = format!("messages/{}/{}.json", message.project_id, message.id);
         let result = (|| {
             let _lock = acquire_git_live_lock(route)?;
-            persist_message(&message_path(&route.communications, message), message)?;
+            persist_message(&delivery_path(route, message), message)?;
             self.commit_and_push_locked(route, &relative, &format!("message {}", message.id))
         })();
         self.finish_operation(result)
@@ -6877,29 +7091,33 @@ pub fn read_message(route: &ProjectRoute, message_id: &str) -> Result<Message> {
 
 pub fn list_messages(route: &ProjectRoute) -> Result<Vec<Message>> {
     route.validate()?;
-    let directory = route
-        .communications
-        .join("messages")
-        .join(&route.project_id);
-    if !directory.is_dir() {
-        return Ok(Vec::new());
+    let workers = access::refused_authors(&route.communications, &route.project_id);
+    let mut paths = Vec::new();
+    for (from, directory) in inbox_dirs(route) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for path in entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+        {
+            paths.push((from.clone(), path));
+        }
     }
-    let mut paths = fs::read_dir(directory)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
+    paths.sort_by(|a, b| a.1.cmp(&b.1));
     // One unreadable envelope - a truncated write, a half-synced file - must not
     // blind the whole project: `ferry channel log` and the dashboard read through
     // here, and a single 0-byte file made both fail for every message. Skip it,
     // say which file, and keep reading. A skipped file is never treated as valid.
     let mut messages = Vec::new();
-    for path in paths {
+    for (from, path) in paths {
         match read_message_file(route, &path) {
+            // A Worker's message is accepted from its own hand-ins folder only.
+            Ok(message) if !inbox_accepts(&workers, from.as_deref(), &message.sender) => {}
             Ok(message) => messages.push(message),
             Err(error) => eprintln!("warning: skipped message {}: {error}", path.display()),
         }
@@ -7070,24 +7288,26 @@ fn validate_v2_message(message: &MessageV2) -> Result<()> {
 /// time, not here, so a claimed message stays visible until acknowledged.
 pub fn list_messages_v2(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
     route.validate()?;
-    let directory = route
-        .communications
-        .join("messages")
-        .join(&route.project_id);
-    if !directory.is_dir() {
-        return Ok(Vec::new());
+    let workers = access::refused_authors(&route.communications, &route.project_id);
+    let mut paths = Vec::new();
+    for (from, directory) in inbox_dirs(route) {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for path in entries
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+        {
+            paths.push((from.clone(), path));
+        }
     }
-    let mut paths = fs::read_dir(directory)?
-        .filter_map(std::result::Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "json")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
+    paths.sort_by(|a, b| a.1.cmp(&b.1));
     let mut messages = Vec::new();
-    for path in paths {
+    for (from, path) in paths {
         let raw = match fs::read(&path) {
             Ok(raw) => raw,
             Err(_) => continue,
@@ -7105,6 +7325,7 @@ pub fn list_messages_v2(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
         };
         if validate_v2_message(&message).is_err()
             || message.project_id != route.project_id
+            || !inbox_accepts(&workers, from.as_deref(), &message.sender)
             || verify_v2_message(route, &message).is_err()
         {
             continue;

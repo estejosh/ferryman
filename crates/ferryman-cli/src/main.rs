@@ -243,6 +243,21 @@ enum Command {
         /// <name> --all` is what enrols it.
         #[arg(long, conflicts_with = "master")]
         no_enrol: bool,
+        /// Put the channel here instead of in the ferry root's layout. The layout is what
+        /// Ferryman does when nobody decides; a path given here is recorded as a custom
+        /// placement and respected: never moved, never assumed to be under projects/<id>.
+        #[arg(long)]
+        channel: Option<PathBuf>,
+        /// The repository to record for this project (custom placement).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Where hand-ins are written and synced (custom placement). It must stay outside
+        /// the channel for the access levels to be enforced.
+        #[arg(long)]
+        handins: Option<PathBuf>,
+        /// The project-scoped .env (custom placement). Never synced.
+        #[arg(long)]
+        env: Option<PathBuf>,
     },
     /// Check whether this machine is ready to run a task, before one fails.
     ///
@@ -283,6 +298,17 @@ enum Command {
     Team {
         #[command(subcommand)]
         command: TeamCommand,
+    },
+    /// What each agent may do in a project: Worker, Member or Orchestrator.
+    ///
+    /// A level is a grant the project's master signs into the channel, never a local
+    /// setting; every machine checks the signature. Worker reads the channel and writes
+    /// only to its own hand-ins folder. Member reads and writes the channel. Orchestrator
+    /// is a Member who may also load write credentials from the root's secrets/. An agent
+    /// with no grant is a Member, and the named head and the master are Orchestrators.
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
     },
     /// The Syncthing that Ferryman runs for itself: start it, stop it, see it.
     ///
@@ -821,6 +847,29 @@ enum RootCommand {
     Swarm {
         #[command(subcommand)]
         command: fleetsetup::SwarmCommand,
+    },
+    /// Move a layout-1 root (comms/ repos/ work/) to layout 2: one folder per project.
+    ///
+    /// Dry run unless you pass --apply: a dry run writes nothing at all. Per managed
+    /// project it moves the channel to projects/<id>/comms (the channel id does not
+    /// change, so nothing re-pairs; Syncthing's folder path is updated and kept paused
+    /// meanwhile), hand-ins to projects/<id>/handins, and Ferryman's own clone to
+    /// projects/<id>/repo. It refuses a project with a running worker, a lock or a live
+    /// worktree, and says what blocks it. A project you placed yourself (custom) and any
+    /// checkout of yours are never moved. Nothing is deleted: what a move superseded goes
+    /// to <root>/_to_delete/. The log is <root>/logs/migrate-<UTC time>.md.
+    Migrate {
+        /// Do it. Without this flag nothing is changed.
+        #[arg(long)]
+        apply: bool,
+        /// Leave Ferryman's Syncthing alone (the move still repoints bridge.toml).
+        #[arg(long)]
+        no_syncthing: bool,
+        /// Also move the registered worktrees that no running order uses to _to_delete
+        /// and run `git worktree prune`. Without it they are listed as "would prune" and
+        /// left where they are.
+        #[arg(long)]
+        prune_stale_worktrees: bool,
     },
     /// Move channels into `comms/`, so every channel lives in one place.
     ///
@@ -2721,6 +2770,9 @@ enum WorkCommand {
         /// Apply it but do not push.
         #[arg(long)]
         no_push: bool,
+        /// Go ahead although a verdict file beside it cannot be verified.
+        #[arg(long)]
+        force: bool,
     },
     /// Head only: send a hand-in back, with the reason.
     Reject {
@@ -2730,6 +2782,18 @@ enum WorkCommand {
         reason: String,
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Replace a verdict file that cannot be verified.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Master or head only, once: sign the verdicts written before they were signed
+    /// (v0.5.30 and earlier). Lists them; nothing changes until you pass --yes.
+    AdoptVerdicts {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Sign what the list shows.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -3433,7 +3497,7 @@ fn target_configs(
     }
     let shared = ferryman_channel::ferry::find_root()
         .filter(|_| at.workspace.is_none())
-        .and_then(|root| ferryman_ops::agent::AgentConfig::load(&root.comms()).ok());
+        .and_then(|root| ferryman_ops::agent::AgentConfig::load(&root.shared_home()).ok());
     let mut out = Vec::new();
     for route in target_routes(at)? {
         match ferryman_ops::agent::AgentConfig::load(&route.attachment)
@@ -4062,6 +4126,10 @@ async fn run(cli: Cli) -> Result<()> {
             joining,
             force_new_channel,
             no_enrol,
+            channel,
+            repo,
+            handins,
+            env,
         } => {
             // Before anything is written: a machine may not be configured to be a person.
             if let Some(name) = &agent_name {
@@ -4116,6 +4184,10 @@ async fn run(cli: Cli) -> Result<()> {
                 joining,
                 force_new_channel,
                 no_enrol,
+                channel,
+                repo,
+                handins,
+                env,
             }) {
                 Ok(outcome) => outcome,
                 Err(err) => {
@@ -4322,6 +4394,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::Work { command } => work_command(command)?,
         Command::Team { command } => team_command(command).await?,
+        Command::Access { command } => access_command(command)?,
         Command::Contract { command } => contract_command(command)?,
         Command::Adversary { command } => adversary::command(command).await?,
         Command::Route { command } => route::command(command).await?,
@@ -4362,7 +4435,7 @@ async fn run(cli: Cli) -> Result<()> {
             let comms = match comms {
                 Some(dir) => dir,
                 None => ferryman_channel::ferry::find_root()
-                    .map(|root| root.comms())
+                    .map(|root| root.shared_home())
                     .context("no ferry root found here; pass --comms <folder of channels>")?,
             };
             let decide = (decide != "none").then_some(decide);
@@ -6377,6 +6450,207 @@ fn team_approve_all(
     Ok(())
 }
 
+#[derive(Subcommand, Clone)]
+enum AccessCommand {
+    /// Show each agent's level and whether it is enforced for the project.
+    Show {
+        /// A project id filed in the ferry root. Omit for the project in the current
+        /// directory, or every project when you are not in one.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Set an agent's level. Only the project's master can: it signs the grant.
+    Set {
+        /// The project id.
+        project: String,
+        /// The agent's name on the roster.
+        agent: String,
+        /// worker, member or orchestrator.
+        level: String,
+    },
+    /// Admit agents that registered after the first Worker was set, as Members. They stay
+    /// Workers until you do; with no names this only lists who is waiting.
+    Admit {
+        /// The project id.
+        project: String,
+        /// Who to admit.
+        agents: Vec<String>,
+        /// Admit everyone on the list (read the list first).
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+fn access_route(project: &str) -> Result<ferryman_channel::ProjectRoute> {
+    let root = ferryman_channel::ferry::find_root().context(
+        "no ferry root here; run this in the project, or make a root with 'ferry root init'",
+    )?;
+    let entry = root
+        .read()
+        .projects
+        .into_iter()
+        .find(|entry| entry.project_id == project)
+        .with_context(|| {
+            format!(
+                "no project '{project}' in {}",
+                root.manifest_path().display()
+            )
+        })?;
+    Ok(entry.route(&root)?.0)
+}
+
+/// `ferry access` - who may do what in a project.
+fn access_command(command: AccessCommand) -> Result<()> {
+    use ferryman_channel::access;
+    match command {
+        AccessCommand::Show { project } => {
+            // Showing changes nothing: no filing of the project in the root, no update of
+            // what this machine remembers of the master's grants.
+            ferryman_channel::known::read_only();
+            access::read_only();
+            let routes = match project {
+                Some(project) => vec![access_route(&project)?],
+                None => {
+                    let here = std::env::current_dir().context("read the current directory")?;
+                    if let Ok(route) = ferryman_channel::route_for(&here) {
+                        vec![route]
+                    } else {
+                        let root = ferryman_channel::ferry::find_root()
+                            .context("not in a project, and no ferry root to list")?;
+                        root.read()
+                            .projects
+                            .iter()
+                            .filter(|entry| entry.channel.is_dir())
+                            .filter_map(|entry| entry.route(&root).ok().map(|(route, _)| route))
+                            .collect()
+                    }
+                }
+            };
+            for route in routes {
+                let channel = &route.communications;
+                let grants = access::grants(channel, &route.project_id);
+                println!(
+                    "{}  ({})",
+                    route.project_id,
+                    if access::enforced(channel, &route.project_id) {
+                        "enforced: hand-ins are kept apart from the channel"
+                    } else {
+                        "recorded only: this project's hand-ins sit inside its channel, so a \
+                         Worker has nowhere else to write"
+                    }
+                );
+                for (agent, level) in access::levels(channel, &route.project_id) {
+                    let source = if grants.contains_key(&agent) {
+                        "granted by the master"
+                    } else if level == access::Level::Worker {
+                        "not admitted by the master, so a Worker"
+                    } else {
+                        "default"
+                    };
+                    println!("  {agent:<24} {:<13} {source}", level.as_str());
+                }
+                let waiting = access::pending_admission(channel, &route.project_id);
+                if !waiting.is_empty() {
+                    println!(
+                        "  waiting for the master to admit: {} (ferry access admit {})",
+                        waiting.join(", "),
+                        route.project_id
+                    );
+                }
+            }
+        }
+        AccessCommand::Admit {
+            project,
+            agents,
+            all,
+        } => {
+            let route = access_route(&project)?;
+            let waiting = access::pending_admission(&route.communications, &route.project_id);
+            if agents.is_empty() && !all {
+                if waiting.is_empty() {
+                    println!("nobody is waiting for admission on {project}");
+                } else {
+                    println!("waiting for admission on {project}: {}", waiting.join(", "));
+                    println!("admit by name, or all of them with --all");
+                }
+                return Ok(());
+            }
+            let names = if all { waiting } else { agents };
+            let Some(master) = ferryman_channel::master::read_master(&route)?.map(|d| d.master)
+            else {
+                bail!("{project} has no master yet; claim it with 'ferry root master'");
+            };
+            let identity = signing_identity(&route, &master)?;
+            let done = access::admit(&route, &identity, &names)?;
+            println!("admitted as Members on {project}: {}", done.join(", "));
+        }
+        AccessCommand::Set {
+            project,
+            agent,
+            level,
+        } => {
+            let level = access::Level::parse(&level)?;
+            let route = access_route(&project)?;
+            let Some(master) = ferryman_channel::master::read_master(&route)?.map(|d| d.master)
+            else {
+                bail!(
+                    "{} has no master yet; claim it with 'ferry root master'",
+                    route.project_id
+                );
+            };
+            let identity = signing_identity(&route, &master)?;
+            let grant = access::set_level(&route, &identity, &agent, level)?;
+            println!(
+                "{} is now a {} in {} (signed by {master})",
+                grant.agent,
+                level.as_str(),
+                route.project_id
+            );
+            // On the agent's own machine the grant also shapes Syncthing: a Worker's
+            // channel folder becomes receive-only, so it hears the fleet and sends nothing
+            // back through it. Every other machine refuses the Worker's channel writes
+            // regardless, so this is the second lock, not the only one.
+            let local = ferryman_ops::agent::AgentConfig::load(&route.attachment)
+                .ok()
+                .map(|config| config.agent);
+            if local.is_some_and(|name| {
+                ferryman_channel::canonical_agent_name(&name)
+                    == ferryman_channel::canonical_agent_name(&agent)
+            }) {
+                let worker = level == access::Level::Worker;
+                match ferryman_channel::syncthing_set_folder_type(&route.shared_remote, worker) {
+                    Ok(true) => println!(
+                        "  Syncthing folder {} is now {}",
+                        route.shared_remote,
+                        if worker {
+                            "receive-only"
+                        } else {
+                            "send and receive"
+                        }
+                    ),
+                    Ok(false) => println!(
+                        "  Syncthing is not running or does not sync {}; nothing to change there",
+                        route.shared_remote
+                    ),
+                    Err(error) => {
+                        println!("  could not change the Syncthing folder type: {error:#}")
+                    }
+                }
+                if worker {
+                    let moved = access::sweep_worker_writes(&route, &agent);
+                    if !moved.is_empty() {
+                        println!(
+                            "  moved {} file(s) this machine had written into the channel to its \
+                             hand-ins folder",
+                            moved.len()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 async fn team_command(command: TeamCommand) -> Result<()> {
     use ferryman_channel::invite;
     let here = |workspace: Option<PathBuf>| -> Result<ferryman_channel::ProjectRoute> {
@@ -7875,7 +8149,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 config.max_parallel
             ));
             let iroh = lane::for_worker(&root, identity, &report);
-            run_fleet(fleet, &root.comms(), once, true, iroh, &report).await?;
+            run_fleet(fleet, &root.shared_home(), once, true, iroh, &report).await?;
         }
         Agent::Run {
             // Without `--all-projects`, `--comms` and `--workspace` are mutually
@@ -8732,7 +9006,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
             let folder = handin::create(
                 &route,
                 &identity,
-                &handin::work_dir(&route),
+                &handin::write_dir(&route, &agent),
                 &order,
                 &handin::Cut {
                     repo: &checkout,
@@ -8759,7 +9033,7 @@ fn work_command(command: WorkCommand) -> Result<()> {
             } else {
                 for entry in &entries {
                     println!(
-                        "  {:<24} {:<9} signature {:<11} {} ({} file(s))",
+                        "  {:<24} {:<10} signature {:<11} {} ({} file(s))",
                         entry.order,
                         entry.status.as_str(),
                         entry.signature,
@@ -8773,17 +9047,20 @@ fn work_command(command: WorkCommand) -> Result<()> {
             order,
             workspace,
             no_push,
+            force,
         } => {
             let checkout = here(workspace)?;
             let route = ferryman_channel::route_for(&checkout)?;
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
             let applied = handin::accept(
                 &route,
                 &handin::work_dir(&route),
                 &order,
-                &agent,
+                &identity,
                 &checkout,
                 !no_push,
+                force,
             )?;
             println!(
                 "accepted {order}: applied as {}{}",
@@ -8799,11 +9076,43 @@ fn work_command(command: WorkCommand) -> Result<()> {
             order,
             reason,
             workspace,
+            force,
         } => {
             let route = ferryman_channel::route_for(&here(workspace)?)?;
             let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
-            handin::reject(&route, &handin::work_dir(&route), &order, &agent, &reason)?;
+            let identity = signing_identity(&route, &agent)?;
+            handin::reject(
+                &route,
+                &handin::work_dir(&route),
+                &order,
+                &identity,
+                &reason,
+                force,
+            )?;
             println!("rejected {order}: the worker will see why");
+        }
+        WorkCommand::AdoptVerdicts { workspace, yes } => {
+            let route = ferryman_channel::route_for(&here(workspace)?)?;
+            let agent = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
+            let found = handin::adopt_verdicts(&route, &handin::work_dir(&route), &identity, yes)?;
+            if found.is_empty() {
+                println!("no old unsigned verdicts");
+            }
+            for old in &found {
+                println!("  {:<24} {}", old.order, old.kind);
+            }
+            if !found.is_empty() {
+                if yes {
+                    println!("signed {} verdict(s) as {agent}", found.len());
+                } else {
+                    println!(
+                        "{} old verdict(s). Check each against `git log` and `ferry work list`, \
+                         then run again with --yes to sign them as {agent}.",
+                        found.len()
+                    );
+                }
+            }
         }
     }
     Ok(())
@@ -12195,12 +12504,82 @@ fn root_command(command: RootCommand) -> Result<()> {
             };
             let root = ferry::Root::create(&path)?;
             println!("your Ferryman lives in {}", root.path.display());
-            println!("  comms/   every channel");
-            println!("  repos/   what Ferryman clones, and links to what it adopts");
-            println!("  work/    task worktrees, which come and go");
+            println!(
+                "  projects/<id>/   one folder per project: repo, comms, handins, work, tmp, .env"
+            );
+            println!("  secrets/         write credentials and fleet-wide keys (never synced)");
+            println!("  logs/");
+            println!(
+                "  A project you place yourself (ferry enable --channel ...) stays where you put it."
+            );
             println!();
             println!("  Nothing you already have is moved into it.");
             println!("  Add a project you already have:  ferry root adopt <path>");
+        }
+
+        RootCommand::Migrate {
+            apply,
+            no_syncthing,
+            prune_stale_worktrees,
+        } => {
+            let Some(root) = ferry::find_root() else {
+                println!("no ferry root yet, so there is nothing to migrate.");
+                return Ok(());
+            };
+            // Looking at the workers resolves their routes, and resolving a route files the
+            // project in the root and updates the usage index. A migration, and above all
+            // its dry run, changes only what it reports.
+            ferryman_channel::known::read_only();
+            let scan = ferryman_ops::machine::scan();
+            let options = ferryman_ops::migrate::Options {
+                apply,
+                syncthing: !no_syncthing,
+                backend: None,
+                prune_stale_worktrees,
+                machine_blockers: ferryman_ops::migrate::blockers_from_scan(&scan),
+            };
+            if apply && prune_stale_worktrees {
+                // The exact list, before anything moves.
+                let plan = ferryman_ops::migrate::run(
+                    &root,
+                    &ferryman_ops::migrate::Options {
+                        apply: false,
+                        ..options.clone()
+                    },
+                )?;
+                let lines: Vec<String> = plan
+                    .projects
+                    .iter()
+                    .flat_map(|p| {
+                        p.steps
+                            .iter()
+                            .filter(|step| step.starts_with("stale worktree"))
+                            .map(move |step| format!("  {}: {step}", p.project))
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    println!("no stale worktrees to move.");
+                } else {
+                    println!(
+                        "moving these to _to_delete (under work/, clean, pushed, used by no \
+                         order; a blocked project is skipped):"
+                    );
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                println!();
+            }
+            let report = ferryman_ops::migrate::run(&root, &options)?;
+            print!("{}", report.render());
+            if !apply {
+                println!();
+                println!("  Nothing was changed. Run it with --apply to do it.");
+            } else if !report.clean() {
+                bail!(
+                    "some projects were not migrated; see above, fix what blocks them and run it again"
+                );
+            }
         }
 
         RootCommand::Gather { project, dry_run } => {
@@ -13723,6 +14102,7 @@ mod tests {
                     order,
                     workspace,
                     no_push,
+                    ..
                 },
         } = accept.command
         else {

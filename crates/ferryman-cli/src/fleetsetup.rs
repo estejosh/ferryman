@@ -316,11 +316,13 @@ pub fn layout_command(fix: bool, json: bool) -> Result<bool> {
     let mut report = layout::inspect_live(&root, &scan);
     let mut did: Vec<String> = Vec::new();
     if fix && !report.ok() {
-        for folder in [root.comms(), root.repos(), root.work()] {
+        for (_, folder) in root.top_folders() {
             if !folder.is_dir() && std::fs::create_dir_all(&folder).is_ok() {
                 did.push(format!("made {}", folder.display()));
             }
         }
+        did.extend(layout::make_project_folders(&root));
+        did.extend(layout::sweep_worker_strays(&root));
         match repos::sync(&root, &repos::Options::default()) {
             Ok(rows) => {
                 for row in rows {
@@ -755,7 +757,7 @@ pub fn managed_clone_after_enable(project: &str, quiet: bool) {
                     _ => println!(
                         "  managed clone: {} ({})",
                         row.word(),
-                        root.managed_clone(project).display()
+                        root.managed_clone_of(project).display()
                     ),
                 }
             }

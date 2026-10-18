@@ -1598,6 +1598,40 @@ mod watching {
     }
 
     #[test]
+    fn a_paused_master_may_still_narrow_access_and_the_admissions_that_come_with_it() {
+        use crate::access::{Level, grants, level_of, set_level};
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let bob = AgentIdentity::from_seed("bob", [3u8; 32]);
+        let carol = AgentIdentity::from_seed("carol", [4u8; 32]);
+        let mut route = channel(dir.path(), &josh);
+        for who in [&josh, &bob, &carol] {
+            crate::register_agent(&route, &roster_entry(who)).unwrap();
+            if who.name() != "josh" {
+                route.agents.push(roster_entry(who));
+            }
+        }
+        crate::master::initialize_master(&route, &josh, "josh").unwrap();
+        record(&route, &josh, "josh", 1, Outcome::Contradicted, "gone").unwrap();
+        age_the_contradiction(&route, &josh, PAUSE_AFTER_HOURS + 1);
+        let id = route.project_id.clone();
+        let channel = route.communications.clone();
+
+        let error = set_level(&route, &josh, "bob", Level::Member)
+            .expect_err("widening waits for the anchor")
+            .to_string();
+        assert!(error.contains("widen access"), "{error}");
+
+        // The first Worker keeps everyone already here as they were; that is not a widening.
+        set_level(&route, &josh, "carol", Level::Worker)
+            .expect("narrowing is allowed while paused, with the admissions it needs");
+        assert_eq!(level_of(&channel, &id, "carol"), Level::Worker);
+        assert!(grants(&channel, &id).contains_key("bob"));
+        assert_eq!(level_of(&channel, &id, "bob"), Level::Member);
+    }
+
+    #[test]
     fn a_verified_master_grants_as_before() {
         let dir = tempfile::tempdir().unwrap();
         let josh = AgentIdentity::from_seed("josh", [1u8; 32]);

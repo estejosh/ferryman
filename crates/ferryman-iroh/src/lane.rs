@@ -35,7 +35,7 @@ use iroh::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use ferryman_channel::ProjectRoute;
+use ferryman_channel::{ProjectRoute, access, ferry};
 
 use crate::manifest::{self, Entry, HashCache, Plan, Rules};
 use crate::{ALPN, IrohConfig, MAX_FILE, endpoint_hex};
@@ -173,8 +173,34 @@ impl Status {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Hello {
+    /// The project, or `<project>+handins` for its hand-ins folder.
     project_id: String,
     manifest: Vec<Entry>,
+    /// False when the dialer will send nothing from this folder (a Worker's machine and the
+    /// channel: it only listens). The answerer then asks for nothing, rather than asking for
+    /// files that will be skipped. A dialer that does not say sends.
+    #[serde(default = "yes")]
+    send: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// The key a project's hand-ins folder is exchanged under, beside the channel's own.
+/// A peer that predates the hand-ins folder does not know it and refuses it, which is the
+/// compatible answer: the channel still syncs.
+pub const HANDINS_SUFFIX: &str = "+handins";
+
+/// One folder of a project that is exchanged: the channel, or its hand-ins.
+struct Share {
+    key: String,
+    dir: PathBuf,
+    rules: Rules,
+    /// Whether this machine offers what is in the folder. False only for the channel on a
+    /// machine whose agents are all Workers: it hears the fleet and says nothing back
+    /// through it (ADR 0024).
+    send: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -202,6 +228,9 @@ pub struct Lane {
     cache: Mutex<HashCache>,
     status: Mutex<Status>,
     status_file: Option<PathBuf>,
+    /// The agents that run on this machine, so the lane knows when every one of them is a
+    /// Worker and the channel is receive-only here. Empty (tests) means none are known.
+    local_agents: Mutex<Vec<String>>,
 }
 
 impl Lane {
@@ -226,7 +255,70 @@ impl Lane {
             own,
             cache: Mutex::new(HashCache::default()),
             status_file,
+            local_agents: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Say which agents run on this machine. A project in which all of them are Workers is
+    /// then listened to and never published: the channel is receive-only here.
+    pub fn set_local_agents(&self, names: Vec<String>) {
+        *self
+            .local_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = names;
+    }
+
+    /// The folders of `route` exchanged with `peer`, on this machine's rules:
+    ///
+    /// - the channel, minus anything a Worker-level agent authored, and offered only if some
+    ///   agent here is above Worker;
+    /// - the hand-ins folder when the project keeps it apart from the channel (layout 2 or a
+    ///   recorded path), minus the head's verdict files unless the peer is the head.
+    ///
+    /// Read from disk each time: a level changed a second ago applies on the next exchange.
+    fn shares(&self, route: &ProjectRoute, peer: &Peer) -> Vec<Share> {
+        let channel = &route.communications;
+        let id = &route.project_id;
+        let local = self
+            .local_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
+        let mut channel_rules = Rules::for_channel(channel);
+        if handins_elsewhere {
+            // `handins/` in the channel is the old layout's; the project's hand-ins are
+            // exchanged as their own share, so an unmigrated peer cannot re-create it here.
+            channel_rules = channel_rules.excluding("handins/");
+        }
+        let mut shares = vec![Share {
+            key: id.clone(),
+            dir: channel.clone(),
+            rules: channel_rules
+                .refusing_authors(access::refused_authors(channel, id))
+                .refusing_roster(access::unadmitted_names(channel, id))
+                // A peer whose agents are all Workers writes its hand-ins, never the channel.
+                .refusing_incoming(access::machine_is_worker_only(
+                    channel,
+                    id,
+                    &peer.agents.iter().cloned().collect::<Vec<_>>(),
+                )),
+            send: !access::machine_is_worker_only(channel, id, &local),
+        }];
+        let handins = ferry::handins_dir_for(channel, id);
+        if !handins.starts_with(channel) {
+            // The folder is the project's own and a hand-in is written into it; making it
+            // here is what a worker does on start anyway.
+            let _ = std::fs::create_dir_all(&handins);
+            let verdicts = access::may_write_verdicts(channel, id, &peer.agents);
+            shares.push(Share {
+                key: format!("{id}{HANDINS_SUFFIX}"),
+                rules: Rules::for_channel(&handins).refusing_verdicts(!verdicts),
+                dir: handins,
+                send: true,
+            });
+        }
+        shares
     }
 
     #[must_use]
@@ -307,11 +399,23 @@ impl Lane {
         mut recv: RecvStream,
     ) -> Result<Outcome> {
         let hello: Hello = read_frame(&mut recv).await?;
+        // `<project>` is the channel, `<project>+handins` its hand-ins folder.
+        let project_id = hello
+            .project_id
+            .strip_suffix(HANDINS_SUFFIX)
+            .unwrap_or(&hello.project_id);
         let route = self
             .projects
             .iter()
-            .find(|route| route.project_id == hello.project_id);
-        let Some(route) = route.filter(|_| peer.projects.contains(&hello.project_id)) else {
+            .find(|route| route.project_id == project_id);
+        let share = route
+            .filter(|_| peer.projects.contains(project_id))
+            .and_then(|route| {
+                self.shares(route, peer)
+                    .into_iter()
+                    .find(|share| share.key == hello.project_id)
+            });
+        let Some(share) = share else {
             write_frame(
                 &mut send,
                 &Reply::Refused {
@@ -324,24 +428,31 @@ impl Lane {
             // this one we do not serve, or do not trust it in.
             return Ok(Outcome::default());
         };
-        let channel = &route.communications;
-        let rules = Rules::for_channel(channel);
-        let ours = self.scan(channel, &rules);
-        let plan = manifest::plan(&hello.manifest, &ours, &rules);
+        let (channel, rules) = (&share.dir, &share.rules);
+        let ours = self.scan(channel, rules);
+        let mut plan = manifest::plan(&hello.manifest, &ours, rules);
+        // A folder this machine only listens to gives nothing; a dialer that only listens
+        // is asked for nothing.
+        if !share.send {
+            plan.give.clear();
+        }
+        if !hello.send {
+            plan.want.clear();
+        }
         write_frame(&mut send, &Reply::Plan(plan.clone())).await?;
         let mut received = 0;
         for path in &plan.want {
-            received += u64::from(receive_item(&mut recv, channel, &rules, path).await?);
+            received += u64::from(receive_item(&mut recv, channel, rules, path).await?);
         }
         let mut sent = 0;
         for path in &plan.give {
-            sent += u64::from(send_item(&mut send, channel, &rules, &ours, path).await?);
+            sent += u64::from(send_item(&mut send, channel, rules, &ours, path).await?);
         }
         send.finish()?;
         Ok(Outcome {
             received,
             sent,
-            projects: vec![route.project_id.clone()],
+            projects: vec![share.key.clone()],
         })
     }
 
@@ -376,14 +487,16 @@ impl Lane {
             .iter()
             .filter(|route| peer.projects.contains(&route.project_id))
         {
-            match self.sync_project(&connection, route).await {
-                Ok(Some((received, sent))) => {
-                    totals.received += received;
-                    totals.sent += sent;
-                    totals.projects.push(route.project_id.clone());
+            for share in self.shares(route, peer) {
+                match self.sync_share(&connection, &share).await {
+                    Ok(Some((received, sent))) => {
+                        totals.received += received;
+                        totals.sent += sent;
+                        totals.projects.push(share.key.clone());
+                    }
+                    Ok(None) => {}
+                    Err(error) => failures.push(format!("{}: {error:#}", share.key)),
                 }
-                Ok(None) => {}
-                Err(error) => failures.push(format!("{}: {error:#}", route.project_id)),
             }
         }
         connection.close(0u32.into(), b"done");
@@ -395,20 +508,27 @@ impl Lane {
     }
 
     /// `None`: the other side does not share this project with us.
-    async fn sync_project(
+    async fn sync_share(
         &self,
         connection: &Connection,
-        route: &ProjectRoute,
+        share: &Share,
     ) -> Result<Option<(u64, u64)>> {
-        let channel = &route.communications;
-        let rules = Rules::for_channel(channel);
-        let ours = self.scan(channel, &rules);
+        let (channel, rules) = (&share.dir, &share.rules);
+        let ours = self.scan(channel, rules);
+        // What this side offers: everything it has, or - for a folder it only listens to -
+        // nothing, so even a peer that asks is told "skip" (the sender enforces it too).
+        let offered = if share.send {
+            ours.clone()
+        } else {
+            BTreeMap::new()
+        };
         let (mut send, mut recv) = connection.open_bi().await?;
         write_frame(
             &mut send,
             &Hello {
-                project_id: route.project_id.clone(),
+                project_id: share.key.clone(),
                 manifest: ours.values().cloned().collect(),
+                send: share.send,
             },
         )
         .await?;
@@ -418,13 +538,17 @@ impl Lane {
         };
         let mut sent = 0;
         for path in &plan.want {
-            sent += u64::from(send_item(&mut send, channel, &rules, &ours, path).await?);
+            sent += u64::from(send_item(&mut send, channel, rules, &offered, path).await?);
         }
         send.finish()?;
         let mut received = 0;
         for path in &plan.give {
-            received += u64::from(receive_item(&mut recv, channel, &rules, path).await?);
+            received += u64::from(receive_item(&mut recv, channel, rules, path).await?);
         }
+        // Wait for the answerer to finish its side: it does that only after it has read and
+        // written everything sent to it. Closing the connection before then discards what
+        // is still in flight, which is exactly the case where there was nothing to receive.
+        let _ = recv.read_to_end(64).await;
         Ok(Some((received, sent)))
     }
 

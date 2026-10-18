@@ -271,3 +271,217 @@ async fn a_peer_that_names_paths_outside_the_channel_writes_nothing_there() {
         assert!(found(base, name).is_empty(), "{name} was written");
     }
 }
+
+// ---------------------------------------------------------------------------------------
+// Layout 2 and access levels (ADR 0024): the hand-ins folder syncs beside the channel, a
+// Worker's channel writes are refused where they arrive, and its own machine stays quiet.
+
+fn v2_route(base: &Path, project: &str) -> ProjectRoute {
+    let root = ferryman_channel::ferry::Root::create_with_layout(&base.join("ferry"), 2).unwrap();
+    let communications = root.comms_home(project);
+    let workspace = root.managed_clone(project);
+    let attachment = workspace.join(".ferryman");
+    fs::create_dir_all(&communications).unwrap();
+    fs::create_dir_all(&attachment).unwrap();
+    ProjectRoute {
+        project_id: project.into(),
+        workspace,
+        attachment,
+        communications,
+        shared_remote: String::new(),
+        git_remote: String::new(),
+        git_visibility: "private".into(),
+        agents: Vec::new(),
+    }
+}
+
+/// fang (the master, so an Orchestrator) on A, and wisp (made a Worker) on B.
+struct Levels {
+    _dir: tempfile::TempDir,
+    a: Arc<Lane>,
+    b: Arc<Lane>,
+    a_route: ProjectRoute,
+    b_route: ProjectRoute,
+    a_handins: std::path::PathBuf,
+    b_handins: std::path::PathBuf,
+}
+
+async fn levels() -> Levels {
+    let dir = tempfile::tempdir().unwrap();
+    ferryman_channel::licensing::use_machine_state_dir_per_thread(
+        std::env::temp_dir().join(format!("ferryman-iroh-tests-{}", std::process::id())),
+    );
+    let mut a_route = v2_route(&dir.path().join("a"), "demo");
+    let b_route = v2_route(&dir.path().join("b"), "demo");
+    let fang = AgentIdentity::load_or_create("fang", &a_route.attachment).unwrap();
+    let wisp = AgentIdentity::load_or_create("wisp", &b_route.attachment).unwrap();
+    let (key_a, key_b) = (SecretKey::generate(), SecretKey::generate());
+    let lookup = MemoryLookup::new();
+    let a_end = endpoint(key_a.clone(), &lookup).await;
+    let b_end = endpoint(key_b.clone(), &lookup).await;
+    lookup.add_endpoint_info(addr(&a_end));
+    lookup.add_endpoint_info(addr(&b_end));
+    enrol(&a_route, &fang);
+    enrol(&a_route, &wisp);
+    a_route.agents = ferryman_channel::read_agent_roster(&a_route.communications).unwrap();
+    ferryman_channel::master::initialize_master(&a_route, &fang, "fang").unwrap();
+    ferryman_channel::access::set_level(
+        &a_route,
+        &fang,
+        "wisp",
+        ferryman_channel::access::Level::Worker,
+    )
+    .unwrap();
+    // wisp is a Worker now, so its record is written to its own hand-ins folder.
+    ferryman_channel::transports::publish(&a_route, &fang, &endpoint_hex(&key_a.public()), None)
+        .unwrap();
+    ferryman_channel::transports::publish(&a_route, &wisp, &endpoint_hex(&key_b.public()), None)
+        .unwrap();
+    let a_handins = ferryman_channel::ferry::handins_dir_for(&a_route.communications, "demo");
+    let b_handins = ferryman_channel::ferry::handins_dir_for(&b_route.communications, "demo");
+    fs::create_dir_all(&a_handins).unwrap();
+    fs::create_dir_all(&b_handins).unwrap();
+    // What the first sync would have left on B.
+    copy_tree(&a_route.communications, &b_route.communications);
+    copy_tree(&a_handins, &b_handins);
+    let a = Lane::new(a_end, vec![a_route.clone()], None, None);
+    let b = Lane::new(b_end, vec![b_route.clone()], None, None);
+    tokio::spawn(Arc::clone(&a).serve());
+    tokio::spawn(Arc::clone(&b).serve());
+    Levels {
+        _dir: dir,
+        a,
+        b,
+        a_route,
+        b_route,
+        a_handins,
+        b_handins,
+    }
+}
+
+fn put(dir: &Path, path: &str, text: &str) {
+    let file = dir.join(path);
+    fs::create_dir_all(file.parent().unwrap()).unwrap();
+    fs::write(file, text).unwrap();
+}
+
+#[tokio::test]
+async fn the_handins_folder_syncs_beside_the_channel_and_verdicts_come_from_the_head_only() {
+    let l = levels().await;
+    // The Worker hands work in; the head (fang, the master) writes a verdict beside it.
+    put(
+        &l.b_handins,
+        "wisp/ord-1/handin.json",
+        "{\"from\":\"wisp\"}",
+    );
+    put(
+        &l.a_handins,
+        "wisp/ord-1/accepted.json",
+        "{\"by\":\"fang\"}",
+    );
+    // And the Worker writes a verdict of its own, which is not its to write.
+    put(
+        &l.b_handins,
+        "wisp/ord-2/accepted.json",
+        "{\"by\":\"wisp\"}",
+    );
+
+    l.a.round().await;
+
+    let status = l.a.status();
+    let peer = &status.peers[&endpoint_hex(&l.b.endpoint().id())];
+    assert!(peer.last_error.is_none(), "{:?}", peer.last_error);
+    assert!(peer.projects.contains(&"demo".to_owned()));
+    assert!(
+        peer.projects.contains(&"demo+handins".to_owned()),
+        "{:?}",
+        peer.projects
+    );
+    assert_eq!(
+        fs::read_to_string(l.a_handins.join("wisp/ord-1/handin.json")).unwrap(),
+        "{\"from\":\"wisp\"}",
+        "the hand-in reached the head"
+    );
+    assert_eq!(
+        fs::read_to_string(l.b_handins.join("wisp/ord-1/accepted.json")).unwrap(),
+        "{\"by\":\"fang\"}",
+        "the head's verdict reached the Worker"
+    );
+    assert!(
+        !l.a_handins.join("wisp/ord-2/accepted.json").exists(),
+        "a verdict from a peer that is not the head is not let in"
+    );
+    // Nothing of the hand-ins went into the channel.
+    assert!(!l.a_route.communications.join("handins").exists());
+    assert!(!l.a_route.communications.join("wisp").exists());
+}
+
+#[tokio::test]
+async fn a_workers_channel_files_are_refused_on_arrival_by_name_and_by_content() {
+    let l = levels().await;
+    // The Worker's machine has put things in its channel copy that it should not have.
+    put(&l.b_route.communications, "tasks/t-1/claim.wisp.json", "{}");
+    put(&l.b_route.communications, "presence/wisp.json", "{}");
+    put(
+        &l.b_route.communications,
+        "messages/demo/m-1.json",
+        "{\"sender\":\"Wisp\",\"id\":\"m-1\"}",
+    );
+    // And something that is fine.
+    put(&l.b_route.communications, "notes/readme.txt", "ok");
+
+    // B does not know it is a Worker-only machine (no local agents set), so it offers all
+    // of it: this is the receiving side's own refusal.
+    l.a.round().await;
+
+    let a = &l.a_route.communications;
+    assert!(!a.join("tasks/t-1/claim.wisp.json").exists(), "by name");
+    assert!(!a.join("presence/wisp.json").exists(), "by name");
+    assert!(!a.join("messages/demo/m-1.json").exists(), "by content");
+    // A knows B's agents are all Workers, so nothing B offers into the channel is let in,
+    // innocent or not: its writes belong in its hand-ins, and a Worker that registered a
+    // fresh name could not talk its way round the file-by-file rules.
+    assert!(
+        !a.join("notes/readme.txt").exists(),
+        "a Worker-only peer writes nothing into the channel"
+    );
+}
+
+#[tokio::test]
+async fn a_workers_own_machine_listens_to_the_channel_and_publishes_none_of_it() {
+    let l = levels().await;
+    l.b.set_local_agents(vec!["wisp".to_owned()]);
+    put(
+        &l.a_route.communications,
+        "tasks/t-9/order.json",
+        "{\"from\":\"a\"}",
+    );
+    put(&l.b_route.communications, "notes/local.txt", "b only");
+
+    // Either side may dial; the Worker's machine must give nothing from the channel.
+    l.a.round().await;
+    l.b.round().await;
+
+    assert_eq!(
+        fs::read_to_string(l.b_route.communications.join("tasks/t-9/order.json")).unwrap(),
+        "{\"from\":\"a\"}",
+        "it hears the fleet"
+    );
+    assert!(
+        !l.a_route.communications.join("notes/local.txt").exists(),
+        "and says nothing back through the channel"
+    );
+    // Its hand-ins still go out.
+    put(&l.b_handins, "wisp/ord-3/handin.json", "{}");
+    l.b.round().await;
+    let status = l.b.status();
+    let peer = &status.peers[&endpoint_hex(&l.a.endpoint().id())];
+    assert!(peer.last_error.is_none(), "{:?}", peer.last_error);
+    assert!(
+        l.a_handins.join("wisp/ord-3/handin.json").is_file(),
+        "{status:?} a={:?} b={:?} astat={:?}",
+        found(&l.a_handins, "handin.json"),
+        found(&l.b_handins, "handin.json"),
+        l.a.status()
+    );
+}

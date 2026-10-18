@@ -4207,6 +4207,11 @@ async fn roster(
     let presence = ferryman_channel::receipts::list_presence(&route).map_err(internal)?;
     let absent =
         ferryman_channel::receipts::absent_at(&route.agents, &presence, chrono::Utc::now());
+    // The master-signed access level of each agent (Worker, Member, Orchestrator), and
+    // whether this project enforces it. Shown only; changing one is `ferry access set`.
+    let levels = ferryman_channel::access::levels(&route.communications, &route.project_id);
+    let level_enforced =
+        ferryman_channel::access::enforced(&route.communications, &route.project_id);
     let items = agents
         .iter()
         .map(|agent| {
@@ -4234,6 +4239,10 @@ async fn roster(
             json!({
                 "name": agent.name,
                 "role": agent.role,
+                "level": levels
+                    .get(&ferryman_channel::canonical_agent_name(&agent.name))
+                    .map_or("member", |level| level.as_str()),
+                "level_enforced": level_enforced,
                 "capabilities": agent.capabilities,
                 "mcp": ferryman_channel::discovery::is_mcp(agent),
                 "key": agent.public_key.as_deref().map(fingerprint).unwrap_or_default(),

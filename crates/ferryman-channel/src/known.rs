@@ -75,12 +75,24 @@ pub fn known() -> Vec<KnownProject> {
     out
 }
 
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Stop [`remember`] from writing anything (the usage index, and filing in the ferry root)
+/// for the rest of this process. For a command that promises to change nothing, such as the
+/// dry run of `ferry root migrate`: looking up a route is otherwise a write.
+pub fn read_only() {
+    READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Note that this machine used this project. Best-effort and silent on failure.
 ///
 /// Called from the one place every command already funnels through, so no command has to
 /// remember to do it - a discovery feature that depends on being called correctly is one
 /// that will be wrong exactly when it matters.
 pub fn remember(route: &ProjectRoute) {
+    if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     // First, always. This used to run at the end, after the index's hourly rate limit had
     // already returned - so a project seen in the last hour was never filed, which meant
     // the projects this machine uses MOST were the ones missing from the manifest. It is
@@ -250,7 +262,7 @@ mod tests {
     fn using_a_project_files_it_in_the_ferry_root_without_being_asked() {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
 
         // Somebody just uses a project. They run no filing command.
         let route = route(dir.path(), "alpha");
@@ -276,7 +288,7 @@ mod tests {
         assert_eq!(known().len(), 1);
 
         // The root appears afterwards, and the project is simply used again.
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
         assert!(root.projects().is_empty());
         remember(&route);
 
@@ -292,7 +304,7 @@ mod tests {
     fn filing_moves_nothing_and_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
-        let root = crate::ferry::Root::create(&dir.path().join("ferry")).unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
 
         let route = route(dir.path(), "alpha");
         std::fs::write(route.workspace.join("mine.txt"), "untouched").unwrap();

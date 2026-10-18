@@ -2,6 +2,8 @@
 
 Every machine that runs Ferryman has the same layout under its ferry root. One command puts it there (`ferry fleet setup`), and `ferry doctor --layout` and the watchdog check it and repair what is safe. Nothing depends on a person or an agent remembering a path, because a path an agent has to remember is a path it will eventually get wrong.
 
+**Layout 1 (older roots, still supported):**
+
 ```text
 <root>/                       X:\ferry   or   /mnt/nvme-storage/ferry
   .ferry                      this machine's manifest (never leaves the machine)
@@ -12,7 +14,38 @@ Every machine that runs Ferryman has the same layout under its ferry root. One c
   service/                    the worker's environment file, wrapper and backups (see FLEET_SETUP.md)
 ```
 
-## What each folder is for
+## Layout 2: one folder per project (0.6.0)
+
+A new root is layout 2 (ADR 0024). Each project has one folder, so you can hand an LLM `projects/<id>/` and it sees that project and nothing else.
+
+```text
+<root>/
+  .ferry                      the manifest (version 2); never leaves the machine
+  ferry.toml                  this machine's choices
+  projects/<id>/
+    repo/                     Ferryman's own clone. Machine-local.
+    comms/                    the channel. Synced (Syncthing folder id <id>-ferryman, unchanged).
+    handins/                  hand-ins and a worker-level agent's own signed writes. Synced (<id>-handins).
+    work/                     task worktrees. Machine-local.
+    tmp/                      scratch. Machine-local.
+    .env                      this project's keys only. Never synced.
+  secrets/                    write credentials and fleet-wide keys. Never synced. Orchestrator only.
+  logs/                       including migrate-<UTC>.md
+```
+
+**The layout is the default, never a rule.** The manifest's recorded paths are the truth. `ferry enable --channel P --repo P --handins P --env P` puts a project where you say and records it as `placement: custom`; a project adopted from outside the root is custom too. Nothing Ferryman does assumes a project is under `projects/<id>`: it asks the entry. `ferry root migrate` never moves a custom project, and `doctor --layout` checks only that a custom project's recorded paths exist. A custom project is not a failure.
+
+**Hand-ins have their own folder** so that a Worker-level agent can be kept out of the channel. Everything such an agent writes (hand-ins, claims, status, replies, its iroh transports record) goes to `handins/<agent>/`; readers treat the signed files there as if they were in the channel for that agent. See "Access levels" below.
+
+**What may be synced.** Only `projects/<id>/comms` and `projects/<id>/handins`, or the paths a custom entry records. Ferryman refuses to share the root, `projects/`, `projects/<id>` itself, `repo/`, `work/`, `tmp/`, `secrets/`, `service/`, or any folder holding an `.env`, and `doctor --layout` reports one already configured.
+
+**Access levels** are signed by the project's master (`ferry access set <project> <agent> worker|member|orchestrator`, `ferry access show`). A Worker reads the channel and never writes it: the machines that receive its files refuse a channel file it authored, and accept its writes only from `handins/<agent>/`. A Worker and a Member read the project's `.env` and nothing under `secrets/`; only an Orchestrator reads `secrets/`. With no grant an agent is a Member until the project has a Worker; from then on a roster name the master has not admitted (the roster is unsigned, so a Worker could register a fresh one) is a Worker too, and setting the first Worker signs everyone already there in as a Member. The master and the named head are Orchestrators. **This is not a sandbox:** every agent on a machine runs as the same operating-system user, so a process that goes around Ferryman can read `secrets/` straight from disk. The levels decide what Ferryman loads for an agent and what other machines accept from it; keep a secret that must never reach a Worker off any machine a Worker runs on. Levels are enforced when hand-ins are kept apart from the channel (layout 2 or a recorded path); in a layout-1 project they are recorded and shown, and refuse nothing.
+
+**Moving a layout-1 root.** `ferry root migrate` is a dry run. `ferry root migrate --apply` moves each managed project (channel, hand-ins, Ferryman's own clone), repoints `bridge.toml` and Ferryman's Syncthing folder paths (ids kept, so nobody re-pairs), refuses a project with a running worker, lock or live worktree and says why, leaves stale worktrees under `work/` and lists them, deletes nothing (superseded files go to `_to_delete/`), logs to `logs/migrate-<UTC>.md`, and bumps the manifest to version 2 only when every managed project moved. It can be run again.
+
+A layout-1 root keeps working unchanged. The rest of this page describes layout 1 and the checks both share.
+
+## What each folder is for (layout 1)
 
 **`comms/`** holds one channel per project: orders, claims, results, the roster, the master's signed settings. It is plain files, and Syncthing carries it between your machines.
 
@@ -53,7 +86,7 @@ Before this rule, hand-ins were shared as a second folder, `<project>-work`, whi
 
 ## `ferry doctor --layout`
 
-Six checks. Each failing one prints the command that fixes it.
+Six checks in layout 1, eight in layout 2. Each failing one prints the command that fixes it.
 
 | Check | Passes when |
 |---|---|
@@ -62,7 +95,9 @@ Six checks. Each failing one prints the command that fixes it.
 | one worker | exactly one worker runs or is enabled on this machine |
 | service | that worker is a service, so a reboot or a closed terminal does not end it |
 | locks | no `worker-<agent>.lock` names a process that is gone |
-| syncthing | no configured Syncthing folder sits outside `comms/` |
+| syncthing | no configured Syncthing folder sits outside `comms/` (layout 2: outside `projects/<id>/comms` and `handins`) |
+| projects (layout 2) | a managed project has `repo/`, `comms/`, `handins/` and `work/`; a custom one has the paths it recorded. Custom is not a failure |
+| keys | no `secrets/` or `.env` is inside a synced folder, and no Worker-level agent on this machine has a write path into the channel (its hand-ins are separate, nothing of its is stray in `comms/`, its Syncthing folder is receive-only) |
 
 `--json` prints the same. `--fix` makes missing folders, runs `repos sync`, renames the locks of dead processes to `<name>.stale-<pid>` (never deleting them, and only after looking at the pid again) and stops Syncthing sharing strays Ferryman registered. It does not sign, enrol, revoke or release anything: those are the master's lines, and `ferry fleet setup` prints them.
 
