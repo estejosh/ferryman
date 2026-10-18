@@ -364,6 +364,11 @@ pub fn read_receipts(route: &ProjectRoute, order_id: &str) -> Result<Receipts> {
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
+        if let Some(worker) = from.as_deref()
+            && !crate::access::overlay_content_is_theirs(worker, name, text.as_bytes())
+        {
+            continue;
+        }
         if name.starts_with("delivered.")
             && let Ok(value) = serde_json::from_str::<OrderDelivered>(&text)
         {

@@ -1853,6 +1853,10 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
+            // And naming itself inside: a claim "from" somebody else is not its claim.
+            if !access::overlay_content_is_theirs(&worker, name, text.as_bytes()) {
+                continue;
+            }
             ingest(name, &text);
         }
     }

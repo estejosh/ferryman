@@ -136,19 +136,19 @@ struct Memory {
     agents: BTreeMap<String, AccessGrant>,
 }
 
-fn memory_path(channel: &Path, project_id: &str) -> Option<PathBuf> {
-    use sha2::{Digest, Sha256};
+/// Keyed by the project and not by where its channel is: `root migrate` moves the channel,
+/// and a memory keyed by the path would be forgotten by it, which is the rollback this
+/// memory exists to refuse.
+fn memory_path(_channel: &Path, project_id: &str) -> Option<PathBuf> {
     let dir = crate::licensing::machine_state_dir()?.join("access");
-    let place = fs::canonicalize(channel).unwrap_or_else(|_| channel.to_path_buf());
-    let digest = Sha256::digest(place.display().to_string().to_lowercase().as_bytes());
-    Some(dir.join(format!(
-        "{}-{}.json",
-        project_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
-            .collect::<String>(),
-        &hex::encode(digest)[..16]
-    )))
+    let id: String = project_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if id.is_empty() {
+        return None;
+    }
+    Some(dir.join(format!("{id}.json")))
 }
 
 fn read_memory(channel: &Path, project_id: &str) -> Memory {
@@ -158,7 +158,19 @@ fn read_memory(channel: &Path, project_id: &str) -> Memory {
         .unwrap_or_default()
 }
 
+static READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For the rest of this process, only look: what the machine remembers of the master's
+/// grants is not updated. `ferry access show` calls this so that showing never changes
+/// anything.
+pub fn read_only() {
+    READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn write_memory(channel: &Path, project_id: &str, memory: &Memory) {
+    if READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
     let Some(path) = memory_path(channel, project_id) else {
         return;
     };
@@ -237,46 +249,80 @@ pub fn grants(channel: &Path, project_id: &str) -> BTreeMap<String, AccessGrant>
 #[must_use]
 pub fn level_of(channel: &Path, project_id: &str, agent: &str) -> Level {
     let name = canonical_agent_name(agent);
-    if let Ok(roster) = crate::read_agent_roster(channel)
-        && let Ok(Some(master)) = crate::master::read_master_at(channel, &roster)
-        && canonical_agent_name(&master.master) == name
-    {
-        return Level::Orchestrator;
-    }
-    if let Some(grant) = grants(channel, project_id).get(&name) {
-        return grant.level;
-    }
-    if crate::head::current(channel, project_id)
+    resolve_levels(channel, project_id, std::slice::from_ref(&name))
+        .remove(&name)
+        .unwrap_or(Level::Member)
+}
+
+/// The level of each of `names` (canonical), computed once over one read of the channel.
+///
+/// Order: the master is Orchestrator; then the master's explicit grant; then the current
+/// head is Orchestrator; then a name the master has not admitted is a Worker as soon as the
+/// project has any Worker grant (the roster is unsigned and trusted on first use, so a
+/// Worker that registered a fresh name would otherwise start as a Member); else Member.
+fn resolve_levels(channel: &Path, project_id: &str, names: &[String]) -> BTreeMap<String, Level> {
+    let roster = crate::read_agent_roster(channel).unwrap_or_default();
+    let master = crate::master::read_master_at(channel, &roster)
         .ok()
         .flatten()
-        .is_some_and(|head| canonical_agent_name(&head.agent) == name)
-    {
-        return Level::Orchestrator;
-    }
-    Level::Member
+        .map(|declaration| canonical_agent_name(&declaration.master));
+    let grants = grants(channel, project_id);
+    let restrict = grants.values().any(|grant| grant.level == Level::Worker);
+    let admitted = if restrict {
+        crate::master::admitted_at(channel, &roster)
+    } else {
+        BTreeSet::new()
+    };
+    let head = crate::head::current(channel, project_id)
+        .ok()
+        .flatten()
+        .map(|head| canonical_agent_name(&head.agent));
+    names
+        .iter()
+        .map(|name| {
+            let level = if master.as_deref() == Some(name.as_str()) {
+                Level::Orchestrator
+            } else if let Some(grant) = grants.get(name) {
+                grant.level
+            } else if head.as_deref() == Some(name.as_str()) {
+                Level::Orchestrator
+            } else if restrict && !admitted.contains(name) {
+                Level::Worker
+            } else {
+                Level::Member
+            };
+            (name.clone(), level)
+        })
+        .collect()
 }
 
 /// Every level in the project, for the agents on the roster: explicit, or the default.
 #[must_use]
 pub fn levels(channel: &Path, project_id: &str) -> BTreeMap<String, Level> {
-    let mut out = BTreeMap::new();
-    for agent in crate::read_agent_roster(channel).unwrap_or_default() {
-        let name = canonical_agent_name(&agent.name);
-        let level = level_of(channel, project_id, &name);
-        out.insert(name, level);
-    }
-    out
+    let names: Vec<String> = crate::read_agent_roster(channel)
+        .unwrap_or_default()
+        .iter()
+        .map(|agent| canonical_agent_name(&agent.name))
+        .collect();
+    resolve_levels(channel, project_id, &names)
 }
 
-/// The canonical names of the agents that are Worker-level here.
+/// The canonical names of the agents that are Worker-level here: the master's explicit
+/// Worker grants, and any roster name the master has not admitted once a Worker exists.
 #[must_use]
 pub fn worker_agents(channel: &Path, project_id: &str) -> BTreeSet<String> {
-    grants(channel, project_id)
+    let mut names: BTreeSet<String> = grants(channel, project_id).into_keys().collect();
+    names.extend(
+        crate::read_agent_roster(channel)
+            .unwrap_or_default()
+            .iter()
+            .map(|agent| canonical_agent_name(&agent.name)),
+    );
+    let names: Vec<String> = names.into_iter().collect();
+    resolve_levels(channel, project_id, &names)
         .into_iter()
-        .filter(|(_, grant)| grant.level == Level::Worker)
+        .filter(|(_, level)| *level == Level::Worker)
         .map(|(name, _)| name)
-        // An explicit Worker grant never outranks the master, who signs it.
-        .filter(|name| level_of(channel, project_id, name) == Level::Worker)
         .collect()
 }
 
@@ -314,6 +360,34 @@ pub fn set_level(
     // Widening is held back with the rest of what a master with a failing anchor may do.
     if level != Level::Worker {
         crate::anchor::refuse_if_paused(route, master.name(), "widen access")?;
+    }
+    // The first Worker makes "on the roster" mean nothing (a name nobody admitted is a
+    // Worker from then on), so everyone already working here is admitted as a Member in
+    // the same step, signed, rather than demoted by it.
+    if level == Level::Worker
+        && !grants(channel, &route.project_id)
+            .values()
+            .any(|grant| grant.level == Level::Worker)
+    {
+        let admitted = crate::master::admitted_at(channel, &roster);
+        let head = crate::head::current(channel, &route.project_id)
+            .ok()
+            .flatten()
+            .map(|head| canonical_agent_name(&head.agent));
+        let held = grants(channel, &route.project_id);
+        for member in &roster {
+            let other = canonical_agent_name(&member.name);
+            if other == name
+                || other == canonical_agent_name(master.name())
+                || head.as_deref() == Some(other.as_str())
+                || held.contains_key(&other)
+                || admitted.contains(&other)
+                || !is_safe_component(&other)
+            {
+                continue;
+            }
+            set_level(route, master, &other, Level::Member)?;
+        }
     }
     let held = read_memory(channel, &route.project_id)
         .agents
@@ -454,26 +528,104 @@ pub fn overlay_dirs(channel: &Path, project_id: &str) -> Vec<(String, PathBuf)> 
             let dir = handins.join(&agent);
             (agent, dir)
         })
-        .filter(|(_, dir)| dir.is_dir())
+        // A link in the hand-ins folder is not followed: it could point anywhere.
+        .filter(|(_, dir)| crate::handin::is_real_dir(dir))
         .collect()
 }
 
-/// A file name's dot-separated words, lower case, without the extension.
+/// The kinds of file a channel names after the agent that wrote it (`claim.<agent>.json`,
+/// `heartbeat.<agent>.json`, `result.<agent>.001.json`, ...).
+const AGENT_FILE_KINDS: [&str; 13] = [
+    "claim",
+    "heartbeat",
+    "result",
+    "release",
+    "review",
+    "recommendation",
+    "offer",
+    "interrupt",
+    "delivered",
+    "read",
+    "presence",
+    "transports",
+    "ledger",
+];
+
+/// A file name's words, lower case, without the extension: its dot-separated segments, and
+/// for a segment that is a kind and an agent run together (`claim-wisp`, `heartbeat_wisp`)
+/// the agent part as well. Splitting every dash would turn the member `eng-nebra` into the
+/// worker `nebra`; only a segment that starts with a known kind is read that way.
 fn words(name: &str) -> Vec<String> {
     let stem = name
         .strip_suffix(".jsonl")
         .or_else(|| name.strip_suffix(".json"))
         .unwrap_or(name);
-    stem.split('.').map(str::to_ascii_lowercase).collect()
+    let mut out: Vec<String> = Vec::new();
+    for segment in stem.split('.') {
+        let segment = segment.to_ascii_lowercase();
+        for sep in ['-', '_'] {
+            if let Some((kind, rest)) = segment.split_once(sep)
+                && AGENT_FILE_KINDS.contains(&kind)
+                && !rest.is_empty()
+            {
+                out.push(rest.to_owned());
+            }
+        }
+        out.push(segment);
+    }
+    out
+}
+
+/// Keys that say who wrote a file or whose assertion it is.
+const AUTHOR_KEYS: [&str; 7] = [
+    "signed_by",
+    "sender",
+    "from",
+    "reviewer",
+    "releaser",
+    "offered_by",
+    "agent",
+];
+
+/// The author keys a value carries, as canonical names. `agent` counts only for a claim,
+/// heartbeat, result or receipt (elsewhere it names who a file is about: a grant, a roster entry).
+fn authors_in(value: &serde_json::Value, relative_name: &str) -> Vec<String> {
+    let name = relative_name.to_ascii_lowercase();
+    let about_self = ["claim", "heartbeat", "result", "delivered", "read"]
+        .iter()
+        .any(|kind| name.starts_with(kind));
+    AUTHOR_KEYS
+        .iter()
+        .filter(|key| **key != "agent" || about_self)
+        .filter_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+        .map(canonical_agent_name)
+        .collect()
+}
+
+/// The JSON values in a file's bytes: the document, or each line of a `.jsonl`.
+fn json_values(name: &str, bytes: &[u8]) -> Vec<serde_json::Value> {
+    if bytes.len() > 2 * 1024 * 1024 {
+        return Vec::new();
+    }
+    if name.to_ascii_lowercase().ends_with(".jsonl") {
+        return bytes
+            .split(|b| *b == b'\n')
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect();
+    }
+    serde_json::from_slice(bytes).ok().into_iter().collect()
 }
 
 /// Whether the file at `relative` (channel-relative, `/`-separated) is authored by one of the
 /// `workers`, and so is not to be accepted from a channel. Returns the worker it names.
 ///
-/// By name: a file called `claim.<w>.json`, `result.<w>.001.json`, `<w>.json`,
-/// `ledger.<w>.jsonl` (any word of the file name, outside the folders that are *about* an
-/// agent and not by it). And by content when `bytes` are given: a JSON file whose `signed_by`
-/// or `sender` is a worker.
+/// By name: a file called `claim.<w>.json`, `claim-<w>.json`, `result.<w>.001.json`,
+/// `<w>.json`, `ledger.<w>.jsonl` (any word of the file name, outside the folders that are
+/// *about* an agent and not by it). And by content when `bytes` are
+/// given: a JSON document, or any line of a JSONL file, whose `signed_by`, `sender`, `from`,
+/// `reviewer`, `releaser` or `offered_by` - or, for a claim, heartbeat or result, `agent` -
+/// is a worker. A file in `grants/` or `access/` is the master's statement about an agent,
+/// so only its `signed_by` counts.
 #[must_use]
 pub fn comms_author_refused(
     relative: &str,
@@ -489,35 +641,111 @@ pub fn comms_author_refused(
     // About an agent, written by someone else: the roster entry, the master's grants and
     // levels, device records.
     let about = matches!(first, "agents" | "grants" | "access" | "devices");
-    if !about
-        && let Some(name) = lower.rsplit('/').next()
-        && let Some(worker) = words(name).iter().find(|word| workers.contains(*word))
-    {
+    let file_name = lower.rsplit('/').next().unwrap_or_default();
+    if !about && let Some(worker) = words(file_name).iter().find(|word| workers.contains(*word)) {
         return Some(worker.clone());
     }
-    if let Some(bytes) = bytes
-        && bytes.len() <= 2 * 1024 * 1024
-        && let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes)
-    {
-        for key in ["signed_by", "sender", "from"] {
-            if let Some(who) = value.get(key).and_then(serde_json::Value::as_str) {
-                let who = canonical_agent_name(who);
+    if let Some(bytes) = bytes {
+        for value in json_values(file_name, bytes) {
+            for who in authors_in(&value, file_name) {
                 if workers.contains(&who) && !about {
                     return Some(who);
                 }
+            }
+            if about
+                && let Some(who) = value.get("signed_by").and_then(serde_json::Value::as_str)
+                && workers.contains(&canonical_agent_name(who))
+            {
+                return Some(canonical_agent_name(who));
             }
         }
     }
     None
 }
 
-/// Whether a channel-relative path in a worker's overlay folder is the worker's own: the
-/// folder holds only what that worker wrote, so a file named for another agent (a claim in
-/// someone else's name) is not accepted from it.
+/// The roster names that are Workers only because the master has not admitted them (no
+/// grant of theirs): a fresh name a Worker registered. Empty unless the project keeps
+/// hand-ins apart from the channel and has a Worker.
+#[must_use]
+pub fn unadmitted_names(channel: &Path, project_id: &str) -> BTreeSet<String> {
+    let workers = refused_authors(channel, project_id);
+    if workers.is_empty() {
+        return workers;
+    }
+    let granted = grants(channel, project_id);
+    workers
+        .into_iter()
+        .filter(|name| !granted.contains_key(name))
+        .collect()
+}
+
+/// Whether `relative` is a roster entry or device record (`agents/<name>.json`,
+/// `devices/<name>...`) for one of the `unadmitted` names: a registration nobody admitted,
+/// which neither goes out nor comes in. The roster is unsigned and trusted on first use, so
+/// this is what keeps a fresh name from spreading. A Worker the master did grant keeps its
+/// own entry (its key has to be known to check what it hands in).
+#[must_use]
+pub fn roster_write_refused(relative: &str, unadmitted: &BTreeSet<String>) -> Option<String> {
+    if unadmitted.is_empty() {
+        return None;
+    }
+    let lower = relative.to_ascii_lowercase();
+    let mut parts = lower.split('/');
+    if !matches!(parts.next(), Some("agents" | "devices")) {
+        return None;
+    }
+    let name = lower.rsplit('/').next()?;
+    let stem = name.split('.').next()?;
+    unadmitted.contains(stem).then(|| stem.to_owned())
+}
+
+/// Whether a file in a worker's overlay folder is the worker's own, by name: the folder holds
+/// only what that worker wrote, so a file in someone else's name (a claim as `victim`), or
+/// in more than one (`claim.wisp.victim.json`), is not accepted from it. The agent is the
+/// segment after the kind (`claim.<agent>...`), else the first (`<agent>.json`); what follows
+/// it may only be a number (a revision).
 #[must_use]
 pub fn overlay_file_is_theirs(agent: &str, file_name: &str) -> bool {
     let agent = canonical_agent_name(agent);
-    words(&file_name.to_ascii_lowercase()).contains(&agent)
+    let lower = file_name.to_ascii_lowercase();
+    let stem = lower
+        .strip_suffix(".jsonl")
+        .or_else(|| lower.strip_suffix(".json"))
+        .unwrap_or(&lower);
+    let segments: Vec<&str> = stem.split('.').collect();
+    let (named, rest): (String, &[&str]) = match segments.split_first() {
+        Some((kind, rest)) if AGENT_FILE_KINDS.contains(kind) && !rest.is_empty() => {
+            (rest[0].to_owned(), &rest[1..])
+        }
+        Some((first, rest)) => {
+            // `claim-wisp.json`: a kind and an agent run together.
+            let joined = ['-', '_'].iter().find_map(|sep| {
+                first
+                    .split_once(*sep)
+                    .filter(|(kind, tail)| AGENT_FILE_KINDS.contains(kind) && !tail.is_empty())
+                    .map(|(_, tail)| tail.to_owned())
+            });
+            (joined.unwrap_or_else(|| (*first).to_owned()), rest)
+        }
+        None => return false,
+    };
+    named == agent
+        && rest
+            .iter()
+            .all(|segment| !segment.is_empty() && segment.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether what is inside a worker's overlay file is the worker's too: every author key it
+/// carries (`signed_by`, `sender`, `from`, `reviewer`, `releaser`, `offered_by`, and for a
+/// claim, heartbeat or result `agent`), in the document or on any line of a JSONL file,
+/// names that worker. Binding the author to the folder is what stops a worker writing a
+/// claim "from" somebody else into its own hand-ins.
+#[must_use]
+pub fn overlay_content_is_theirs(agent: &str, file_name: &str, bytes: &[u8]) -> bool {
+    let agent = canonical_agent_name(agent);
+    json_values(file_name, bytes)
+        .iter()
+        .all(|value| authors_in(value, file_name).iter().all(|who| *who == agent))
 }
 
 /// Move the files a Worker-level agent wrote into the channel, out of it, into
@@ -897,6 +1125,61 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_that_registers_a_new_key_is_still_a_worker_until_the_master_admits_it() {
+        let f = fixture();
+        let channel = &f.route.communications;
+        set_level(&f.route, &f.master, "wisp", Level::Worker).unwrap();
+        // fang was working here before the first Worker; it was admitted, not demoted.
+        assert_eq!(level_of(channel, "demo", "fang"), Level::Member);
+
+        // The Worker writes a roster entry under a fresh name with a fresh key.
+        let alias = AgentIdentity::from_seed("wisp-two", [10u8; 32]);
+        enrol(&f.route, &alias, "worker");
+        assert_eq!(level_of(channel, "demo", "wisp-two"), Level::Worker);
+        let workers = refused_authors(channel, "demo");
+        assert!(workers.contains("wisp-two"), "{workers:?}");
+        // Both the registration and a write to the channel are refused on the way in.
+        let unadmitted = unadmitted_names(channel, "demo");
+        assert_eq!(unadmitted, BTreeSet::from(["wisp-two".to_owned()]));
+        assert!(roster_write_refused("agents/wisp-two.json", &unadmitted).is_some());
+        assert!(roster_write_refused("devices/wisp-two.json", &unadmitted).is_some());
+        // The granted Worker keeps its own roster entry: its key is how its hand-ins verify.
+        assert!(roster_write_refused("agents/wisp.json", &unadmitted).is_none());
+        assert!(comms_author_refused("tasks/t-1/claim.wisp-two.json", None, &workers).is_some());
+        let signed = br#"{"signed_by":"wisp-two"}"#;
+        assert!(comms_author_refused("grants/wisp-two.json", Some(signed), &workers).is_some());
+        assert!(comms_author_refused("access/wisp-two.json", Some(signed), &workers).is_some());
+
+        // The master admits it (a signed grant) and it is a Member from then on.
+        crate::master::grant_member(
+            &f.route,
+            &f.master,
+            "wisp-two",
+            &alias.public_key_hex(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(level_of(channel, "demo", "wisp-two"), Level::Member);
+    }
+
+    #[test]
+    fn what_the_machine_remembers_follows_the_project_not_the_channels_place() {
+        let f = fixture();
+        let elsewhere = f.root.path.join("projects/demo/moved");
+        assert_eq!(
+            memory_path(&f.route.communications, "demo"),
+            memory_path(&elsewhere, "demo"),
+            "root migrate moves the channel; the anti-replay memory must not be forgotten by it"
+        );
+        assert_ne!(
+            memory_path(&f.route.communications, "demo"),
+            memory_path(&f.route.communications, "other")
+        );
+    }
+
+    #[test]
     fn a_grant_must_be_signed_by_the_master() {
         let f = fixture();
         let channel = &f.route.communications;
@@ -1023,6 +1306,59 @@ mod tests {
         assert!(
             comms_author_refused("tasks/t-1/claim.wisp.json", None, &BTreeSet::new()).is_none()
         );
+    }
+
+    #[test]
+    fn the_author_is_bound_to_the_name_the_content_and_the_folder() {
+        let workers = BTreeSet::from(["wisp".to_owned()]);
+        // Dashes and underscores between a kind and an agent are not a way round the name.
+        for refused in [
+            "tasks/t-1/claim-wisp.json",
+            "tasks/t-1/heartbeat_wisp.json",
+            "tasks/t-1/RESULT.Wisp.001.json",
+        ] {
+            assert!(
+                comms_author_refused(refused, None, &workers).is_some(),
+                "{refused}"
+            );
+        }
+        // A member whose name merely ends in a worker's is not caught by it.
+        let nebra = BTreeSet::from(["nebra".to_owned()]);
+        assert!(comms_author_refused("presence/eng-nebra.json", None, &nebra).is_none());
+        assert!(comms_author_refused("tasks/t-1/claim.eng-nebra.json", None, &nebra).is_none());
+
+        // The claim's own agent field counts, whatever the file is called.
+        let claim = br#"{"order_id":"t-1","agent":"wisp"}"#;
+        assert!(
+            comms_author_refused("tasks/t-1/claim.victim.json", Some(claim), &workers).is_some()
+        );
+        // A JSONL file is judged line by line.
+        let lines = b"{\"kind\":\"x\",\"actor\":\"fang\"}\n{\"sender\":\"wisp\"}\n";
+        assert!(comms_author_refused("notes/log.jsonl", Some(lines), &workers).is_some());
+        let fine = b"{\"sender\":\"fang\"}\n";
+        assert!(comms_author_refused("notes/log.jsonl", Some(fine), &workers).is_none());
+
+        // In a worker's own folder: its name and only its name, then at most a revision.
+        assert!(overlay_file_is_theirs("wisp", "claim.wisp.json"));
+        assert!(overlay_file_is_theirs("wisp", "result.wisp.001.json"));
+        assert!(overlay_file_is_theirs("wisp", "claim-wisp.json"));
+        assert!(overlay_file_is_theirs("wisp", "ledger.wisp.jsonl"));
+        assert!(!overlay_file_is_theirs("wisp", "claim.victim.json"));
+        assert!(!overlay_file_is_theirs("wisp", "claim.wisp.victim.json"));
+        assert!(!overlay_file_is_theirs("wisp", "claim.victim.wisp.json"));
+        assert!(!overlay_file_is_theirs("wisp", "order.json"));
+        // And the name inside has to agree with the folder.
+        assert!(overlay_content_is_theirs("wisp", "claim.wisp.json", claim));
+        assert!(!overlay_content_is_theirs(
+            "wisp",
+            "claim.wisp.json",
+            br#"{"agent":"victim"}"#
+        ));
+        assert!(!overlay_content_is_theirs(
+            "wisp",
+            "ledger.wisp.jsonl",
+            b"{\"signed_by\":\"wisp\"}\n{\"signed_by\":\"victim\"}\n"
+        ));
     }
 
     #[test]

@@ -284,11 +284,25 @@ impl Lane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
+        let mut channel_rules = Rules::for_channel(channel);
+        if handins_elsewhere {
+            // `handins/` in the channel is the old layout's; the project's hand-ins are
+            // exchanged as their own share, so an unmigrated peer cannot re-create it here.
+            channel_rules = channel_rules.excluding("handins/");
+        }
         let mut shares = vec![Share {
             key: id.clone(),
             dir: channel.clone(),
-            rules: Rules::for_channel(channel)
-                .refusing_authors(access::refused_authors(channel, id)),
+            rules: channel_rules
+                .refusing_authors(access::refused_authors(channel, id))
+                .refusing_roster(access::unadmitted_names(channel, id))
+                // A peer whose agents are all Workers writes its hand-ins, never the channel.
+                .refusing_incoming(access::machine_is_worker_only(
+                    channel,
+                    id,
+                    &peer.agents.iter().cloned().collect::<Vec<_>>(),
+                )),
             send: !access::machine_is_worker_only(channel, id, &local),
         }];
         let handins = ferry::handins_dir_for(channel, id);

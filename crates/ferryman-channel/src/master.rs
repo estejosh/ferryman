@@ -463,6 +463,58 @@ pub fn member_grants(route: &ProjectRoute) -> Result<Vec<(MasterGrant, Signature
     Ok(grants)
 }
 
+/// The canonical names of the agents the master has admitted to the channel: those with a
+/// `grants/<name>.json` that verifies as the master's and has no valid revocation beside
+/// it. The roster itself is unsigned and trusted on first use, so being on it admits nobody.
+#[must_use]
+pub fn admitted_at(
+    communications: &Path,
+    roster: &[AgentRoute],
+) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    let Ok(Some(declaration)) = read_master_at(communications, roster) else {
+        return out;
+    };
+    let Some(master) = roster
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(&declaration.master))
+    else {
+        return out;
+    };
+    let Ok(entries) = fs::read_dir(communications.join("grants")) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let Some(grant) = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<MasterGrant>(&text).ok())
+        else {
+            continue;
+        };
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        if !stem.eq_ignore_ascii_case(&grant.grantee) {
+            continue;
+        }
+        let valid = check_signature(
+            grant.signed_by.as_ref(),
+            grant.signature.as_ref(),
+            &grant_payload(&grant),
+            std::slice::from_ref(master),
+        ) == SignatureCheck::Valid;
+        if valid && !is_revoked_in(communications, roster, &grant.grantee) {
+            out.insert(grant.grantee.to_ascii_lowercase());
+        }
+    }
+    out
+}
+
 /// A master-signed statement that a member's access has ended.
 ///
 /// Kept beside the grant rather than deleting it: the history should say who had

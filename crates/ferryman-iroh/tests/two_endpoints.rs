@@ -438,9 +438,12 @@ async fn a_workers_channel_files_are_refused_on_arrival_by_name_and_by_content()
     assert!(!a.join("tasks/t-1/claim.wisp.json").exists(), "by name");
     assert!(!a.join("presence/wisp.json").exists(), "by name");
     assert!(!a.join("messages/demo/m-1.json").exists(), "by content");
-    assert_eq!(
-        fs::read_to_string(a.join("notes/readme.txt")).unwrap(),
-        "ok"
+    // A knows B's agents are all Workers, so nothing B offers into the channel is let in,
+    // innocent or not: its writes belong in its hand-ins, and a Worker that registered a
+    // fresh name could not talk its way round the file-by-file rules.
+    assert!(
+        !a.join("notes/readme.txt").exists(),
+        "a Worker-only peer writes nothing into the channel"
     );
 }
 

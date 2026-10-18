@@ -83,6 +83,12 @@ pub struct Rules {
     /// Hand-ins folders only: `accepted.json` and `rejected.json` are the head's alone, so
     /// from a peer that is not the head they are neither wanted nor let in.
     no_verdicts: bool,
+    /// Nothing is let in from the peer: it is a machine whose agents are all Workers, whose
+    /// writes belong in the hand-ins folder and not in the channel (ADR 0024).
+    no_incoming: bool,
+    /// Roster entries and device records for names the master has not admitted (a fresh
+    /// name a Worker registered): neither carried nor let in.
+    refused_roster: std::collections::BTreeSet<String>,
 }
 
 /// The head's verdict files, written beside a hand-in.
@@ -101,6 +107,29 @@ impl Rules {
     #[must_use]
     pub fn refusing_verdicts(mut self, refuse: bool) -> Self {
         self.no_verdicts = refuse;
+        self
+    }
+
+    /// Also keep `pattern` (anchored at the folder, `/`-separated) where it is. For a
+    /// channel in a project whose hand-ins live elsewhere: a `handins/` folder in the
+    /// channel is a leftover of the old layout, and an unmigrated peer must not re-create it.
+    #[must_use]
+    pub fn excluding(mut self, pattern: &str) -> Self {
+        self.patterns.push(pattern.to_ascii_lowercase());
+        self
+    }
+
+    /// Refuse the roster entries and device records of these unadmitted names.
+    #[must_use]
+    pub fn refusing_roster(mut self, unadmitted: std::collections::BTreeSet<String>) -> Self {
+        self.refused_roster = unadmitted;
+        self
+    }
+
+    /// Let nothing in from the peer (a channel shared with a Worker-only machine).
+    #[must_use]
+    pub fn refusing_incoming(mut self, refuse: bool) -> Self {
+        self.no_incoming = refuse;
         self
     }
 
@@ -132,6 +161,8 @@ impl Rules {
             patterns,
             refused_authors: std::collections::BTreeSet::new(),
             no_verdicts: false,
+            no_incoming: false,
+            refused_roster: std::collections::BTreeSet::new(),
         }
     }
 
@@ -141,6 +172,7 @@ impl Rules {
     #[must_use]
     pub fn excludes_incoming(&self, path: &str) -> bool {
         self.excludes(path)
+            || self.no_incoming
             || (self.no_verdicts
                 && path.rsplit('/').next().is_some_and(|name| {
                     VERDICT_FILES.contains(&name.to_ascii_lowercase().as_str())
@@ -159,6 +191,9 @@ impl Rules {
             && ferryman_channel::access::comms_author_refused(path, None, &self.refused_authors)
                 .is_some()
         {
+            return true;
+        }
+        if ferryman_channel::access::roster_write_refused(path, &self.refused_roster).is_some() {
             return true;
         }
         self.patterns.iter().any(|pattern| {
@@ -540,6 +575,23 @@ mod tests {
             &no_rules(),
         );
         assert!(plan.want.is_empty(), "{:?}", plan.want);
+    }
+
+    #[test]
+    fn a_worker_only_peer_writes_nothing_into_the_channel_and_handins_stay_out_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = Rules::for_channel(dir.path())
+            .excluding("handins/")
+            .refusing_incoming(true);
+        // Whatever it offers is not let in, however innocent it looks.
+        assert!(rules.excludes_incoming("tasks/t-1/order.json"));
+        assert!(rules.excludes_incoming("agents/wisp-two.json"));
+        // The old layout's hand-ins folder is not carried in either direction.
+        assert!(rules.excludes("handins/wisp/o1/handin.json"));
+        // A peer that is not Worker-only is let in as before.
+        let open = Rules::for_channel(dir.path()).excluding("handins/");
+        assert!(!open.excludes_incoming("tasks/t-1/order.json"));
+        assert!(open.excludes_incoming("handins/x/y.json"));
     }
 
     #[test]
