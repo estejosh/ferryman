@@ -18,6 +18,7 @@ pub mod anchor;
 pub mod ask;
 pub mod automerge;
 pub mod capability;
+pub mod compaction;
 pub mod contract;
 pub mod conversation;
 pub mod cost;
@@ -4368,6 +4369,8 @@ pub fn route_for(start: &Path) -> Result<ProjectRoute> {
 
 pub fn is_acknowledged(route: &ProjectRoute, message_id: &str) -> bool {
     acknowledgement_path(route, message_id).is_file()
+        // A compacted message's acknowledgement went into the archive with it.
+        || compaction::find(route, message_id).is_some_and(|archived| archived.acknowledged())
 }
 
 fn outbox_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
@@ -7269,14 +7272,61 @@ pub fn read_message(route: &ProjectRoute, message_id: &str) -> Result<Message> {
         .join("messages")
         .join(&route.project_id)
         .join(format!("{message_id}.json"));
-    let message: Message = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read message {message_id}"))?,
-    )?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        // Compacted: the archive keeps the file text it had.
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match compaction::find(route, message_id) {
+                Some(archived) => archived.raw.into_bytes(),
+                None => return Err(error).with_context(|| format!("read message {message_id}")),
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("read message {message_id}")),
+    };
+    let message: Message = serde_json::from_slice(&bytes)?;
     message.validate()?;
     if message.project_id != route.project_id {
         bail!("stored message belongs to another project")
     }
     Ok(message)
+}
+
+/// [`list_messages`] and the messages compaction moved into the archive, oldest first.
+pub fn list_messages_with_archive(route: &ProjectRoute) -> Result<Vec<Message>> {
+    let mut messages = list_messages(route)?;
+    let known: std::collections::HashSet<String> =
+        messages.iter().map(|message| message.id.clone()).collect();
+    // The archive is held to the same rule as the inbox: a Worker's words are not the channel's.
+    let refused = access::refused_authors(&route.communications, &route.project_id);
+    messages.extend(
+        compaction::archived_v1(route)
+            .into_iter()
+            .filter(|message| {
+                !known.contains(&message.id)
+                    && !refused.contains(&canonical_agent_name(&message.sender))
+            }),
+    );
+    messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    Ok(messages)
+}
+
+/// [`list_messages_v2`] and the archived v2 messages, sorted by ID.
+pub fn list_messages_v2_with_archive(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
+    let mut messages = list_messages_v2(route)?;
+    let known: std::collections::HashSet<String> =
+        messages.iter().map(|message| message.id.clone()).collect();
+    // The archive is held to the same rule as the inbox: a Worker's words are not the channel's.
+    let refused = access::refused_authors(&route.communications, &route.project_id);
+    messages.extend(
+        compaction::archived_v2(route)
+            .into_iter()
+            .filter(|message| {
+                !known.contains(&message.id)
+                    && !refused.contains(&canonical_agent_name(&message.sender))
+            }),
+    );
+    messages.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(messages)
 }
 
 pub fn list_messages(route: &ProjectRoute) -> Result<Vec<Message>> {
@@ -7362,6 +7412,11 @@ pub fn find_message_by_idempotency_key(
             Some(_) => {}
             None => found = Some(message),
         }
+    }
+    if found.is_none() {
+        found = compaction::archived_v1(route)
+            .into_iter()
+            .find(|message| message.idempotency_key == idempotency_key);
     }
     Ok(found)
 }
@@ -7540,10 +7595,20 @@ pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<Message
         .join("messages")
         .join(&route.project_id)
         .join(format!("{message_id}.json"));
-    let message: MessageV2 = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read v2 message {message_id}"))?,
-    )
-    .with_context(|| format!("parse v2 message {message_id}"))?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match compaction::find(route, message_id) {
+                Some(archived) => archived.raw.into_bytes(),
+                None => {
+                    return Err(error).with_context(|| format!("read v2 message {message_id}"));
+                }
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("read v2 message {message_id}")),
+    };
+    let message: MessageV2 =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse v2 message {message_id}"))?;
     validate_v2_message(&message)?;
     if message.project_id != route.project_id {
         bail!("stored message belongs to another project")

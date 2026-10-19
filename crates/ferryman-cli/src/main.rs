@@ -1641,6 +1641,27 @@ enum Channel {
         #[arg(long)]
         task: Option<String>,
     },
+    /// Roll old acknowledged messages into the channel's archive.
+    ///
+    /// Only the channel's head agent, or its master when it has none, compacts. Messages
+    /// older than the master's `--archive-after-days` (30 unless set, see `ferry channel
+    /// files policy`) that were acknowledged go into one file per month per thread under
+    /// `archive/`, with the original signed text. A signed record is written first, and
+    /// originals are removed on a later pass, after the grace, once the archive is seen to
+    /// hold them. `ferry channel log` and `ferry channel inbox --all` still show them.
+    Compact {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Say what would happen, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Hours a signed record must age before the originals it covers are removed.
+        #[arg(long, default_value_t = 24)]
+        grace_hours: u32,
+        /// Who is compacting. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
     /// Everything that has happened in this channel, oldest last.
     ///
     /// Orders, claims, results, reviews and messages, merged into one timeline with
@@ -1825,6 +1846,9 @@ enum FilesCommand {
         /// Days files stay once their order is done or reviewed (default 7).
         #[arg(long, value_name = "DAYS")]
         retention_days: Option<u32>,
+        /// Days after which an acknowledged message is rolled into the archive (default 30).
+        #[arg(long, value_name = "DAYS")]
+        archive_after_days: Option<u32>,
         /// Who is signing. Defaults to this machine's name.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
@@ -10465,11 +10489,16 @@ fn files_command(route: &ferryman_channel::ProjectRoute, command: FilesCommand) 
             max_file_mb,
             max_order_mb,
             retention_days,
+            archive_after_days,
             agent,
         } => {
             let (mut policy, _) =
                 ferryman_channel::policy::effective(&route.communications, &route.project_id);
-            if max_file_mb.is_none() && max_order_mb.is_none() && retention_days.is_none() {
+            if max_file_mb.is_none()
+                && max_order_mb.is_none()
+                && retention_days.is_none()
+                && archive_after_days.is_none()
+            {
                 let limits = order_files::limits(route);
                 let mb = |bytes: u64| bytes / (1024 * 1024);
                 println!("per file     {} MB", mb(limits.max_file));
@@ -10478,8 +10507,14 @@ fn files_command(route: &ferryman_channel::ProjectRoute, command: FilesCommand) 
                     "kept         {} days after the order is done or reviewed",
                     limits.retention_days
                 );
+                println!(
+                    "archived     acknowledged messages after {} days",
+                    ferryman_channel::compaction::archive_after_days(route)
+                );
                 return Ok(());
             }
+            policy.files.archive_after_days =
+                archive_after_days.or(policy.files.archive_after_days);
             policy.files.max_file_mb = max_file_mb.or(policy.files.max_file_mb);
             policy.files.max_order_mb = max_order_mb.or(policy.files.max_order_mb);
             policy.files.retention_days = retention_days.or(policy.files.retention_days);
@@ -10962,7 +10997,11 @@ fn channel(command: Channel) -> Result<()> {
                     }
                 )
             }
-            let messages = ferryman_channel::list_messages(&route)?;
+            let messages = if all {
+                ferryman_channel::list_messages_with_archive(&route)?
+            } else {
+                ferryman_channel::list_messages(&route)?
+            };
             let mine: Vec<_> = messages
                 .into_iter()
                 // Case-insensitive against what is STORED: messages written before names
@@ -11659,6 +11698,43 @@ fn channel(command: Channel) -> Result<()> {
             }
         }
 
+        Channel::Compact {
+            workspace,
+            dry_run,
+            grace_hours,
+            agent,
+        } => {
+            let route = here(workspace)?;
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
+            let report = ferryman_channel::compaction::compact(
+                &route,
+                &identity,
+                chrono::Utc::now(),
+                chrono::Duration::hours(i64::from(grace_hours)),
+                dry_run,
+            )?;
+            let (archive, remove) = if dry_run {
+                ("would archive", "would remove")
+            } else {
+                ("archived", "removed")
+            };
+            if let Some(cutoff) = report.cutoff {
+                println!(
+                    "messages acknowledged before {} are archived",
+                    cutoff.format("%Y-%m-%d")
+                );
+            }
+            println!("{archive} {} message(s)", report.archived.len());
+            if let Some(record) = &report.record {
+                println!("signed record {}", record.display());
+            }
+            println!("{remove} {} original(s)", report.removed.len());
+            for (id, why) in &report.kept {
+                println!("kept {id}: {why}");
+            }
+        }
+
         Channel::Log { workspace, limit } => {
             let route = here(workspace)?;
             // This used to print messages only. The channel's actual history is its
@@ -11723,7 +11799,7 @@ fn channel(command: Channel) -> Result<()> {
                     ));
                 }
             }
-            for message in ferryman_channel::list_messages(&route)? {
+            for message in ferryman_channel::list_messages_with_archive(&route)? {
                 entries.push((
                     message.created_at,
                     format!(

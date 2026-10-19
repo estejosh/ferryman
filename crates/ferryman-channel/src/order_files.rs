@@ -1957,6 +1957,7 @@ mod tests {
                 max_file_mb: Some(10),
                 max_order_mb: Some(30),
                 retention_days: Some(2),
+                ..Default::default()
             },
             ..crate::policy::Policy::default()
         };
@@ -1987,6 +1988,7 @@ mod tests {
                 max_file_mb: Some(100),
                 max_order_mb: Some(10),
                 retention_days: None,
+                ..Default::default()
             },
             ..crate::policy::Policy::default()
         };

@@ -542,6 +542,10 @@ pub struct FileLimits {
     /// Days after an order is done or reviewed that its files stay in the channel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u32>,
+    /// Days after which an acknowledged message is rolled into the channel's archive. See
+    /// [`crate::compaction`]. 30 when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_after_days: Option<u32>,
 }
 
 impl FileLimits {
@@ -571,6 +575,11 @@ impl FileLimits {
             && !(1..=3650).contains(&days)
         {
             bail!("files must be kept for 1 to 3650 days");
+        }
+        if let Some(days) = self.archive_after_days
+            && !(1..=3650).contains(&days)
+        {
+            bail!("messages must be archived after 1 to 3650 days");
         }
         Ok(())
     }
