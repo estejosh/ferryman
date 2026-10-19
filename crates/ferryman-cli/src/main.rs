@@ -3945,6 +3945,19 @@ enum Memory {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Take the agent profiles written before profiles were bound to a project into this
+    /// project, re-signing each for it.
+    ///
+    /// A profile from that time says nothing about which project it belongs to, so a
+    /// project does not trust one until its operator adopts it. Only the project's master
+    /// does this, on a machine that holds the agent's own key; a profile whose signature
+    /// does not hold, or whose key is elsewhere, is left as it is and named.
+    AdoptV1 {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
 }
 #[derive(Subcommand, Clone)]
 enum Artifacts {
@@ -5268,6 +5281,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?
             }
+            Memory::AdoptV1 { project, workspace } => adopt_v1_profiles(workspace, &project)?,
         },
         Command::Artifacts { command } => match command {
             Artifacts::List { project, job } => {
@@ -10027,6 +10041,65 @@ fn record_agent_profile(
     ferryman_channel::memory::append_agent_profile_for(bank, project_id, agent, &line, identity)
         .with_context(|| format!("append to {}", path.display()))?;
     let _ = ferryman_channel::memory::regenerate_roster(bank);
+/// `ferry memory adopt-v1`: re-sign this project's v1 agent profiles for the project.
+fn adopt_v1_profiles(workspace: Option<PathBuf>, project: &str) -> Result<()> {
+    let start = match workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    let route = ferryman_channel::route_for(&start)?;
+    if !route.project_id.eq_ignore_ascii_case(project) {
+        bail!(
+            "this folder belongs to project '{}', not '{project}'; run it from {project}'s",
+            route.project_id
+        );
+    }
+    let me = ferryman_ops::identity::resolve(None, &route.attachment)?;
+    match ferryman_channel::master::read_master(&route)? {
+        Some(master) if master.master.eq_ignore_ascii_case(&me) => {}
+        Some(master) => bail!(
+            "only the project's operator adopts profiles: {} is its master, this machine is {me}",
+            master.master
+        ),
+        None => bail!("{project} has no master, so nobody can adopt its profiles"),
+    }
+    let Some(bank) = ferryman_channel::memory::memory_bank_checked(&route) else {
+        bail!("{project}'s memory bank is not inside its channel, so it is not used");
+    };
+    let mut adopted = 0;
+    for (agent, _) in ferryman_channel::memory::list_agent_profiles(&bank) {
+        if ferryman_channel::memory::verify_agent_profile_for(
+            &bank,
+            &route.project_id,
+            &agent,
+            &route.agents,
+        ) == ferryman_channel::SignatureCheck::Valid
+        {
+            continue; // already this project's
+        }
+        let Some(identity) =
+            ferryman_channel::AgentIdentity::load_existing(&agent, &route.attachment)?
+        else {
+            println!("skipped {agent}: this machine does not hold its key");
+            continue;
+        };
+        if ferryman_channel::memory::adopt_v1_profile(
+            &bank,
+            &route.project_id,
+            &agent,
+            &route.agents,
+            &identity,
+        )? {
+            adopted += 1;
+            println!("adopted {agent}");
+        } else {
+            println!("skipped {agent}: not a v1 profile with a valid signature");
+        }
+    }
+    println!("adopted {adopted} profile(s) into {project}");
+    Ok(())
+}
+
     Ok(())
 }
 

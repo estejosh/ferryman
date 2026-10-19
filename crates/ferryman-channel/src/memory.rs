@@ -57,7 +57,9 @@ pub struct ProfileAttestation {
     /// The project whose channel this profile is signed for (format v2). One agent key is on
     /// every roster of a fleet worker's projects, so without this a profile copied from one
     /// project's memory bank into another's verified there and reached its prompts. Absent
-    /// in v1 profiles, which older workers wrote and which still read as before.
+    /// in v1 profiles, which older workers wrote. A v1 profile says nothing about which
+    /// project it belongs to, so inside a project it is not trusted until an operator
+    /// adopts it ([`adopt_v1_profile`]); the project-less check still reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     pub signed_by: Option<String>,
@@ -173,7 +175,8 @@ pub fn verify_agent_profile(bank: &Path, agent: &str, roster: &[AgentRoute]) -> 
 
 /// [`verify_agent_profile`] for the profile of `project_id`'s channel: a v2 profile signed
 /// for another project is `Invalid` here, whoever signed it. A v1 profile has no project in
-/// it and is judged as it always was.
+/// it, so it could have been copied from any channel; here it is `Unsigned` until
+/// [`adopt_v1_profile`] re-signs it for this project.
 #[must_use]
 pub fn verify_agent_profile_for(
     bank: &Path,
@@ -200,7 +203,9 @@ fn verify_profile(
         return SignatureCheck::Invalid;
     };
     match (attestation.format.as_str(), &attestation.project_id) {
-        (ATTESTATION_FORMAT, None) => {}
+        // The project-less check only: inside a project a v1 profile proves no link to it.
+        (ATTESTATION_FORMAT, None) if project_id.is_none() => {}
+        (ATTESTATION_FORMAT, None) => return SignatureCheck::Unsigned,
         // Signed for a project: only that project's bank may use it.
         (ATTESTATION_FORMAT_V2, Some(signed_for)) if project_id == Some(signed_for.as_str()) => {}
         _ => return SignatureCheck::Invalid,
@@ -265,16 +270,42 @@ pub fn memory_bank_dir(route: &ProjectRoute) -> PathBuf {
 #[must_use]
 pub fn memory_bank_checked(route: &ProjectRoute) -> Option<PathBuf> {
     let bank = memory_bank_dir(route);
-    let Ok(channel) = std::fs::canonicalize(&route.communications) else {
-        return Some(bank);
-    };
+    // If the channel cannot be resolved there is nothing to compare the bank against, and
+    // a bank that cannot be shown to be inside it is not used.
+    let channel = std::fs::canonicalize(&route.communications).ok()?;
     for folder in [bank.clone(), bank.join("agents")] {
+        if is_link(&folder) {
+            return None;
+        }
         match std::fs::canonicalize(&folder) {
             Ok(real) if !real.starts_with(&channel) => return None,
-            _ => {}
+            Ok(_) => {}
+            // Not made yet: it will be made in place.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
     }
     Some(bank)
+}
+
+/// Whether `path` is a symlink, or on Windows any reparse point (a junction, a mount
+/// point), without following it. A path that is not there is not a link.
+fn is_link(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Where one agent's specialization profile lives, given the memory bank dir.
@@ -547,9 +578,9 @@ fn append_profile(
     // and signing would make it this project's own, and carry that project's memory into
     // every prompt here. It is moved aside, not deleted, and this project starts its own.
     if let Some(project) = project_id
-        && signed_for_another_project(bank, agent, project)
+        && let Some(why) = not_this_projects(bank, agent, project)
     {
-        set_aside(bank, agent)?;
+        set_aside(bank, agent, why)?;
     }
     // Append and sign as one step: a second order finishing at the same moment must sign
     // a profile that has both lines in it.
@@ -565,17 +596,43 @@ fn append_profile(
     sign_profile(bank, project_id, agent, identity)
 }
 
-/// Whether the profile's signature names a project other than `project_id`.
-fn signed_for_another_project(bank: &Path, agent: &str, project_id: &str) -> bool {
-    std::fs::read_to_string(attestation_path(bank, agent))
+/// Why the profile on disk is not `project_id`'s to add to, if it is not: its signature
+/// names another project, or it is an unadopted v1 profile that names none. Appending and
+/// signing either would make it this project's own, and carry its memory into every prompt
+/// here.
+fn not_this_projects(bank: &Path, agent: &str, project_id: &str) -> Option<&'static str> {
+    let attestation = std::fs::read_to_string(attestation_path(bank, agent))
         .ok()
-        .and_then(|text| serde_json::from_str::<ProfileAttestation>(&text).ok())
-        .and_then(|attestation| attestation.project_id)
-        .is_some_and(|signed_for| signed_for != project_id)
+        .and_then(|text| serde_json::from_str::<ProfileAttestation>(&text).ok())?;
+    match attestation.project_id {
+        Some(signed_for) if signed_for != project_id => Some("other-project"),
+        Some(_) => None,
+        None if attestation.format == ATTESTATION_FORMAT => Some("unadopted-v1"),
+        None => None,
+    }
+}
+
+/// Re-sign an agent's v1 profile for `project_id` (format v2), if it is a v1 profile whose
+/// signature holds. This is the one way a profile written before profiles were bound to a
+/// project is taken into one; it is for an operator to run, once the profile is known to
+/// belong there. Returns whether anything was adopted.
+pub fn adopt_v1_profile(
+    bank: &Path,
+    project_id: &str,
+    agent: &str,
+    roster: &[AgentRoute],
+    identity: &AgentIdentity,
+) -> std::io::Result<bool> {
+    if verify_agent_profile(bank, agent, roster) != SignatureCheck::Valid {
+        return Ok(false);
+    }
+    let _lock = crate::own_files_lock();
+    sign_profile(bank, Some(project_id), agent, identity)?;
+    Ok(true)
 }
 
 /// Move a profile and its signature out of the way, under names that are not profiles.
-fn set_aside(bank: &Path, agent: &str) -> std::io::Result<()> {
+fn set_aside(bank: &Path, agent: &str, why: &str) -> std::io::Result<()> {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%.3f");
     for path in [
         agent_profile_path(bank, agent),
@@ -583,7 +640,7 @@ fn set_aside(bank: &Path, agent: &str) -> std::io::Result<()> {
     ] {
         if path.is_file() {
             let mut name = path.file_name().unwrap_or_default().to_os_string();
-            name.push(format!(".other-project-{stamp}"));
+            name.push(format!(".{why}-{stamp}"));
             std::fs::rename(&path, path.with_file_name(name))?;
         }
     }
@@ -975,16 +1032,74 @@ mod tests {
         assert_eq!(kept, 2, "the copy and its signature are kept, not deleted");
     }
 
-    /// Profiles written before the project was part of the signature keep working.
+    /// A profile written before the project was part of the signature says nothing about
+    /// where it belongs, so in a project it is not trusted until an operator adopts it.
     #[test]
-    fn a_profile_signed_before_projects_were_bound_still_reads_in_its_own_bank() {
+    fn a_v1_profile_is_unsigned_in_a_project_until_it_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wisp, wisp_route) = signer("wisp");
+        let roster = [wisp_route];
+        append_agent_profile(dir.path(), "wisp", "Rust", &wisp).unwrap();
+        assert_eq!(
+            verify_agent_profile_for(dir.path(), "demo", "wisp", &roster),
+            SignatureCheck::Unsigned
+        );
+        assert!(list_verified_peer_profiles_for(dir.path(), "demo", "other", &roster).is_empty());
+        // The project-less check is unchanged.
+        assert_eq!(
+            verify_agent_profile(dir.path(), "wisp", &roster),
+            SignatureCheck::Valid
+        );
+
+        assert!(adopt_v1_profile(dir.path(), "demo", "wisp", &roster, &wisp).unwrap());
+        assert_eq!(
+            verify_agent_profile_for(dir.path(), "demo", "wisp", &roster),
+            SignatureCheck::Valid
+        );
+        // Adopted for demo, so it does not verify for another project.
+        assert_eq!(
+            verify_agent_profile_for(dir.path(), "elsewhere", "wisp", &roster),
+            SignatureCheck::Invalid
+        );
+        // And there is nothing left to adopt.
+        assert!(!adopt_v1_profile(dir.path(), "demo", "wisp", &roster, &wisp).unwrap());
+    }
+
+    #[test]
+    fn appending_never_adopts_a_v1_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let (wisp, wisp_route) = signer("wisp");
+        let roster = [wisp_route];
+        append_agent_profile(dir.path(), "wisp", "carried in from elsewhere", &wisp).unwrap();
+        append_agent_profile_for(dir.path(), "demo", "wisp", "demo work", &wisp).unwrap();
+        let own = load_agent_profile(dir.path(), "wisp").unwrap();
+        assert!(
+            own.contains("demo work") && !own.contains("elsewhere"),
+            "{own}"
+        );
+        assert_eq!(
+            verify_agent_profile_for(dir.path(), "demo", "wisp", &roster),
+            SignatureCheck::Valid
+        );
+        let kept = std::fs::read_dir(dir.path().join("agents"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".unadopted-v1-"))
+            .count();
+        assert_eq!(kept, 2, "the old profile and its signature are kept");
+    }
+
+    #[test]
+    fn a_bad_signature_is_not_adopted() {
         let dir = tempfile::tempdir().unwrap();
         let (wisp, wisp_route) = signer("wisp");
         append_agent_profile(dir.path(), "wisp", "Rust", &wisp).unwrap();
-        assert_eq!(
-            verify_agent_profile_for(dir.path(), "demo", "wisp", &[wisp_route]),
-            SignatureCheck::Valid
-        );
+        std::fs::write(
+            agent_profile_path(dir.path(), "wisp"),
+            "edited by someone\n",
+        )
+        .unwrap();
+        assert!(!adopt_v1_profile(dir.path(), "demo", "wisp", &[wisp_route], &wisp).unwrap());
     }
 
     /// The legacy, project-less check cannot judge a profile that names a project, so it
@@ -998,6 +1113,54 @@ mod tests {
             verify_agent_profile(dir.path(), "wisp", &[wisp_route]),
             SignatureCheck::Invalid
         );
+    }
+
+    fn route_in(dir: &Path, channel: &Path) -> ProjectRoute {
+        ProjectRoute {
+            project_id: "iroh-test".into(),
+            workspace: dir.to_path_buf(),
+            attachment: dir.to_path_buf(),
+            communications: channel.to_path_buf(),
+            shared_remote: String::new(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    /// A channel that cannot be resolved vouches for nothing.
+    #[test]
+    fn a_memory_bank_in_a_channel_that_cannot_be_resolved_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = route_in(dir.path(), &dir.path().join("not-made"));
+        assert!(memory_bank_checked(&route).is_none());
+    }
+
+    /// A junction is how a link is made on Windows without any privilege.
+    #[cfg(windows)]
+    #[test]
+    fn a_memory_bank_that_is_a_junction_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = dir.path().join("iroh-test");
+        let other = dir.path().join("quantly").join("memory-bank");
+        std::fs::create_dir_all(&channel).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let route = route_in(dir.path(), &channel);
+        assert!(memory_bank_checked(&route).is_some());
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(channel.join("memory-bank"))
+            .arg(&other)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        assert!(is_link(&channel.join("memory-bank")));
+        assert!(memory_bank_checked(&route).is_none());
+        // Removing the junction leaves what it pointed at.
+        std::fs::remove_dir(channel.join("memory-bank")).unwrap();
+        assert!(other.is_dir());
+        std::fs::create_dir_all(channel.join("memory-bank")).unwrap();
+        assert!(memory_bank_checked(&route).is_some());
     }
 
     /// A memory bank that is a link to somewhere else is not this project's.
