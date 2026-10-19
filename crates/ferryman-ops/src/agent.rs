@@ -7359,6 +7359,8 @@ mod tests {
     /// Point this thread's machine state (keys, the pause marker) at a temporary
     /// directory, and prove it did, before anything below writes a pause.
     fn hermetic_machine() {
+        // The checkout may sit inside a real ferry root; a test finds only the one it makes.
+        ferryman_channel::ferry::isolate_root_search_for_this_thread();
         ferryman_channel::licensing::use_machine_state_dir_per_thread(
             std::env::temp_dir().join(format!("ferryman-ops-selftest-{}", std::process::id())),
         );

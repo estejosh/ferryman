@@ -5468,6 +5468,9 @@ mod tests {
     use tower::ServiceExt;
 
     fn test_route(dir: &std::path::Path) -> ProjectRoute {
+        // No ferry root: a checkout inside a real one (a worktree under it) would otherwise
+        // be found by `find_root`, and "all my repos" would be the machine's real projects.
+        ferryman_channel::ferry::isolate_root_search_for_this_thread();
         let workspace = dir.join("workspace");
         let attachment = workspace.join(".ferryman");
         ProjectRoute {

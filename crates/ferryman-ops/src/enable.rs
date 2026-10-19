@@ -730,6 +730,8 @@ pub fn perform(request: Request) -> Result<Outcome> {
 /// ~/.local/state. First call wins, so every test here shares one temporary machine.
 #[cfg(test)]
 fn hermetic_machine() {
+    // The checkout may sit inside a real ferry root; a test finds only the one it makes.
+    ferryman_channel::ferry::isolate_root_search_for_this_thread();
     let dir = std::env::temp_dir().join(format!(
         "ferryman-test-machine-{}-{}",
         env!("CARGO_CRATE_NAME"),
@@ -806,6 +808,8 @@ mod tests {
     /// compiled without it - which is how the suite came to write real signing keys into
     /// ~/.local/state. First call wins, so every test here shares one temporary machine.
     fn hermetic_machine() {
+        // The checkout may sit inside a real ferry root; a test finds only the one it makes.
+        ferryman_channel::ferry::isolate_root_search_for_this_thread();
         // One machine per test thread, not per process: enable files a project in the ferry
         // root it finds through this directory's pointer, and the project guard refuses to file
         // one name under two channels, so tests that share a pointer refuse each other.

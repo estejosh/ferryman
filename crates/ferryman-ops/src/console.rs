@@ -94,6 +94,8 @@ mod tests {
 
     /// Keep this test binary's machine state out of the developer's home.
     fn hermetic_machine() {
+        // The checkout may sit inside a real ferry root; a test finds only the one it makes.
+        ferryman_channel::ferry::isolate_root_search_for_this_thread();
         let dir = std::env::temp_dir().join(format!(
             "ferryman-console-test-machine-{}-{}",
             env!("CARGO_CRATE_NAME"),
