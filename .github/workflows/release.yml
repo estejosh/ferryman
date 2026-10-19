@@ -248,3 +248,30 @@ jobs:
             ferryman-tray-${{ matrix.target }}.zip
             ferryman-tray-${{ matrix.target }}.zip.sha256
           fail_on_unmatched_files: true
+
+  # The desktop app (beta): the dashboard in a native window, with a tray.
+  #
+  # Built by desktop-bundle.yml, which can also be run by hand to prove the installers build
+  # without making a release. Its own job for the tray's reasons: it is excluded from the
+  # workspace, needs desktop libraries a headless box does not have, and is an extra rather
+  # than the product, so a packaging failure here must not take the `ferry` binaries down.
+  desktop:
+    uses: ./.github/workflows/desktop-bundle.yml
+    with:
+      ref: ${{ github.event.inputs.tag || github.ref }}
+
+  desktop-attach:
+    needs: desktop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          merge-multiple: true
+          path: dist
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true

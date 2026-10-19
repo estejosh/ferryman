@@ -134,3 +134,43 @@ jobs:
           cargo clippy --manifest-path crates/ferryman-tray/Cargo.toml
           --all-targets -- -D warnings
       - run: cargo build --manifest-path crates/ferryman-tray/Cargo.toml --release
+
+  # The desktop app is excluded from the workspace for the tray's reason, and for a bigger
+  # one: a web-view stack is several hundred crates that `cargo test --workspace` should
+  # not pay for. This builds it where it ships, on every push, so a change to the dashboard
+  # or the channel that the app cannot follow fails on a branch rather than on a tag.
+  #
+  # Linux needs webkit2gtk (the web view), GTK, an appindicator for the tray, and D-Bus
+  # headers for the credential store the server crate links.
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97
+        with:
+          components: rustfmt, clippy
+      - name: Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libdbus-1-dev libwebkit2gtk-4.1-dev \
+            libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev \
+            libssl-dev patchelf
+      # The desktop crate is outside the workspace, so a version bump does not reach it on
+      # its own. Installers are named after this number.
+      - name: Desktop version matches the workspace
+        shell: bash
+        run: |
+          ws=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          desktop=$(grep -m1 '^version = ' crates/ferryman-desktop/Cargo.toml | cut -d'"' -f2)
+          echo "workspace $ws, desktop $desktop"
+          test "$ws" = "$desktop"
+      - run: cargo fmt --check --manifest-path crates/ferryman-desktop/Cargo.toml
+      - run: >
+          cargo clippy --manifest-path crates/ferryman-desktop/Cargo.toml
+          --all-targets -- -D warnings
+      - run: cargo build --manifest-path crates/ferryman-desktop/Cargo.toml --release

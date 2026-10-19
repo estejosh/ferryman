@@ -18,7 +18,7 @@ members = [
 # ferryman-tray is excluded on purpose: it needs desktop libraries (GTK on Linux) that a
 # headless agent box does not have, and breaking the build there to compile a tray nobody
 # on that machine can see would be the wrong trade. Built per platform in the release job.
-exclude = ["crates/ferryman-tray"]
+exclude = ["crates/ferryman-tray", "crates/ferryman-desktop"]
 resolver = "2"
 
 [workspace.package]
