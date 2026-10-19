@@ -7800,12 +7800,22 @@ fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
 /// choose, so one project it cannot take (another worker holds its lock, its lock file
 /// cannot be written) is named and left out rather than stopping the rest, and each pass
 /// asks again whether the project is still one it may work in.
+/// What an `--all-projects` worker needs to ask, every pass, which projects have become
+/// open to it since it started: the root, where its key and `agent.toml` are, and the
+/// config it started with (before any project's own rules were laid over it).
+struct Reevaluate {
+    root: ferryman_channel::ferry::Root,
+    home: std::path::PathBuf,
+    config: agent::AgentConfig,
+}
+
 async fn run_fleet(
     fleet: agent::Fleet,
     watching: &std::path::Path,
     once: bool,
     serving_everywhere: bool,
     iroh: Option<lane::WorkerLane>,
+    reevaluate: Option<Reevaluate>,
     report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
 ) -> Result<()> {
     // One worker per identity per channel. Two under one name resume each other's
@@ -7942,14 +7952,18 @@ async fn run_fleet(
     prepare_work_folders(fleet.served.iter().map(|(route, _)| route), report);
     // The iroh lane, when this machine has it on: the channels as repaired above, served
     // and synced in the background beside Syncthing for as long as this worker runs.
+    let mut live_lane = None;
     if let Some(iroh) = iroh {
         let routes = fleet
             .served
             .iter()
             .map(|(route, _)| route.clone())
             .collect();
-        iroh.start(routes, report).await;
+        live_lane = iroh.start(routes, report).await;
     }
+    // What was last said about each project that is not open to this worker, so a pass says
+    // it again only when the reason changes.
+    let mut told: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     loop {
         // Keeping a long-running worker current.
         //
@@ -8006,6 +8020,21 @@ async fn run_fleet(
                 }
                 Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
             }
+        }
+
+        // Who is on each roster and which projects are open to this worker are read again
+        // every pass: an approval (`ferry team approve <agent> --all`) reaches a running
+        // worker now, not at its next restart.
+        if let Some(reevaluate) = &reevaluate {
+            ferryman_ops::fleet::refresh_rosters(&mut fleet.served);
+            take_newly_approved(
+                reevaluate,
+                &mut fleet,
+                &mut locks,
+                &mut told,
+                live_lane.as_ref(),
+                report,
+            );
         }
 
         anchor_maintenance(&fleet.served, report).await;
@@ -8071,6 +8100,84 @@ async fn run_fleet(
         tokio::time::sleep(poll).await;
     }
     Ok(())
+}
+
+/// Start serving the projects that have become open to a running `--all-projects` worker.
+///
+/// Each gets what a project gets at startup: the worker lock (one worker per identity per
+/// channel), this version stamped on it, its hand-in folders, and a place in the iroh lane.
+/// A project still closed is named once, and again only if the reason changes.
+fn take_newly_approved(
+    reevaluate: &Reevaluate,
+    fleet: &mut agent::Fleet,
+    locks: &mut Vec<agent::WorkerLock>,
+    told: &mut std::collections::BTreeMap<String, String>,
+    lane: Option<&lane::LiveLane>,
+    report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
+) {
+    let found = match ferryman_ops::fleet::newly_served(
+        &reevaluate.root,
+        &reevaluate.home,
+        &reevaluate.config,
+        &fleet.served,
+    ) {
+        Ok(found) => found,
+        Err(error) => {
+            report.warn(&format!(
+                "could not look for newly approved projects: {error:#}"
+            ));
+            return;
+        }
+    };
+    let mut still_closed = std::collections::BTreeSet::new();
+    for (_, why) in &found.skipped {
+        let Some((project, reason)) = why.split_once(": ") else {
+            continue;
+        };
+        still_closed.insert(project.to_owned());
+        if told.get(project).is_none_or(|said| said != reason) {
+            // The first pass repeats what startup already said about each; only a change
+            // is news after that.
+            if told.contains_key(project) {
+                report.info(&format!("  {project}: {reason}"));
+            }
+            told.insert(project.to_owned(), reason.to_owned());
+        }
+    }
+    told.retain(|project, _| still_closed.contains(project));
+    let mut taken = Vec::new();
+    for (route, config) in found.served {
+        match agent::WorkerLock::take(&route.attachment, &config.agent) {
+            Ok(Some(lock)) => locks.push(lock),
+            Ok(None) => {
+                report.warn(&format!(
+                    "  not watching {}: another worker on this machine already holds its \
+                     lock as the same agent. Two under one identity run the same order twice",
+                    route.project_id
+                ));
+                continue;
+            }
+            Err(error) => {
+                report.warn(&format!(
+                    "  not watching {}: no worker lock ({error:#})",
+                    route.project_id
+                ));
+                continue;
+            }
+        }
+        report.info(&format!(
+            "now serving {}: it was approved while this worker ran",
+            route.project_id
+        ));
+        let _ =
+            ferryman_channel::licensing::refresh_device_version(&route, env!("CARGO_PKG_VERSION"));
+        if let Some(lane) = lane {
+            lane.add(&route, report);
+        }
+        taken.push((route, config));
+    }
+    prepare_work_folders(taken.iter().map(|(route, _)| route), report);
+    fleet.served.extend(taken);
 }
 
 async fn agent_command(command: Agent) -> Result<()> {
@@ -8179,7 +8286,21 @@ async fn agent_command(command: Agent) -> Result<()> {
                 config.max_parallel
             ));
             let iroh = lane::for_worker(&root, identity, &report);
-            run_fleet(fleet, &root.shared_home(), once, true, iroh, &report).await?;
+            let reevaluate = Reevaluate {
+                root: root.clone(),
+                home: home.attachment.clone(),
+                config: config.clone(),
+            };
+            run_fleet(
+                fleet,
+                &root.shared_home(),
+                once,
+                true,
+                iroh,
+                Some(reevaluate),
+                &report,
+            )
+            .await?;
         }
         Agent::Run {
             // Without `--all-projects`, `--comms` and `--workspace` are mutually
@@ -8259,7 +8380,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 return Ok(());
             }
             fleetsetup::guard_worker_start(false, allow_second_worker)?;
-            run_fleet(fleet, &comms, once, false, None, &report).await?;
+            run_fleet(fleet, &comms, once, false, None, None, &report).await?;
         }
         Agent::Run {
             workspace,

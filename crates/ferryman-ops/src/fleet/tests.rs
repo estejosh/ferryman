@@ -1079,3 +1079,90 @@ fn a_projects_policy_goes_into_that_projects_prompts_and_no_other() {
         "beta must not read alpha's policy"
     );
 }
+
+#[test]
+fn a_project_approved_while_the_worker_runs_is_served_on_the_next_pass() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    project(dir.path(), &root, "alpha", &josh(), true);
+    enrolled_everywhere(&root);
+    // Created after the approval: this worker is not on its roster.
+    project(dir.path(), &root, "beta", &josh(), true);
+    let (home, config) = home(dir.path(), "");
+
+    // The worker starts and serves alpha only.
+    let (plan, identity) = plan_worker(&root, &home, &config).unwrap();
+    let mut fleet = serve(plan, &identity, &config);
+    assert_eq!(fleet.served.len(), 1);
+
+    // A pass later nothing has changed: beta is named as not open, alpha is not asked about.
+    let pass = newly_served(&root, &home, &config, &fleet.served).unwrap();
+    assert!(pass.served.is_empty());
+    assert_eq!(pass.skipped.len(), 1);
+    assert!(
+        pass.skipped[0].1.contains("not on its roster"),
+        "{:?}",
+        pass.skipped
+    );
+
+    // The master approves it with the worker still running.
+    enrolled_everywhere(&root);
+    let pass = newly_served(&root, &home, &config, &fleet.served).unwrap();
+    assert_eq!(pass.served.len(), 1);
+    assert_eq!(pass.served[0].0.project_id, "beta");
+    // It comes with the base config, and its key is put in its checkout.
+    assert_eq!(pass.served[0].1.agent, "ichabod-test");
+    assert!(
+        AgentIdentity::load_existing("ichabod-test", &attachment_of(dir.path(), "beta"))
+            .unwrap()
+            .is_some()
+    );
+    fleet.served.extend(pass.served);
+
+    // Served now, so the next pass has nothing new to say.
+    let pass = newly_served(&root, &home, &config, &fleet.served).unwrap();
+    assert!(pass.served.is_empty() && pass.skipped.is_empty());
+}
+
+#[test]
+fn a_served_projects_roster_is_read_again_each_pass() {
+    hermetic();
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create(&dir.path().join("ferry")).unwrap();
+    project(dir.path(), &root, "alpha", &josh(), true);
+    enrolled_everywhere(&root);
+    let (home, config) = home(dir.path(), "");
+    let (plan, identity) = plan_worker(&root, &home, &config).unwrap();
+    let mut fleet = serve(plan, &identity, &config);
+    let before = fleet.served[0].0.agents.len();
+
+    // Someone is approved after the worker started.
+    let newcomer = AgentIdentity::from_seed("newcomer", [5u8; 32]);
+    let route = route_of(&root, "alpha");
+    ferryman_channel::register_agent(
+        &route,
+        &AgentRoute {
+            name: "newcomer".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(newcomer.public_key_hex()),
+            encryption_key: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fleet.served[0].0.agents.len(),
+        before,
+        "still the old roster"
+    );
+    refresh_rosters(&mut fleet.served);
+    assert_eq!(fleet.served[0].0.agents.len(), before + 1);
+    assert!(
+        fleet.served[0]
+            .0
+            .agents
+            .iter()
+            .any(|agent| agent.name == "newcomer")
+    );
+}

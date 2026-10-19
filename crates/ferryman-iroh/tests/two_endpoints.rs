@@ -616,3 +616,41 @@ async fn first_contact_does_not_trust_a_peer_no_shared_channel_vouches_for() {
             .exists()
     );
 }
+
+#[tokio::test]
+async fn a_project_added_while_the_lane_runs_is_synced_from_then_on() {
+    let p = pair().await;
+    let base = p._dir.path();
+    let (a_late, b_late) = (
+        route(&base.join("a"), "late"),
+        route(&base.join("b"), "late"),
+    );
+    let fang = AgentIdentity::from_seed("fang", [1; 32]);
+    let wisp = AgentIdentity::from_seed("wisp", [2; 32]);
+    for route in [&a_late, &b_late] {
+        enrol(route, &fang);
+        enrol(route, &wisp);
+    }
+    let (a_id, b_id) = (
+        endpoint_hex(&p.a.endpoint().id()),
+        endpoint_hex(&p.b.endpoint().id()),
+    );
+    ferryman_channel::transports::publish(&a_late, &fang, &a_id, None).unwrap();
+    ferryman_channel::transports::publish(&a_late, &wisp, &b_id, None).unwrap();
+    copy_tree(&a_late.communications, &b_late.communications);
+    write(&a_late, "tasks/t-1/order.json", "{\"late\":true}");
+
+    // Neither lane serves it yet, so a round moves nothing of it.
+    p.a.round().await;
+    assert!(!b_late.communications.join("tasks").exists());
+
+    // Added to both running lanes, it is carried from the next round on.
+    p.a.add_project(a_late.clone());
+    p.b.add_project(b_late.clone());
+    assert!(p.a.project_ids().contains(&"late".to_owned()));
+    p.a.round().await;
+    assert_eq!(
+        fs::read_to_string(b_late.communications.join("tasks/t-1/order.json")).unwrap(),
+        "{\"late\":true}"
+    );
+}

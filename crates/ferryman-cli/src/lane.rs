@@ -261,13 +261,25 @@ impl WorkerLane {
     /// leave the lane running in the background for as long as the worker runs. A lane
     /// that cannot start is a warning, never a reason for the worker to stop: Syncthing
     /// still carries the channels.
-    pub(crate) async fn start(self, routes: Vec<ProjectRoute>, report: &impl Progress) {
-        if let Err(error) = self.try_start(routes, report).await {
-            report.warn(&format!("iroh lane not started: {error:#}"));
+    pub(crate) async fn start(
+        self,
+        routes: Vec<ProjectRoute>,
+        report: &impl Progress,
+    ) -> Option<LiveLane> {
+        match self.try_start(routes, report).await {
+            Ok(live) => Some(live),
+            Err(error) => {
+                report.warn(&format!("iroh lane not started: {error:#}"));
+                None
+            }
         }
     }
 
-    async fn try_start(self, routes: Vec<ProjectRoute>, report: &impl Progress) -> Result<()> {
+    async fn try_start(
+        self,
+        routes: Vec<ProjectRoute>,
+        report: &impl Progress,
+    ) -> Result<LiveLane> {
         let machine = ferryman_iroh::machine_dir()?;
         let (key, _) = ferryman_iroh::load_or_create_key(&machine)?;
         let endpoint = ferryman_iroh::lane::bind(&self.config, key).await?;
@@ -304,8 +316,37 @@ impl WorkerLane {
         // Who this machine's worker is, so a Worker-level agent here listens to a channel
         // and publishes none of it (its writes go out through its hand-ins folder).
         lane.set_local_agents(vec![self.identity.name().to_owned()]);
+        let live = LiveLane {
+            lane: std::sync::Arc::clone(&lane),
+            identity: self.identity,
+            relay_url: self.config.relay_url.clone(),
+        };
         tokio::spawn(lane.run(ferryman_iroh::lane::ROUND_EVERY));
-        Ok(())
+        Ok(live)
+    }
+}
+
+/// The running lane, kept by the worker so projects approved after it started can join it.
+pub(crate) struct LiveLane {
+    lane: std::sync::Arc<ferryman_iroh::Lane>,
+    identity: ferryman_channel::AgentIdentity,
+    relay_url: Option<String>,
+}
+
+impl LiveLane {
+    /// Publish this worker's record in `route`'s channel and serve the channel from now on.
+    pub(crate) fn add(&self, route: &ProjectRoute, report: &impl Progress) {
+        let id = self.lane.endpoint().id();
+        let (_, failed) = ferryman_iroh::publish_everywhere(
+            std::slice::from_ref(route),
+            &self.identity,
+            &id,
+            self.relay_url.as_deref(),
+        );
+        for line in failed {
+            report.warn(&format!("iroh lane: no transports record in {line}"));
+        }
+        self.lane.add_project(route.clone());
     }
 }
 

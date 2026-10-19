@@ -226,7 +226,8 @@ pub struct Outcome {
 /// One endpoint serving and syncing every channel in `projects`.
 pub struct Lane {
     endpoint: Endpoint,
-    projects: Vec<ProjectRoute>,
+    /// The channels served. Grows while the worker runs ([`Lane::add_project`]).
+    projects: Mutex<Vec<ProjectRoute>>,
     own: String,
     cache: Mutex<HashCache>,
     status: Mutex<Status>,
@@ -254,12 +255,46 @@ impl Lane {
                 ..Status::default()
             }),
             endpoint,
-            projects,
+            projects: Mutex::new(projects),
             own,
             cache: Mutex::new(HashCache::default()),
             status_file,
             local_agents: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A snapshot of the channels served now.
+    fn routes(&self) -> Vec<ProjectRoute> {
+        self.projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Serve one more channel from the next connection and round on, or replace the route
+    /// of one already served. For a worker that finds a project newly approved while it
+    /// runs, so it need not be restarted for the lane to carry it.
+    pub fn add_project(&self, route: ProjectRoute) {
+        let mut projects = self
+            .projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match projects
+            .iter_mut()
+            .find(|have| have.project_id == route.project_id)
+        {
+            Some(have) => *have = route,
+            None => projects.push(route),
+        }
+    }
+
+    /// The ids of the channels served now.
+    #[must_use]
+    pub fn project_ids(&self) -> Vec<String> {
+        self.routes()
+            .into_iter()
+            .map(|route| route.project_id)
+            .collect()
     }
 
     /// Say which agents run on this machine. A project in which all of them are Workers is
@@ -352,7 +387,8 @@ impl Lane {
     #[must_use]
     pub fn trusted(&self) -> BTreeMap<EndpointId, Peer> {
         let mut peers: BTreeMap<EndpointId, Peer> = BTreeMap::new();
-        for route in &self.projects {
+        let projects = self.routes();
+        for route in &projects {
             for record in ferryman_channel::transports::honoured_records(route) {
                 if record.endpoint_id == self.own {
                     continue;
@@ -378,8 +414,7 @@ impl Lane {
         // channel served here that it has none in yet, so two machines that already share
         // a project can find each other in a new one without a hand-copied file.
         for peer in peers.values_mut() {
-            peer.bootstrap = self
-                .projects
+            peer.bootstrap = projects
                 .iter()
                 .map(|route| route.project_id.clone())
                 .filter(|id| !peer.projects.contains(id))
@@ -427,10 +462,8 @@ impl Lane {
             .project_id
             .strip_suffix(HANDINS_SUFFIX)
             .unwrap_or(&hello.project_id);
-        let route = self
-            .projects
-            .iter()
-            .find(|route| route.project_id == project_id);
+        let projects = self.routes();
+        let route = projects.iter().find(|route| route.project_id == project_id);
         let share = route
             .filter(|_| peer.projects.contains(project_id) || peer.bootstrap.contains(project_id))
             .and_then(|route| {
@@ -505,7 +538,8 @@ impl Lane {
             .context("connect")?;
         let mut totals = Outcome::default();
         let mut failures = Vec::new();
-        for route in self.projects.iter().filter(|route| {
+        let projects = self.routes();
+        for route in projects.iter().filter(|route| {
             peer.projects.contains(&route.project_id) || peer.bootstrap.contains(&route.project_id)
         }) {
             for share in self.shares(route, peer) {
