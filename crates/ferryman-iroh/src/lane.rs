@@ -128,6 +128,9 @@ pub async fn probe_relay(config: &IrohConfig, wait: Duration) -> Result<()> {
 pub struct Peer {
     pub agents: BTreeSet<String>,
     pub projects: BTreeSet<String>,
+    /// Projects served here that this peer is not yet trusted in, but is trusted in another
+    /// channel the two share: offered the `transports/` records of these and nothing else.
+    pub bootstrap: BTreeSet<String>,
     pub relay: Option<RelayUrl>,
 }
 
@@ -284,6 +287,15 @@ impl Lane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        if peer.bootstrap.contains(id) && !peer.projects.contains(id) {
+            // First contact: the agents' records and nothing more, in both directions.
+            return vec![Share {
+                key: id.clone(),
+                dir: channel.clone(),
+                rules: Rules::for_channel(channel).transports_only(route.clone()),
+                send: !access::machine_is_worker_only(channel, id, &local),
+            }];
+        }
         let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
         let mut channel_rules = Rules::for_channel(channel);
         if handins_elsewhere {
@@ -362,6 +374,17 @@ impl Lane {
                 }
             }
         }
+        // A peer trusted in one channel may be offered the transports records of any other
+        // channel served here that it has none in yet, so two machines that already share
+        // a project can find each other in a new one without a hand-copied file.
+        for peer in peers.values_mut() {
+            peer.bootstrap = self
+                .projects
+                .iter()
+                .map(|route| route.project_id.clone())
+                .filter(|id| !peer.projects.contains(id))
+                .collect();
+        }
         peers
     }
 
@@ -409,7 +432,7 @@ impl Lane {
             .iter()
             .find(|route| route.project_id == project_id);
         let share = route
-            .filter(|_| peer.projects.contains(project_id))
+            .filter(|_| peer.projects.contains(project_id) || peer.bootstrap.contains(project_id))
             .and_then(|route| {
                 self.shares(route, peer)
                     .into_iter()
@@ -482,11 +505,9 @@ impl Lane {
             .context("connect")?;
         let mut totals = Outcome::default();
         let mut failures = Vec::new();
-        for route in self
-            .projects
-            .iter()
-            .filter(|route| peer.projects.contains(&route.project_id))
-        {
+        for route in self.projects.iter().filter(|route| {
+            peer.projects.contains(&route.project_id) || peer.bootstrap.contains(&route.project_id)
+        }) {
             for share in self.shares(route, peer) {
                 match self.sync_share(&connection, &share).await {
                     Ok(Some((received, sent))) => {

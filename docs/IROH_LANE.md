@@ -54,9 +54,34 @@ channel's own `agents/`, and whom the master has not revoked. The project id is 
 into the record, so it cannot be copied into another channel. Every connection from any
 other endpoint is closed as soon as it is accepted, before any channel is read. A peer is
 offered a channel only if it is trusted in that channel; being in one project does not
-open another, and a project only one side serves is skipped. Records are re-read on every
+open another (beyond the first-contact exchange below), and a project only one side serves is
+skipped. Records are re-read on every
 connection and every round, so a revocation takes effect on the next one.
 
+## First contact in a new channel
+
+Trust in a channel needs each side to hold the other's `transports/<agent>.json` for that
+channel, and those are channel files, so two machines that already share one project used
+to need a hand-copied file (or Syncthing) for every further project. They no longer do.
+
+A peer that is trusted in at least one channel served here (its endpoint id is in an
+honoured record of that channel: signed by a roster agent, on the roster pin, not revoked) is
+offered, for every OTHER channel served here that it is not yet trusted in, the `transports/`
+records of that channel and nothing else, in both directions. Nothing else is opened:
+
+- only `transports/<agent>.json` is listed, asked for, sent or received. Not tasks, not
+  messages, not `agents/`, not the hand-ins folder (which is not offered at all);
+- a received record is kept only if this machine would honour it as it stands: the file is
+  named for the agent it holds, that agent signed it for THIS project, its key is the one this
+  channel's roster pins, it has its own `agents/<agent>.json` here, it is not revoked, it is
+  not dated in the future, and it is under 8 KiB. Anything else is read and dropped;
+- once a kept record names the peer's endpoint, ordinary trust applies from the next round
+  (a round is every 30 seconds): the same rules as any trusted peer, and the same revocation.
+
+One limit remains, deliberately: the agent's roster entry, `agents/<agent>.json`, must already
+be in the new channel on the receiving machine (from the invite, a git checkout or Syncthing).
+The lane will not carry a roster entry before trust, because a roster entry is what trust is
+made of. Without it the record is dropped and first contact simply does not happen yet.
 ## What moves, and what never does
 
 Every 30 seconds the worker sends each trusted peer, per shared project, a manifest

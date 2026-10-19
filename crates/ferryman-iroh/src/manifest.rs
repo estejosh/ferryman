@@ -89,6 +89,32 @@ pub struct Rules {
     /// Roster entries and device records for names the master has not admitted (a fresh
     /// name a Worker registered): neither carried nor let in.
     refused_roster: std::collections::BTreeSet<String>,
+    /// First contact: only `transports/<agent>.json` is carried, and a received one must
+    /// pass the channel's own check for a record it would honour.
+    transports_only: Option<Gate>,
+}
+
+/// A check on a received file: its path and bytes.
+type Check = dyn Fn(&str, &[u8]) -> bool + Send + Sync;
+
+/// What a received file must satisfy besides the path rules.
+#[derive(Clone)]
+struct Gate(std::sync::Arc<Check>);
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Gate")
+    }
+}
+
+/// Whether `lower` (lowercased, `/`-separated) is the `transports` folder or a record in it.
+fn is_transports_path(lower: &str) -> bool {
+    let mut parts = lower.split('/');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("transports"), None, _) => true,
+        (Some("transports"), Some(name), None) => name.ends_with(".json") && name.len() > 5,
+        _ => false,
+    }
 }
 
 /// The head's verdict files, written beside a hand-in.
@@ -116,6 +142,17 @@ impl Rules {
     #[must_use]
     pub fn excluding(mut self, pattern: &str) -> Self {
         self.patterns.push(pattern.to_ascii_lowercase());
+        self
+    }
+
+    /// Carry only the agents' `transports/` records, and let in only one that `route` would
+    /// itself honour: what a peer trusted in another channel may be given of this one before
+    /// it is trusted in it.
+    #[must_use]
+    pub fn transports_only(mut self, route: ferryman_channel::ProjectRoute) -> Self {
+        self.transports_only = Some(Gate(std::sync::Arc::new(move |path, bytes| {
+            ferryman_channel::transports::acceptable(&route, path, bytes)
+        })));
         self
     }
 
@@ -163,6 +200,7 @@ impl Rules {
             no_verdicts: false,
             no_incoming: false,
             refused_roster: std::collections::BTreeSet::new(),
+            transports_only: None,
         }
     }
 
@@ -185,6 +223,9 @@ impl Rules {
         let lower = path.to_ascii_lowercase();
         let components: Vec<&str> = lower.split('/').collect();
         if components.iter().any(|name| machine_local(name)) {
+            return true;
+        }
+        if self.transports_only.is_some() && !is_transports_path(&lower) {
             return true;
         }
         if !self.refused_authors.is_empty()
@@ -474,6 +515,14 @@ pub fn write_received(channel: &Path, rules: &Rules, entry: &Entry, bytes: &[u8]
     {
         bail!(
             "'{}' is authored by {worker}, a Worker, which writes to its hand-ins and never the channel",
+            entry.path
+        );
+    }
+    if let Some(Gate(check)) = &rules.transports_only
+        && !check(&entry.path, bytes)
+    {
+        bail!(
+            "'{}' is not a record this channel would honour, and nothing else is let in before first trust",
             entry.path
         );
     }
