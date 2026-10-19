@@ -204,6 +204,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         let claim = ferryman_channel::Claim {
             order_id: "t-hold".into(),

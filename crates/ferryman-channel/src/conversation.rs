@@ -116,6 +116,7 @@ pub fn sign_conversation(
         format: CONVERSATION_FORMAT.to_string(),
         agent: slugify(topic),
         sha256: digest_of(&bytes),
+        project_id: None,
         signed_by: None,
         signature: None,
     };

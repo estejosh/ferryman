@@ -1903,13 +1903,36 @@ fn remember_root(path: &Path) {
     }
 }
 
+thread_local! {
+    static ROOT_SEARCH_ISOLATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make [`find_root`] on this thread ignore `FERRYMAN_ROOT` and the working directory, and
+/// follow only the machine's pointer - which a test keeps in its own state directory.
+///
+/// For tests. `find_root` otherwise walks up from the working directory, and a test run
+/// from a checkout that sits inside a real ferry root (a worktree under it, say) finds that
+/// root, reads its real projects, and can write to them; CI never does, because its checkout
+/// is nowhere near one. Neither the environment (shared by every test thread) nor the
+/// machine state directory (which only moves the pointer) can stop the walk, and a
+/// thread-local cannot leak into the test beside it.
+pub fn isolate_root_search_for_this_thread() {
+    ROOT_SEARCH_ISOLATED.with(|flag| flag.set(true));
+}
+
 /// The ferry root for this machine, if there is one.
 ///
 /// Looked for in the order that respects what the person actually did: an explicit
 /// override, then a root they are standing inside, then the one they made.
 #[must_use]
 pub fn find_root() -> Option<Root> {
-    if let Ok(explicit) = std::env::var("FERRYMAN_ROOT")
+    // This crate's own tests, automatically; a dependent crate's tests call
+    // `isolate_root_search_for_this_thread` themselves, as they do for the machine state.
+    #[cfg(test)]
+    isolate_root_search_for_this_thread();
+    let isolated = ROOT_SEARCH_ISOLATED.with(std::cell::Cell::get);
+    if !isolated
+        && let Ok(explicit) = std::env::var("FERRYMAN_ROOT")
         && !explicit.is_empty()
     {
         let path = PathBuf::from(explicit);
@@ -1917,7 +1940,8 @@ pub fn find_root() -> Option<Root> {
             return Some(Root { path });
         }
     }
-    if let Ok(cwd) = std::env::current_dir()
+    if !isolated
+        && let Ok(cwd) = std::env::current_dir()
         && let Some(root) = find_root_from(&cwd)
     {
         return Some(root);

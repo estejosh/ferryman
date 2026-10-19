@@ -908,8 +908,19 @@ async fn list_communications(
     checked(&state, &headers, &project_id)?;
     let route = project_route(&state, &project_id)?;
     communications::quarantine_invalid_inbound(&route).map_err(ApiError::internal)?;
-    let v1_messages = list_v1_communications(&route).map_err(ApiError::internal)?;
-    let v2_messages = communications::list_messages_v2(&route).map_err(ApiError::internal)?;
+    let mut v1_messages = list_v1_communications(&route).map_err(ApiError::internal)?;
+    // Messages compaction moved into the archive are still part of the history.
+    let live: std::collections::HashSet<String> = v1_messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect();
+    v1_messages.extend(
+        communications::compaction::archived_v1(&route)
+            .into_iter()
+            .filter(|message| !live.contains(&message.id)),
+    );
+    let v2_messages =
+        communications::list_messages_v2_with_archive(&route).map_err(ApiError::internal)?;
     let mut items = Vec::with_capacity(v1_messages.len() + v2_messages.len());
     for message in v1_messages {
         items

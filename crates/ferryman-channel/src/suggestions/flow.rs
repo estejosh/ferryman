@@ -1539,6 +1539,7 @@ fn accept(
         touches: Vec::new(),
         needs: None,
         allow_overlap: false,
+        priority: None,
     };
     ctx.identity.sign_order(&mut order);
     match crate::issue_order(ctx.route, &order) {
@@ -1675,6 +1676,7 @@ fn credit(ctx: &Ctx<'_>, thread: &mut Thread) -> Result<()> {
         touches: Vec::new(),
         needs: None,
         allow_overlap: false,
+        priority: None,
     };
     ctx.identity.sign_order(&mut order);
     match crate::issue_order(ctx.route, &order) {

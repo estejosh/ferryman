@@ -2000,6 +2000,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         order
@@ -3253,6 +3254,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             };
             josh().sign_order(&mut order);
             ferryman_channel::issue_order(route, &order).unwrap();

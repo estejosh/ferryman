@@ -1445,6 +1445,12 @@ enum Channel {
         /// already claimed.
         #[arg(long)]
         allow_overlap: bool,
+        /// How soon this should be picked up: high, normal or low. Signed into the order.
+        /// Workers take the highest first, then the oldest, and never interrupt work in
+        /// hand. Left out, an order from a person (the master or an operator) is high and
+        /// one from an agent is normal.
+        #[arg(long, value_name = "PRIORITY", value_parser = parse_priority)]
+        priority: Option<ferryman_channel::Priority>,
         /// The interface contract this order provides or consumes, as
         /// name@version:provides or name@version:consumes. A worker will not start it
         /// until the master has locked that contract.
@@ -1635,6 +1641,33 @@ enum Channel {
         #[arg(long)]
         task: Option<String>,
     },
+    /// Roll old acknowledged messages into the channel's archive.
+    ///
+    /// Only the channel's head agent, or its master when it has none, compacts. Messages
+    /// older than the master's `--archive-after-days` (30 unless set, see `ferry channel
+    /// files policy`) that were acknowledged go into one file per month per thread under
+    /// `archive/`, with the original signed text. A signed record is written first, and
+    /// originals are removed on a later pass, after the grace, once the archive is seen to
+    /// hold them. `ferry channel log` and `ferry channel inbox --all` still show them.
+    ///
+    /// Syncthing channels only, for now: the iroh lane never deletes, so its peers would
+    /// send back what was compacted. A channel the lane carries is refused.
+    Compact {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Say what would happen, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Hours a signed record must age before the originals it covers are removed.
+        #[arg(long, default_value_t = 24)]
+        grace_hours: u32,
+        /// Allow a grace under one hour (the default floor), so originals can go at once.
+        #[arg(long)]
+        force_no_grace: bool,
+        /// Who is compacting. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
     /// Everything that has happened in this channel, oldest last.
     ///
     /// Orders, claims, results, reviews and messages, merged into one timeline with
@@ -1819,6 +1852,9 @@ enum FilesCommand {
         /// Days files stay once their order is done or reviewed (default 7).
         #[arg(long, value_name = "DAYS")]
         retention_days: Option<u32>,
+        /// Days after which an acknowledged message is rolled into the archive (default 30).
+        #[arg(long, value_name = "DAYS")]
+        archive_after_days: Option<u32>,
         /// Who is signing. Defaults to this machine's name.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
@@ -3909,6 +3945,19 @@ enum Memory {
         #[arg(long)]
         limit: Option<u32>,
     },
+    /// Take the agent profiles written before profiles were bound to a project into this
+    /// project, re-signing each for it.
+    ///
+    /// A profile from that time says nothing about which project it belongs to, so a
+    /// project does not trust one until its operator adopts it. Only the project's master
+    /// does this, on a machine that holds the agent's own key; a profile whose signature
+    /// does not hold, or whose key is elsewhere, is left as it is and named.
+    AdoptV1 {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
 }
 #[derive(Subcommand, Clone)]
 enum Artifacts {
@@ -5232,6 +5281,7 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?
             }
+            Memory::AdoptV1 { project, workspace } => adopt_v1_profiles(workspace, &project)?,
         },
         Command::Artifacts { command } => match command {
             Artifacts::List { project, job } => {
@@ -7770,12 +7820,22 @@ fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
 /// choose, so one project it cannot take (another worker holds its lock, its lock file
 /// cannot be written) is named and left out rather than stopping the rest, and each pass
 /// asks again whether the project is still one it may work in.
+/// What an `--all-projects` worker needs to ask, every pass, which projects have become
+/// open to it since it started: the root, where its key and `agent.toml` are, and the
+/// config it started with (before any project's own rules were laid over it).
+struct Reevaluate {
+    root: ferryman_channel::ferry::Root,
+    home: std::path::PathBuf,
+    config: agent::AgentConfig,
+}
+
 async fn run_fleet(
     fleet: agent::Fleet,
     watching: &std::path::Path,
     once: bool,
     serving_everywhere: bool,
     iroh: Option<lane::WorkerLane>,
+    reevaluate: Option<Reevaluate>,
     report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
 ) -> Result<()> {
     // One worker per identity per channel. Two under one name resume each other's
@@ -7912,14 +7972,18 @@ async fn run_fleet(
     prepare_work_folders(fleet.served.iter().map(|(route, _)| route), report);
     // The iroh lane, when this machine has it on: the channels as repaired above, served
     // and synced in the background beside Syncthing for as long as this worker runs.
+    let mut live_lane = None;
     if let Some(iroh) = iroh {
         let routes = fleet
             .served
             .iter()
             .map(|(route, _)| route.clone())
             .collect();
-        iroh.start(routes, report).await;
+        live_lane = iroh.start(routes, report).await;
     }
+    // What was last said about each project that is not open to this worker, so a pass says
+    // it again only when the reason changes.
+    let mut told: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     loop {
         // Keeping a long-running worker current.
         //
@@ -7978,6 +8042,21 @@ async fn run_fleet(
             }
         }
 
+        // Who is on each roster and which projects are open to this worker are read again
+        // every pass: an approval (`ferry team approve <agent> --all`) reaches a running
+        // worker now, not at its next restart.
+        if let Some(reevaluate) = &reevaluate {
+            ferryman_ops::fleet::refresh_rosters(&mut fleet.served);
+            take_newly_approved(
+                reevaluate,
+                &mut fleet,
+                &mut locks,
+                &mut told,
+                live_lane.as_ref(),
+                report,
+            );
+        }
+
         anchor_maintenance(&fleet.served, report).await;
 
         // The projects the fleet is focused on are looked at first, then the rest,
@@ -7988,9 +8067,15 @@ async fn run_fleet(
         let focus = ferryman_channel::focus::current();
         ferryman_ops::fleet::in_focus_order(&mut fleet.served, &focus, chrono::Utc::now());
         for (route, config) in &mut fleet.served {
-            if serving_everywhere
-                && let Some(why) = ferryman_ops::fleet::no_longer_served(route, config)
-            {
+            let closed = if serving_everywhere {
+                ferryman_ops::fleet::no_longer_served(route, config)
+            } else {
+                None
+            };
+            if serving_everywhere && let Some(lane) = live_lane.as_ref() {
+                lane.follow(route, closed.is_none(), report);
+            }
+            if let Some(why) = closed {
                 report.warn(&format!("{} not worked this pass: {why}", route.project_id));
                 continue;
             }
@@ -8041,6 +8126,101 @@ async fn run_fleet(
         tokio::time::sleep(poll).await;
     }
     Ok(())
+}
+
+/// Start serving the projects that have become open to a running `--all-projects` worker.
+///
+/// Each gets what a project gets at startup: the worker lock (one worker per identity per
+/// channel), this version stamped on it, its hand-in folders, and a place in the iroh lane.
+/// A project still closed is named once, and again only if the reason changes.
+fn take_newly_approved(
+    reevaluate: &Reevaluate,
+    fleet: &mut agent::Fleet,
+    locks: &mut Vec<agent::WorkerLock>,
+    told: &mut std::collections::BTreeMap<String, String>,
+    lane: Option<&lane::LiveLane>,
+    report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
+) {
+    let found = match ferryman_ops::fleet::newly_served(
+        &reevaluate.root,
+        &reevaluate.home,
+        &reevaluate.config,
+        &fleet.served,
+    ) {
+        Ok(found) => found,
+        Err(error) => {
+            report.warn(&format!(
+                "could not look for newly approved projects: {error:#}"
+            ));
+            return;
+        }
+    };
+    let mut still_closed = std::collections::BTreeSet::new();
+    for (_, why) in &found.skipped {
+        let Some((project, reason)) = why.split_once(": ") else {
+            continue;
+        };
+        still_closed.insert(project.to_owned());
+        if told.get(project).is_none_or(|said| said != reason) {
+            // The first pass repeats what startup already said about each; only a change
+            // is news after that.
+            if told.contains_key(project) {
+                report.info(&format!("  {project}: {reason}"));
+            }
+            told.insert(project.to_owned(), reason.to_owned());
+        }
+    }
+    told.retain(|project, _| project.starts_with("lock:") || still_closed.contains(project));
+    let mut taken = Vec::new();
+    for (route, config) in found.served {
+        match agent::WorkerLock::take(&route.attachment, &config.agent) {
+            Ok(Some(lock)) => {
+                told.remove(&format!("lock:{}", route.project_id));
+                locks.push(lock);
+            }
+            Ok(None) => {
+                // This project is looked at again every pass until something serves it, so
+                // the same sentence would be printed every few seconds. Once, and again if
+                // the reason changes.
+                if told
+                    .insert(format!("lock:{}", route.project_id), "held".to_owned())
+                    .is_none()
+                {
+                    report.warn(&format!(
+                        "  not watching {}: another worker on this machine already holds its \
+                         lock as the same agent. Two under one identity run the same order twice",
+                        route.project_id
+                    ));
+                }
+                continue;
+            }
+            Err(error) => {
+                let said = format!("{error:#}");
+                if told
+                    .insert(format!("lock:{}", route.project_id), said.clone())
+                    .is_none_or(|before| before != said)
+                {
+                    report.warn(&format!(
+                        "  not watching {}: no worker lock ({said})",
+                        route.project_id
+                    ));
+                }
+                continue;
+            }
+        }
+        report.info(&format!(
+            "now serving {}: it was approved while this worker ran",
+            route.project_id
+        ));
+        let _ =
+            ferryman_channel::licensing::refresh_device_version(&route, env!("CARGO_PKG_VERSION"));
+        if let Some(lane) = lane {
+            lane.add(&route, report);
+        }
+        taken.push((route, config));
+    }
+    prepare_work_folders(taken.iter().map(|(route, _)| route), report);
+    fleet.served.extend(taken);
 }
 
 async fn agent_command(command: Agent) -> Result<()> {
@@ -8149,7 +8329,21 @@ async fn agent_command(command: Agent) -> Result<()> {
                 config.max_parallel
             ));
             let iroh = lane::for_worker(&root, identity, &report);
-            run_fleet(fleet, &root.shared_home(), once, true, iroh, &report).await?;
+            let reevaluate = Reevaluate {
+                root: root.clone(),
+                home: home.attachment.clone(),
+                config: config.clone(),
+            };
+            run_fleet(
+                fleet,
+                &root.shared_home(),
+                once,
+                true,
+                iroh,
+                Some(reevaluate),
+                &report,
+            )
+            .await?;
         }
         Agent::Run {
             // Without `--all-projects`, `--comms` and `--workspace` are mutually
@@ -8229,7 +8423,7 @@ async fn agent_command(command: Agent) -> Result<()> {
                 return Ok(());
             }
             fleetsetup::guard_worker_start(false, allow_second_worker)?;
-            run_fleet(fleet, &comms, once, false, None, &report).await?;
+            run_fleet(fleet, &comms, once, false, None, None, &report).await?;
         }
         Agent::Run {
             workspace,
@@ -8504,7 +8698,7 @@ fn loadmem(
                      or use --agent with a name this machine holds a key for."
                 )
             })?;
-        record_agent_profile(bank_dir, name, &note, &identity)?;
+        record_agent_profile(bank_dir, &route.project_id, name, &note, &identity)?;
         println!(
             "recorded into {}",
             ferryman_channel::memory::agent_profile_path(bank_dir, name).display()
@@ -8624,6 +8818,11 @@ fn parse_work_kind(value: &str) -> Result<ferryman_channel::work::WorkKind, Stri
 }
 
 /// `large` as `--size` takes it.
+/// `high`, `normal` or `low` as `--priority` takes it.
+fn parse_priority(value: &str) -> Result<ferryman_channel::Priority, String> {
+    ferryman_channel::Priority::parse(value).map_err(|error| format!("{error:#}"))
+}
+
 fn parse_work_size(value: &str) -> Result<ferryman_channel::work::Size, String> {
     ferryman_channel::work::Size::parse(value).map_err(|error| format!("{error:#}"))
 }
@@ -9842,10 +10041,70 @@ fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// `ferry memory adopt-v1`: re-sign this project's v1 agent profiles for the project.
+fn adopt_v1_profiles(workspace: Option<PathBuf>, project: &str) -> Result<()> {
+    let start = match workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    let route = ferryman_channel::route_for(&start)?;
+    if !route.project_id.eq_ignore_ascii_case(project) {
+        bail!(
+            "this folder belongs to project '{}', not '{project}'; run it from {project}'s",
+            route.project_id
+        );
+    }
+    let me = ferryman_ops::identity::resolve(None, &route.attachment)?;
+    match ferryman_channel::master::read_master(&route)? {
+        Some(master) if master.master.eq_ignore_ascii_case(&me) => {}
+        Some(master) => bail!(
+            "only the project's operator adopts profiles: {} is its master, this machine is {me}",
+            master.master
+        ),
+        None => bail!("{project} has no master, so nobody can adopt its profiles"),
+    }
+    let Some(bank) = ferryman_channel::memory::memory_bank_checked(&route) else {
+        bail!("{project}'s memory bank is not inside its channel, so it is not used");
+    };
+    let mut adopted = 0;
+    for (agent, _) in ferryman_channel::memory::list_agent_profiles(&bank) {
+        if ferryman_channel::memory::verify_agent_profile_for(
+            &bank,
+            &route.project_id,
+            &agent,
+            &route.agents,
+        ) == ferryman_channel::SignatureCheck::Valid
+        {
+            continue; // already this project's
+        }
+        let Some(identity) =
+            ferryman_channel::AgentIdentity::load_existing(&agent, &route.attachment)?
+        else {
+            println!("skipped {agent}: this machine does not hold its key");
+            continue;
+        };
+        if ferryman_channel::memory::adopt_v1_profile(
+            &bank,
+            &route.project_id,
+            &agent,
+            &route.agents,
+            &identity,
+        )? {
+            adopted += 1;
+            println!("adopted {agent}");
+        } else {
+            println!("skipped {agent}: not a v1 profile with a valid signature");
+        }
+    }
+    println!("adopted {adopted} profile(s) into {project}");
+    Ok(())
+}
+
 /// Append a dated note to one agent's specialization profile, creating the file
 /// and its `agents/` directory on first use, then refresh the derived roster.
 fn record_agent_profile(
     bank: &std::path::Path,
+    project_id: &str,
     agent: &str,
     note: &str,
     identity: &ferryman_channel::AgentIdentity,
@@ -9861,7 +10120,7 @@ fn record_agent_profile(
     } else {
         format!("- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))
     };
-    ferryman_channel::memory::append_agent_profile(bank, agent, &line, identity)
+    ferryman_channel::memory::append_agent_profile_for(bank, project_id, agent, &line, identity)
         .with_context(|| format!("append to {}", path.display()))?;
     let _ = ferryman_channel::memory::regenerate_roster(bank);
     Ok(())
@@ -10453,11 +10712,16 @@ fn files_command(route: &ferryman_channel::ProjectRoute, command: FilesCommand) 
             max_file_mb,
             max_order_mb,
             retention_days,
+            archive_after_days,
             agent,
         } => {
             let (mut policy, _) =
                 ferryman_channel::policy::effective(&route.communications, &route.project_id);
-            if max_file_mb.is_none() && max_order_mb.is_none() && retention_days.is_none() {
+            if max_file_mb.is_none()
+                && max_order_mb.is_none()
+                && retention_days.is_none()
+                && archive_after_days.is_none()
+            {
                 let limits = order_files::limits(route);
                 let mb = |bytes: u64| bytes / (1024 * 1024);
                 println!("per file     {} MB", mb(limits.max_file));
@@ -10466,8 +10730,14 @@ fn files_command(route: &ferryman_channel::ProjectRoute, command: FilesCommand) 
                     "kept         {} days after the order is done or reviewed",
                     limits.retention_days
                 );
+                println!(
+                    "archived     acknowledged messages after {} days",
+                    ferryman_channel::compaction::archive_after_days(route)
+                );
                 return Ok(());
             }
+            policy.files.archive_after_days =
+                archive_after_days.or(policy.files.archive_after_days);
             policy.files.max_file_mb = max_file_mb.or(policy.files.max_file_mb);
             policy.files.max_order_mb = max_order_mb.or(policy.files.max_order_mb);
             policy.files.retention_days = retention_days.or(policy.files.retention_days);
@@ -10525,10 +10795,22 @@ fn channel(command: Channel) -> Result<()> {
                     "single-agent / unmanaged"
                 }
             );
+            // What carries the channel off this machine. An iroh-only channel (`ferry enable
+            // --no-syncthing`) has a folder id in its bridge.toml all the same, so naming it
+            // as the transport would be wrong.
+            let carried = lane::carried_by_iroh(&route);
+            if let Some(carried) = &carried {
+                println!("transport      iroh lane, endpoint {}", carried.endpoint_id);
+                println!("               {}", carried.describe());
+            }
             println!(
                 "syncthing      {}",
                 if route.shared_remote.is_empty() {
                     "(no folder id configured)".to_string()
+                } else if carried.is_some()
+                    && ferryman_channel::syncthing_channel_state(&route).is_none()
+                {
+                    "not used for this channel (Syncthing has no folder for it)".to_string()
                 } else {
                     format!("folder '{}'", route.shared_remote)
                 }
@@ -10875,27 +11157,42 @@ fn channel(command: Channel) -> Result<()> {
             if let Some(identity) = sign_as(&route, &sender)? {
                 identity.sign(&mut message);
             }
-            let mut engine = ferryman_channel::system_delivery_engine();
+            // A channel the iroh lane carries is not Syncthing's: do not ask Syncthing about
+            // it (that is a wait on a service that may not even run here) and say so.
+            let carried = lane::carried_by_iroh(&route);
+            let mut engine = match &carried {
+                Some(_) => ferryman_channel::system_delivery_engine_carried("iroh"),
+                None => ferryman_channel::system_delivery_engine(),
+            };
             let receipt = engine.send(&route, &message)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             // The receipt says the file was written. Whether it can leave this machine is
             // a different question, and the one a person sending a message means.
-            match ferryman_ops::syncthing::channel_sync(&route) {
-                ferryman_ops::syncthing::ChannelSync::Synced => eprintln!(
-                    "saved; Syncthing carries it to the other machines. It is read once the \
-                     recipient acknowledges it (ferry channel inbox --agent {})",
+            if let Some(carried) = &carried {
+                eprintln!(
+                    "saved; {}. It is read once the recipient acknowledges it (ferry channel \
+                     inbox --agent {})",
+                    carried.describe(),
                     message.recipient
-                ),
-                ferryman_ops::syncthing::ChannelSync::Split { syncs } => eprintln!(
-                    "NOT SENT: saved on this machine only. This workspace reads {} but \
+                );
+            } else {
+                match ferryman_ops::syncthing::channel_sync(&route) {
+                    ferryman_ops::syncthing::ChannelSync::Synced => eprintln!(
+                        "saved; Syncthing carries it to the other machines. It is read once the \
+                     recipient acknowledges it (ferry channel inbox --agent {})",
+                        message.recipient
+                    ),
+                    ferryman_ops::syncthing::ChannelSync::Split { syncs } => eprintln!(
+                        "NOT SENT: saved on this machine only. This workspace reads {} but \
                      Syncthing syncs {}. Run `ferry doctor --fix` here, then send again",
-                    route.communications.display(),
-                    syncs.display()
-                ),
-                ferryman_ops::syncthing::ChannelSync::Unknown => eprintln!(
-                    "saved on this machine. Syncthing could not confirm it syncs this \
+                        route.communications.display(),
+                        syncs.display()
+                    ),
+                    ferryman_ops::syncthing::ChannelSync::Unknown => eprintln!(
+                        "saved on this machine. Syncthing could not confirm it syncs this \
                      channel, so it may not leave; run `ferry doctor` to check"
-                ),
+                    ),
+                }
             }
         }
 
@@ -10923,7 +11220,11 @@ fn channel(command: Channel) -> Result<()> {
                     }
                 )
             }
-            let messages = ferryman_channel::list_messages(&route)?;
+            let messages = if all {
+                ferryman_channel::list_messages_with_archive(&route)?
+            } else {
+                ferryman_channel::list_messages(&route)?
+            };
             let mine: Vec<_> = messages
                 .into_iter()
                 // Case-insensitive against what is STORED: messages written before names
@@ -10956,6 +11257,7 @@ fn channel(command: Channel) -> Result<()> {
             depends_on,
             touches,
             allow_overlap,
+            priority,
             interface,
             result_schema,
             kind,
@@ -11047,6 +11349,10 @@ fn channel(command: Channel) -> Result<()> {
                 touches,
                 needs,
                 allow_overlap,
+                // Only what was asked for is signed. Without `--priority` the order carries
+                // none, so a worker on an older release still verifies it; the default
+                // (high from a person, normal from an agent) is applied when it is worked.
+                priority,
             };
             // Asked before the order exists, so it cannot find itself.
             let overlapping = match ferryman_channel::overlap::issue_warnings(&route, &order) {
@@ -11116,6 +11422,20 @@ fn channel(command: Channel) -> Result<()> {
             if let Some(needs) = &order.needs {
                 println!("  needs: {} (signed into the order)", needs.describe());
             }
+            if let Some(carried) = lane::carried_by_iroh(&route) {
+                println!("  {}", carried.describe());
+            }
+            println!(
+                "  priority {}{}",
+                order
+                    .effective_priority(&ferryman_channel::people(&route))
+                    .as_str(),
+                if order.priority.is_some() {
+                    " (signed into the order)"
+                } else {
+                    ""
+                }
+            );
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),
                 None => println!("  open: whichever agent claims first wins"),
@@ -11604,6 +11924,58 @@ fn channel(command: Channel) -> Result<()> {
             }
         }
 
+        Channel::Compact {
+            workspace,
+            dry_run,
+            grace_hours,
+            force_no_grace,
+            agent,
+        } => {
+            let route = here(workspace)?;
+            if lane::carried_by_iroh(&route).is_some()
+                || !ferryman_channel::transports::honoured_records(&route).is_empty()
+            {
+                bail!(
+                    "this channel is carried by the iroh lane, and compaction is Syncthing-only \
+                     for now: iroh never deletes, so its peers would send back every message \
+                     compaction removed and no space would be freed"
+                )
+            }
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
+            let pass = if force_no_grace {
+                ferryman_channel::compaction::compact_unchecked
+            } else {
+                ferryman_channel::compaction::compact
+            };
+            let report = pass(
+                &route,
+                &identity,
+                chrono::Utc::now(),
+                chrono::Duration::hours(i64::from(grace_hours)),
+                dry_run,
+            )?;
+            let (archive, remove) = if dry_run {
+                ("would archive", "would remove")
+            } else {
+                ("archived", "removed")
+            };
+            if let Some(cutoff) = report.cutoff {
+                println!(
+                    "messages acknowledged before {} are archived",
+                    cutoff.format("%Y-%m-%d")
+                );
+            }
+            println!("{archive} {} message(s)", report.archived.len());
+            if let Some(record) = &report.record {
+                println!("signed record {}", record.display());
+            }
+            println!("{remove} {} original(s)", report.removed.len());
+            for (id, why) in &report.kept {
+                println!("kept {id}: {why}");
+            }
+        }
+
         Channel::Log { workspace, limit } => {
             let route = here(workspace)?;
             // This used to print messages only. The channel's actual history is its
@@ -11668,7 +12040,7 @@ fn channel(command: Channel) -> Result<()> {
                     ));
                 }
             }
-            for message in ferryman_channel::list_messages(&route)? {
+            for message in ferryman_channel::list_messages_with_archive(&route)? {
                 entries.push((
                     message.created_at,
                     format!(
@@ -14127,5 +14499,33 @@ mod tests {
             "a rejection needs its reason"
         );
         assert!(super::Cli::try_parse_from(["ferry", "work", "list", "--json"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod priority_flag_tests {
+    use clap::Parser;
+
+    fn parsed(extra: &[&str]) -> Result<Option<ferryman_channel::Priority>, clap::Error> {
+        let mut args = vec!["ferry", "channel", "order", "--id", "t-1", "--task", "x"];
+        args.extend_from_slice(extra);
+        let cli = super::Cli::try_parse_from(args)?;
+        let super::Command::Channel {
+            command: super::Channel::Order { priority, .. },
+        } = cli.command
+        else {
+            panic!("not an order");
+        };
+        Ok(priority)
+    }
+
+    #[test]
+    fn priority_is_high_normal_or_low_and_optional() {
+        use ferryman_channel::Priority::{High, Low, Normal};
+        assert_eq!(parsed(&[]).unwrap(), None);
+        assert_eq!(parsed(&["--priority", "high"]).unwrap(), Some(High));
+        assert_eq!(parsed(&["--priority", "Normal"]).unwrap(), Some(Normal));
+        assert_eq!(parsed(&["--priority", "low"]).unwrap(), Some(Low));
+        assert!(parsed(&["--priority", "urgent"]).is_err());
     }
 }

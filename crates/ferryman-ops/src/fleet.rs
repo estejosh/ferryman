@@ -178,6 +178,21 @@ pub fn plan_worker(
     home: &Path,
     config: &AgentConfig,
 ) -> Result<(WorkerPlan, AgentIdentity)> {
+    plan_worker_except(root, home, config, &std::collections::BTreeSet::new())
+}
+
+/// [`plan_worker`] for the projects not in `already`: what a running worker asks each pass
+/// to find the ones that have become open to it since it started. Projects it already
+/// serves are not looked at again here (a revocation of one is [`no_longer_served`]'s).
+///
+/// # Errors
+/// As [`plan_worker`].
+pub fn plan_worker_except(
+    root: &Root,
+    home: &Path,
+    config: &AgentConfig,
+    already: &std::collections::BTreeSet<String>,
+) -> Result<(WorkerPlan, AgentIdentity)> {
     // The name becomes a file name under every checkout's `keys/` and a lock name beside
     // it. An `agent.toml` is the operator's own, but a path is not a thing to find out
     // about after a key has been written through it.
@@ -203,6 +218,7 @@ pub fn plan_worker(
         .read()
         .projects
         .into_iter()
+        .filter(|entry| !already.contains(&entry.project_id))
         .map(|entry| {
             let standing = judge(root, &entry, config, &key, &machine)
                 .unwrap_or_else(|error| skip(format!("{error:#}")));
@@ -304,6 +320,42 @@ fn judge(
         route: Box::new(route),
         seat,
     })
+}
+
+/// The projects that have become open to a running worker since it started, or since the
+/// last time it asked: those in the root that it does not serve yet and now may. What
+/// `ferry team approve <agent> --all` does on the master's machine reaches a worker that is
+/// already running through here, on its next pass, instead of at its next restart.
+///
+/// `config` is the BASE config the worker started with, not one of the per-project copies
+/// in `served`: each project gets its own binding rules laid over it by [`serve`]. The ones
+/// still not open are in `skipped` with the reason, every time; the caller says each once.
+///
+/// # Errors
+/// The worker's key is gone from `home`.
+pub fn newly_served(
+    root: &Root,
+    home: &Path,
+    config: &AgentConfig,
+    served: &[(ProjectRoute, AgentConfig)],
+) -> Result<Fleet> {
+    let already = served
+        .iter()
+        .map(|(route, _)| route.project_id.clone())
+        .collect();
+    let (plan, identity) = plan_worker_except(root, home, config, &already)?;
+    Ok(serve(plan, &identity, config))
+}
+
+/// Read each served project's roster again. A route carries the roster it was loaded with,
+/// and orders, results and reviews are checked against it: left alone for weeks it would
+/// call a person approved since the worker started a stranger.
+pub fn refresh_rosters(served: &mut [(ProjectRoute, AgentConfig)]) {
+    for (route, _) in served {
+        if let Ok(roster) = ferryman_channel::read_agent_roster(&route.communications) {
+            route.agents = roster;
+        }
+    }
 }
 
 /// Why a project this worker started serving is not one to work in now, if it is not.

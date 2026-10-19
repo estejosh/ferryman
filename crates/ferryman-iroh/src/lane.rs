@@ -128,6 +128,9 @@ pub async fn probe_relay(config: &IrohConfig, wait: Duration) -> Result<()> {
 pub struct Peer {
     pub agents: BTreeSet<String>,
     pub projects: BTreeSet<String>,
+    /// Projects served here that this peer is not yet trusted in, but is trusted in another
+    /// channel the two share: offered the `transports/` records of these and nothing else.
+    pub bootstrap: BTreeSet<String>,
     pub relay: Option<RelayUrl>,
 }
 
@@ -223,7 +226,8 @@ pub struct Outcome {
 /// One endpoint serving and syncing every channel in `projects`.
 pub struct Lane {
     endpoint: Endpoint,
-    projects: Vec<ProjectRoute>,
+    /// The channels served. Grows while the worker runs ([`Lane::add_project`]).
+    projects: Mutex<Vec<ProjectRoute>>,
     own: String,
     cache: Mutex<HashCache>,
     status: Mutex<Status>,
@@ -251,12 +255,58 @@ impl Lane {
                 ..Status::default()
             }),
             endpoint,
-            projects,
+            projects: Mutex::new(projects),
             own,
             cache: Mutex::new(HashCache::default()),
             status_file,
             local_agents: Mutex::new(Vec::new()),
         })
+    }
+
+    /// A snapshot of the channels served now.
+    fn routes(&self) -> Vec<ProjectRoute> {
+        self.projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Serve one more channel from the next connection and round on, or replace the route
+    /// of one already served. For a worker that finds a project newly approved while it
+    /// runs, so it need not be restarted for the lane to carry it.
+    pub fn add_project(&self, route: ProjectRoute) {
+        let mut projects = self
+            .projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match projects
+            .iter_mut()
+            .find(|have| have.project_id == route.project_id)
+        {
+            Some(have) => *have = route,
+            None => projects.push(route),
+        }
+    }
+
+    /// Stop serving a channel, from the next connection and round on: it was archived, or
+    /// its master took this worker out of it. Returns whether it had been served.
+    pub fn remove_project(&self, project_id: &str) -> bool {
+        let mut projects = self
+            .projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = projects.len();
+        projects.retain(|route| route.project_id != project_id);
+        projects.len() != before
+    }
+
+    /// The ids of the channels served now.
+    #[must_use]
+    pub fn project_ids(&self) -> Vec<String> {
+        self.routes()
+            .into_iter()
+            .map(|route| route.project_id)
+            .collect()
     }
 
     /// Say which agents run on this machine. A project in which all of them are Workers is
@@ -284,6 +334,15 @@ impl Lane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        if peer.bootstrap.contains(id) && !peer.projects.contains(id) {
+            // First contact: the agents' records and nothing more, in both directions.
+            return vec![Share {
+                key: id.clone(),
+                dir: channel.clone(),
+                rules: Rules::for_channel(channel).transports_only(route.clone()),
+                send: !access::machine_is_worker_only(channel, id, &local),
+            }];
+        }
         let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
         let mut channel_rules = Rules::for_channel(channel);
         if handins_elsewhere {
@@ -340,7 +399,8 @@ impl Lane {
     #[must_use]
     pub fn trusted(&self) -> BTreeMap<EndpointId, Peer> {
         let mut peers: BTreeMap<EndpointId, Peer> = BTreeMap::new();
-        for route in &self.projects {
+        let projects = self.routes();
+        for route in &projects {
             for record in ferryman_channel::transports::honoured_records(route) {
                 if record.endpoint_id == self.own {
                     continue;
@@ -361,6 +421,33 @@ impl Lane {
                     peer.relay = record.relay_url.as_deref().and_then(|u| u.parse().ok());
                 }
             }
+        }
+        // A peer trusted in one channel may be offered the transports records of any other
+        // channel served here that it has none in yet, so two machines that already share
+        // a project can find each other in a new one without a hand-copied file.
+        //
+        // Only where that peer's agent is already on the channel's roster: a record is
+        // let in for an agent the channel knows, so offering the channel to a peer that
+        // has no place on it would only be asking to be refused, and would tell it the
+        // project exists.
+        for peer in peers.values_mut() {
+            peer.bootstrap = projects
+                .iter()
+                .filter(|route| !peer.projects.contains(&route.project_id))
+                .filter(|route| {
+                    peer.agents.iter().any(|agent| {
+                        route
+                            .communications
+                            .join("agents")
+                            .join(format!(
+                                "{}.json",
+                                ferryman_channel::canonical_agent_name(agent)
+                            ))
+                            .is_file()
+                    })
+                })
+                .map(|route| route.project_id.clone())
+                .collect();
         }
         peers
     }
@@ -404,12 +491,10 @@ impl Lane {
             .project_id
             .strip_suffix(HANDINS_SUFFIX)
             .unwrap_or(&hello.project_id);
-        let route = self
-            .projects
-            .iter()
-            .find(|route| route.project_id == project_id);
+        let projects = self.routes();
+        let route = projects.iter().find(|route| route.project_id == project_id);
         let share = route
-            .filter(|_| peer.projects.contains(project_id))
+            .filter(|_| peer.projects.contains(project_id) || peer.bootstrap.contains(project_id))
             .and_then(|route| {
                 self.shares(route, peer)
                     .into_iter()
@@ -482,11 +567,10 @@ impl Lane {
             .context("connect")?;
         let mut totals = Outcome::default();
         let mut failures = Vec::new();
-        for route in self
-            .projects
-            .iter()
-            .filter(|route| peer.projects.contains(&route.project_id))
-        {
+        let projects = self.routes();
+        for route in projects.iter().filter(|route| {
+            peer.projects.contains(&route.project_id) || peer.bootstrap.contains(&route.project_id)
+        }) {
             for share in self.shares(route, peer) {
                 match self.sync_share(&connection, &share).await {
                     Ok(Some((received, sent))) => {

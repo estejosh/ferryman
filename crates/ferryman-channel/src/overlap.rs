@@ -676,6 +676,7 @@ pub(crate) mod tests {
             touches: globs(touches),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 

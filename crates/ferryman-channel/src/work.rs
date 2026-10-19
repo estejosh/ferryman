@@ -1635,6 +1635,7 @@ mod tests {
             touches: touches.iter().map(ToString::to_string).collect(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 
@@ -1902,6 +1903,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 

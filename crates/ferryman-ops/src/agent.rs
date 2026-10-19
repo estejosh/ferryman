@@ -1867,12 +1867,26 @@ result.\n\n";
 /// input the worker acted on without asking who wrote it, while orders, results and even
 /// steer interrupts were all signature-checked with explicit trust-boundary comments.
 fn profile_block(route: &ProjectRoute, agent: &str) -> String {
-    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    // This project's memory and no other's: a bank that leads out of the channel is not
+    // read, and a profile signed for another project does not verify here. A fleet worker
+    // is one agent in every project, so its key is on every roster and the signature alone
+    // could not tell one project's profile from another's.
+    let Some(bank) = ferryman_channel::memory::memory_bank_checked(route) else {
+        tracing::warn!(
+            "{}: its memory-bank leads outside its channel, so it is left out of the prompt",
+            route.project_id
+        );
+        return String::new();
+    };
     // Reading the roster costs a directory scan per prompt, which is nothing beside spawning
     // an agent CLI, and it is the only way to know whose key is whose.
     let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
-    let (profile, check) =
-        ferryman_channel::memory::load_checked_agent_profile(&bank, agent, &roster);
+    let (profile, check) = ferryman_channel::memory::load_checked_agent_profile_for(
+        &bank,
+        &route.project_id,
+        agent,
+        &roster,
+    );
     let Some(profile) = profile.filter(|text| !text.trim().is_empty()) else {
         return String::new();
     };
@@ -1895,9 +1909,16 @@ fn profile_block(route: &ProjectRoute, agent: &str) -> String {
 /// practiced at". A peer's profile is that peer's claim about itself; presenting it as fact
 /// invites the model to act on a stranger's self-description, which is what a nomination is.
 fn peer_roster_block(route: &ProjectRoute, agent: &str, task: &str) -> String {
-    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    let Some(bank) = ferryman_channel::memory::memory_bank_checked(route) else {
+        return String::new();
+    };
     let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
-    let peers = ferryman_channel::memory::list_verified_peer_profiles(&bank, agent, &roster);
+    let peers = ferryman_channel::memory::list_verified_peer_profiles_for(
+        &bank,
+        &route.project_id,
+        agent,
+        &roster,
+    );
     if peers.is_empty() {
         return String::new();
     }
@@ -1919,7 +1940,9 @@ fn peer_roster_block(route: &ProjectRoute, agent: &str, task: &str) -> String {
          yours, say so at the start of your result — for example \"better suited to 'claw' \
          (Rust)\" — then do your best anyway.\n",
     );
-    if let Some(hint) = ferryman_channel::memory::routing_hint(&bank, agent, task, &roster) {
+    if let Some(hint) =
+        ferryman_channel::memory::routing_hint_for(&bank, &route.project_id, agent, task, &roster)
+    {
         out.push_str(&format!("\n{hint}\n"));
     }
     out.push('\n');
@@ -1937,7 +1960,9 @@ fn record_agent_activity(
     summary: &str,
     identity: &AgentIdentity,
 ) {
-    let bank = ferryman_channel::memory::memory_bank_dir(route);
+    let Some(bank) = ferryman_channel::memory::memory_bank_checked(route) else {
+        return;
+    };
     let summary = ferryman_channel::memory::summarize(summary);
     let line = if summary.is_empty() {
         format!("- {} {order_id}", chrono::Utc::now().format("%Y-%m-%d"))
@@ -1949,7 +1974,13 @@ fn record_agent_activity(
     };
     // Signed as it is written. The identity is already in hand here - it just signed the
     // result - so there is no reason for the profile to be the one artifact left unsigned.
-    let _ = ferryman_channel::memory::append_agent_profile(&bank, agent, &line, identity);
+    let _ = ferryman_channel::memory::append_agent_profile_for(
+        &bank,
+        &route.project_id,
+        agent,
+        &line,
+        identity,
+    );
 }
 
 /// What the engine is told about the shapes its order is held to: the locked interface
@@ -6288,6 +6319,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -6374,6 +6406,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 
@@ -6819,6 +6852,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         assert_eq!(
             commit_subject("t-4f2a", &order),
@@ -6987,6 +7021,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -7324,6 +7359,8 @@ mod tests {
     /// Point this thread's machine state (keys, the pause marker) at a temporary
     /// directory, and prove it did, before anything below writes a pause.
     fn hermetic_machine() {
+        // The checkout may sit inside a real ferry root; a test finds only the one it makes.
+        ferryman_channel::ferry::isolate_root_search_for_this_thread();
         ferryman_channel::licensing::use_machine_state_dir_per_thread(
             std::env::temp_dir().join(format!("ferryman-ops-selftest-{}", std::process::id())),
         );
@@ -9957,5 +9994,84 @@ mod engine_usage_tests {
         assert!(super::may_kill_orphan(stranger.id(), program));
         let _ = stranger.kill();
         let _ = stranger.wait();
+    }
+
+    /// A fleet worker is one agent in every project, with its key on every roster. What it
+    /// has worked on in one project must not reach the prompt for another.
+    #[test]
+    fn one_projects_memory_never_reaches_another_projects_prompt() {
+        use crate::agent::{peer_roster_block, profile_block, record_agent_activity};
+        use ferryman_channel::{AgentIdentity, ProjectRoute};
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let wisp = AgentIdentity::from_seed("wisp", [5; 32]);
+        let route = |project: &str| {
+            let workspace = dir.path().join(project);
+            let attachment = workspace.join(".ferryman");
+            let communications = attachment.join("ferryman");
+            std::fs::create_dir_all(&communications).unwrap();
+            let route = ProjectRoute {
+                project_id: project.to_string(),
+                workspace,
+                attachment,
+                communications,
+                shared_remote: String::new(),
+                git_remote: String::new(),
+                git_visibility: String::new(),
+                agents: Vec::new(),
+            };
+            ferryman_channel::register_agent(
+                &route,
+                &ferryman_channel::AgentRoute {
+                    name: "wisp".into(),
+                    role: "worker".into(),
+                    capabilities: Vec::new(),
+                    public_key: Some(wisp.public_key_hex()),
+                    encryption_key: None,
+                },
+            )
+            .unwrap();
+            route
+        };
+        let quantly = route("quantly");
+        let iroh = route("iroh-test");
+
+        record_agent_activity(
+            &quantly,
+            "wisp",
+            "q-1",
+            "paper trading only, Rust only",
+            &wisp,
+        );
+        let own = profile_block(&quantly, "wisp");
+        assert!(own.contains("paper trading only"), "{own}");
+        assert_eq!(
+            profile_block(&iroh, "wisp"),
+            "",
+            "nothing recorded in iroh-test yet"
+        );
+
+        // Whatever carries the files - a misconfigured sync, a hand copy, a shared folder -
+        // puts quantly's memory into iroh-test's bank.
+        let from = ferryman_channel::memory::memory_bank_dir(&quantly).join("agents");
+        let to = ferryman_channel::memory::memory_bank_dir(&iroh).join("agents");
+        std::fs::create_dir_all(&to).unwrap();
+        for entry in std::fs::read_dir(&from).unwrap().flatten() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+        let leaked = profile_block(&iroh, "wisp");
+        assert!(
+            !leaked.contains("paper trading"),
+            "quantly's memory reached iroh-test's prompt: {leaked}"
+        );
+        assert!(peer_roster_block(&iroh, "someone-else", "trading").is_empty());
+
+        // And work in iroh-test does not pick the copy up and make it its own.
+        record_agent_activity(&iroh, "wisp", "i-1", "relay handshake", &wisp);
+        let theirs = profile_block(&iroh, "wisp");
+        assert!(theirs.contains("relay handshake"), "{theirs}");
+        assert!(!theirs.contains("paper trading"), "{theirs}");
+        // Quantly's own is untouched.
+        assert!(profile_block(&quantly, "wisp").contains("paper trading only"));
     }
 }

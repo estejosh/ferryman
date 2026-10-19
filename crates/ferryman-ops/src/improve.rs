@@ -678,6 +678,7 @@ fn verify_claims(
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             };
             identity.sign_order(&mut order);
             match ferryman_channel::issue_order(route, &order) {
@@ -1119,6 +1120,7 @@ fn issue_missing(
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         identity.sign_order(&mut order);
         match ferryman_channel::issue_order(route, &order) {
@@ -2481,6 +2483,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp.sign_order(&mut order);
         ferryman_channel::issue_order(&route, &order).unwrap();
@@ -2854,6 +2857,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp.sign_order(&mut order);
         ferryman_channel::issue_order(&route, &order).unwrap();
@@ -3338,6 +3342,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         let task = |id: &str, output: &str| Task {
             order: order(id),
@@ -3566,6 +3571,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();

@@ -18,6 +18,7 @@ pub mod anchor;
 pub mod ask;
 pub mod automerge;
 pub mod capability;
+pub mod compaction;
 pub mod contract;
 pub mod conversation;
 pub mod cost;
@@ -57,6 +58,7 @@ pub mod policy;
 pub mod portable_auth;
 pub mod quantly;
 pub mod questions;
+pub mod readcache;
 pub mod receipts;
 pub mod release;
 pub mod router;
@@ -847,8 +849,107 @@ pub struct Order {
     /// working on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_overlap: bool,
+    /// How soon this should be picked up, signed into the order when set. `None` reads as
+    /// [`Priority::Normal`], which is what every order issued before this field was, so
+    /// their bytes and signatures are unchanged. See [`Priority`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "priority_or_none"
+    )]
+    pub priority: Option<Priority>,
 }
 
+/// How soon an order should be picked up.
+///
+/// A worker claims the highest priority first and, among equals, the oldest. It never
+/// interrupts work it is already doing: priority orders the queue and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Low,
+    Normal,
+    High,
+}
+
+impl Priority {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+
+    /// `high`, `normal` or `low`, in any case.
+    ///
+    /// # Errors
+    /// Anything else.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "high" => Ok(Self::High),
+            "normal" => Ok(Self::Normal),
+            "low" => Ok(Self::Low),
+            other => bail!("priority is high, normal or low, not '{other}'"),
+        }
+    }
+}
+
+/// A priority this version does not know reads as none, not as an unreadable order. The
+/// order's signature then does not verify (the value is part of what was signed), so it is
+/// refused rather than run at a priority nobody here understands.
+fn priority_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Priority>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|text| Priority::parse(&text).ok()))
+}
+
+impl Order {
+    /// The priority this order SAYS: what was signed into it, or normal. Not what it is
+    /// worked at when it says nothing; that is [`Order::effective_priority`].
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        self.priority.unwrap_or(Priority::Normal)
+    }
+
+    /// The priority this order is worked at. A signed priority is that. An order that
+    /// carries none is worked at the default of whoever issued it, decided here and now
+    /// from the signer's role and never written into the order: high from a person
+    /// (`people`, see [`people`]), normal from an agent, and high from an order nobody
+    /// signed. Leaving the default out of the signed bytes is what keeps an order a worker
+    /// on an older release can still verify.
+    #[must_use]
+    pub fn effective_priority(&self, people: &std::collections::HashSet<String>) -> Priority {
+        if let Some(priority) = self.priority {
+            return priority;
+        }
+        match &self.signed_by {
+            Some(signer) if !people.contains(&signer.to_ascii_lowercase()) => Priority::Normal,
+            _ => Priority::High,
+        }
+    }
+}
+
+/// The people on a project, lowercased: its master and every roster entry whose role is
+/// `operator`. Agents (workers, bridges, the improvement loop) are not. Read from the
+/// channel as it is now, so a person who joined since the route was built is one.
+#[must_use]
+pub fn people(route: &ProjectRoute) -> std::collections::HashSet<String> {
+    let roster = read_agent_roster(&route.communications).unwrap_or_else(|_| route.agents.clone());
+    let mut people: std::collections::HashSet<String> = roster
+        .iter()
+        .filter(|agent| agent.role == "operator")
+        .map(|agent| agent.name.to_ascii_lowercase())
+        .collect();
+    if let Some(declaration) = master::read_master_at(&route.communications, &roster)
+        .ok()
+        .flatten()
+    {
+        people.insert(declaration.master.to_ascii_lowercase());
+    }
+    people
+}
 /// An agent staking a claim on an open order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claim {
@@ -1737,10 +1838,52 @@ pub fn submit_recommendation(
 
 /// Read one task by reading its directory.
 pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
+    read_task_with(route, order_id, &ReadContext::new(route))
+}
+
+/// What reading a task depends on besides its own files, worked out once for a whole pass.
+struct ReadContext {
+    workers: std::collections::BTreeSet<String>,
+    overlays: Vec<(String, PathBuf)>,
+    trust: Option<u64>,
+}
+
+impl ReadContext {
+    fn new(route: &ProjectRoute) -> Self {
+        let workers = access::refused_authors(&route.communications, &route.project_id);
+        let overlays =
+            access::overlay_dirs_among(&route.communications, &route.project_id, workers.clone());
+        let trust = readcache::trust_key(
+            &route.project_id,
+            &route.agents,
+            &workers,
+            &overlays,
+            &route.communications,
+        );
+        Self {
+            workers,
+            overlays,
+            trust,
+        }
+    }
+}
+
+fn read_task_with(route: &ProjectRoute, order_id: &str, ctx: &ReadContext) -> Result<Task> {
     if !is_safe_component(order_id) {
         bail!("order id must be a path-safe identifier")
     }
     let directory = task_dir(route, order_id);
+    // Unchanged since this machine last read it, under the same trust: no need to read it
+    // again (see the `readcache` module).
+    let mut files = readcache::Fingerprint::default();
+    files.add_dir("", &directory);
+    for (worker, dir) in &ctx.overlays {
+        files.add_dir(&format!("{worker}/"), &dir.join("tasks").join(order_id));
+    }
+    let files = files.sorted();
+    if let Some(task) = readcache::lookup(&directory, ctx.trust, &files) {
+        return Ok(task);
+    }
     let order: Order = serde_json::from_str(&fs::read_to_string(directory.join("order.json"))?)
         .with_context(|| format!("order {order_id} is unreadable"))?;
     if order.id != order_id {
@@ -1761,7 +1904,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     // refused on the way in, wherever it came from: a synced copy, a hand-copied file, a
     // tool that ignored the rule. Their own signed files are read from `handins/<agent>/`
     // below, as if they were here. Both lists are empty for nearly every project.
-    let workers = access::refused_authors(&route.communications, &route.project_id);
+    let workers = &ctx.workers;
     let mut ingest = |name: &str, text: &str| {
         // A single unreadable file must not hide the rest of the task.
         if name.starts_with("claim.")
@@ -1829,7 +1972,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             && access::comms_author_refused(
                 &format!("tasks/{order_id}/{name}"),
                 Some(text.as_bytes()),
-                &workers,
+                workers,
             )
             .is_some()
         {
@@ -1837,24 +1980,24 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         }
         ingest(name, &text);
     }
-    for (worker, dir) in access::overlay_dirs(&route.communications, &route.project_id) {
-        let Ok(files) = fs::read_dir(dir.join("tasks").join(order_id)) else {
+    for (worker, dir) in &ctx.overlays {
+        let Ok(listing) = fs::read_dir(dir.join("tasks").join(order_id)) else {
             continue;
         };
-        for entry in files.flatten() {
+        for entry in listing.flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             // Only what that worker wrote, under its own name.
-            if !access::overlay_file_is_theirs(&worker, name) {
+            if !access::overlay_file_is_theirs(worker, name) {
                 continue;
             }
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
             // And naming itself inside: a claim "from" somebody else is not its claim.
-            if !access::overlay_content_is_theirs(&worker, name, text.as_bytes()) {
+            if !access::overlay_content_is_theirs(worker, name, text.as_bytes()) {
                 continue;
             }
             ingest(name, &text);
@@ -1863,7 +2006,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     results.sort_by_key(|r: &TaskResult| r.revision);
     reviews.sort_by_key(|r: &Review| r.revision);
     recommendations.sort_by_key(|r: &Recommendation| r.revision);
-    Ok(Task {
+    let task = Task {
         order,
         claims,
         results,
@@ -1873,7 +2016,19 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         releases,
         kills,
         offers,
-    })
+    };
+    // Whether an offer stands, or a delegate's verdict counts, turns on the time as well as
+    // on files, so those tasks are read afresh each time.
+    let own_verdicts = task.reviews.iter().all(|review| {
+        review
+            .signed_by
+            .as_deref()
+            .is_some_and(|signer| signer.eq_ignore_ascii_case(&review.reviewer))
+    });
+    if task.offers.is_empty() && own_verdicts {
+        readcache::remember(&directory, ctx.trust, files, &task);
+    }
+    Ok(task)
 }
 
 /// Every task in the channel.
@@ -1883,6 +2038,10 @@ pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
         return Ok(Vec::new());
     }
     let mut tasks = Vec::new();
+    // The roster, the grants and the master are looked at once for the whole pass, not once
+    // per task; and a task folder that has not changed is not read again.
+    let ctx = ReadContext::new(route);
+    let mut seen = std::collections::HashSet::new();
     for entry in fs::read_dir(&root)? {
         let path = entry?.path();
         if !path.is_dir() {
@@ -1891,10 +2050,12 @@ pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
         let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if let Ok(task) = read_task(route, id) {
+        seen.insert(path.clone());
+        if let Ok(task) = read_task_with(route, id, &ctx) {
             tasks.push(task);
         }
     }
+    readcache::retain_under(&root, &seen);
     tasks.sort_by_key(|task| task.order.created_at);
     Ok(tasks)
 }
@@ -2000,6 +2161,18 @@ pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result
             _ => {}
         }
     }
+    // Highest priority first, then the oldest: what this worker would take next, in order.
+    // Work it already holds comes before anything it has yet to claim, so a new high
+    // priority order never displaces work in hand.
+    let people = people(route);
+    out.sort_by_cached_key(|task| {
+        let unclaimed = matches!(task.state(), TaskState::Open | TaskState::Offered { .. });
+        (
+            unclaimed,
+            std::cmp::Reverse(task.order.effective_priority(&people)),
+            task.order.created_at,
+        )
+    });
     Ok(out)
 }
 
@@ -2352,10 +2525,9 @@ impl AgentIdentity {
     /// channel. Unsigned, it was the one input the worker acted on without checking who
     /// wrote it - see [`crate::memory::ProfileAttestation`] for the whole argument.
     pub fn sign_profile_attestation(&self, attestation: &mut crate::memory::ProfileAttestation) {
-        let signature = self.signing.sign(
-            crate::memory::attestation_payload_for(&attestation.agent, &attestation.sha256)
-                .as_bytes(),
-        );
+        let signature = self
+            .signing
+            .sign(crate::memory::payload_of(attestation).as_bytes());
         attestation.signed_by = Some(self.name.clone());
         attestation.signature = Some(hex::encode(signature.to_bytes()));
     }
@@ -2434,6 +2606,11 @@ fn order_payload(order: &Order) -> String {
     }
     if order.allow_overlap {
         payload.push_str("\noverlap:allow");
+    }
+    // Bound when set, like the fields above: an order without one keeps its old bytes, and
+    // one with one cannot be bumped up the queue after it was signed.
+    if let Some(priority) = order.priority {
+        payload.push_str(&format!("\npriority:{}", priority.as_str()));
     }
     if order.requires_approval {
         payload.push_str("\napproval:true");
@@ -4202,8 +4379,40 @@ pub fn route_for(start: &Path) -> Result<ProjectRoute> {
     Ok(route)
 }
 
+/// Whether `message_id` has been acknowledged: its acknowledgement file is live, or
+/// compaction moved it into the archive with the message. Every check that decides
+/// "has this been handled" goes through here, never through the file alone - a compacted
+/// message must not be claimed again.
 pub fn is_acknowledged(route: &ProjectRoute, message_id: &str) -> bool {
-    acknowledgement_path(route, message_id).is_file()
+    acknowledgement_path(route, message_id).is_file() || compaction::acknowledged(route, message_id)
+}
+
+/// The text of a stored message, from the live folder or, once compacted, the archive.
+fn stored_message_bytes(route: &ProjectRoute, message_id: &str) -> Result<Vec<u8>> {
+    let path = route
+        .communications
+        .join("messages")
+        .join(&route.project_id)
+        .join(format!("{message_id}.json"));
+    match fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match compaction::find(route, message_id) {
+                Some(archived) => Ok(archived.raw.into_bytes()),
+                None => Err(error).with_context(|| format!("read message {message_id}")),
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("read message {message_id}")),
+    }
+}
+
+/// The acknowledgement compaction archived with a message, parsed.
+fn archived_acknowledgement<T: serde::de::DeserializeOwned>(
+    route: &ProjectRoute,
+    message_id: &str,
+) -> Option<T> {
+    let raw = compaction::find(route, message_id)?.ack_raw?;
+    serde_json::from_str(&raw).ok()
 }
 
 fn outbox_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
@@ -4441,6 +4650,10 @@ pub struct SyncthingProbe {
     /// `Unavailable` rather than guessing, so delivery fails over instead of silently
     /// assuming a transport that may not exist.
     pub api_key: String,
+    /// Set when some other lane (iroh) carries the channel, and says which. The folder is
+    /// then not Syncthing's to vouch for, so it is not asked: the probe answers `Healthy`
+    /// at once, with no call to Syncthing and no wait on one that is not running.
+    pub carried_by: Option<String>,
 }
 
 impl SyncthingProbe {
@@ -4456,12 +4669,19 @@ impl SyncthingProbe {
         // Syncthing while the channel was carried by another.
         let api_base = syncthing_api_base();
         let api_key = syncthing_api_key().unwrap_or_default();
-        Self { api_base, api_key }
+        Self {
+            api_base,
+            api_key,
+            carried_by: None,
+        }
     }
 }
 
 impl SharedHealthProbe for SyncthingProbe {
     fn health(&mut self, route: &ProjectRoute) -> Result<Health> {
+        if self.carried_by.is_some() {
+            return Ok(Health::Healthy);
+        }
         if self.api_key.is_empty() || route.shared_remote.trim().is_empty() {
             return Ok(Health::Unavailable);
         }
@@ -6229,6 +6449,10 @@ impl<G: GitRunner> MessageTransport for PrivateGitTransport<G> {
         let result = (|| {
             let _lock = acquire_git_live_lock(route)?;
             if !acknowledgement_path(route, &acknowledgement.message_id).is_file() {
+                if is_acknowledged(route, &acknowledgement.message_id) {
+                    // Compacted: it was delivered before it was archived.
+                    return Ok(());
+                }
                 bail!("acknowledgement must be durable before Git delivery")
             }
             self.commit_and_push_locked(
@@ -6358,11 +6582,26 @@ pub fn system_delivery_engine() -> SystemDeliveryEngine {
 /// callers that already resolved their configuration.
 #[must_use]
 pub fn system_delivery_engine_in(namespace: ChannelNamespace) -> SystemDeliveryEngine {
+    system_delivery_engine_for(namespace, None)
+}
+
+/// [`system_delivery_engine`] for a channel another lane carries (`carried_by` names it):
+/// Syncthing is not asked about it, so a machine that does not run Syncthing does not
+/// wait on one.
+#[must_use]
+pub fn system_delivery_engine_carried(carried_by: &str) -> SystemDeliveryEngine {
+    system_delivery_engine_for(ChannelNamespace::from_env(), Some(carried_by.to_string()))
+}
+
+fn system_delivery_engine_for(
+    namespace: ChannelNamespace,
+    carried_by: Option<String>,
+) -> SystemDeliveryEngine {
+    let mut probe = SyncthingProbe::from_env();
+    probe.carried_by = carried_by;
     DeliveryEngine::with_namespace(
         LocalFilesystemTransport,
-        SharedFolderTransport {
-            probe: SyncthingProbe::from_env(),
-        },
+        SharedFolderTransport { probe },
         PrivateGitTransport::with_namespace(SystemGit, namespace.clone()),
         namespace,
     )
@@ -6403,7 +6642,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
 
         let outbox = outbox_path(route, &message.id);
         persist_message(&outbox, message)?;
-        if acknowledgement_path(route, &message.id).is_file() {
+        if is_acknowledged(route, &message.id) {
             fs::remove_file(&outbox)?;
             return self.receipt(
                 route,
@@ -6665,7 +6904,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
             .attachment
             .join("runtime/acknowledgement-deliveries")
             .join(format!("{}.json", canonical.message_id));
-        if acknowledgement_path(route, &canonical.message_id).is_file()
+        if is_acknowledged(route, &canonical.message_id)
             && !queued_path.is_file()
             && delivery_path.is_file()
         {
@@ -6821,7 +7060,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
                         continue;
                     }
                 };
-                if acknowledgement_path(route, &message.id).is_file() {
+                if is_acknowledged(route, &message.id) {
                     fs::remove_file(path)?;
                     continue;
                 }
@@ -7049,7 +7288,7 @@ pub fn claim_message(route: &ProjectRoute, message: &Message) -> Result<bool> {
     if message.project_id != route.project_id || !route.permits(&message.recipient, None) {
         bail!("message is not permitted by this project route")
     }
-    if acknowledgement_path(route, &message.id).is_file() {
+    if is_acknowledged(route, &message.id) {
         return Ok(false);
     }
     let claim = route
@@ -7079,14 +7318,61 @@ pub fn read_message(route: &ProjectRoute, message_id: &str) -> Result<Message> {
         .join("messages")
         .join(&route.project_id)
         .join(format!("{message_id}.json"));
-    let message: Message = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read message {message_id}"))?,
-    )?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        // Compacted: the archive keeps the file text it had.
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match compaction::find(route, message_id) {
+                Some(archived) => archived.raw.into_bytes(),
+                None => return Err(error).with_context(|| format!("read message {message_id}")),
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("read message {message_id}")),
+    };
+    let message: Message = serde_json::from_slice(&bytes)?;
     message.validate()?;
     if message.project_id != route.project_id {
         bail!("stored message belongs to another project")
     }
     Ok(message)
+}
+
+/// [`list_messages`] and the messages compaction moved into the archive, oldest first.
+pub fn list_messages_with_archive(route: &ProjectRoute) -> Result<Vec<Message>> {
+    let mut messages = list_messages(route)?;
+    let known: std::collections::HashSet<String> =
+        messages.iter().map(|message| message.id.clone()).collect();
+    // The archive is held to the same rule as the inbox: a Worker's words are not the channel's.
+    let refused = access::refused_authors(&route.communications, &route.project_id);
+    messages.extend(
+        compaction::archived_v1(route)
+            .into_iter()
+            .filter(|message| {
+                !known.contains(&message.id)
+                    && !refused.contains(&canonical_agent_name(&message.sender))
+            }),
+    );
+    messages.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    Ok(messages)
+}
+
+/// [`list_messages_v2`] and the archived v2 messages, sorted by ID.
+pub fn list_messages_v2_with_archive(route: &ProjectRoute) -> Result<Vec<MessageV2>> {
+    let mut messages = list_messages_v2(route)?;
+    let known: std::collections::HashSet<String> =
+        messages.iter().map(|message| message.id.clone()).collect();
+    // The archive is held to the same rule as the inbox: a Worker's words are not the channel's.
+    let refused = access::refused_authors(&route.communications, &route.project_id);
+    messages.extend(
+        compaction::archived_v2(route)
+            .into_iter()
+            .filter(|message| {
+                !known.contains(&message.id)
+                    && !refused.contains(&canonical_agent_name(&message.sender))
+            }),
+    );
+    messages.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(messages)
 }
 
 pub fn list_messages(route: &ProjectRoute) -> Result<Vec<Message>> {
@@ -7173,6 +7459,11 @@ pub fn find_message_by_idempotency_key(
             None => found = Some(message),
         }
     }
+    if found.is_none() {
+        found = compaction::archived_v1(route)
+            .into_iter()
+            .find(|message| message.idempotency_key == idempotency_key);
+    }
     Ok(found)
 }
 
@@ -7185,15 +7476,8 @@ pub fn record_acknowledgement(
     if acknowledgement.project_id != route.project_id {
         bail!("acknowledgement project does not match route")
     }
-    let stored_message_path = route
-        .communications
-        .join("messages")
-        .join(&route.project_id)
-        .join(format!("{}.json", acknowledgement.message_id));
-    let message: Message = serde_json::from_slice(
-        &fs::read(&stored_message_path)
-            .with_context(|| format!("read message {}", acknowledgement.message_id))?,
-    )?;
+    let message: Message =
+        serde_json::from_slice(&stored_message_bytes(route, &acknowledgement.message_id)?)?;
     if acknowledgement.idempotency_key != message.idempotency_key
         || (acknowledgement.recipient != message.recipient
             && !route.agents.iter().any(|agent| {
@@ -7204,8 +7488,12 @@ pub fn record_acknowledgement(
         bail!("acknowledgement does not match the stored message")
     }
     let path = acknowledgement_path(route, &acknowledgement.message_id);
-    if path.exists() {
-        let existing: Acknowledgement = serde_json::from_slice(&fs::read(&path)?)?;
+    let existing: Option<Acknowledgement> = if path.exists() {
+        Some(serde_json::from_slice(&fs::read(&path)?)?)
+    } else {
+        archived_acknowledgement(route, &acknowledgement.message_id)
+    };
+    if let Some(existing) = existing {
         if existing.message_id == acknowledgement.message_id
             && existing.project_id == acknowledgement.project_id
             && existing.recipient == acknowledgement.recipient
@@ -7234,14 +7522,7 @@ pub fn inbound_message_format(route: &ProjectRoute, message_id: &str) -> Result<
     if Uuid::parse_str(message_id).is_err() {
         bail!("message ID is invalid")
     }
-    let path = route
-        .communications
-        .join("messages")
-        .join(&route.project_id)
-        .join(format!("{message_id}.json"));
-    let value: Value = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read message {message_id}"))?,
-    )?;
+    let value: Value = serde_json::from_slice(&stored_message_bytes(route, message_id)?)?;
     Ok(value
         .get("format")
         .and_then(Value::as_str)
@@ -7350,10 +7631,20 @@ pub fn read_message_v2(route: &ProjectRoute, message_id: &str) -> Result<Message
         .join("messages")
         .join(&route.project_id)
         .join(format!("{message_id}.json"));
-    let message: MessageV2 = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read v2 message {message_id}"))?,
-    )
-    .with_context(|| format!("parse v2 message {message_id}"))?;
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match compaction::find(route, message_id) {
+                Some(archived) => archived.raw.into_bytes(),
+                None => {
+                    return Err(error).with_context(|| format!("read v2 message {message_id}"));
+                }
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("read v2 message {message_id}")),
+    };
+    let message: MessageV2 =
+        serde_json::from_slice(&bytes).with_context(|| format!("parse v2 message {message_id}"))?;
     validate_v2_message(&message)?;
     if message.project_id != route.project_id {
         bail!("stored message belongs to another project")
@@ -7392,7 +7683,7 @@ pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<boo
         bail!("message is not permitted by this project route")
     }
     verify_v2_message(route, message)?;
-    if acknowledgement_path(route, &message.id).is_file() {
+    if is_acknowledged(route, &message.id) {
         return Ok(false);
     }
     let claim = route
@@ -7458,16 +7749,9 @@ pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2)
     }
     verify_v2_acknowledgement(route, acknowledgement)?;
 
-    let stored_message_path = route
-        .communications
-        .join("messages")
-        .join(&route.project_id)
-        .join(format!("{}.json", acknowledgement.message_id));
-    let stored_message: MessageV2 = serde_json::from_slice(
-        &fs::read(&stored_message_path)
-            .with_context(|| format!("read message {}", acknowledgement.message_id))?,
-    )
-    .with_context(|| format!("parse v2 message {}", acknowledgement.message_id))?;
+    let stored_message: MessageV2 =
+        serde_json::from_slice(&stored_message_bytes(route, &acknowledgement.message_id)?)
+            .with_context(|| format!("parse v2 message {}", acknowledgement.message_id))?;
     validate_v2_message(&stored_message)?;
     if stored_message.project_id != route.project_id {
         bail!("stored message belongs to another project")
@@ -7487,8 +7771,12 @@ pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2)
     // Serialize idempotency + replay check-and-record for the acknowledgement.
     let _replay_lock = acquire_replay_lock(route)?;
     let path = acknowledgement_path(route, &acknowledgement.message_id);
-    if path.exists() {
-        let existing: AcknowledgementV2 = serde_json::from_slice(&fs::read(&path)?)?;
+    let existing: Option<AcknowledgementV2> = if path.exists() {
+        Some(serde_json::from_slice(&fs::read(&path)?)?)
+    } else {
+        archived_acknowledgement(route, &acknowledgement.message_id)
+    };
+    if let Some(existing) = existing {
         if existing.message_id == acknowledgement.message_id
             && existing.project_id == acknowledgement.project_id
             && existing.recipient == acknowledgement.recipient
@@ -7531,10 +7819,13 @@ fn canonical_acknowledgement(
     acknowledgement: &Acknowledgement,
 ) -> Result<Acknowledgement> {
     let path = acknowledgement_path(route, &acknowledgement.message_id);
-    if !path.is_file() {
+    let existing: Acknowledgement = if path.is_file() {
+        serde_json::from_slice(&fs::read(&path)?)?
+    } else if let Some(archived) = archived_acknowledgement(route, &acknowledgement.message_id) {
+        archived
+    } else {
         return Ok(acknowledgement.clone());
-    }
-    let existing: Acknowledgement = serde_json::from_slice(&fs::read(&path)?)?;
+    };
     existing.validate()?;
     if existing.message_id != acknowledgement.message_id
         || existing.project_id != acknowledgement.project_id
@@ -9698,6 +9989,7 @@ mod work_over_files_tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 
@@ -10607,5 +10899,53 @@ mod windows_paths {
     fn the_helper_agrees_with_the_mapping_it_documents() {
         let plain = real_path(Path::new(r"X:\already\plain"));
         assert_eq!(plain, PathBuf::from(r"X:\already\plain"));
+    }
+}
+
+#[cfg(test)]
+mod priority_payload_tests {
+    use super::*;
+
+    /// The signed bytes of an order that names no priority are the bytes every release
+    /// before priority signed, so a worker on an older release still verifies it.
+    #[test]
+    fn an_order_without_a_priority_has_the_payload_it_always_had() {
+        let order = Order {
+            id: "o-1".into(),
+            project_id: "demo".into(),
+            issued_by: "josh".into(),
+            assigned_to: Some("wisp".into()),
+            created_at: "2026-10-18T10:00:00Z".parse().unwrap(),
+            payload: json!({ "task": "do it" }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            needs: None,
+            allow_overlap: false,
+            priority: None,
+        };
+        let legacy = format!(
+            "ferryman-order-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            order.id,
+            order.project_id,
+            order.issued_by,
+            "wisp",
+            order.created_at.to_rfc3339(),
+            order.requires_review,
+            payload_digest(&order.payload),
+        );
+        assert_eq!(order_payload(&order), legacy);
+        assert!(!serde_json::to_string(&order).unwrap().contains("priority"));
+        // And choosing one is what changes the bytes.
+        let chosen = Order {
+            priority: Some(Priority::High),
+            ..order
+        };
+        assert_eq!(order_payload(&chosen), format!("{legacy}\npriority:high"));
     }
 }

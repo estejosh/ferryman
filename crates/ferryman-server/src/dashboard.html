@@ -802,6 +802,7 @@ async function showTask(id) {
         <span class="mono" style="color:var(--faint)">${esc(st.raw)}</span></dd>
       <dt>Issued by</dt><dd>${esc(d.issued_by || "—")}</dd>
       <dt>Addressed to</dt><dd>${esc(d.assigned_to || "anyone")}</dd>
+      <dt>Priority</dt><dd>${esc((d.order || {}).priority || "normal")}${(d.order || {}).priority_signed ? "" : ` <span style="color:var(--faint)">(not set on the order, so normal)</span>`}</dd>
       <dt>Order signature</dt><dd>${sigBadge(d.sig) || "—"}</dd>
       <dt>Created</dt><dd>${esc(d.created_at || "—")} <span style="color:var(--faint)">${ago(d.created_at)}</span></dd>
       ${d.engine ? `<dt>Engine</dt><dd>${esc(d.engine)}</dd>` : ""}
@@ -879,6 +880,7 @@ function taskRow(t) {
       <div class="r">
         ${t.holder ? `<span class="badge">${esc(t.holder)}</span>` : ""}
         ${t.engine ? `<span class="badge">${esc(t.engine)}</span>` : ""}
+        ${t.priority && t.priority !== "normal" ? `<span class="badge ${t.priority === "high" ? "warn" : ""}" title="Workers take the highest priority first, then the oldest">${esc(t.priority)} priority</span>` : ""}
         ${contractBadges(t)}
         ${sigBadge(t.sig)}
         ${stageBadge(t.stage)}
@@ -1055,6 +1057,14 @@ function newOrderForm() {
       ${sealable.length ? `
         <div style="margin-top:12px">Encrypt the files so only these agents can open them (optional)</div>
         ${sealable.map((a) => `<label style="display:block"><input type="checkbox" data-order-seal="${esc(a.name)}"> ${esc(a.name)}</label>`).join("")}` : ""}
+      <label style="display:block;margin-top:12px">Priority
+        <select id="order-priority" style="width:100%">
+          <option value="">High (the default for an order from you)</option>
+          <option value="normal">Normal</option>
+          <option value="low">Low</option>
+        </select>
+      </label>
+      <div class="s" style="color:var(--dim)">Workers take the highest priority first, then the oldest. It never interrupts work already running.</div>
       <label style="display:block;margin-top:12px"><input type="checkbox" id="order-review"> Wait for my review before it counts as done</label>
       <div style="margin-top:14px"><button class="btn primary" id="order-send">Send the order</button>
         <span id="order-msg" class="s" style="margin-left:10px"></span></div>
@@ -1085,7 +1095,8 @@ function wireNewOrder() {
       msg("Signing...");
       orderDone = await api("/api/orders", { method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ id, task, to: to || null, files: names, seal_to: sealTo,
-          requires_review: $("#order-review").checked }) });
+          requires_review: $("#order-review").checked,
+          priority: $("#order-priority").value || null }) });
       $("#order-task").value = "";
       $("#order-files").value = "";
       await refresh();

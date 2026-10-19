@@ -73,9 +73,16 @@ struct Pair {
     b_demo: ProjectRoute,
     a_private: ProjectRoute,
     outside: std::path::PathBuf,
+    /// A channel both machines serve and know the roster of, where neither holds the
+    /// other's TRANSPORTS record: (A's copy, B's copy). Only with `pair_with(true)`.
+    fresh: Option<(ProjectRoute, ProjectRoute)>,
 }
 
 async fn pair() -> Pair {
+    pair_with(false).await
+}
+
+async fn pair_with(with_fresh: bool) -> Pair {
     let dir = tempfile::tempdir().unwrap();
     // Fixed per process, not inside this test's own folder: the override is set once, and
     // another test's thread would otherwise keep its keys in a folder this one deletes.
@@ -106,8 +113,49 @@ async fn pair() -> Pair {
     enrol(&a_private, &wisp);
     ferryman_channel::transports::publish(&a_private, &wisp, &endpoint_hex(&key_b.public()), None)
         .unwrap();
-    let a = Lane::new(a_end, vec![a_demo.clone(), a_private.clone()], None, None);
-    let b = Lane::new(b_end, vec![b_demo.clone()], None, None);
+    let mut a_routes = vec![a_demo.clone(), a_private.clone()];
+    let mut b_routes = vec![b_demo.clone()];
+    let mut fresh = None;
+    if with_fresh {
+        let (a_fresh, b_fresh) = (
+            route(&dir.path().join("a"), "fresh"),
+            route(&dir.path().join("b"), "fresh"),
+        );
+        let mallory = AgentIdentity::load_or_create("mallory", &a_fresh.attachment).unwrap();
+        // Both know who is in the project; each has published only its own record.
+        for route in [&a_fresh, &b_fresh] {
+            enrol(route, &fang);
+            enrol(route, &wisp);
+        }
+        // Someone only A's roster knows.
+        enrol(&a_fresh, &mallory);
+        ferryman_channel::transports::publish(
+            &a_fresh,
+            &fang,
+            &endpoint_hex(&key_a.public()),
+            None,
+        )
+        .unwrap();
+        ferryman_channel::transports::publish(
+            &b_fresh,
+            &wisp,
+            &endpoint_hex(&key_b.public()),
+            None,
+        )
+        .unwrap();
+        ferryman_channel::transports::publish(
+            &a_fresh,
+            &mallory,
+            &endpoint_hex(&SecretKey::generate().public()),
+            None,
+        )
+        .unwrap();
+        a_routes.push(a_fresh.clone());
+        b_routes.push(b_fresh.clone());
+        fresh = Some((a_fresh, b_fresh));
+    }
+    let a = Lane::new(a_end, a_routes, None, None);
+    let b = Lane::new(b_end, b_routes, None, None);
     tokio::spawn(Arc::clone(&a).serve());
     tokio::spawn(Arc::clone(&b).serve());
     let outside = dir.path().join("outside");
@@ -120,6 +168,7 @@ async fn pair() -> Pair {
         b_demo,
         a_private,
         outside,
+        fresh,
     }
 }
 
@@ -483,5 +532,156 @@ async fn a_workers_own_machine_listens_to_the_channel_and_publishes_none_of_it()
         found(&l.a_handins, "handin.json"),
         found(&l.b_handins, "handin.json"),
         l.a.status()
+    );
+}
+
+#[tokio::test]
+async fn first_contact_opens_only_the_transports_records_of_a_new_channel() {
+    let p = pair_with(true).await;
+    let (a_fresh, b_fresh) = p.fresh.clone().unwrap();
+    // Work in A's copy of the new channel. It must not move before trust is there.
+    write(&a_fresh, "tasks/t-9/order.json", "{\"from\":\"a\"}");
+    write(&a_fresh, "messages/m-9.json", "{}");
+    let (a_id, b_id) = (p.a.endpoint().id(), p.b.endpoint().id());
+
+    // Today's rule: neither is trusted in `fresh`, because neither holds the other's record.
+    assert!(!p.a.trusted()[&b_id].projects.contains("fresh"));
+    assert!(!p.b.trusted()[&a_id].projects.contains("fresh"));
+    // But each is offered it, because the other is trusted in `demo`.
+    assert!(p.a.trusted()[&b_id].bootstrap.contains("fresh"));
+
+    p.a.round().await;
+    let status = p.a.status();
+    let peer = &status.peers[&endpoint_hex(&b_id)];
+    assert!(peer.last_error.is_none(), "{:?}", peer.last_error);
+
+    // The records crossed, both ways.
+    assert!(
+        b_fresh
+            .communications
+            .join("transports/fang.json")
+            .is_file()
+    );
+    assert!(
+        a_fresh
+            .communications
+            .join("transports/wisp.json")
+            .is_file()
+    );
+    // Nothing else did: not the work, not the messages.
+    assert!(!b_fresh.communications.join("tasks").exists());
+    assert!(!b_fresh.communications.join("messages").exists());
+    // And a record from an agent B's roster does not know was not let in.
+    assert!(
+        !b_fresh
+            .communications
+            .join("transports/mallory.json")
+            .exists()
+    );
+
+    // Now the ordinary rule applies: each holds the other's record, so each trusts the
+    // other in `fresh`, and the next round carries the channel.
+    assert!(p.a.trusted()[&b_id].projects.contains("fresh"));
+    assert!(p.b.trusted()[&a_id].projects.contains("fresh"));
+    p.a.round().await;
+    assert_eq!(
+        fs::read_to_string(b_fresh.communications.join("tasks/t-9/order.json")).unwrap(),
+        "{\"from\":\"a\"}"
+    );
+}
+
+#[tokio::test]
+async fn first_contact_is_offered_only_where_the_peers_agent_is_on_the_roster() {
+    let p = pair_with(true).await;
+    let base = p._dir.path();
+    let b_id = p.b.endpoint().id();
+    // A channel A serves whose roster has fang but not wisp, B's agent.
+    let closed = route(&base.join("a"), "closed");
+    enrol(&closed, &AgentIdentity::from_seed("fang", [1; 32]));
+    p.a.add_project(closed);
+    let offered = p.a.trusted()[&b_id].bootstrap.clone();
+    assert!(offered.contains("fresh"), "{offered:?}");
+    assert!(!offered.contains("closed"), "{offered:?}");
+}
+
+#[tokio::test]
+async fn a_project_taken_out_is_no_longer_served_and_can_come_back() {
+    let p = pair().await;
+    let b_id = p.b.endpoint().id();
+    assert!(p.a.trusted()[&b_id].projects.contains("demo"));
+    assert!(p.a.remove_project("demo"));
+    assert!(!p.a.remove_project("demo"), "nothing left to remove");
+    assert!(!p.a.project_ids().contains(&"demo".to_owned()));
+    assert!(
+        p.a.trusted()
+            .get(&b_id)
+            .is_none_or(|peer| !peer.projects.contains("demo"))
+    );
+    p.a.add_project(p.a_demo.clone());
+    assert!(p.a.trusted()[&b_id].projects.contains("demo"));
+}
+
+#[tokio::test]
+async fn first_contact_does_not_trust_a_peer_no_shared_channel_vouches_for() {
+    let p = pair_with(true).await;
+    let (_, b_fresh) = p.fresh.clone().unwrap();
+    // A stranger holding the right project names but no endpoint any record vouches for.
+    let lookup = MemoryLookup::new();
+    lookup.add_endpoint_info(addr(p.b.endpoint()));
+    let stranger = endpoint(SecretKey::generate(), &lookup).await;
+    let lane = Lane::new(stranger, vec![route(&p.outside, "fresh")], None, None);
+    let peer = ferryman_iroh::lane::Peer {
+        bootstrap: ["fresh".to_owned()].into(),
+        ..Default::default()
+    };
+    assert!(lane.sync_peer(p.b.endpoint().id(), &peer).await.is_err());
+    assert!(
+        !b_fresh
+            .communications
+            .join("transports/mallory.json")
+            .exists()
+    );
+    assert!(
+        !p.outside
+            .join("fresh/.ferryman/ferryman/transports")
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn a_project_added_while_the_lane_runs_is_synced_from_then_on() {
+    let p = pair().await;
+    let base = p._dir.path();
+    let (a_late, b_late) = (
+        route(&base.join("a"), "late"),
+        route(&base.join("b"), "late"),
+    );
+    let fang = AgentIdentity::from_seed("fang", [1; 32]);
+    let wisp = AgentIdentity::from_seed("wisp", [2; 32]);
+    for route in [&a_late, &b_late] {
+        enrol(route, &fang);
+        enrol(route, &wisp);
+    }
+    let (a_id, b_id) = (
+        endpoint_hex(&p.a.endpoint().id()),
+        endpoint_hex(&p.b.endpoint().id()),
+    );
+    ferryman_channel::transports::publish(&a_late, &fang, &a_id, None).unwrap();
+    ferryman_channel::transports::publish(&a_late, &wisp, &b_id, None).unwrap();
+    copy_tree(&a_late.communications, &b_late.communications);
+    write(&a_late, "tasks/t-1/order.json", "{\"late\":true}");
+
+    // Neither lane serves it yet, so a round moves nothing of it.
+    p.a.round().await;
+    assert!(!b_late.communications.join("tasks").exists());
+
+    // Added to both running lanes, it is carried from the next round on.
+    p.a.add_project(a_late.clone());
+    p.b.add_project(b_late.clone());
+    assert!(p.a.project_ids().contains(&"late".to_owned()));
+    p.a.round().await;
+    assert_eq!(
+        fs::read_to_string(b_late.communications.join("tasks/t-1/order.json")).unwrap(),
+        "{\"late\":true}"
     );
 }

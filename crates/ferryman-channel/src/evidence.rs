@@ -1872,6 +1872,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         by.sign_order(&mut order);
         crate::issue_order(route, &order).unwrap();

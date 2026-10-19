@@ -2223,6 +2223,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             };
             self.boss.sign_order(&mut order);
             crate::issue_order(&self.route, &order).unwrap();
@@ -3548,6 +3549,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         Task {
             order,

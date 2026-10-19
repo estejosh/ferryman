@@ -85,6 +85,7 @@ fn issue(route: &ProjectRoute, id: &str, to: Option<&str>) {
         touches: Vec::new(),
         needs: None,
         allow_overlap: false,
+        priority: None,
     };
     josh().sign_order(&mut order);
     ferryman_channel::issue_order(route, &order).unwrap();

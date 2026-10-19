@@ -177,6 +177,44 @@ fn honoured(route: &ProjectRoute, record: &Transports) -> bool {
     !crate::master::is_revoked_in(&route.communications, &roster, &agent)
 }
 
+/// The most a record offered at first contact may be. A real one is a few hundred bytes.
+pub const MAX_RECORD_BYTES: u64 = 8 * 1024;
+
+/// Whether `bytes`, offered by a peer as the channel file `path`, is a record this channel
+/// would honour if it were already here: the file `transports/<agent>.json`, holding that
+/// agent's own signed record for THIS project, from an agent on this channel's roster who
+/// has not been revoked.
+///
+/// This is the one thing the iroh lane lets in from a peer it trusts in another channel but
+/// not yet in this one (see `docs/IROH_LANE.md`, "First contact"). It checks everything
+/// [`honoured_records`] does, so what is let in is exactly what would have been believed.
+#[must_use]
+pub fn acceptable(route: &ProjectRoute, path: &str, bytes: &[u8]) -> bool {
+    let Some(stem) = path
+        .strip_prefix("transports/")
+        .and_then(|name| name.strip_suffix(".json"))
+    else {
+        return false;
+    };
+    if stem.is_empty() || stem.contains('/') || stem.contains(".sync-conflict-") {
+        return false;
+    }
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return false;
+    }
+    let Ok(record) = serde_json::from_slice::<Transports>(bytes) else {
+        return false;
+    };
+    if canonical_agent_name(&record.agent) != stem || !honoured(route, &record) {
+        return false;
+    }
+    // A peer cannot put an older record over the one already here: a valid, signed record
+    // that an agent has since replaced (its machine moved, its key was rotated) would
+    // otherwise point the lane back at an endpoint that agent no longer uses.
+    let here = route.communications.join(DIR).join(format!("{stem}.json"));
+    read_one(&here).is_none_or(|existing| existing.at <= record.at)
+}
+
 /// Every record in this channel that is honoured, by agent name.
 ///
 /// Read afresh on every call: an agent revoked a second ago is not reachable now.
@@ -319,6 +357,30 @@ mod tests {
         record.endpoint_id = ENDPOINT.replace("01", "02");
         fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
         assert!(honoured_records(&f.route).is_empty());
+    }
+
+    #[test]
+    fn a_peer_cannot_put_an_older_record_over_the_one_here() {
+        let f = fixture();
+        let fang = member(&f.route, "fang");
+        publish(&f.route, &fang, ENDPOINT, None).unwrap();
+        let file = path(&f.route, "fang");
+        let older = fs::read(&file).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let moved = ENDPOINT.replace("01", "02");
+        publish(&f.route, &fang, &moved, None).unwrap();
+        let newer = fs::read(&file).unwrap();
+        assert_ne!(older, newer);
+
+        // Both are signed by fang and honoured by the roster; only the newer may stand.
+        assert!(!acceptable(&f.route, "transports/fang.json", &older));
+        assert!(acceptable(&f.route, "transports/fang.json", &newer));
+        // And a record for an agent with none here yet is accepted as before.
+        let wisp = member(&f.route, "wisp");
+        publish(&f.route, &wisp, ENDPOINT, None).unwrap();
+        let first = fs::read(path(&f.route, "wisp")).unwrap();
+        fs::remove_file(path(&f.route, "wisp")).unwrap();
+        assert!(acceptable(&f.route, "transports/wisp.json", &first));
     }
 
     #[test]
