@@ -3838,6 +3838,7 @@ async fn tasks(
     // Contracts, holds and overlaps are only believed when signed by someone on the
     // roster, and a member who joined after the dashboard started must count.
     let current = with_current_roster(&route);
+    let people = ferryman_channel::people(&route);
     // Which open or claimed orders are heading for the same files as which, once for the
     // whole list rather than once per card.
     let overlaps = ferryman_channel::overlap::overlap_map(&current, &tasks);
@@ -3870,7 +3871,7 @@ async fn tasks(
                 // recorded one (null for work done before the smart router).
                 "routing": routing_reason(task),
                 "allow_overlap": task.order.allow_overlap,
-                "priority": task.order.priority().as_str(),
+                "priority": task.order.effective_priority(&people).as_str(),
                 "overlaps": overlaps.get(&task.order.id).cloned().unwrap_or_default(),
                 "holds": ferryman_channel::hold::read(&current, &task.order.id),
             })
@@ -4011,7 +4012,7 @@ async fn task_detail(
             "touches": task.order.touches,
             "needs": task.order.needs,
             "allow_overlap": task.order.allow_overlap,
-            "priority": task.order.priority().as_str(),
+            "priority": task.order.effective_priority(&ferryman_channel::people(&route)).as_str(),
             "priority_signed": task.order.priority.is_some(),
             "payload": task.order.payload,
             "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
@@ -5333,7 +5334,7 @@ async fn new_order(
         Some(text) => Some(
             ferryman_channel::Priority::parse(text).map_err(|error| bad(format!("{error:#}")))?,
         ),
-        None => ferryman_channel::default_priority(&route, identity.name()),
+        None => None,
     };
     let mut payload = json!({ "task": body.task });
     let uploads = upload_dir(&route, identity.name(), &id);
@@ -8427,7 +8428,7 @@ mod tests {
         let token = signed_in(&app, &dashboard_state).await;
 
         for (id, body, expect) in [
-            ("p-1", r#"{"id":"p-1","task":"x"}"#, Some("high")),
+            ("p-1", r#"{"id":"p-1","task":"x"}"#, None),
             (
                 "p-2",
                 r#"{"id":"p-2","task":"x","priority":"low"}"#,
@@ -8438,11 +8439,7 @@ mod tests {
                 r#"{"id":"p-3","task":"x","priority":"normal"}"#,
                 Some("normal"),
             ),
-            (
-                "p-4",
-                r#"{"id":"p-4","task":"x","priority":""}"#,
-                Some("high"),
-            ),
+            ("p-4", r#"{"id":"p-4","task":"x","priority":""}"#, None),
         ] {
             let issued = post(&app, "/api/orders", body, Some(&token)).await;
             assert_eq!(issued.status(), StatusCode::OK, "{id}");

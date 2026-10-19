@@ -906,39 +906,50 @@ fn priority_or_none<'de, D: serde::Deserializer<'de>>(
 }
 
 impl Order {
-    /// The priority this order is worked at: what it says, or normal.
+    /// The priority this order SAYS: what was signed into it, or normal. Not what it is
+    /// worked at when it says nothing; that is [`Order::effective_priority`].
     #[must_use]
     pub fn priority(&self) -> Priority {
         self.priority.unwrap_or(Priority::Normal)
     }
+
+    /// The priority this order is worked at. A signed priority is that. An order that
+    /// carries none is worked at the default of whoever issued it, decided here and now
+    /// from the signer's role and never written into the order: high from a person
+    /// (`people`, see [`people`]), normal from an agent, and high from an order nobody
+    /// signed. Leaving the default out of the signed bytes is what keeps an order a worker
+    /// on an older release can still verify.
+    #[must_use]
+    pub fn effective_priority(&self, people: &std::collections::HashSet<String>) -> Priority {
+        if let Some(priority) = self.priority {
+            return priority;
+        }
+        match &self.signed_by {
+            Some(signer) if !people.contains(&signer.to_ascii_lowercase()) => Priority::Normal,
+            _ => Priority::High,
+        }
+    }
 }
 
-/// Whether `issuer` is a person on this project: its master, or a roster entry whose role is
-/// `operator`. Agents (workers, bridges, the improvement loop) are not.
+/// The people on a project, lowercased: its master and every roster entry whose role is
+/// `operator`. Agents (workers, bridges, the improvement loop) are not. Read from the
+/// channel as it is now, so a person who joined since the route was built is one.
 #[must_use]
-pub fn issuer_is_person(route: &ProjectRoute, issuer: &str) -> bool {
-    // The roster as it is now, not as the route was built: a person who joined since is
-    // still a person.
+pub fn people(route: &ProjectRoute) -> std::collections::HashSet<String> {
     let roster = read_agent_roster(&route.communications).unwrap_or_else(|_| route.agents.clone());
-    if roster
+    let mut people: std::collections::HashSet<String> = roster
         .iter()
-        .any(|agent| agent.name.eq_ignore_ascii_case(issuer) && agent.role == "operator")
-    {
-        return true;
-    }
-    master::read_master_at(&route.communications, &roster)
+        .filter(|agent| agent.role == "operator")
+        .map(|agent| agent.name.to_ascii_lowercase())
+        .collect();
+    if let Some(declaration) = master::read_master_at(&route.communications, &roster)
         .ok()
         .flatten()
-        .is_some_and(|declaration| declaration.master.eq_ignore_ascii_case(issuer))
+    {
+        people.insert(declaration.master.to_ascii_lowercase());
+    }
+    people
 }
-
-/// The priority an order gets when its issuer did not choose one: high from a person,
-/// nothing (so normal) from an agent. A person's order is the one they are waiting on.
-#[must_use]
-pub fn default_priority(route: &ProjectRoute, issuer: &str) -> Option<Priority> {
-    issuer_is_person(route, issuer).then_some(Priority::High)
-}
-
 /// An agent staking a claim on an open order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claim {
@@ -2153,11 +2164,12 @@ pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result
     // Highest priority first, then the oldest: what this worker would take next, in order.
     // Work it already holds comes before anything it has yet to claim, so a new high
     // priority order never displaces work in hand.
+    let people = people(route);
     out.sort_by_cached_key(|task| {
         let unclaimed = matches!(task.state(), TaskState::Open | TaskState::Offered { .. });
         (
             unclaimed,
-            std::cmp::Reverse(task.order.priority()),
+            std::cmp::Reverse(task.order.effective_priority(&people)),
             task.order.created_at,
         )
     });
@@ -10863,5 +10875,53 @@ mod windows_paths {
     fn the_helper_agrees_with_the_mapping_it_documents() {
         let plain = real_path(Path::new(r"X:\already\plain"));
         assert_eq!(plain, PathBuf::from(r"X:\already\plain"));
+    }
+}
+
+#[cfg(test)]
+mod priority_payload_tests {
+    use super::*;
+
+    /// The signed bytes of an order that names no priority are the bytes every release
+    /// before priority signed, so a worker on an older release still verifies it.
+    #[test]
+    fn an_order_without_a_priority_has_the_payload_it_always_had() {
+        let order = Order {
+            id: "o-1".into(),
+            project_id: "demo".into(),
+            issued_by: "josh".into(),
+            assigned_to: Some("wisp".into()),
+            created_at: "2026-10-18T10:00:00Z".parse().unwrap(),
+            payload: json!({ "task": "do it" }),
+            requires_review: true,
+            requires_approval: false,
+            depends_on: Vec::new(),
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            needs: None,
+            allow_overlap: false,
+            priority: None,
+        };
+        let legacy = format!(
+            "ferryman-order-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            order.id,
+            order.project_id,
+            order.issued_by,
+            "wisp",
+            order.created_at.to_rfc3339(),
+            order.requires_review,
+            payload_digest(&order.payload),
+        );
+        assert_eq!(order_payload(&order), legacy);
+        assert!(!serde_json::to_string(&order).unwrap().contains("priority"));
+        // And choosing one is what changes the bytes.
+        let chosen = Order {
+            priority: Some(Priority::High),
+            ..order
+        };
+        assert_eq!(order_payload(&chosen), format!("{legacy}\npriority:high"));
     }
 }

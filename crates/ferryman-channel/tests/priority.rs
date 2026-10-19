@@ -5,7 +5,7 @@ use std::path::Path;
 use chrono::{Duration, Utc};
 use ferryman_channel::{
     AgentIdentity, AgentRoute, Order, Priority, ProjectRoute, SignatureCheck, claim_order,
-    default_priority, issue_order, verify_order, work_for,
+    issue_order, verify_order, work_for,
 };
 use serde_json::json;
 
@@ -170,15 +170,35 @@ fn a_priority_this_version_does_not_know_does_not_make_the_order_unreadable() {
 }
 
 #[test]
-fn a_person_defaults_to_high_and_an_agent_to_normal() {
+fn an_order_without_a_priority_is_worked_at_its_issuers_default() {
     let rig = rig();
-    assert_eq!(default_priority(&rig.route, "boss"), Some(Priority::High));
-    assert_eq!(default_priority(&rig.route, "bot"), None);
-    assert_eq!(default_priority(&rig.route, "stranger"), None);
+    let people = ferryman_channel::people(&rig.route);
+    assert!(people.contains("boss") && !people.contains("bot"));
+    let by = |who: &str| {
+        let mut order = order("d", who, 0, None);
+        match who {
+            "boss" => rig.boss.sign_order(&mut order),
+            _ => rig.bot.sign_order(&mut order),
+        }
+        order
+    };
+    // A person's order that names no priority is high, an agent's is normal, and nothing
+    // was written into either.
+    assert_eq!(by("boss").effective_priority(&people), Priority::High);
+    assert_eq!(by("bot").effective_priority(&people), Priority::Normal);
+    assert_eq!(by("boss").priority, None);
+    // An order nobody signed gets the person default.
+    assert_eq!(
+        order("u", "bot", 0, None).effective_priority(&people),
+        Priority::High
+    );
+    // A signed priority wins over the role.
+    let mut low = order("l", "boss", 0, Some(Priority::Low));
+    rig.boss.sign_order(&mut low);
+    assert_eq!(low.effective_priority(&people), Priority::Low);
     assert_eq!(Priority::parse("HIGH").unwrap(), Priority::High);
     assert!(Priority::parse("urgent").is_err());
 }
-
 #[test]
 fn a_worker_takes_the_highest_priority_first_then_the_oldest() {
     let rig = rig();
@@ -203,6 +223,9 @@ fn a_worker_takes_the_highest_priority_first_then_the_oldest() {
             "b-low-oldest"
         ]
     );
+    // A person's order that names no priority is worked ahead of an agent's older one.
+    issue(&rig, order("f-person-default", "boss", 1, None));
+    assert_eq!(queue(&rig, "wisp")[2], "f-person-default");
 }
 
 #[test]

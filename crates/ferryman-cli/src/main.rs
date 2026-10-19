@@ -11247,9 +11247,10 @@ fn channel(command: Channel) -> Result<()> {
                 touches,
                 needs,
                 allow_overlap,
-                // What was asked for, else what the issuer's standing gives: a person's order
-                // is high, an agent's is normal.
-                priority: priority.or_else(|| ferryman_channel::default_priority(&route, &issuer)),
+                // Only what was asked for is signed. Without `--priority` the order carries
+                // none, so a worker on an older release still verifies it; the default
+                // (high from a person, normal from an agent) is applied when it is worked.
+                priority,
             };
             // Asked before the order exists, so it cannot find itself.
             let overlapping = match ferryman_channel::overlap::issue_warnings(&route, &order) {
@@ -11324,7 +11325,9 @@ fn channel(command: Channel) -> Result<()> {
             }
             println!(
                 "  priority {}{}",
-                order.priority().as_str(),
+                order
+                    .effective_priority(&ferryman_channel::people(&route))
+                    .as_str(),
                 if order.priority.is_some() {
                     " (signed into the order)"
                 } else {

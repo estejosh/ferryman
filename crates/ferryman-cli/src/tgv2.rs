@@ -505,7 +505,7 @@ impl Bridge {
             needs: None,
             allow_overlap: false,
             // Typed by a person, so it is the one they are waiting on.
-            priority: ferryman_channel::default_priority(&route, &principal),
+            priority: None,
         };
         self.agent.sign_order(&mut order);
         if let Err(error) = ferryman_channel::issue_order(&route, &order) {
