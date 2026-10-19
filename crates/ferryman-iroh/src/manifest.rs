@@ -285,16 +285,52 @@ impl HashCache {
             return Some(hash.clone());
         }
         let hash = blake3::hash(&fs::read(path).ok()?).to_hex().to_string();
-        self.known
-            .insert(path.to_path_buf(), (size, mtime, hash.clone()));
+        // A file written a moment ago could be rewritten, same size, within the clock's
+        // resolution: hash it again next round rather than remember it (git's "racy" rule).
+        if now_ms().saturating_sub(mtime) >= SETTLE_MS {
+            self.known
+                .insert(path.to_path_buf(), (size, mtime, hash.clone()));
+        }
         Some(hash)
     }
+
+    /// Forget the files under `channel` that were not seen in the latest scan, so the
+    /// cache follows the folder instead of growing with everything it ever held.
+    fn forget_missing(&mut self, channel: &Path, seen: &std::collections::HashSet<PathBuf>) {
+        self.known
+            .retain(|path, _| !path.starts_with(channel) || seen.contains(path));
+    }
+
+    /// How many hashes are remembered (a test).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.known.len()
+    }
+
+    /// Whether nothing is remembered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.known.is_empty()
+    }
+}
+
+/// How old a file must be before its hash is remembered.
+const SETTLE_MS: i64 = 2_000;
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis()),
+    )
+    .unwrap_or(0)
 }
 
 /// Every file in `channel` that the lane would carry, by path.
 #[must_use]
 pub fn scan(channel: &Path, rules: &Rules, cache: &mut HashCache) -> BTreeMap<String, Entry> {
     let mut found = BTreeMap::new();
+    let mut seen = std::collections::HashSet::new();
     let mut pending = vec![(channel.to_path_buf(), String::new())];
     while let Some((dir, prefix)) = pending.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -320,6 +356,7 @@ pub fn scan(channel: &Path, rules: &Rules, cache: &mut HashCache) -> BTreeMap<St
                 pending.push((entry.path(), relative));
             } else if meta.is_file() && meta.len() <= MAX_FILE {
                 let mtime = mtime_ms(&meta);
+                seen.insert(entry.path());
                 if let Some(hash) = cache.hash(&entry.path(), meta.len(), mtime) {
                     found.insert(
                         relative.clone(),
@@ -334,6 +371,7 @@ pub fn scan(channel: &Path, rules: &Rules, cache: &mut HashCache) -> BTreeMap<St
             }
         }
     }
+    cache.forget_missing(channel, &seen);
     found
 }
 
@@ -709,5 +747,64 @@ mod tests {
         assert!(!outside.join("planted.json").exists());
         // And the link is not offered either.
         assert!(scan(&channel, &rules, &mut HashCache::default()).is_empty());
+    }
+
+    #[test]
+    fn hashes_are_remembered_for_old_files_only_and_follow_the_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = dir.path();
+        fs::create_dir_all(channel.join("messages")).unwrap();
+        let old = channel.join("messages/old.json");
+        let young = channel.join("messages/young.json");
+        fs::write(&old, b"one").unwrap();
+        fs::write(&young, b"two").unwrap();
+        // Age one of them past the settling window.
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        let mut cache = HashCache::default();
+        let found = scan(channel, &no_rules(), &mut cache);
+        assert_eq!(found.len(), 2);
+        // The file touched a moment ago is hashed again next round; the old one is not.
+        assert_eq!(cache.len(), 1);
+
+        // A file that has gone is forgotten.
+        fs::remove_file(&old).unwrap();
+        assert_eq!(scan(channel, &no_rules(), &mut cache).len(), 1);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn a_remembered_hash_is_not_trusted_after_the_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.json");
+        fs::write(&file, b"one").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let age = |t| {
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        age(long_ago);
+        let mut cache = HashCache::default();
+        let first = scan(dir.path(), &no_rules(), &mut cache)["a.json"]
+            .hash
+            .clone();
+        // Same size, different bytes, and the old time put back: a different time is what
+        // the cache keys on, so make it different.
+        fs::write(&file, b"two").unwrap();
+        age(long_ago - std::time::Duration::from_secs(5));
+        let second = scan(dir.path(), &no_rules(), &mut cache)["a.json"]
+            .hash
+            .clone();
+        assert_ne!(first, second);
     }
 }

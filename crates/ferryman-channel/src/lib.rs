@@ -57,6 +57,7 @@ pub mod policy;
 pub mod portable_auth;
 pub mod quantly;
 pub mod questions;
+pub mod readcache;
 pub mod receipts;
 pub mod release;
 pub mod router;
@@ -1737,10 +1738,52 @@ pub fn submit_recommendation(
 
 /// Read one task by reading its directory.
 pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
+    read_task_with(route, order_id, &ReadContext::new(route))
+}
+
+/// What reading a task depends on besides its own files, worked out once for a whole pass.
+struct ReadContext {
+    workers: std::collections::BTreeSet<String>,
+    overlays: Vec<(String, PathBuf)>,
+    trust: Option<u64>,
+}
+
+impl ReadContext {
+    fn new(route: &ProjectRoute) -> Self {
+        let workers = access::refused_authors(&route.communications, &route.project_id);
+        let overlays =
+            access::overlay_dirs_among(&route.communications, &route.project_id, workers.clone());
+        let trust = readcache::trust_key(
+            &route.project_id,
+            &route.agents,
+            &workers,
+            &overlays,
+            &route.communications,
+        );
+        Self {
+            workers,
+            overlays,
+            trust,
+        }
+    }
+}
+
+fn read_task_with(route: &ProjectRoute, order_id: &str, ctx: &ReadContext) -> Result<Task> {
     if !is_safe_component(order_id) {
         bail!("order id must be a path-safe identifier")
     }
     let directory = task_dir(route, order_id);
+    // Unchanged since this machine last read it, under the same trust: no need to read it
+    // again (see the `readcache` module).
+    let mut files = readcache::Fingerprint::default();
+    files.add_dir("", &directory);
+    for (worker, dir) in &ctx.overlays {
+        files.add_dir(&format!("{worker}/"), &dir.join("tasks").join(order_id));
+    }
+    let files = files.sorted();
+    if let Some(task) = readcache::lookup(&directory, ctx.trust, &files) {
+        return Ok(task);
+    }
     let order: Order = serde_json::from_str(&fs::read_to_string(directory.join("order.json"))?)
         .with_context(|| format!("order {order_id} is unreadable"))?;
     if order.id != order_id {
@@ -1761,7 +1804,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     // refused on the way in, wherever it came from: a synced copy, a hand-copied file, a
     // tool that ignored the rule. Their own signed files are read from `handins/<agent>/`
     // below, as if they were here. Both lists are empty for nearly every project.
-    let workers = access::refused_authors(&route.communications, &route.project_id);
+    let workers = &ctx.workers;
     let mut ingest = |name: &str, text: &str| {
         // A single unreadable file must not hide the rest of the task.
         if name.starts_with("claim.")
@@ -1829,7 +1872,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
             && access::comms_author_refused(
                 &format!("tasks/{order_id}/{name}"),
                 Some(text.as_bytes()),
-                &workers,
+                workers,
             )
             .is_some()
         {
@@ -1837,24 +1880,24 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         }
         ingest(name, &text);
     }
-    for (worker, dir) in access::overlay_dirs(&route.communications, &route.project_id) {
-        let Ok(files) = fs::read_dir(dir.join("tasks").join(order_id)) else {
+    for (worker, dir) in &ctx.overlays {
+        let Ok(listing) = fs::read_dir(dir.join("tasks").join(order_id)) else {
             continue;
         };
-        for entry in files.flatten() {
+        for entry in listing.flatten() {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
             // Only what that worker wrote, under its own name.
-            if !access::overlay_file_is_theirs(&worker, name) {
+            if !access::overlay_file_is_theirs(worker, name) {
                 continue;
             }
             let Ok(text) = fs::read_to_string(&path) else {
                 continue;
             };
             // And naming itself inside: a claim "from" somebody else is not its claim.
-            if !access::overlay_content_is_theirs(&worker, name, text.as_bytes()) {
+            if !access::overlay_content_is_theirs(worker, name, text.as_bytes()) {
                 continue;
             }
             ingest(name, &text);
@@ -1863,7 +1906,7 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
     results.sort_by_key(|r: &TaskResult| r.revision);
     reviews.sort_by_key(|r: &Review| r.revision);
     recommendations.sort_by_key(|r: &Recommendation| r.revision);
-    Ok(Task {
+    let task = Task {
         order,
         claims,
         results,
@@ -1873,7 +1916,19 @@ pub fn read_task(route: &ProjectRoute, order_id: &str) -> Result<Task> {
         releases,
         kills,
         offers,
-    })
+    };
+    // Whether an offer stands, or a delegate's verdict counts, turns on the time as well as
+    // on files, so those tasks are read afresh each time.
+    let own_verdicts = task.reviews.iter().all(|review| {
+        review
+            .signed_by
+            .as_deref()
+            .is_some_and(|signer| signer.eq_ignore_ascii_case(&review.reviewer))
+    });
+    if task.offers.is_empty() && own_verdicts {
+        readcache::remember(&directory, ctx.trust, files, &task);
+    }
+    Ok(task)
 }
 
 /// Every task in the channel.
@@ -1883,6 +1938,10 @@ pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
         return Ok(Vec::new());
     }
     let mut tasks = Vec::new();
+    // The roster, the grants and the master are looked at once for the whole pass, not once
+    // per task; and a task folder that has not changed is not read again.
+    let ctx = ReadContext::new(route);
+    let mut seen = std::collections::HashSet::new();
     for entry in fs::read_dir(&root)? {
         let path = entry?.path();
         if !path.is_dir() {
@@ -1891,10 +1950,12 @@ pub fn list_tasks(route: &ProjectRoute) -> Result<Vec<Task>> {
         let Some(id) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if let Ok(task) = read_task(route, id) {
+        seen.insert(path.clone());
+        if let Ok(task) = read_task_with(route, id, &ctx) {
             tasks.push(task);
         }
     }
+    readcache::retain_under(&root, &seen);
     tasks.sort_by_key(|task| task.order.created_at);
     Ok(tasks)
 }

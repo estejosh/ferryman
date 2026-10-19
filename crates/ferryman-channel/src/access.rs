@@ -613,8 +613,22 @@ pub fn overlay_dirs(channel: &Path, project_id: &str) -> Vec<(String, PathBuf)> 
     if !enforced(channel, project_id) {
         return Vec::new();
     }
+    overlay_dirs_among(channel, project_id, worker_agents(channel, project_id))
+}
+
+/// [`overlay_dirs`], for Workers the caller has already worked out (`refused_authors`), so a
+/// pass over a channel does not work them out twice.
+#[must_use]
+pub fn overlay_dirs_among(
+    channel: &Path,
+    project_id: &str,
+    workers: BTreeSet<String>,
+) -> Vec<(String, PathBuf)> {
+    if workers.is_empty() {
+        return Vec::new();
+    }
     let handins = crate::ferry::handins_dir_for(channel, project_id);
-    worker_agents(channel, project_id)
+    workers
         .into_iter()
         .map(|agent| {
             let dir = handins.join(&agent);
