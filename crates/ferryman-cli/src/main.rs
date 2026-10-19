@@ -10525,10 +10525,22 @@ fn channel(command: Channel) -> Result<()> {
                     "single-agent / unmanaged"
                 }
             );
+            // What carries the channel off this machine. An iroh-only channel (`ferry enable
+            // --no-syncthing`) has a folder id in its bridge.toml all the same, so naming it
+            // as the transport would be wrong.
+            let carried = lane::carried_by_iroh(&route);
+            if let Some(carried) = &carried {
+                println!("transport      iroh lane, endpoint {}", carried.endpoint_id);
+                println!("               {}", carried.describe());
+            }
             println!(
                 "syncthing      {}",
                 if route.shared_remote.is_empty() {
                     "(no folder id configured)".to_string()
+                } else if carried.is_some()
+                    && ferryman_channel::syncthing_channel_state(&route).is_none()
+                {
+                    "not used for this channel (Syncthing has no folder for it)".to_string()
                 } else {
                     format!("folder '{}'", route.shared_remote)
                 }
@@ -10875,27 +10887,42 @@ fn channel(command: Channel) -> Result<()> {
             if let Some(identity) = sign_as(&route, &sender)? {
                 identity.sign(&mut message);
             }
-            let mut engine = ferryman_channel::system_delivery_engine();
+            // A channel the iroh lane carries is not Syncthing's: do not ask Syncthing about
+            // it (that is a wait on a service that may not even run here) and say so.
+            let carried = lane::carried_by_iroh(&route);
+            let mut engine = match &carried {
+                Some(_) => ferryman_channel::system_delivery_engine_carried("iroh"),
+                None => ferryman_channel::system_delivery_engine(),
+            };
             let receipt = engine.send(&route, &message)?;
             println!("{}", serde_json::to_string_pretty(&receipt)?);
             // The receipt says the file was written. Whether it can leave this machine is
             // a different question, and the one a person sending a message means.
-            match ferryman_ops::syncthing::channel_sync(&route) {
-                ferryman_ops::syncthing::ChannelSync::Synced => eprintln!(
-                    "saved; Syncthing carries it to the other machines. It is read once the \
-                     recipient acknowledges it (ferry channel inbox --agent {})",
+            if let Some(carried) = &carried {
+                eprintln!(
+                    "saved; {}. It is read once the recipient acknowledges it (ferry channel \
+                     inbox --agent {})",
+                    carried.describe(),
                     message.recipient
-                ),
-                ferryman_ops::syncthing::ChannelSync::Split { syncs } => eprintln!(
-                    "NOT SENT: saved on this machine only. This workspace reads {} but \
+                );
+            } else {
+                match ferryman_ops::syncthing::channel_sync(&route) {
+                    ferryman_ops::syncthing::ChannelSync::Synced => eprintln!(
+                        "saved; Syncthing carries it to the other machines. It is read once the \
+                     recipient acknowledges it (ferry channel inbox --agent {})",
+                        message.recipient
+                    ),
+                    ferryman_ops::syncthing::ChannelSync::Split { syncs } => eprintln!(
+                        "NOT SENT: saved on this machine only. This workspace reads {} but \
                      Syncthing syncs {}. Run `ferry doctor --fix` here, then send again",
-                    route.communications.display(),
-                    syncs.display()
-                ),
-                ferryman_ops::syncthing::ChannelSync::Unknown => eprintln!(
-                    "saved on this machine. Syncthing could not confirm it syncs this \
+                        route.communications.display(),
+                        syncs.display()
+                    ),
+                    ferryman_ops::syncthing::ChannelSync::Unknown => eprintln!(
+                        "saved on this machine. Syncthing could not confirm it syncs this \
                      channel, so it may not leave; run `ferry doctor` to check"
-                ),
+                    ),
+                }
             }
         }
 
@@ -11115,6 +11142,9 @@ fn channel(command: Channel) -> Result<()> {
             }
             if let Some(needs) = &order.needs {
                 println!("  needs: {} (signed into the order)", needs.describe());
+            }
+            if let Some(carried) = lane::carried_by_iroh(&route) {
+                println!("  {}", carried.describe());
             }
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),

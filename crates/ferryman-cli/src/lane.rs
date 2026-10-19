@@ -308,3 +308,205 @@ impl WorkerLane {
         Ok(())
     }
 }
+
+/// How this machine's iroh lane carries one channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Carried {
+    /// This machine's endpoint id, as the channel's transports record names it.
+    pub endpoint_id: String,
+    /// The worker's lane finished a round recently, so it is running now.
+    pub running: bool,
+    /// When the worker's lane last finished a round.
+    pub last_round: Option<chrono::DateTime<chrono::Utc>>,
+    /// Peers whose last exchange covered this project.
+    pub peers: usize,
+}
+
+impl Carried {
+    /// The line `channel send` and `channel status` print.
+    pub(crate) fn describe(&self) -> String {
+        let peers = match self.peers {
+            0 => "no peer has synced it yet".to_owned(),
+            1 => "1 peer has synced it".to_owned(),
+            n => format!("{n} peers have synced it"),
+        };
+        if self.running {
+            format!("the iroh lane is carrying this channel ({peers})")
+        } else {
+            format!(
+                "the iroh lane carries this channel, but the worker's lane has not run lately \
+                 ({peers}); it goes out when `ferry agent run --all-projects` is running"
+            )
+        }
+    }
+}
+
+/// Whether the iroh lane, not Syncthing, is what carries `route`'s channel off this
+/// machine. Reads this machine's own settings and the channel; asks no service anything.
+pub(crate) fn carried_by_iroh(route: &ProjectRoute) -> Option<Carried> {
+    let root = ferryman_channel::ferry::find_root()?;
+    let config = IrohConfig::load(&root.path);
+    let machine = ferryman_iroh::machine_dir().ok()?;
+    carried_in(route, config.enabled, &machine, chrono::Utc::now())
+}
+
+/// The lane carries a channel from this machine when it is switched on, the machine has an
+/// iroh key, and the channel holds a record, honoured by its roster, that names that key.
+fn carried_in(
+    route: &ProjectRoute,
+    enabled: bool,
+    machine: &std::path::Path,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Carried> {
+    if !enabled {
+        return None;
+    }
+    let key = ferryman_iroh::load_key(machine).ok()??;
+    let me = ferryman_iroh::endpoint_hex(&key.public());
+    if !ferryman_channel::transports::honoured_records(route)
+        .iter()
+        .any(|record| record.endpoint_id.eq_ignore_ascii_case(&me))
+    {
+        return None;
+    }
+    let status = ferryman_iroh::Status::read(&machine.join(ferryman_iroh::STATUS_FILE));
+    let last_round = status.as_ref().and_then(|status| status.updated);
+    // A few rounds' grace: a round can be slow, and one missed is not "stopped".
+    let running = last_round.is_some_and(|at| {
+        now - at < chrono::Duration::from_std(ferryman_iroh::lane::ROUND_EVERY * 6).unwrap()
+    });
+    let peers = status.map_or(0, |status| {
+        status
+            .peers
+            .values()
+            .filter(|peer| peer.projects.iter().any(|id| id == &route.project_id))
+            .count()
+    });
+    Some(Carried {
+        endpoint_id: me,
+        running,
+        last_round,
+        peers,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferryman_channel::{AgentIdentity, AgentRoute};
+
+    fn route(base: &std::path::Path) -> ProjectRoute {
+        let workspace = base.join("demo");
+        let attachment = workspace.join(".ferryman");
+        let communications = attachment.join("ferryman");
+        std::fs::create_dir_all(&communications).unwrap();
+        ProjectRoute {
+            project_id: "demo".into(),
+            workspace,
+            attachment,
+            communications,
+            shared_remote: "demo-ferryman".into(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn enrolled(route: &ProjectRoute, name: &str) -> AgentIdentity {
+        let identity = AgentIdentity::load_or_create(name, &route.attachment).unwrap();
+        ferryman_channel::register_agent(
+            route,
+            &AgentRoute {
+                name: name.into(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(identity.public_key_hex()),
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        identity
+    }
+
+    #[test]
+    fn a_channel_with_this_machines_record_is_carried_by_iroh_and_one_without_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let machine = dir.path().join("machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        let route = route(dir.path());
+        let wisp = enrolled(&route, "wisp");
+        let now = chrono::Utc::now();
+
+        // No key yet, and no record: Syncthing's channel, as before.
+        assert!(carried_in(&route, true, &machine, now).is_none());
+
+        let (key, _) = ferryman_iroh::load_or_create_key(&machine).unwrap();
+        let me = ferryman_iroh::endpoint_hex(&key.public());
+        // A key but no record in this channel.
+        assert!(carried_in(&route, true, &machine, now).is_none());
+
+        ferryman_channel::transports::publish(&route, &wisp, &me, None).unwrap();
+        let carried = carried_in(&route, true, &machine, now).unwrap();
+        assert_eq!(carried.endpoint_id, me);
+        assert!(!carried.running, "no worker has run the lane yet");
+        assert!(carried.describe().contains("has not run lately"));
+
+        // Switched off in ferry.toml: not carried.
+        assert!(carried_in(&route, false, &machine, now).is_none());
+
+        // A record that names some other machine's key is not this machine's.
+        let other = tempfile::tempdir().unwrap();
+        ferryman_iroh::load_or_create_key(other.path()).unwrap();
+        assert!(carried_in(&route, true, other.path(), now).is_none());
+    }
+
+    #[test]
+    fn a_lane_that_ran_lately_is_running_and_counts_the_peers_that_have_this_project() {
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let machine = dir.path().join("machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        let route = route(dir.path());
+        let wisp = enrolled(&route, "wisp");
+        let (key, _) = ferryman_iroh::load_or_create_key(&machine).unwrap();
+        ferryman_channel::transports::publish(
+            &route,
+            &wisp,
+            &ferryman_iroh::endpoint_hex(&key.public()),
+            None,
+        )
+        .unwrap();
+        let now = chrono::Utc::now();
+        let mut status = ferryman_iroh::Status {
+            updated: Some(now - chrono::Duration::seconds(20)),
+            ..Default::default()
+        };
+        status.peers.insert(
+            "aa".repeat(32),
+            ferryman_iroh::lane::PeerStatus {
+                projects: vec!["demo".into()],
+                ..Default::default()
+            },
+        );
+        status.peers.insert(
+            "bb".repeat(32),
+            ferryman_iroh::lane::PeerStatus {
+                projects: vec!["other".into()],
+                ..Default::default()
+            },
+        );
+        std::fs::write(
+            machine.join(ferryman_iroh::STATUS_FILE),
+            serde_json::to_vec(&status).unwrap(),
+        )
+        .unwrap();
+        let carried = carried_in(&route, true, &machine, now).unwrap();
+        assert!(carried.running);
+        assert_eq!(carried.peers, 1);
+        assert!(carried.describe().contains("1 peer has synced it"));
+        // The same lane, an hour later with no new round: not running.
+        let later = now + chrono::Duration::hours(1);
+        assert!(!carried_in(&route, true, &machine, later).unwrap().running);
+    }
+}

@@ -4502,6 +4502,10 @@ pub struct SyncthingProbe {
     /// `Unavailable` rather than guessing, so delivery fails over instead of silently
     /// assuming a transport that may not exist.
     pub api_key: String,
+    /// Set when some other lane (iroh) carries the channel, and says which. The folder is
+    /// then not Syncthing's to vouch for, so it is not asked: the probe answers `Healthy`
+    /// at once, with no call to Syncthing and no wait on one that is not running.
+    pub carried_by: Option<String>,
 }
 
 impl SyncthingProbe {
@@ -4517,12 +4521,19 @@ impl SyncthingProbe {
         // Syncthing while the channel was carried by another.
         let api_base = syncthing_api_base();
         let api_key = syncthing_api_key().unwrap_or_default();
-        Self { api_base, api_key }
+        Self {
+            api_base,
+            api_key,
+            carried_by: None,
+        }
     }
 }
 
 impl SharedHealthProbe for SyncthingProbe {
     fn health(&mut self, route: &ProjectRoute) -> Result<Health> {
+        if self.carried_by.is_some() {
+            return Ok(Health::Healthy);
+        }
         if self.api_key.is_empty() || route.shared_remote.trim().is_empty() {
             return Ok(Health::Unavailable);
         }
@@ -6419,11 +6430,26 @@ pub fn system_delivery_engine() -> SystemDeliveryEngine {
 /// callers that already resolved their configuration.
 #[must_use]
 pub fn system_delivery_engine_in(namespace: ChannelNamespace) -> SystemDeliveryEngine {
+    system_delivery_engine_for(namespace, None)
+}
+
+/// [`system_delivery_engine`] for a channel another lane carries (`carried_by` names it):
+/// Syncthing is not asked about it, so a machine that does not run Syncthing does not
+/// wait on one.
+#[must_use]
+pub fn system_delivery_engine_carried(carried_by: &str) -> SystemDeliveryEngine {
+    system_delivery_engine_for(ChannelNamespace::from_env(), Some(carried_by.to_string()))
+}
+
+fn system_delivery_engine_for(
+    namespace: ChannelNamespace,
+    carried_by: Option<String>,
+) -> SystemDeliveryEngine {
+    let mut probe = SyncthingProbe::from_env();
+    probe.carried_by = carried_by;
     DeliveryEngine::with_namespace(
         LocalFilesystemTransport,
-        SharedFolderTransport {
-            probe: SyncthingProbe::from_env(),
-        },
+        SharedFolderTransport { probe },
         PrivateGitTransport::with_namespace(SystemGit, namespace.clone()),
         namespace,
     )
