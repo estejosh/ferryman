@@ -390,6 +390,45 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// The full object name `rev` resolves to in the repository at `workspace`, or `None` when
+/// git cannot say (not a repository, unknown or ambiguous name).
+fn full_sha(workspace: &std::path::Path, rev: &str) -> Option<String> {
+    // An option-looking value is never a commit name, and must not reach git as a flag.
+    if rev.is_empty() || rev.starts_with('-') {
+        return None;
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--verify", "--quiet", "--end-of-options"])
+        .arg(format!("{rev}^{{commit}}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .to_ascii_lowercase();
+    (sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())).then_some(sha)
+}
+
+/// Whether two names for a commit (a full SHA, an abbreviation of any length) are the same
+/// commit. Compared as full SHAs, never as strings: `ferry release prepare --commit <full>`
+/// and a status check that asks git for `--short` HEAD name one commit twice.
+///
+/// Identical text is a match without asking git. Anything git cannot resolve unambiguously
+/// is not a match: a gate refuses on doubt.
+fn same_commit(workspace: &std::path::Path, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (full_sha(workspace, a), full_sha(workspace, b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Whether this release may be signed, and if not, why not in a sentence.
 ///
 /// Every check is a refusal rather than a warning. There is no `--force`: a release that
@@ -422,7 +461,7 @@ pub fn may_sign(
     // itself is unattributable.
     if let Some(denial) = list_denials(route).into_iter().find(|denial| {
         denial.version == request.version
-            && denial.commit == at_commit
+            && same_commit(&route.workspace, &denial.commit, at_commit)
             && denial.denied_at > approval.approved_at
             && verify_denial(denial, &route.agents) == SignatureCheck::Valid
     }) {
@@ -432,7 +471,7 @@ pub fn may_sign(
         });
     }
 
-    if approval.commit != at_commit {
+    if !same_commit(&route.workspace, &approval.commit, at_commit) {
         return Err(Refusal::CommitMoved {
             approved: approval.commit.clone(),
             actual: at_commit.to_string(),
@@ -562,6 +601,94 @@ mod tests {
         );
         // And it says so in words a person can act on.
         assert!(refusal.to_string().contains("does not approve another"));
+    }
+
+    /// A repository with two commits at `route.workspace`; returns (first, second) full SHAs.
+    fn two_commits(route: &ProjectRoute) -> (String, String) {
+        let git = |args: &[&str]| -> String {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&route.workspace)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&route.workspace).unwrap();
+        git(&["init", "-q"]);
+        std::fs::write(route.workspace.join("a"), "1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        let first = git(&["rev-parse", "HEAD"]);
+        std::fs::write(route.workspace.join("a"), "2").unwrap();
+        git(&["commit", "-q", "-am", "two"]);
+        let second = git(&["rev-parse", "HEAD"]);
+        (first, second)
+    }
+
+    /// The observed failure: `release prepare --commit <full sha>` made a request that
+    /// `release status` then refused against `rev-parse --short HEAD`.
+    #[test]
+    fn a_full_sha_and_its_abbreviation_are_the_same_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fleet, fleet_route) = signer("beastly");
+        let (operator, operator_route) = signer("josh");
+        let mut route = route(dir.path());
+        route.agents = vec![fleet_route, operator_route];
+        let (first, second) = two_commits(&route);
+
+        // Prepared and approved at the full SHA of HEAD.
+        let request = request("v0.5.6", &second);
+        write_request(&route, &request, &fleet).unwrap();
+        write_approval(&route, &approval("v0.5.6", &second), &operator).unwrap();
+
+        // Asked about at the short form, and at an even shorter one.
+        for at in [&second[..7], &second[..12], second.as_str()] {
+            assert!(
+                may_sign(&route, &request, at).is_ok(),
+                "{at} is the approved commit"
+            );
+        }
+        // And the other way round: approved at the short form, asked at the full one.
+        write_approval(&route, &approval("v0.5.6", &second[..7]), &operator).unwrap();
+        assert!(may_sign(&route, &request, &second).is_ok());
+
+        // A different commit, in either spelling, is still refused; so is one git cannot
+        // resolve at all.
+        for at in [&first[..7], first.as_str(), "deadbee"] {
+            assert!(
+                matches!(
+                    may_sign(&route, &request, at),
+                    Err(Refusal::CommitMoved { .. })
+                ),
+                "{at} is not the approved commit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_denial_of_a_commit_holds_in_any_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let (fleet, fleet_route) = signer("beastly");
+        let (operator, operator_route) = signer("josh");
+        let mut route = route(dir.path());
+        route.agents = vec![fleet_route, operator_route];
+        let (_, second) = two_commits(&route);
+
+        let request = request("v0.5.6", &second);
+        write_request(&route, &request, &fleet).unwrap();
+        write_approval(&route, &approval("v0.5.6", &second), &operator).unwrap();
+        let mut no = denial("v0.5.6", &second[..9], "not yet");
+        no.denied_at = Utc::now() + chrono::Duration::seconds(5);
+        write_denial(&route, &no, &operator).unwrap();
+
+        assert!(matches!(
+            may_sign(&route, &request, &second),
+            Err(Refusal::Denied { .. })
+        ));
     }
 
     #[test]
