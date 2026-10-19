@@ -62,6 +62,7 @@ fn order(route: &ProjectRoute, boss: &AgentIdentity, id: &str) {
         touches: Vec::new(),
         needs: None,
         allow_overlap: false,
+        priority: None,
     };
     boss.sign_order(&mut order);
     write(&dir.join("order.json"), &order);

@@ -504,6 +504,8 @@ impl Bridge {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            // Typed by a person, so it is the one they are waiting on.
+            priority: ferryman_channel::default_priority(&route, &principal),
         };
         self.agent.sign_order(&mut order);
         if let Err(error) = ferryman_channel::issue_order(&route, &order) {
@@ -3015,6 +3017,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         josh().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();
@@ -3541,6 +3544,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         josh().sign_order(&mut order);
         ferryman_channel::issue_order(&ferryman, &order).unwrap();
@@ -3967,6 +3971,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         ferryman_channel::issue_order(&ferryman, &order).unwrap();
@@ -4348,6 +4353,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         ferryman_channel::issue_order(&ferryman, &order).unwrap();
@@ -4405,6 +4411,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         ferryman_channel::issue_order(route, &order).unwrap();

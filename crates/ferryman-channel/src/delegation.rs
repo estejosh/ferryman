@@ -713,6 +713,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         signer.sign_order(&mut order);
         order

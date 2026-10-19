@@ -1729,6 +1729,7 @@ mod paused_work {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 

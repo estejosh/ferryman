@@ -1638,6 +1638,8 @@ fn issue(
         touches: Vec::new(),
         needs: None,
         allow_overlap: false,
+        // Typed by a person, so it is the one they are waiting on.
+        priority: ferryman_channel::default_priority(route, issuer),
     };
     // Unsigned work is work nobody can attribute. If this identity can sign, it does.
     if let Some(identity) = crate::sign_as(route, issuer)? {

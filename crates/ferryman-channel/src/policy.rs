@@ -5037,6 +5037,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             },
             claims: claimed
                 .map(|(agent, age)| crate::Claim {

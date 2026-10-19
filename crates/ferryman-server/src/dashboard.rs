@@ -3870,6 +3870,7 @@ async fn tasks(
                 // recorded one (null for work done before the smart router).
                 "routing": routing_reason(task),
                 "allow_overlap": task.order.allow_overlap,
+                "priority": task.order.priority().as_str(),
                 "overlaps": overlaps.get(&task.order.id).cloned().unwrap_or_default(),
                 "holds": ferryman_channel::hold::read(&current, &task.order.id),
             })
@@ -4010,6 +4011,8 @@ async fn task_detail(
             "touches": task.order.touches,
             "needs": task.order.needs,
             "allow_overlap": task.order.allow_overlap,
+            "priority": task.order.priority().as_str(),
+            "priority_signed": task.order.priority.is_some(),
             "payload": task.order.payload,
             "sig": sig(&ferryman_channel::verify_order(&task.order, &route.agents)),
         },
@@ -5264,6 +5267,9 @@ struct NewOrderBody {
     to: Option<String>,
     #[serde(default)]
     requires_review: bool,
+    /// `high`, `normal` or `low`. Left out, an order from a person is high.
+    #[serde(default)]
+    priority: Option<String>,
     /// Names of files already sent with `PUT /api/orders/{id}/files/{name}`.
     #[serde(default)]
     files: Vec<String>,
@@ -5318,6 +5324,17 @@ async fn new_order(
         return Err(bad("the machine to do it must be a path-safe name".into()));
     }
 
+    let priority = match body
+        .priority
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => Some(
+            ferryman_channel::Priority::parse(text).map_err(|error| bad(format!("{error:#}")))?,
+        ),
+        None => ferryman_channel::default_priority(&route, identity.name()),
+    };
     let mut payload = json!({ "task": body.task });
     let uploads = upload_dir(&route, identity.name(), &id);
     let specs = body
@@ -5365,6 +5382,7 @@ async fn new_order(
         touches: Vec::new(),
         needs: None,
         allow_overlap: false,
+        priority,
     };
     identity.sign_order(&mut order);
     if let Err(error) = ferryman_channel::issue_order(&route, &order) {
@@ -5481,6 +5499,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 
@@ -8384,6 +8403,75 @@ mod tests {
         assert_eq!(plain.status(), StatusCode::OK);
         let task = ferryman_channel::read_task(&route, "o-4").unwrap();
         assert!(task.order.payload.get("files").is_none());
+    }
+
+    /// An order from a person is high unless they say otherwise; the form can set it, and the
+    /// task shows it.
+    #[tokio::test]
+    async fn an_order_from_the_dashboard_has_a_priority_a_person_can_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let route = Arc::new(test_route(dir.path()));
+        ferryman_channel::register_agent(
+            &route,
+            &ferryman_channel::AgentRoute {
+                name: "alice".into(),
+                role: "operator".into(),
+                capabilities: Vec::new(),
+                public_key: None,
+                encryption_key: None,
+            },
+        )
+        .unwrap();
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+
+        for (id, body, expect) in [
+            ("p-1", r#"{"id":"p-1","task":"x"}"#, Some("high")),
+            (
+                "p-2",
+                r#"{"id":"p-2","task":"x","priority":"low"}"#,
+                Some("low"),
+            ),
+            (
+                "p-3",
+                r#"{"id":"p-3","task":"x","priority":"normal"}"#,
+                Some("normal"),
+            ),
+            (
+                "p-4",
+                r#"{"id":"p-4","task":"x","priority":""}"#,
+                Some("high"),
+            ),
+        ] {
+            let issued = post(&app, "/api/orders", body, Some(&token)).await;
+            assert_eq!(issued.status(), StatusCode::OK, "{id}");
+            let task = ferryman_channel::read_task(&route, id).unwrap();
+            assert_eq!(task.order.priority.map(|p| p.as_str()), expect, "{id}");
+        }
+        let refused = post(
+            &app,
+            "/api/orders",
+            r#"{"id":"p-5","task":"x","priority":"urgent"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        assert!(ferryman_channel::read_task(&route, "p-5").is_err());
+
+        let all = get_json(&app, "/api/tasks", Some(&token)).await;
+        let priority_of = |id: &str| {
+            all.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"] == id)
+                .map(|t| t["priority"].clone())
+        };
+        assert_eq!(priority_of("p-1"), Some(json!("high")));
+        assert_eq!(priority_of("p-2"), Some(json!("low")));
+        let detail = get_json(&app, "/api/tasks/p-2", Some(&token)).await;
+        assert_eq!(detail["order"]["priority"], "low");
+        assert_eq!(detail["order"]["priority_signed"], true);
     }
 
     #[tokio::test]

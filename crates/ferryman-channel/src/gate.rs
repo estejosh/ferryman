@@ -614,6 +614,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         crate::issue_order(route, &order).unwrap();
@@ -819,6 +820,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         wisp().sign_order(&mut order);
         crate::issue_order(route, &order).unwrap();

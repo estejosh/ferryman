@@ -6319,6 +6319,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             },
             claims: Vec::new(),
             results: Vec::new(),
@@ -6405,6 +6406,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 
@@ -6850,6 +6852,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         assert_eq!(
             commit_subject("t-4f2a", &order),
@@ -7018,6 +7021,7 @@ mod tests {
                 touches: Vec::new(),
                 needs: None,
                 allow_overlap: false,
+                priority: None,
             },
             claims: Vec::new(),
             results: Vec::new(),

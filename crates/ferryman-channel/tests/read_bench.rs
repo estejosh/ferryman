@@ -66,6 +66,7 @@ fn fill(route: &ProjectRoute, wisp: &AgentIdentity, boss: &AgentIdentity, tasks:
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         boss.sign_order(&mut order);
         write(&dir.join("order.json"), &order);

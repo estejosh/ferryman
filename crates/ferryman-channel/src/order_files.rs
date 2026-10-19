@@ -1655,6 +1655,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         fx.orchestrator.sign_order(&mut order);
         crate::issue_order(&fx.route, &order).unwrap();
@@ -1779,6 +1780,7 @@ mod tests {
                 min_context_k: None,
             }),
             allow_overlap: false,
+            priority: None,
         };
         fx.orchestrator.sign_order(&mut order);
         let raw = serde_json::to_value(&order).unwrap();
@@ -2106,6 +2108,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         assert_eq!(names(&order), vec!["a.bin".to_string()]);
         assert_eq!(crate::work::attachments(&order.payload).len(), 2);

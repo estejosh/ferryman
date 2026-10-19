@@ -1445,6 +1445,12 @@ enum Channel {
         /// already claimed.
         #[arg(long)]
         allow_overlap: bool,
+        /// How soon this should be picked up: high, normal or low. Signed into the order.
+        /// Workers take the highest first, then the oldest, and never interrupt work in
+        /// hand. Left out, an order from a person (the master or an operator) is high and
+        /// one from an agent is normal.
+        #[arg(long, value_name = "PRIORITY", value_parser = parse_priority)]
+        priority: Option<ferryman_channel::Priority>,
         /// The interface contract this order provides or consumes, as
         /// name@version:provides or name@version:consumes. A worker will not start it
         /// until the master has locked that contract.
@@ -8624,6 +8630,11 @@ fn parse_work_kind(value: &str) -> Result<ferryman_channel::work::WorkKind, Stri
 }
 
 /// `large` as `--size` takes it.
+/// `high`, `normal` or `low` as `--priority` takes it.
+fn parse_priority(value: &str) -> Result<ferryman_channel::Priority, String> {
+    ferryman_channel::Priority::parse(value).map_err(|error| format!("{error:#}"))
+}
+
 fn parse_work_size(value: &str) -> Result<ferryman_channel::work::Size, String> {
     ferryman_channel::work::Size::parse(value).map_err(|error| format!("{error:#}"))
 }
@@ -10984,6 +10995,7 @@ fn channel(command: Channel) -> Result<()> {
             depends_on,
             touches,
             allow_overlap,
+            priority,
             interface,
             result_schema,
             kind,
@@ -11075,6 +11087,9 @@ fn channel(command: Channel) -> Result<()> {
                 touches,
                 needs,
                 allow_overlap,
+                // What was asked for, else what the issuer's standing gives: a person's order
+                // is high, an agent's is normal.
+                priority: priority.or_else(|| ferryman_channel::default_priority(&route, &issuer)),
             };
             // Asked before the order exists, so it cannot find itself.
             let overlapping = match ferryman_channel::overlap::issue_warnings(&route, &order) {
@@ -11147,6 +11162,15 @@ fn channel(command: Channel) -> Result<()> {
             if let Some(carried) = lane::carried_by_iroh(&route) {
                 println!("  {}", carried.describe());
             }
+            println!(
+                "  priority {}{}",
+                order.priority().as_str(),
+                if order.priority.is_some() {
+                    " (signed into the order)"
+                } else {
+                    ""
+                }
+            );
             match order.assigned_to {
                 Some(ref who) => println!("  addressed to {who}: nothing to race over"),
                 None => println!("  open: whichever agent claims first wins"),
@@ -14158,5 +14182,33 @@ mod tests {
             "a rejection needs its reason"
         );
         assert!(super::Cli::try_parse_from(["ferry", "work", "list", "--json"]).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod priority_flag_tests {
+    use clap::Parser;
+
+    fn parsed(extra: &[&str]) -> Result<Option<ferryman_channel::Priority>, clap::Error> {
+        let mut args = vec!["ferry", "channel", "order", "--id", "t-1", "--task", "x"];
+        args.extend_from_slice(extra);
+        let cli = super::Cli::try_parse_from(args)?;
+        let super::Command::Channel {
+            command: super::Channel::Order { priority, .. },
+        } = cli.command
+        else {
+            panic!("not an order");
+        };
+        Ok(priority)
+    }
+
+    #[test]
+    fn priority_is_high_normal_or_low_and_optional() {
+        use ferryman_channel::Priority::{High, Low, Normal};
+        assert_eq!(parsed(&[]).unwrap(), None);
+        assert_eq!(parsed(&["--priority", "high"]).unwrap(), Some(High));
+        assert_eq!(parsed(&["--priority", "Normal"]).unwrap(), Some(Normal));
+        assert_eq!(parsed(&["--priority", "low"]).unwrap(), Some(Low));
+        assert!(parsed(&["--priority", "urgent"]).is_err());
     }
 }

@@ -848,6 +848,94 @@ pub struct Order {
     /// working on.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_overlap: bool,
+    /// How soon this should be picked up, signed into the order when set. `None` reads as
+    /// [`Priority::Normal`], which is what every order issued before this field was, so
+    /// their bytes and signatures are unchanged. See [`Priority`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "priority_or_none"
+    )]
+    pub priority: Option<Priority>,
+}
+
+/// How soon an order should be picked up.
+///
+/// A worker claims the highest priority first and, among equals, the oldest. It never
+/// interrupts work it is already doing: priority orders the queue and nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Priority {
+    Low,
+    Normal,
+    High,
+}
+
+impl Priority {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Normal => "normal",
+            Self::High => "high",
+        }
+    }
+
+    /// `high`, `normal` or `low`, in any case.
+    ///
+    /// # Errors
+    /// Anything else.
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "high" => Ok(Self::High),
+            "normal" => Ok(Self::Normal),
+            "low" => Ok(Self::Low),
+            other => bail!("priority is high, normal or low, not '{other}'"),
+        }
+    }
+}
+
+/// A priority this version does not know reads as none, not as an unreadable order. The
+/// order's signature then does not verify (the value is part of what was signed), so it is
+/// refused rather than run at a priority nobody here understands.
+fn priority_or_none<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Priority>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|text| Priority::parse(&text).ok()))
+}
+
+impl Order {
+    /// The priority this order is worked at: what it says, or normal.
+    #[must_use]
+    pub fn priority(&self) -> Priority {
+        self.priority.unwrap_or(Priority::Normal)
+    }
+}
+
+/// Whether `issuer` is a person on this project: its master, or a roster entry whose role is
+/// `operator`. Agents (workers, bridges, the improvement loop) are not.
+#[must_use]
+pub fn issuer_is_person(route: &ProjectRoute, issuer: &str) -> bool {
+    // The roster as it is now, not as the route was built: a person who joined since is
+    // still a person.
+    let roster = read_agent_roster(&route.communications).unwrap_or_else(|_| route.agents.clone());
+    if roster
+        .iter()
+        .any(|agent| agent.name.eq_ignore_ascii_case(issuer) && agent.role == "operator")
+    {
+        return true;
+    }
+    master::read_master_at(&route.communications, &roster)
+        .ok()
+        .flatten()
+        .is_some_and(|declaration| declaration.master.eq_ignore_ascii_case(issuer))
+}
+
+/// The priority an order gets when its issuer did not choose one: high from a person,
+/// nothing (so normal) from an agent. A person's order is the one they are waiting on.
+#[must_use]
+pub fn default_priority(route: &ProjectRoute, issuer: &str) -> Option<Priority> {
+    issuer_is_person(route, issuer).then_some(Priority::High)
 }
 
 /// An agent staking a claim on an open order.
@@ -2061,6 +2149,17 @@ pub fn work_among(route: &ProjectRoute, agent: &str, tasks: Vec<Task>) -> Result
             _ => {}
         }
     }
+    // Highest priority first, then the oldest: what this worker would take next, in order.
+    // Work it already holds comes before anything it has yet to claim, so a new high
+    // priority order never displaces work in hand.
+    out.sort_by_cached_key(|task| {
+        let unclaimed = matches!(task.state(), TaskState::Open | TaskState::Offered { .. });
+        (
+            unclaimed,
+            std::cmp::Reverse(task.order.priority()),
+            task.order.created_at,
+        )
+    });
     Ok(out)
 }
 
@@ -2494,6 +2593,11 @@ fn order_payload(order: &Order) -> String {
     }
     if order.allow_overlap {
         payload.push_str("\noverlap:allow");
+    }
+    // Bound when set, like the fields above: an order without one keeps its old bytes, and
+    // one with one cannot be bumped up the queue after it was signed.
+    if let Some(priority) = order.priority {
+        payload.push_str(&format!("\npriority:{}", priority.as_str()));
     }
     if order.requires_approval {
         payload.push_str("\napproval:true");
@@ -9784,6 +9888,7 @@ mod work_over_files_tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         }
     }
 

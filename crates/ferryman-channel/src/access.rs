@@ -1580,6 +1580,7 @@ mod tests {
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
+            priority: None,
         };
         issuer.sign_order(&mut order);
         order
