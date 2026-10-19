@@ -390,11 +390,20 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// Whether `name` is spelled like a commit: 4 to 40 lowercase hex digits. A branch, `HEAD`
+/// or a tag is not, however it resolves today: it moves, and an approval of a moving name
+/// approves whatever it points at next.
+fn is_commit_name(name: &str) -> bool {
+    (4..=40).contains(&name.len()) && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The full object name `rev` resolves to in the repository at `workspace`, or `None` when
-/// git cannot say (not a repository, unknown or ambiguous name).
+/// it is not spelled like a commit, or git cannot say (not a repository, unknown or
+/// ambiguous name).
 fn full_sha(workspace: &std::path::Path, rev: &str) -> Option<String> {
-    // An option-looking value is never a commit name, and must not reach git as a flag.
-    if rev.is_empty() || rev.starts_with('-') {
+    // Only a commit's own hex name is resolved. This also keeps an option-looking value
+    // from reaching git as a flag.
+    if !is_commit_name(rev) {
         return None;
     }
     let output = std::process::Command::new("git")
@@ -417,11 +426,12 @@ fn full_sha(workspace: &std::path::Path, rev: &str) -> Option<String> {
 /// commit. Compared as full SHAs, never as strings: `ferry release prepare --commit <full>`
 /// and a status check that asks git for `--short` HEAD name one commit twice.
 ///
-/// Identical text is a match without asking git. Anything git cannot resolve unambiguously
-/// is not a match: a gate refuses on doubt.
+/// Identical commit names are a match without asking git. Anything that is not spelled like
+/// a commit (`main`, `HEAD`, a tag), or that git cannot resolve unambiguously, is not a
+/// match: a gate refuses on doubt.
 fn same_commit(workspace: &std::path::Path, a: &str, b: &str) -> bool {
     if a == b {
-        return true;
+        return is_commit_name(a);
     }
     match (full_sha(workspace, a), full_sha(workspace, b)) {
         (Some(a), Some(b)) => a == b,
@@ -667,6 +677,45 @@ mod tests {
                 "{at} is not the approved commit"
             );
         }
+    }
+
+    /// A ref is not a commit: it moves. It matches nothing, not even itself.
+    #[test]
+    fn a_branch_a_tag_or_head_is_not_a_commit_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = route(dir.path());
+        let (_, second) = two_commits(&route);
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&route.workspace)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        // update-ref, not `git tag`: a developer's global signing config must not matter.
+        git(&["update-ref", "refs/tags/v-moving", "HEAD"]);
+        route.agents = Vec::new();
+        for name in [
+            "HEAD", "main", "master", "v-moving", "HEAD~0", "-x", "", "abc", "ABCDEF1",
+        ] {
+            assert!(
+                !same_commit(&route.workspace, name, name),
+                "{name:?} matched itself"
+            );
+            assert!(
+                !same_commit(&route.workspace, name, &second),
+                "{name:?} matched a commit"
+            );
+            assert!(
+                !same_commit(&route.workspace, &second, name),
+                "{name:?} matched a commit"
+            );
+        }
+        // The real spellings still do.
+        assert!(same_commit(&route.workspace, &second, &second[..7]));
+        assert!(same_commit(&route.workspace, &second[..4], &second));
     }
 
     #[test]
