@@ -348,6 +348,21 @@ impl LiveLane {
         }
         self.lane.add_project(route.clone());
     }
+
+    /// Keep the lane in step with whether the worker still serves `route`: a project that
+    /// was archived, or that its master took the worker out of, leaves the lane (it would
+    /// otherwise stay in it, and keep being synced, until the worker restarted), and joins
+    /// again if it comes back.
+    pub(crate) fn follow(&self, route: &ProjectRoute, served: bool, report: &impl Progress) {
+        let id = &route.project_id;
+        let carried = self.lane.project_ids().contains(id);
+        if served && !carried {
+            self.add(route, report);
+            report.info(&format!("iroh lane: serving {id} again"));
+        } else if !served && self.lane.remove_project(id) {
+            report.info(&format!("iroh lane: no longer serving {id}"));
+        }
+    }
 }
 
 /// How this machine's iroh lane carries one channel.

@@ -591,6 +591,37 @@ async fn first_contact_opens_only_the_transports_records_of_a_new_channel() {
 }
 
 #[tokio::test]
+async fn first_contact_is_offered_only_where_the_peers_agent_is_on_the_roster() {
+    let p = pair_with(true).await;
+    let base = p._dir.path();
+    let b_id = p.b.endpoint().id();
+    // A channel A serves whose roster has fang but not wisp, B's agent.
+    let closed = route(&base.join("a"), "closed");
+    enrol(&closed, &AgentIdentity::from_seed("fang", [1; 32]));
+    p.a.add_project(closed);
+    let offered = p.a.trusted()[&b_id].bootstrap.clone();
+    assert!(offered.contains("fresh"), "{offered:?}");
+    assert!(!offered.contains("closed"), "{offered:?}");
+}
+
+#[tokio::test]
+async fn a_project_taken_out_is_no_longer_served_and_can_come_back() {
+    let p = pair().await;
+    let b_id = p.b.endpoint().id();
+    assert!(p.a.trusted()[&b_id].projects.contains("demo"));
+    assert!(p.a.remove_project("demo"));
+    assert!(!p.a.remove_project("demo"), "nothing left to remove");
+    assert!(!p.a.project_ids().contains(&"demo".to_owned()));
+    assert!(
+        p.a.trusted()
+            .get(&b_id)
+            .is_none_or(|peer| !peer.projects.contains("demo"))
+    );
+    p.a.add_project(p.a_demo.clone());
+    assert!(p.a.trusted()[&b_id].projects.contains("demo"));
+}
+
+#[tokio::test]
 async fn first_contact_does_not_trust_a_peer_no_shared_channel_vouches_for() {
     let p = pair_with(true).await;
     let (_, b_fresh) = p.fresh.clone().unwrap();

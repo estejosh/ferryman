@@ -288,6 +288,18 @@ impl Lane {
         }
     }
 
+    /// Stop serving a channel, from the next connection and round on: it was archived, or
+    /// its master took this worker out of it. Returns whether it had been served.
+    pub fn remove_project(&self, project_id: &str) -> bool {
+        let mut projects = self
+            .projects
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = projects.len();
+        projects.retain(|route| route.project_id != project_id);
+        projects.len() != before
+    }
+
     /// The ids of the channels served now.
     #[must_use]
     pub fn project_ids(&self) -> Vec<String> {
@@ -413,26 +425,14 @@ impl Lane {
         // A peer trusted in one channel may be offered the transports records of any other
         // channel served here that it has none in yet, so two machines that already share
         // a project can find each other in a new one without a hand-copied file.
-        for peer in peers.values_mut() {
-            peer.bootstrap = projects
-                .iter()
-                .map(|route| route.project_id.clone())
-                .filter(|id| !peer.projects.contains(id))
-                .collect();
-        }
-        peers
-    }
-
-    /// Serve every incoming connection until the endpoint closes.
-    pub async fn serve(self: Arc<Self>) {
         //
         // Only where that peer's agent is already on the channel's roster: a record is
         // let in for an agent the channel knows, so offering the channel to a peer that
         // has no place on it would only be asking to be refused, and would tell it the
         // project exists.
-        while let Some(incoming) = self.endpoint.accept().await {
-            let lane = Arc::clone(&self);
-            tokio::spawn(async move {
+        for peer in peers.values_mut() {
+            peer.bootstrap = projects
+                .iter()
                 .filter(|route| !peer.projects.contains(&route.project_id))
                 .filter(|route| {
                     peer.agents.iter().any(|agent| {
@@ -446,6 +446,17 @@ impl Lane {
                             .is_file()
                     })
                 })
+                .map(|route| route.project_id.clone())
+                .collect();
+        }
+        peers
+    }
+
+    /// Serve every incoming connection until the endpoint closes.
+    pub async fn serve(self: Arc<Self>) {
+        while let Some(incoming) = self.endpoint.accept().await {
+            let lane = Arc::clone(&self);
+            tokio::spawn(async move {
                 if let Ok(connection) = incoming.await {
                     lane.answer_connection(connection).await;
                 }

@@ -8067,9 +8067,15 @@ async fn run_fleet(
         let focus = ferryman_channel::focus::current();
         ferryman_ops::fleet::in_focus_order(&mut fleet.served, &focus, chrono::Utc::now());
         for (route, config) in &mut fleet.served {
-            if serving_everywhere
-                && let Some(why) = ferryman_ops::fleet::no_longer_served(route, config)
-            {
+            let closed = if serving_everywhere {
+                ferryman_ops::fleet::no_longer_served(route, config)
+            } else {
+                None
+            };
+            if serving_everywhere && let Some(lane) = live_lane.as_ref() {
+                lane.follow(route, closed.is_none(), report);
+            }
+            if let Some(why) = closed {
                 report.warn(&format!("{} not worked this pass: {why}", route.project_id));
                 continue;
             }
@@ -8164,24 +8170,41 @@ fn take_newly_approved(
             told.insert(project.to_owned(), reason.to_owned());
         }
     }
-    told.retain(|project, _| still_closed.contains(project));
+    told.retain(|project, _| project.starts_with("lock:") || still_closed.contains(project));
     let mut taken = Vec::new();
     for (route, config) in found.served {
         match agent::WorkerLock::take(&route.attachment, &config.agent) {
-            Ok(Some(lock)) => locks.push(lock),
+            Ok(Some(lock)) => {
+                told.remove(&format!("lock:{}", route.project_id));
+                locks.push(lock);
+            }
             Ok(None) => {
-                report.warn(&format!(
-                    "  not watching {}: another worker on this machine already holds its \
-                     lock as the same agent. Two under one identity run the same order twice",
-                    route.project_id
-                ));
+                // This project is looked at again every pass until something serves it, so
+                // the same sentence would be printed every few seconds. Once, and again if
+                // the reason changes.
+                if told
+                    .insert(format!("lock:{}", route.project_id), "held".to_owned())
+                    .is_none()
+                {
+                    report.warn(&format!(
+                        "  not watching {}: another worker on this machine already holds its \
+                         lock as the same agent. Two under one identity run the same order twice",
+                        route.project_id
+                    ));
+                }
                 continue;
             }
             Err(error) => {
-                report.warn(&format!(
-                    "  not watching {}: no worker lock ({error:#})",
-                    route.project_id
-                ));
+                let said = format!("{error:#}");
+                if told
+                    .insert(format!("lock:{}", route.project_id), said.clone())
+                    .is_none_or(|before| before != said)
+                {
+                    report.warn(&format!(
+                        "  not watching {}: no worker lock ({said})",
+                        route.project_id
+                    ));
+                }
                 continue;
             }
         }
@@ -10018,29 +10041,6 @@ fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Append a dated note to one agent's specialization profile, creating the file
-/// and its `agents/` directory on first use, then refresh the derived roster.
-fn record_agent_profile(
-    bank: &std::path::Path,
-    project_id: &str,
-    agent: &str,
-    note: &str,
-    identity: &ferryman_channel::AgentIdentity,
-) -> Result<()> {
-    let path = ferryman_channel::memory::agent_profile_path(bank, agent);
-    // The very first record becomes the one-line summary; later records append a
-    // dated history line, so the summary stays readable in the roster.
-    let fresh = std::fs::read_to_string(&path)
-        .map(|text| text.trim().is_empty())
-        .unwrap_or(true);
-    let line = if fresh {
-        note.to_string()
-    } else {
-        format!("- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))
-    };
-    ferryman_channel::memory::append_agent_profile_for(bank, project_id, agent, &line, identity)
-        .with_context(|| format!("append to {}", path.display()))?;
-    let _ = ferryman_channel::memory::regenerate_roster(bank);
 /// `ferry memory adopt-v1`: re-sign this project's v1 agent profiles for the project.
 fn adopt_v1_profiles(workspace: Option<PathBuf>, project: &str) -> Result<()> {
     let start = match workspace {
@@ -10100,6 +10100,29 @@ fn adopt_v1_profiles(workspace: Option<PathBuf>, project: &str) -> Result<()> {
     Ok(())
 }
 
+/// Append a dated note to one agent's specialization profile, creating the file
+/// and its `agents/` directory on first use, then refresh the derived roster.
+fn record_agent_profile(
+    bank: &std::path::Path,
+    project_id: &str,
+    agent: &str,
+    note: &str,
+    identity: &ferryman_channel::AgentIdentity,
+) -> Result<()> {
+    let path = ferryman_channel::memory::agent_profile_path(bank, agent);
+    // The very first record becomes the one-line summary; later records append a
+    // dated history line, so the summary stays readable in the roster.
+    let fresh = std::fs::read_to_string(&path)
+        .map(|text| text.trim().is_empty())
+        .unwrap_or(true);
+    let line = if fresh {
+        note.to_string()
+    } else {
+        format!("- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))
+    };
+    ferryman_channel::memory::append_agent_profile_for(bank, project_id, agent, &line, identity)
+        .with_context(|| format!("append to {}", path.display()))?;
+    let _ = ferryman_channel::memory::regenerate_roster(bank);
     Ok(())
 }
 
