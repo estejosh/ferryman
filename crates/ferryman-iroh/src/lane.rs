@@ -425,9 +425,27 @@ impl Lane {
 
     /// Serve every incoming connection until the endpoint closes.
     pub async fn serve(self: Arc<Self>) {
+        //
+        // Only where that peer's agent is already on the channel's roster: a record is
+        // let in for an agent the channel knows, so offering the channel to a peer that
+        // has no place on it would only be asking to be refused, and would tell it the
+        // project exists.
         while let Some(incoming) = self.endpoint.accept().await {
             let lane = Arc::clone(&self);
             tokio::spawn(async move {
+                .filter(|route| !peer.projects.contains(&route.project_id))
+                .filter(|route| {
+                    peer.agents.iter().any(|agent| {
+                        route
+                            .communications
+                            .join("agents")
+                            .join(format!(
+                                "{}.json",
+                                ferryman_channel::canonical_agent_name(agent)
+                            ))
+                            .is_file()
+                    })
+                })
                 if let Ok(connection) = incoming.await {
                     lane.answer_connection(connection).await;
                 }
