@@ -106,6 +106,12 @@ In a layout-2 project (docs/LAYOUT.md) the lane exchanges two folders per projec
 Access levels (ADR 0024) are enforced by the machine that **receives** a file. A channel file authored by a Worker-level agent, by its name or by the `signed_by`, `sender` or `from` inside it, is dropped on arrival, signed or not; a Worker's files are accepted only from `handins/<agent>/`. `accepted.json` and `rejected.json` in the hand-ins folder are accepted only from the project's head or master. On a Worker's own machine the lane listens to the channel and publishes none of it (`Lane::set_local_agents`); under Syncthing the same machine's channel folder is made receive-only by `ferry access set`. A Worker's `transports` record is written to its hand-ins folder and honoured from there only.
 ## Not done yet
 
+- Channel compaction (`ferry channel compact`) is Syncthing-only for now. The lane never
+  deletes, so a peer would send back every message compaction removed and the space would
+  never be freed; and an archive file over 64 MiB would not be carried at all. `compact`
+  therefore refuses a channel the lane carries, or that has a `transports` record, with a
+  message saying so. Its archive files are split at 32 MiB (`<thread>.part2.jsonl`, ...)
+  so that they stay under the cap once the lane can propagate a removal.
 - Files are checked by hash in transit, but not every file type's own signature is
   audited on arrival. The readers that already verify signatures (orders, results,
   policies, records) still do so when they read, exactly as for Syncthing.

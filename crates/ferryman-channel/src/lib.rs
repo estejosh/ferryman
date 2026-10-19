@@ -4379,10 +4379,40 @@ pub fn route_for(start: &Path) -> Result<ProjectRoute> {
     Ok(route)
 }
 
+/// Whether `message_id` has been acknowledged: its acknowledgement file is live, or
+/// compaction moved it into the archive with the message. Every check that decides
+/// "has this been handled" goes through here, never through the file alone - a compacted
+/// message must not be claimed again.
 pub fn is_acknowledged(route: &ProjectRoute, message_id: &str) -> bool {
-    acknowledgement_path(route, message_id).is_file()
-        // A compacted message's acknowledgement went into the archive with it.
-        || compaction::find(route, message_id).is_some_and(|archived| archived.acknowledged())
+    acknowledgement_path(route, message_id).is_file() || compaction::acknowledged(route, message_id)
+}
+
+/// The text of a stored message, from the live folder or, once compacted, the archive.
+fn stored_message_bytes(route: &ProjectRoute, message_id: &str) -> Result<Vec<u8>> {
+    let path = route
+        .communications
+        .join("messages")
+        .join(&route.project_id)
+        .join(format!("{message_id}.json"));
+    match fs::read(&path) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            match compaction::find(route, message_id) {
+                Some(archived) => Ok(archived.raw.into_bytes()),
+                None => Err(error).with_context(|| format!("read message {message_id}")),
+            }
+        }
+        Err(error) => Err(error).with_context(|| format!("read message {message_id}")),
+    }
+}
+
+/// The acknowledgement compaction archived with a message, parsed.
+fn archived_acknowledgement<T: serde::de::DeserializeOwned>(
+    route: &ProjectRoute,
+    message_id: &str,
+) -> Option<T> {
+    let raw = compaction::find(route, message_id)?.ack_raw?;
+    serde_json::from_str(&raw).ok()
 }
 
 fn outbox_path(route: &ProjectRoute, message_id: &str) -> PathBuf {
@@ -6419,6 +6449,10 @@ impl<G: GitRunner> MessageTransport for PrivateGitTransport<G> {
         let result = (|| {
             let _lock = acquire_git_live_lock(route)?;
             if !acknowledgement_path(route, &acknowledgement.message_id).is_file() {
+                if is_acknowledged(route, &acknowledgement.message_id) {
+                    // Compacted: it was delivered before it was archived.
+                    return Ok(());
+                }
                 bail!("acknowledgement must be durable before Git delivery")
             }
             self.commit_and_push_locked(
@@ -6608,7 +6642,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
 
         let outbox = outbox_path(route, &message.id);
         persist_message(&outbox, message)?;
-        if acknowledgement_path(route, &message.id).is_file() {
+        if is_acknowledged(route, &message.id) {
             fs::remove_file(&outbox)?;
             return self.receipt(
                 route,
@@ -6870,7 +6904,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
             .attachment
             .join("runtime/acknowledgement-deliveries")
             .join(format!("{}.json", canonical.message_id));
-        if acknowledgement_path(route, &canonical.message_id).is_file()
+        if is_acknowledged(route, &canonical.message_id)
             && !queued_path.is_file()
             && delivery_path.is_file()
         {
@@ -7026,7 +7060,7 @@ impl<L: MessageTransport, S: MessageTransport, G: MessageTransport> DeliveryEngi
                         continue;
                     }
                 };
-                if acknowledgement_path(route, &message.id).is_file() {
+                if is_acknowledged(route, &message.id) {
                     fs::remove_file(path)?;
                     continue;
                 }
@@ -7254,7 +7288,7 @@ pub fn claim_message(route: &ProjectRoute, message: &Message) -> Result<bool> {
     if message.project_id != route.project_id || !route.permits(&message.recipient, None) {
         bail!("message is not permitted by this project route")
     }
-    if acknowledgement_path(route, &message.id).is_file() {
+    if is_acknowledged(route, &message.id) {
         return Ok(false);
     }
     let claim = route
@@ -7442,15 +7476,8 @@ pub fn record_acknowledgement(
     if acknowledgement.project_id != route.project_id {
         bail!("acknowledgement project does not match route")
     }
-    let stored_message_path = route
-        .communications
-        .join("messages")
-        .join(&route.project_id)
-        .join(format!("{}.json", acknowledgement.message_id));
-    let message: Message = serde_json::from_slice(
-        &fs::read(&stored_message_path)
-            .with_context(|| format!("read message {}", acknowledgement.message_id))?,
-    )?;
+    let message: Message =
+        serde_json::from_slice(&stored_message_bytes(route, &acknowledgement.message_id)?)?;
     if acknowledgement.idempotency_key != message.idempotency_key
         || (acknowledgement.recipient != message.recipient
             && !route.agents.iter().any(|agent| {
@@ -7461,8 +7488,12 @@ pub fn record_acknowledgement(
         bail!("acknowledgement does not match the stored message")
     }
     let path = acknowledgement_path(route, &acknowledgement.message_id);
-    if path.exists() {
-        let existing: Acknowledgement = serde_json::from_slice(&fs::read(&path)?)?;
+    let existing: Option<Acknowledgement> = if path.exists() {
+        Some(serde_json::from_slice(&fs::read(&path)?)?)
+    } else {
+        archived_acknowledgement(route, &acknowledgement.message_id)
+    };
+    if let Some(existing) = existing {
         if existing.message_id == acknowledgement.message_id
             && existing.project_id == acknowledgement.project_id
             && existing.recipient == acknowledgement.recipient
@@ -7491,14 +7522,7 @@ pub fn inbound_message_format(route: &ProjectRoute, message_id: &str) -> Result<
     if Uuid::parse_str(message_id).is_err() {
         bail!("message ID is invalid")
     }
-    let path = route
-        .communications
-        .join("messages")
-        .join(&route.project_id)
-        .join(format!("{message_id}.json"));
-    let value: Value = serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("read message {message_id}"))?,
-    )?;
+    let value: Value = serde_json::from_slice(&stored_message_bytes(route, message_id)?)?;
     Ok(value
         .get("format")
         .and_then(Value::as_str)
@@ -7659,7 +7683,7 @@ pub fn claim_message_v2(route: &ProjectRoute, message: &MessageV2) -> Result<boo
         bail!("message is not permitted by this project route")
     }
     verify_v2_message(route, message)?;
-    if acknowledgement_path(route, &message.id).is_file() {
+    if is_acknowledged(route, &message.id) {
         return Ok(false);
     }
     let claim = route
@@ -7725,16 +7749,9 @@ pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2)
     }
     verify_v2_acknowledgement(route, acknowledgement)?;
 
-    let stored_message_path = route
-        .communications
-        .join("messages")
-        .join(&route.project_id)
-        .join(format!("{}.json", acknowledgement.message_id));
-    let stored_message: MessageV2 = serde_json::from_slice(
-        &fs::read(&stored_message_path)
-            .with_context(|| format!("read message {}", acknowledgement.message_id))?,
-    )
-    .with_context(|| format!("parse v2 message {}", acknowledgement.message_id))?;
+    let stored_message: MessageV2 =
+        serde_json::from_slice(&stored_message_bytes(route, &acknowledgement.message_id)?)
+            .with_context(|| format!("parse v2 message {}", acknowledgement.message_id))?;
     validate_v2_message(&stored_message)?;
     if stored_message.project_id != route.project_id {
         bail!("stored message belongs to another project")
@@ -7754,8 +7771,12 @@ pub fn acknowledge_v2(route: &ProjectRoute, acknowledgement: &AcknowledgementV2)
     // Serialize idempotency + replay check-and-record for the acknowledgement.
     let _replay_lock = acquire_replay_lock(route)?;
     let path = acknowledgement_path(route, &acknowledgement.message_id);
-    if path.exists() {
-        let existing: AcknowledgementV2 = serde_json::from_slice(&fs::read(&path)?)?;
+    let existing: Option<AcknowledgementV2> = if path.exists() {
+        Some(serde_json::from_slice(&fs::read(&path)?)?)
+    } else {
+        archived_acknowledgement(route, &acknowledgement.message_id)
+    };
+    if let Some(existing) = existing {
         if existing.message_id == acknowledgement.message_id
             && existing.project_id == acknowledgement.project_id
             && existing.recipient == acknowledgement.recipient
@@ -7798,10 +7819,13 @@ fn canonical_acknowledgement(
     acknowledgement: &Acknowledgement,
 ) -> Result<Acknowledgement> {
     let path = acknowledgement_path(route, &acknowledgement.message_id);
-    if !path.is_file() {
+    let existing: Acknowledgement = if path.is_file() {
+        serde_json::from_slice(&fs::read(&path)?)?
+    } else if let Some(archived) = archived_acknowledgement(route, &acknowledgement.message_id) {
+        archived
+    } else {
         return Ok(acknowledgement.clone());
-    }
-    let existing: Acknowledgement = serde_json::from_slice(&fs::read(&path)?)?;
+    };
     existing.validate()?;
     if existing.message_id != acknowledgement.message_id
         || existing.project_id != acknowledgement.project_id

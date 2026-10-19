@@ -13,9 +13,17 @@
 //!   has run out, re-reads the archive, and finds each entry there and intact. A file
 //!   that changed since it was archived is left alone.
 //! - **One writer.** Only the channel's head agent compacts, or its master when it has
-//!   none. Anyone else is refused. Should two machines run as that same agent anyway, the
-//!   archive is merged as a union and written by rename, and a second pass over what the
-//!   first did finds nothing to do - so the worst case is repeated work, not a lost line.
+//!   none. Anyone else is refused. Passes on one machine take a lock and run one at a
+//!   time. Two machines running as that same agent do not share a lock, and each writes
+//!   an archive file by rename, so the later rename can drop a line the earlier pass had
+//!   added. That cannot lose a message: an original is removed only by a pass that finds
+//!   its line in the archive, intact, at that moment, and the next pass archives the
+//!   dropped line again.
+//! - **A grace floor.** Originals wait at least [`MIN_GRACE`] after their record is
+//!   written, unless the caller goes through [`compact_unchecked`].
+//! - **Parts.** An archive file never grows past [`MAX_PART_BYTES`]; further lines go to
+//!   `<thread>.part2.jsonl`, `.part3.jsonl` and so on, so each stays a file the iroh lane
+//!   will carry. iroh never deletes, so this version compacts Syncthing channels only.
 //! - **Readers still find them.** [`find`], [`archived_v1`], [`archived_v2`] and the
 //!   fallbacks in `read_message`, `is_acknowledged` and `find_message_by_idempotency_key`
 //!   read the archive when the live folder no longer has the file.
@@ -26,13 +34,16 @@
 //! separate "read" marker in a channel, so acknowledged is the one signal used.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -45,6 +56,13 @@ use crate::{
 pub const DEFAULT_ARCHIVE_AFTER_DAYS: u32 = 30;
 
 const FORMAT: &str = "ferryman-compaction/v1";
+
+/// The longest an archive file grows. The iroh lane carries files up to 64 MiB; half of
+/// that leaves room, and keeps a rewrite of the last part cheap.
+pub const MAX_PART_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The shortest wait between a signed record and the removal of the originals it covers.
+pub const MIN_GRACE: Duration = Duration::hours(1);
 
 /// One archived message, with its acknowledgement, as stored on a line of a monthly file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,10 +212,52 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn archive_file(route: &ProjectRoute, month: &str, thread: &str) -> PathBuf {
-    archive_dir(route)
-        .join(month)
-        .join(format!("{thread}.jsonl"))
+/// Where part `number` (1 is the first) of a month's thread is kept.
+fn part_path(route: &ProjectRoute, month: &str, thread: &str, number: u32) -> PathBuf {
+    let name = if number <= 1 {
+        format!("{thread}.jsonl")
+    } else {
+        format!("{thread}.part{number}.jsonl")
+    };
+    archive_dir(route).join(month).join(name)
+}
+
+/// The part number a file name has for `thread`, or `None` if it is not one of its parts.
+fn part_number(thread: &str, file_name: &str) -> Option<u32> {
+    let rest = file_name.strip_prefix(thread)?.strip_suffix(".jsonl")?;
+    if rest.is_empty() {
+        return Some(1);
+    }
+    rest.strip_prefix(".part")?.parse().ok().filter(|n| *n >= 2)
+}
+
+/// Every part of a month's thread that exists, in order.
+fn parts_of(route: &ProjectRoute, month: &str, thread: &str) -> Vec<(u32, PathBuf)> {
+    let Ok(inside) = fs::read_dir(archive_dir(route).join(month)) else {
+        return Vec::new();
+    };
+    let mut parts: Vec<(u32, PathBuf)> = inside
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            Some((part_number(thread, &name)?, entry.path()))
+        })
+        .collect();
+    parts.sort();
+    parts
+}
+
+fn line_of(entry: &Archived) -> Result<String> {
+    Ok(serde_json::to_string(entry)? + "\n")
+}
+
+/// Every intact entry in a month's thread, whichever part holds it; a part that does not
+/// verify contributes nothing.
+fn read_parts(route: &ProjectRoute, month: &str, thread: &str) -> Vec<Archived> {
+    parts_of(route, month, thread)
+        .into_iter()
+        .flat_map(|(_, path)| read_archive_file(&path).unwrap_or_default())
+        .collect()
 }
 
 /// Every line of one archive file, or `None` when any line does not parse and verify -
@@ -263,12 +323,168 @@ pub fn archived_messages(route: &ProjectRoute) -> Vec<Archived> {
 /// One archived message by id.
 #[must_use]
 pub fn find(route: &ProjectRoute, message_id: &str) -> Option<Archived> {
-    if !archive_dir(route).is_dir() || uuid::Uuid::parse_str(message_id).is_err() {
+    if uuid::Uuid::parse_str(message_id).is_err() {
         return None;
     }
-    archived_messages(route)
+    let (path, _) = index(route).get(message_id)?.clone();
+    let text = fs::read_to_string(path).ok()?;
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Archived>(line).ok())
+        .find(|entry| entry.id == message_id && entry.intact())
+}
+
+/// Whether the archive holds this message with its acknowledgement. Answered from an
+/// index of ids, not by reading the archive.
+#[must_use]
+pub fn acknowledged(route: &ProjectRoute, message_id: &str) -> bool {
+    index(route)
+        .get(message_id)
+        .is_some_and(|(_, acknowledged)| *acknowledged)
+}
+
+type Stamp = (PathBuf, u64, Option<SystemTime>);
+type Ids = HashMap<String, (PathBuf, bool)>;
+
+struct RouteIndex {
+    checked: Instant,
+    stamps: Vec<Stamp>,
+    ids: Arc<Ids>,
+}
+
+/// One archive file's ids, valid while its size and modification time are as stamped.
+struct FileIds {
+    size: u64,
+    modified: Option<SystemTime>,
+    ids: Arc<Vec<(String, bool)>>,
+}
+
+fn routes() -> &'static Mutex<HashMap<PathBuf, RouteIndex>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, RouteIndex>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+fn files() -> &'static Mutex<HashMap<PathBuf, FileIds>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, FileIds>>> = OnceLock::new();
+    CACHE.get_or_init(Mutex::default)
+}
+
+/// Forget what was learned about this channel's archive; a pass that wrote to it calls it.
+fn forget(route: &ProjectRoute) {
+    if let Ok(mut cache) = routes().lock() {
+        cache.remove(&archive_dir(route));
+    }
+}
+
+/// A file modified this recently could change again without its stamp changing, on a
+/// filesystem with coarse timestamps; it is read again each time instead of trusted.
+const RACY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a checked index is reused without looking at the files again.
+const REUSE: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn is_racy(modified: Option<SystemTime>) -> bool {
+    modified.is_none_or(|at| {
+        SystemTime::now()
+            .duration_since(at)
+            .map_or(true, |age| age < RACY)
+    })
+}
+
+fn ids_of(path: &Path) -> Vec<(String, bool)> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<Archived>(line).ok())
+        .filter(Archived::intact)
+        .map(|entry| (entry.id.clone(), entry.acknowledged()))
+        .collect()
+}
+
+/// Message id -> the archive file holding it, and whether its acknowledgement is there.
+/// Built from the files' sizes and modification times, so a lookup does not read them.
+fn index(route: &ProjectRoute) -> Arc<Ids> {
+    let dir = archive_dir(route);
+    if !dir.is_dir() {
+        return Arc::default();
+    }
+    if let Ok(cache) = routes().lock()
+        && let Some(hit) = cache.get(&dir)
+        && hit.checked.elapsed() < REUSE
+    {
+        return hit.ids.clone();
+    }
+    let stamps: Vec<Stamp> = archive_files(route)
         .into_iter()
-        .find(|entry| entry.id == message_id)
+        .filter_map(|path| {
+            let meta = fs::metadata(&path).ok()?;
+            Some((path, meta.len(), meta.modified().ok()))
+        })
+        .collect();
+    let racy = stamps.iter().any(|(_, _, modified)| is_racy(*modified));
+    if !racy
+        && let Ok(mut cache) = routes().lock()
+        && let Some(hit) = cache.get_mut(&dir)
+        && hit.stamps == stamps
+    {
+        hit.checked = Instant::now();
+        return hit.ids.clone();
+    }
+    let mut ids = Ids::new();
+    for (path, size, modified) in &stamps {
+        let cached = files().lock().ok().and_then(|cache| {
+            cache
+                .get(path)
+                .filter(|have| have.size == *size && have.modified == *modified)
+                .map(|have| have.ids.clone())
+        });
+        let found = match cached {
+            Some(found) => found,
+            None => {
+                let found = Arc::new(ids_of(path));
+                if !is_racy(*modified)
+                    && let Ok(mut cache) = files().lock()
+                {
+                    cache.insert(
+                        path.clone(),
+                        FileIds {
+                            size: *size,
+                            modified: *modified,
+                            ids: found.clone(),
+                        },
+                    );
+                }
+                found
+            }
+        };
+        for (id, acknowledged) in found.iter() {
+            let slot = ids
+                .entry(id.clone())
+                .or_insert_with(|| (path.clone(), *acknowledged));
+            slot.1 |= *acknowledged;
+        }
+    }
+    let ids = Arc::new(ids);
+    if let Ok(mut cache) = routes().lock() {
+        cache.insert(
+            dir,
+            RouteIndex {
+                // A racy file is looked at again on the next call.
+                checked: if racy {
+                    Instant::now()
+                        .checked_sub(REUSE * 2)
+                        .unwrap_or_else(Instant::now)
+                } else {
+                    Instant::now()
+                },
+                stamps,
+                ids: ids.clone(),
+            },
+        );
+    }
+    ids
 }
 
 /// The archived v1 messages, parsed and checked the way a live one is.
@@ -415,17 +631,62 @@ fn valid_records(route: &ProjectRoute) -> Vec<Record> {
     records
 }
 
+/// The lock that keeps two passes on this machine from running at once.
+fn lock(route: &ProjectRoute) -> Result<fs::File> {
+    let path = route.attachment.join("runtime/locks/compaction.lock");
+    fs::create_dir_all(path.parent().context("lock path has no parent")?)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)?;
+    file.lock_exclusive()
+        .with_context(|| format!("compaction lock is held: {}", path.display()))?;
+    Ok(file)
+}
+
 /// Run one compaction pass as `identity`, which must be the channel's compactor.
 ///
 /// Archives what has aged out, signs a record of it, and removes originals whose record is
 /// at least `grace` old and whose archive lines verify. With `dry_run` nothing is written
-/// or removed and the report says what would be.
+/// or removed and the report says what would be. A `grace` under [`MIN_GRACE`] is refused;
+/// [`compact_unchecked`] is the way past that.
 pub fn compact(
     route: &ProjectRoute,
     identity: &AgentIdentity,
     now: DateTime<Utc>,
     grace: Duration,
     dry_run: bool,
+) -> Result<Report> {
+    if grace < MIN_GRACE {
+        bail!(
+            "a grace under {} hour(s) is refused: originals would be removed before anyone \
+             could notice a bad archive; pass --force-no-grace to do it anyway",
+            MIN_GRACE.num_hours()
+        );
+    }
+    compact_unchecked(route, identity, now, grace, dry_run)
+}
+
+/// [`compact`] with no floor on the grace.
+pub fn compact_unchecked(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    now: DateTime<Utc>,
+    grace: Duration,
+    dry_run: bool,
+) -> Result<Report> {
+    compact_with(route, identity, now, grace, dry_run, MAX_PART_BYTES)
+}
+
+fn compact_with(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    now: DateTime<Utc>,
+    grace: Duration,
+    dry_run: bool,
+    part_limit: u64,
 ) -> Result<Report> {
     route.validate()?;
     match compactor(route)? {
@@ -440,6 +701,7 @@ pub fn compact(
             route.project_id
         ),
     }
+    let _lock = if dry_run { None } else { Some(lock(route)?) };
     let cutoff = now - Duration::days(i64::from(archive_after_days(route)));
     let mut report = Report {
         cutoff: Some(cutoff),
@@ -461,28 +723,44 @@ pub fn compact(
     }
     let mut newly: Vec<RecordEntry> = Vec::new();
     for ((month, thread), group) in groups {
-        let path = archive_file(route, &month, &thread);
-        let mut existing = if path.is_file() {
-            if let Some(entries) = read_archive_file(&path) {
-                entries
-            } else {
-                for entry in group {
-                    report.kept.push((
-                        entry.id,
-                        format!(
-                            "{} has a line that does not verify, so it was left alone",
-                            path.display()
-                        ),
-                    ));
+        // Every part must verify before any is touched; an archive that is not whole is
+        // never rewritten.
+        let mut parts: Vec<(u32, PathBuf, Vec<Archived>, u64)> = Vec::new();
+        let mut broken = None;
+        for (number, path) in parts_of(route, &month, &thread) {
+            match read_archive_file(&path) {
+                Some(entries) => {
+                    let size = entries
+                        .iter()
+                        .map(|e| line_of(e).map_or(0, |l| l.len() as u64))
+                        .sum();
+                    parts.push((number, path, entries, size));
                 }
-                continue;
+                None => {
+                    broken = Some(path);
+                    break;
+                }
             }
-        } else {
-            Vec::new()
-        };
-        let mut added = false;
+        }
+        if let Some(path) = broken {
+            for entry in group {
+                report.kept.push((
+                    entry.id,
+                    format!(
+                        "{} has a line that does not verify, so it was left alone",
+                        path.display()
+                    ),
+                ));
+            }
+            continue;
+        }
+        let mut touched: BTreeSet<usize> = BTreeSet::new();
         for entry in group {
-            match existing.iter().find(|have| have.id == entry.id) {
+            let have = parts
+                .iter()
+                .flat_map(|(_, _, entries, _)| entries)
+                .find(|have| have.id == entry.id);
+            match have {
                 Some(have)
                     if have.sha256 == entry.sha256 && have.ack_sha256 == entry.ack_sha256 => {}
                 Some(_) => {
@@ -493,9 +771,26 @@ pub fn compact(
                     continue;
                 }
                 None => {
-                    added = true;
                     report.archived.push(entry.id.clone());
-                    existing.push(entry.clone());
+                    if !dry_run {
+                        let length = line_of(&entry)?.len() as u64;
+                        let fits = parts.last().is_some_and(|(_, _, _, size)| {
+                            *size == 0 || *size + length <= part_limit
+                        });
+                        if !fits {
+                            let number = parts.last().map_or(1, |(number, ..)| number + 1);
+                            parts.push((
+                                number,
+                                part_path(route, &month, &thread, number),
+                                Vec::new(),
+                                0,
+                            ));
+                        }
+                        let last = parts.len() - 1;
+                        parts[last].2.push(entry.clone());
+                        parts[last].3 += length;
+                        touched.insert(last);
+                    }
                 }
             }
             if !covered.contains(&(entry.id.clone(), entry.sha256.clone())) {
@@ -508,14 +803,15 @@ pub fn compact(
                 });
             }
         }
-        if added && !dry_run {
-            existing.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        for index in touched {
+            let (_, path, entries, _) = &mut parts[index];
+            entries.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
             let mut text = String::new();
-            for entry in &existing {
-                text.push_str(&serde_json::to_string(entry)?);
-                text.push('\n');
+            for entry in entries.iter() {
+                text.push_str(&line_of(entry)?);
             }
-            atomic_write(&path, text.as_bytes())?;
+            atomic_write(path, text.as_bytes())?;
+            forget(route);
         }
     }
 
@@ -562,7 +858,7 @@ fn sweep(
         .communications
         .join("acknowledgements")
         .join(&route.project_id);
-    let mut files: BTreeMap<PathBuf, Vec<Archived>> = BTreeMap::new();
+    let mut files: BTreeMap<(String, String), Vec<Archived>> = BTreeMap::new();
     for record in valid_records(route) {
         if record.created_at + grace > now {
             continue;
@@ -572,10 +868,9 @@ fn sweep(
             if !message_path.is_file() {
                 continue;
             }
-            let path = archive_file(route, &entry.month, &entry.thread);
             let archive = files
-                .entry(path.clone())
-                .or_insert_with(|| read_archive_file(&path).unwrap_or_default());
+                .entry((entry.month.clone(), entry.thread.clone()))
+                .or_insert_with(|| read_parts(route, &entry.month, &entry.thread));
             let held = archive.iter().any(|have| {
                 have.id == entry.id
                     && have.sha256 == entry.sha256
@@ -735,7 +1030,8 @@ mod tests {
         )
         .unwrap();
 
-        let report = compact(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
+        let report =
+            compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
         assert_eq!(report.archived, vec![old.id.clone()]);
         assert_eq!(report.removed, vec![old.id.clone()]);
 
@@ -779,7 +1075,8 @@ mod tests {
         let old = message(&rig, &rig.grouchly, "beastly", 45, true, now);
 
         // First pass, with a day's grace: archived and recorded, nothing removed.
-        let first = compact(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
+        let first =
+            compact_unchecked(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
         assert_eq!(first.archived, vec![old.id.clone()]);
         assert!(first.removed.is_empty());
         assert!(live(&rig, &old.id), "the original stays through the grace");
@@ -797,7 +1094,7 @@ mod tests {
         );
 
         // A second pass inside the grace writes no second record and removes nothing.
-        let second = compact(
+        let second = compact_unchecked(
             &rig.route,
             &rig.josh,
             now + Duration::hours(2),
@@ -809,7 +1106,7 @@ mod tests {
         assert!(live(&rig, &old.id));
 
         // After the grace the original goes, and only because the archive still holds it.
-        let third = compact(
+        let third = compact_unchecked(
             &rig.route,
             &rig.josh,
             now + Duration::days(2),
@@ -820,7 +1117,7 @@ mod tests {
         assert_eq!(third.removed, vec![old.id.clone()]);
         assert!(!live(&rig, &old.id));
         // And a fourth finds nothing to do.
-        let fourth = compact(
+        let fourth = compact_unchecked(
             &rig.route,
             &rig.josh,
             now + Duration::days(3),
@@ -836,14 +1133,15 @@ mod tests {
         let rig = rig();
         let now = Utc::now();
         let old = message(&rig, &rig.grouchly, "beastly", 45, true, now);
-        let first = compact(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
+        let first =
+            compact_unchecked(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
         assert!(first.record.is_some());
 
         // The archive line is damaged.
         let file = archive_files(&rig.route).pop().unwrap();
         let good = fs::read_to_string(&file).unwrap();
         fs::write(&file, good.replace("hello 45", "hello 46")).unwrap();
-        let after = compact(
+        let after = compact_unchecked(
             &rig.route,
             &rig.josh,
             now + Duration::days(2),
@@ -865,7 +1163,7 @@ mod tests {
             .join(format!("{}.json", old.id));
         let text = fs::read_to_string(&path).unwrap();
         fs::write(&path, text.replace("hello 45", "hello 99")).unwrap();
-        let changed = compact(
+        let changed = compact_unchecked(
             &rig.route,
             &rig.josh,
             now + Duration::days(2),
@@ -887,7 +1185,8 @@ mod tests {
         let rig = rig();
         let now = Utc::now();
         let old = message(&rig, &rig.grouchly, "beastly", 45, true, now);
-        let first = compact(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
+        let first =
+            compact_unchecked(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
         let path = first.record.unwrap();
         let mut record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         record.compactor = "beastly".into();
@@ -914,7 +1213,8 @@ mod tests {
         message(&rig, &rig.grouchly, "beastly", 45, true, now);
 
         // A worker is refused, and nothing moved.
-        let refused = compact(&rig.route, &rig.grouchly, now, Duration::zero(), false).unwrap_err();
+        let refused =
+            compact_unchecked(&rig.route, &rig.grouchly, now, Duration::zero(), false).unwrap_err();
         assert!(
             refused.to_string().contains("only josh compacts"),
             "{refused}"
@@ -931,8 +1231,9 @@ mod tests {
         .unwrap();
         crate::head::claim(&rig.route.communications, "proj", &rig.grouchly, None).unwrap();
         assert_eq!(compactor(&rig.route).unwrap().as_deref(), Some("grouchly"));
-        assert!(compact(&rig.route, &rig.josh, now, Duration::zero(), false).is_err());
-        let done = compact(&rig.route, &rig.grouchly, now, Duration::zero(), false).unwrap();
+        assert!(compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).is_err());
+        let done =
+            compact_unchecked(&rig.route, &rig.grouchly, now, Duration::zero(), false).unwrap();
         assert_eq!(done.archived.len(), 1);
     }
 
@@ -942,9 +1243,9 @@ mod tests {
         let now = Utc::now();
         let a = message(&rig, &rig.grouchly, "beastly", 45, true, now);
         let b = message(&rig, &rig.beastly, "grouchly", 44, true, now);
-        compact(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
+        compact_unchecked(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
         let c = message(&rig, &rig.grouchly, "beastly", 46, true, now);
-        compact(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
+        compact_unchecked(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
         for id in [&a.id, &b.id, &c.id] {
             assert!(find(&rig.route, id).is_some(), "{id}");
         }
@@ -962,7 +1263,7 @@ mod tests {
         message(&rig, &rig.beastly, "grouchly", 101, true, now);
         message(&rig, &rig.grouchly, "josh", 100, true, now);
         message(&rig, &rig.grouchly, "beastly", 160, true, now);
-        compact(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
+        compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
         let names: Vec<String> = archive_files(&rig.route)
             .iter()
             .map(|p| {
@@ -990,7 +1291,7 @@ mod tests {
         let rig = rig();
         let now = Utc::now();
         let old = message(&rig, &rig.grouchly, "beastly", 45, true, now);
-        let report = compact(&rig.route, &rig.josh, now, Duration::zero(), true).unwrap();
+        let report = compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), true).unwrap();
         assert_eq!(report.archived, vec![old.id.clone()]);
         assert!(!archive_dir(&rig.route).exists());
         assert!(live(&rig, &old.id));
@@ -1003,7 +1304,7 @@ mod tests {
         let now = Utc::now();
         let old = message(&rig, &rig.grouchly, "beastly", 10, true, now);
         assert!(
-            compact(&rig.route, &rig.josh, now, Duration::zero(), true)
+            compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), true)
                 .unwrap()
                 .archived
                 .is_empty()
@@ -1013,7 +1314,134 @@ mod tests {
         crate::policy::set_policy(&rig.route.communications, "proj", Some(policy), &rig.josh)
             .unwrap();
         assert_eq!(archive_after_days(&rig.route), 7);
-        let report = compact(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
+        let report =
+            compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
         assert_eq!(report.archived, vec![old.id]);
+    }
+
+    #[test]
+    fn an_archive_file_stops_at_its_limit_and_every_message_is_still_found() {
+        let rig = rig();
+        let now = Utc::now();
+        let ids: Vec<String> = (0..6)
+            .map(|_| message(&rig, &rig.grouchly, "beastly", 45, true, now).id)
+            .collect();
+        let limit = 2500;
+        let report =
+            compact_with(&rig.route, &rig.josh, now, Duration::zero(), false, limit).unwrap();
+        assert_eq!(report.archived.len(), 6);
+        assert_eq!(report.removed.len(), 6);
+
+        let files = archive_files(&rig.route);
+        assert!(files.len() >= 2, "{files:?}");
+        for file in &files {
+            assert!(fs::metadata(file).unwrap().len() <= limit, "{file:?}");
+        }
+        assert!(
+            files
+                .iter()
+                .any(|f| f.to_string_lossy().contains(".part2.jsonl")),
+            "{files:?}"
+        );
+        for id in &ids {
+            assert!(find(&rig.route, id).is_some_and(|e| e.acknowledged()));
+            assert!(crate::is_acknowledged(&rig.route, id));
+            assert_eq!(&crate::read_message(&rig.route, id).unwrap().id, id);
+        }
+
+        // A later pass adds to the last part and loses nothing from the others.
+        let later = message(&rig, &rig.grouchly, "beastly", 44, true, now);
+        compact_with(&rig.route, &rig.josh, now, Duration::zero(), false, limit).unwrap();
+        for id in ids.iter().chain([&later.id]) {
+            assert!(find(&rig.route, id).is_some(), "{id}");
+        }
+        assert_eq!(archived_messages(&rig.route).len(), 7);
+    }
+
+    #[test]
+    fn a_grace_under_an_hour_is_refused_unless_forced() {
+        let rig = rig();
+        let now = Utc::now();
+        let old = message(&rig, &rig.grouchly, "beastly", 45, true, now);
+        let refused = compact(&rig.route, &rig.josh, now, Duration::minutes(5), false).unwrap_err();
+        assert!(
+            refused.to_string().contains("--force-no-grace"),
+            "{refused}"
+        );
+        assert!(live(&rig, &old.id));
+        assert!(archive_files(&rig.route).is_empty());
+
+        let done = compact(&rig.route, &rig.josh, now, MIN_GRACE, false).unwrap();
+        assert_eq!(done.archived, vec![old.id.clone()]);
+        assert!(done.removed.is_empty(), "the hour has not passed");
+        assert!(live(&rig, &old.id));
+    }
+
+    #[test]
+    fn the_index_follows_the_archive_as_it_changes() {
+        let rig = rig();
+        let now = Utc::now();
+        let first = message(&rig, &rig.grouchly, "beastly", 45, true, now);
+        let second = message(&rig, &rig.grouchly, "beastly", 46, true, now);
+        assert!(!acknowledged(&rig.route, &first.id));
+        compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
+        assert!(acknowledged(&rig.route, &first.id));
+        assert!(acknowledged(&rig.route, &second.id));
+        // An id the archive never held, or one that is not an id at all.
+        assert!(!acknowledged(&rig.route, &uuid::Uuid::new_v4().to_string()));
+        assert!(!acknowledged(&rig.route, "../x"));
+
+        // A pass that adds to an existing archive is seen at once.
+        let third = message(&rig, &rig.grouchly, "beastly", 47, true, now);
+        assert!(!acknowledged(&rig.route, &third.id));
+        compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
+        assert!(acknowledged(&rig.route, &third.id));
+    }
+
+    #[test]
+    fn the_compaction_lock_is_exclusive() {
+        let rig = rig();
+        let held = lock(&rig.route).unwrap();
+        let path = rig.route.attachment.join("runtime/locks/compaction.lock");
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        assert!(other.try_lock_exclusive().is_err());
+        drop(held);
+        assert!(other.try_lock_exclusive().is_ok());
+    }
+
+    #[test]
+    fn a_compacted_message_is_never_claimed_or_acknowledged_again() {
+        let rig = rig();
+        let now = Utc::now();
+        let old = message(&rig, &rig.grouchly, "beastly", 45, true, now);
+        compact_unchecked(&rig.route, &rig.josh, now, Duration::zero(), false).unwrap();
+        assert!(!live(&rig, &old.id) && !live_ack(&rig, &old.id));
+
+        assert!(!crate::claim_message(&rig.route, &old).unwrap());
+
+        // The same acknowledgement again: already recorded, and no file comes back.
+        let again = Acknowledgement {
+            message_id: old.id.clone(),
+            project_id: "proj".into(),
+            recipient: old.recipient.clone(),
+            processed_at: now,
+            idempotency_key: old.idempotency_key.clone(),
+        };
+        assert!(!record_acknowledgement(&rig.route, &again).unwrap());
+        assert!(!live_ack(&rig, &old.id));
+
+        // A different one for it is still a conflict, not a quiet success.
+        let mut other = again.clone();
+        other.idempotency_key = "someone-elses-key".into();
+        assert!(record_acknowledgement(&rig.route, &other).is_err());
+
+        assert_eq!(
+            crate::inbound_message_format(&rig.route, &old.id).unwrap(),
+            crate::MESSAGE_FORMAT
+        );
     }
 }

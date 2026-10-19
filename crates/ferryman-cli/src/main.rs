@@ -1649,6 +1649,9 @@ enum Channel {
     /// `archive/`, with the original signed text. A signed record is written first, and
     /// originals are removed on a later pass, after the grace, once the archive is seen to
     /// hold them. `ferry channel log` and `ferry channel inbox --all` still show them.
+    ///
+    /// Syncthing channels only, for now: the iroh lane never deletes, so its peers would
+    /// send back what was compacted. A channel the lane carries is refused.
     Compact {
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -1658,6 +1661,9 @@ enum Channel {
         /// Hours a signed record must age before the originals it covers are removed.
         #[arg(long, default_value_t = 24)]
         grace_hours: u32,
+        /// Allow a grace under one hour (the default floor), so originals can go at once.
+        #[arg(long)]
+        force_no_grace: bool,
         /// Who is compacting. Defaults to this machine's name.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
@@ -11826,12 +11832,27 @@ fn channel(command: Channel) -> Result<()> {
             workspace,
             dry_run,
             grace_hours,
+            force_no_grace,
             agent,
         } => {
             let route = here(workspace)?;
+            if lane::carried_by_iroh(&route).is_some()
+                || !ferryman_channel::transports::honoured_records(&route).is_empty()
+            {
+                bail!(
+                    "this channel is carried by the iroh lane, and compaction is Syncthing-only \
+                     for now: iroh never deletes, so its peers would send back every message \
+                     compaction removed and no space would be freed"
+                )
+            }
             let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             let identity = signing_identity(&route, &agent)?;
-            let report = ferryman_channel::compaction::compact(
+            let pass = if force_no_grace {
+                ferryman_channel::compaction::compact_unchecked
+            } else {
+                ferryman_channel::compaction::compact
+            };
+            let report = pass(
                 &route,
                 &identity,
                 chrono::Utc::now(),
