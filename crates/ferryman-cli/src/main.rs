@@ -8504,7 +8504,7 @@ fn loadmem(
                      or use --agent with a name this machine holds a key for."
                 )
             })?;
-        record_agent_profile(bank_dir, name, &note, &identity)?;
+        record_agent_profile(bank_dir, &route.project_id, name, &note, &identity)?;
         println!(
             "recorded into {}",
             ferryman_channel::memory::agent_profile_path(bank_dir, name).display()
@@ -9846,6 +9846,7 @@ fn print_memory_file(heading: &str, path: &std::path::Path) -> Result<()> {
 /// and its `agents/` directory on first use, then refresh the derived roster.
 fn record_agent_profile(
     bank: &std::path::Path,
+    project_id: &str,
     agent: &str,
     note: &str,
     identity: &ferryman_channel::AgentIdentity,
@@ -9861,7 +9862,7 @@ fn record_agent_profile(
     } else {
         format!("- {} {note}", chrono::Utc::now().format("%Y-%m-%d"))
     };
-    ferryman_channel::memory::append_agent_profile(bank, agent, &line, identity)
+    ferryman_channel::memory::append_agent_profile_for(bank, project_id, agent, &line, identity)
         .with_context(|| format!("append to {}", path.display()))?;
     let _ = ferryman_channel::memory::regenerate_roster(bank);
     Ok(())

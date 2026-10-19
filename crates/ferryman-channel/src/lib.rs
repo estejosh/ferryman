@@ -2413,10 +2413,9 @@ impl AgentIdentity {
     /// channel. Unsigned, it was the one input the worker acted on without checking who
     /// wrote it - see [`crate::memory::ProfileAttestation`] for the whole argument.
     pub fn sign_profile_attestation(&self, attestation: &mut crate::memory::ProfileAttestation) {
-        let signature = self.signing.sign(
-            crate::memory::attestation_payload_for(&attestation.agent, &attestation.sha256)
-                .as_bytes(),
-        );
+        let signature = self
+            .signing
+            .sign(crate::memory::payload_of(attestation).as_bytes());
         attestation.signed_by = Some(self.name.clone());
         attestation.signature = Some(hex::encode(signature.to_bytes()));
     }
