@@ -111,3 +111,10 @@ Some projects must not be worked by the fleet: a secrets repository, someone els
 - A machine can also exclude a project for itself (`ferry root swarm exclude pc-secrets`), written to `[swarm] exclude` in `<root>/ferry.toml`. Nobody else can reach it.
 
 Either way: `repos sync` does not clone it, an all-projects worker does not serve it (and a running one stops at its next pass), and `team approve --all` does not enrol anyone in it. `ferry root swarm show` lists both.
+
+## Where Josh's machines keep things
+Added 2026-10-21. One root per machine, nothing outside it.
+- beastly: root `X:\ferry`. Code in `repos\<project>`, channels in `comms\<project>-ferryman`, scratch in `tmp`, retired old checkouts in `_retired`, Hone's data folders in `hone-data`.
+- grouchly: root `/mnt/nvme-storage/repos/ferry` with the same `repos`, `comms`, `tmp` and `_retired` folders. Some channels there still sit in `/mnt/nvme-storage/repos/ferryman-comms` until the services that use them move.
+- Secrets stay in `X:\ferryman\.env` (copy at `X:\ferry\secrets\.env`) until Custodly replaces them. Never print or commit them.
+- The `ferry root show` command lists every project with its repo and channel path.
