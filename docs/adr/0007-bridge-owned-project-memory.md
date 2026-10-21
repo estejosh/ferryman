@@ -1,0 +1,3 @@
+# ADR 0007: Bridge-owned append-only project memory
+
+Agent or orchestrator state can be incomplete or corrupted, so a project's durable operational memory is owned by the bridge. The Bridge remains control-plane infrastructure, not a substitute actor: it provides the recovery record for an actor to load. It is kept outside the project workspace in a bridge-managed Markdown mirror and in append-only SQLite entries. The API supports additions and reads, not mutations or deletions. This preserves recovery context while avoiding a claim that agents are trustworthy sources of truth; provenance is recorded per entry.
