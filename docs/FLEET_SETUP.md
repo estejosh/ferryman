@@ -74,6 +74,25 @@ ferry agent run --all-projects   # start the worker again; the iroh lane re-read
 ```
 
 A project with a running worker, a worker lock or a live worktree is refused, and the line names what blocks it. Custom projects and your own checkouts are listed as left in place. Nothing is deleted: superseded copies go to `<root>/_to_delete/`. Where Ferryman's Syncthing has a project's folder, its path is changed and the folder id kept, so no other machine re-pairs; migrate the fleet together, or pause the folder on the machines that have not moved yet. Run it on grouchly the same way (root `/mnt/nvme-storage/repos/ferry`). Then `ferry access show` lists each agent's level and `ferry access set <project> <agent> worker|member|orchestrator` (the master's command) changes one.
+## The fleet folder (0.6.1)
+
+The fleet has one folder of its own, `<root>/fleet/`, a synced channel (Syncthing folder id `fleet-ferryman`, carried by the iroh lane too) that holds what is true of the whole fleet: where each machine keeps each project, what each machine runs, notices, fleet orders and release approvals (ADR 0026, docs/LAYOUT.md). Setting it up is the master's, once:
+
+```sh
+ferry fleet init                       # on the master's machine; makes <root>/fleet, registers it, admits this machine
+ferry fleet admit <name> --machine <m> # for each other machine, once it has started a worker
+ferry fleet machines                   # who is publishing: version, layout, projects, last seen
+ferry fleet notices                    # layout changes, deprecations, new releases
+ferry fleet notice update-available "0.6.2 is out" --version 0.6.2 --severity warning
+ferry fleet order restart-worker --machine grouchly   # a worker acts only on the master's signature
+```
+
+A worker on another machine puts itself on the fleet roster when it starts and says so if the master has not admitted it yet (`fleet folder: not publishing yet - ...`). Until it is admitted it can read the folder and write nothing. Once it is, it publishes its machine record and its directory entries each pass; `ferry enable`, `ferry root adopt`, `ferry root data` and `ferry root migrate --apply` publish at once. After a migrate the directory is updated first, then a signed `layout-change` notice lists every old and new path.
+
+`ferry where <project>` answers where a project is, on this machine or another, and nothing in a script needs to hardcode a path. `ferry fleet write-hints` puts a "ask `ferry where`" block into each clone's CLAUDE.md and AGENTS.md; it shows what it would do unless you pass `--apply`, and it never commits.
+
+The folder is additive. A machine on an older release never reads it and loses nothing. Release requests are written there when it exists and also, while older machines are about, to the `ferryman` project's channel, and both places are read. A worker does not update itself because a notice says a release is out: it says so, and follows the update policy it has (`FERRYMAN_NO_AUTO_UPDATE`). A fleet `update` order from the master does update it, unless that variable is set; a `migrate` order is reported and left to a person, because a migrate refuses to run while a worker does.
+
 ## One worker per machine
 
 Two workers on one machine claim the same orders, burn the same engines and race each other's worktrees. `ferry fleet setup --service` leaves exactly one:

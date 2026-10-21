@@ -675,12 +675,58 @@ pub fn examine(start: &Path) -> Report {
         },
     ));
 
+    // The fleet's own folder (ADR 0026), when this root has one. Advice only.
+    if let Some(root) = ferryman_channel::ferry::find_root()
+        && ferryman_channel::fleethome::exists(&root)
+    {
+        let (ok, line) = fleet_home_line(&root);
+        checks.push(check("fleet_home", ok, false, line));
+    }
+
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {
         project: route.project_id,
         ready,
         checks,
     }
+}
+
+/// What the `fleet_home` check says: whether this machine is in the directory, what the fleet
+/// folder holds that does not count, and notices and a release waiting to be read.
+fn fleet_home_line(root: &ferryman_channel::ferry::Root) -> (bool, String) {
+    use ferryman_channel::fleethome as home;
+    let me = crate::identity::machine_name().unwrap_or_default();
+    let (machines, _) = home::read_machines(root);
+    let published = machines
+        .iter()
+        .any(|row| row.body.machine.eq_ignore_ascii_case(&me));
+    let ignored = home::audit(root, &me).rejected.len();
+    let unread = home::unread_high(root).len();
+    let (notices, _) = home::read_notices(root);
+    let newer = home::newer_release(&notices, env!("CARGO_PKG_VERSION"));
+    let mut parts = vec![format!(
+        "{} machine(s) publish to the fleet folder",
+        machines.len()
+    )];
+    if !published {
+        parts.push(format!(
+            "{me} has not published yet (the master admits it: ferry fleet admit {me})"
+        ));
+    }
+    if ignored > 0 {
+        parts.push(format!(
+            "{ignored} file(s) ignored as unsigned, forged or not admitted"
+        ));
+    }
+    if unread > 0 {
+        parts.push(format!(
+            "{unread} unread high-severity notice(s): ferry fleet notices"
+        ));
+    }
+    if let Some(version) = newer {
+        parts.push(format!("release {version} is announced"));
+    }
+    (published && ignored == 0 && unread == 0, parts.join("; "))
 }
 
 /// What the `layout_peers` check says: on the v2 layout, which peers have not migrated.

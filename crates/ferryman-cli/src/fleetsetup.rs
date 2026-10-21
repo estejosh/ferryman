@@ -256,9 +256,19 @@ pub enum FleetCommand {
         #[arg(long)]
         no_fetch: bool,
     },
+    /// The fleet's own folder, and what is in it (ADR 0026).
+    #[command(flatten)]
+    Home(super::fleethome::HomeCommand),
 }
 
 pub fn fleet_command(command: FleetCommand) -> Result<()> {
+    match command {
+        FleetCommand::Home(home) => super::fleethome::run(home),
+        setup @ FleetCommand::Setup { .. } => fleet_setup(setup),
+    }
+}
+
+fn fleet_setup(command: FleetCommand) -> Result<()> {
     let FleetCommand::Setup {
         identity,
         home,
@@ -270,7 +280,10 @@ pub fn fleet_command(command: FleetCommand) -> Result<()> {
         service,
         no_syncthing,
         no_fetch,
-    } = command;
+    } = command
+    else {
+        bail!("not a setup command")
+    };
     let root = match ferryman_channel::ferry::find_root() {
         Some(root) => root,
         None => match root {
@@ -339,6 +352,7 @@ pub fn layout_command(fix: bool, json: bool) -> Result<bool> {
         for line in layout::unshare_strays(&root) {
             did.push(line);
         }
+        did.extend(layout::fix_fleet_stignore(&root));
         report = layout::inspect_live(&root, &machine::scan());
     }
     if json {

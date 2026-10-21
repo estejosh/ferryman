@@ -458,6 +458,7 @@ pub fn make_project_folders(root: &Root) -> Vec<String> {
             entry.handins_path(root),
             entry.work_path(root),
             root.project_tmp(&entry.project_id),
+            entry.data_path(root),
         ] {
             if !path.is_dir() && fs::create_dir_all(&path).is_ok() {
                 made.push(format!("made {}", path.display()));
@@ -672,8 +673,122 @@ pub fn inspect_with(root: &Root, scan: &Scan, folders: Option<&[Folder]>) -> Rep
     {
         checks.push(project_folders(root));
     }
+    checks.push(data_check(root));
+    if ferryman_channel::fleethome::exists(root) {
+        checks.push(fleet_check(root));
+    }
     checks.push(keys_and_levels(root, folders.is_some()));
     Report { checks, stale }
+}
+/// Each project's data folder is machine-local: it must not sit inside (or hold) a folder
+/// that is synced, wherever a person put it. A folder that is simply not made yet is not a
+/// problem; `--fix` makes it.
+fn data_check(root: &Root) -> Check {
+    let mut problems = Vec::new();
+    let mut made = 0_usize;
+    let mut total = 0_usize;
+    for entry in live(root) {
+        let data = entry.data_path(root);
+        total += 1;
+        if data.is_dir() {
+            made += 1;
+        }
+        for (what, synced) in [
+            ("channel", entry.channel.clone()),
+            ("hand-ins", entry.handins_path(root)),
+            ("fleet folder", root.fleet_dir()),
+        ] {
+            if ferryman_channel::access::path_within(&data, &synced)
+                || ferryman_channel::access::path_within(&synced, &data)
+            {
+                problems.push(format!(
+                    "{}: data {} is inside or around its {what} {}",
+                    entry.project_id,
+                    data.display(),
+                    synced.display()
+                ));
+            }
+        }
+    }
+    Check {
+        name: "data",
+        ok: problems.is_empty(),
+        detail: if problems.is_empty() {
+            format!("{total} project(s) keep their data apart from anything synced ({made} folder(s) made)")
+        } else {
+            problems.join("; ")
+        },
+        fix: Some(
+            "ferry root data <project> <path> (a place outside every synced folder); ferry doctor --layout --fix makes the folders"
+                .into(),
+        ),
+    }
+}
+
+/// `--fix` for the fleet folder: write the `.stignore` this machine is missing (it is never
+/// synced). Returns what was done.
+pub fn fix_fleet_stignore(root: &Root) -> Vec<String> {
+    let dir = root.fleet_dir();
+    if !ferryman_channel::fleethome::exists(root) {
+        return Vec::new();
+    }
+    match ferryman_channel::fleethome::ensure_stignore(&dir) {
+        Ok(true) => vec![format!("wrote {}", dir.join(".stignore").display())],
+        Ok(false) => Vec::new(),
+        Err(error) => vec![format!("fleet .stignore not written: {error:#}")],
+    }
+}
+
+/// The fleet folder (ADR 0026): what is in it that does not count, and whether this machine
+/// is in the directory.
+fn fleet_check(root: &Root) -> Check {
+    use ferryman_channel::fleethome as home;
+    let me = crate::identity::machine_name().unwrap_or_default();
+    let findings = home::audit(root, &me);
+    let (machines, _) = home::read_machines(root);
+    let known = machines
+        .iter()
+        .any(|row| row.body.machine.eq_ignore_ascii_case(&me));
+    let missing = home::stignore_missing(&root.fleet_dir());
+    let stignore_ok = missing.is_empty();
+    let ok = findings.rejected.is_empty() && stignore_ok;
+    let listed: Vec<String> = findings
+        .rejected
+        .iter()
+        .take(6)
+        .map(|item| format!("{} ({})", item.path, item.why))
+        .collect();
+    Check {
+        name: "fleet",
+        ok,
+        detail: if !stignore_ok && findings.rejected.is_empty() {
+            format!(
+                "the fleet folder's .stignore is missing or lacks: {} (it is never synced, so this machine must write it)",
+                missing.join(", ")
+            )
+        } else if ok {
+            format!(
+                "{} machine(s) in the fleet folder{}",
+                machines.len(),
+                if known {
+                    String::new()
+                } else {
+                    format!("; this machine ({me}) has not published yet")
+                }
+            )
+        } else {
+            format!(
+                "{} file(s) in the fleet folder are ignored (unsigned, forged or from someone the master has not admitted): {}{}",
+                findings.rejected.len(),
+                listed.join("; "),
+                if findings.rejected.len() > listed.len() { "; ..." } else { "" }
+            )
+        },
+        fix: Some(
+            "ferry doctor --layout --fix writes a missing .stignore; for ignored files look at who wrote them, the master admits a machine with `ferry fleet admit <name> --machine <machine>`"
+                .into(),
+        ),
+    }
 }
 #[cfg(test)]
 mod tests;

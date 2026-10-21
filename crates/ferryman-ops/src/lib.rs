@@ -24,6 +24,7 @@ pub mod enable;
 pub mod engines;
 pub mod eval;
 pub mod fleet;
+pub mod fleethome;
 pub mod governor;
 pub mod identity;
 pub mod improve;

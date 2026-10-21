@@ -126,10 +126,41 @@ fn release_dir(route: &ProjectRoute) -> PathBuf {
     route.communications.join("release")
 }
 
+/// Where a root with a fleet folder keeps release records (ADR 0026): `fleet/releases/`. Nonewhen
+/// there is no fleet folder, which is every root until the master runs `ferry fleet init`.
+fn fleet_release_dir(route: &ProjectRoute) -> Option<PathBuf> {
+    crate::fleethome::releases_dir_near(&route.communications)
+}
+
+/// Where a record is written first: the fleet folder when there is one, else the project
+/// channel's own `release/`.
+fn primary_dir(route: &ProjectRoute) -> PathBuf {
+    fleet_release_dir(route).unwrap_or_else(|| release_dir(route))
+}
+
+/// Both places, the fleet folder first. A record found in either counts; the first one found
+/// by file name wins, so the fleet copy shadows an old one.
+fn release_dirs(route: &ProjectRoute) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = fleet_release_dir(route).into_iter().collect();
+    dirs.push(release_dir(route));
+    dirs
+}
+
+/// Keep the old place current too, so a machine still on an older release sees the request
+/// and the approval where it has always looked. The old copies are never deleted.
+fn mirror_to_old<T: Serialize>(route: &ProjectRoute, primary: &std::path::Path, value: &T) {
+    if let Some(name) = primary.file_name() {
+        let old = release_dir(route).join(name);
+        if old != primary {
+            let _ = crate::atomic_json(&old, value);
+        }
+    }
+}
+
 /// Where one machine's release request lives.
 #[must_use]
 pub fn request_path(route: &ProjectRoute, preparer: &str) -> PathBuf {
-    release_dir(route).join(format!(
+    primary_dir(route).join(format!(
         "request.{}.json",
         crate::canonical_agent_name(preparer)
     ))
@@ -138,7 +169,7 @@ pub fn request_path(route: &ProjectRoute, preparer: &str) -> PathBuf {
 /// Where one person's approval lives.
 #[must_use]
 pub fn approval_path(route: &ProjectRoute, approver: &str) -> PathBuf {
-    release_dir(route).join(format!(
+    primary_dir(route).join(format!(
         "approval.{}.json",
         crate::canonical_agent_name(approver)
     ))
@@ -160,7 +191,7 @@ fn request_payload(request: &ReleaseRequest) -> String {
 /// Where one person's denial lives. One writer per path, like everything else.
 #[must_use]
 pub fn denial_path(route: &ProjectRoute, denier: &str) -> PathBuf {
-    release_dir(route).join(format!(
+    primary_dir(route).join(format!(
         "denial.{}.json",
         crate::canonical_agent_name(denier)
     ))
@@ -203,6 +234,7 @@ pub fn write_request(
 
     let path = request_path(route, &request.prepared_by);
     crate::atomic_json(&path, &request).with_context(|| format!("write {}", path.display()))?;
+    mirror_to_old(route, &path, &request);
     Ok(path)
 }
 
@@ -219,6 +251,7 @@ pub fn write_approval(
 
     let path = approval_path(route, &approval.approved_by);
     crate::atomic_json(&path, &approval).with_context(|| format!("write {}", path.display()))?;
+    mirror_to_old(route, &path, &approval);
     Ok(path)
 }
 
@@ -236,6 +269,7 @@ pub fn write_denial(
 
     let path = denial_path(route, &denial.denied_by);
     crate::atomic_json(&path, &denial).with_context(|| format!("write {}", path.display()))?;
+    mirror_to_old(route, &path, &denial);
     Ok(path)
 }
 
@@ -269,12 +303,23 @@ pub fn verify_approval(approval: &ReleaseApproval, roster: &[AgentRoute]) -> Sig
     )
 }
 
-fn read_dir_of<T: for<'a> Deserialize<'a>>(route: &ProjectRoute, prefix: &str) -> Vec<T> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(release_dir(route)) else {
-        return out;
-    };
-    for entry in entries.flatten() {
+/// Read every `<prefix>*.json` record in the release folders. When the same file name is in
+/// both the fleet folder and the old place, the newer record wins (`stamp`, then the file's
+/// mtime; a tie keeps the fleet copy). A 0.5.30 peer writes only the old place, so a stale
+/// fleet copy must not mask what it wrote.
+fn read_dir_of<T: for<'a> Deserialize<'a>>(
+    route: &ProjectRoute,
+    prefix: &str,
+    stamp: impl Fn(&T) -> DateTime<Utc>,
+) -> Vec<T> {
+    let mut out: Vec<(String, T, (DateTime<Utc>, std::time::SystemTime))> = Vec::new();
+    let entries: Vec<_> = release_dirs(route)
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten()
+        .flatten()
+        .collect();
+    for entry in entries {
         let path = entry.path();
         if path.extension().is_none_or(|e| e != "json") {
             continue;
@@ -286,25 +331,44 @@ fn read_dir_of<T: for<'a> Deserialize<'a>>(route: &ProjectRoute, prefix: &str) -
         if !is_ours {
             continue;
         }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
         if let Ok(text) = std::fs::read_to_string(&path)
             && let Ok(value) = serde_json::from_str::<T>(&text)
         {
-            out.push(value);
+            let mtime = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let rank = (stamp(&value), mtime);
+            match out.iter_mut().find(|(have, _, _)| *have == name) {
+                Some(slot) => {
+                    if rank > slot.2 {
+                        slot.1 = value;
+                        slot.2 = rank;
+                    }
+                }
+                None => out.push((name, value, rank)),
+            }
         }
     }
-    out
+    out.into_iter().map(|(_, value, _)| value).collect()
 }
 
 /// Every release request in the channel, newest first.
 pub fn list_requests(route: &ProjectRoute) -> Vec<ReleaseRequest> {
-    let mut out: Vec<ReleaseRequest> = read_dir_of(route, "request.");
+    let mut out: Vec<ReleaseRequest> =
+        read_dir_of(route, "request.", |r: &ReleaseRequest| r.prepared_at);
     out.sort_by_key(|request| std::cmp::Reverse(request.prepared_at));
     out
 }
 
 /// Every approval in the channel, newest first.
 pub fn list_approvals(route: &ProjectRoute) -> Vec<ReleaseApproval> {
-    let mut out: Vec<ReleaseApproval> = read_dir_of(route, "approval.");
+    let mut out: Vec<ReleaseApproval> =
+        read_dir_of(route, "approval.", |r: &ReleaseApproval| r.approved_at);
     out.sort_by_key(|approval| std::cmp::Reverse(approval.approved_at));
     out
 }
@@ -312,7 +376,8 @@ pub fn list_approvals(route: &ProjectRoute) -> Vec<ReleaseApproval> {
 /// Every denial in the channel, newest first.
 #[must_use]
 pub fn list_denials(route: &ProjectRoute) -> Vec<ReleaseDenial> {
-    let mut out: Vec<ReleaseDenial> = read_dir_of(route, "denial.");
+    let mut out: Vec<ReleaseDenial> =
+        read_dir_of(route, "denial.", |r: &ReleaseDenial| r.denied_at);
     out.sort_by_key(|denial| std::cmp::Reverse(denial.denied_at));
     out
 }
@@ -955,5 +1020,99 @@ mod tests {
 
         assert_eq!(list_requests(&route).len(), 1);
         assert_eq!(list_approvals(&route).len(), 1);
+    }
+
+    #[test]
+    fn releases_go_to_the_fleet_folder_and_are_still_read_from_the_old_place() {
+        crate::ferry::isolate_root_search_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 2).unwrap();
+        let channel = root.comms_home("ferryman");
+        std::fs::create_dir_all(&channel).unwrap();
+        let mut route = route(dir.path());
+        route.communications = channel.clone();
+        let (josh, _) = signer("josh");
+        let old = channel.join("release");
+
+        // What a release before the fleet folder left behind.
+        crate::atomic_json(&old.join("request.beastly.json"), &request("0.6.0", "aaa")).unwrap();
+        crate::atomic_json(&old.join("approval.josh.json"), &approval("0.6.0", "aaa")).unwrap();
+        assert_eq!(list_requests(&route).len(), 1);
+        assert_eq!(list_approvals(&route).len(), 1);
+        // No fleet folder yet: a new record goes where it always went.
+        let path = write_request(&route, &request("0.6.1", "bbb"), &josh).unwrap();
+        assert_eq!(path, old.join("request.beastly.json"));
+
+        // With a fleet folder, records go there, and the old place is kept current as well.
+        std::fs::create_dir_all(root.fleet_dir().join("releases")).unwrap();
+        let path = write_request(&route, &request("0.6.2", "ccc"), &josh).unwrap();
+        assert_eq!(
+            path,
+            root.fleet_dir()
+                .join("releases")
+                .join("request.beastly.json")
+        );
+        assert_eq!(list_requests(&route).len(), 1, "one request, not two");
+        assert_eq!(
+            list_requests(&route)[0].version,
+            "0.6.2",
+            "the fleet copy is the one that counts"
+        );
+        let mirrored: ReleaseRequest =
+            serde_json::from_slice(&std::fs::read(old.join("request.beastly.json")).unwrap())
+                .unwrap();
+        assert_eq!(mirrored.version, "0.6.2", "an older release still sees it");
+
+        // An older release writes only the old place: when that copy is the newer, it wins
+        // over a stale fleet copy of the same file, for requests, approvals and denials.
+        let stale = Utc::now() - chrono::Duration::hours(3);
+        let mut old_request = request("0.6.3", "ddd");
+        old_request.prepared_at = Utc::now();
+        let mut stale_request = request("0.6.2", "ccc");
+        stale_request.prepared_at = stale;
+        let releases = root.fleet_dir().join("releases");
+        crate::atomic_json(&releases.join("request.beastly.json"), &stale_request).unwrap();
+        crate::atomic_json(&old.join("request.beastly.json"), &old_request).unwrap();
+        assert_eq!(list_requests(&route)[0].version, "0.6.3");
+        // And the other way round the fleet copy still wins.
+        crate::atomic_json(
+            &releases.join("request.beastly.json"),
+            &request("0.6.4", "eee"),
+        )
+        .unwrap();
+        assert_eq!(list_requests(&route)[0].version, "0.6.4");
+        let mut stale_approval = approval("0.6.2", "ccc");
+        stale_approval.approved_at = stale;
+        crate::atomic_json(&releases.join("approval.josh.json"), &stale_approval).unwrap();
+        let mut new_approval = approval("0.6.3", "ddd");
+        new_approval.approved_at = Utc::now();
+        crate::atomic_json(&old.join("approval.josh.json"), &new_approval).unwrap();
+        assert_eq!(list_approvals(&route)[0].version, "0.6.3");
+        let mut stale_denial = denial("0.6.2", "ccc", "x");
+        stale_denial.denied_at = stale;
+        crate::atomic_json(&releases.join("denial.josh.json"), &stale_denial).unwrap();
+        let mut new_denial = denial("0.6.3", "ddd", "y");
+        new_denial.denied_at = Utc::now();
+        crate::atomic_json(&old.join("denial.josh.json"), &new_denial).unwrap();
+        assert_eq!(list_denials(&route)[0].version, "0.6.3");
+        std::fs::remove_file(old.join("denial.josh.json")).unwrap();
+        std::fs::remove_file(releases.join("denial.josh.json")).unwrap();
+        crate::atomic_json(&old.join("approval.josh.json"), &approval("0.6.0", "aaa")).unwrap();
+        std::fs::remove_file(releases.join("approval.josh.json")).unwrap();
+
+        // An approval only the old place has is still an approval.
+        assert_eq!(list_approvals(&route).len(), 1);
+        assert_eq!(list_approvals(&route)[0].version, "0.6.0");
+        // Nothing was deleted by any of this.
+        assert!(old.join("approval.josh.json").is_file());
+        write_approval(&route, &approval("0.6.2", "ccc"), &josh).unwrap();
+        assert_eq!(list_approvals(&route).len(), 1);
+        assert_eq!(list_approvals(&route)[0].version, "0.6.2");
+        assert!(
+            root.fleet_dir()
+                .join("releases")
+                .join("approval.josh.json")
+                .is_file()
+        );
     }
 }

@@ -74,6 +74,13 @@ fn served(
             ferryman_ops::fleet::Standing::Skips(_) => None,
         })
         .collect();
+    let mut routes: Vec<ProjectRoute> = routes;
+    // The fleet folder rides the lane too (ADR 0026), once it exists and this worker is on its
+    // roster; the worker enrols itself there when it starts.
+    if ferryman_channel::fleethome::exists(root) {
+        crate::fleethome::WorkerPass::enrol_worker(root, &identity);
+        routes.push(ferryman_channel::fleethome::route(root));
+    }
     Ok((routes, identity))
 }
 
@@ -257,6 +264,11 @@ pub(crate) fn for_worker(
 }
 
 impl WorkerLane {
+    /// The worker's identity, so it can be put on the fleet folder's roster.
+    pub(crate) fn identity(&self) -> &ferryman_channel::AgentIdentity {
+        &self.identity
+    }
+
     /// Bind the endpoint, publish this worker's record into every channel it serves, and
     /// leave the lane running in the background for as long as the worker runs. A lane
     /// that cannot start is a warning, never a reason for the worker to stop: Syncthing

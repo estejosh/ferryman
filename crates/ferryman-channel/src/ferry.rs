@@ -177,9 +177,27 @@ pub struct Entry {
     /// Where this project's task worktrees go, when not the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work: Option<PathBuf>,
+    /// Where this project keeps its own data (a database, a model, a dataset), when not the
+    /// default `projects/<id>/data`. Machine-local and never synced, whoever chose the place:
+    /// the scope guard and the iroh lane both refuse it, and `doctor --layout` reports one
+    /// that sits inside a synced folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<PathBuf>,
 }
 
 impl Entry {
+    /// Where the project's data lives: the recorded path, else `projects/<id>/data`.
+    ///
+    /// The default is the same in both layouts, so the answer is stable across `root
+    /// migrate`. The folder is not made by asking: `ferry where` names the place, and
+    /// `ferry doctor --layout --fix` makes it.
+    #[must_use]
+    pub fn data_path(&self, root: &Root) -> PathBuf {
+        self.data
+            .clone()
+            .unwrap_or_else(|| root.project_data(&self.project_id))
+    }
+
     /// Whether this project is in the layout's places or a person's own.
     ///
     /// Custom when it says so, or when its channel is neither of the two places the layout
@@ -1082,6 +1100,30 @@ impl Root {
         self.project_dir(project_id).join(".env")
     }
 
+    /// The project's data folder by default: `projects/<id>/data`. Machine-local, never
+    /// synced. The same place in layout 1 and layout 2, so it does not move when the root
+    /// does.
+    #[must_use]
+    pub fn project_data(&self, project_id: &str) -> PathBuf {
+        self.project_dir(project_id).join("data")
+    }
+
+    /// `fleet/`: the fleet's own channel (ADR 0026). Synced under the folder id
+    /// `fleet-ferryman`, like a project channel, and holding what is true of the whole fleet
+    /// rather than of one project. Not a project: it is never filed in the manifest, so no
+    /// worker serves it as one and `repos sync` never tries to clone it.
+    #[must_use]
+    pub fn fleet_dir(&self) -> PathBuf {
+        self.path.join("fleet")
+    }
+
+    /// `fleet/local/`: the fleet folder's machine-local part. Excluded from Syncthing by the
+    /// fleet channel's `.stignore` and from the iroh lane by its fleet-only `local/` rule.
+    #[must_use]
+    pub fn fleet_local(&self) -> PathBuf {
+        self.fleet_dir().join("local")
+    }
+
     /// `secrets/`: write credentials and fleet-wide keys. Never synced, and only an
     /// orchestrator-level agent may read from it.
     #[must_use]
@@ -1560,8 +1602,55 @@ impl Root {
             if places.work.is_some() {
                 entry.work = places.work.clone();
             }
+            if places.data.is_some() {
+                entry.data = places.data.clone();
+            }
         })?;
         Ok(())
+    }
+
+    /// Record where a project's data lives (`ferry root data <project> <path>`). Nothing on
+    /// disk is created or moved; `None` goes back to the default. A path that would be
+    /// synced is refused: data is machine-local, whatever else it is.
+    ///
+    /// # Errors
+    /// The project is not filed here, or `path` is inside (or holds) a folder that is
+    /// synced.
+    pub fn set_data(&self, project_id: &str, path: Option<&Path>) -> Result<bool> {
+        if let Some(path) = path {
+            if !path.is_absolute() {
+                bail!("a data path has to be absolute: {}", path.display());
+            }
+            let entry = self
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project_id)
+                .with_context(|| {
+                    format!(
+                        "no project '{project_id}' in {}",
+                        self.manifest_path().display()
+                    )
+                })?;
+            for (what, synced) in [
+                ("channel", entry.channel.clone()),
+                ("hand-ins", entry.handins_path(self)),
+                ("fleet folder", self.fleet_dir()),
+            ] {
+                if crate::access::path_within(path, &synced)
+                    || crate::access::path_within(&synced, path)
+                {
+                    bail!(
+                        "{} is inside or above the {what} ({}), which is synced. Data is machine-local and never synced",
+                        path.display(),
+                        synced.display()
+                    );
+                }
+            }
+        }
+        self.update_entry(project_id, |entry| {
+            entry.data = path.map(Path::to_path_buf);
+        })
     }
 
     /// Remove one project from the manifest. Nothing on disk is touched.
@@ -1725,6 +1814,7 @@ pub struct CustomPlaces {
     pub handins: Option<PathBuf>,
     pub env: Option<PathBuf>,
     pub work: Option<PathBuf>,
+    pub data: Option<PathBuf>,
 }
 
 /// Where a project's hand-ins are, given only its channel.
@@ -3070,6 +3160,7 @@ mod tests {
                 handins: Some(root.path.join("hand-placed").join("handins")),
                 env: Some(root.path.join("hand-placed").join("secrets.env")),
                 work: None,
+                data: None,
             },
         )
         .unwrap();

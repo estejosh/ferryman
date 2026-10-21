@@ -4503,10 +4503,88 @@ async fn fleet(
         "machines": machines,
         "devices": devices,
         "projects": projects,
+        "fleet_home": fleet_home_json(),
         "current": route.project_id,
         "home": state.route.project_id,
         "version": env!("CARGO_PKG_VERSION"),
     })))
+}
+
+/// The fleet's own folder as the Fleet page shows it (ADR 0026): live notices, the machines that
+/// publish with their version and layout, and where each machine keeps each project. Only what
+/// is signed and admitted is here; what was ignored is counted, and `ferry doctor --layout` names it.
+fn fleet_home_json() -> Value {
+    use ferryman_channel::fleethome as home;
+    let Some(root) = ferryman_channel::ferry::find_root() else {
+        return json!({ "present": false });
+    };
+    if !home::exists(&root) {
+        return json!({ "present": false });
+    }
+    let mine = env!("CARGO_PKG_VERSION");
+    let now = chrono::Utc::now();
+    let (notices, notice_findings) = home::read_notices(&root);
+    let (machines, machine_findings) = home::read_machines(&root);
+    let directory = home::read_directory(&root);
+    let notices: Vec<Value> = notices
+        .iter()
+        .filter(|row| !row.expired)
+        .take(50)
+        .map(|row| {
+            json!({
+                "id": row.body.id,
+                "kind": row.body.kind,
+                "severity": row.body.severity,
+                "title": row.body.title,
+                "text": row.body.text,
+                "issued": row.body.issued.to_rfc3339(),
+                "machine": row.body.machine,
+                "signed_by": row.signed_by,
+            })
+        })
+        .collect();
+    let machines: Vec<Value> = machines
+        .iter()
+        .map(|row| {
+            json!({
+                "machine": row.body.machine,
+                "version": row.body.version,
+                "layout": row.body.layout,
+                "os": row.body.os,
+                "projects": row.body.projects,
+                "engines": row.body.engines,
+                "last_seen": row.body.last_seen.to_rfc3339(),
+                "quiet": now - row.body.last_seen > chrono::Duration::hours(1),
+                "behind": ferryman_channel::licensing::version_is_older(&row.body.version, mine),
+            })
+        })
+        .collect();
+    let mut rows: Vec<Value> = Vec::new();
+    for (project, by_machine) in &directory.projects {
+        for (machine, found) in by_machine {
+            let paths = &found.body.paths;
+            rows.push(json!({
+                "project": project,
+                "machine": machine,
+                "code": paths.code,
+                "channel": paths.channel,
+                "handins": paths.handins,
+                "data": paths.data,
+                "env": paths.env,
+                "source": if found.overridden { "override" } else { "directory" },
+                "state": found.body.lifecycle,
+                "signed_by": found.signed_by,
+            }));
+        }
+    }
+    json!({
+        "present": true,
+        "master": home::Trust::load(&root.fleet_dir()).master(),
+        "notices": notices,
+        "machines": machines,
+        "directory": rows,
+        "ignored": notice_findings.rejected.len() + machine_findings.rejected.len() + directory.findings.rejected.len(),
+    })
 }
 
 /// Where sibling projects are looked for, when it is not simply the parent directory.

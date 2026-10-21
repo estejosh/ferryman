@@ -30,6 +30,7 @@ pub mod entitlement;
 pub mod events;
 pub mod evidence;
 pub mod ferry;
+pub mod fleethome;
 pub mod focus;
 pub mod focus_suggest;
 pub mod gate;
@@ -4150,6 +4151,16 @@ fn legacy_pin_path(attachment: &Path, name: &str) -> PathBuf {
 fn read_pin(attachment: &Path, name: &str) -> Option<String> {
     let current = pin_path(attachment, name);
     if let Ok(pinned) = std::fs::read_to_string(&current) {
+        let pinned = pinned.trim().to_string();
+        mirror_pin(attachment, name, &pinned);
+        return Some(pinned);
+    }
+    // The old place is the authority while it has the pin. The fleet folder's copy is what
+    // is left when it has not (ADR 0026): a pin lost from comms/ is not trusted afresh.
+    if let Some(mirror) = fleet_pin_dir(attachment)
+        && let Ok(pinned) =
+            std::fs::read_to_string(mirror.join(format!("{}.pub", canonical_agent_name(name))))
+    {
         return Some(pinned.trim().to_string());
     }
     let pinned = std::fs::read_to_string(legacy_pin_path(attachment, name)).ok()?;
@@ -4168,6 +4179,31 @@ fn write_pin(attachment: &Path, name: &str, key: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(&path, key);
+    mirror_pin(attachment, name, key);
+}
+
+/// Where a v1 root's pins are mirrored once it has a fleet folder: `fleet/local/agents-pinned`.
+/// Only the shared `comms/` attachment of a root has one; a project's own attachment does not.
+/// The mirror is never synced (`fleet/local` is machine-local) and never replaces the old copy.
+fn fleet_pin_dir(attachment: &Path) -> Option<PathBuf> {
+    if attachment.file_name()? != "comms" {
+        return None;
+    }
+    let local = attachment.parent()?.join("fleet").join("local");
+    local.is_dir().then(|| local.join("agents-pinned"))
+}
+
+/// Copy a pin into the fleet mirror when there is one and it has none yet. Best-effort.
+fn mirror_pin(attachment: &Path, name: &str, key: &str) {
+    let Some(dir) = fleet_pin_dir(attachment) else {
+        return;
+    };
+    let path = dir.join(format!("{}.pub", canonical_agent_name(name)));
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(&path, key);
 }
 
@@ -5124,6 +5160,10 @@ pub fn syncthing_register_folder(
         route.shared_remote.clone()
     };
     debug_assert_eq!(folder_id, channel_folder_id(route));
+    if route.project_id == fleethome::PROJECT {
+        // The machine accepting the fleet folder writes its own `.stignore` first.
+        fleethome::ensure_stignore(&route.communications)?;
+    }
     register_folder(
         &folder_id,
         &route.communications,
