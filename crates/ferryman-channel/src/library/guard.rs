@@ -308,7 +308,15 @@ fn is_random_looking(word: &str) -> bool {
     let (lower, upper, digit) = classes(word);
     let kinds = usize::from(lower) + usize::from(upper) + usize::from(digit);
     let h = entropy(word);
-    (lower && upper && digit && h >= 3.9) || (len >= 40 && kinds >= 3 && h >= 4.3)
+    // A long run with only two kinds of character (no digit, by chance) is still random if its
+    // entropy is high; prose, paths and identifiers sit well below that bar.
+    (lower && upper && digit && h >= 3.9)
+        || (len >= 40 && kinds >= 3 && h >= 4.3)
+        || (len >= 40
+            && kinds >= 2
+            && h >= 4.6
+            && !word.contains('.')
+            && word.matches('/').count() < 3)
 }
 
 /// Whether `text` looks like it holds a secret, and what kind.
@@ -476,6 +484,20 @@ mod tests {
                 let probe: String = text.chars().skip(text.len() / 2).take(12).collect();
                 assert!(!message.contains(&probe), "{name} leaked into the message");
             }
+        }
+    }
+
+    #[test]
+    fn a_long_random_run_with_no_digit_is_still_refused_but_identifiers_and_paths_are_not() {
+        let letters: Vec<char> = ('a'..='z').chain('A'..='Z').collect();
+        let run: String = (0..44).map(|i| letters[(i * 7 + 3) % 52]).collect();
+        assert!(scan(&format!("it is {run}")).is_some());
+        for text in [
+            "ThisIsAVeryLongCamelCaseIdentifierNameForAThing",
+            "Program/Files/Ferryman/Library/Store/Facts/Index",
+            "see crates/ferryman-channel/src/library/store.rs for the rules",
+        ] {
+            assert!(scan(text).is_none(), "{text}");
         }
     }
 
