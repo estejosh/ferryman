@@ -269,7 +269,7 @@ That is a precondition for any "no Syncthing fallback" claim; this ADR does not 
    Custodly's side for the QR screen and phrase confirm.
 7. The `custodly-deposit` project and receiver wiring, dual run, drills, cutover. 2 days of work
    and seven calendar days of observation.
-8. Rescue channel over Hive (proposal, see below). 8 to 10 days; a condition for removing Syncthing,
+8. Rescue channel over Hive (proposal, see below). 7 to 9 days; a condition for removing Syncthing,
    not for the dual run.
 
 About 25 to 30 working days, around six weeks elapsed with the observation week. Steps 2, 3 and
@@ -330,112 +330,111 @@ These answer the questions this ADR was proposed with.
 
 ## Rescue channel over Hive (proposal, not built)
 
-Status: proposal. Nothing in this section is in v0.6.2 and none of it is decided.
+Status: proposal. Nothing in this section is in v0.6.2 and none of it is decided beyond the
+shape below, which is the master's.
 
 **The problem.** Once Syncthing is gone, the lane depends on a relay for any pair of machines that
-cannot reach each other directly. The relay list (decision 7) and the public-relay fallback cover a
-relay going down. They do not cover everything: the list itself arrives over the lane, so a machine
-that is cut off cannot learn that the master moved the fleet to a new relay; and all the relays in
-the list can be unreachable from one network at once. The machine then has nothing to find its peers
-with. The rescue channel is a way to say "here is where I am, and here is where to find us" that
-does not use the lane, a relay, a server of ours or Syncthing.
+cannot reach each other directly. The relay list (decision 7) and the optional public-relay fallback
+cover a relay going down. They do not cover everything: the list itself arrives over the lane, so a
+machine that is cut off cannot learn that the fleet moved to a new relay, and all the relays can be
+unreachable from one network at once. The machine then has nothing to find its peers with. The
+rescue channel lets the master say "here is where I am, and which relay list to use" without using
+the lane, a relay, a server of ours or Syncthing.
 
-**The idea.** When no relay and no peer path works, a machine posts a small sealed record to the
-Hive blockchain as a `custom_json` operation under a fleet-specific id (for example
-`ferryman-rescue-v1`), from a Hive account the fleet controls. A Hive block takes about 3 seconds,
-posting costs no money (it spends the account's resource credits), and a `custom_json` payload is
-limited to about 8 KB. The record carries:
+**The shape.** There is no routine posting. One Hive account belongs to the fleet. The master
+machine (beastly) is the poster:
 
-- the machine's current iroh endpoint addresses (its endpoint id, its relay URL, and, only if the
-  fleet turns it on, direct-address candidates for hole punching);
-- the relay-list version and, when the master has moved the fleet, the new relay URL or the whole
-  list (these records are signed by the master, not by the machine);
-- a sequence number, a validity time and the machine's name.
+- If it has been cut off from every relay and every peer for 15 minutes (configurable, the same
+  idea as `alert_after_minutes`), it posts **one** encrypted, master-signed record as a
+  `custom_json` operation under a fleet-specific id (for example `ferryman-rescue-v1`). The record
+  holds its current iroh endpoint addresses (endpoint id, relay URL and, only if the fleet turns it
+  on, direct-address candidates for hole punching) and the version of the relay list.
+- It also posts when its relay changes, so a reader's next look finds the current one.
+- Every other machine, and every phone, **only reads** Hive, and only while it is itself cut off. It
+  polls every few minutes while disconnected (reads are free), takes the newest valid record, and
+  uses the addresses in it to reach the master. A master-signed relay-list change in the record is
+  applied like a change to `fleet/relays.json`.
+- **The record grants nothing.** Reaching the master through it is only a way to dial. The
+  ordinary iroh checks decide whether the machine is let in: the endpoint id must be in a
+  roster-honoured transports record, and a phone needs its signed grant. A record cannot add a
+  peer, a roster entry or a permission.
+- *Optional backup poster.* One designated non-master machine (for example grouchly) may post, but
+  only if it is cut off **and** no fresh master record exists after a longer wait (for example 60
+  minutes). That keeps the fleet able to rendezvous when beastly itself is the machine that is
+  offline. A backup record is signed by the backup machine's roster key, not the master's, and a
+  reader treats it as a pointer to that machine only.
+- *Routine posts* (a baseline every few hours so the newest addresses are never stale) are an
+  option, off by default. They add a regular footprint on the chain, which the default avoids.
 
-Peers read Hive (any public API node, several configured, none trusted for content because the
-content is signed) for operations with that id, but only when their normal paths have failed
-(see Cadence). A record that verifies is handed to iroh as an
-address-lookup source, so the next dial uses the addresses in it, and a master-signed relay change
-is applied like a change to `fleet/relays.json`. **It is rendezvous and signalling only.** No file,
-manifest, order or message ever goes over Hive, and the lane's own trust rules are unchanged: a
-peer reached through a rescue record is still let in only if its endpoint id is in a roster-honoured
-transports record.
-
-**Cadence: posting is rare, not continuous.** Hive's roughly 3 second block time is only how
-fast a posted operation is confirmed; it is not a posting rate and nothing here posts that
-often. A machine posts in three cases:
-
-1. *A baseline record every N hours*, so the latest known addresses are never stale. N is
-   configurable from 1 to 6 hours, default 6 (four operations a day per machine).
-2. *At once when its addresses or its relay change*, so the record a reader finds is the
-   current one.
-3. *At once when it finds it has lost every path*: the relay and every peer unreachable for
-   longer than the lane's alert threshold (`alert_after_minutes`, default 15).
-
-Readers do not watch the chain. A machine reads Hive only when its normal paths have failed,
-and then polls every few minutes while it stays disconnected (reads are free). From what it
-reads it takes the newest valid signed record for each machine and ignores the rest. When the
-lane is healthy nothing reads Hive at all.
-
-The benefits of this cadence: the on-chain footprint is small and so is the metadata an
-observer can collect (a regular baseline, plus a burst when something changes or breaks),
-and the resource-credit cost is negligible. It also means the baseline is the usual way a
-reader finds an address, so an outage costs a poll interval, not a block time, to recover from.
+It is **rendezvous and signalling only.** No file, manifest, order or message ever goes over Hive.
+Hive's roughly 3 second block time is only how fast a posted operation is confirmed; it is not a
+posting rate, and nothing here posts anywhere near that often. In the normal case nothing posts
+and nothing reads.
 
 **Sealing and verification.**
 
-- *Signed:* a machine's record is signed with its roster key, and a relay change with the master's
-  key. A reader checks the signature against the fleet roster before using anything in it, exactly
-  as it does for fleet files, so what is on the chain is not trusted for what it says, only for being
-  there. A record from a name not on the roster, a revoked key, or a bad signature is dropped.
+- *Signed:* the master's record is signed with the master's key and checked against the fleet
+  roster before anything in it is used, as fleet files are. What is on the chain is not trusted for
+  what it says, only for being there. A record from a name not on the roster, a revoked key or with a
+  bad signature is dropped.
 - *Sealed:* the payload is encrypted so the chain's readers learn nothing from its content.
-  Recommended: a fresh ephemeral key per record, with the content key wrapped separately to each
-  roster member (an X25519 sealed box derived from the roster's keys), at about 80 bytes per
-  recipient, which fits a fleet of tens of machines in 8 KB. Revoking a machine means not wrapping
-  to it from then on. The alternative is one fleet rescue key held by every machine, which is smaller
-  but cannot be rotated while a machine is cut off, which is the case this exists for. Josh's
-  Obscura protocol is a candidate encoding for the sealed payload; it has not been evaluated here and
-  the choice is open.
-- *Replay:* each record has a per-signer sequence number (a reader keeps the highest it has seen and
-  drops anything lower or equal), an expiry (an hour is plenty: an address that is older is stale
-  anyway) and the signer's name inside what is signed, so a record cannot be replayed under another
-  name or after it has expired. The Hive block and its timestamp are only used to order and discard;
-  they are not trusted for time.
+  Recommended: a fresh ephemeral key per record, the content key wrapped separately to each roster
+  member and each enrolled phone (an X25519 sealed box derived from their keys), about 80 bytes per
+  recipient, which fits a fleet of tens of machines in the 8 KB limit of a `custom_json` operation.
+  Revoking a machine means not wrapping to it from then on. The alternative, one fleet rescue key held
+  by every machine, is smaller but cannot be rotated while a machine is cut off, which is the case
+  this exists for. Josh's Obscura protocol is a candidate encoding for the sealed payload; it has not
+  been evaluated here and the choice is open. A phone is wrapped to only for the records that
+  carry the master's address and relay list, the same restriction as its grant in (b).
+- *Replay:* a per-signer sequence number (a reader keeps the highest it has seen and drops anything
+  lower or equal), an expiry inside what is signed (an hour; an older address is stale anyway) and
+  the signer's name inside what is signed, so a record cannot be replayed under another name or
+  after it has expired. The Hive block and its timestamp are used to order and discard, not
+  trusted for time.
+
+**Keys.** The fleet account's posting key is not copied around. The fleet account uses Hive's
+account-authority delegation: it grants **posting authority** to each poster machine's own Hive
+account (beastly, and the backup if there is one), so each poster signs with a key of its own and
+the fleet account's keys are never on a fleet machine. Revoking a poster is removing its account from
+the fleet account's posting authorities. Those keys are held through Custodly. The fleet account's
+owner and active keys never touch a fleet machine; a posting key cannot move funds, only post.
 
 **Risks.**
 
-- *Public metadata.* The content is sealed; the fact of it is not. Anyone can see that an account
-  posted under that id at those times, how often, and the size. The baseline
-  record is regular, so it shows little, but the extra records at a change and at a loss of all
-  paths tell an observer when something happened to a machine. The chain is permanent, so a
-  sealed record is stored for good: if the fleet's keys ever leak, old records become readable. That
-  is why direct IP addresses are off by default and why every record is sealed to a fresh key.
-- *Hive API node availability.* Public nodes come and go and rate-limit. Several are configured,
-  and a reader tries them in turn. If all are unreachable the rescue channel is simply unavailable,
-  as a relay would be; it is a fallback to a fallback.
-- *Account key custody.* The account's posting key lives on the machines that post (a posting key
-  cannot move funds, only post). A leaked key lets a stranger spend the account's resource credits
-  and spam the id, which costs the fleet its rescue channel until the key is rotated, and cannot
-  forge a record. Custody of the owner and active keys is Custodly's job. A per-machine account
-  instead of one shared account removes the shared key at the price of a roster entry per account.
-- *Cost.* Posting is free to the poster but not free: the account needs enough staked Hive Power
-  for the resource credits to post one small operation when a machine is in trouble. At the default cadence
-  (four baseline records a day per machine, plus the occasional change) that is far inside what a
-  small stake gives; the stake has to exist and be kept.
+- *Public metadata.* The content is sealed; the fact of it is not. Anyone can see that the account
+  posted under that id and when. With no routine posting there is no regular pattern, but each record
+  then marks a moment when the master was cut off, which an observer can read as an outage, and a
+  relay change as a change. The chain is permanent, so a sealed record is stored for good: if the keys
+  ever leak, old records become readable. That is why direct IP addresses are off by default and why
+  every record is sealed to a fresh key.
+- *Hive API node availability.* Public nodes come and go and rate-limit. Several are configured and
+  a reader tries them in turn, trusting none for content because the content is signed. If all are
+  unreachable the rescue channel is unavailable, as a relay would be; it is a fallback to a fallback.
+- *The master being the poster.* The channel helps only if the master can reach Hive while it
+  cannot reach its peers, which is the usual way a machine is cut off (the peers or the relay are
+  down, not the whole internet). If beastly is itself offline the optional backup poster is what
+  covers it, after its longer wait. With no backup, a master that is down posts nothing.
+- *Delegated authority.* A poster machine's own Hive key lives on that machine. A leak lets a
+  stranger post under the fleet account's authority until the master removes that account from the
+  posting authorities. A stranger cannot forge a record (the signature is checked), but can spend
+  the account's resource credits and flood the id, which costs the fleet its rescue channel until
+  the authority is revoked.
+- *Cost.* Posting spends the account's resource credits, not money, and needs enough staked Hive
+  Power to exist. At this cadence (a post when the master is cut off, and when the relay changes) the
+  use is negligible; the stake has to exist and be kept.
 - *A censoring or lagging node* can hide a record from one reader. Reading more than one node, and
   accepting a record from whichever has it, is the answer.
 
 **Phones.** It works for phones with no change in kind. A phone has no relay but ours, and a phone
-can read Hive over HTTPS from any API node whatever network it is on. If our relay is down, a
-phone that cannot be told is stuck, and a signed relay-change record is how it would be told. A
-phone is a recipient only of the relay-list and relay-change records, never of other machines'
-addresses (the same restriction as its grant in (b)).
+can read Hive over HTTPS from any API node whatever network it is on. If our relay is down, a phone
+that cannot be told is stuck, and a master-signed relay-change record is how it would be told. The
+phone's entry in the ordinary iroh checks, its signed grant, still decides whether it is let in.
 
-**Effort and place in the order.** About 8 to 10 working days for one engineer: the record format,
-sealing and replay rules with tests (3), a Hive client that streams the id from several nodes and
-posts the operation (2), the iroh address-lookup source and the trigger that decides "no path
-works" (2 to 3, after a spike to confirm the extension point at iroh 1.3), the doctor and status
-lines (1), and an end-to-end test against a Hive test network or a recorded node (1 to 2). It is
-step 8 in the order above. It does not gate the cutover's dual run, but it is a condition for
-removing Syncthing, since that is the moment the lane becomes the only way a stranded machine
-could be reached.
+**Effort and place in the order.** About 7 to 9 working days for one engineer: the record format,
+sealing and replay rules with tests (3), a Hive client that reads the id from several nodes and posts
+the operation under delegated authority (2), the iroh address-lookup source and the triggers
+("cut off for 15 minutes", "relay changed", "cut off and no fresh master record after 60 minutes")
+after a spike to confirm the extension point at iroh 1.3 (2 to 3), doctor and status lines (1), and
+an end-to-end test against a recorded node or a Hive test network (1). It is step 8 in the order
+above. It does not gate the cutover's dual run, but it is a condition for removing Syncthing, since
+that is the moment the lane becomes the only way a stranded machine could be reached.
