@@ -32,7 +32,12 @@ use sha2::Digest as _;
 /// A verifier that accepts one certificate, by its SHA-256.
 #[derive(Debug)]
 pub struct Pinned {
-    sha256: [u8; 32],
+    /// The pin for our own relays (those in `public`'s host list, or all of them when
+    /// there is no `public`). `None`: no such default.
+    sha256: Option<[u8; 32]>,
+    /// Relays the master's list vouches for with a certificate of their own: host, pin.
+    /// Checked first.
+    host_pins: Vec<(String, [u8; 32])>,
     provider: Arc<CryptoProvider>,
     /// For a relay that is not one of ours: the ordinary public-CA check, and the hosts that
     /// ARE ours (and so need the pin). `None`: every relay needs the pin.
@@ -43,10 +48,33 @@ impl Pinned {
     #[must_use]
     pub fn new(sha256: [u8; 32], provider: Arc<CryptoProvider>) -> Self {
         Self {
-            sha256,
+            sha256: Some(sha256),
+            host_pins: Vec::new(),
             provider,
             public: None,
         }
+    }
+
+    /// No default pin: a relay needs the pin the master gave its host, or (with
+    /// [`Self::with_public_fallback`]) a public CA.
+    #[must_use]
+    pub fn without_default(provider: Arc<CryptoProvider>) -> Self {
+        Self {
+            sha256: None,
+            host_pins: Vec::new(),
+            provider,
+            public: None,
+        }
+    }
+
+    /// These hosts need exactly these certificates, whatever else is trusted.
+    #[must_use]
+    pub fn with_host_pins(mut self, pins: Vec<(String, [u8; 32])>) -> Self {
+        self.host_pins = pins
+            .into_iter()
+            .map(|(host, pin)| (host.trim_matches(['[', ']']).to_ascii_lowercase(), pin))
+            .collect();
+        self
     }
 
     /// Also accept a relay that is not at one of `pinned_hosts` when a public CA vouches for
@@ -82,18 +110,24 @@ impl ServerCertVerifier for Pinned {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        if let Some((public, ours)) = &self.public
-            && !ours.contains(&host_of(server_name))
-        {
-            return public.verify_server_cert(
-                end_entity,
-                intermediates,
-                server_name,
-                ocsp_response,
-                now,
-            );
-        }
-        if fingerprint(end_entity.as_ref()) == self.sha256 {
+        let host = host_of(server_name);
+        let pin = if let Some((_, pin)) = self.host_pins.iter().find(|(h, _)| *h == host) {
+            Some(*pin)
+        } else {
+            if let Some((public, ours)) = &self.public
+                && !ours.contains(&host)
+            {
+                return public.verify_server_cert(
+                    end_entity,
+                    intermediates,
+                    server_name,
+                    ocsp_response,
+                    now,
+                );
+            }
+            self.sha256
+        };
+        if pin.is_some_and(|pin| fingerprint(end_entity.as_ref()) == pin) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(
@@ -147,25 +181,42 @@ pub fn ca_config(
     pinned_hosts: &[String],
     public_fallback: bool,
 ) -> iroh::tls::CaTlsConfig {
-    match pin {
-        Some(sha256) => {
-            let hosts: Vec<String> = pinned_hosts
-                .iter()
-                .map(|host| host.trim_matches(['[', ']']).to_ascii_lowercase())
-                .collect();
-            iroh::tls::CaTlsConfig::custom_server_cert_verifier(Arc::new(move |provider| {
-                let mut pinned = Pinned::new(sha256, provider.clone());
-                if public_fallback {
-                    pinned = pinned.with_public_fallback(
-                        public_verifier(provider).map_err(std::io::Error::other)?,
-                        hosts.clone(),
-                    );
-                }
-                Ok(Arc::new(pinned) as Arc<_>)
-            }))
-        }
-        None => iroh::tls::CaTlsConfig::embedded(),
+    ca_config_with(pin, pinned_hosts, &[], public_fallback)
+}
+
+/// [`ca_config`], and relays the master's list gave a certificate of their own
+/// (`host_pins`: host, pin). Those hosts need exactly that certificate. With `host_pins`
+/// and no `pin`, every other relay is checked against the public CAs, as it is without
+/// any of this.
+#[must_use]
+pub fn ca_config_with(
+    pin: Option<[u8; 32]>,
+    pinned_hosts: &[String],
+    host_pins: &[(String, [u8; 32])],
+    public_fallback: bool,
+) -> iroh::tls::CaTlsConfig {
+    if pin.is_none() && host_pins.is_empty() {
+        return iroh::tls::CaTlsConfig::embedded();
     }
+    let hosts: Vec<String> = pinned_hosts
+        .iter()
+        .map(|host| host.trim_matches(['[', ']']).to_ascii_lowercase())
+        .collect();
+    let host_pins = host_pins.to_vec();
+    iroh::tls::CaTlsConfig::custom_server_cert_verifier(Arc::new(move |provider| {
+        let base = match pin {
+            Some(sha256) => Pinned::new(sha256, provider.clone()),
+            None => Pinned::without_default(provider.clone()),
+        };
+        let mut pinned = base.with_host_pins(host_pins.clone());
+        if public_fallback || pin.is_none() {
+            pinned = pinned.with_public_fallback(
+                public_verifier(provider).map_err(std::io::Error::other)?,
+                hosts.clone(),
+            );
+        }
+        Ok(Arc::new(pinned) as Arc<_>)
+    }))
 }
 
 /// The ordinary check: certificates a public CA signed, for the name asked for.
@@ -202,6 +253,39 @@ mod tests {
         assert!(
             pinned
                 .verify_server_cert(&other, &[], &name, &[], UnixTime::now())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_host_the_master_gave_its_own_pin_needs_that_one() {
+        let a = CertificateDer::from(b"certificate a".to_vec());
+        let b = CertificateDer::from(b"certificate b".to_vec());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let pinned = Pinned::new(fingerprint(a.as_ref()), provider)
+            .with_host_pins(vec![("Relay.Example".into(), fingerprint(b.as_ref()))]);
+        let theirs = ServerName::try_from("relay.example").unwrap();
+        let ours = ServerName::try_from("162.35.10.46").unwrap();
+        let ok = |cert: &CertificateDer<'_>, name: &ServerName<'_>| {
+            pinned
+                .verify_server_cert(cert, &[], name, &[], UnixTime::now())
+                .is_ok()
+        };
+        assert!(ok(&b, &theirs));
+        assert!(!ok(&a, &theirs), "its host does not take the default pin");
+        assert!(ok(&a, &ours));
+        assert!(!ok(&b, &ours), "another host does not take its pin");
+    }
+
+    #[test]
+    fn with_no_default_pin_a_host_without_one_is_refused() {
+        let a = CertificateDer::from(b"certificate a".to_vec());
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let pinned = Pinned::without_default(provider);
+        let name = ServerName::try_from("anywhere.example").unwrap();
+        assert!(
+            pinned
+                .verify_server_cert(&a, &[], &name, &[], UnixTime::now())
                 .is_err()
         );
     }

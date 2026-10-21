@@ -82,7 +82,7 @@ fallback_public_relays = true                   # off unless you say so
 alert_after_minutes = 15                        # see "Is the lane healthy?"
 ```
 
-- **Our relays** are pinned: each must present the one certificate in `relay_cert_sha256`
+- **Our relays** (those in `ferry.toml`) are pinned: each must present the one certificate in `relay_cert_sha256`
   and nothing a public CA signed stands in for it. With no pin they must present a certificate
   a public CA signed. All must be `https://`.
 - **Public relays** are checked against the public CA roots in the ordinary way and need no
@@ -108,6 +108,48 @@ alert_after_minutes = 15                        # see "Is the lane healthy?"
 
 A config that says `enabled = true` and names no relay used to mean "direct only". It now means
 "iroh's public relays". Add `direct_only = true` to keep the old behaviour.
+
+### The fleet's relay list (0.6.2)
+
+A fleet that runs its own relays does not have to put them in every machine's `ferry.toml`.
+The master signs an ordered list into the fleet folder, and every machine reads it:
+
+```
+ferry fleet relays                                      # show it
+ferry fleet relays set https://162.35.10.46/=<sha256> https://relay2.example.org/
+ferry fleet relays add https://relay3.example.org/ --note "Frankfurt"
+ferry fleet relays add https://relay0.example.org/ --first
+ferry fleet relays remove https://relay3.example.org/
+ferry fleet order restart-worker                        # have the fleet pick the change up
+```
+
+- **Order.** A machine tries the relays in its own `ferry.toml` first, then the list in the
+  master's order. The first is the primary; our VPS goes first. A relay named in both places
+  is used once, as `ferry.toml` has it.
+- **Failover.** All of them are in the map the endpoint is bound with. iroh homes on the
+  one that answers best and moves to the next when it stops answering; the worker republishes
+  the relay it is homed on in its TRANSPORTS record, so peers find it there. The alerts above
+  fire when none connects.
+- **Trust.** `fleet/relays.json` is signed like every other fleet file and only the master's
+  signature counts. A copy signed by a machine the master admitted, or edited afterwards, is
+  ignored (`ferry doctor` lists it). An entry that is not an `https://` address, has odd
+  characters, or has a pin that is not 64 hex digits is dropped, the rest kept.
+- **Certificates.** `=<sha256>` is the master's word for that relay's certificate, and applies
+  to that host alone: a second relay with its own self-signed certificate needs no change on
+  any machine. An entry without a pin must present a certificate a public CA signed (a relay
+  with a domain and a Let's Encrypt certificate, say). A pin cannot be loosened by the list:
+  the relays in `ferry.toml` still need `relay_cert_sha256`.
+- **When it takes effect.** The relays and the certificates to trust are fixed when the worker
+  binds, so a changed list applies when the worker restarts. A running worker notices the
+  change, says so once, and keeps what it has.
+- **No relay in `ferry.toml`** and a list in the fleet folder: the list is the plan, not iroh's
+  public relays. Without both, a new user is on the public relays. `direct_only` ignores the list.
+- **Public relays** stay what they were: an opt-in fallback, off for a setup that pins a relay.
+- **Tokens.** The list carries no secret. The shared token (if any) goes on every relay in the
+  list; a lane with none works. A relay that wants a per-device credential, such as a hosted
+  one, is another entry in the list; the entry is a record with room for more fields.
+
+Running a relay on a fleet machine (`ferry relay serve`) is not built; see ADR 0027.
 
 ## Is the lane healthy? Alerts
 

@@ -92,6 +92,22 @@ pub fn relay_mode(config: &IrohConfig) -> Result<RelayMode> {
     }
 }
 
+/// Host and pinned certificate of each relay in the fleet's list that has one.
+fn fleet_host_pins(config: &IrohConfig) -> Vec<(String, [u8; 32])> {
+    if config.direct_only {
+        return Vec::new();
+    }
+    config
+        .fleet_relays
+        .iter()
+        .filter_map(|entry| {
+            let pin = entry.pin?;
+            let url: RelayUrl = entry.url.parse().ok()?;
+            Some((url.host_str()?.to_owned(), pin))
+        })
+        .collect()
+}
+
 /// The host part of each relay URL, for telling our relays from public ones.
 fn relay_hosts(urls: &[String]) -> Vec<String> {
     urls.iter()
@@ -146,14 +162,17 @@ pub async fn bind_with_map(
     let builder = Endpoint::builder(presets::Minimal)
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
-        .ca_tls_config(crate::tls::ca_config(
-            // The pin is for our own relays; with none named it would wrongly bind the
-            // public ones to it.
+        .ca_tls_config(crate::tls::ca_config_with(
+            // The pin is for the relays named in ferry.toml; with none named it would
+            // wrongly bind the others to it.
             config
                 .relay_cert_sha256
                 .filter(|_| !config.relays.is_empty() && !config.direct_only),
             &relay_hosts(&config.relays),
-            fallback,
+            &fleet_host_pins(config),
+            // A relay from the fleet's list with no certificate of its own must be one a
+            // public CA signed for.
+            fallback || config.fleet_relays.iter().any(|entry| entry.pin.is_none()),
         ))
         .relay_mode(mode);
     let endpoint = builder.bind().await.context("bind the iroh endpoint")?;
@@ -1234,5 +1253,39 @@ mod relay_tests {
             );
             endpoint.close().await;
         }
+    }
+
+    #[tokio::test]
+    async fn the_lane_binds_with_the_fleets_relays_and_their_own_pins() {
+        use crate::config::FleetRelayEntry;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config("", dir.path()).with_fleet_relays(vec![
+            FleetRelayEntry {
+                url: "https://127.0.0.1:9".into(),
+                pin: Some([3; 32]),
+            },
+            FleetRelayEntry {
+                url: "https://relay.invalid".into(),
+                pin: None,
+            },
+        ]);
+        assert_eq!(
+            fleet_host_pins(&cfg),
+            vec![("127.0.0.1".to_owned(), [3u8; 32])],
+            "only the entry with a certificate of its own is pinned"
+        );
+        let RelayMode::Custom(map) = relay_mode(&cfg).unwrap() else {
+            panic!("the fleet's list is a custom relay map");
+        };
+        let urls: Vec<String> = map
+            .relays::<Vec<Arc<RelayConfig>>>()
+            .iter()
+            .map(|r| r.url.to_string())
+            .collect();
+        assert_eq!(urls.len(), 2, "{urls:?}");
+        let (endpoint, _) = bind_with_map(&cfg, iroh::SecretKey::generate())
+            .await
+            .unwrap();
+        endpoint.close().await;
     }
 }

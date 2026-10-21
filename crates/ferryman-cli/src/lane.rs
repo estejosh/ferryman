@@ -11,6 +11,26 @@ use ferryman_channel::ProjectRoute;
 use ferryman_iroh::IrohConfig;
 use ferryman_ops::Progress;
 
+/// `[iroh]` from `ferry.toml`, plus the relays the fleet's master listed in the fleet
+/// folder (signed; only the master's list counts). The machine's own relays come first.
+pub(crate) fn load_config(root: &ferryman_channel::ferry::Root) -> IrohConfig {
+    let config = IrohConfig::load(&root.path);
+    if !config.enabled {
+        return config;
+    }
+    let listed = ferryman_channel::fleethome::read_relays(root);
+    config.with_fleet_relays(
+        listed
+            .relays
+            .iter()
+            .map(|relay| ferryman_iroh::config::FleetRelayEntry {
+                url: relay.url.clone(),
+                pin: relay.pin(),
+            })
+            .collect(),
+    )
+}
+
 #[derive(clap::Subcommand, Clone)]
 pub(crate) enum LaneCommand {
     /// Channels over iroh (QUIC) through our own relay, beside Syncthing.
@@ -95,11 +115,15 @@ fn init(workspace: Option<PathBuf>) -> Result<()> {
         machine.join(ferryman_iroh::KEY_FILE).display()
     );
     let root = root()?;
-    let config = IrohConfig::load(&root.path);
+    let config = load_config(&root);
     let (routes, identity) = served(&root, workspace)?;
     // Public-relay setups publish no relay: the worker adds its home relay once connected.
-    let (written, failed) =
-        ferryman_iroh::publish_everywhere(&routes, &identity, &id, config.relay_url.as_deref());
+    let (written, failed) = ferryman_iroh::publish_everywhere(
+        &routes,
+        &identity,
+        &id,
+        config.all_relays().first().map(String::as_str),
+    );
     println!(
         "transports record for '{}': {written} written, {} already current, in {} channel(s)",
         identity.name(),
@@ -135,7 +159,7 @@ fn init(workspace: Option<PathBuf>) -> Result<()> {
 async fn status(json: bool) -> Result<()> {
     let machine = ferryman_iroh::machine_dir()?;
     let root = root()?;
-    let config = IrohConfig::load(&root.path);
+    let config = load_config(&root);
     let key = ferryman_iroh::load_key(&machine)?;
     let token_file = config.relay_token_file.clone();
     let token_present = token_file.as_ref().is_some_and(|path| path.is_file());
@@ -155,7 +179,8 @@ async fn status(json: bool) -> Result<()> {
                 "enabled": config.enabled,
                 "relay_plan": config.describe_relays(),
                 "relay_url": config.relay_url,
-                "relays": config.relays,
+                "relays": config.all_relays(),
+                "fleet_relays": config.fleet_relays.iter().map(|r| r.url.clone()).collect::<Vec<_>>(),
                 "fallback_public_relays": config.fallback_public_relays,
                 "direct_only": config.direct_only,
                 "relay_cert_pinned": config.relay_cert_sha256.is_some(),
@@ -196,6 +221,21 @@ async fn status(json: bool) -> Result<()> {
             None => "",
         }
     );
+    if !config.fleet_relays.is_empty() {
+        println!(
+            "fleet relays  {} from the master's signed list (after any in ferry.toml)",
+            config
+                .fleet_relays
+                .iter()
+                .map(|r| format!(
+                    "{}{}",
+                    r.url,
+                    if r.pin.is_some() { " (pinned)" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if let Some(path) = &token_file {
         println!(
             "relay token   {} ({})",
@@ -342,7 +382,7 @@ pub(crate) fn for_worker(
     identity: ferryman_channel::AgentIdentity,
     report: &impl Progress,
 ) -> Option<WorkerLane> {
-    let config = IrohConfig::load(&root.path);
+    let config = load_config(root);
     for note in &config.notes {
         report.warn(&format!("iroh lane: {note}"));
     }
@@ -387,7 +427,7 @@ impl WorkerLane {
             &routes,
             &self.identity,
             &id,
-            self.config.relay_url.as_deref(),
+            self.config.all_relays().first().map(String::as_str),
         );
         for line in failed {
             report.warn(&format!("iroh lane: no transports record in {line}"));
@@ -411,7 +451,7 @@ impl WorkerLane {
         let lane = ferryman_iroh::Lane::new(
             endpoint,
             routes,
-            self.config.relay_url.clone(),
+            self.config.all_relays().first().cloned(),
             Some(machine.join(ferryman_iroh::STATUS_FILE)),
         );
         // Who this machine's worker is, so a Worker-level agent here listens to a channel
@@ -424,8 +464,10 @@ impl WorkerLane {
         let live = LiveLane {
             lane: std::sync::Arc::clone(&lane),
             identity: self.identity,
-            relay_url: self.config.relay_url.clone(),
+            relay_url: self.config.all_relays().first().cloned(),
             alert_after_minutes: self.config.alert_after_minutes,
+            bound_relays: self.config.all_relays(),
+            told_of_new_list: std::sync::atomic::AtomicBool::new(false),
         };
         tokio::spawn(lane.run(ferryman_iroh::lane::ROUND_EVERY));
         Ok(live)
@@ -439,9 +481,32 @@ pub(crate) struct LiveLane {
     /// The primary relay of ours from `ferry.toml`, if any.
     relay_url: Option<String>,
     alert_after_minutes: u64,
+    /// The relays this lane was bound with, to notice the fleet's list changing under it.
+    bound_relays: Vec<String>,
+    told_of_new_list: std::sync::atomic::AtomicBool,
 }
 
 impl LiveLane {
+    /// The relays are fixed when the lane binds (the certificates it will trust are too), so
+    /// a changed fleet list takes effect when the worker restarts: say so, once.
+    fn check_relay_list(&self, report: &impl Progress) {
+        use std::sync::atomic::Ordering;
+        if self.told_of_new_list.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(root) = ferryman_channel::ferry::find_root() else {
+            return;
+        };
+        let now = load_config(&root).all_relays();
+        if now != self.bound_relays {
+            self.told_of_new_list.store(true, Ordering::Relaxed);
+            report.warn(
+                "iroh lane: the fleet's relay list changed since this worker started; it \
+                 takes effect on restart (`ferry fleet order restart-worker`)",
+            );
+        }
+    }
+
     /// The relay a peer should dial us through: the one we are connected to now, else the
     /// primary of ours, else none (direct, or a public-relay setup not yet connected).
     fn current_relay(&self) -> Option<String> {
@@ -548,6 +613,7 @@ impl LiveLane {
     /// cleared when it stops; the fleet sees it as a `lane-health` notice (warning), and this
     /// machine as a line in `ferry doctor` and the dashboard. The worker's own log says it too.
     pub(crate) fn check_health(&self, report: &impl Progress) {
+        self.check_relay_list(report);
         let relay = self.current_relay();
         if relay.is_some() {
             // An unchanged record is not rewritten, so this costs a read per channel.

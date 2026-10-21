@@ -159,6 +159,15 @@ pub enum HomeCommand {
         #[arg(long)]
         json: bool,
     },
+    /// The fleet's relay list: the relays every machine's iroh lane tries, in order, after
+    /// any named in its own ferry.toml. Only the master changes it (signed); with no
+    /// subcommand, shows it.
+    Relays {
+        #[command(subcommand)]
+        action: Option<RelaysAction>,
+        #[arg(long)]
+        json: bool,
+    },
     /// The machines in the fleet folder: version, layout, what they serve, when last seen.
     Machines {
         #[arg(long)]
@@ -175,6 +184,139 @@ pub enum HomeCommand {
         #[arg(long)]
         project: Vec<String>,
     },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum RelaysAction {
+    /// Show the list.
+    List,
+    /// Replace the list. Each entry is `https://host[:port]/`, and `=<sha256>` after it
+    /// when the relay's certificate is not one a public CA signed (a bare IP, say).
+    Set {
+        #[arg(required = true)]
+        relays: Vec<String>,
+    },
+    /// Add one (at the end, or first with --first); an entry for the same URL is replaced.
+    Add {
+        relay: String,
+        #[arg(long)]
+        first: bool,
+        /// What it is, for people.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Take one out, by its URL.
+    Remove { url: String },
+}
+
+fn parse_relay(text: &str) -> Result<home::FleetRelay> {
+    let (url, pin) = match text.split_once('=') {
+        Some((url, pin)) => (url, Some(pin.to_ascii_lowercase())),
+        None => (text, None),
+    };
+    let relay = home::FleetRelay {
+        url: url.to_owned(),
+        cert_sha256: pin,
+        note: None,
+    };
+    relay.check().map_err(|why| anyhow::anyhow!(why))?;
+    Ok(relay)
+}
+
+fn same_url(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/')
+        .eq_ignore_ascii_case(b.trim_end_matches('/'))
+}
+
+fn print_relays(list: &home::RelayList) {
+    if list.relays.is_empty() {
+        println!("relay list: none (machines use only what their own ferry.toml names)");
+    }
+    for (n, relay) in list.relays.iter().enumerate() {
+        println!(
+            "  {}. {}{}{}",
+            n + 1,
+            relay.url,
+            if relay.cert_sha256.is_some() {
+                "  (certificate pinned)"
+            } else {
+                "  (public CA)"
+            },
+            relay
+                .note
+                .as_deref()
+                .map(|note| format!("  {note}"))
+                .unwrap_or_default()
+        );
+    }
+    for rejection in &list.findings.rejected {
+        println!("  ignored: {} - {}", rejection.path, rejection.why);
+    }
+}
+
+fn relays(action: Option<RelaysAction>, json: bool) -> Result<()> {
+    let root = root()?;
+    need_fleet(&root)?;
+    let current = home::read_relays(&root);
+    let next = match action {
+        None | Some(RelaysAction::List) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "relays": current.relays,
+                        "written_at": current.written_at,
+                        "ignored": current.findings.rejected.iter()
+                            .map(|r| serde_json::json!({"path": r.path, "why": r.why}))
+                            .collect::<Vec<_>>(),
+                    }))?
+                );
+            } else {
+                print_relays(&current);
+            }
+            return Ok(());
+        }
+        Some(RelaysAction::Set { relays }) => relays
+            .iter()
+            .map(|text| parse_relay(text))
+            .collect::<Result<Vec<_>>>()?,
+        Some(RelaysAction::Add { relay, first, note }) => {
+            let mut added = parse_relay(&relay)?;
+            added.note = note;
+            let mut next: Vec<_> = current
+                .relays
+                .iter()
+                .filter(|have| !same_url(&have.url, &added.url))
+                .cloned()
+                .collect();
+            if first {
+                next.insert(0, added);
+            } else {
+                next.push(added);
+            }
+            next
+        }
+        Some(RelaysAction::Remove { url }) => {
+            let next: Vec<_> = current
+                .relays
+                .iter()
+                .filter(|have| !same_url(&have.url, &url))
+                .cloned()
+                .collect();
+            if next.len() == current.relays.len() {
+                bail!("{url} is not in the relay list");
+            }
+            next
+        }
+    };
+    let master = master_identity(&root)?;
+    home::publish_relays(&root, &master, next)?;
+    print_relays(&home::read_relays(&root));
+    println!(
+        "signed. A running worker keeps the relays it started with; \
+         `ferry fleet order restart-worker` makes the fleet pick this up."
+    );
+    Ok(())
 }
 
 fn root() -> Result<Root> {
@@ -257,6 +399,7 @@ pub fn run(command: HomeCommand) -> Result<()> {
             println!("{name} may now write the fleet folder's entries for {machine}");
             Ok(())
         }
+        HomeCommand::Relays { action, json } => relays(action, json),
         HomeCommand::Publish => {
             let root = root()?;
             need_fleet(&root)?;

@@ -77,6 +77,20 @@ pub enum RelayPlan {
     Direct,
 }
 
+/// A relay the master put in the fleet's signed relay list (see `FLEET_SETUP`/`IROH_LANE`),
+/// as the lane needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetRelayEntry {
+    pub url: String,
+    /// The certificate the master vouched for. `None`: a public CA must vouch for it.
+    pub pin: Option<[u8; 32]>,
+}
+
+fn same_relay(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/')
+        .eq_ignore_ascii_case(b.trim_end_matches('/'))
+}
+
 /// What `[iroh]` says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrohConfig {
@@ -94,6 +108,9 @@ pub struct IrohConfig {
     pub relay_quic_port: u16,
     /// Minutes before a silent peer or an unreachable relay is raised as a warning.
     pub alert_after_minutes: u64,
+    /// Relays from the fleet's master-signed list, in its order, after [`Self::relays`].
+    /// Not read from `ferry.toml`: [`Self::with_fleet_relays`] fills it.
+    pub fleet_relays: Vec<FleetRelayEntry>,
     /// What was wrong with the section, if anything.
     pub notes: Vec<String>,
 }
@@ -110,12 +127,36 @@ impl Default for IrohConfig {
             relay_token_file: None,
             relay_quic_port: DEFAULT_QUIC_PORT,
             alert_after_minutes: DEFAULT_ALERT_MINUTES,
+            fleet_relays: Vec::new(),
             notes: Vec::new(),
         }
     }
 }
 
 impl IrohConfig {
+    /// Add the fleet's relay list after the relays this machine names itself. A relay
+    /// already named in `ferry.toml` stays as `ferry.toml` has it (and its pin); the rest
+    /// follow in the master's order. With `direct_only` they are ignored.
+    #[must_use]
+    pub fn with_fleet_relays(mut self, list: Vec<FleetRelayEntry>) -> Self {
+        if self.direct_only {
+            return self;
+        }
+        self.fleet_relays = list
+            .into_iter()
+            .filter(|entry| !self.relays.iter().any(|own| same_relay(own, &entry.url)))
+            .collect();
+        self
+    }
+
+    /// Every relay of ours in order of preference: this machine's own, then the fleet's.
+    #[must_use]
+    pub fn all_relays(&self) -> Vec<String> {
+        let mut all = self.relays.clone();
+        all.extend(self.fleet_relays.iter().map(|entry| entry.url.clone()));
+        all
+    }
+
     /// Read `[iroh]` from `<root>/ferry.toml`. Never fails; problems become notes and
     /// leave the lane off.
     #[must_use]
@@ -255,11 +296,11 @@ impl IrohConfig {
     pub fn relay_plan(&self) -> RelayPlan {
         if self.direct_only {
             RelayPlan::Direct
-        } else if self.relays.is_empty() {
+        } else if self.relays.is_empty() && self.fleet_relays.is_empty() {
             RelayPlan::Public
         } else {
             RelayPlan::Custom {
-                urls: self.relays.clone(),
+                urls: self.all_relays(),
                 fallback_public: self.fallback_public_relays,
             }
         }
@@ -329,6 +370,57 @@ pub fn parse_fingerprint(text: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fleets_relays_follow_our_own_in_the_masters_order() {
+        let list = vec![
+            FleetRelayEntry {
+                url: "https://162.35.10.46/".into(),
+                pin: None,
+            },
+            FleetRelayEntry {
+                url: "https://b.example/".into(),
+                pin: Some([1; 32]),
+            },
+        ];
+        let only_fleet = IrohConfig {
+            enabled: true,
+            ..IrohConfig::default()
+        }
+        .with_fleet_relays(list.clone());
+        assert_eq!(
+            only_fleet.relay_plan(),
+            RelayPlan::Custom {
+                urls: vec!["https://162.35.10.46/".into(), "https://b.example/".into()],
+                fallback_public: false,
+            },
+            "no relay of our own named: the fleet's list is the plan, not iroh's public relays"
+        );
+        // One already in ferry.toml is not repeated, and keeps its place (first).
+        let both = IrohConfig {
+            enabled: true,
+            relays: vec!["https://162.35.10.46".into()],
+            ..IrohConfig::default()
+        }
+        .with_fleet_relays(list.clone());
+        assert_eq!(
+            both.all_relays(),
+            vec!["https://162.35.10.46", "https://b.example/"]
+        );
+        assert_eq!(both.fleet_relays.len(), 1);
+        // No relays at all means none, whatever the fleet lists.
+        let direct = IrohConfig {
+            enabled: true,
+            direct_only: true,
+            ..IrohConfig::default()
+        }
+        .with_fleet_relays(list);
+        assert_eq!(direct.relay_plan(), RelayPlan::Direct);
+        assert!(direct.fleet_relays.is_empty());
+        // An empty list changes nothing: a new user is still on the public relays.
+        let nothing = IrohConfig::default().with_fleet_relays(Vec::new());
+        assert_eq!(nothing.relay_plan(), RelayPlan::Public);
+    }
 
     const PIN: &str = "49:32:08:E4:6F:B8:E3:9B:FD:F2:8D:B8:0F:8C:33:F9:\
                        9F:2A:57:A0:A1:71:B3:52:4A:9D:11:67:AD:BD:C0:D1";
