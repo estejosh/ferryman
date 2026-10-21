@@ -5160,6 +5160,10 @@ pub fn syncthing_register_folder(
         route.shared_remote.clone()
     };
     debug_assert_eq!(folder_id, channel_folder_id(route));
+    if route.project_id == fleethome::PROJECT {
+        // The machine accepting the fleet folder writes its own `.stignore` first.
+        fleethome::ensure_stignore(&route.communications)?;
+    }
     register_folder(
         &folder_id,
         &route.communications,

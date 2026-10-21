@@ -592,6 +592,9 @@ impl WorkerPass {
     /// Add the worker's own identity to the fleet roster, so the iroh lane can publish its
     /// transports record there. It is not admitted by this: it still cannot write an entry.
     pub fn enrol_worker(root: &Root, worker: &AgentIdentity) {
+        // A folder Syncthing has handed over may have no master.json yet; it still needs its
+        // own `.stignore`.
+        let _ = home::ensure_stignore(&root.fleet_dir());
         if home::exists(root) {
             let _ = home::enrol(root, worker);
         }

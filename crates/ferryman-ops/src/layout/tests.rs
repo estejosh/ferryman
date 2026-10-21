@@ -236,3 +236,49 @@ fn not_reaching_syncthing_is_a_check_not_made_and_not_a_failure() {
     assert!(check(&report, "syncthing").ok);
     assert!(report.ok(), "{}", report.render());
 }
+
+#[test]
+fn a_missing_or_short_fleet_stignore_fails_the_fleet_check_and_fix_writes_it() {
+    use ferryman_channel::{AgentIdentity, fleethome};
+    let (_dir, root) = setup();
+    let josh = AgentIdentity::from_seed("josh", [7u8; 32]);
+    fleethome::init(&root, &josh).unwrap();
+    let ignore = root.fleet_dir().join(".stignore");
+    assert!(
+        check(
+            &inspect_with(&root, &scan_of(vec![unit(true)]), None),
+            "fleet"
+        )
+        .ok
+    );
+
+    // A machine the folder was synced to has none: .stignore is never synced.
+    fs::remove_file(&ignore).unwrap();
+    let report = inspect_with(&root, &scan_of(vec![unit(true)]), None);
+    let fleet = check(&report, "fleet");
+    assert!(!fleet.ok, "{}", fleet.detail);
+    assert!(fleet.detail.contains(".stignore"), "{}", fleet.detail);
+
+    // One that lacks the `local` rule is wrong too.
+    fs::write(&ignore, "keys\n").unwrap();
+    assert!(
+        !check(
+            &inspect_with(&root, &scan_of(vec![unit(true)]), None),
+            "fleet"
+        )
+        .ok
+    );
+
+    assert_eq!(fix_fleet_stignore(&root).len(), 1);
+    let text = fs::read_to_string(&ignore).unwrap();
+    assert!(text.lines().any(|l| l == "local"), "{text}");
+    assert!(text.lines().any(|l| l == "keys"), "{text}");
+    assert!(
+        check(
+            &inspect_with(&root, &scan_of(vec![unit(true)]), None),
+            "fleet"
+        )
+        .ok
+    );
+    assert!(fix_fleet_stignore(&root).is_empty());
+}

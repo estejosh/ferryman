@@ -103,6 +103,44 @@ pub fn exists(root: &Root) -> bool {
 const STIGNORE: &str =
     "local\nkeys\n*.tmp\n*.key\n*.seed\n*.exe\n*.dll\n*.so\n*.dylib\n*.env\n.env\n";
 
+/// The lines of the fleet `.stignore` that `dir` lacks (all of them when the file is
+/// missing). Empty means it is right. An extra line is fine; a missing rule is not, because
+/// `.stignore` is never synced and each machine must write its own.
+#[must_use]
+pub fn stignore_missing(dir: &Path) -> Vec<&'static str> {
+    let text = fs::read_to_string(dir.join(".stignore")).unwrap_or_default();
+    STIGNORE
+        .lines()
+        .filter(|want| !text.lines().any(|have| have.trim() == *want))
+        .collect()
+}
+
+/// Make this machine's fleet `.stignore` right: write it when missing, add the rules it
+/// lacks when not. Does nothing when `dir` is not a folder. True when it wrote.
+///
+/// # Errors
+/// The file cannot be written.
+pub fn ensure_stignore(dir: &Path) -> Result<bool> {
+    if !dir.is_dir() {
+        return Ok(false);
+    }
+    let missing = stignore_missing(dir);
+    if missing.is_empty() {
+        return Ok(false);
+    }
+    let path = dir.join(".stignore");
+    let mut text = fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    for line in missing {
+        text.push_str(line);
+        text.push('\n');
+    }
+    fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    Ok(true)
+}
+
 const LIBRARIAN_README: &str = "# The librarian\n\n\
 A place held for the fleet's librarian: the thing that will know what the fleet has learned, \
 across projects, and answer for it.\n\n\
@@ -509,9 +547,7 @@ pub fn init(root: &Root, master: &AgentIdentity) -> Result<Init> {
             report.made.push(format!("{sub}/"));
         }
     }
-    let ignore = dir.join(".stignore");
-    if !ignore.is_file() {
-        fs::write(&ignore, STIGNORE)?;
+    if ensure_stignore(&dir)? {
         report.made.push(".stignore".into());
     }
     let readme = dir.join(LIBRARIAN).join("README.md");
@@ -548,6 +584,8 @@ pub fn enrol(root: &Root, identity: &AgentIdentity) -> Result<bool> {
             root.path.display()
         );
     }
+    // `.stignore` is never synced: a machine that was handed this folder writes its own.
+    ensure_stignore(&root.fleet_dir())?;
     let route = route(root);
     let name = canonical_agent_name(identity.name());
     if route.agents.iter().any(|agent| {
@@ -1146,7 +1184,22 @@ pub fn post_notice(root: &Root, identity: &AgentIdentity, mut body: NoticeBody) 
             body.kind
         );
     }
-    atomic(&dir.join(NOTICES).join(format!("{}.json", body.id)), &doc)?;
+    let path = dir.join(NOTICES).join(format!("{}.json", body.id));
+    // A machine's notice never replaces one the master signed: same id, no standing.
+    if trust.master() != Some(canonical_agent_name(identity.name()).as_str())
+        && let Some(existing) = read_signed(&path)
+        && existing
+            .signed_by
+            .as_deref()
+            .is_some_and(|by| trust.master() == Some(canonical_agent_name(by).as_str()))
+    {
+        bail!(
+            "notice {} was signed by the master, and {} is not the master, so it is not replaced",
+            body.id,
+            identity.name()
+        );
+    }
+    atomic(&path, &doc)?;
     Ok(body.id)
 }
 
@@ -1608,8 +1661,10 @@ impl HintPlan {
         let parent = self.file.parent().context("a file with no folder")?;
         let temporary = parent.join(format!(".ferry-where-{}.tmp", std::process::id()));
         fs::write(&temporary, text)?;
-        fs::rename(&temporary, &self.file)
-            .with_context(|| format!("write {}", self.file.display()))?;
+        if let Err(error) = fs::rename(&temporary, &self.file) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error).with_context(|| format!("write {}", self.file.display()));
+        }
         Ok(true)
     }
 }
@@ -1622,6 +1677,7 @@ impl HintPlan {
 /// The markers are damaged (one without the other, out of order, or more than once); then
 /// nothing is touched.
 pub fn place_hint(existing: &str, block: &str) -> Result<String> {
+    let (begin_at, end_at) = hint_markers(existing);
     let crlf = existing.contains("\r\n");
     let block = block.trim_end_matches(['\r', '\n']);
     let block = if crlf {
@@ -1629,8 +1685,7 @@ pub fn place_hint(existing: &str, block: &str) -> Result<String> {
     } else {
         block.to_owned()
     };
-    let begins = existing.matches(HINT_BEGIN).count();
-    let ends = existing.matches(HINT_END).count();
+    let (begins, ends) = (begin_at.len(), end_at.len());
     match (begins, ends) {
         (0, 0) => {
             let eol = if crlf { "\r\n" } else { "\n" };
@@ -1646,8 +1701,8 @@ pub fn place_hint(existing: &str, block: &str) -> Result<String> {
             Ok(out)
         }
         (1, 1) => {
-            let start = existing.find(HINT_BEGIN).unwrap_or_default();
-            let end = existing.find(HINT_END).unwrap_or_default();
+            let start = begin_at[0];
+            let end = end_at[0];
             if end < start {
                 bail!("the end marker comes before the begin marker");
             }
@@ -1662,6 +1717,36 @@ pub fn place_hint(existing: &str, block: &str) -> Result<String> {
     }
 }
 
+/// Where the begin and end markers are in `text`, ignoring any inside a fenced code block
+/// (a document that shows the markers as an example is not one that has them).
+fn hint_markers(text: &str) -> (Vec<usize>, Vec<usize>) {
+    let (mut begins, mut ends) = (Vec::new(), Vec::new());
+    let mut fence: Option<char> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let opens = ["```", "~~~"]
+            .iter()
+            .find(|f| trimmed.starts_with(**f))
+            .and_then(|f| f.chars().next());
+        match (fence, opens) {
+            (None, Some(c)) => fence = Some(c),
+            (Some(open), Some(c)) if open == c => fence = None,
+            (None, None) => {
+                if let Some(at) = line.find(HINT_BEGIN) {
+                    begins.push(offset + at);
+                }
+                if let Some(at) = line.find(HINT_END) {
+                    ends.push(offset + at);
+                }
+            }
+            _ => {}
+        }
+        offset += line.len();
+    }
+    (begins, ends)
+}
+
 const MAX_INSTRUCTIONS: u64 = 1024 * 1024;
 
 fn plan_one(project: &str, file: PathBuf, block: &str, create: bool) -> Option<HintPlan> {
@@ -1673,7 +1758,12 @@ fn plan_one(project: &str, file: PathBuf, block: &str, create: bool) -> Option<H
     };
     let meta = fs::symlink_metadata(&file).ok();
     let Some(meta) = meta else {
-        return create.then(|| plan(HintAction::Create, Some(block.to_owned())));
+        return create.then(|| {
+            plan(
+                HintAction::Create,
+                Some(format!("{}\n", block.trim_end_matches(['\r', '\n']))),
+            )
+        });
     };
     if !meta.is_file() {
         return Some(plan(HintAction::Refused("not a plain file".into()), None));
@@ -1688,7 +1778,7 @@ fn plan_one(project: &str, file: PathBuf, block: &str, create: bool) -> Option<H
         Err(why) => Some(plan(HintAction::Refused(why.to_string()), None)),
         Ok(text) if text == existing => Some(plan(HintAction::Unchanged, None)),
         Ok(text) => {
-            let action = if existing.contains(HINT_BEGIN) {
+            let action = if !hint_markers(&existing).0.is_empty() {
                 HintAction::Update
             } else {
                 HintAction::Append
@@ -1848,6 +1938,56 @@ mod tests {
                 .iter()
                 .all(|e| e.project_id != PROJECT)
         );
+    }
+
+    #[test]
+    fn a_machine_that_was_handed_the_folder_writes_its_own_stignore() {
+        let f = fleet();
+        let dir = f.root.fleet_dir();
+        // `.stignore` is never synced, so a non-master machine starts without one.
+        fs::remove_file(dir.join(".stignore")).unwrap();
+        assert_eq!(stignore_missing(&dir).len(), STIGNORE.lines().count());
+        let tiny = AgentIdentity::from_seed("tiny-ferry", [12u8; 32]);
+        enrol(&f.root, &tiny).unwrap();
+        assert!(stignore_missing(&dir).is_empty());
+        let text = fs::read_to_string(dir.join(".stignore")).unwrap();
+        assert!(text.lines().any(|l| l == "local"), "{text}");
+
+        // An existing file that lacks `local` gets it added, and keeps what else it had.
+        fs::write(dir.join(".stignore"), "keys\n*.tmp\nmine").unwrap();
+        assert!(stignore_missing(&dir).contains(&"local"));
+        assert!(ensure_stignore(&dir).unwrap());
+        let text = fs::read_to_string(dir.join(".stignore")).unwrap();
+        assert!(text.lines().any(|l| l == "mine"), "{text}");
+        assert!(text.lines().any(|l| l == "local"), "{text}");
+        assert!(!ensure_stignore(&dir).unwrap());
+        // Not a folder: nothing is made.
+        assert!(!ensure_stignore(&dir.join("nope")).unwrap());
+    }
+
+    #[test]
+    fn a_machine_cannot_replace_a_notice_the_master_signed() {
+        let f = fleet();
+        let mut by_master = NoticeBody::new("layout-change", "info", "from josh", "text");
+        by_master.id = "fixed-id".into();
+        by_master.machine = Some("beastly".into());
+        post_notice(&f.root, &f.josh, by_master.clone()).unwrap();
+        let mut by_machine = by_master.clone();
+        by_machine.title = "from beastly".into();
+        let error = post_notice(&f.root, &f.beastly, by_machine.clone()).unwrap_err();
+        assert!(
+            error.to_string().contains("signed by the master"),
+            "{error}"
+        );
+        let (rows, _) = read_notices(&f.root);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body.title, "from josh");
+        // The machine may replace its own, and the master may replace anything.
+        by_machine.id = "its-own".into();
+        post_notice(&f.root, &f.beastly, by_machine.clone()).unwrap();
+        by_machine.title = "again".into();
+        post_notice(&f.root, &f.beastly, by_machine.clone()).unwrap();
+        post_notice(&f.root, &f.josh, by_machine).unwrap();
     }
 
     #[test]
@@ -2243,6 +2383,47 @@ mod tests {
             "a bare newline crept in"
         );
         assert!(out.ends_with(&format!("{HINT_END}\r\nafter\r\n")));
+
+        // Markers shown inside a code fence are an example, not the block.
+        let fenced = format!("# Doc\n\n```\n{HINT_BEGIN}\nexample\n{HINT_END}\n```\n");
+        let out = place_hint(&fenced, &block).unwrap();
+        assert!(out.starts_with(&fenced), "the example is left alone");
+        assert_eq!(
+            out.matches(HINT_BEGIN).count(),
+            2,
+            "and the block is appended"
+        );
+        assert_eq!(place_hint(&out, &block).unwrap(), out);
+
+        // A file made new ends in a newline.
+        let plan = plan_one(
+            "demo",
+            PathBuf::from("/nonexistent/x/CLAUDE.md"),
+            "a\nb",
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.action, HintAction::Create);
+        assert!(plan.new_text.as_deref().unwrap().ends_with("b\n"));
+
+        // A failed rename leaves no temporary file behind.
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("CLAUDE.md");
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("keep"), "x").unwrap();
+        let doomed = HintPlan {
+            project: "demo".into(),
+            file: blocked,
+            action: HintAction::Create,
+            new_text: Some("x\n".into()),
+        };
+        assert!(doomed.apply().is_err());
+        assert!(
+            fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp"))
+        );
 
         // Damaged markers are refused and nothing is written.
         for broken in [

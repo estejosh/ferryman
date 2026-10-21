@@ -725,6 +725,20 @@ fn data_check(root: &Root) -> Check {
     }
 }
 
+/// `--fix` for the fleet folder: write the `.stignore` this machine is missing (it is never
+/// synced). Returns what was done.
+pub fn fix_fleet_stignore(root: &Root) -> Vec<String> {
+    let dir = root.fleet_dir();
+    if !ferryman_channel::fleethome::exists(root) {
+        return Vec::new();
+    }
+    match ferryman_channel::fleethome::ensure_stignore(&dir) {
+        Ok(true) => vec![format!("wrote {}", dir.join(".stignore").display())],
+        Ok(false) => Vec::new(),
+        Err(error) => vec![format!("fleet .stignore not written: {error:#}")],
+    }
+}
+
 /// The fleet folder (ADR 0026): what is in it that does not count, and whether this machine
 /// is in the directory.
 fn fleet_check(root: &Root) -> Check {
@@ -735,7 +749,9 @@ fn fleet_check(root: &Root) -> Check {
     let known = machines
         .iter()
         .any(|row| row.body.machine.eq_ignore_ascii_case(&me));
-    let ok = findings.rejected.is_empty();
+    let missing = home::stignore_missing(&root.fleet_dir());
+    let stignore_ok = missing.is_empty();
+    let ok = findings.rejected.is_empty() && stignore_ok;
     let listed: Vec<String> = findings
         .rejected
         .iter()
@@ -745,7 +761,12 @@ fn fleet_check(root: &Root) -> Check {
     Check {
         name: "fleet",
         ok,
-        detail: if ok {
+        detail: if !stignore_ok && findings.rejected.is_empty() {
+            format!(
+                "the fleet folder's .stignore is missing or lacks: {} (it is never synced, so this machine must write it)",
+                missing.join(", ")
+            )
+        } else if ok {
             format!(
                 "{} machine(s) in the fleet folder{}",
                 machines.len(),
@@ -764,7 +785,7 @@ fn fleet_check(root: &Root) -> Check {
             )
         },
         fix: Some(
-            "look at who wrote them; the master admits a machine with `ferry fleet admit <name> --machine <machine>`"
+            "ferry doctor --layout --fix writes a missing .stignore; for ignored files look at who wrote them, the master admits a machine with `ferry fleet admit <name> --machine <machine>`"
                 .into(),
         ),
     }

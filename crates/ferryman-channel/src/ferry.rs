@@ -1118,7 +1118,7 @@ impl Root {
     }
 
     /// `fleet/local/`: the fleet folder's machine-local part. Excluded from Syncthing by the
-    /// fleet channel's `.stignore` and from the iroh lane by its built-in `local` rule.
+    /// fleet channel's `.stignore` and from the iroh lane by its fleet-only `local/` rule.
     #[must_use]
     pub fn fleet_local(&self) -> PathBuf {
         self.fleet_dir().join("local")

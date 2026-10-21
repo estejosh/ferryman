@@ -64,7 +64,6 @@ const BUILT_IN: &[&str] = &[
     "*.cmd",
     "*.ps1",
     "*.sh",
-    "local",
 ];
 
 /// The suffix of the lane's own temporary files. Ends in `.tmp`, so Syncthing (and this

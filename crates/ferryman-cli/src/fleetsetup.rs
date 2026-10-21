@@ -352,6 +352,7 @@ pub fn layout_command(fix: bool, json: bool) -> Result<bool> {
         for line in layout::unshare_strays(&root) {
             did.push(line);
         }
+        did.extend(layout::fix_fleet_stignore(&root));
         report = layout::inspect_live(&root, &machine::scan());
     }
     if json {

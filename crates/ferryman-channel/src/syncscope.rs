@@ -100,6 +100,29 @@ const FORBIDDEN_UNDER_ROOT: [(&str, &str); 6] = [
     ),
 ];
 
+/// What `child` is below `parent`, as `/`-separated text, compared the way the scope guard
+/// compares paths (separators, trailing slashes, `.` and `..`, and case on Windows).
+/// `Some("")` when they are the same place, `None` when `child` is not under `parent`.
+#[must_use]
+pub fn below(child: &Path, parent: &Path) -> Option<String> {
+    let child = normalise(&child.display().to_string());
+    let parent = normalise(&parent.display().to_string());
+    let parent = parent.trim_end_matches('/');
+    if child == parent {
+        return Some(String::new());
+    }
+    child
+        .strip_prefix(parent)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_owned)
+}
+
+/// Whether `child` is `parent` or lies under it, by the scope guard's own comparison.
+#[must_use]
+pub fn is_within(child: &Path, parent: &Path) -> bool {
+    below(child, parent).is_some()
+}
+
 /// Whether `child` is `parent` or lies under it. Text comparison, like Syncthing's own
 /// config: the path may not exist on this machine, and separators and case may differ.
 fn within(child: &str, parent: &str) -> bool {
@@ -603,6 +626,32 @@ mod tests {
             !found
                 .iter()
                 .any(|p| p.ends_with("comms") && p.contains("projects"))
+        );
+    }
+
+    #[test]
+    fn below_compares_like_the_guard_does() {
+        let p = Path::new;
+        assert_eq!(
+            below(p("X:\\ferry\\comms\\a\\data"), p("X:\\ferry\\comms\\a\\")),
+            Some("data".into())
+        );
+        assert_eq!(
+            below(p("X:/ferry/comms/a/"), p("X:\\ferry\\comms\\a")),
+            Some(String::new())
+        );
+        assert_eq!(
+            below(p("X:\\ferry\\comms\\ab"), p("X:\\ferry\\comms\\a")),
+            None
+        );
+        assert!(!is_within(
+            p("X:\\ferry\\comms\\a\\..\\b"),
+            p("X:\\ferry\\comms\\a")
+        ));
+        // `X:\Ferry` and `X:\ferry` are one place where paths are case-insensitive.
+        assert_eq!(
+            is_within(p("X:\\Ferry\\comms\\a\\data"), p("X:\\ferry\\comms\\a")),
+            cfg!(windows)
         );
     }
 
