@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 mod adversary;
 mod enginepolicy;
+mod fleethome;
 mod fleetsetup;
 mod focus;
 mod gitanchor;
@@ -258,6 +259,11 @@ enum Command {
         /// The project-scoped .env (custom placement). Never synced.
         #[arg(long)]
         env: Option<PathBuf>,
+        /// Where this project keeps its own data (a database, a model, a dataset). Machine-local:
+        /// recorded in the ferry root, never synced, and refused if it sits inside a synced folder.
+        /// Without it the place is `projects/<id>/data`.
+        #[arg(long)]
+        data: Option<PathBuf>,
     },
     /// Check whether this machine is ready to run a task, before one fails.
     ///
@@ -697,6 +703,12 @@ enum Command {
         #[command(subcommand)]
         command: fleetsetup::ReposCommand,
     },
+    /// Where a project is on this machine (or another): its code, channel, hand-ins, data and env.
+    ///
+    /// Prints the path and nothing else, so a script can use it: `cd "$(ferry where demo)"`.
+    /// Reads the fleet directory and this machine's own manifest, from any folder. Paths move;
+    /// ask here instead of writing one down.
+    Where(fleethome::WhereArgs),
     /// Set a machine up: one layout, one worker, every repo.
     Fleet {
         #[command(subcommand)]
@@ -870,6 +882,20 @@ enum RootCommand {
         /// left where they are.
         #[arg(long)]
         prune_stale_worktrees: bool,
+    },
+    /// Where a project keeps its own data: show it, set it, or go back to the default.
+    ///
+    /// A data folder (a database, a model, a dataset) is machine-local. It is never synced by
+    /// Syncthing or the iroh lane, and a path inside a synced folder is refused. The default is
+    /// `projects/<id>/data`. Nothing is created or moved: this records the place.
+    Data {
+        /// The project id.
+        project: String,
+        /// The place. Without it, say where it is now.
+        path: Option<PathBuf>,
+        /// Go back to `projects/<id>/data`.
+        #[arg(long, conflicts_with = "path")]
+        reset: bool,
     },
     /// Move channels into `comms/`, so every channel lives in one place.
     ///
@@ -4179,6 +4205,7 @@ async fn run(cli: Cli) -> Result<()> {
             repo,
             handins,
             env,
+            data,
         } => {
             // Before anything is written: a machine may not be configured to be a person.
             if let Some(name) = &agent_name {
@@ -4237,6 +4264,7 @@ async fn run(cli: Cli) -> Result<()> {
                 repo,
                 handins,
                 env,
+                data,
             }) {
                 Ok(outcome) => outcome,
                 Err(err) => {
@@ -4256,6 +4284,10 @@ async fn run(cli: Cli) -> Result<()> {
                     return Err(err);
                 }
             };
+            // The fleet folder, when there is one, learns where this project lives.
+            if let Some(root) = ferryman_channel::ferry::find_root() {
+                fleethome::publish_quiet(&root);
+            }
             // A project enrolled here gets Ferryman's own clone in `repos/<project>`, so the
             // layout holds from the first command and no agent has to remember to make it.
             if !no_enrol {
@@ -4975,6 +5007,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Root { command } => root_command(command)?,
         Command::Repos { command } => fleetsetup::repos_command(command)?,
         Command::Fleet { command } => fleetsetup::fleet_command(command)?,
+        Command::Where(args) => fleethome::where_command(&args)?,
         Command::Order { command } => fleetsetup::order_command(command)?,
         Command::Release { command } => release_command(command)?,
         Command::Marvin { command } => marvin_command(command)?,
@@ -7974,17 +8007,51 @@ async fn run_fleet(
     // and synced in the background beside Syncthing for as long as this worker runs.
     let mut live_lane = None;
     if let Some(iroh) = iroh {
-        let routes = fleet
+        let mut routes: Vec<ferryman_channel::ProjectRoute> = fleet
             .served
             .iter()
             .map(|(route, _)| route.clone())
             .collect();
+        // The fleet's own folder, when this root has one: its channel is carried like any
+        // other (ADR 0026). The worker goes on its roster first, so its record can be written.
+        if let Some(root) = ferryman_channel::ferry::find_root()
+            && ferryman_channel::fleethome::exists(&root)
+        {
+            fleethome::WorkerPass::enrol_worker(&root, iroh.identity());
+            routes.push(ferryman_channel::fleethome::route(&root));
+        }
         live_lane = iroh.start(routes, report).await;
     }
     // What was last said about each project that is not open to this worker, so a pass says
     // it again only when the reason changes.
     let mut told: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut home_pass = fleethome::WorkerPass::default();
     loop {
+        // The fleet folder (ADR 0026): publish this machine's entries, say what the fleet has
+        // said, and act on what the master ordered. Best-effort: it never stops the work.
+        {
+            let mut engines: Vec<String> = fleet
+                .served
+                .iter()
+                .flat_map(|(_, config)| {
+                    config
+                        .engines
+                        .iter()
+                        .map(|engine| format!("{} ({})", engine.name, engine.tier.as_str()))
+                })
+                .collect();
+            engines.sort();
+            engines.dedup();
+            let projects: Vec<String> = fleet
+                .served
+                .iter()
+                .map(|(route, _)| route.project_id.clone())
+                .collect();
+            if let fleethome::Next::Stop(why) = home_pass.run(&engines, &projects, report).await {
+                report.info(&format!("stopping so the next start is fresh: {why}"));
+                return Ok(());
+            }
+        }
         // Keeping a long-running worker current.
         //
         // `keep_current` on startup was not enough, and the gap is the whole
@@ -12942,8 +13009,14 @@ fn root_command(command: RootCommand) -> Result<()> {
                 }
                 println!();
             }
+            let before = ferryman_ops::fleethome::snapshot(&root);
             let report = ferryman_ops::migrate::run(&root, &options)?;
             print!("{}", report.render());
+            if apply {
+                // Tell the fleet where everything is now: the directory first, then a signed
+                // notice listing every old and new path (ADR 0026). Never a reason to fail.
+                fleethome::after_move(&root, &before, "root migrate", "high");
+            }
             if !apply {
                 println!();
                 println!("  Nothing was changed. Run it with --apply to do it.");
@@ -12952,6 +13025,45 @@ fn root_command(command: RootCommand) -> Result<()> {
                     "some projects were not migrated; see above, fix what blocks them and run it again"
                 );
             }
+        }
+
+        RootCommand::Data {
+            project,
+            path,
+            reset,
+        } => {
+            let Some(root) = ferry::find_root() else {
+                bail!("no ferry root yet - make one with `ferry root init`")
+            };
+            let entry = root
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project)
+                .with_context(|| {
+                    format!(
+                        "no project '{project}' in {}",
+                        root.manifest_path().display()
+                    )
+                })?;
+            if path.is_none() && !reset {
+                println!("{}", entry.data_path(&root).display());
+                return Ok(());
+            }
+            let before = ferryman_ops::fleethome::snapshot(&root);
+            root.set_data(&project, path.as_deref())?;
+            let now = root
+                .read()
+                .projects
+                .into_iter()
+                .find(|entry| entry.project_id == project)
+                .map(|entry| entry.data_path(&root));
+            println!(
+                "{project}: data is {}",
+                now.map_or_else(String::new, |p| p.display().to_string())
+            );
+            println!("  Machine-local: never synced, never moved. Nothing was created or copied.");
+            fleethome::after_move(&root, &before, "data path changed", "info");
         }
 
         RootCommand::Gather { project, dry_run } => {
@@ -13121,6 +13233,7 @@ fn root_command(command: RootCommand) -> Result<()> {
                 );
                 return Ok(());
             }
+            fleethome::publish_quiet(&root);
             println!("filed {} in {}", route.project_id, root.path.display());
             println!("  channel  {}", route.communications.display());
             match &repo {

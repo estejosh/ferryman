@@ -28,7 +28,9 @@ A new root is layout 2 (ADR 0024). Each project has one folder, so you can hand 
     handins/                  hand-ins and a worker-level agent's own signed writes. Synced (<id>-handins).
     work/                     task worktrees. Machine-local.
     tmp/                      scratch. Machine-local.
+    data/                     this project's own data (a database, a model). Machine-local, never synced.
     .env                      this project's keys only. Never synced.
+  fleet/                      the fleet's own channel (Syncthing folder id fleet-ferryman). See below.
   secrets/                    write credentials and fleet-wide keys. Never synced. Orchestrator only.
   logs/                       including migrate-<UTC>.md
 ```
@@ -45,6 +47,32 @@ A new root is layout 2 (ADR 0024). Each project has one folder, so you can hand 
 
 A layout-1 root keeps working unchanged. The rest of this page describes layout 1 and the checks both share.
 
+## The fleet folder, and `ferry where` (0.6.1)
+
+`<root>/fleet/` is one more synced channel, separate from every project, for what is true of the whole fleet: where each machine keeps each project, what each machine runs, notices, fleet orders and release approvals (ADR 0026). It exists once the master runs `ferry fleet init`, and a root without it works as before.
+
+```text
+<root>/fleet/
+  master.json, agents/, grants/                the folder's own trust
+  directory/<project>/<machine>.json           where a machine keeps a project (signed by the machine)
+  directory/<project>/<machine>.override.json  the same, signed by the master; it wins
+  machines/<machine>.json                      version, layout, root, OS, engines, projects served, last seen
+  notices/<id>.json                            layout-change, deprecation, update-available, migration, general
+  orders/<id>.json                             fleet orders: update, migrate, restart-worker
+  releases/                                    release requests, approvals, denials (the project channel's release/ is still read)
+  librarian/README.md                          a placeholder
+  local/                                       this machine's part: pins, keys, what it has read. Never synced.
+```
+
+A file counts only if it is signed by the master, or by a machine the master admitted (`ferry fleet admit`) and only for that machine's own entries. A Worker-level agent never writes here. Anything else is ignored, and `ferry doctor --layout` lists it. A path in the directory is checked (no `..`, no UNC or device paths, no control characters) and is never opened or run.
+
+**`ferry where <project>`** prints this machine's path to the project's code, from any folder. `--kind code|channel|handins|data|env` picks one place, `--machine M` asks about another machine, `--json` gives every place and who vouched for it, `--all` lists every project on every machine. For this machine it reads the root's own manifest first, so the answer is right the moment a migrate finishes; for another machine it reads that machine's directory entry, or the master's override of it.
+
+**`ferry where --session-hint <project>`** prints a short block for a CLAUDE.md or AGENTS.md. `ferry fleet write-hints` shows what it would write into each clone's CLAUDE.md (and AGENTS.md where there is one), and `--apply` writes it between `<!-- ferry:where begin -->` and `<!-- ferry:where end -->`, touching nothing else and committing nothing.
+
+**`data/`.** A project's own data (a database, a model, a dataset) lives in `projects/<id>/data` unless you say otherwise (`ferry enable --data PATH`, `ferry root data <project> PATH`). It is machine-local: Syncthing and the iroh lane both refuse it, and a path inside or around a synced folder is refused when you record it. `ferry doctor --layout --fix` makes the default folder.
+
+**After a move.** `ferry root migrate --apply` updates this machine's directory entries, then posts a signed `layout-change` notice listing every old and new path. `ferry fleet notices` and the dashboard's Fleet page show it; a running worker says each unread high-severity notice once.
 ## What each folder is for (layout 1)
 
 **`comms/`** holds one channel per project: orders, claims, results, the roster, the master's signed settings. It is plain files, and Syncthing carries it between your machines.
@@ -86,7 +114,7 @@ Before this rule, hand-ins were shared as a second folder, `<project>-work`, whi
 
 ## `ferry doctor --layout`
 
-Six checks in layout 1, eight in layout 2. Each failing one prints the command that fixes it.
+Six checks in layout 1, eight in layout 2, and a `data` check in both; a root with a fleet folder has a `fleet` check too. Each failing one prints the command that fixes it.
 
 | Check | Passes when |
 |---|---|
@@ -97,6 +125,8 @@ Six checks in layout 1, eight in layout 2. Each failing one prints the command t
 | locks | no `worker-<agent>.lock` names a process that is gone |
 | syncthing | no configured Syncthing folder sits outside `comms/` (layout 2: outside `projects/<id>/comms` and `handins`) |
 | projects (layout 2) | a managed project has `repo/`, `comms/`, `handins/` and `work/`; a custom one has the paths it recorded. Custom is not a failure |
+| data | no project's data folder (`projects/<id>/data` or the path recorded) is inside, or around, a synced folder |
+| fleet | nothing in `fleet/` is being ignored (unsigned, forged, or from a machine the master has not admitted) |
 | keys | no `secrets/` or `.env` is inside a synced folder, and no Worker-level agent on this machine has a write path into the channel (its hand-ins are separate, nothing of its is stray in `comms/`, its Syncthing folder is receive-only) |
 
 `--json` prints the same. `--fix` makes missing folders, runs `repos sync`, renames the locks of dead processes to `<name>.stale-<pid>` (never deleting them, and only after looking at the pid again) and stops Syncthing sharing strays Ferryman registered. It does not sign, enrol, revoke or release anything: those are the master's lines, and `ferry fleet setup` prints them.

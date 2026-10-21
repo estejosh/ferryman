@@ -85,7 +85,7 @@ fn forms(path: &Path) -> Vec<String> {
 }
 
 /// The parts of a ferry root nothing may share besides `comms/`.
-const FORBIDDEN_UNDER_ROOT: [(&str, &str); 5] = [
+const FORBIDDEN_UNDER_ROOT: [(&str, &str); 6] = [
     ("repos", "is under repos/, which holds git clones"),
     ("work", "is under work/, which holds git worktrees"),
     (
@@ -94,6 +94,10 @@ const FORBIDDEN_UNDER_ROOT: [(&str, &str); 5] = [
     ),
     ("secrets", "is under secrets/, which holds credentials"),
     ("logs", "is under logs/, which holds this machine's logs"),
+    (
+        "fleet/local",
+        "is under fleet/local/, this machine's own part of the fleet folder",
+    ),
 ];
 
 /// Whether `child` is `parent` or lies under it. Text comparison, like Syncthing's own
@@ -201,6 +205,23 @@ fn carries(root: &Root, path: &Path) -> Option<String> {
     }
     // The default `projects/<id>/.env` is covered by the structural rules above: a folder
     // that holds it is the project folder or something above it.
+    // A project's data is machine-local wherever it is recorded: a folder that holds it, or
+    // lies inside it, is never shared.
+    for entry in root.projects() {
+        let data = entry.data_path(root);
+        let data_forms = forms(&data);
+        if holds(&data)
+            || data_forms
+                .iter()
+                .any(|data| target.iter().any(|outer| within(outer, data)))
+        {
+            return Some(format!(
+                "would carry {}'s data folder {}, which is machine-local",
+                entry.project_id,
+                data.display()
+            ));
+        }
+    }
     None
 }
 
@@ -312,6 +333,7 @@ pub fn strays<'a>(root: &Path, folders: &'a [Folder]) -> Vec<&'a Folder> {
                 .iter()
                 .any(|suffix| folder.id.ends_with(suffix));
             let in_a_place = within(&target, &comms)
+                || target == format!("{base}/fleet")
                 || (within(&target, &projects) && layout_two_reason(&projects, &target).is_none())
                 || is_recorded(&manifest, &folder.path);
             ours && !in_a_place
@@ -534,6 +556,7 @@ mod tests {
                 handins: Some(mine.join("handins")),
                 env: Some(mine.join("keys.env")),
                 work: None,
+                data: None,
             },
         )
         .unwrap();
@@ -594,5 +617,73 @@ mod tests {
         assert_eq!(folders[0].path, "/x/comms/a-ferryman");
         assert_eq!(folders[1].path, "");
         assert!(folders_in(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn a_projects_data_and_the_fleet_folders_local_part_are_never_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::ferry::Root::create_with_layout(&dir.path().join("ferry"), 2).unwrap();
+        // The default data folder is a project-folder child that is not comms or handins.
+        let why = refusal(&root.path, &root.project_data("demo")).unwrap();
+        assert!(why.contains("not its comms or handins"), "{why}");
+        assert!(guard(&root.project_data("demo")).is_err());
+        // The fleet folder is a channel; its local part is this machine's own.
+        assert!(guard(&root.fleet_dir()).is_ok());
+        assert!(refusal(&root.path, &root.fleet_local()).is_some());
+        assert!(refusal(&root.path, &root.fleet_local().join("agents-pinned")).is_some());
+        let at = |id: &str, path: std::path::PathBuf| Folder {
+            id: id.to_string(),
+            label: String::new(),
+            path: path.display().to_string(),
+        };
+        let folders = vec![
+            at("fleet-ferryman", root.fleet_dir()),
+            at("fleet-ferryman", root.fleet_local()),
+        ];
+        let stray: Vec<_> = strays(&root.path, &folders)
+            .into_iter()
+            .map(|f| f.path.clone())
+            .collect();
+        assert_eq!(stray, vec![root.fleet_local().display().to_string()]);
+
+        // A custom project that keeps its data beside its channel, or inside it.
+        let mine = dir.path().join("mine");
+        std::fs::create_dir_all(mine.join("comms")).unwrap();
+        root.record_custom(
+            "pc",
+            &crate::ferry::CustomPlaces {
+                channel: mine.join("comms"),
+                repo: None,
+                handins: Some(mine.join("handins")),
+                env: None,
+                work: None,
+                data: Some(mine.join("data")),
+            },
+        )
+        .unwrap();
+        assert!(guard(&mine.join("comms")).is_ok());
+        assert!(guard(&mine.join("data")).is_err());
+        assert!(guard(&mine.join("data").join("sub")).is_err());
+        let error = guard(&mine).unwrap_err().to_string();
+        assert!(error.contains("data folder"), "{error}");
+        // Pointing the data inside the channel is refused when it is recorded, and a data
+        // folder inside a channel that is already recorded would stop that channel being shared.
+        assert!(
+            root.set_data("pc", Some(&mine.join("comms").join("data")))
+                .is_err()
+        );
+        assert!(
+            root.set_data("pc", Some(&root.fleet_dir().join("data")))
+                .is_err()
+        );
+        assert!(
+            root.set_data("pc", Some(std::path::Path::new("relative")))
+                .is_err()
+        );
+        assert!(
+            root.set_data("pc", Some(&dir.path().join("elsewhere")))
+                .unwrap()
+        );
+        assert!(root.set_data("pc", None).unwrap());
     }
 }

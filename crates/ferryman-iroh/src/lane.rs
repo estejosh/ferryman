@@ -350,6 +350,14 @@ impl Lane {
             // exchanged as their own share, so an unmigrated peer cannot re-create it here.
             channel_rules = channel_rules.excluding("handins/");
         }
+        // A project's data is machine-local wherever it sits (ADR 0026): if it is inside the
+        // channel, it stays out of what is exchanged; if it IS the channel, nothing is.
+        let mut skip_channel = false;
+        match data_spot(channel, id) {
+            Some(DataSpot::Inside(pattern)) => channel_rules = channel_rules.excluding(&pattern),
+            Some(DataSpot::Whole) => skip_channel = true,
+            None => {}
+        }
         let mut shares = vec![Share {
             key: id.clone(),
             dir: channel.clone(),
@@ -364,15 +372,24 @@ impl Lane {
                 )),
             send: !access::machine_is_worker_only(channel, id, &local),
         }];
+        if skip_channel {
+            shares.clear();
+        }
         let handins = ferry::handins_dir_for(channel, id);
         if !handins.starts_with(channel) {
             // The folder is the project's own and a hand-in is written into it; making it
             // here is what a worker does on start anyway.
             let _ = std::fs::create_dir_all(&handins);
             let verdicts = access::may_write_verdicts(channel, id, &peer.agents);
+            let mut rules = Rules::for_channel(&handins).refusing_verdicts(!verdicts);
+            match data_spot(&handins, id) {
+                Some(DataSpot::Inside(pattern)) => rules = rules.excluding(&pattern),
+                Some(DataSpot::Whole) => return shares,
+                None => {}
+            }
             shares.push(Share {
                 key: format!("{id}{HANDINS_SUFFIX}"),
-                rules: Rules::for_channel(&handins).refusing_verdicts(!verdicts),
+                rules,
                 dir: handins,
                 send: true,
             });
@@ -772,4 +789,72 @@ async fn receive_item(
     let mut bytes = vec![0_u8; usize::try_from(entry.size)?];
     recv.read_exact(&mut bytes).await?;
     Ok(manifest::write_received(channel, rules, &entry, &bytes).unwrap_or(false))
+}
+
+/// Where a project's machine-local data sits relative to a folder the lane would exchange.
+#[derive(Debug, PartialEq, Eq)]
+enum DataSpot {
+    /// Inside it: the folder-anchored pattern that keeps it out.
+    Inside(String),
+    /// It is the folder, or the folder is inside it: nothing here may be exchanged.
+    Whole,
+}
+
+/// The project's data folder (`projects/<id>/data`, or the path recorded) against `dir`.
+/// Data is never synced, by Syncthing or here, however a person placed it.
+fn data_spot(dir: &Path, id: &str) -> Option<DataSpot> {
+    let root = ferry::find_root_from(dir)?;
+    let entry = root
+        .projects()
+        .into_iter()
+        .find(|entry| entry.project_id == id)?;
+    let data = entry.data_path(&root);
+    if dir.starts_with(&data) {
+        return Some(DataSpot::Whole);
+    }
+    let relative = data.strip_prefix(dir).ok()?;
+    let text = relative.to_string_lossy().replace('\\', "/");
+    (!text.is_empty())
+        .then(|| format!("{text}/"))
+        .map(DataSpot::Inside)
+}
+
+#[cfg(test)]
+mod data_tests {
+    use super::*;
+
+    #[test]
+    fn a_projects_data_inside_what_the_lane_exchanges_is_kept_out() {
+        ferry::isolate_root_search_for_this_thread();
+        let dir = tempfile::tempdir().unwrap();
+        let root = ferry::Root::create_with_layout(&dir.path().join("ferry"), 2).unwrap();
+        let channel = root.comms_home("demo");
+        std::fs::create_dir_all(&channel).unwrap();
+        root.adopt("demo", &channel, None).unwrap();
+        // The default sits beside the channel, not in it.
+        assert_eq!(data_spot(&channel, "demo"), None);
+
+        // Recorded inside the channel (a hand edit, or an old manifest): kept out.
+        root.update_entry("demo", |entry| {
+            entry.data = Some(channel.join("scratch").join("db"))
+        })
+        .unwrap();
+        let spot = data_spot(&channel, "demo");
+        assert_eq!(spot, Some(DataSpot::Inside("scratch/db/".into())));
+        let rules = Rules::for_channel(&channel).excluding("scratch/db/");
+        assert!(rules.excludes("scratch/db/model.bin"));
+        assert!(rules.excludes_incoming("scratch/db/x"));
+        assert!(!rules.excludes("tasks/t-1/order.json"));
+
+        // The data folder as the channel itself: nothing is exchanged.
+        root.update_entry("demo", |entry| entry.data = Some(channel.clone()))
+            .unwrap();
+        assert_eq!(data_spot(&channel, "demo"), Some(DataSpot::Whole));
+        assert_eq!(
+            data_spot(&channel.join("sub"), "demo"),
+            Some(DataSpot::Whole)
+        );
+        // Another project is not affected.
+        assert_eq!(data_spot(&channel, "other"), None);
+    }
 }

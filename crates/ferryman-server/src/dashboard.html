@@ -2543,8 +2543,63 @@ pages.fleet = async () => {
           </tr>`).join("") : `<tr><td colspan="5"><div class="empty">No machines registered.</div></td></tr>`}
         </tbody>
       </table>
-    </div>`;
+    </div>${fleetHome(d)}`;
 };
+
+// The fleet's own folder (ADR 0026): notices, the machines that publish, and where every
+// machine keeps every project. The filter box at the top is the lookup: type a project or a
+// machine and the directory narrows to it.
+function fleetHome(d) {
+  const f = d.fleet_home || {};
+  if (!f.present) {
+    return `<div class="head" style="margin-top:24px"><div><h2>Fleet folder</h2>
+      <p>No fleet folder in this root yet. The master runs <code>ferry fleet init</code> to make it.</p></div></div>`;
+  }
+  const tone = { high: "bad", warning: "warn", info: "" };
+  const notices = (f.notices || []).filter((n) => matches(`${n.kind} ${n.title} ${n.text} ${n.machine || ""}`));
+  const machines = (f.machines || []).filter((m) => matches(`${m.machine} ${m.version} ${(m.projects || []).join(" ")}`));
+  const rows = (f.directory || []).filter((r) => matches(`${r.project} ${r.machine} ${r.code || ""} ${r.channel || ""} ${r.data || ""}`));
+  const ignored = f.ignored || 0;
+  return `
+    <div class="head" style="margin-top:24px"><div><h2>Fleet folder</h2>
+      <p>What is true of the whole fleet, signed by the master or by the machine it is about.${f.master ? ` Master: ${esc(f.master)}.` : ""}</p></div></div>
+    ${ignored ? `<div class="notice"><b>${ignored} file${ignored === 1 ? "" : "s"} ignored</b><div>Unsigned, forged or from a machine the master has not admitted. <code>ferry doctor --layout</code> lists them.</div></div>` : ""}
+    <div class="panel">${notices.length ? notices.map((n) => `
+      <div class="row" style="display:block">
+        <span class="badge ${tone[n.severity] || ""}">${esc(n.severity)}</span>
+        <span class="t mono">${esc(n.kind)}</span> ${esc(n.title)}
+        <span style="color:var(--faint)">${esc(ago(n.issued))} by ${esc(n.signed_by)}</span>
+        ${n.text ? `<div style="color:var(--faint);white-space:pre-wrap">${esc(String(n.text).split("\n").slice(0, 8).join("\n"))}</div>` : ""}
+      </div>`).join("") : `<div class="empty">No notices.</div>`}</div>
+    <div class="panel scroll" style="margin-top:12px">
+      <table class="grid">
+        <thead><tr><th>Machine</th><th>Ferry</th><th>Layout</th><th>OS</th><th>Serves</th><th>Seen</th></tr></thead>
+        <tbody>${machines.length ? machines.map((m) => `
+          <tr>
+            <td class="lead">${esc(m.machine)}</td>
+            <td>${esc(m.version)}${m.behind ? ` <span class="badge warn" title="behind this dashboard (${esc(d.version || "")})">behind</span>` : ""}</td>
+            <td>${esc(m.layout)}</td>
+            <td>${esc(m.os)}</td>
+            <td>${esc((m.projects || []).length)}</td>
+            <td>${esc(ago(m.last_seen))}${m.quiet ? ` <span class="badge warn">quiet</span>` : ""}</td>
+          </tr>`).join("") : `<tr><td colspan="6"><div class="empty">No machine has published yet.</div></td></tr>`}</tbody>
+      </table>
+    </div>
+    <div class="panel scroll" style="margin-top:12px">
+      <table class="grid">
+        <thead><tr><th>Project</th><th>Machine</th><th>Code</th><th>Channel</th><th>Data</th><th>From</th></tr></thead>
+        <tbody>${rows.length ? rows.map((r) => `
+          <tr>
+            <td class="lead">${esc(r.project)}</td>
+            <td>${esc(r.machine)}</td>
+            <td class="mono">${esc(r.code || "—")}</td>
+            <td class="mono">${esc(r.channel || "—")}</td>
+            <td class="mono">${esc(r.data || "—")}</td>
+            <td>${esc(r.source)}${r.state === "archived" ? ` <span class="badge">archived</span>` : ""}</td>
+          </tr>`).join("") : `<tr><td colspan="6"><div class="empty">${state.filter ? "Nothing matches that." : "No entries yet."}</div></td></tr>`}</tbody>
+      </table>
+    </div>`;
+}
 
 // A JSON shape written the way a person reads it: the type first, then each property on
 // its own line, `*` marking the ones that are required.

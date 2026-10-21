@@ -85,6 +85,9 @@ pub struct Request {
     pub repo: Option<PathBuf>,
     pub handins: Option<PathBuf>,
     pub env: Option<PathBuf>,
+    /// Where this project keeps its own data (machine-local, never synced). Recorded in the
+    /// root's manifest; the default is `projects/<id>/data`.
+    pub data: Option<PathBuf>,
 }
 
 /// A file this run created, or found already correct.
@@ -695,11 +698,31 @@ pub fn perform(request: Request) -> Result<Outcome> {
             handins: request.handins.clone(),
             env: request.env.clone(),
             work: None,
+            data: None,
         };
         root.record_custom(&project, &places)?;
         steps.push(Step {
             what: "custom placement recorded in the ferry root",
             path: root.manifest_path(),
+            created: true,
+        });
+    }
+    // The project's own data (ADR 0026): machine-local, recorded here, never synced.
+    if let Some(data) = &request.data {
+        let Some(root) = ferryman_channel::ferry::find_root() else {
+            bail!(
+                "--data is recorded in the ferry root, and there is none yet - make one with `ferry root init`"
+            );
+        };
+        let repo = request
+            .repo
+            .clone()
+            .or_else(|| workspace.join(".git").exists().then(|| workspace.clone()));
+        root.adopt(&project, &route.communications, repo.as_deref())?;
+        root.set_data(&project, Some(data))?;
+        steps.push(Step {
+            what: "data folder recorded in the ferry root (machine-local, never synced)",
+            path: data.clone(),
             created: true,
         });
     }
@@ -792,6 +815,7 @@ pub(crate) mod tests_support {
             repo: None,
             handins: None,
             env: None,
+            data: None,
         })
         .unwrap();
         dir
@@ -852,6 +876,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
         })?;
         Ok(())
     }
@@ -991,6 +1016,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
         };
         let outcome = perform(request).unwrap();
         let created: Vec<&str> = outcome
@@ -1048,6 +1074,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
         })
         .unwrap();
         let config = fs::read_to_string(AgentConfig::path(&dir.join(".ferryman"))).unwrap();
@@ -1082,6 +1109,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
         })
         .unwrap();
         assert!(
@@ -1219,6 +1247,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
             ..request_in(&dir)
         })
         .unwrap();
@@ -1243,6 +1272,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
             master: true,
             ..request_in(&dir)
         })
@@ -1327,6 +1357,7 @@ mod tests {
             repo: None,
             handins: None,
             env: None,
+            data: None,
         }
     }
 
