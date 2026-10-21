@@ -167,6 +167,20 @@ ferry fleet order restart-worker                        # have the fleet pick th
 
 Running a relay on a fleet machine (`ferry relay serve`) is not built; see ADR 0027.
 
+### The Hive rescue channel (opt-in, `--features hive-rescue`)
+
+When a machine is cut off from the relay and from every peer, it has no way to learn that the relay moved. The rescue channel is a last-resort mailbox on the Hive blockchain: one fleet account, one sealed, master-signed `custom_json` only when it is needed, read by cut-off machines that poll a few Hive nodes.
+
+- **Off by default**, in a separate crate (`ferryman-hive-rescue`) and behind a CLI feature. `[hive_rescue] enabled = true` in `ferry.toml` turns it on.
+- **The record grants nothing.** It says where to reach the master (an iroh endpoint id, optionally relay URL) and which rescue relay to try. A reader verifies the signature against the roster, then iroh's normal peer checks still apply.
+- **Posted** by the master after `cut_off_minutes` (15) cut off from relay and peers, re-posted every `repost_minutes` (45) while still cut off, and when the relay list changes. A non-master `backup` poster is optional (cut off and no fresh master record for 60 minutes). Routine posting is off.
+- **Sealed** to the roster members that published an `encryption_key`: a per-record ephemeral X25519 key wraps a content key for each member, the body is ChaCha20-Poly1305. Anyone reading Hive sees only ciphertext of about 80 bytes per member.
+- **Replay**: per-signer sequence numbers and an expiry (60 minutes).
+- **Keys**: the fleet account's own keys are never on a machine. The poster signs with its own posting key via account-authority delegation; set `HIVE_RESCUE_ACCOUNT` (the fleet account), `HIVE_RESCUE_POSTING_KEY` and optionally `HIVE_RESCUE_POSTER` in the environment or in `X:\ferry\secrets\.env`. The key is never logged.
+- **CLI**: `ferry rescue hive status | post --dry-run | read | mock` (the plain `ferry rescue` stays the break-glass terminal).
+
+See `docs/testing/rescue-drill.md` for the drill.
+
 ## Is the lane healthy? Alerts
 
 Once per worker pass the lane works out what is wrong with itself, from what it last did:
