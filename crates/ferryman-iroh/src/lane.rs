@@ -37,6 +37,7 @@ use serde::{Deserialize, Serialize};
 
 use ferryman_channel::{ProjectRoute, access, ferry, syncscope};
 
+use crate::config::RelayPlan;
 use crate::manifest::{self, Entry, HashCache, Plan, Rules};
 use crate::{ALPN, IrohConfig, MAX_FILE, endpoint_hex};
 
@@ -44,6 +45,11 @@ use crate::{ALPN, IrohConfig, MAX_FILE, endpoint_hex};
 pub const ROUND_EVERY: Duration = Duration::from_secs(30);
 /// How long a peer gets to answer a dial.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the relays of ours may all be unreachable before the public relays are added
+/// (only when `fallback_public_relays` is on).
+const FALLBACK_AFTER: chrono::Duration = chrono::Duration::minutes(2);
+/// A peer that has failed for this long is worth a warning; a single bad round is not.
+pub const ERROR_GRACE: chrono::Duration = chrono::Duration::minutes(2);
 /// How long one peer's whole round may take before it is abandoned until the next.
 const PEER_TIMEOUT: Duration = Duration::from_secs(600);
 /// The largest message that is not a file. A manifest of a big channel is the biggest.
@@ -52,7 +58,51 @@ const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Close code for a connection from an endpoint no channel here has on record.
 const NOT_TRUSTED: u32 = 403;
 
-/// Bind this machine's endpoint for `config`: our relay or none, never n0's.
+/// The relay mode a configuration asks for (see [`IrohConfig::relay_plan`]):
+///
+/// - direct only: no relay;
+/// - our own relays: exactly those, in the order given, each with the shared token when
+///   there is one (the token is optional) - public relays are not in the map;
+/// - nothing named: iroh's public relays, which need no pin and no token.
+///
+/// # Errors
+/// A relay URL does not parse or the token file cannot be read.
+pub fn relay_mode(config: &IrohConfig) -> Result<RelayMode> {
+    match config.relay_plan() {
+        RelayPlan::Direct => Ok(RelayMode::Disabled),
+        RelayPlan::Public => Ok(RelayMode::Default),
+        RelayPlan::Custom { urls, .. } => {
+            let token = config.token()?;
+            let mut configs = Vec::new();
+            for url in urls {
+                let parsed: RelayUrl = url
+                    .parse()
+                    .with_context(|| format!("relay '{url}' is not a URL"))?;
+                let mut relay = RelayConfig::from(parsed);
+                if let Some(quic) = relay.quic.as_mut() {
+                    quic.port = config.relay_quic_port;
+                }
+                if let Some(token) = &token {
+                    relay = relay.with_auth_token(token.clone());
+                }
+                configs.push(relay);
+            }
+            Ok(RelayMode::Custom(RelayMap::from_iter(configs)))
+        }
+    }
+}
+
+/// The host part of each relay URL, for telling our relays from public ones.
+fn relay_hosts(urls: &[String]) -> Vec<String> {
+    urls.iter()
+        .filter_map(|url| url.parse::<RelayUrl>().ok())
+        .filter_map(|url| url.host_str().map(str::to_owned))
+        .collect()
+}
+
+/// Bind this machine's endpoint for `config`: our relays, iroh's public relays, or none,
+/// as [`relay_mode`] says. Public relays are added to a custom setup later and only if
+/// asked for ([`Lane::round`]).
 ///
 /// `presets::Minimal` sets the crypto provider and nothing else, so there is no address
 /// lookup service (no n0 DNS, no pkarr) to opt out of. Peers are dialed by endpoint id and
@@ -60,30 +110,54 @@ const NOT_TRUSTED: u32 = 403;
 /// machines through that relay when one exists.
 ///
 /// # Errors
-/// The relay URL does not parse, the token file cannot be read, or the endpoint cannot
+/// A relay URL does not parse, the token file cannot be read, or the endpoint cannot
 /// bind a socket.
 pub async fn bind(config: &IrohConfig, key: iroh::SecretKey) -> Result<Endpoint> {
+    Ok(bind_with_map(config, key).await?.0)
+}
+
+/// [`bind`], and the relay map the endpoint shares when it is one of ours and public relays
+/// may be added to it later; hand that to [`Lane::configure_relays`].
+///
+/// # Errors
+/// As [`bind`].
+pub async fn bind_with_map(
+    config: &IrohConfig,
+    key: iroh::SecretKey,
+) -> Result<(Endpoint, Option<RelayMap>)> {
+    let mode = relay_mode(config)?;
+    let keep = match (&mode, config.relay_plan()) {
+        (
+            RelayMode::Custom(map),
+            RelayPlan::Custom {
+                fallback_public: true,
+                ..
+            },
+        ) => Some(map.clone()),
+        _ => None,
+    };
+    let fallback = matches!(
+        config.relay_plan(),
+        RelayPlan::Custom {
+            fallback_public: true,
+            ..
+        }
+    );
     let builder = Endpoint::builder(presets::Minimal)
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
-        .ca_tls_config(crate::tls::ca_config(config.relay_cert_sha256));
-    let builder = match &config.relay_url {
-        Some(url) => {
-            let url: RelayUrl = url
-                .parse()
-                .with_context(|| format!("relay_url '{url}' is not a URL"))?;
-            let mut relay = RelayConfig::from(url);
-            if let Some(quic) = relay.quic.as_mut() {
-                quic.port = config.relay_quic_port;
-            }
-            if let Some(token) = config.token()? {
-                relay = relay.with_auth_token(token);
-            }
-            builder.relay_mode(RelayMode::Custom(RelayMap::from(relay)))
-        }
-        None => builder.relay_mode(RelayMode::Disabled),
-    };
-    builder.bind().await.context("bind the iroh endpoint")
+        .ca_tls_config(crate::tls::ca_config(
+            // The pin is for our own relays; with none named it would wrongly bind the
+            // public ones to it.
+            config
+                .relay_cert_sha256
+                .filter(|_| !config.relays.is_empty() && !config.direct_only),
+            &relay_hosts(&config.relays),
+            fallback,
+        ))
+        .relay_mode(mode);
+    let endpoint = builder.bind().await.context("bind the iroh endpoint")?;
+    Ok((endpoint, keep))
 }
 
 /// Whether the relay in `config` lets an endpoint in: `Ok` once one is connected to it,
@@ -96,8 +170,8 @@ pub async fn bind(config: &IrohConfig, key: iroh::SecretKey) -> Result<Endpoint>
 /// # Errors
 /// The relay did not accept a connection within `wait`, and why when it is known.
 pub async fn probe_relay(config: &IrohConfig, wait: Duration) -> Result<()> {
-    if config.relay_url.is_none() {
-        bail!("no relay_url configured");
+    if config.relay_plan() == RelayPlan::Direct {
+        bail!("no relay configured (direct only)");
     }
     let endpoint = bind(config, iroh::SecretKey::generate()).await?;
     let mut watcher = endpoint.home_relay_status();
@@ -145,6 +219,24 @@ pub struct Status {
     pub relay_problem: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated: Option<DateTime<Utc>>,
+    /// When this lane started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started: Option<DateTime<Utc>>,
+    /// This lane's version, so `status` can set it beside each peer's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The relay this endpoint is homed on right now (ours or a public one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_relay: Option<String>,
+    /// Since when no relay has been connected, while one is meant to be. Cleared on connect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_down_since: Option<DateTime<Utc>>,
+    /// Whether a relay is meant to be in use at all (false for direct only).
+    #[serde(default)]
+    pub relay_expected: bool,
+    /// iroh's public relays were added because none of ours could be reached.
+    #[serde(default)]
+    pub public_fallback_active: bool,
     /// By endpoint id.
     #[serde(default)]
     pub peers: BTreeMap<String, PeerStatus>,
@@ -164,6 +256,15 @@ pub struct PeerStatus {
     pub received: u64,
     /// Files sent to this peer, since the worker started.
     pub sent: u64,
+    /// The version of ferry the peer runs, as it said in the exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// How the last exchange travelled: `direct`, or `relay <url>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Since when every exchange with this peer has failed. Cleared by a good one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failing_since: Option<DateTime<Utc>>,
 }
 
 impl Status {
@@ -184,6 +285,9 @@ struct Hello {
     /// files that will be skipped. A dialer that does not say sends.
     #[serde(default = "yes")]
     send: bool,
+    /// The dialer's version of ferry, so the answerer can show it. Older peers say none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
 }
 
 fn yes() -> bool {
@@ -221,6 +325,30 @@ pub struct Outcome {
     /// The projects that were actually exchanged. A project only one side serves, or
     /// only one side trusts the other in, is refused by the other side and left out.
     pub projects: Vec<String>,
+    /// The version the peer said it runs.
+    pub peer_version: Option<String>,
+    /// How the connection travelled: `direct` or `relay <url>`.
+    pub path: Option<String>,
+}
+
+/// This build's version, as it is told to peers.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// How a connection is travelling now: the selected path, direct or through a relay.
+fn path_of(connection: &Connection) -> Option<String> {
+    let paths = connection.paths();
+    let chosen = paths
+        .iter()
+        .find(iroh::endpoint::Path::is_selected)
+        .or_else(|| paths.iter().next())?;
+    Some(if chosen.is_relay() {
+        match chosen.remote_addr() {
+            iroh::TransportAddr::Relay(url) => format!("relay {url}"),
+            _ => "relay".to_owned(),
+        }
+    } else {
+        "direct".to_owned()
+    })
 }
 
 /// One endpoint serving and syncing every channel in `projects`.
@@ -235,6 +363,10 @@ pub struct Lane {
     /// The agents that run on this machine, so the lane knows when every one of them is a
     /// Worker and the channel is receive-only here. Empty (tests) means none are known.
     local_agents: Mutex<Vec<String>>,
+    /// The relay map the endpoint was bound with, kept when public relays may be added to it
+    /// later (`fallback_public_relays`): the endpoint shares it, so an entry added here is
+    /// seen by iroh.
+    fallback_map: Mutex<Option<RelayMap>>,
 }
 
 impl Lane {
@@ -251,6 +383,8 @@ impl Lane {
         Arc::new(Self {
             status: Mutex::new(Status {
                 endpoint_id: own.clone(),
+                started: Some(Utc::now()),
+                version: Some(VERSION.to_owned()),
                 relay_url,
                 ..Status::default()
             }),
@@ -260,11 +394,28 @@ impl Lane {
             cache: Mutex::new(HashCache::default()),
             status_file,
             local_agents: Mutex::new(Vec::new()),
+            fallback_map: Mutex::new(None),
         })
     }
 
+    /// Say how relays are meant to be used, so the lane knows what "relay unreachable"
+    /// means and what to do about it: `expected` is false for direct only; `fallback` is the
+    /// map the endpoint was bound with when iroh's public relays may be added to it once
+    /// none of ours has answered for a couple of minutes.
+    pub fn configure_relays(&self, expected: bool, fallback: Option<RelayMap>) {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .relay_expected = expected;
+        *self
+            .fallback_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = fallback;
+    }
+
     /// A snapshot of the channels served now.
-    fn routes(&self) -> Vec<ProjectRoute> {
+    #[must_use]
+    pub fn routes(&self) -> Vec<ProjectRoute> {
         self.projects
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -491,7 +642,10 @@ impl Lane {
             return;
         };
         while let Ok((send, recv)) = connection.accept_bi().await {
-            let outcome = self.answer(&peer, send, recv).await;
+            let mut outcome = self.answer(&peer, send, recv).await;
+            if let Ok(done) = &mut outcome {
+                done.path = path_of(&connection);
+            }
             self.note(&remote, &peer, outcome);
         }
     }
@@ -503,6 +657,7 @@ impl Lane {
         mut recv: RecvStream,
     ) -> Result<Outcome> {
         let hello: Hello = read_frame(&mut recv).await?;
+        let peer_version = hello.version.clone();
         // `<project>` is the channel, `<project>+handins` its hand-ins folder.
         let project_id = hello
             .project_id
@@ -541,6 +696,7 @@ impl Lane {
         if !hello.send {
             plan.want.clear();
         }
+        plan.version = Some(VERSION.to_owned());
         write_frame(&mut send, &Reply::Plan(plan.clone())).await?;
         let mut received = 0;
         for path in &plan.want {
@@ -555,6 +711,8 @@ impl Lane {
             received,
             sent,
             projects: vec![share.key.clone()],
+            peer_version,
+            path: None,
         })
     }
 
@@ -590,16 +748,20 @@ impl Lane {
         }) {
             for share in self.shares(route, peer) {
                 match self.sync_share(&connection, &share).await {
-                    Ok(Some((received, sent))) => {
+                    Ok(Some((received, sent, version))) => {
                         totals.received += received;
                         totals.sent += sent;
                         totals.projects.push(share.key.clone());
+                        if version.is_some() {
+                            totals.peer_version = version;
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => failures.push(format!("{}: {error:#}", share.key)),
                 }
             }
         }
+        totals.path = path_of(&connection);
         connection.close(0u32.into(), b"done");
         if failures.is_empty() {
             Ok(totals)
@@ -613,7 +775,7 @@ impl Lane {
         &self,
         connection: &Connection,
         share: &Share,
-    ) -> Result<Option<(u64, u64)>> {
+    ) -> Result<Option<(u64, u64, Option<String>)>> {
         let (channel, rules) = (&share.dir, &share.rules);
         let ours = self.scan(channel, rules);
         // What this side offers: everything it has, or - for a folder it only listens to -
@@ -630,6 +792,7 @@ impl Lane {
                 project_id: share.key.clone(),
                 manifest: ours.values().cloned().collect(),
                 send: share.send,
+                version: Some(VERSION.to_owned()),
             },
         )
         .await?;
@@ -650,7 +813,7 @@ impl Lane {
         // written everything sent to it. Closing the connection before then discards what
         // is still in flight, which is exactly the case where there was nothing to receive.
         let _ = recv.read_to_end(64).await;
-        Ok(Some((received, sent)))
+        Ok(Some((received, sent, plan.version)))
     }
 
     fn scan(&self, channel: &Path, rules: &Rules) -> BTreeMap<String, Entry> {
@@ -672,14 +835,35 @@ impl Lane {
             Ok(outcome) => {
                 entry.last_sync = Some(Utc::now());
                 entry.last_error = None;
+                entry.failing_since = None;
                 entry.received += outcome.received;
                 entry.sent += outcome.sent;
                 if !outcome.projects.is_empty() {
                     entry.projects = outcome.projects;
                 }
+                if outcome.peer_version.is_some() {
+                    entry.version = outcome.peer_version;
+                }
+                if outcome.path.is_some() {
+                    entry.path = outcome.path;
+                }
             }
-            Err(error) => entry.last_error = Some(format!("{error:#}")),
+            Err(error) => {
+                entry.last_error = Some(format!("{error:#}"));
+                entry.failing_since.get_or_insert_with(Utc::now);
+            }
         }
+    }
+
+    /// The relay this endpoint is homed on, as a URL, for the TRANSPORTS record: a peer
+    /// dials us through it. Falls back to the primary relay of ours when none is connected.
+    #[must_use]
+    pub fn home_relay_url(&self) -> Option<String> {
+        let relays = self.endpoint.home_relay_status().get();
+        relays
+            .iter()
+            .find(|relay| relay.is_connected())
+            .map(|relay| relay.url().to_string())
     }
 
     fn record_relay(&self) {
@@ -689,6 +873,31 @@ impl Lane {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         status.relay_connected = relays.iter().any(iroh::endpoint::RelayStatus::is_connected);
+        status.home_relay = relays
+            .iter()
+            .find(|relay| relay.is_connected())
+            .map(|relay| relay.url().to_string());
+        if !status.relay_expected || status.relay_connected {
+            status.relay_down_since = None;
+        } else {
+            status.relay_down_since.get_or_insert_with(Utc::now);
+        }
+        // Our own relays are all unreachable, and public ones were asked for as a fallback:
+        // add them now. The map is shared with the endpoint, so iroh sees them on its next
+        // look at the network. Once added they stay for the life of the worker.
+        if !status.public_fallback_active
+            && status
+                .relay_down_since
+                .is_some_and(|since| Utc::now() - since >= FALLBACK_AFTER)
+            && let Some(map) = self
+                .fallback_map
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+        {
+            map.extend(&RelayMode::Default.relay_map());
+            status.public_fallback_active = true;
+        }
         status.relay_problem = relays.iter().find_map(|relay| {
             relay
                 .auth_denied_reason()
@@ -919,5 +1128,111 @@ mod data_tests {
         );
         // Another project is not affected.
         assert_eq!(data_spot(&channel, "other"), None);
+    }
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    fn config(extra: &str, state: &Path) -> IrohConfig {
+        IrohConfig::parse(&format!("[iroh]\nenabled = true\n{extra}"), Some(state))
+    }
+
+    fn urls(mode: &RelayMode) -> Vec<String> {
+        let mut urls: Vec<String> = mode
+            .relay_map()
+            .urls::<Vec<RelayUrl>>()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        urls.sort();
+        urls
+    }
+
+    #[test]
+    fn nothing_named_is_iroh_s_public_relays() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = relay_mode(&config("", dir.path())).unwrap();
+        assert_eq!(mode, RelayMode::Default);
+        assert!(!mode.relay_map().is_empty());
+    }
+
+    #[test]
+    fn direct_only_is_no_relay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = relay_mode(&config("direct_only = true\n", dir.path())).unwrap();
+        assert!(mode.relay_map().is_empty());
+    }
+
+    #[test]
+    fn our_relays_are_exactly_ours_and_no_public_one_unless_added_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let both = config(
+            "relay_url = \"https://a.example\"\nrelays = [\"https://b.example\"]\n\
+             fallback_public_relays = true\n",
+            dir.path(),
+        );
+        let mode = relay_mode(&both).unwrap();
+        assert_eq!(urls(&mode), ["https://a.example/", "https://b.example/"]);
+    }
+
+    #[test]
+    fn the_token_is_optional_and_is_put_on_our_relays_only_when_there_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config("relay_url = \"https://a.example\"\n", dir.path());
+        let token_of = |mode: &RelayMode| -> Vec<Option<String>> {
+            mode.relay_map()
+                .relays::<Vec<Arc<RelayConfig>>>()
+                .iter()
+                .map(|relay| relay.auth_token.clone())
+                .collect()
+        };
+        assert_eq!(token_of(&relay_mode(&cfg).unwrap()), [None]);
+        std::fs::write(
+            dir.path().join(crate::config::DEFAULT_TOKEN_FILE),
+            "s3cret\n",
+        )
+        .unwrap();
+        assert_eq!(
+            token_of(&relay_mode(&cfg).unwrap()),
+            [Some("s3cret".to_owned())]
+        );
+    }
+
+    #[test]
+    fn our_hosts_are_told_apart_from_public_ones_by_host() {
+        let hosts = relay_hosts(&[
+            "https://162.35.10.46".into(),
+            "https://Relay.Example".into(),
+        ]);
+        assert!(hosts.contains(&"162.35.10.46".to_owned()), "{hosts:?}");
+        assert!(
+            hosts
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("relay.example"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_lane_binds_with_no_token_in_each_of_the_three_modes() {
+        let dir = tempfile::tempdir().unwrap();
+        for extra in [
+            "",
+            "relay_url = \"https://127.0.0.1:9\"\n",
+            "relay_url = \"https://127.0.0.1:9\"\nfallback_public_relays = true\n",
+            "direct_only = true\n",
+        ] {
+            let cfg = config(extra, dir.path());
+            assert_eq!(cfg.token().unwrap(), None);
+            let (endpoint, kept) = bind_with_map(&cfg, iroh::SecretKey::generate())
+                .await
+                .unwrap_or_else(|error| panic!("{extra:?}: {error:#}"));
+            assert_eq!(
+                kept.is_some(),
+                cfg.fallback_public_relays && !cfg.relays.is_empty()
+            );
+            endpoint.close().await;
+        }
     }
 }

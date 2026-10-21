@@ -225,6 +225,8 @@ fn the_windows_wrapper_loads_its_environment_from_a_file_and_is_read_as_the_work
     );
     assert!(text.contains("SetEnvironmentVariable"));
     assert!(text.contains("exit $LASTEXITCODE"));
+    // The worker reads this to know a failing exit will be restarted (the update restart).
+    assert!(text.contains("$env:FERRYMAN_SUPERVISED"), "{text}");
     assert!(!text.contains("API_KEY"));
     let (found, _) = machine::invocation_in_text(&text).expect("the wrapper runs a worker");
     assert!(found.all_projects);

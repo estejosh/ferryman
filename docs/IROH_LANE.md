@@ -1,10 +1,10 @@
-# The iroh lane: channels over QUIC, through our own relay
+# The iroh lane: channels over QUIC, through a relay of your choice
 
 Syncthing carries a channel well between machines on one network. Away from home it is
 only as good as its discovery and its public relays. The iroh lane carries the same
 channel folders a second way: over [iroh](https://www.iroh.computer) (QUIC, peers
-identified by ed25519 endpoint ids), through a relay we run ourselves, and directly
-between two machines whenever they can see each other.
+identified by ed25519 endpoint ids), through a relay (a small one of your own, iroh's
+public ones, or none), and directly between two machines whenever they can see each other.
 
 It runs **beside** Syncthing, not instead of it. Both write channel files the same way
 (temporary file, then rename) and both keep modification times, so a file that arrived by
@@ -12,7 +12,17 @@ one lane is simply already there when the other looks.
 
 ## Turning it on, per machine
 
-1. Add to the ferry root's `ferry.toml` (machine-local, never synced):
+1. Add to the ferry root's `ferry.toml` (machine-local, never synced). The smallest working
+   setup, and the right one for a new user, is:
+
+   ```toml
+   [iroh]
+   enabled = true
+   ```
+
+   With no relay named, the lane uses iroh's public relays: no server to run, no
+   certificate to pin, no token. To use a relay of your own instead, see
+   [Relays](#relays-ours-irohs-public-ones-or-none) below. Our own fleet's relay is:
 
    ```toml
    [iroh]
@@ -22,10 +32,12 @@ one lane is simply already there when the other looks.
    relay_cert_sha256 = "49:32:08:E4:6F:B8:E3:9B:FD:F2:8D:B8:0F:8C:33:F9:9F:2A:57:A0:A1:71:B3:52:4A:9D:11:67:AD:BD:C0:D1"
    ```
 
-2. Put the relay's access token, and nothing else, in `iroh-relay.token` in the machine
-   state directory (`%LOCALAPPDATA%\Ferryman` on Windows, `~/.local/state/ferryman` on
-   Linux, or `$FERRYMAN_STATE_DIR`). `relay_token_file = "<path>"` points elsewhere.
-   The token is read, never printed, and never belongs in a channel or in `ferry.toml`.
+2. Only if the relay asks for an access token: put it, and nothing else, in
+   `iroh-relay.token` in the machine state directory (`%LOCALAPPDATA%\Ferryman` on Windows,
+   `~/.local/state/ferryman` on Linux, or `$FERRYMAN_STATE_DIR`). `relay_token_file =
+   "<path>"` points elsewhere. **The token is optional**: with no file the lane connects
+   without one, which is all the public relays ask for. It is read, never printed, and never
+   belongs in a channel or in `ferry.toml`.
 
 3. From the worker's home checkout (where its `agent.toml` is):
 
@@ -39,12 +51,91 @@ one lane is simply already there when the other looks.
 4. Restart the worker (`ferry agent run --all-projects`). Its startup line says
    `iroh lane on as <endpoint id> over N channel(s), relay ...`.
 
-5. `ferry lane iroh status` shows the endpoint id, whether the relay lets us in (it dials
-   with a throwaway key, so it does not disturb the worker), and each peer the worker has
-   synced with: when, which projects, how many files each way, and the last error.
+5. `ferry lane iroh status` shows the endpoint id, the version, which relays may be used,
+   whether the relay lets us in (it dials with a throwaway key, so it does not disturb the
+   worker), any standing alerts, and for each peer the worker has synced with: the last
+   success, the last error (and since when it has been failing), whether the exchange went
+   direct or through a relay (and which), the version it runs, and how many files went each
+   way. `--json` gives the same.
 
 Do this on every machine. A pair starts syncing once each has the other's record, and the
 records travel like any channel file: over Syncthing at first, over iroh after that.
+
+## Relays: ours, iroh's public ones, or none
+
+The lane works in any of these ways, chosen by what `[iroh]` says about relays:
+
+| `ferry.toml` | The lane uses |
+| --- | --- |
+| nothing about relays | **iroh's public relays** (n0's defaults). The default for a new user. |
+| `relay_url` and/or `relays` | **Our relays only**, primary first. Public relays are not used. |
+| the above plus `fallback_public_relays = true` | Ours, and iroh's public relays **only while none of ours can be reached**. |
+| `direct_only = true` | **No relay.** Machines must be able to reach each other. |
+
+```toml
+[iroh]
+enabled = true
+relay_url = "https://relay-one.example"        # the primary
+relays = ["https://relay-two.example"]          # more of ours, after the primary
+relay_cert_sha256 = "49:32:...:C0:D1"           # pins OUR relays (self-signed certificate)
+fallback_public_relays = true                   # off unless you say so
+alert_after_minutes = 15                        # see "Is the lane healthy?"
+```
+
+- **Our relays** are pinned: each must present the one certificate in `relay_cert_sha256`
+  and nothing a public CA signed stands in for it. With no pin they must present a certificate
+  a public CA signed. All must be `https://`.
+- **Public relays** are checked against the public CA roots in the ordinary way and need no
+  pin and no token. When the fallback is on, one verifier serves both: a relay at one of our
+  hosts needs the pin, any other relay needs a public certificate.
+- **The fallback is a fallback**, not a second choice made by latency. The lane starts with our
+  relays only. If none has been connected for two minutes, the public relays are added to the
+  relay map the endpoint was bound with, and `status` says so. The map is shared with the
+  endpoint, so iroh sees the new entries the next time it checks the network; restarting the
+  worker applies them at once. They stay for the life of the worker. A peer is dialed through
+  the relay its own TRANSPORTS record names: the worker republishes its record when the relay it
+  is on changes (a public-relay setup publishes its home relay once connected), so a peer on a
+  public relay can still be found.
+- **The token is optional in all of these.** It is put on our relays when `iroh-relay.token`
+  exists and nowhere else, and never on a public relay. A relay that wants no token needs no
+  file; a lane with no token and public relays works as it is. A machine can move off the shared
+  token without the lane noticing: delete the file once the relay no longer asks.
+- **Direct only** is for a flat network. With no relay, two machines behind different NATs
+  will often not reach each other, and `status` will say so.
+- iroh picks its home relay among the relays it knows by latency, so the order of `relays`
+  is the order they are listed and published, not a guarantee of which one carries a given
+  connection.
+
+A config that says `enabled = true` and names no relay used to mean "direct only". It now means
+"iroh's public relays". Add `direct_only = true` to keep the old behaviour.
+
+## Is the lane healthy? Alerts
+
+Once per worker pass the lane works out what is wrong with itself, from what it last did:
+
+- **a peer failing**: every exchange with it has ended in an error for two minutes or more;
+- **a peer gone quiet**: no successful sync with it for `alert_after_minutes` (default 15),
+  counted from the lane's start for a peer it has never reached;
+- **no relay**: a relay is meant to be in use and none has been connected for two minutes.
+
+A peer that is both failing and quiet is one alert. Each alert is raised **once**, when it
+starts to hold, and cleared **once**, when it stops. It is shown:
+
+- in the worker's log (`iroh lane alert: ...`, then `iroh lane recovered: ...`);
+- in `ferry doctor` (a `lane` line) and `ferry lane iroh status` (an `ALERT` line);
+- in the dashboard's `/api/fleet` as `lane_alerts` (checked, threshold, and each alert with
+  its key, text, since and severity `warning`);
+- to the rest of the fleet as a `lane-health` notice in the fleet folder (ADR 0026), severity
+  `warning`, signed by the machine's own identity and about its own machine only. The notice id
+  is fixed per machine and alert, so raising it again replaces the file, and recovery overwrites
+  the same file, marked `info` and expired, which every reader treats as gone. Nothing is
+  deleted (the lane never deletes). A machine the master has not admitted (`ferry fleet admit`)
+  cannot post one and says so; it still has the first three. There is no Telegram push for these
+  today: the Telegram bridge only relays orders and results.
+
+The alert state is in `lane-alerts.json` in the machine state directory (machine-local).
+Machines still on 0.6.1 do not know the `lane-health` kind and list those notices as ignored in
+`ferry doctor` until they update.
 
 ## Who may connect
 
@@ -128,7 +219,9 @@ A project's `data/` folder is machine-local and is never exchanged. By default i
   Syncthing would have kept a conflict copy. Channel writers are mostly one-writer,
   write-once files, which is why this is acceptable for now.
 - No LAN discovery: peers are dialed by endpoint id and the relay URL in their record,
-  and iroh finds the direct path between them through that relay. With no relay
-  configured, the lane has no way to reach anyone.
+  and iroh finds the direct path between them through that relay. With `direct_only` and
+  no address a peer can reach, the lane has no way to reach anyone.
+- The public-relay fallback is exercised by tests of the configuration, the relay map and the
+  certificate check, not against n0's servers; try it on a machine before relying on it.
 - The relay certificate is pinned by hash: rotating it means changing
   `relay_cert_sha256` on every machine.

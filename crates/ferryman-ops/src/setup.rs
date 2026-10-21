@@ -398,6 +398,9 @@ pub fn windows_wrapper(spec: &Spec, command: &str) -> String {
          \x20 }}\r\n\
          }}\r\n\
          $env:GIT_TERMINAL_PROMPT = '0'\r\n\
+         # The task restarts a failing exit: a worker that stops to take an update exits 75\r\n\
+         # (EX_TEMPFAIL) so this wrapper passes a failure on and the task starts it again.\r\n\
+         $env:FERRYMAN_SUPERVISED = 'task'\r\n\
          $env:GCM_INTERACTIVE = 'never'\r\n\
          Set-Location -LiteralPath {workspace}\r\n\
          & {ferry} {command}\r\n\

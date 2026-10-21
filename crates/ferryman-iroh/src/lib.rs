@@ -51,6 +51,7 @@
 //! [iroh]: https://www.iroh.computer
 
 pub mod config;
+pub mod health;
 pub mod lane;
 pub mod manifest;
 pub mod tls;

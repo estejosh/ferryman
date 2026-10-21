@@ -1098,11 +1098,12 @@ pub fn read_machines(root: &Root) -> (Vec<MachineRow>, Findings) {
 // ---------------------------------------------------------------------------------------
 // Notices
 
-pub const NOTICE_KINDS: [&str; 5] = [
+pub const NOTICE_KINDS: [&str; 6] = [
     "layout-change",
     "deprecation",
     "update-available",
     "migration",
+    "lane-health",
     "general",
 ];
 pub const SEVERITIES: [&str; 3] = ["info", "warning", "high"];
@@ -1118,8 +1119,8 @@ pub struct NoticeBody {
     pub issued: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires: Option<DateTime<Utc>>,
-    /// The machine a `layout-change` or `migration` notice is about; the machine's own
-    /// identity may sign those, and only those, for itself.
+    /// The machine a `layout-change`, `migration` or `lane-health` notice is about; the
+    /// machine's own identity may sign those, and only those, for itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
     /// Kind-specific facts: old and new paths, the version an update names.
@@ -1147,13 +1148,16 @@ impl NoticeBody {
 }
 
 fn notice_scope(body: &NoticeBody) -> Option<&str> {
-    matches!(body.kind.as_str(), "layout-change" | "migration")
-        .then_some(body.machine.as_deref())
-        .flatten()
+    matches!(
+        body.kind.as_str(),
+        "layout-change" | "migration" | "lane-health"
+    )
+    .then_some(body.machine.as_deref())
+    .flatten()
 }
 
-/// Post a notice. The master may post any; a machine identity may post a `layout-change`
-/// or `migration` notice about its own machine.
+/// Post a notice. The master may post any; a machine identity may post a `layout-change`,
+/// `migration` or `lane-health` notice about its own machine.
 ///
 /// # Errors
 /// A kind or severity that is not known, a field too long, or no standing.
@@ -1988,6 +1992,45 @@ mod tests {
         by_machine.title = "again".into();
         post_notice(&f.root, &f.beastly, by_machine.clone()).unwrap();
         post_notice(&f.root, &f.josh, by_machine).unwrap();
+    }
+
+    #[test]
+    fn a_machine_raises_one_lane_health_notice_about_itself_and_clears_it_in_place() {
+        let f = fleet();
+        let id = crate::lanealerts::notice_id("beastly", "peer:aaaa");
+        let mut raised = NoticeBody::new("lane-health", "warning", "beastly: no sync", "quiet");
+        raised.id = id.clone();
+        raised.machine = Some("beastly".into());
+        post_notice(&f.root, &f.beastly, raised.clone()).unwrap();
+        // Raised again with new text on a later pass: still one notice.
+        raised.text = "quiet for 20 minutes".into();
+        post_notice(&f.root, &f.beastly, raised.clone()).unwrap();
+        let (rows, findings) = read_notices(&f.root);
+        assert_eq!(rows.len(), 1, "{findings:?}");
+        assert_eq!(rows[0].body.severity, "warning");
+        assert!(!rows[0].expired);
+        // Recovery overwrites the same file and expires it, which readers treat as gone.
+        let mut cleared = raised;
+        cleared.severity = "info".into();
+        cleared.expires = Some(Utc::now());
+        post_notice(&f.root, &f.beastly, cleared).unwrap();
+        let (rows, _) = read_notices(&f.root);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].expired);
+        assert_eq!(rows[0].body.id, id);
+    }
+
+    #[test]
+    fn a_machine_cannot_speak_for_another_machines_lane() {
+        let f = fleet();
+        let mut notice = NoticeBody::new("lane-health", "warning", "tiny is down", "text");
+        notice.machine = Some("tiny".into());
+        let error = post_notice(&f.root, &f.beastly, notice).unwrap_err();
+        assert!(error.to_string().contains("may not post"), "{error}");
+        // Without a machine named, it is not a machine-scoped notice at all.
+        let mut anonymous = NoticeBody::new("lane-health", "warning", "x", "text");
+        anonymous.machine = None;
+        assert!(post_notice(&f.root, &f.beastly, anonymous).is_err());
     }
 
     #[test]
