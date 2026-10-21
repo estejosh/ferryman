@@ -1,0 +1,20 @@
+# Tokens and secret values belong in the environment or an OS keychain reference.
+listen = "127.0.0.1:8787"
+database = "./.data/bridge.db"
+artifacts = "./.data/artifacts"
+# Set ORCHESTRATOR_NETWORK_ARTIFACTS to a mapped/network HDD when it is available.
+# The bridge falls back to the local artifacts path when that directory does not exist.
+workspace_root = "./.data/projects"
+memory_root = "./.data/bridge-memory"
+# Optional but recommended: give only a trusted operator the matching memory token.
+# Server: ORCHESTRATOR_MEMORY_WRITE_TOKEN=...
+# CLI/operator: ORCHESTRATOR_MEMORY_TOKEN=...
+# Optional Google Drive mirror: set both values as environment variables, never here.
+# ORCHESTRATOR_DRIVE_ACCESS_TOKEN=...
+# ORCHESTRATOR_DRIVE_FOLDER_ID=...
+local_development = true
+
+[retention]
+# Project integrations should minimize prompt/result retention before submission.
+artifact_days = 30
+event_days = 30

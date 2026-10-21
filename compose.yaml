@@ -1,0 +1,6 @@
+services:
+  bridge:
+    build: .
+    ports: ["8787:8787"]
+    volumes: ["./.data:/data"]
+    command: ["orchestrator-server", "--database", "/data/bridge.db", "--artifacts", "/data/artifacts"]

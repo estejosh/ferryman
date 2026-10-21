@@ -1,0 +1,17 @@
+name: Contributor policy
+on:
+  pull_request:
+jobs:
+  dco:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - name: Require Signed-off-by on every pull request commit
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          for commit in $(git rev-list "$BASE..$HEAD"); do
+            git log -1 --format=%B "$commit" | grep -qi '^Signed-off-by:' || { echo "Missing Signed-off-by in $commit. Commit with: git commit -s"; exit 1; }
+          done
