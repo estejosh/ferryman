@@ -7,6 +7,7 @@ members = [
   "crates/ferryman-ops",
   "crates/ferryman-worker-sdk",
   "crates/ferryman-iroh",
+  "crates/ferryman-hive-rescue",
   # A sub-product rather than a part of Ferryman: `ferry-deadman` seals a repo to a
   # future drand beacon round, and works on any git repository with no Ferryman
   # anywhere. It is in this workspace so it is built, linted and tested with
