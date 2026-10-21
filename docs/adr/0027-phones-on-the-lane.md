@@ -269,6 +269,8 @@ That is a precondition for any "no Syncthing fallback" claim; this ADR does not 
    Custodly's side for the QR screen and phrase confirm.
 7. The `custodly-deposit` project and receiver wiring, dual run, drills, cutover. 2 days of work
    and seven calendar days of observation.
+8. Rescue channel over Hive (proposal, see below). 8 to 10 days; a condition for removing Syncthing,
+   not for the dual run.
 
 About 25 to 30 working days, around six weeks elapsed with the observation week. Steps 2, 3 and
 4 can run beside 6 once the frame format in (a) is fixed.
@@ -295,11 +297,121 @@ These answer the questions this ADR was proposed with.
    docs/IROH_LANE.md, "Relays: ours, iroh's public ones, or none", shipped in v0.6.2). The gate
    is an extra door in front of our own relay, not a new requirement of the lane. A machine
    whose config names no relay, or only public ones, is unaffected by anything in this ADR.
-5. **A second relay: decision pending.** The rationale for one is a single point of failure: once
-   Syncthing is gone, a down relay stops every pair that cannot see each other directly. Two
-   things reduce the case for it. The lane now takes an ordered list of relays and can fall back
-   to iroh's public relays when none of ours answers (`fallback_public_relays`, v0.6.2), and it
-   raises a warning when the relay has been unreachable for two minutes. Whether that is enough,
-   or a second VPS is worth running, is left open until the lane has run without Syncthing for a
-   while. Note that a phone has no public-relay fallback unless the gate also admits it there,
-   which it cannot (public relays have no gate): a phone depends on our relay.
+5. **Our fleet uses our own relay, on the VPS (162.35.10.46); iroh's public relays stay an
+   option for other users and are off for our fleet.** `fallback_public_relays` exists
+   (v0.6.2) and stays unset in our `ferry.toml`; a setup that pins a relay never gets public
+   relays unless it asks. This is the posture the phones need anyway (a phone cannot use a
+   public relay, which has no gate).
+6. **A hosted relay may be sold later; the design must make it one more entry.** A paying user's
+   relay is a relay URL, a certificate (or a public-CA one) and, possibly, a credential that is
+   theirs alone. That is what a fleet relay entry is (item 7); the per-device credential is the
+   optional token of item 4 issued per device instead of shared, so nothing about the lane
+   changes when the relay is somebody's service rather than ours.
+7. **A second relay, decentrally: a master-signed fleet relay list (built in v0.6.2).**
+   `fleet/relays.json` in the fleet folder (ADR 0026) holds an ordered list of relays, signed by
+   the master and verified like every other fleet file: only the master's signature counts, and an
+   edited or foreign copy is ignored and shown by `ferry doctor`. An entry is a URL and, for a
+   relay no public CA signs for, the SHA-256 of its certificate, which the master vouches for and
+   which applies to that host only. Machines try the relays in their own `ferry.toml` first and
+   then the list in order; iroh homes on the best one and moves on when it stops answering, and the
+   worker republishes the relay it is on. Our VPS is first. Adding a second relay is therefore one
+   command on the master (`ferry fleet relays add ...`) and a worker restart on each machine, with
+   no edit to any `ferry.toml`. A change to the list is picked up when the worker restarts, because
+   the certificates to trust are fixed when the endpoint binds; making that live is a later step.
+
+   **Next step, not built: a fleet machine volunteers a relay.** The `iroh-relay` crate at the
+   version we use (1.3.0) has a `server` feature, so a relay can be embedded in `ferry` (a
+   `ferry relay serve`) or run as the stock `iroh-relay` binary, and its access-control hook is the
+   same one the gate in (c) uses. A machine with a publicly reachable port and a certificate would
+   run it and the master would add it to the list. This is small to build on top of the list
+   (about 3 days, most of it the certificate: a bare-IP self-signed certificate whose pin the
+   master writes into the entry, or a domain and an ordinary certificate) but it puts a relay on a
+   home or office machine, so it waits until a machine that should carry one exists.
+
+## Rescue channel over Hive (proposal, not built)
+
+Status: proposal. Nothing in this section is in v0.6.2 and none of it is decided.
+
+**The problem.** Once Syncthing is gone, the lane depends on a relay for any pair of machines that
+cannot reach each other directly. The relay list (decision 7) and the public-relay fallback cover a
+relay going down. They do not cover everything: the list itself arrives over the lane, so a machine
+that is cut off cannot learn that the master moved the fleet to a new relay; and all the relays in
+the list can be unreachable from one network at once. The machine then has nothing to find its peers
+with. The rescue channel is a way to say "here is where I am, and here is where to find us" that
+does not use the lane, a relay, a server of ours or Syncthing.
+
+**The idea.** When no relay and no peer path works, a machine posts a small sealed record to the
+Hive blockchain as a `custom_json` operation under a fleet-specific id (for example
+`ferryman-rescue-v1`), from a Hive account the fleet controls. A Hive block takes about 3 seconds,
+posting costs no money (it spends the account's resource credits), and a `custom_json` payload is
+limited to about 8 KB. The record carries:
+
+- the machine's current iroh endpoint addresses (its endpoint id, its relay URL, and, only if the
+  fleet turns it on, direct-address candidates for hole punching);
+- the relay-list version and, when the master has moved the fleet, the new relay URL or the whole
+  list (these records are signed by the master, not by the machine);
+- a sequence number, a validity time and the machine's name.
+
+Peers watch Hive (any public API node, several configured, none trusted for content because the
+content is signed) for operations with that id. A record that verifies is handed to iroh as an
+address-lookup source, so the next dial uses the addresses in it, and a master-signed relay change
+is applied like a change to `fleet/relays.json`. **It is rendezvous and signalling only.** No file,
+manifest, order or message ever goes over Hive, and the lane's own trust rules are unchanged: a
+peer reached through a rescue record is still let in only if its endpoint id is in a roster-honoured
+transports record.
+
+**Sealing and verification.**
+
+- *Signed:* a machine's record is signed with its roster key, and a relay change with the master's
+  key. A reader checks the signature against the fleet roster before using anything in it, exactly
+  as it does for fleet files, so what is on the chain is not trusted for what it says, only for being
+  there. A record from a name not on the roster, a revoked key, or a bad signature is dropped.
+- *Sealed:* the payload is encrypted so the chain's readers learn nothing from its content.
+  Recommended: a fresh ephemeral key per record, with the content key wrapped separately to each
+  roster member (an X25519 sealed box derived from the roster's keys), at about 80 bytes per
+  recipient, which fits a fleet of tens of machines in 8 KB. Revoking a machine means not wrapping
+  to it from then on. The alternative is one fleet rescue key held by every machine, which is smaller
+  but cannot be rotated while a machine is cut off, which is the case this exists for. Josh's
+  Obscura protocol is a candidate encoding for the sealed payload; it has not been evaluated here and
+  the choice is open.
+- *Replay:* each record has a per-signer sequence number (a reader keeps the highest it has seen and
+  drops anything lower or equal), an expiry (an hour is plenty: an address that is older is stale
+  anyway) and the signer's name inside what is signed, so a record cannot be replayed under another
+  name or after it has expired. The Hive block and its timestamp are only used to order and discard;
+  they are not trusted for time.
+
+**Risks.**
+
+- *Public metadata.* The content is sealed; the fact of it is not. Anyone can see that an account
+  posted under that id at those times, how often, and the size. Records posted only when the lane
+  is in trouble also tell an observer when the fleet is in trouble. The chain is permanent, so a
+  sealed record is stored for good: if the fleet's keys ever leak, old records become readable. That
+  is why direct IP addresses are off by default and why every record is sealed to a fresh key.
+- *Hive API node availability.* Public nodes come and go and rate-limit. Several are configured,
+  and a reader tries them in turn. If all are unreachable the rescue channel is simply unavailable,
+  as a relay would be; it is a fallback to a fallback.
+- *Account key custody.* The account's posting key lives on the machines that post (a posting key
+  cannot move funds, only post). A leaked key lets a stranger spend the account's resource credits
+  and spam the id, which costs the fleet its rescue channel until the key is rotated, and cannot
+  forge a record. Custody of the owner and active keys is Custodly's job. A per-machine account
+  instead of one shared account removes the shared key at the price of a roster entry per account.
+- *Cost.* Posting is free to the poster but not free: the account needs enough staked Hive Power
+  for the resource credits to post one small operation when a machine is in trouble. A handful of
+  operations a day is far inside what a small stake gives; the stake has to exist and be kept.
+- *A censoring or lagging node* can hide a record from one reader. Reading more than one node, and
+  accepting a record from whichever has it, is the answer.
+
+**Phones.** It works for phones with no change in kind. A phone has no relay but ours, and a phone
+can read Hive over HTTPS from any API node whatever network it is on. If our relay is down, a
+phone that cannot be told is stuck, and a signed relay-change record is how it would be told. A
+phone is a recipient only of the relay-list and relay-change records, never of other machines'
+addresses (the same restriction as its grant in (b)).
+
+**Effort and place in the order.** About 8 to 10 working days for one engineer: the record format,
+sealing and replay rules with tests (3), a Hive client that streams the id from several nodes and
+posts the operation (2), the iroh address-lookup source and the trigger that decides "no path
+works" (2 to 3, after a spike to confirm the extension point at iroh 1.3), the doctor and status
+lines (1), and an end-to-end test against a Hive test network or a recorded node (1 to 2). It is
+step 8 in the order above. It does not gate the cutover's dual run, but it is a condition for
+removing Syncthing, since that is the moment the lane becomes the only way a stranded machine
+could be reached.
