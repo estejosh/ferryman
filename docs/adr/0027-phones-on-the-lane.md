@@ -1,6 +1,7 @@
 # ADR 0027: Phones on the lane
 
-Status: proposed, for the master (josh). Builds on 0014, 0021, 0023, 0024 and 0026. Related to
+Status: proposed, for the master (josh); his decisions on the open questions are recorded at the
+end (2026-10-21). Builds on 0014, 0021, 0023, 0024 and 0026. Related to
 docs/IROH_LANE.md. Written for Custodly (an Android app that drops sealed key files into a
 folder that a receiver on beastly reads and answers with receipts), which needs the iroh lane
 as its transport because Syncthing is being retired about a week after iroh runs clean.
@@ -90,6 +91,9 @@ roster entry, grant, access file or verdict. `phone-grant` has no level above `w
 Revocation: the master sets `revoked` (higher `seq`) or removes the grant. The server rereads
 grants on every connection. Grants also expire (default 30 days, renewed by `RENEW` while the
 phone still holds a live one), so a phone that is lost and never revoked stops working alone.
+Renewal is silent: the phone swaps a grant near expiry for the next one in the background and the
+master is not asked again. Revocation is immediate and does not wait for expiry (see the decisions
+at the end).
 
 Onboarding, in order:
 
@@ -113,7 +117,8 @@ id, not a secret:
 - A phone presents no token. The relay learns its endpoint id from the authenticated handshake
   and asks a small **gate** whether that id may connect. The gate says yes for the ids of
   unexpired, unrevoked phone grants (and for machines, until they too move off the token).
-- The gate is a few dozen lines: `ferry relay-gate serve`, run on beastly or the relay host. It
+- The gate is a few dozen lines: `ferry relay-gate serve`, run **on the relay VPS
+  (162.35.10.46)**, not on beastly (decided; see the end). It
   reads the signed grants, verifies them against the master's key, and serves an allow list. The
   relay's access hook calls it (an HTTP check, or a file the gate rewrites). The relay host was
   not inspected for this ADR. What iroh's relay offers for per-endpoint access control, and
@@ -124,8 +129,10 @@ id, not a secret:
   machine and no rotation of the shared token.
 - The relay forwards encrypted QUIC. It sees endpoint ids, IP addresses and volume, never file
   names or content.
-- Unchanged: the certificate pin (the phone ships the hash), and machines keep the shared token
-  until a follow-up moves them to the gate. A lost phone no longer endangers the machines' token.
+- Unchanged: the certificate pin (the phone ships the hash). Machines move off the shared token
+  in the same release (decided; see the end), but a per-device credential is optional, never
+  required: the lane keeps working with no token at all and with iroh's public relays, for
+  anyone running Ferryman without our relay. A lost phone no longer endangers the machines' token.
 
 ### d. Expiring small files, opt-in
 
@@ -266,9 +273,33 @@ That is a precondition for any "no Syncthing fallback" claim; this ADR does not 
 About 25 to 30 working days, around six weeks elapsed with the observation week. Steps 2, 3 and
 4 can run beside 6 once the frame format in (a) is fixed.
 
-## Questions for the master
+## Decisions of the master (2026-10-21)
 
-- Grant lifetime 30 days renewed in the background, or ask the master again after 90?
-- Is arm64-only acceptable for the first build?
-- May the gate run on beastly, beside the master key, or must it live on the relay host?
-- Should machines move off the shared relay token in the same release?
+These answer the questions this ADR was proposed with.
+
+1. **Grant renewal: silent renewal.** A grant lasts 30 days and renews itself in the background
+   while the phone holds a live one; the master is not asked again after 90 days or at any other
+   point. **Revocation is immediate**: the master sets `revoked` (higher `seq`) and the gate drops
+   the endpoint within one poll (30 seconds), whatever time the grant had left. Expiry stays as
+   the backstop for a lost phone nobody revoked.
+2. **arm64-only for the first build: yes.** `lib/arm64-v8a/libferryman_phone.so` only. Other ABIs
+   are a later decision, taken if a device in use needs one.
+3. **The relay gate runs on the relay VPS (162.35.10.46), not on beastly.** The master key stays
+   where it is and the gate holds only what it needs to verify: the master's public key and the
+   signed grants it reads. How the grants reach the VPS (the lane itself, as a read-only peer of
+   the channel that holds them, is the obvious way) is for the spike to settle. This also means
+   the relay's access decision does not depend on beastly being up.
+4. **Machines move off the shared relay token in the same release**, with one condition: a
+   per-device credential stays **optional**. The lane must keep working with no token and with
+   iroh's public relays, because Ferryman is used by people who run no relay of ours (see
+   docs/IROH_LANE.md, "Relays: ours, iroh's public ones, or none", shipped in v0.6.2). The gate
+   is an extra door in front of our own relay, not a new requirement of the lane. A machine
+   whose config names no relay, or only public ones, is unaffected by anything in this ADR.
+5. **A second relay: decision pending.** The rationale for one is a single point of failure: once
+   Syncthing is gone, a down relay stops every pair that cannot see each other directly. Two
+   things reduce the case for it. The lane now takes an ordered list of relays and can fall back
+   to iroh's public relays when none of ours answers (`fallback_public_relays`, v0.6.2), and it
+   raises a warning when the relay has been unreachable for two minutes. Whether that is enough,
+   or a second VPS is worth running, is left open until the lane has run without Syncthing for a
+   while. Note that a phone has no public-relay fallback unless the gate also admits it there,
+   which it cannot (public relays have no gate): a phone depends on our relay.
