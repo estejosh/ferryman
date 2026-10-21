@@ -352,13 +352,35 @@ limited to about 8 KB. The record carries:
   list (these records are signed by the master, not by the machine);
 - a sequence number, a validity time and the machine's name.
 
-Peers watch Hive (any public API node, several configured, none trusted for content because the
-content is signed) for operations with that id. A record that verifies is handed to iroh as an
+Peers read Hive (any public API node, several configured, none trusted for content because the
+content is signed) for operations with that id, but only when their normal paths have failed
+(see Cadence). A record that verifies is handed to iroh as an
 address-lookup source, so the next dial uses the addresses in it, and a master-signed relay change
 is applied like a change to `fleet/relays.json`. **It is rendezvous and signalling only.** No file,
 manifest, order or message ever goes over Hive, and the lane's own trust rules are unchanged: a
 peer reached through a rescue record is still let in only if its endpoint id is in a roster-honoured
 transports record.
+
+**Cadence: posting is rare, not continuous.** Hive's roughly 3 second block time is only how
+fast a posted operation is confirmed; it is not a posting rate and nothing here posts that
+often. A machine posts in three cases:
+
+1. *A baseline record every N hours*, so the latest known addresses are never stale. N is
+   configurable from 1 to 6 hours, default 6 (four operations a day per machine).
+2. *At once when its addresses or its relay change*, so the record a reader finds is the
+   current one.
+3. *At once when it finds it has lost every path*: the relay and every peer unreachable for
+   longer than the lane's alert threshold (`alert_after_minutes`, default 15).
+
+Readers do not watch the chain. A machine reads Hive only when its normal paths have failed,
+and then polls every few minutes while it stays disconnected (reads are free). From what it
+reads it takes the newest valid signed record for each machine and ignores the rest. When the
+lane is healthy nothing reads Hive at all.
+
+The benefits of this cadence: the on-chain footprint is small and so is the metadata an
+observer can collect (a regular baseline, plus a burst when something changes or breaks),
+and the resource-credit cost is negligible. It also means the baseline is the usual way a
+reader finds an address, so an outage costs a poll interval, not a block time, to recover from.
 
 **Sealing and verification.**
 
@@ -383,8 +405,9 @@ transports record.
 **Risks.**
 
 - *Public metadata.* The content is sealed; the fact of it is not. Anyone can see that an account
-  posted under that id at those times, how often, and the size. Records posted only when the lane
-  is in trouble also tell an observer when the fleet is in trouble. The chain is permanent, so a
+  posted under that id at those times, how often, and the size. The baseline
+  record is regular, so it shows little, but the extra records at a change and at a loss of all
+  paths tell an observer when something happened to a machine. The chain is permanent, so a
   sealed record is stored for good: if the fleet's keys ever leak, old records become readable. That
   is why direct IP addresses are off by default and why every record is sealed to a fresh key.
 - *Hive API node availability.* Public nodes come and go and rate-limit. Several are configured,
@@ -396,8 +419,9 @@ transports record.
   forge a record. Custody of the owner and active keys is Custodly's job. A per-machine account
   instead of one shared account removes the shared key at the price of a roster entry per account.
 - *Cost.* Posting is free to the poster but not free: the account needs enough staked Hive Power
-  for the resource credits to post one small operation when a machine is in trouble. A handful of
-  operations a day is far inside what a small stake gives; the stake has to exist and be kept.
+  for the resource credits to post one small operation when a machine is in trouble. At the default cadence
+  (four baseline records a day per machine, plus the occasional change) that is far inside what a
+  small stake gives; the stake has to exist and be kept.
 - *A censoring or lagging node* can hide a record from one reader. Reading more than one node, and
   accepting a record from whichever has it, is the answer.
 
