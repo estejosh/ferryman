@@ -195,9 +195,13 @@ async fn run(dir: PathBuf) -> Result<()> {
         std::mem::forget(mock);
     }
 
-    let toml = format!(
-        "[iroh]\nenabled = true\nrelay_url = \"{primary}\"\nrelay_cert_sha256 = \"{pin}\"\n"
-    );
+    // `--primary-pin none` means the primary relay has a public certificate (no pin).
+    let pin_line = if pin == "none" {
+        String::new()
+    } else {
+        format!("relay_cert_sha256 = \"{pin}\"\n")
+    };
+    let toml = format!("[iroh]\nenabled = true\nrelay_url = \"{primary}\"\n{pin_line}");
     let mut cfg = IrohConfig::parse(&toml, Some(&dir));
     for note in &cfg.notes {
         log(format!("config note: {note}"));
