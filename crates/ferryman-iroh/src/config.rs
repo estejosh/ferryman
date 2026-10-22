@@ -7,9 +7,12 @@
 //! #
 //! #  (a) our own relay (pinned): `relay_url`, optionally more in `relays`, in order. The
 //! #      first is the primary. Public relays are NOT used unless you opt in below.
-//! #  (b) iroh's default public relays: say nothing about relays at all. This is what a
-//! #      new user gets, and it needs no server, no certificate and no token.
-//! #  (c) direct only: `direct_only = true`. No relay; machines must reach each other.
+//! #  (b) iroh's default public relays: `public_relays = true`, and nothing else about
+//! #      relays. It needs no server, no certificate and no token, but it is a choice you
+//! #      make: saying nothing about relays never means public relays.
+//! #  (c) direct only: `direct_only = true`, or saying nothing at all. No relay; machines
+//! #      must reach each other.
+//! # public_relays = true
 //! relay_url = "https://162.35.10.46"
 //! # relays = ["https://relay-two.example"]      # more of our own, after relay_url
 //! # fallback_public_relays = true               # with a custom relay: n0's defaults too
@@ -23,6 +26,9 @@
 //! # relay_quic_port = 443
 //! # Minutes without a good sync (or with an error) before the lane raises a warning.
 //! # alert_after_minutes = 15
+//! # Peers that come and go (a laptop) and must never raise an alert: agent names, or the
+//! # start of an endpoint id. Every other peer is expected to be on all the time.
+//! # intermittent_peers = ["laptop-agent"]
 //! ```
 //!
 //! # Why the token is a path and not a value
@@ -103,11 +109,18 @@ pub struct IrohConfig {
     pub fallback_public_relays: bool,
     /// No relay at all, public or ours.
     pub direct_only: bool,
+    /// With no relay of ours named and none in the fleet's list: use iroh's public relays.
+    /// Never implied; without it, no relay named means no relay.
+    pub public_relays: bool,
     pub relay_cert_sha256: Option<[u8; 32]>,
     pub relay_token_file: Option<PathBuf>,
     pub relay_quic_port: u16,
     /// Minutes before a silent peer or an unreachable relay is raised as a warning.
     pub alert_after_minutes: u64,
+    /// Peers that come and go (a laptop): agent names, or the start of an endpoint id. The
+    /// lane never raises an alert about them. Every other peer is expected to be on all the
+    /// time, as a machine with a worker service is.
+    pub intermittent_peers: Vec<String>,
     /// Relays from the fleet's master-signed list, in its order, after [`Self::relays`].
     /// Not read from `ferry.toml`: [`Self::with_fleet_relays`] fills it.
     pub fleet_relays: Vec<FleetRelayEntry>,
@@ -123,10 +136,12 @@ impl Default for IrohConfig {
             relays: Vec::new(),
             fallback_public_relays: false,
             direct_only: false,
+            public_relays: false,
             relay_cert_sha256: None,
             relay_token_file: None,
             relay_quic_port: DEFAULT_QUIC_PORT,
             alert_after_minutes: DEFAULT_ALERT_MINUTES,
+            intermittent_peers: Vec::new(),
             fleet_relays: Vec::new(),
             notes: Vec::new(),
         }
@@ -147,6 +162,24 @@ impl IrohConfig {
             .filter(|entry| !self.relays.iter().any(|own| same_relay(own, &entry.url)))
             .collect();
         self
+    }
+
+    /// Enabled, with no relay named anywhere and public relays not asked for: the lane runs
+    /// relay-less, which is worth saying.
+    #[must_use]
+    pub fn relayless_for_want_of_a_relay(&self) -> bool {
+        self.enabled
+            && !self.direct_only
+            && !self.public_relays
+            && self.relays.is_empty()
+            && self.fleet_relays.is_empty()
+    }
+
+    /// Whether `url` is one this machine's own `ferry.toml` names (not one that came from
+    /// the fleet's list). Only those get the access token.
+    #[must_use]
+    pub fn is_own_relay(&self, url: &str) -> bool {
+        self.relays.iter().any(|own| same_relay(own, url))
     }
 
     /// Every relay of ours in order of preference: this machine's own, then the fleet's.
@@ -199,6 +232,23 @@ impl IrohConfig {
             .get("fallback_public_relays")
             .and_then(toml::Value::as_bool)
             .unwrap_or(false);
+        config.public_relays = section
+            .get("public_relays")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        match section.get("intermittent_peers") {
+            None => {}
+            Some(toml::Value::Array(items)) => {
+                config.intermittent_peers = items
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .map(str::to_owned)
+                    .collect();
+            }
+            Some(_) => config
+                .notes
+                .push("[iroh] intermittent_peers is not a list of names".into()),
+        }
         // `relay_url` is the primary and `relays` the rest, in order; one list, no repeats.
         let mut relays: Vec<String> = Vec::new();
         if let Some(url) = section.get("relay_url").and_then(toml::Value::as_str) {
@@ -289,15 +339,21 @@ impl IrohConfig {
     /// Which relays this configuration allows.
     ///
     /// - `direct_only`: none.
-    /// - a relay of ours named: ours, in order, plus the public ones only when
-    ///   `fallback_public_relays` is set.
-    /// - nothing named: iroh's public relays. A new user's lane works with no server.
+    /// - a relay of ours named (in `ferry.toml` or the fleet's list): ours, in order, plus
+    ///   the public ones only when `fallback_public_relays` is set.
+    /// - nothing named: iroh's public relays only if `public_relays = true`; otherwise no
+    ///   relay at all. It fails closed: an empty or unreadable list never turns into a
+    ///   public relay carrying the fleet's traffic.
     #[must_use]
     pub fn relay_plan(&self) -> RelayPlan {
         if self.direct_only {
             RelayPlan::Direct
         } else if self.relays.is_empty() && self.fleet_relays.is_empty() {
-            RelayPlan::Public
+            if self.public_relays {
+                RelayPlan::Public
+            } else {
+                RelayPlan::Direct
+            }
         } else {
             RelayPlan::Custom {
                 urls: self.all_relays(),
@@ -310,8 +366,12 @@ impl IrohConfig {
     #[must_use]
     pub fn describe_relays(&self) -> String {
         match self.relay_plan() {
+            RelayPlan::Direct if !self.direct_only && !self.public_relays => {
+                "none (no relay is named; `public_relays = true` would use iroh's public relays)"
+                    .into()
+            }
             RelayPlan::Direct => "none (direct only)".into(),
-            RelayPlan::Public => "iroh's public relays (no relay of our own configured)".into(),
+            RelayPlan::Public => "iroh's public relays (public_relays = true)".into(),
             RelayPlan::Custom {
                 urls,
                 fallback_public,
@@ -417,9 +477,15 @@ mod tests {
         .with_fleet_relays(list);
         assert_eq!(direct.relay_plan(), RelayPlan::Direct);
         assert!(direct.fleet_relays.is_empty());
-        // An empty list changes nothing: a new user is still on the public relays.
+        // An empty list changes nothing, and nothing is not the public relays.
         let nothing = IrohConfig::default().with_fleet_relays(Vec::new());
-        assert_eq!(nothing.relay_plan(), RelayPlan::Public);
+        assert_eq!(nothing.relay_plan(), RelayPlan::Direct);
+        let opted_in = IrohConfig {
+            public_relays: true,
+            ..IrohConfig::default()
+        }
+        .with_fleet_relays(Vec::new());
+        assert_eq!(opted_in.relay_plan(), RelayPlan::Public);
     }
 
     const PIN: &str = "49:32:08:E4:6F:B8:E3:9B:FD:F2:8D:B8:0F:8C:33:F9:\
@@ -486,11 +552,40 @@ mod tests {
     }
 
     #[test]
-    fn a_new_user_with_no_relay_named_gets_the_public_relays() {
+    fn no_relay_named_is_no_relay_and_public_relays_need_an_explicit_opt_in() {
         let config = IrohConfig::parse("[iroh]\nenabled = true\n", None);
         assert!(config.enabled);
-        assert_eq!(config.relay_plan(), RelayPlan::Public);
+        assert_eq!(config.relay_plan(), RelayPlan::Direct);
+        assert!(config.relayless_for_want_of_a_relay());
+        assert!(config.describe_relays().contains("public_relays = true"));
         assert_eq!(config.relay_url, None);
+        let opted = IrohConfig::parse("[iroh]\nenabled = true\npublic_relays = true\n", None);
+        assert_eq!(opted.relay_plan(), RelayPlan::Public);
+        assert!(!opted.relayless_for_want_of_a_relay());
+    }
+
+    #[test]
+    fn only_relays_named_in_ferry_toml_are_ours_for_the_token() {
+        let config = IrohConfig::parse(
+            "[iroh]\nenabled = true\nrelay_url = \"https://a.example\"\n",
+            None,
+        )
+        .with_fleet_relays(vec![FleetRelayEntry {
+            url: "https://listed.example/".into(),
+            pin: None,
+        }]);
+        assert!(config.is_own_relay("https://a.example"));
+        assert!(config.is_own_relay("https://a.example/"));
+        assert!(!config.is_own_relay("https://listed.example/"));
+    }
+
+    #[test]
+    fn intermittent_peers_are_read() {
+        let config = IrohConfig::parse(
+            "[iroh]\nenabled = true\nintermittent_peers = [\"laptop\"]\n",
+            None,
+        );
+        assert_eq!(config.intermittent_peers, vec!["laptop".to_owned()]);
     }
 
     #[test]

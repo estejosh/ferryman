@@ -61,9 +61,11 @@ const NOT_TRUSTED: u32 = 403;
 /// The relay mode a configuration asks for (see [`IrohConfig::relay_plan`]):
 ///
 /// - direct only: no relay;
-/// - our own relays: exactly those, in the order given, each with the shared token when
-///   there is one (the token is optional) - public relays are not in the map;
-/// - nothing named: iroh's public relays, which need no pin and no token.
+/// - our own relays: exactly those, in the order given, the ones named in `ferry.toml`
+///   with the shared token when there is one (the token is optional, and a relay that
+///   only the fleet's list names never gets it) - public relays are not in the map;
+/// - nothing named: no relay, unless `public_relays = true` (iroh's public relays, which
+///   need no pin and no token).
 ///
 /// # Errors
 /// A relay URL does not parse or the token file cannot be read.
@@ -82,7 +84,13 @@ pub fn relay_mode(config: &IrohConfig) -> Result<RelayMode> {
                 if let Some(quic) = relay.quic.as_mut() {
                     quic.port = config.relay_quic_port;
                 }
-                if let Some(token) = &token {
+                // The token is this machine's credential for the relays it names itself. A
+                // relay that only the fleet's list names never gets it: the list is shared
+                // and signed, but a listed relay is not one this machine chose to trust
+                // with a secret (per-relay credentials come later).
+                if let Some(token) = &token
+                    && config.is_own_relay(&url)
+                {
                     relay = relay.with_auth_token(token.clone());
                 }
                 configs.push(relay);
@@ -256,6 +264,11 @@ pub struct Status {
     /// iroh's public relays were added because none of ours could be reached.
     #[serde(default)]
     pub public_fallback_active: bool,
+    /// What is wrong with the relay configuration (the fleet's relay list is missing,
+    /// unsigned, empty or stale), if anything. The lane is running on the last good list or
+    /// with no relay, never on public relays it was not told to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_problem: Option<String>,
     /// By endpoint id.
     #[serde(default)]
     pub peers: BTreeMap<String, PeerStatus>,
@@ -430,6 +443,14 @@ impl Lane {
             .fallback_map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = fallback;
+    }
+
+    /// Note (or clear, with `None`) a fault in the relay configuration, for the health check.
+    pub fn set_config_problem(&self, problem: Option<String>) {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config_problem = problem;
     }
 
     /// A snapshot of the channels served now.
@@ -1170,11 +1191,51 @@ mod relay_tests {
     }
 
     #[test]
-    fn nothing_named_is_iroh_s_public_relays() {
+    fn nothing_named_is_no_relay_and_public_relays_need_the_opt_in() {
         let dir = tempfile::tempdir().unwrap();
-        let mode = relay_mode(&config("", dir.path())).unwrap();
+        let none = relay_mode(&config("", dir.path())).unwrap();
+        assert!(
+            none.relay_map().is_empty(),
+            "nothing named must not mean public relays"
+        );
+        let mode = relay_mode(&config("public_relays = true\n", dir.path())).unwrap();
         assert_eq!(mode, RelayMode::Default);
         assert!(!mode.relay_map().is_empty());
+    }
+
+    #[test]
+    fn the_token_never_goes_to_a_relay_only_the_fleet_names() {
+        use crate::config::FleetRelayEntry;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::config::DEFAULT_TOKEN_FILE),
+            "s3cret\n",
+        )
+        .unwrap();
+        let cfg =
+            config("relay_url = \"https://a.example\"\n", dir.path()).with_fleet_relays(vec![
+                FleetRelayEntry {
+                    url: "https://listed.example/".into(),
+                    pin: None,
+                },
+            ]);
+        let mode = relay_mode(&cfg).unwrap();
+        for relay in mode.relay_map().relays::<Vec<Arc<RelayConfig>>>() {
+            let own = relay.url.to_string().contains("a.example");
+            assert_eq!(relay.auth_token.is_some(), own, "{}", relay.url);
+        }
+        // Only a fleet relay: no token anywhere.
+        let only = config("", dir.path()).with_fleet_relays(vec![FleetRelayEntry {
+            url: "https://listed.example/".into(),
+            pin: None,
+        }]);
+        let mode = relay_mode(&only).unwrap();
+        assert!(
+            mode.relay_map()
+                .relays::<Vec<Arc<RelayConfig>>>()
+                .iter()
+                .all(|relay| relay.auth_token.is_none())
+        );
     }
 
     #[test]

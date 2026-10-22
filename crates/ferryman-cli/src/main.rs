@@ -7877,6 +7877,15 @@ async fn run_fleet(
     reevaluate: Option<Reevaluate>,
     report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
 ) -> Result<()> {
+    // A scheduled-task wrapper written before 0.6.2 does not say it will restart a failing
+    // exit. Mark it now, once, so the update that comes later does not leave this worker
+    // dead (the restart also recognises the old wrapper without this; see `restart`).
+    if cfg!(windows)
+        && let Some(root) = ferryman_channel::ferry::find_root()
+        && let Ok(true) = ferryman_ops::setup::refresh_worker_wrapper(&root)
+    {
+        report.info("marked the worker's scheduled-task wrapper so it restarts after an update");
+    }
     // One worker per identity per channel. Two under one name resume each other's
     // claims and run the same order twice; see WorkerLock.
     let mut fleet = fleet;
@@ -8059,8 +8068,8 @@ async fn run_fleet(
                     return Ok(());
                 }
                 report.warn(&format!(
-                    "not restarting ({why}): this worker has already restarted {} times in the \
-                     last hour, so it carries on",
+                    "not restarting ({why}): either this worker has already restarted {} times \
+                     in the last hour or there is nowhere to keep that count, so it carries on",
                     restart::MAX_PER_HOUR
                 ));
             }
@@ -8089,7 +8098,8 @@ async fn run_fleet(
             }
             report.warn(&format!(
                 "updated on disk, but this worker has already restarted {} times in the last \
-                 hour, so it carries on with the version it is running until its next start",
+                 hour (or has nowhere to keep that count), so it carries on with the version \
+                 it is running until its next start",
                 restart::MAX_PER_HOUR
             ));
         }

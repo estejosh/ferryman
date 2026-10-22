@@ -20,8 +20,10 @@ one lane is simply already there when the other looks.
    enabled = true
    ```
 
-   With no relay named, the lane uses iroh's public relays: no server to run, no
-   certificate to pin, no token. To use a relay of your own instead, see
+   With no relay named (in `ferry.toml` or the fleet's list) the lane runs **without a
+   relay**: machines must reach each other directly, and the worker says so. Saying nothing
+   about relays never means public relays. To use iroh's public relays (no server to run, no
+   certificate to pin, no token) add `public_relays = true`. To use a relay of your own, see
    [Relays](#relays-ours-irohs-public-ones-or-none) below. Our own fleet's relay is:
 
    ```toml
@@ -67,7 +69,8 @@ The lane works in any of these ways, chosen by what `[iroh]` says about relays:
 
 | `ferry.toml` | The lane uses |
 | --- | --- |
-| nothing about relays | **iroh's public relays** (n0's defaults). The default for a new user. |
+| nothing about relays | **No relay** (fails closed). Add a relay, or `public_relays = true`. |
+| `public_relays = true`, nothing else about relays | **iroh's public relays** (n0's defaults). An explicit choice. |
 | `relay_url` and/or `relays` | **Our relays only**, primary first. Public relays are not used. |
 | the above plus `fallback_public_relays = true` | Ours, and iroh's public relays **only while none of ours can be reached**. |
 | `direct_only = true` | **No relay.** Machines must be able to reach each other. |
@@ -106,8 +109,8 @@ alert_after_minutes = 15                        # see "Is the lane healthy?"
   is the order they are listed and published, not a guarantee of which one carries a given
   connection.
 
-A config that says `enabled = true` and names no relay used to mean "direct only". It now means
-"iroh's public relays". Add `direct_only = true` to keep the old behaviour.
+A config that says `enabled = true` and names no relay means no relay, as it always did
+(`direct_only = true` says so outright). Public relays are used only with `public_relays = true`.
 
 ### The fleet's relay list (0.6.2)
 
@@ -143,10 +146,23 @@ ferry fleet order restart-worker                        # have the fleet pick th
   binds, so a changed list applies when the worker restarts. A running worker notices the
   change, says so once, and keeps what it has.
 - **No relay in `ferry.toml`** and a list in the fleet folder: the list is the plan, not iroh's
-  public relays. Without both, a new user is on the public relays. `direct_only` ignores the list.
-- **Public relays** stay what they were: an opt-in fallback, off for a setup that pins a relay.
-- **Tokens.** The list carries no secret. The shared token (if any) goes on every relay in the
-  list; a lane with none works. A relay that wants a per-device credential, such as a hosted
+  public relays. Without both, the lane has no relay. `direct_only` ignores the list.
+- **It fails closed.** If the fleet has a list (one is in the folder, or one was accepted
+  before) and it is missing, unsigned, signed by anyone but the master, edited, empty, or
+  older than the last one accepted, it is not used. The last good list stays in use (kept in
+  `fleet-relays-seen.json` in the machine state directory); with none, the lane keeps only
+  the relays `ferry.toml` names, or none. It never becomes public relays, and the lane raises
+  a `relay-config` alert. An older list (by its `written_at`) than the last accepted is
+  refused, so a restored backup or a replay cannot move the fleet back. `ferry fleet relays
+  set` refuses an empty list.
+- **Public relays** stay what they were: an opt-in (`public_relays`, or `fallback_public_relays`
+  as a fallback to relays of ours), off for a setup that pins a relay.
+- **Failover.** The list is a set of candidates in the master's order. iroh picks the home
+  relay by latency among those it knows and moves when that one stops answering; the order
+  is not a promise of which relay carries a connection.
+- **Tokens.** The list carries no secret. The shared token (if any) goes only on the relays
+  this machine's own `ferry.toml` names, never on one that only the fleet's list names; a
+  lane with none works. A relay that wants a per-device credential, such as a hosted
   one, is another entry in the list; the entry is a record with room for more fields.
 
 Running a relay on a fleet machine (`ferry relay serve`) is not built; see ADR 0027.
@@ -158,26 +174,39 @@ Once per worker pass the lane works out what is wrong with itself, from what it 
 - **a peer failing**: every exchange with it has ended in an error for two minutes or more;
 - **a peer gone quiet**: no successful sync with it for `alert_after_minutes` (default 15),
   counted from the lane's start for a peer it has never reached;
-- **no relay**: a relay is meant to be in use and none has been connected for two minutes.
+- **no relay**: a relay is meant to be in use and none has been connected for two minutes;
+- **relay configuration faulty** (`relay-config`): the fleet's relay list cannot be used (see
+  above) and the lane is on the last good list or none.
 
 A peer that is both failing and quiet is one alert. Each alert is raised **once**, when it
-starts to hold, and cleared **once**, when it stops. It is shown:
+starts to hold, and cleared **once**, on positive evidence that it is fine: a successful sync
+with that peer since the worker started, a connected relay, a good configuration. Alerts
+stand across a worker restart (a new lane has seen nothing yet, and "not seen failing" is not
+"working"), so a restart neither clears them nor raises them again. Peers that come and go
+(a laptop) are listed in `ferry.toml` and never raised on; every other peer is expected to be
+on all the time:
+
+```toml
+[iroh]
+intermittent_peers = ["laptop-agent"]   # agent names, or the start of an endpoint id (6+ chars)
+```
+
+It is shown:
 
 - in the worker's log (`iroh lane alert: ...`, then `iroh lane recovered: ...`);
 - in `ferry doctor` (a `lane` line) and `ferry lane iroh status` (an `ALERT` line);
 - in the dashboard's `/api/fleet` as `lane_alerts` (checked, threshold, and each alert with
   its key, text, since and severity `warning`);
-- to the rest of the fleet as a `lane-health` notice in the fleet folder (ADR 0026), severity
-  `warning`, signed by the machine's own identity and about its own machine only. The notice id
-  is fixed per machine and alert, so raising it again replaces the file, and recovery overwrites
-  the same file, marked `info` and expired, which every reader treats as gone. Nothing is
-  deleted (the lane never deletes). A machine the master has not admitted (`ferry fleet admit`)
-  cannot post one and says so; it still has the first three. There is no Telegram push for these
+- to the rest of the fleet in `lane-health/<machine>.json` in the fleet folder, signed by the
+  machine's own identity and about its own machine only. It lists the alerts standing now; an
+  empty list is the all-clear and replaces them. It is written when the worker starts and
+  when an alert is raised or cleared. It is a folder of its own and not a notice, because
+  machines on 0.6.1 and 0.5.30 reject a notice of a kind they do not know and show it as
+  ignored in `ferry doctor`; they never read this folder. A machine the master has not
+  admitted (`ferry fleet admit`) cannot write one and says so; it still has the first three. There is no Telegram push for these
   today: the Telegram bridge only relays orders and results.
 
 The alert state is in `lane-alerts.json` in the machine state directory (machine-local).
-Machines still on 0.6.1 do not know the `lane-health` kind and list those notices as ignored in
-`ferry doctor` until they update.
 
 ## Who may connect
 

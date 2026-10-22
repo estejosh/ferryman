@@ -14,13 +14,25 @@ use ferryman_ops::Progress;
 /// `[iroh]` from `ferry.toml`, plus the relays the fleet's master listed in the fleet
 /// folder (signed; only the master's list counts). The machine's own relays come first.
 pub(crate) fn load_config(root: &ferryman_channel::ferry::Root) -> IrohConfig {
+    load_config_checked(root).0
+}
+
+/// [`load_config`], and what is wrong with the fleet's relay list, if anything.
+///
+/// It fails closed. A list that is missing, unsigned, edited, empty or older than the last one
+/// accepted is not used; the last good one stays in use, and with none the lane has only the
+/// relays `ferry.toml` names, or none. It never becomes iroh's public relays: those need
+/// `public_relays = true`, written by the person who owns this machine.
+pub(crate) fn load_config_checked(
+    root: &ferryman_channel::ferry::Root,
+) -> (IrohConfig, Option<String>) {
     let config = IrohConfig::load(&root.path);
     if !config.enabled {
-        return config;
+        return (config, None);
     }
-    let listed = ferryman_channel::fleethome::read_relays(root);
-    config.with_fleet_relays(
-        listed
+    let choice = ferryman_channel::fleethome::choose_relays_here(root);
+    let mut config = config.with_fleet_relays(
+        choice
             .relays
             .iter()
             .map(|relay| ferryman_iroh::config::FleetRelayEntry {
@@ -28,7 +40,16 @@ pub(crate) fn load_config(root: &ferryman_channel::ferry::Root) -> IrohConfig {
                 pin: relay.pin(),
             })
             .collect(),
-    )
+    );
+    if config.relayless_for_want_of_a_relay() {
+        config.notes.push(
+            "[iroh] no relay is named (in ferry.toml or the fleet's relay list), so the lane \
+             runs without one: machines must reach each other directly. Name a relay, or set \
+             `public_relays = true` to use iroh's public relays."
+                .into(),
+        );
+    }
+    (config, choice.problem)
 }
 
 #[derive(clap::Subcommand, Clone)]
@@ -373,6 +394,8 @@ fn print_worker(lane: &ferryman_iroh::Status, now: chrono::DateTime<chrono::Utc>
 /// The lane, ready to start inside the worker.
 pub(crate) struct WorkerLane {
     config: IrohConfig,
+    /// What is wrong with the fleet's relay list, if anything (see [`load_config_checked`]).
+    config_problem: Option<String>,
     identity: ferryman_channel::AgentIdentity,
 }
 
@@ -382,11 +405,18 @@ pub(crate) fn for_worker(
     identity: ferryman_channel::AgentIdentity,
     report: &impl Progress,
 ) -> Option<WorkerLane> {
-    let config = load_config(root);
+    let (config, config_problem) = load_config_checked(root);
     for note in &config.notes {
         report.warn(&format!("iroh lane: {note}"));
     }
-    config.enabled.then_some(WorkerLane { config, identity })
+    if let Some(problem) = &config_problem {
+        report.warn(&format!("iroh lane: {problem}"));
+    }
+    config.enabled.then_some(WorkerLane {
+        config,
+        config_problem,
+        identity,
+    })
 }
 
 impl WorkerLane {
@@ -461,6 +491,7 @@ impl WorkerLane {
             self.config.relay_plan() != ferryman_iroh::config::RelayPlan::Direct,
             fallback_map,
         );
+        lane.set_config_problem(self.config_problem.clone());
         let live = LiveLane {
             lane: std::sync::Arc::clone(&lane),
             identity: self.identity,
@@ -468,6 +499,8 @@ impl WorkerLane {
             alert_after_minutes: self.config.alert_after_minutes,
             bound_relays: self.config.all_relays(),
             told_of_new_list: std::sync::atomic::AtomicBool::new(false),
+            intermittent: self.config.intermittent_peers.clone(),
+            reported_health: std::sync::atomic::AtomicBool::new(false),
         };
         tokio::spawn(lane.run(ferryman_iroh::lane::ROUND_EVERY));
         Ok(live)
@@ -484,6 +517,10 @@ pub(crate) struct LiveLane {
     /// The relays this lane was bound with, to notice the fleet's list changing under it.
     bound_relays: Vec<String>,
     told_of_new_list: std::sync::atomic::AtomicBool,
+    /// Peers `ferry.toml` says come and go (laptops): never raised on.
+    intermittent: Vec<String>,
+    /// This run has told the fleet folder where it stands at least once.
+    reported_health: std::sync::atomic::AtomicBool,
 }
 
 impl LiveLane {
@@ -491,13 +528,16 @@ impl LiveLane {
     /// a changed fleet list takes effect when the worker restarts: say so, once.
     fn check_relay_list(&self, report: &impl Progress) {
         use std::sync::atomic::Ordering;
-        if self.told_of_new_list.load(Ordering::Relaxed) {
-            return;
-        }
         let Some(root) = ferryman_channel::ferry::find_root() else {
             return;
         };
-        let now = load_config(&root).all_relays();
+        // Every pass: a list that has gone bad is an alert, and one that is mended clears it.
+        let (config, problem) = load_config_checked(&root);
+        self.lane.set_config_problem(problem);
+        if self.told_of_new_list.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = config.all_relays();
         if now != self.bound_relays {
             self.told_of_new_list.store(true, Ordering::Relaxed);
             report.warn(
@@ -546,46 +586,14 @@ impl LiveLane {
     }
 }
 
-/// The fleet notice that carries one lane alert from this machine, or that it has cleared.
+/// Say what is wrong with this machine's lane in the fleet folder (`lane-health/`, signed by
+/// this machine's own identity). Never a reason to stop: a machine the master has not
+/// admitted still has the alerts in `ferry doctor` and the dashboard.
 ///
-/// The id is stable per machine and alert, so a second sighting replaces the file instead of
-/// adding one, and clearing overwrites it: the notice is marked expired (and `info`) at that
-/// moment, which is what every reader treats as gone. Nothing is deleted, because the lane
-/// never deletes and a removed file would only be sent back by a peer.
-fn lane_notice(
-    machine: &str,
-    transition: &ferryman_channel::lanealerts::Transition,
-    now: chrono::DateTime<chrono::Utc>,
-) -> ferryman_channel::fleethome::NoticeBody {
-    use ferryman_channel::lanealerts::{Transition, notice_id};
-    let (alert, cleared) = match transition {
-        Transition::Raised(alert) => (alert, false),
-        Transition::Cleared(alert) => (alert, true),
-    };
-    let mut body = ferryman_channel::fleethome::NoticeBody::new(
-        "lane-health",
-        if cleared { "info" } else { "warning" },
-        &if cleared {
-            format!("{machine}: recovered - {}", alert.title)
-        } else {
-            format!("{machine}: {}", alert.title)
-        },
-        &alert.text,
-    );
-    body.id = notice_id(machine, &alert.key);
-    body.machine = Some(machine.to_owned());
-    body.issued = if cleared { now } else { alert.since };
-    body.expires = cleared.then_some(now);
-    body.details = serde_json::json!({
-        "key": alert.key,
-        "state": if cleared { "cleared" } else { "raised" },
-    });
-    body
-}
-
-/// Post the notice for a transition, if this machine may. Never a reason to stop: a machine
-/// the master has not admitted still has the alert in `ferry doctor` and the dashboard.
-fn post_lane_notice(transition: &ferryman_channel::lanealerts::Transition, report: &impl Progress) {
+/// It is not a fleet notice. A notice of a kind a 0.6.1 or 0.5.30 machine does not know is
+/// rejected and shown by its `ferry doctor` as ignored; the `lane-health/` folder is one
+/// those versions never read.
+fn post_lane_health(alerts: &[ferryman_channel::lanealerts::Alert], report: &impl Progress) {
     let Some(root) = ferryman_channel::ferry::find_root() else {
         return;
     };
@@ -598,11 +606,12 @@ fn post_lane_notice(transition: &ferryman_channel::lanealerts::Transition, repor
     ) else {
         return;
     };
-    let body = lane_notice(&machine, transition, chrono::Utc::now());
-    if let Err(error) = ferryman_channel::fleethome::post_notice(&root, &identity, body) {
+    if let Err(error) =
+        ferryman_channel::fleethome::publish_health(&root, &identity, &machine, alerts)
+    {
         report.warn(&format!(
-            "iroh lane: could not post the fleet notice ({error:#}); the alert is still in \
-             `ferry doctor` here"
+            "iroh lane: could not report lane health to the fleet ({error:#}); the alerts are \
+             still in `ferry doctor` here"
         ));
     }
 }
@@ -610,7 +619,7 @@ fn post_lane_notice(transition: &ferryman_channel::lanealerts::Transition, repor
 impl LiveLane {
     /// Once a pass: keep the TRANSPORTS record pointing at the relay we are on, work out what
     /// is wrong with the lane, and say so once. An alert is raised when it starts to hold and
-    /// cleared when it stops; the fleet sees it as a `lane-health` notice (warning), and this
+    /// cleared when it stops; the fleet sees it in `lane-health/<machine>.json`, and this
     /// machine as a line in `ferry doctor` and the dashboard. The worker's own log says it too.
     pub(crate) fn check_health(&self, report: &impl Progress) {
         self.check_relay_list(report);
@@ -632,15 +641,24 @@ impl LiveLane {
         };
         let now = chrono::Utc::now();
         let minutes = i64::try_from(self.alert_after_minutes).unwrap_or(15);
-        let found = ferryman_iroh::health::evaluate(
-            &self.lane.status(),
-            now,
-            chrono::Duration::minutes(minutes),
-        );
+        let status = self.lane.status();
+        let quiet_for = chrono::Duration::minutes(minutes);
+        let found = ferryman_iroh::health::evaluate(&status, now, quiet_for, &self.intermittent);
         let previous = ferryman_channel::lanealerts::read(&machine).unwrap_or_default();
+        // Alerts stand across a restart: a new lane has seen nothing yet, so an alert is
+        // cleared only on positive evidence that its subject is fine.
+        let standing: Vec<String> = previous.active.iter().map(|a| a.key.clone()).collect();
+        let proven = ferryman_iroh::health::proven_ok(
+            &status,
+            now,
+            quiet_for,
+            &self.intermittent,
+            &standing,
+        );
         let (state, transitions) = ferryman_channel::lanealerts::reconcile(
             &previous,
             found,
+            &proven,
             self.alert_after_minutes,
             now,
         );
@@ -659,7 +677,12 @@ impl LiveLane {
                     report.info(&format!("iroh lane recovered: {}", alert.title));
                 }
             }
-            post_lane_notice(transition, report);
+        }
+        let first = !self
+            .reported_health
+            .swap(true, std::sync::atomic::Ordering::Relaxed);
+        if first || !transitions.is_empty() {
+            post_lane_health(&state.active, report);
         }
     }
 }
@@ -863,28 +886,5 @@ mod tests {
         // The same lane, an hour later with no new round: not running.
         let later = now + chrono::Duration::hours(1);
         assert!(!carried_in(&route, true, &machine, later).unwrap().running);
-    }
-
-    #[test]
-    fn a_lane_alert_becomes_a_warning_notice_and_its_recovery_expires_the_same_one() {
-        use ferryman_channel::lanealerts::{Alert, Transition};
-        let now = chrono::Utc::now();
-        let alert = Alert {
-            key: "peer:aaaa".into(),
-            title: "iroh lane: no sync with wisp".into(),
-            text: "No successful sync for over 15 minute(s).".into(),
-            since: now - chrono::Duration::minutes(16),
-        };
-        let raised = lane_notice("beastly", &Transition::Raised(alert.clone()), now);
-        assert_eq!(raised.kind, "lane-health");
-        assert_eq!(raised.severity, "warning");
-        assert_eq!(raised.machine.as_deref(), Some("beastly"));
-        assert_eq!(raised.expires, None);
-        assert!(raised.title.starts_with("beastly: "));
-        let cleared = lane_notice("beastly", &Transition::Cleared(alert), now);
-        assert_eq!(cleared.id, raised.id, "one notice per machine and alert");
-        assert_eq!(cleared.severity, "info");
-        assert_eq!(cleared.expires, Some(now));
-        assert!(cleared.title.contains("recovered"));
     }
 }

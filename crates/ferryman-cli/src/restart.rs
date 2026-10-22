@@ -18,11 +18,15 @@
 //!   Same process id, so a supervisor sees one unbroken process, and with no supervisor the
 //!   worker is simply running again. If the `exec` fails, exit [`EXIT_RESTART`] so a
 //!   supervisor that restarts on failure does the job.
-//! - **Windows, under a supervisor** (the scheduled-task wrapper sets
-//!   `FERRYMAN_SUPERVISED`): exit [`EXIT_RESTART`] (75, `EX_TEMPFAIL`). The wrapper passes the
-//!   exit code on, the task's restart-on-failure policy sees a failure and starts the worker
-//!   again within a minute. Documented in docs/FLEET_SETUP.md. Spawning a child here instead
-//!   would fight the task for the worker lock and could be killed with the task.
+//! - **Windows, under a supervisor**: exit [`EXIT_RESTART`] (75, `EX_TEMPFAIL`). The wrapper
+//!   passes the exit code on, the task's restart-on-failure policy sees a failure and starts
+//!   the worker again within a minute. Documented in docs/FLEET_SETUP.md. Spawning a child
+//!   here instead would fight the task for the worker lock and could be killed with the task.
+//!   The supervisor is known by the `FERRYMAN_SUPERVISED` the 0.6.2 wrapper sets, or, for a
+//!   wrapper written before that, by this process having the wrapper script
+//!   (`ferryman-worker.ps1`) among its parents. And the worker marks that old wrapper itself
+//!   when it starts (`ferryman_ops::setup::refresh_worker_wrapper`), so the next run of the
+//!   task has the variable too.
 //! - **Windows, with no supervisor**: start the same command line as a detached process that
 //!   waits a few seconds (so this process has exited and released its locks), then exit 0.
 //!
@@ -32,8 +36,24 @@
 //! crashes on start and re-triggers the update check) must not become a loop. Every request
 //! is recorded in `reexec.json` in the machine state directory, and more than
 //! [`MAX_PER_HOUR`] in an hour is refused: the worker says so and keeps running the code it
-//! has. The update check itself is rate limited to once in six hours, so this is the second
-//! line, not the first.
+//! has. With no machine state directory to keep the history in, a restart is refused too: a
+//! guard that cannot remember is not a guard. The update check itself is rate limited to
+//! once in six hours, so this is the second line, not the first.
+//!
+//! # The transport
+//!
+//! A managed Syncthing is not a child that dies with the worker: it is started detached
+//! (its own process group, or a systemd unit) precisely so that a restart of the worker
+//! leaves it running, and the new worker finds it with `managed_running`. `exec` therefore
+//! has nothing to stop first; the lane's own endpoint is closed with the runtime before
+//! `main` gets here.
+//!
+//! # The replacement's delay
+//!
+//! A detached replacement must start after this process has exited. It is told when, as a
+//! time, in [`NOT_BEFORE_VAR`], not as a number of seconds to wait: a delay inherited by
+//! every process the worker later starts would make each of them sleep, while a time that
+//! has passed delays nothing. `exec` removes it.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -56,8 +76,12 @@ pub const STATE_FILE: &str = "reexec.json";
 /// Set by a supervisor wrapper that restarts a non-zero exit (the Windows scheduled task).
 pub const SUPERVISED_VAR: &str = "FERRYMAN_SUPERVISED";
 
-/// Seconds a detached replacement waits before it starts, so the old process is gone.
-pub const DELAY_VAR: &str = "FERRYMAN_REEXEC_DELAY_SECS";
+/// The Unix time before which a detached replacement does not start work, so the process
+/// that started it is gone. A time that has passed delays nothing.
+pub const NOT_BEFORE_VAR: &str = "FERRYMAN_REEXEC_NOT_BEFORE";
+
+/// How long a detached replacement waits.
+const DETACHED_DELAY_SECS: u64 = 5;
 
 static WANTED: AtomicBool = AtomicBool::new(false);
 
@@ -132,9 +156,8 @@ pub fn exe_to_start(reported: &Path) -> PathBuf {
 #[must_use]
 pub fn ask() -> bool {
     let Some(dir) = ferryman_channel::licensing::machine_state_dir() else {
-        // Nowhere to keep the guard: restarting once is still better than staying stopped.
-        WANTED.store(true, Ordering::SeqCst);
-        return true;
+        // Nowhere to keep the guard, so nothing could stop a loop: do not restart.
+        return false;
     };
     if allow(&dir, Utc::now(), MAX_PER_HOUR) {
         WANTED.store(true, Ordering::SeqCst);
@@ -150,14 +173,42 @@ pub fn wanted() -> bool {
     WANTED.load(Ordering::SeqCst)
 }
 
+/// How long to wait, at `now` (Unix seconds), for a [`NOT_BEFORE_VAR`] holding `value`:
+/// the time left, never more than 30 seconds, and nothing for a time that has passed or a
+/// value that is not a number.
+#[must_use]
+pub fn delay_left(value: &str, now: u64) -> std::time::Duration {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|not_before| not_before.saturating_sub(now).min(30))
+        .map_or(std::time::Duration::ZERO, std::time::Duration::from_secs)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
 /// Wait out the replacement delay a detached restart asked for, at the start of a command.
 pub fn honour_delay() {
-    if let Some(seconds) = std::env::var(DELAY_VAR)
-        .ok()
-        .and_then(|text| text.parse::<u64>().ok())
-    {
-        std::thread::sleep(std::time::Duration::from_secs(seconds.min(30)));
+    if let Ok(value) = std::env::var(NOT_BEFORE_VAR) {
+        let wait = delay_left(&value, unix_now());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
+        }
     }
+}
+
+/// Whether the worker's supervisor will restart a failing exit: the wrapper said so, or (a
+/// wrapper written before it did) the worker's scheduled-task wrapper started this process.
+fn supervised() -> bool {
+    if std::env::var_os(SUPERVISED_VAR).is_some_and(|v| !v.is_empty() && v != "0") {
+        return true;
+    }
+    cfg!(windows) && ferryman_ops::setup::under_worker_wrapper()
 }
 
 fn args() -> Vec<OsString> {
@@ -175,10 +226,13 @@ pub fn perform() -> ExitCode {
             return ExitCode::from(EXIT_RESTART);
         }
     };
-    match method(
-        cfg!(unix),
-        std::env::var_os(SUPERVISED_VAR).is_some_and(|v| !v.is_empty() && v != "0"),
-    ) {
+    if cfg!(windows)
+        && let Some(root) = ferryman_channel::ferry::find_root()
+    {
+        // Mark an old wrapper so the next run of the task is known to be supervised.
+        let _ = ferryman_ops::setup::refresh_worker_wrapper(&root);
+    }
+    match method(cfg!(unix), supervised()) {
         Method::Exec => exec(&exe),
         Method::ExitForSupervisor => {
             println!("restarting after the update: exiting {EXIT_RESTART} for the supervisor");
@@ -194,7 +248,7 @@ fn exec(exe: &Path) -> ExitCode {
     println!("restarting after the update: {}", exe.display());
     let error = std::process::Command::new(exe)
         .args(args())
-        .env_remove(DELAY_VAR)
+        .env_remove(NOT_BEFORE_VAR)
         .exec();
     // Only reached when the exec failed.
     eprintln!(
@@ -211,7 +265,10 @@ fn exec(_exe: &Path) -> ExitCode {
 
 fn spawn_detached(exe: &Path) -> ExitCode {
     let mut command = std::process::Command::new(exe);
-    command.args(args()).env(DELAY_VAR, "5");
+    command.args(args()).env(
+        NOT_BEFORE_VAR,
+        (unix_now() + DETACHED_DELAY_SECS).to_string(),
+    );
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -291,6 +348,22 @@ mod tests {
         assert_eq!(method(true, true), Method::Exec);
         assert_eq!(method(false, true), Method::ExitForSupervisor);
         assert_eq!(method(false, false), Method::SpawnDetached);
+    }
+
+    #[test]
+    fn the_replacements_delay_is_a_time_that_stops_mattering_once_it_has_passed() {
+        // Still ahead: wait out what is left.
+        assert_eq!(delay_left("105", 100).as_secs(), 5);
+        // Passed: nothing, so a process the worker starts later is not held up by the
+        // variable it inherited.
+        assert!(delay_left("105", 106).is_zero());
+        assert!(delay_left("105", 105).is_zero());
+        // Never a long wait, and never a panic on nonsense.
+        assert_eq!(delay_left("99999999999", 100).as_secs(), 30);
+        assert!(delay_left("soon", 100).is_zero());
+        assert!(delay_left("", 100).is_zero());
+        // The delay is not a count of seconds any more, so the old name does nothing.
+        assert_eq!(NOT_BEFORE_VAR, "FERRYMAN_REEXEC_NOT_BEFORE");
     }
 
     #[test]
