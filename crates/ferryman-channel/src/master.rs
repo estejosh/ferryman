@@ -385,7 +385,7 @@ fn grant_payload(grant: &MasterGrant) -> String {
 }
 
 /// The master's roster entry, if the master is declared and in the roster.
-fn master_agent(route: &ProjectRoute) -> Result<Option<AgentRoute>> {
+pub(crate) fn master_agent(route: &ProjectRoute) -> Result<Option<AgentRoute>> {
     let Some(declaration) = read_master(route)? else {
         return Ok(None);
     };

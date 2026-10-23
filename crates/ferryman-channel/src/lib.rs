@@ -73,6 +73,7 @@ pub mod syncscope;
 pub mod tamper;
 pub mod trajectory;
 pub mod transports;
+pub mod ttl;
 pub mod work;
 pub mod worktree;
 
