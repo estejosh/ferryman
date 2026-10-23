@@ -2,7 +2,7 @@
 
 Two agents in one checkout share one git index and one HEAD. So one agent's `git add -A`
 commits the other's files, one agent's `pull` moves files under the other mid-task, and both
-pick "the next decision number". Lanes remove all three. Decision record: ADR 0028.
+pick "the next decision number". Lanes remove all three. Decision record: ADR 0029.
 
 A **lane** is one agent's (or one task's) own git worktree and branch of the same repository,
 the paths it owns, and one serialized way onto `main`.

@@ -1,4 +1,4 @@
-# ADR 0028: Lanes
+# ADR 0029: Lanes
 
 Status: proposed, approved by the master (josh) as a spec, 2026-10-23. Builds on 0019, 0024.
 Related to the per-order worktrees of `ferry channel worktree`.

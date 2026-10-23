@@ -1,5 +1,5 @@
 //! Shared counters: sequential ids (decision numbers, asset ids) handed out through the
-//! channel so that two agents never take the same one (ADR 0028).
+//! channel so that two agents never take the same one (ADR 0029).
 //!
 //! A claim is a signed file `counters/<name>/<n>.<agent>.json`. The number `n` belongs to
 //! the claim with the lowest `(claimed_at, agent, machine)` among the validly signed

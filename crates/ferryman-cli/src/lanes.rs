@@ -1,4 +1,4 @@
-//! `ferry lanes ...` and `ferry counter ...`: several agents, one repository (ADR 0028).
+//! `ferry lanes ...` and `ferry counter ...`: several agents, one repository (ADR 0029).
 //!
 //! The logic is in `ferryman_channel::lanes` and `ferryman_channel::counters`; this file
 //! is argument parsing, choosing the project and the agent, and saying what happened.
