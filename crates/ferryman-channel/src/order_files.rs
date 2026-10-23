@@ -1778,6 +1778,7 @@ mod tests {
                 kind: None,
                 size: None,
                 min_context_k: None,
+                ..Default::default()
             }),
             allow_overlap: false,
             priority: None,

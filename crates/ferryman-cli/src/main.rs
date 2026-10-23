@@ -9,6 +9,7 @@ mod lane;
 mod license;
 mod licensor;
 mod mcp;
+mod mcp_agent;
 mod mcp_client;
 mod restart;
 mod route;
@@ -1065,14 +1066,29 @@ enum MarvinCommand {
 
 #[derive(Subcommand, Clone)]
 enum McpCommand {
-    /// Serve this project over MCP (Model Context Protocol) on stdio, exposing
-    /// the channel's query surface — tasks, memory, roster, ledger, learnings,
-    /// skills — as tools an MCP client (Claude Desktop, Codex, Claude Code) can
-    /// call. Read-only: an MCP connection is a stranger, not the operator.
+    /// Serve this project over MCP (Model Context Protocol) on stdio (beta). With
+    /// `--as <agent>` an MCP client (Claude Desktop, Codex, Claude Code) gets six tools
+    /// to join, catch up, take orders, talk, follow the primary and ask the human, signed
+    /// with that agent's own key and capped by its grant. Without `--as`, or with
+    /// `--read-only`, it is the read-only query surface: a stranger, not the operator.
     Serve {
         /// The project directory. Defaults to where you are.
         #[arg(long)]
         workspace: Option<PathBuf>,
+        /// Speak as this agent (for example claude-desktop-beastly). The name is bound
+        /// to a key by the roster; this cannot speak as another agent.
+        #[arg(long = "as", value_parser = agent_name)]
+        agent: Option<String>,
+        /// The project, by id, in the ferry root. Defaults to the one in --workspace.
+        #[arg(long)]
+        project: Option<String>,
+        /// Extra tool groups, comma separated: admin (search, get, status, update) and
+        /// legacy (the eight read-only query tools).
+        #[arg(long, value_delimiter = ',')]
+        tools: Vec<String>,
+        /// Keep the old read-only behaviour even with --as.
+        #[arg(long)]
+        read_only: bool,
     },
     /// Connect to an external MCP server and print the tools it advertises.
     List {
@@ -5018,7 +5034,19 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Release { command } => release_command(command)?,
         Command::Marvin { command } => marvin_command(command)?,
         Command::Mcp { command } => match command {
-            McpCommand::Serve { workspace } => mcp::serve(workspace)?,
+            McpCommand::Serve {
+                workspace,
+                agent,
+                project,
+                tools,
+                read_only,
+            } => mcp::serve(&mcp::Options {
+                workspace,
+                agent,
+                project,
+                tools,
+                read_only,
+            })?,
             McpCommand::List { server } => mcp_client::list(&server)?,
             McpCommand::Call {
                 server,
@@ -11376,6 +11404,7 @@ fn channel(command: Channel) -> Result<()> {
                 kind,
                 size,
                 min_context_k,
+                ..ferryman_channel::work::ExplicitNeeds::default()
             })
             .filter(|needs| !needs.is_empty());
             if let Some(k) = min_context_k {

@@ -83,6 +83,64 @@ pub async fn latest_release() -> Result<String> {
         .context("the latest release has no tag name")
 }
 
+/// The newest public release whose tag is signed, as GitHub verifies it, or `None`.
+///
+/// The MCP server's update notice (ADR 0028) uses this instead of [`latest_release`]: a
+/// release whose tag is lightweight or whose signature GitHub cannot verify is not one this
+/// project suggests installing. Draft and pre-releases never count.
+pub async fn latest_verified_release() -> Result<Option<String>> {
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("ferry/", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+    let get = |url: String| {
+        let client = client.clone();
+        async move {
+            let response = client.get(&url).send().await.context("ask GitHub")?;
+            if !response.status().is_success() {
+                bail!("GitHub answered {} for {url}", response.status());
+            }
+            let body: serde_json::Value = response.json().await.context("read GitHub's answer")?;
+            Ok::<_, anyhow::Error>(body)
+        }
+    };
+    let release = get(format!(
+        "https://api.github.com/repos/{REPO}/releases/latest"
+    ))
+    .await?;
+    if release["draft"].as_bool() == Some(true) || release["prerelease"].as_bool() == Some(true) {
+        return Ok(None);
+    }
+    let Some(tag) = release["tag_name"].as_str() else {
+        return Ok(None);
+    };
+    let reference = get(format!(
+        "https://api.github.com/repos/{REPO}/git/ref/tags/{tag}"
+    ))
+    .await?;
+    let Some(sha) = annotated_tag_sha(&reference) else {
+        return Ok(None);
+    };
+    let object = get(format!(
+        "https://api.github.com/repos/{REPO}/git/tags/{sha}"
+    ))
+    .await?;
+    Ok(tag_object_is_verified(&object).then(|| tag.to_string()))
+}
+
+/// The object a tag ref points at, if it is an annotated tag. A lightweight tag points
+/// straight at a commit and carries no signature, so it is not one this suggests.
+fn annotated_tag_sha(reference: &serde_json::Value) -> Option<&str> {
+    (reference["object"]["type"].as_str() == Some("tag"))
+        .then(|| reference["object"]["sha"].as_str())
+        .flatten()
+}
+
+/// Whether GitHub verified the tag's signature.
+fn tag_object_is_verified(object: &serde_json::Value) -> bool {
+    object["verification"]["verified"].as_bool() == Some(true)
+}
+
 /// This build's version, as a release tag would spell it.
 #[must_use]
 pub fn running_version() -> String {
@@ -91,7 +149,7 @@ pub fn running_version() -> String {
 
 /// A version as numbers, for comparing. Anything after a `-` is a pre-release suffix and
 /// is ignored: `0.5.5-rc1` and `0.5.5` are the same release for this purpose.
-fn parts(version: &str) -> Vec<u64> {
+pub(crate) fn parts(version: &str) -> Vec<u64> {
     version
         .trim()
         .trim_start_matches('v')
@@ -379,6 +437,24 @@ pub async fn update_and_hand_over() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_annotated_tag_with_a_verified_signature_is_suggested() {
+        use serde_json::json;
+        // A lightweight tag points at a commit: nothing signed it.
+        let lightweight = json!({ "object": { "type": "commit", "sha": "abc" } });
+        assert_eq!(annotated_tag_sha(&lightweight), None);
+        let annotated = json!({ "object": { "type": "tag", "sha": "abc" } });
+        assert_eq!(annotated_tag_sha(&annotated), Some("abc"));
+        // Annotated but unsigned, or signed with a key GitHub cannot verify.
+        assert!(!tag_object_is_verified(
+            &json!({ "verification": { "verified": false } })
+        ));
+        assert!(!tag_object_is_verified(&json!({})));
+        assert!(tag_object_is_verified(
+            &json!({ "verification": { "verified": true } })
+        ));
+    }
 
     #[test]
     fn this_platform_has_a_published_build() {

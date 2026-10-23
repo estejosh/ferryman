@@ -52,6 +52,12 @@ components:
       properties:
         message: {type: string}
 paths:
+  /api/connect:
+    get:
+      summary: What the Connect an AI app panel needs to write a config (this ferry binary and a machine label; no secrets)
+      responses:
+        '200': {description: the ferry path and machine label}
+        '401': {description: no session}
   /api/auth/create:
     post:
       summary: Mint a password-sealed operator identity and publish its public key to the roster

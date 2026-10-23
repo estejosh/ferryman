@@ -1543,6 +1543,17 @@ async fn run_agent(
     heartbeat: Option<TaskHeartbeat>,
 ) -> Result<AgentRun> {
     let (binary, args) = run_command(config, workspace, prompt, credentials);
+    // ADR 0028, pending snifrig agreement: a heavy order runs through the machine's snifrig
+    // queue, but only when the operator turned `snifrig_heavy` on and a snifrig that has the
+    // can-i-start check is on PATH. Otherwise this is the same command as always.
+    let (binary, args) = match &heartbeat {
+        Some(beat) => {
+            let (binary, args, _via) =
+                crate::heavy::plan(&beat.route, &beat.order_id, binary, args);
+            (binary, args)
+        }
+        None => (binary, args),
+    };
     for warning in mount_warnings(workspace) {
         tracing::warn!("{warning}");
     }

@@ -384,6 +384,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/auth/recover", post(recover_operator))
         .route("/api/auth/status", get(auth_status))
         .route("/api/identity", get(identity))
+        .route("/api/connect", get(connect_info))
         .route("/api/team", get(team))
         .route("/api/tasks", get(tasks))
         .route("/api/tasks/{id}", get(task_detail))
@@ -1053,6 +1054,30 @@ async fn identity(
         "derives": derives,
         "seed_present": seed_present,
     })))
+}
+
+/// GET /api/connect - what the "Connect an AI app" panel needs to write copy-paste config:
+/// where `ferry` is on this machine and a name for it. Nothing secret: no key, token or
+/// passphrase is ever part of an MCP config.
+async fn connect_info(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    state
+        .sessions
+        .resolve(session_token(&headers))
+        .ok_or((StatusCode::UNAUTHORIZED, "sign in first".to_string()))?;
+    let machine: String = ferryman_channel::receipts::machine_label()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let ferry = std::env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    Ok(Json(
+        json!({ "ferry": ferry, "machine": machine.trim_matches('-') }),
+    ))
 }
 
 /// POST /api/auth/login — unlock an operator identity and start a session.

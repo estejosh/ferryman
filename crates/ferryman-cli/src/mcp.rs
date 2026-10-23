@@ -1,16 +1,21 @@
 //! `ferry mcp` — serve this project over the Model Context Protocol.
 //!
-//! MCP is JSON-RPC 2.0 over stdio. This module speaks the small server slice a
-//! read-only client needs: `initialize`, `tools/list`, `tools/call`, and `ping`.
-//! The tools are Ferryman's *query* surface — tasks, memory, roster, ledger,
-//! learnings, skills, and the discovery manifest — so an MCP client (Claude
-//! Desktop, Codex, Claude Code, …) can observe and answer questions about a
-//! fleet without any write authority. Write tools are deliberately absent: an
-//! MCP connection is a stranger, not the operator.
+//! MCP is JSON-RPC 2.0 over stdio. This module speaks the small server slice a client
+//! needs: `initialize`, `tools/list`, `tools/call`, `resources/read` and `ping`.
+//!
+//! Two surfaces, chosen at start (ADR 0028, beta):
+//!
+//! - **Agent surface** (`ferry mcp serve --as <agent> --project <id>`): six core tools that
+//!   are thin facades over the same library calls as `ferry channel ...`, signed with the
+//!   agent's own key and capped by its grant. See [`crate::mcp_agent`]. Opt-in groups:
+//!   `--tools admin` and `--tools legacy`.
+//! - **Query surface** (no `--as`, or `--read-only`): the eight read-only tools this server
+//!   always had, and the gateway that proxies external servers from `.ferryman/mcp.toml`.
+//!   An MCP connection that names no agent is a stranger, not the operator.
 //!
 //! This is the executable half of the MCP-agent designation in
-//! `ferryman_channel::discovery`: the designated agent is the one you point an
-//! MCP client at, and it runs this server.
+//! `ferryman_channel::discovery`: the designated agent is the one you point an MCP client
+//! at, and it runs this server.
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -18,59 +23,33 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::mcp_agent::{self, Agent};
 use crate::mcp_client::McpClient;
 use ferryman_channel::{ProjectRoute, TaskState};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
+/// `serverInfo.version`: carries `-beta` (ADR 0028).
+const SERVER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-beta");
+
+/// What `ferry mcp serve` was started with.
+#[derive(Default, Clone)]
+pub struct Options {
+    pub workspace: Option<PathBuf>,
+    /// `--as <agent>`: speak as this agent. Absent means the read-only query surface.
+    pub agent: Option<String>,
+    /// `--project <id>`: the project in the ferry root. Absent means the workspace.
+    pub project: Option<String>,
+    /// `--tools admin,legacy`.
+    pub tools: Vec<String>,
+    /// `--read-only`: the old stranger behaviour, even with `--as`.
+    pub read_only: bool,
+}
+
 /// Resolve the project route for a `ferry mcp` subcommand.
 pub fn route_for(workspace: Option<PathBuf>) -> Result<ProjectRoute> {
     let start = workspace.unwrap_or(std::env::current_dir().context("read the current directory")?);
     ferryman_channel::route_for(&start)
-}
-
-/// Run the MCP server on stdio until the client closes stdin. Besides Ferryman's
-/// own tools, any external server in `.ferryman/mcp.toml` is connected and its
-/// tools proxied under a `name_` prefix, so one connection serves the whole
-/// fleet's tool surface.
-pub fn serve(workspace: Option<PathBuf>) -> Result<()> {
-    let route = route_for(workspace)?;
-    let mut gateways = Vec::new();
-    for (name, spec) in load_servers(&route)? {
-        match McpClient::connect(&spec) {
-            Ok(mut client) => match client.list_tools_raw() {
-                Ok(raw) => {
-                    let prefix = format!("{name}_");
-                    let tools = raw
-                        .into_iter()
-                        .map(|mut tool| {
-                            if let Some(original) = tool.get("name").and_then(Value::as_str) {
-                                tool["name"] = Value::String(format!("{prefix}{original}"));
-                            }
-                            tool
-                        })
-                        .collect();
-                    gateways.push(Gateway {
-                        prefix,
-                        tools,
-                        client,
-                    });
-                }
-                Err(err) => eprintln!("mcp server '{name}' failed to list tools: {err:#}"),
-            },
-            Err(err) => eprintln!("mcp server '{name}' failed to start: {err:#}"),
-        }
-    }
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.context("read from stdin")?;
-        if let Some(response) = handle_line(&route, &mut gateways, line.trim()) {
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
-        }
-    }
-    Ok(())
 }
 
 /// An external MCP server connected at startup, with its tools prefixed so the
@@ -81,28 +60,224 @@ struct Gateway {
     client: McpClient,
 }
 
+/// One running server: which surface, and what it proxies.
+pub struct Server {
+    route: ProjectRoute,
+    agent: Option<Agent>,
+    /// Serve the eight query tools (and the gateway).
+    legacy: bool,
+    gateways: Vec<Gateway>,
+}
+
+/// Parse `--tools` values (each may itself be comma separated) into group names.
+pub fn parse_groups(values: &[String]) -> Result<Vec<String>> {
+    let mut groups = Vec::new();
+    for value in values {
+        for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "admin" | "legacy" => {
+                    if !groups.iter().any(|g| g == part) {
+                        groups.push(part.to_string());
+                    }
+                }
+                other => bail!("--tools takes admin or legacy, not '{other}'"),
+            }
+        }
+    }
+    Ok(groups)
+}
+
+impl Server {
+    /// Build a server from its options, connecting any configured external servers when
+    /// the query surface is served.
+    pub fn build(options: &Options) -> Result<Self> {
+        let groups = parse_groups(&options.tools)?;
+        let route = match &options.project {
+            Some(project) => crate::access_route(project)?,
+            None => route_for(options.workspace.clone())?,
+        };
+        let agent = match (&options.agent, options.read_only) {
+            (Some(name), false) => {
+                mcp_agent::check_agent_name(name)?;
+                Some(Agent::new(
+                    route.clone(),
+                    name,
+                    groups.iter().any(|g| g == "admin"),
+                ))
+            }
+            _ => None,
+        };
+        let legacy = agent.is_none() || groups.iter().any(|g| g == "legacy");
+        let mut server = Server {
+            route,
+            agent,
+            legacy,
+            gateways: Vec::new(),
+        };
+        if server.legacy {
+            server.connect_gateways()?;
+        }
+        Ok(server)
+    }
+
+    /// A server for tests and embedding: no external servers connected.
+    #[cfg(test)]
+    pub fn with(route: ProjectRoute, agent: Option<Agent>, legacy: bool) -> Self {
+        Server {
+            route,
+            agent,
+            legacy,
+            gateways: Vec::new(),
+        }
+    }
+
+    fn connect_gateways(&mut self) -> Result<()> {
+        for (name, spec) in load_servers(&self.route)? {
+            match McpClient::connect(&spec) {
+                Ok(mut client) => match client.list_tools_raw() {
+                    Ok(raw) => {
+                        let prefix = format!("{name}_");
+                        let tools = raw
+                            .into_iter()
+                            .map(|mut tool| {
+                                if let Some(original) = tool.get("name").and_then(Value::as_str) {
+                                    tool["name"] = Value::String(format!("{prefix}{original}"));
+                                }
+                                tool
+                            })
+                            .collect();
+                        self.gateways.push(Gateway {
+                            prefix,
+                            tools,
+                            client,
+                        });
+                    }
+                    Err(err) => eprintln!("mcp server '{name}' failed to list tools: {err:#}"),
+                },
+                Err(err) => eprintln!("mcp server '{name}' failed to start: {err:#}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// The tool list: sorted, static, byte-stable (T8). Core first, then the opt-in groups.
+    pub fn tools(&self) -> Vec<Value> {
+        let mut all = Vec::new();
+        if let Some(agent) = &self.agent {
+            all.extend(mcp_agent::core_tools());
+            if agent.admin {
+                all.extend(mcp_agent::admin_tools());
+            }
+        }
+        if self.legacy {
+            let mut legacy = legacy_tools();
+            legacy.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+            all.extend(legacy);
+            for gateway in &self.gateways {
+                all.extend(gateway.tools.iter().cloned());
+            }
+        }
+        all
+    }
+
+    /// Route a `tools/call`.
+    fn call(&mut self, request: &Value) -> Value {
+        let params = request.get("params").cloned().unwrap_or(Value::Null);
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if let Some(agent) = &self.agent
+            && name.starts_with("ferry_")
+        {
+            return agent.call(name, &args);
+        }
+        if self.legacy {
+            for gateway in &mut self.gateways {
+                if let Some(tool) = name.strip_prefix(&gateway.prefix) {
+                    return match gateway.client.call_tool(tool, args) {
+                        Ok(result) => result,
+                        Err(err) => json!({
+                            "content": [{ "type": "text", "text": format!("{err:#}") }],
+                            "isError": true,
+                        }),
+                    };
+                }
+            }
+            return call_tool(&self.route, request);
+        }
+        json!({
+            "content": [{ "type": "text", "text": format!("unknown tool: {name}") }],
+            "isError": true,
+        })
+    }
+}
+
+/// Run the MCP server on stdio until the client closes stdin.
+pub fn serve(options: &Options) -> Result<()> {
+    let mut server = Server::build(options)?;
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+    for line in stdin.lock().lines() {
+        let line = line.context("read from stdin")?;
+        if let Some(response) = handle_line(&mut server, line.trim()) {
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+        }
+    }
+    Ok(())
+}
+
 /// Dispatch one JSON-RPC line and return the response, if one is owed.
 /// Notifications carry no id and therefore get no response.
-fn handle_line(route: &ProjectRoute, gateways: &mut [Gateway], line: &str) -> Option<String> {
+pub fn handle_line(server: &mut Server, line: &str) -> Option<String> {
     let request: Value = serde_json::from_str(line).ok()?;
     let method = request.get("method")?.as_str()?;
     let id = request.get("id").cloned()?;
     let response = match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
+        "initialize" => {
+            let mut result = json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": { "tools": {} },
-                "serverInfo": { "name": "ferryman", "version": env!("CARGO_PKG_VERSION") },
-            },
-        }),
+                "serverInfo": { "name": "ferryman", "version": SERVER_VERSION },
+            });
+            if server.agent.is_some() {
+                result["capabilities"]["resources"] = json!({});
+                result["instructions"] = json!(mcp_agent::INSTRUCTIONS);
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
         "ping" => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
         "tools/list" => {
-            json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": all_tools(gateways) } })
+            json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": server.tools() } })
         }
         "tools/call" => {
-            json!({ "jsonrpc": "2.0", "id": id, "result": call_any(route, gateways, &request) })
+            json!({ "jsonrpc": "2.0", "id": id, "result": server.call(&request) })
+        }
+        "resources/list" if server.agent.is_some() => {
+            json!({ "jsonrpc": "2.0", "id": id, "result": { "resources": [] } })
+        }
+        "resources/templates/list" if server.agent.is_some() => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "resourceTemplates": [
+                { "uriTemplate": "ferry://{project}/order/{id}", "name": "order", "mimeType": "text/plain" },
+                { "uriTemplate": "ferry://{project}/msg/{id}", "name": "message", "mimeType": "text/plain" },
+                { "uriTemplate": "ferry://{project}/brief/{agent}", "name": "brief", "mimeType": "text/plain" },
+            ] },
+        }),
+        "resources/read" if server.agent.is_some() => {
+            let uri = request["params"]["uri"].as_str().unwrap_or("");
+            match server.agent.as_ref().map(|a| a.read_resource(uri)) {
+                Some(Ok(result)) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                Some(Err(err)) => json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32002, "message": format!("{err:#}") },
+                }),
+                None => unreachable!("guarded by the match arm"),
+            }
         }
         _ => json!({
             "jsonrpc": "2.0",
@@ -113,39 +288,8 @@ fn handle_line(route: &ProjectRoute, gateways: &mut [Gateway], line: &str) -> Op
     Some(response.to_string())
 }
 
-/// Ferryman's own tools plus every connected external server's prefixed tools.
-fn all_tools(gateways: &[Gateway]) -> Vec<Value> {
-    let mut all = tools();
-    for gateway in gateways {
-        all.extend(gateway.tools.iter().cloned());
-    }
-    all
-}
-
-/// Route a `tools/call` to an external server when the tool name carries its
-/// prefix, otherwise to Ferryman's own tools.
-fn call_any(route: &ProjectRoute, gateways: &mut [Gateway], request: &Value) -> Value {
-    let params = request.get("params").cloned().unwrap_or(Value::Null);
-    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-    for gateway in gateways.iter_mut() {
-        if let Some(tool) = name.strip_prefix(&gateway.prefix) {
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            return match gateway.client.call_tool(tool, args) {
-                Ok(result) => result,
-                Err(err) => json!({
-                    "content": [{ "type": "text", "text": format!("{err:#}") }],
-                    "isError": true,
-                }),
-            };
-        }
-    }
-    call_tool(route, request)
-}
-
-fn tools() -> Vec<Value> {
+/// The eight read-only query tools (`--tools legacy`, and the whole surface without `--as`).
+fn legacy_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "channel_status",
@@ -253,18 +397,7 @@ fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
 }
 
 fn state_name(state: &TaskState) -> &'static str {
-    match state {
-        TaskState::Open => "open",
-        TaskState::Offered { .. } => "offered",
-        TaskState::Claimed { .. } => "claimed",
-        TaskState::Stale { .. } => "stale",
-        TaskState::AwaitingReview { .. } => "awaiting_review",
-        TaskState::ChangesRequested { .. } => "changes_requested",
-        TaskState::Accepted => "accepted",
-        TaskState::Done => "done",
-        TaskState::Refuted { .. } => "refuted",
-        TaskState::Killed { .. } => "killed",
-    }
+    mcp_agent::state_name(state)
 }
 
 fn channel_status(route: &ProjectRoute) -> Result<Value> {
@@ -311,7 +444,7 @@ fn get_task(route: &ProjectRoute, args: &Value) -> Result<Value> {
     let results: Vec<Value> = task
         .results
         .iter()
-        .map(|r| json!({ "revision": r.revision, "agent": r.agent, "output": result_text(&r.payload) }))
+        .map(|r| json!({ "revision": r.revision, "agent": r.agent, "output": mcp_agent::result_text(&r.payload) }))
         .collect();
     let reviews: Vec<Value> = task
         .reviews
@@ -330,19 +463,6 @@ fn get_task(route: &ProjectRoute, args: &Value) -> Result<Value> {
         "results": results,
         "reviews": reviews,
     }))
-}
-
-/// The readable text of a result payload, whatever shape the agent chose.
-fn result_text(payload: &Value) -> String {
-    match payload {
-        Value::String(text) => text.clone(),
-        other => other
-            .get("output")
-            .or_else(|| other.get("result"))
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_else(|| serde_json::to_string(other).unwrap_or_default()),
-    }
 }
 
 fn read_memory(route: &ProjectRoute, args: &Value) -> Result<Value> {
@@ -513,28 +633,38 @@ mod tests {
         }
     }
 
+    fn legacy_server() -> Server {
+        Server::with(route(), None, true)
+    }
+
+    fn rpc(server: &mut Server, line: &str) -> Value {
+        serde_json::from_str(&handle_line(server, line).unwrap()).unwrap()
+    }
+
     #[test]
     fn initialize_advertises_tools() {
-        let response = handle_line(
-            &route(),
-            &mut [],
+        let v = rpc(
+            &mut legacy_server(),
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&response).unwrap();
+        );
         assert_eq!(v["result"]["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(v["result"]["serverInfo"]["name"], "ferryman");
+        assert!(
+            v["result"]["serverInfo"]["version"]
+                .as_str()
+                .unwrap()
+                .ends_with("-beta")
+        );
+        // The stranger surface carries no instructions and no resources.
+        assert!(v["result"].get("instructions").is_none());
     }
 
     #[test]
     fn tools_list_has_the_query_surface() {
-        let response = handle_line(
-            &route(),
-            &mut [],
+        let v = rpc(
+            &mut legacy_server(),
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&response).unwrap();
+        );
         assert!(v["result"]["tools"].as_array().unwrap().len() >= 7);
     }
 
@@ -542,8 +672,7 @@ mod tests {
     fn a_notification_gets_no_response() {
         assert!(
             handle_line(
-                &route(),
-                &mut [],
+                &mut legacy_server(),
                 r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
             )
             .is_none()
@@ -552,25 +681,19 @@ mod tests {
 
     #[test]
     fn calling_an_unknown_tool_returns_is_error() {
-        let response = handle_line(
-            &route(),
-            &mut [],
+        let v = rpc(
+            &mut legacy_server(),
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"nope"}}"#,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&response).unwrap();
+        );
         assert_eq!(v["result"]["isError"], true);
     }
 
     #[test]
     fn channel_status_reports_the_project() {
-        let response = handle_line(
-            &route(),
-            &mut [],
+        let v = rpc(
+            &mut legacy_server(),
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"channel_status"}}"#,
-        )
-        .unwrap();
-        let v: Value = serde_json::from_str(&response).unwrap();
+        );
         assert_eq!(v["result"]["isError"], false);
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("ferryman"));
@@ -613,6 +736,15 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn tool_groups_parse_and_reject_unknowns() {
+        assert_eq!(
+            parse_groups(&["admin,legacy".to_string(), "admin".to_string()]).unwrap(),
+            ["admin", "legacy"]
+        );
+        assert!(parse_groups(&["everything".to_string()]).is_err());
+    }
+
     /// A minimal stdio MCP server driven by line number, mirroring the client test.
     ///
     /// Gated with its test: unconditional, it is an unused constant on Windows and
@@ -648,20 +780,17 @@ done
                 tool
             })
             .collect();
-        let mut gateways = vec![Gateway {
+        let mut server = legacy_server();
+        server.gateways.push(Gateway {
             prefix: prefix.clone(),
             tools,
             client,
-        }];
+        });
         // tools/list merges Ferryman's own tools with the prefixed external one.
-        assert!(
-            all_tools(&gateways)
-                .iter()
-                .any(|t| t["name"] == "github_echo")
-        );
+        assert!(server.tools().iter().any(|t| t["name"] == "github_echo"));
         // tools/call routes the prefixed name back to the external server.
         let request = json!({ "params": { "name": "github_echo", "arguments": { "text": "hi" } } });
-        let result = call_any(&route(), &mut gateways, &request);
+        let result = server.call(&request);
         assert_eq!(result["content"][0]["text"], "fixture-ok");
         assert_eq!(result["isError"], false);
         std::fs::remove_dir_all(&dir).ok();

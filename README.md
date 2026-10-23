@@ -121,6 +121,9 @@ Two consequences worth caring about:
 - **A web dashboard** to watch tasks, ledger, cost and learnings, and to
   approve or send work back from a browser — and to set secrets once, sealed to
   exactly the machines that should receive them.
+- **MCP server (beta).** `ferry mcp serve --as <name>` lets Claude Desktop, Claude Code
+  or Codex join a project, catch up, take orders, talk and ask you for approvals, in
+  about 630 tokens of tool definitions. See [docs/MCP.md](docs/MCP.md).
 - **Recovery you can rehearse.** Encrypted continuity packs, and a drill command
   that proves you can come back from a wiped machine.
 - **Opt-in sandboxing.** Run each worker inside a fresh podman or docker
@@ -227,6 +230,7 @@ other. See its [README](crates/ferry-deadman/README.md).
 |---|---|
 | [Running in a container](docs/CONTAINER.md) | podman and Docker, single or multi-project |
 | [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
+| [MCP server (beta)](docs/MCP.md) | connect Claude Desktop, Claude Code or Codex |
 | [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
 | [Writing a worker (server mode)](docs/WRITING_A_WORKER.md) | the lease-based worker protocol behind `ferryman-server` |
@@ -368,9 +372,6 @@ them loses work or leaks anything.
   install scripts.
 - **`ferry bench --timeout-secs` is accepted and ignored.** The benchmark uses a
   fixed 300s per task.
-- **The MCP client has no timeouts.** An external MCP server that hangs will block
-  the gateway, and one that never answers at startup will stop `ferry mcp serve`
-  from answering at all. Point it only at servers you trust to respond.
 - **External MCP tool output is not marked as third-party** when it reaches an
   agent's prompt. Treat any MCP server you connect as something whose output can
   influence your agents, and prefer read-only ones.
