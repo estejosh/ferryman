@@ -20,7 +20,7 @@
 //! expiry, and a sequence number higher than any seen from that signer. A record grants
 //! nothing: the ordinary iroh checks still decide who is let in.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chacha20poly1305::{
@@ -49,6 +49,11 @@ pub const CLOCK_SKEW: Duration = Duration::minutes(10);
 pub const MAX_LIFETIME: Duration = Duration::hours(24);
 /// Direct address candidates a record may carry.
 pub const MAX_DIRECT: usize = 8;
+/// The longest operation `json` anything here will look at (a node's limit is lower, so
+/// this only matters for what a hostile node or a hand-made operation sends).
+pub const MAX_OP_JSON: usize = 16 * 1024;
+/// The longest sealed record: the `json` carries it in hex.
+pub const MAX_SEALED: usize = MAX_OP_JSON / 2;
 
 /// Who signed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -254,6 +259,9 @@ pub fn seal(record: &Signed, recipients: &[Recipient]) -> Result<Vec<u8>> {
 /// Not a record of this format, not wrapped to this machine, or tampered with.
 pub fn open(sealed: &[u8], fleet: &str, me: &EncryptionIdentity) -> Result<Signed> {
     const SLOT: usize = 4 + 48;
+    if sealed.len() > MAX_SEALED {
+        bail!("not a rescue record: too long");
+    }
     if sealed.first() != Some(&SEAL_VERSION) || sealed.len() < 1 + 32 + 12 + 1 {
         bail!("not a rescue record");
     }
@@ -316,9 +324,15 @@ pub fn parse_op_json(json: &str, fleet: &str) -> Result<Vec<u8>> {
         f: String,
         s: String,
     }
+    if json.len() > MAX_OP_JSON {
+        bail!("not a rescue operation: too long");
+    }
     let op: Op = serde_json::from_str(json).context("not a rescue operation")?;
     if op.v != VERSION || op.f != fleet {
         bail!("an operation for another fleet or version");
+    }
+    if op.s.len() > MAX_SEALED * 2 {
+        bail!("not a rescue operation: too long");
     }
     hex::decode(op.s).context("the sealed part is not hex")
 }
@@ -331,6 +345,12 @@ pub struct Verifier<'a> {
     pub master: &'a str,
     /// Names whose backup records count.
     pub backups: &'a [String],
+    /// Roster names the master revoked (canonical): nothing they sign counts.
+    pub revoked: &'a BTreeSet<String>,
+    /// The iroh endpoint ids each roster name is known by (canonical name to lower-case
+    /// hex), from records the fleet's own channels honour. A backup record may point only
+    /// at its signer's own endpoint.
+    pub endpoints: &'a BTreeMap<String, BTreeSet<String>>,
     pub now: DateTime<Utc>,
 }
 
@@ -370,6 +390,9 @@ impl Verifier<'_> {
         else {
             return refuse(format!("'{}' is not on the roster", body.signer));
         };
+        if self.revoked.contains(&signer) {
+            return refuse(format!("'{}' was revoked", body.signer));
+        }
         let Some(key) = agent
             .public_key
             .as_deref()
@@ -416,6 +439,14 @@ impl Verifier<'_> {
                     || body.relay_list_version.is_some()
                 {
                     return refuse("a backup record may only point at its own machine");
+                }
+                let own = self.endpoints.get(&signer);
+                if !own.is_some_and(|ids| ids.contains(&body.at.id.to_ascii_lowercase())) {
+                    return refuse(format!(
+                        "a backup record may only point at its signer's own endpoint, and \
+                         '{}' is not known by that one",
+                        body.signer
+                    ));
                 }
             }
         }

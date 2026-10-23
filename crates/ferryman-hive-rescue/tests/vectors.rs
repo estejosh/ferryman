@@ -1,6 +1,7 @@
 //! Hive transaction serialization, digest and signature against vectors made by the
 //! reference implementation (`@hiveio/dhive` 1.3.2: `Types.Transaction`,
-//! `cryptoUtils.transactionDigest`, `PrivateKey.sign`). See `tests/data/README`.
+//! `cryptoUtils.transactionDigest`, `PrivateKey.sign`). `tests/data/gen_vectors.mjs` makes
+//! `tests/data/hive_vectors.json`; its header says how to rerun it.
 
 use ferryman_hive_rescue::tx::{
     CustomJson, MAINNET_CHAIN_ID, PostingKey, Transaction, parse_hive_time,
@@ -22,9 +23,11 @@ fn tx_of(v: &Value) -> Transaction {
         ref_block_prefix: u32::try_from(v["ref_block_prefix"].as_u64().unwrap()).unwrap(),
         expiration: parse_hive_time(v["expiration"].as_str().unwrap()).unwrap(),
         operations: vec![CustomJson {
-            required_auths: Vec::new(),
+            required_auths: v["required_auths"].as_array().map_or_else(Vec::new, |a| {
+                a.iter().map(|x| x.as_str().unwrap().to_owned()).collect()
+            }),
             required_posting_auths: vec![v["account"].as_str().unwrap().to_owned()],
-            id: "ferryman-rescue-v1".into(),
+            id: v["id"].as_str().unwrap_or("ferryman-rescue-v1").into(),
             json: v["json"].as_str().unwrap().to_owned(),
         }],
     }
@@ -32,7 +35,41 @@ fn tx_of(v: &Value) -> Transaction {
 
 #[test]
 fn there_are_vectors() {
-    assert!(vectors().len() >= 3);
+    assert!(vectors().len() >= 14);
+}
+
+/// The reference's signing loop retries until the signature is canonical; the vectors
+/// include keys and transactions where it needed 2, 3 and more than 4 tries, so the
+/// retry path (a fresh nonce each time) is checked against the reference, not just the
+/// lucky first attempt.
+#[test]
+fn the_vectors_include_non_canonical_retries() {
+    let attempts: Vec<u64> = vectors()
+        .iter()
+        .map(|v| v["attempts"].as_u64().unwrap())
+        .collect();
+    for wanted in [2, 3] {
+        assert!(
+            attempts.contains(&wanted),
+            "no vector needing {wanted} tries"
+        );
+    }
+    assert!(
+        attempts.iter().any(|a| *a >= 4),
+        "no vector needing 4+ tries"
+    );
+    assert!(attempts.contains(&1));
+}
+
+#[test]
+fn the_wif_and_public_key_match_the_reference() {
+    for v in vectors() {
+        let key = PostingKey::from_wif(v["wif"].as_str().unwrap()).unwrap();
+        let sealed = key.public_key_bytes();
+        let stm = v["pub"].as_str().unwrap().strip_prefix("STM").unwrap();
+        let decoded = bs58::decode(stm).into_vec().unwrap();
+        assert_eq!(&decoded[..33], &sealed[..], "{}", v["seed"]);
+    }
 }
 
 #[test]

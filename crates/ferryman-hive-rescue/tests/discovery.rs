@@ -4,10 +4,11 @@
 mod common;
 
 use chrono::{DateTime, Utc};
-use common::{ACCOUNT, Fleet, at};
+use common::{ACCOUNT, Fleet, TEST_WIF, at};
 use ferryman_hive_rescue::mock::MockHive;
 use ferryman_hive_rescue::record::{self, Kind};
 use ferryman_hive_rescue::rescuer::{LaneInfo, Verdict};
+use ferryman_hive_rescue::tx::PostingKey;
 use ferryman_iroh::lane::{PeerStatus, Status};
 
 /// A lane that has lost its relay and its one peer since `since`.
@@ -49,7 +50,7 @@ fn info(relay: Option<&str>) -> LaneInfo {
 
 #[tokio::test]
 async fn the_master_posts_once_after_the_cut_off_and_a_cut_off_machine_learns_from_it() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let master = fleet.rescuer(&fleet.beastly, &hive.url(), a.path(), true, |c| {
@@ -115,7 +116,7 @@ async fn the_master_posts_once_after_the_cut_off_and_a_cut_off_machine_learns_fr
 
 #[tokio::test]
 async fn a_healthy_machine_reads_nothing_and_a_reader_without_a_key_never_posts() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let dir = tempfile::tempdir().unwrap();
     let t0 = Utc::now();
@@ -138,7 +139,7 @@ async fn a_healthy_machine_reads_nothing_and_a_reader_without_a_key_never_posts(
 
 #[tokio::test]
 async fn it_posts_again_while_still_cut_off_so_a_fresh_record_is_always_there() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let dir = tempfile::tempdir().unwrap();
     let master = fleet.rescuer(&fleet.beastly, &hive.url(), dir.path(), true, |_| {});
@@ -176,7 +177,7 @@ async fn it_posts_again_while_still_cut_off_so_a_fresh_record_is_always_there() 
 
 #[tokio::test]
 async fn a_relay_change_is_posted_but_the_first_sighting_is_only_a_baseline() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let dir = tempfile::tempdir().unwrap();
     let master = fleet.rescuer(&fleet.beastly, &hive.url(), dir.path(), true, |_| {});
@@ -219,7 +220,7 @@ async fn a_relay_change_is_posted_but_the_first_sighting_is_only_a_baseline() {
 
 #[tokio::test]
 async fn the_backup_posts_only_when_cut_off_long_and_no_fresh_master_record_exists() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let (m, g) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let master = fleet.rescuer(&fleet.beastly, &hive.url(), m.path(), true, |_| {});
@@ -286,7 +287,7 @@ async fn the_backup_posts_only_when_cut_off_long_and_no_fresh_master_record_exis
 
 #[tokio::test]
 async fn forgeries_replays_and_other_fleets_on_the_chain_are_not_believed() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let dir = tempfile::tempdir().unwrap();
     let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), dir.path(), false, |_| {});
@@ -363,7 +364,7 @@ async fn forgeries_replays_and_other_fleets_on_the_chain_are_not_believed() {
 
 #[tokio::test]
 async fn a_dead_node_costs_a_note_not_the_channel() {
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let fleet = Fleet::new();
     let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let master = fleet.rescuer(&fleet.beastly, &hive.url(), a.path(), true, |_| {});
@@ -377,7 +378,7 @@ async fn a_dead_node_costs_a_note_not_the_channel() {
     );
 
     // Two nodes configured: the first is down, the second works.
-    let down = MockHive::start("127.0.0.1:0").await.unwrap();
+    let down = common::start_mock().await;
     down.set_down(true);
     let reader = fleet.rescuer_nodes(
         &fleet.grouchly,
@@ -395,4 +396,228 @@ async fn a_dead_node_costs_a_note_not_the_channel() {
     hive.set_down(true);
     let read = reader.poll(at(t0, 30), true).await.unwrap();
     assert!(read.answered.is_empty() && !read.applied);
+}
+
+#[tokio::test]
+async fn a_record_buried_under_dust_transfers_is_still_found() {
+    let hive = common::start_mock().await;
+    let fleet = Fleet::new();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let master = fleet.rescuer(&fleet.beastly, &hive.url(), a.path(), true, |_| {});
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), b.path(), false, |_| {});
+    let t0 = Utc::now();
+    master
+        .tick(&cut_off(t0), &info(None), at(t0, 16))
+        .await
+        .posted
+        .expect("posted");
+
+    // Anyone can send dust: far more than the 100 newest entries the first version read.
+    hive.inject_transfers(ACCOUNT, 1200);
+    let before = hive.history_calls();
+    let read = reader.poll(at(t0, 17), true).await.unwrap();
+    assert_eq!(read.scanned, 1, "the custom_json is the only one");
+    assert!(read.applied, "{:?}", read.records);
+    assert!(matches!(
+        read.records[0].verdict,
+        Verdict::Valid { new: true, .. }
+    ));
+    // The head, then pages of 500 back to it: three pages of dust and the record's.
+    assert!(hive.history_calls() - before >= 4);
+}
+
+#[tokio::test]
+async fn a_record_newest_in_the_history_costs_one_page() {
+    let hive = common::start_mock().await;
+    let fleet = Fleet::new();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let master = fleet.rescuer(&fleet.beastly, &hive.url(), a.path(), true, |_| {});
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), b.path(), false, |_| {});
+    let t0 = Utc::now();
+    hive.inject_transfers(ACCOUNT, 3000);
+    master
+        .tick(&cut_off(t0), &info(None), at(t0, 16))
+        .await
+        .posted
+        .expect("posted");
+    let before = hive.history_calls();
+    assert!(reader.poll(at(t0, 17), true).await.unwrap().applied);
+    // One call for the newest index, one page: it stops at a record that counts.
+    assert_eq!(hive.history_calls() - before, 2);
+}
+
+#[tokio::test]
+async fn the_search_for_a_record_is_bounded() {
+    let hive = common::start_mock().await;
+    let fleet = Fleet::new();
+    let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let master = fleet.rescuer(&fleet.beastly, &hive.url(), a.path(), true, |_| {});
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), b.path(), false, |_| {});
+    let t0 = Utc::now();
+    master
+        .tick(&cut_off(t0), &info(None), at(t0, 16))
+        .await
+        .posted
+        .expect("posted");
+    // Buried deeper than the reader will go (40 pages of 500 entries): not found, and the
+    // reader gives up after a bounded number of requests rather than walking it all.
+    hive.inject_transfers(ACCOUNT, 21_000);
+    let before = hive.history_calls();
+    let read = reader.poll(at(t0, 17), true).await.unwrap();
+    assert_eq!(read.scanned, 0);
+    assert!(!read.applied);
+    assert!(hive.history_calls() - before <= 41);
+
+    // And a record older than a week is not looked at, however near the top.
+    let hive = common::start_mock().await;
+    let c = tempfile::tempdir().unwrap();
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), c.path(), false, |_| {});
+    let view = fleet.view.lock().unwrap().clone();
+    let tag = record::fleet_tag(view.roster[0].public_key.as_ref().unwrap());
+    let signed = record::sign(
+        ferryman_hive_rescue::record::Body {
+            v: 1,
+            fleet: tag.clone(),
+            kind: Kind::Master,
+            signer: "beastly-ferry".into(),
+            seq: 3,
+            issued: t0,
+            expires: at(t0, 60),
+            at: ferryman_hive_rescue::record::Where {
+                id: "cd".repeat(32),
+                relay_url: None,
+                direct: Vec::new(),
+            },
+            relay_list_version: None,
+            rescue_relay: None,
+            relays: None,
+        },
+        &fleet.beastly.signer(),
+    )
+    .unwrap();
+    let sealed = record::seal(&signed, &record::recipients(&view.roster, |_| false)).unwrap();
+    hive.inject_at(
+        ACCOUNT,
+        "ferryman-rescue",
+        &record::op_json(&tag, &sealed),
+        t0 - chrono::Duration::days(8),
+    );
+    let read = reader.poll(at(t0, 1), true).await.unwrap();
+    assert_eq!(read.scanned, 0);
+}
+
+#[tokio::test]
+async fn an_oversized_answer_from_a_node_is_dropped_unparsed() {
+    let hive = common::start_mock().await;
+    let fleet = Fleet::new();
+    let dir = tempfile::tempdir().unwrap();
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), dir.path(), false, |_| {});
+    hive.set_oversize(true);
+    let read = reader.poll(Utc::now(), true).await.unwrap();
+    assert!(read.answered.is_empty());
+    assert!(
+        read.failed.iter().any(|(_, why)| why.contains("over")),
+        "{:?}",
+        read.failed
+    );
+}
+
+#[tokio::test]
+async fn it_will_not_post_with_a_key_that_is_not_a_posting_key_of_the_account() {
+    let fleet = Fleet::new();
+    let t0 = Utc::now();
+    let key = PostingKey::from_wif(TEST_WIF).unwrap();
+
+    // The node knows no such account.
+    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let master = fleet.rescuer(&fleet.beastly, &hive.url(), dir.path(), true, |_| {});
+    let report = master.tick(&cut_off(t0), &info(None), at(t0, 16)).await;
+    assert!(report.posted.is_none());
+    assert!(
+        report.notes.iter().any(|n| n.contains("no Hive account")),
+        "{:?}",
+        report.notes
+    );
+
+    // The key is the account's owner and active key: refused, nothing broadcast.
+    let own = key.mock_public_key_string();
+    hive.set_account(
+        ACCOUNT,
+        serde_json::json!({
+            "name": ACCOUNT,
+            "owner": {"key_auths": [[own, 1]]},
+            "active": {"key_auths": [[own, 1]]},
+            "posting": {"key_auths": [[own, 1]], "account_auths": []},
+            "memo_key": own,
+        }),
+    );
+    let report = master.tick(&cut_off(t0), &info(None), at(t0, 17)).await;
+    assert!(report.posted.is_none());
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("owner, active or memo")),
+        "{:?}",
+        report.notes
+    );
+    assert_eq!(hive.broadcasts(), 0);
+
+    // Only a posting key of the account is let through.
+    hive.authorize_key(ACCOUNT, &key);
+    let report = master.tick(&cut_off(t0), &info(None), at(t0, 18)).await;
+    assert!(report.posted.is_some(), "{:?}", report.notes);
+    assert_eq!(hive.broadcasts(), 1);
+}
+
+#[tokio::test]
+async fn a_machine_with_no_memory_ignores_a_stale_unexpired_record() {
+    let hive = common::start_mock().await;
+    let fleet = Fleet::new();
+    let t0 = Utc::now();
+    let view = fleet.view.lock().unwrap().clone();
+    let tag = record::fleet_tag(view.roster[0].public_key.as_ref().unwrap());
+    // Issued 40 minutes ago, still good for 20: a replay target on a machine that lost
+    // its state.
+    let signed = record::sign(
+        ferryman_hive_rescue::record::Body {
+            v: 1,
+            fleet: tag.clone(),
+            kind: Kind::Master,
+            signer: "beastly-ferry".into(),
+            seq: 3,
+            issued: t0 - chrono::Duration::minutes(40),
+            expires: at(t0, 20),
+            at: ferryman_hive_rescue::record::Where {
+                id: "cd".repeat(32),
+                relay_url: None,
+                direct: Vec::new(),
+            },
+            relay_list_version: None,
+            rescue_relay: None,
+            relays: None,
+        },
+        &fleet.beastly.signer(),
+    )
+    .unwrap();
+    let sealed = record::seal(&signed, &record::recipients(&view.roster, |_| false)).unwrap();
+    hive.inject(ACCOUNT, "ferryman-rescue", &record::op_json(&tag, &sealed));
+
+    let blank = tempfile::tempdir().unwrap();
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), blank.path(), false, |_| {});
+    let read = reader.poll(t0, true).await.unwrap();
+    assert!(!read.applied, "{:?}", read.records);
+    assert!(reader.snapshot().latest_master.is_none());
+
+    // The same machine with a state file on disk (it remembers what it saw) takes it.
+    let known = tempfile::tempdir().unwrap();
+    ferryman_hive_rescue::state::State::default()
+        .save(known.path())
+        .unwrap();
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), known.path(), false, |_| {});
+    assert!(reader.poll(t0, true).await.unwrap().applied);
+    // And the sequence number it saw is on disk now.
+    let again = ferryman_hive_rescue::state::State::load(known.path());
+    assert_eq!(again.seen_seq.get("beastly-ferry"), Some(&3));
 }

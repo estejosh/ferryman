@@ -191,6 +191,8 @@ async fn run(dir: PathBuf) -> Result<()> {
 
     if let Some(addr) = arg("serve-hive") {
         let mock = MockHive::start(&addr).await?;
+        let wif = std::env::var("HIVE_RESCUE_POSTING_KEY").unwrap_or_else(|_| TEST_WIF.into());
+        mock.authorize_key("drillfleet", &PostingKey::from_wif(&wif)?);
         log(format!("mock Hive node serving on {}", mock.url()));
         std::mem::forget(mock);
     }

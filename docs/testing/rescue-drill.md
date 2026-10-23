@@ -105,7 +105,7 @@ clock started later than grouchly's. With production timers the post comes 15 mi
 Needs, from Josh:
 
 - a Hive account for the fleet (`HIVE_RESCUE_ACCOUNT`) with enough staked HP for resource credits,
-- its posting key for the master (`HIVE_RESCUE_POSTING_KEY`, posting authority only, in `X:\ferry\secrets\.env`),
+- its posting key for the master (`HIVE_RESCUE_POSTING_KEY`, posting authority only, in the secrets file),
 - optionally a delegated poster account and key for the backup machine (authority granted by the fleet account),
 - two or three public API nodes to list under `[hive_rescue] nodes`.
 

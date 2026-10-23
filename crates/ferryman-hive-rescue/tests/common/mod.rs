@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use ferryman_channel::secrets::EncryptionIdentity;
 use ferryman_channel::{AgentIdentity, AgentRoute};
 use ferryman_hive_rescue::config::{Credentials, RescueConfig};
+use ferryman_hive_rescue::mock::MockHive;
 use ferryman_hive_rescue::rescuer::{FleetView, Rescuer, ViewFn};
 use ferryman_hive_rescue::rpc::HiveClient;
 use ferryman_hive_rescue::tx::PostingKey;
@@ -15,6 +16,18 @@ use ferryman_hive_rescue::tx::PostingKey;
 /// A posting key from the reference implementation's vectors (never a real key).
 pub const TEST_WIF: &str = "5K2r4ZRQ9HUu1Y1Sfon55LSe5jLwKiwcB7wAEi61cHKDjZ3LrGY";
 pub const ACCOUNT: &str = "ferryfleet";
+
+/// The iroh endpoint id the tests' lanes report (key seed 5).
+pub fn test_endpoint() -> String {
+    hex::encode(iroh::SecretKey::from_bytes(&[5; 32]).public().as_bytes())
+}
+
+/// A mock Hive node that lists [`TEST_WIF`] as the posting key of [`ACCOUNT`].
+pub async fn start_mock() -> MockHive {
+    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    hive.authorize_key(ACCOUNT, &PostingKey::from_wif(TEST_WIF).unwrap());
+    hive
+}
 
 #[derive(Clone)]
 pub struct Machine {
@@ -62,6 +75,16 @@ impl Fleet {
         let view = FleetView {
             roster: vec![beastly.route(), grouchly.route()],
             master: Some("beastly-ferry".into()),
+            // Both machines are known by the endpoint the tests' `LaneInfo` names.
+            endpoints: ["beastly-ferry", "grouchly-ferry"]
+                .into_iter()
+                .map(|name| {
+                    (
+                        name.to_owned(),
+                        std::collections::BTreeSet::from([test_endpoint()]),
+                    )
+                })
+                .collect(),
             ..FleetView::default()
         };
         Self {

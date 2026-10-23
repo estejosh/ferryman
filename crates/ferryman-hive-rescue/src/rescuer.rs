@@ -16,6 +16,7 @@
 //! Nothing here grants access. A record is a way to dial; the ordinary iroh checks (the
 //! roster-honoured TRANSPORTS records, a phone's signed grant) decide who is let in.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +32,7 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayUrl};
 
 use crate::config::{Credentials, RescueConfig};
 use crate::record::{self, Body, Kind, RescueRelay, Signed, Verifier, Where};
-use crate::rpc::HiveClient;
+use crate::rpc::{Bounds, HistoryOp, HiveClient};
 use crate::state::{Posted, State};
 use crate::tx::CustomJson;
 
@@ -43,8 +44,12 @@ pub struct FleetView {
     pub master: Option<String>,
     pub relays: Vec<FleetRelay>,
     pub relays_version: Option<DateTime<Utc>>,
-    /// Roster names the master revoked: not wrapped to from then on.
-    pub revoked: std::collections::BTreeSet<String>,
+    /// Roster names the master revoked: not wrapped to from then on, and nothing they
+    /// sign counts.
+    pub revoked: BTreeSet<String>,
+    /// The iroh endpoint ids each roster name is known by (canonical name to lower-case
+    /// hex), from the TRANSPORTS records the fleet's channels honour.
+    pub endpoints: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// A source of [`FleetView`]: the fleet folder in production, a fixture in tests.
@@ -63,12 +68,25 @@ pub fn view_from_root(root: ferryman_channel::ferry::Root) -> ViewFn {
             .map(|a| canonical_agent_name(&a.name))
             .filter(|name| ferryman_channel::master::is_revoked_in(&dir, &roster, name))
             .collect();
+        let mut endpoints: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for entry in root.projects() {
+            let Ok((route, _)) = entry.route(&root) else {
+                continue;
+            };
+            for record in ferryman_channel::transports::honoured_records(&route) {
+                endpoints
+                    .entry(canonical_agent_name(&record.agent))
+                    .or_default()
+                    .insert(record.endpoint_id.to_ascii_lowercase());
+            }
+        }
         FleetView {
             roster,
             master: trust.master().map(str::to_owned),
             relays: list.relays,
             relays_version: list.written_at,
             revoked,
+            endpoints,
         }
     })
 }
@@ -153,6 +171,8 @@ pub struct PollReport {
     pub records: Vec<Finding>,
     /// A record was accepted and applied this time.
     pub applied: bool,
+    /// The state file could not be written: replay protection will not survive a restart.
+    pub save_error: Option<String>,
 }
 
 /// What became of one operation read.
@@ -212,6 +232,15 @@ pub struct Preview {
     pub digest_hex: Option<String>,
 }
 
+/// What a record taught iroh, so it can be taken back when the record expires.
+struct Applied {
+    kind: Kind,
+    endpoint: EndpointId,
+    expires: DateTime<Utc>,
+    /// Relays this record put in the shared map (not ones that were there already).
+    added_relays: Vec<RelayUrl>,
+}
+
 pub struct Rescuer {
     cfg: RescueConfig,
     creds: Credentials,
@@ -224,6 +253,7 @@ pub struct Rescuer {
     relay_map: Mutex<Option<RelayMap>>,
     endpoint: Mutex<Option<Endpoint>>,
     state: Mutex<State>,
+    applied: Mutex<Vec<Applied>>,
     last: Mutex<TickReport>,
 }
 
@@ -253,7 +283,10 @@ impl Rescuer {
         signer: AgentIdentity,
         enc: EncryptionIdentity,
     ) -> Self {
-        let state = State::load(&state_dir);
+        let mut state = State::load(&state_dir);
+        // No readable state: no memory of what was replayed. Take only records issued from
+        // just before now on (and keep that floor in the file).
+        state.start_cautiously(Utc::now());
         Self {
             cfg,
             creds,
@@ -266,13 +299,16 @@ impl Rescuer {
             relay_map: Mutex::new(None),
             endpoint: Mutex::new(None),
             state: Mutex::new(state),
+            applied: Mutex::new(Vec::new()),
             last: Mutex::new(TickReport::default()),
         }
     }
 
     /// Plug the rescue address source into `endpoint`, and keep `relay_map` (the map the
     /// endpoint shares, from [`ferryman_iroh::lane::bind_shared`]) to add the rescue relay.
-    /// Anything already accepted (a record cached from before a restart) is applied now.
+    /// Anything already accepted (a record cached from before a restart) is applied now,
+    /// but only after it passes the checks again against the fleet folder as it is now
+    /// (a signer revoked since, a key rotated, an expiry): the cache is a file on disk.
     ///
     /// # Errors
     /// The endpoint is closed.
@@ -294,12 +330,47 @@ impl Rescuer {
             [state.latest_master.clone(), state.latest_backup.clone()]
         };
         let now = Utc::now();
+        let view = (self.view)();
+        let Some(fleet) = Self::fleet_tag(&view) else {
+            return Ok(());
+        };
+        let master = view.master.clone().unwrap_or_default();
+        let verifier = self.verifier(&fleet, &view, &master, now);
+        let mut dropped = false;
         for record in cached.into_iter().flatten() {
-            if record.body.expires > now {
+            if verifier.check(&record).is_ok() {
                 self.apply(&record);
+            } else {
+                let mut state = self.state();
+                match record.body.kind {
+                    Kind::Master => state.latest_master = None,
+                    Kind::Backup => state.latest_backup = None,
+                }
+                dropped = true;
             }
         }
+        if dropped {
+            let _ = self.save();
+        }
         Ok(())
+    }
+
+    fn verifier<'a>(
+        &'a self,
+        fleet: &'a str,
+        view: &'a FleetView,
+        master: &'a str,
+        now: DateTime<Utc>,
+    ) -> Verifier<'a> {
+        Verifier {
+            fleet,
+            roster: &view.roster,
+            master,
+            backups: &self.cfg.backup_agents,
+            revoked: &view.revoked,
+            endpoints: &view.endpoints,
+            now,
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -308,8 +379,8 @@ impl Rescuer {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn save(&self) {
-        let _ = self.state().save(&self.state_dir);
+    fn save(&self) -> Result<()> {
+        self.state().save(&self.state_dir)
     }
 
     /// The address source plugged into iroh: what an accepted record taught it.
@@ -358,22 +429,32 @@ impl Rescuer {
         let view = (self.view)();
         let fleet = Self::fleet_tag(&view).context("the fleet folder names no master yet")?;
         let master = view.master.clone().unwrap_or_default();
+        let verifier = self.verifier(&fleet, &view, &master, now);
+        // Page back through the account's custom_json history (anyone can bury the newest
+        // entries under dust transfers, so the newest 100 entries are not enough) until a
+        // record that counts turns up or a bound is reached.
+        let counts = |ops: &[HistoryOp]| {
+            ops.iter().any(|op| {
+                record::parse_op_json(&op.json, &fleet)
+                    .and_then(|sealed| record::open(&sealed, &fleet, &self.enc))
+                    .is_ok_and(|signed| verifier.check(&signed).is_ok())
+            })
+        };
         let read = self
             .hive
-            .read_history(&self.creds.account, &self.cfg.op_id, 100)
+            .read_history_until(
+                &self.creds.account,
+                &self.cfg.op_id,
+                now,
+                Bounds::default(),
+                &counts,
+            )
             .await;
         let mut report = PollReport {
             answered: read.answered.clone(),
             failed: read.failed.clone(),
             scanned: read.ops.len(),
             ..PollReport::default()
-        };
-        let verifier = Verifier {
-            fleet: &fleet,
-            roster: &view.roster,
-            master: &master,
-            backups: &self.cfg.backup_agents,
-            now,
         };
         let mut accepted = Vec::new();
         // Oldest first, so a replay of an old record after a newer one is seen as one.
@@ -391,7 +472,8 @@ impl Rescuer {
                             .get(&canonical_agent_name(&signed.body.signer))
                             .copied()
                             .unwrap_or(0);
-                        let new = signed.body.seq > seen;
+                        let new =
+                            signed.body.seq > seen && self.state().would_accept(&signed).is_ok();
                         let verdict = Verdict::Valid {
                             kind: signed.body.kind,
                             signer: signed.body.signer.clone(),
@@ -416,6 +498,11 @@ impl Rescuer {
         }
         if apply {
             self.state().last_poll = Some(now);
+            // Written before anything is applied: a record that cannot be remembered as
+            // seen would be taken again after a restart.
+            if let Err(error) = self.save() {
+                report.save_error = Some(format!("{error:#}"));
+            }
             // Only the newest of each kind is worth feeding to iroh.
             for kind in [Kind::Master, Kind::Backup] {
                 if let Some(newest) = accepted
@@ -427,9 +514,38 @@ impl Rescuer {
                     report.applied = true;
                 }
             }
-            self.save();
+            self.expire(now);
         }
         Ok(report)
+    }
+
+    /// Take back what records that have expired taught iroh: their endpoint addresses and
+    /// the relays they added to the shared map (not relays that were there before).
+    pub fn expire(&self, now: DateTime<Utc>) {
+        let mut applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *applied)
+            .into_iter()
+            .partition(|a| a.expires <= now);
+        *applied = kept;
+        let map = self
+            .relay_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for old in gone {
+            if !applied.iter().any(|a| a.endpoint == old.endpoint) {
+                self.lookup.remove_endpoint_info(old.endpoint);
+            }
+            if let Some(map) = map.as_ref() {
+                for url in &old.added_relays {
+                    if !applied.iter().any(|a| a.added_relays.contains(url)) {
+                        map.remove(url);
+                    }
+                }
+            }
+        }
     }
 
     /// Feed a verified record to iroh: where to dial, and the relay to use.
@@ -444,7 +560,11 @@ impl Rescuer {
             return;
         };
         let mut addr = EndpointAddr::new(id);
-        let mut relays: Vec<RelayConfig> = Vec::new();
+        let mut relays: Vec<RelayUrl> = Vec::new();
+        // Only the master's relays join the shared relay map, which every dial on this
+        // machine uses. A backup's record is a pointer to its machine: its relay (named by
+        // that machine alone) stays in that one address and is not added to the map.
+        let master_kind = body.kind == Kind::Master;
         if let Some(url) = body
             .at
             .relay_url
@@ -452,7 +572,9 @@ impl Rescuer {
             .and_then(|u| u.parse::<RelayUrl>().ok())
         {
             addr = addr.with_relay_url(url.clone());
-            relays.push(RelayConfig::from(url));
+            if master_kind {
+                relays.push(url);
+            }
         }
         for direct in &body.at.direct {
             if let Ok(socket) = direct.parse::<std::net::SocketAddr>() {
@@ -461,14 +583,17 @@ impl Rescuer {
         }
         // The master's rescue relay is for everyone to use; a backup's record is only a
         // pointer to its own machine.
-        if body.kind == Kind::Master
+        if master_kind
             && let Some(relay) = &body.rescue_relay
             && let Ok(url) = relay.url.parse::<RelayUrl>()
         {
             addr = addr.with_relay_url(url.clone());
-            relays.push(RelayConfig::from(url));
+            relays.push(url);
         }
+        // A newer record of this kind replaces what the last one taught.
+        self.retract(body.kind);
         self.lookup.set_endpoint_info(addr);
+        let mut added_relays = Vec::new();
         if let Some(map) = self
             .relay_map
             .lock()
@@ -476,7 +601,14 @@ impl Rescuer {
             .as_ref()
             && !relays.is_empty()
         {
-            map.extend(&RelayMap::from_iter(relays));
+            for url in &relays {
+                if !map.contains(url) {
+                    added_relays.push(url.clone());
+                }
+            }
+            map.extend(&RelayMap::from_iter(
+                relays.iter().cloned().map(RelayConfig::from),
+            ));
             // iroh looks at its relays on a network change; tell it one happened, so a
             // relay added now is tried now rather than at its next scheduled look.
             let endpoint = self
@@ -488,6 +620,43 @@ impl Rescuer {
                 && tokio::runtime::Handle::try_current().is_ok()
             {
                 tokio::spawn(async move { endpoint.network_change().await });
+            }
+        }
+        self.applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(Applied {
+                kind: body.kind,
+                endpoint: id,
+                expires: body.expires,
+                added_relays,
+            });
+    }
+
+    /// Take back what the last applied record of `kind` taught, before a newer one does.
+    fn retract(&self, kind: Kind) {
+        let mut applied = self
+            .applied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (old, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *applied)
+            .into_iter()
+            .partition(|a| a.kind == kind);
+        *applied = kept;
+        let map = self
+            .relay_map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for old in old {
+            if !applied.iter().any(|a| a.endpoint == old.endpoint) {
+                self.lookup.remove_endpoint_info(old.endpoint);
+            }
+            if let Some(map) = map.as_ref() {
+                for url in &old.added_relays {
+                    if !applied.iter().any(|a| a.added_relays.contains(url)) {
+                        map.remove(url);
+                    }
+                }
             }
         }
     }
@@ -605,6 +774,11 @@ impl Rescuer {
         if self.creds.account.is_empty() {
             bail!("no fleet account: set HIVE_RESCUE_ACCOUNT or [hive_rescue] account");
         }
+        // Only ever post with a posting key of the right account: an owner or active key
+        // here is a mistake worth stopping before it is used.
+        self.hive
+            .check_posting_key(&self.creds.account, self.creds.poster.as_deref(), key)
+            .await?;
         let view = (self.view)();
         let body = self.body_for(kind, &view, info, now)?;
         let signed = record::sign(body, &self.signer)?;
@@ -628,7 +802,8 @@ impl Rescuer {
             };
         }
         self.apply(&signed);
-        self.save();
+        // The record is out; a state file that cannot be written only costs the dedupe.
+        let _ = self.save();
         Ok(PostOutcome {
             kind,
             reason: reason.to_owned(),
@@ -645,6 +820,7 @@ impl Rescuer {
     /// One look at the world. `status` and `info` come from the lane.
     pub async fn tick(&self, status: &Status, info: &LaneInfo, now: DateTime<Utc>) -> TickReport {
         let mut report = TickReport::default();
+        self.expire(now);
         let view = (self.view)();
         let cut = cut_off_since(status);
         report.cut_off_since = cut;
@@ -765,7 +941,7 @@ impl Rescuer {
             state.posted.relay_url = Some(relay);
             state.posted.relay_list_version = view.relays_version;
             drop(state);
-            self.save();
+            let _ = self.save();
             return None;
         }
         if since_post.is_some_and(|d| d < ChronoDuration::minutes(10)) {
