@@ -28,6 +28,10 @@ pub(crate) enum LanesCommand {
         /// A shared file any lane may touch, beyond DECISIONS.md, README.md, CHANGELOG.md.
         #[arg(long = "shared")]
         shared: Vec<String>,
+        /// A log only ever appended to (repeatable), e.g. DECISIONS.md: concurrent additions
+        /// merge by union when the lane lands. Never name a file that is edited in place.
+        #[arg(long = "append-only")]
+        append_only: Vec<String>,
         /// The branch the lane lands on. Default: main (or master).
         #[arg(long)]
         base: Option<String>,
@@ -85,8 +89,9 @@ pub(crate) enum LanesCommand {
         #[arg(long, default_value_t = 60)]
         wait: u64,
         /// Milliseconds to wait after claiming the landing lock, for a peer's claim to show.
-        #[arg(long, default_value_t = 1000)]
-        settle_ms: u64,
+        /// Default: 1000 when only this machine uses the project, 8000 when others do.
+        #[arg(long)]
+        settle_ms: Option<u64>,
         /// The sealed secret holding the push token (see `ferry channel secret`).
         #[arg(long, default_value = "GH_TOKEN")]
         secret: String,
@@ -100,7 +105,8 @@ pub(crate) enum LanesCommand {
         lane: String,
         #[arg(long)]
         project: Option<String>,
-        /// Discard uncommitted or unlanded work.
+        /// Retire even with uncommitted files, a live session or unlanded commits (the branch
+        /// tip is first saved under refs/ferry/retired/<lane>/).
         #[arg(long)]
         force: bool,
         #[arg(long)]
@@ -207,6 +213,7 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
             lane,
             owns,
             shared,
+            append_only,
             base,
             agent,
         } => {
@@ -220,6 +227,7 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
                     lane: &lane,
                     owns,
                     shared,
+                    append_only,
                     base,
                     exe,
                 },
@@ -307,9 +315,7 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
             };
             let id = session
                 .or_else(lanes::current_session_id)
-                .unwrap_or_else(|| {
-                    format!("s-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])
-                });
+                .unwrap_or_else(|| lanes::stable_session_id(&agent, &cwd));
             let others: Vec<_> = lanes::live_sessions(&gitdir, chrono::Utc::now())
                 .into_iter()
                 .filter(|m| m.session != id)
@@ -372,6 +378,9 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
             else {
                 return Ok(());
             };
+            if let Some(note) = &outcome.offline {
+                eprintln!("ferry lanes: warning: {note}");
+            }
             for problem in &outcome.problems {
                 eprintln!("ferry lanes: warning: {problem}");
             }
@@ -442,7 +451,10 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
                 push,
                 allow_foreign,
                 wait_secs: wait,
-                settle_ms,
+                settle_ms: settle_ms.unwrap_or_else(|| {
+                    let d = counters::default_settle(&route).as_millis();
+                    u64::try_from(d).unwrap_or(8000).max(1000)
+                }),
                 token,
             };
             match lanes::land(&route, &identity, &lane, &opts)? {
@@ -453,6 +465,7 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
                     new_tip,
                     pushed,
                     push_note,
+                    lane_note,
                 } => {
                     println!(
                         "landed {commits} commit(s) of lane '{lane}' on {base}: {} -> {}",
@@ -462,6 +475,9 @@ pub(crate) fn command(command: LanesCommand) -> Result<()> {
                     println!(
                         "  the lane now sits on the new {base}; the old tip is kept at refs/ferry/landed/{lane}/*"
                     );
+                    if let Some(note) = lane_note {
+                        eprintln!("warning: {note}");
+                    }
                     if pushed {
                         println!("  pushed {base}");
                     }
@@ -529,16 +545,7 @@ pub(crate) fn counter_command(command: CounterCommand) -> Result<()> {
             let route = route_of(project.as_deref())?;
             let identity = me(&route, agent)?;
             let machine = lanes::this_machine();
-            let settle = match settle {
-                Some(s) => s,
-                None => {
-                    let peers = counters::claims(&route, &name)?
-                        .values()
-                        .flatten()
-                        .any(|c| c.machine != machine);
-                    if peers { 8 } else { 0 }
-                }
-            };
+            let settle = settle.unwrap_or_else(|| counters::default_settle(&route).as_secs());
             let n = counters::next(
                 &route,
                 &identity,

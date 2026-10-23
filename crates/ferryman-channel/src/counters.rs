@@ -1,7 +1,7 @@
 //! Shared counters: sequential ids (decision numbers, asset ids) handed out through the
 //! channel so that two agents never take the same one (ADR 0029).
 //!
-//! A claim is a signed file `counters/<name>/<n>.<agent>.json`. The number `n` belongs to
+//! A claim is a signed file `counters/<name>/<n>.<agent>.<machine>.json`. The number `n` belongs to
 //! the claim with the lowest `(claimed_at, agent, machine)` among the validly signed
 //! claims for it; anyone who finds a better claim for their number has lost and takes the
 //! next one. A claim that does not verify against the roster counts for nothing.
@@ -71,8 +71,54 @@ fn dir(route: &ProjectRoute, name: &str) -> PathBuf {
     route.communications.join("counters").join(name)
 }
 
-fn claim_file(route: &ProjectRoute, name: &str, n: u64, agent: &str) -> PathBuf {
-    dir(route, name).join(format!("{n}.{agent}.json"))
+fn claim_file(route: &ProjectRoute, name: &str, n: u64, agent: &str, machine: &str) -> PathBuf {
+    dir(route, name).join(format!(
+        "{n}.{agent}.{}.json",
+        crate::lanes::machine_slug(machine)
+    ))
+}
+
+/// Whether another machine could be allocating from this channel: some lane or counter
+/// claim in it was written by a machine other than this one. True means a first-time
+/// cross-machine allocation should wait out the settle window.
+#[must_use]
+pub fn peers_possible(route: &ProjectRoute) -> bool {
+    let me = crate::lanes::machine_slug(&crate::lanes::this_machine());
+    if crate::lanes::load(route)
+        .map(|l| {
+            l.lanes
+                .iter()
+                .any(|r| crate::lanes::machine_slug(&r.machine) != me)
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(route.communications.join("counters")) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        e.file_name().to_str().is_some_and(|name| {
+            claims(route, name)
+                .map(|c| {
+                    c.values()
+                        .flatten()
+                        .any(|c| crate::lanes::machine_slug(&c.machine) != me)
+                })
+                .unwrap_or(false)
+        })
+    })
+}
+
+/// The settle window used when none is given: 8 s when another machine may be allocating,
+/// none when this machine is alone.
+#[must_use]
+pub fn default_settle(route: &ProjectRoute) -> StdDuration {
+    if peers_possible(route) {
+        StdDuration::from_secs(8)
+    } else {
+        StdDuration::ZERO
+    }
 }
 
 fn safe_name(name: &str) -> Result<()> {
@@ -105,7 +151,10 @@ pub fn claim_at(
     let signature = identity.signing.sign(claim.payload().as_bytes());
     claim.signed_by = Some(identity.name().to_owned());
     claim.signature = Some(hex::encode(signature.to_bytes()));
-    crate::atomic_json(&claim_file(route, name, n, &claim.agent), &claim)?;
+    crate::atomic_json(
+        &claim_file(route, name, n, &claim.agent, &claim.machine),
+        &claim,
+    )?;
     Ok(claim)
 }
 
@@ -119,6 +168,12 @@ pub fn claims(route: &ProjectRoute, name: &str) -> Result<BTreeMap<u64, Vec<Clai
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        if path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().contains(".sync-conflict-"))
+        {
+            continue; // a Syncthing conflict copy is never a claim
+        }
         if path.extension().is_none_or(|e| e != "json")
             || path.file_name().is_some_and(|n| n == "policy.json")
         {
@@ -130,7 +185,12 @@ pub fn claims(route: &ProjectRoute, name: &str) -> Result<BTreeMap<u64, Vec<Clai
         else {
             continue;
         };
-        let expected = format!("{}.{}.json", claim.n, claim.agent);
+        let expected = format!(
+            "{}.{}.{}.json",
+            claim.n,
+            claim.agent,
+            crate::lanes::machine_slug(&claim.machine)
+        );
         if claim.project_id != route.project_id
             || claim.name != name
             || path
@@ -337,6 +397,13 @@ pub fn next(
     if let Some(policy) = &policy {
         if let Some(r) = policy.ranges.get(me) {
             range = Some(*r);
+        } else if !policy.ranges.is_empty() {
+            // Ranges are set and this agent has none: starting at `start` would run into
+            // someone else's range. Ask the master for one.
+            bail!(
+                "counter '{name}' hands out ranges and '{me}' has none; ask the master to give it one \
+                 (ferry counter policy {name} --range {me}=START-END)"
+            );
         } else if let Some(allocator) = &policy.allocator
             && allocator != me
             && !opts.provisional
@@ -378,7 +445,8 @@ pub fn next(
             return Ok(candidate);
         }
         // Lost to a claim that arrived first: step aside and take the next one.
-        let _ = fs::remove_file(claim_file(route, name, candidate, me));
+        // Only our own claim, named for our agent and machine; never anyone else's.
+        let _ = fs::remove_file(claim_file(route, name, candidate, me, &mine.machine));
     }
     bail!("could not settle a number for '{name}' after 100 tries")
 }
@@ -531,6 +599,52 @@ mod tests {
             .unwrap(),
             30
         );
+    }
+
+    #[test]
+    fn an_agent_with_no_range_is_refused_when_ranges_are_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let master = AgentIdentity::from_seed("josh", [3; 32]);
+        let a = AgentIdentity::from_seed("ash", [1; 32]);
+        let c = AgentIdentity::from_seed("cy", [4; 32]);
+        let route = route_with(dir.path(), &[&master, &a, &c]);
+        crate::master::initialize_master(&route, &master, "josh").unwrap();
+        let ranges = BTreeMap::from([("ash".to_string(), (1000, 1999))]);
+        set_policy(&route, &master, "asset", None, ranges).unwrap();
+        let err = next(&route, &c, "asset", &NextOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("has none"), "{err}");
+        let provisional = NextOptions {
+            provisional: true,
+            ..NextOptions::default()
+        };
+        assert!(next(&route, &c, "asset", &provisional).is_err());
+        assert!(claims(&route, "asset").unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_agent_on_two_machines_keeps_separate_claim_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = AgentIdentity::from_seed("ash", [1; 32]);
+        let route = route_with(dir.path(), &[&a]);
+        let early = Utc::now() - Duration::seconds(5);
+        claim_at(&route, &a, "decision", 30, "grouchly", early).unwrap();
+        // The same agent on another machine claims the same number a moment later.
+        let late = claim_at(&route, &a, "decision", 30, "beastly", Utc::now()).unwrap();
+        let held = held(&route, "decision").unwrap();
+        assert_eq!(held[0].winner.machine, "grouchly");
+        assert_eq!(held[0].losers.len(), 1, "both claims survive side by side");
+        assert!(claim_file(&route, "decision", 30, "ash", "beastly").exists());
+        assert!(claim_file(&route, "decision", 30, "ash", "grouchly").exists());
+        // A conflict copy is ignored, not read as a claim.
+        let conflict = dir.path().join(
+            "channel/counters/decision/30.ash.beastly.sync-conflict-20260101-000000-ABC.json",
+        );
+        fs::copy(
+            claim_file(&route, "decision", 30, "ash", &late.machine),
+            &conflict,
+        )
+        .unwrap();
+        assert_eq!(claims(&route, "decision").unwrap()[&30].len(), 2);
     }
 
     #[test]

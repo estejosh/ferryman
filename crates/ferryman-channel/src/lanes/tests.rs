@@ -82,6 +82,7 @@ fn spec<'a>(lane: &'a str, owns: &[&str]) -> NewLane<'a> {
         lane,
         owns: owns.iter().map(|s| (*s).to_owned()).collect(),
         shared: Vec::new(),
+        append_only: vec!["DECISIONS.md".into()],
         base: None,
         exe: PathBuf::from("ferry"),
     }
@@ -117,7 +118,19 @@ fn a_lane_is_its_own_worktree_hidden_from_the_main_checkout() {
     let w = world();
     let (record, dir) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
     assert_eq!(record.branch, "lane/game");
-    assert_eq!(dir, w.repo.join(".lanes").join("game"));
+    assert!(
+        same_path(&dir, &w.repo.join(".lanes").join("game")),
+        "{} vs {}",
+        dir.display(),
+        w.repo.display()
+    );
+    // git lists the worktree with forward slashes and long names; it is found all the same.
+    assert!(
+        worktrees(&w.repo)
+            .unwrap()
+            .iter()
+            .any(|t| same_path(&t.path, &dir) && t.branch.as_deref() == Some("lane/game"))
+    );
     assert_eq!(
         run(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]),
         "lane/game"
@@ -321,13 +334,13 @@ fn only_one_landing_at_a_time_and_a_dead_holders_claim_expires() {
         .to_string();
     assert!(err.contains("rf on grouchly is landing"), "{err}");
     // It finished (the claim is withdrawn): the landing goes through.
-    fs::remove_file(claim_path(&w.route, "rf")).unwrap();
+    fs::remove_file(claim_path(&w.route, "rf", "grouchly")).unwrap();
     assert!(matches!(
         land(&w.route, &w.ash, "game", &busy).unwrap(),
         LandOutcome::Landed { .. }
     ));
     assert!(
-        !claim_path(&w.route, "ash").exists(),
+        !claim_path(&w.route, "ash", &this_machine()).exists(),
         "the claim is released"
     );
 }
@@ -412,9 +425,15 @@ fn a_lane_can_land_on_a_remote_without_the_token_touching_disk() {
 
 #[test]
 fn the_credential_reaches_git_only_as_environment_for_the_one_remote() {
-    let env = auth_env("https://github.com/estejosh/idle-ish.git", Some("tok"));
+    let env = auth_env_at(0, "https://github.com/estejosh/idle-ish.git", Some("tok"));
+    assert_eq!(env[0], ("GIT_CONFIG_COUNT".to_string(), "1".to_string()));
     assert_eq!(env[1].1, "http.https://github.com/.extraheader");
     assert_eq!(env[2].1, "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46dG9r");
+    // It appends to entries already present rather than clobbering them.
+    let env = auth_env_at(2, "https://github.com/x.git", Some("tok"));
+    assert_eq!(env[0].1, "3");
+    assert_eq!(env[1].0, "GIT_CONFIG_KEY_2");
+    assert_eq!(env[2].0, "GIT_CONFIG_VALUE_2");
     assert!(auth_env("git@github.com:estejosh/x.git", Some("tok")).is_empty());
     assert!(auth_env("https://github.com/x.git", None).is_empty());
     assert_eq!(
@@ -476,4 +495,305 @@ fn retiring_a_lane_frees_its_globs_and_refuses_unlanded_work() {
     assert_eq!(summary(&w.route, true).unwrap()[0].status, "retired");
     // The globs are free again.
     new_lane(&w.route, &w.rf, spec("game2", &["game/**"])).unwrap();
+}
+
+#[test]
+fn retire_never_loses_work() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    // An untracked file alone blocks a retire.
+    fs::write(game.join("game/scratch.txt"), "notes\n").unwrap();
+    let err = retire_lane(&w.route, &w.ash, "game", false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("uncommitted or untracked"), "{err}");
+    assert!(game.join("game/scratch.txt").is_file());
+    fs::remove_file(game.join("game/scratch.txt")).unwrap();
+    // A live session blocks it.
+    let gitdir = git_dir_of(&game).unwrap();
+    register_session(&gitdir, "sess-a", "ash", None).unwrap();
+    let err = retire_lane(&w.route, &w.ash, "game", false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("live session"), "{err}");
+    release_session(&gitdir, "sess-a");
+    // Unlanded commits block it, and --force keeps them under refs/ferry/retired.
+    commit(&game, &[("game/a.rs", "a\n")], "work");
+    let tip = run(&game, &["rev-parse", "HEAD"]);
+    assert!(retire_lane(&w.route, &w.ash, "game", false).is_err());
+    assert!(branch_exists(&w.repo, "lane/game"));
+    retire_lane(&w.route, &w.ash, "game", true).unwrap();
+    assert!(!branch_exists(&w.repo, "lane/game"));
+    let saved = run(
+        &w.repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/ferry/retired/game/",
+        ],
+    );
+    assert_eq!(saved, tip, "the forced retire left a way back");
+}
+
+#[test]
+fn retire_with_a_missing_worktree_still_counts_unlanded_commits() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    commit(&game, &[("game/a.rs", "a\n")], "work");
+    // The folder is deleted behind git's back.
+    run(
+        &w.repo,
+        &["worktree", "remove", "--force", game.to_str().unwrap()],
+    );
+    assert!(!game.exists());
+    let err = retire_lane(&w.route, &w.ash, "game", false)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("1 commit"), "{err}");
+    assert!(branch_exists(&w.repo, "lane/game"), "the branch is kept");
+    retire_lane(&w.route, &w.ash, "game", true).unwrap();
+    assert!(
+        !run(&w.repo, &["for-each-ref", "refs/ferry/retired/game/"]).is_empty(),
+        "saved before deleting"
+    );
+}
+
+#[test]
+fn landing_stops_if_an_untracked_file_is_in_the_way_and_changes_nothing() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    let (_, art) = new_lane(&w.route, &w.rf, spec("art", &["art/**"])).unwrap();
+    commit(&game, &[("game/a.rs", "a\n")], "game work");
+    commit(&art, &[("art/b.txt", "b\n")], "art work");
+    assert!(matches!(
+        land(&w.route, &w.ash, "game", &LandOptions::default()).unwrap(),
+        LandOutcome::Landed { .. }
+    ));
+    // art has an untracked file where game's landed file would arrive.
+    fs::create_dir_all(art.join("game")).unwrap();
+    fs::write(art.join("game/a.rs"), "mine, not committed\n").unwrap();
+    let main_before = run(&w.repo, &["rev-parse", "main"]);
+    let art_before = run(&art, &["rev-parse", "HEAD"]);
+    let LandOutcome::Refused(why) = land(&w.route, &w.rf, "art", &LandOptions::default()).unwrap()
+    else {
+        panic!("must refuse")
+    };
+    assert!(why.contains("game/a.rs"), "{why}");
+    assert_eq!(run(&w.repo, &["rev-parse", "main"]), main_before);
+    assert_eq!(run(&art, &["rev-parse", "HEAD"]), art_before);
+    assert_eq!(
+        fs::read_to_string(art.join("game/a.rs")).unwrap(),
+        "mine, not committed\n"
+    );
+}
+
+#[test]
+fn a_successful_landing_always_keeps_the_old_tip() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    commit(&game, &[("game/a.rs", "a\n")], "work");
+    let before = run(&game, &["rev-parse", "HEAD"]);
+    let LandOutcome::Landed { old_tip, .. } =
+        land(&w.route, &w.ash, "game", &LandOptions::default()).unwrap()
+    else {
+        panic!("should land")
+    };
+    assert_eq!(old_tip, before);
+    let saved = run(
+        &w.repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/ferry/landed/game/",
+        ],
+    );
+    assert_eq!(saved, before);
+}
+
+#[test]
+fn lane_changed_notices_a_moved_tip_and_uncommitted_edits() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    commit(&game, &[("game/a.rs", "a\n")], "one");
+    let tip = run(&game, &["rev-parse", "HEAD"]);
+    assert_eq!(lane_changed(&game, "lane/game", &tip, &tip).unwrap(), None);
+    fs::write(game.join("game/main.rs"), "changed\n").unwrap();
+    assert!(
+        lane_changed(&game, "lane/game", &tip, &tip)
+            .unwrap()
+            .unwrap()
+            .contains("uncommitted")
+    );
+    run(&game, &["checkout", "-q", "--", "game/main.rs"]);
+    commit(&game, &[("game/b.rs", "b\n")], "two");
+    assert!(
+        lane_changed(&game, "lane/game", &tip, &tip)
+            .unwrap()
+            .unwrap()
+            .contains("moved")
+    );
+}
+
+#[test]
+fn landing_catches_non_ascii_paths_and_renames_out_of_another_lane() {
+    let w = world();
+    new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    let (_, art) = new_lane(&w.route, &w.rf, spec("art", &["art/**"])).unwrap();
+    // A rename out of game's folder is a deletion there, and counts.
+    run(&art, &["mv", "game/main.rs", "art/moved.rs"]);
+    run(&art, &["commit", "-q", "-n", "-m", "move"]);
+    let LandOutcome::Refused(why) = land(&w.route, &w.rf, "art", &LandOptions::default()).unwrap()
+    else {
+        panic!("must refuse")
+    };
+    assert!(why.contains("game/main.rs"), "{why}");
+    // A non-ASCII name is reported as itself, not as a quoted escape.
+    run(&art, &["reset", "-q", "--hard", "main"]);
+    commit(&art, &[("game/h\u{e9}ro.rs", "x\n")], "accent");
+    let LandOutcome::Refused(why) = land(&w.route, &w.rf, "art", &LandOptions::default()).unwrap()
+    else {
+        panic!("must refuse")
+    };
+    assert!(why.contains("h\u{e9}ro.rs"), "{why}");
+}
+
+#[test]
+fn every_hook_chains_to_the_repos_own_hooks_dir() {
+    let w = world();
+    let custom = w._tmp.path().join("husky");
+    fs::create_dir_all(&custom).unwrap();
+    fs::write(
+        custom.join("post-commit"),
+        "#!/bin/sh\necho ran > \"$(git rev-parse --absolute-git-dir)/post-ran\"\n",
+    )
+    .unwrap();
+    run(&w.repo, &["config", "core.hooksPath", &slashes(&custom)]);
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    let hooks = git_dir_of(&game).unwrap().join("ferry-hooks");
+    for name in CLIENT_HOOKS {
+        assert!(hooks.join(name).is_file(), "missing wrapper for {name}");
+    }
+    assert!(
+        fs::read_to_string(hooks.join("post-commit"))
+            .unwrap()
+            .contains("husky")
+    );
+    commit(&game, &[("game/a.rs", "a\n")], "work");
+    assert!(
+        git_dir_of(&game).unwrap().join("post-ran").is_file(),
+        "the repo's own post-commit ran through the wrapper"
+    );
+}
+
+#[test]
+fn append_only_files_union_merge_and_nothing_else_does() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    assert!(
+        !w.repo.join(".git/info/attributes").exists(),
+        "shared attributes untouched"
+    );
+    let attributes =
+        fs::read_to_string(git_dir_of(&game).unwrap().join("ferry-attributes")).unwrap();
+    assert_eq!(attributes.trim(), "DECISIONS.md merge=union");
+    assert!(!attributes.contains("README"));
+}
+
+#[test]
+fn session_ids_are_stable_and_dead_processes_are_not_live() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    assert_eq!(
+        stable_session_id("ash", &game),
+        stable_session_id("ash", &game)
+    );
+    assert_ne!(
+        stable_session_id("ash", &game),
+        stable_session_id("rf", &game)
+    );
+    let gitdir = git_dir_of(&game).unwrap();
+    let id = stable_session_id("ash", &game);
+    register_session(&gitdir, &id, "ash", None).unwrap();
+    register_session(&gitdir, &id, "ash", None).unwrap();
+    assert_eq!(live_sessions(&gitdir, Utc::now()).len(), 1);
+    // A recorded pid that is not running drops the session.
+    register_session(&gitdir, "gone", "rf", Some(u32::MAX - 1)).unwrap();
+    assert_eq!(live_sessions(&gitdir, Utc::now()).len(), 1);
+    register_session(&gitdir, "me", "rf", Some(std::process::id())).unwrap();
+    assert_eq!(live_sessions(&gitdir, Utc::now()).len(), 2);
+}
+
+#[test]
+fn the_same_agent_on_two_machines_has_two_landing_claims() {
+    let w = world();
+    let a = LandingClaim::signed(&w.route, &w.ash, "game", "grouchly", Utc::now());
+    a.publish(&w.route).unwrap();
+    let b = LandingClaim::signed(&w.route, &w.ash, "game", "beastly", Utc::now());
+    b.publish(&w.route).unwrap();
+    assert_ne!(
+        claim_path(&w.route, "ash", "grouchly"),
+        claim_path(&w.route, "ash", "beastly")
+    );
+    // From beastly's point of view only grouchly's claim is someone else's.
+    let others = other_claims(&w.route, "ash", "beastly");
+    assert_eq!(others.len(), 1);
+    assert_eq!(others[0].machine, "grouchly");
+    // A conflict copy is not a claim.
+    let dir = lanes_dir(&w.route).join("landing");
+    fs::copy(
+        claim_path(&w.route, "ash", "grouchly"),
+        dir.join("ash.grouchly.sync-conflict-20260101-000000-XYZ.json"),
+    )
+    .unwrap();
+    assert_eq!(other_claims(&w.route, "ash", "beastly").len(), 1);
+}
+
+#[test]
+fn the_commit_check_uses_a_cached_manifest_when_the_channel_is_gone() {
+    let w = world();
+    let (_, game) = new_lane(&w.route, &w.ash, spec("game", &["game/**"])).unwrap();
+    new_lane(&w.route, &w.rf, spec("art", &["art/**"])).unwrap();
+    // Point the marker at an attachment that is gone: the channel cannot be read. No cache
+    // means allowed with a note; a cache means the owned path is still refused.
+    let gitdir = git_dir_of(&game).unwrap();
+    let mut marker = read_marker(&gitdir).unwrap();
+    marker.attachment = w._tmp.path().join("nowhere");
+    fs::write(marker_path(&gitdir), serde_json::to_vec(&marker).unwrap()).unwrap();
+    fs::create_dir_all(game.join("art")).unwrap();
+    fs::write(game.join("art/x.txt"), "x\n").unwrap();
+    run(&game, &["add", "art/x.txt"]);
+    let none = |_: &ProjectRoute, _: &str| None;
+    let open = check_staged(&game, None, none).unwrap().unwrap();
+    assert!(
+        open.offline
+            .as_deref()
+            .unwrap()
+            .contains("no manifest is cached")
+    );
+    assert!(open.report.refused.is_empty(), "nothing known, so allowed");
+    assert!(gitdir.join("ferry-lanes-warnings.jsonl").is_file());
+    // With a cache from an earlier online check, art/ is still protected.
+    let lanes = load(&w.route).unwrap().lanes;
+    fs::write(
+        gitdir.join("ferry-lanes-cache.json"),
+        serde_json::to_vec(&lanes).unwrap(),
+    )
+    .unwrap();
+    let closed = check_staged(&game, None, none).unwrap().unwrap();
+    assert!(closed.offline.as_deref().unwrap().contains("cached"));
+    assert_eq!(
+        closed.report.refused,
+        vec![("art/x.txt".to_string(), "art".to_string())]
+    );
+}
+
+#[test]
+fn old_git_is_refused_up_front() {
+    assert!(require_git((1, 0), "x").is_ok());
+    assert!(
+        require_git((99, 0), "lanes")
+            .unwrap_err()
+            .to_string()
+            .contains("needs git 99.0")
+    );
 }
