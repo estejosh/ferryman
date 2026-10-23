@@ -303,6 +303,85 @@ same words. C is gated on the LLC (0030 decision 6); until then design and priva
   walks the login and approval; "Connected apps" lists and revokes.
 - Updating the hub is the same signed-release pull as every machine.
 
+## Agentic setup
+
+Once the master's own hub works, setup must not need him. Anyone with their own VPS and storage account
+should be able to tell their own AI agent (Claude Code, Codex, or claude.ai through the MCP) "set up
+Ferryman with my VPS and storage", and have it done end to end. Two parts: a published **setup skill**
+(a prompt and playbook the agent loads) and `ferry setup` subcommands the skill drives. The skill holds
+judgement; the subcommands hold all effects, so an agent cannot improvise a step that is not there.
+
+### Contract of `ferry setup`
+
+- **Non-interactive and idempotent.** Every subcommand takes flags or a plan file, prints JSON, and exits
+  with a distinct code for ok, needs-human, and failed. Running it twice changes nothing the second time.
+- **check, plan, apply, verify.** `ferry setup check` reports the current state (what exists, what is
+  missing, versions). `ferry setup plan` writes a plan file: an ordered list of steps, each with what it
+  changes, whether it is reversible, and whether it needs the human. `ferry setup apply <plan>` runs
+  steps and records each in a local setup log; a step that is already satisfied is skipped. `ferry setup
+  verify` re-checks every step. Every subcommand has `--dry-run`, which shows the exact commands and file
+  changes without making them.
+- **Steps**, in order: (1) pick the profile (below); (2) provision the hub over SSH: install the signed
+  release, service user, systemd unit, firewall rules (allow SSH, 443 and the relay port; deny the rest),
+  hostname check, TLS; (3) create and enrol identities through master-signed grants (hub, then the
+  machines the user names); (4) configure object storage, MEGA S4 or any S3-compatible service, with
+  client-side encryption and a bucket round-trip test; (5) write and sign the relay list; (6) connect AI
+  apps (mint the pairing code, show the URL, wait for approval); (7) run the self-test drill and write its
+  report.
+- **Profile choice.** The skill asks three questions (do you have or want a VPS; do you leave home; do you
+  add phones) and `ferry setup plan --profile auto` proposes A, B or C per 0030: no server means B with the
+  upgrade offer, a server the user owns means A with the hub, "host it for me" means C once it exists. The
+  user confirms the profile; the agent does not choose it silently.
+- **Provider-agnostic.** Any VPS with SSH, root or sudo, and Ubuntu or Debian (a current LTS and the
+  previous one). Nothing calls a provider API; the user buys the server and gives the agent a host name.
+  Tested providers are listed in the repo docs only after a real run on each, and the list says which
+  version was tested. Anything else is "expected to work, untested".
+- **Self-test drill** (`ferry setup drill`): sends a signed message through the hub and back, claims and
+  submits a dummy order, uploads and fetches a small encrypted blob through the store, restarts the hub,
+  fails over to the second relay, and runs an OAuth login against the local test client. It reads only its
+  own dummy project, which it creates and removes. A failed step names the fix.
+
+### What the human keeps, and how the agent never sees credentials
+
+The agent drives; the human decides and holds every secret. The lines that never move:
+
+- **Credentials.** SSH keys or passwords for the VPS, storage access keys, the master passphrase and any
+  API token are entered by the user into the local vault or a dashboard prompt on their own machine. The
+  agent receives **handles** (for example `vault:vps-main`, `vault:s4-main`) and passes them to `ferry setup`,
+  which resolves them locally. Secrets never appear in chat, in a plan file, in the setup log, in a command
+  line or in an environment dump; the output scrubber that guards 0028 tools also scrubs `ferry setup` output.
+  If an agent asks for a secret in chat, the skill tells it to stop and send the user to the prompt.
+- **Signing.** Master-signed grants, the relay list and release trust are approved by the human in the
+  dashboard. The agent can request a signature (a pending item, as `ferry_ask_human` does) and wait; it
+  cannot sign. `ferry setup` never holds the master key.
+- **Spending money.** Buying a server, a domain, a storage plan or a hosted relay is the user's action. A
+  plan step that would incur cost is marked `needs-human: spend` and is never run by the agent.
+- **Destructive steps.** Anything that deletes data, replaces a running service, changes DNS, opens or
+  closes a firewall port on an existing server, or removes a project from the hub is `needs-human:
+  destructive` and runs only after the human approves that step by its id, with the dry-run output shown.
+- The agent is a Worker-level actor by default for setup: it can run `check`, `plan` and `--dry-run`
+  freely; `apply` of anything marked above waits for approval, and an unapproved step ends the run with the
+  needs-human exit code and a plain-language message for the user.
+
+### Rollback and uninstall
+
+- Every `apply` step records an inverse in the setup log. `ferry setup rollback [--to <step>]` undoes steps
+  in reverse order, each dry-runnable and each destructive one human-approved.
+- `ferry setup uninstall --hub` stops and removes the unit and service user on the VPS, removes the
+  firewall rules this tool added, deletes the hub's keys and its synced copies (the purge of 0031), asks
+  the dashboard to revoke the hub's roster entry and the app identities, and leaves the relay, the user's
+  other services and the object store untouched. Deleting stored blobs is a separate, explicit, destructive
+  step. Home machines keep working on direct paths and Hive rescue (0030).
+- A failed `apply` stops at the failing step with the log; re-running `apply` resumes. Nothing is left
+  half-configured without `verify` saying so.
+
+### Where it sits
+
+It is built after the master's own hub works (steps 1 to 7 above), because it automates a flow that must
+first be done by hand once and found stable. Its pieces map to the earlier steps, so each `ferry setup`
+subcommand is a thin wrapper over a function that already exists by then; the new work is the plan and log
+format, SSH provisioning, scrubbing and the drill. The skill is written last, against the real commands.
+
 ## Amendments
 
 - 0030, "Dashboard and MCP are never on the server" and "Does any profile need remote MCP?": a **hub**
@@ -345,11 +424,12 @@ Focused days for one engineer, after the local MCP beta (PR #108) lands. Rough.
 | 9 | Passkey / TOTP owner sign-in | 4 |
 | 10 | Passthrough edge and ACME at home (C and the A option) | 10 |
 | 11 | Profile C routing, wildcard names, CT watch, per-tenant limits (after the C control plane, 0030) | 6 |
+| 12 | Agentic setup: erry setup check/plan/apply/verify/rollback/uninstall/drill, SSH provisioning, secret handles and output scrubbing, setup skill, one real run on each tested provider | 14 |
 
 Order: 1, then 2 and 3 in parallel, then 4, then 5 (first on a separate port), 6, 7. Milestone for the
 master: a read-only Worker connection from claude.ai to his fleet through the hub with the home machines
 off, then ChatGPT. Step 8 is an independent track that can start once the S4 client question (open
-question 9) is settled. 9 after the beta; 10 and 11 only with C.
+question 9) is settled. 9 after the beta; 10 and 11 only with C. 12 (agentic setup) comes after the master's own hub and steps 1 to 7 work, and ideally after 8, so storage setup is covered.
 
 ## Open questions
 
@@ -378,4 +458,5 @@ question 9) is settled. 9 after the beta; 10 and 11 only with C.
 11. Passthrough in A and C: needs the home machine on. Failover to a second home certificate holder:
     defer?
 12. One project per connection, or one connector URL per project (`/p/<project>/mcp`)?
-13. Token lifetimes (15 minutes, 90 days), the DCR cap and the 256 KiB blob threshold are placeholders.
+13. Agentic setup: which providers get a tested run first, where the setup log lives (machine-local, never synced), and whether the skill ships in this repo or in a separate published skills repo?
+14. Token lifetimes (15 minutes, 90 days), the DCR cap and the 256 KiB blob threshold are placeholders.
