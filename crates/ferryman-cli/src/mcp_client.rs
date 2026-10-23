@@ -124,12 +124,17 @@ impl McpClient {
     fn request(&mut self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
-        writeln!(
+        // A server that has already gone away shows up as a broken pipe here; say so in
+        // the same words as the read side does.
+        let sent = writeln!(
             self.stdin,
             "{}",
             json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-        )?;
-        self.stdin.flush()?;
+        )
+        .and_then(|()| self.stdin.flush());
+        if let Err(error) = sent {
+            bail!("MCP server closed the connection during '{method}' ({error})");
+        }
         let deadline = Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());

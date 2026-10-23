@@ -1757,7 +1757,7 @@ fn mcp_budget() {
             };
             for (name, was, now) in pairs {
                 assert!(
-                    (was - now).abs() <= 6,
+                    (was - now).abs() <= 24, // the machine label and ids differ by platform
                     "{key}.{name} was {was}, is {now}: {hint}"
                 );
             }
