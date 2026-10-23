@@ -11,7 +11,6 @@ use std::sync::Arc;
 use chrono::{Duration, Utc};
 use common::{ACCOUNT, Fleet};
 use ferryman_channel::{AgentIdentity, AgentRoute, ProjectRoute};
-use ferryman_hive_rescue::mock::MockHive;
 use ferryman_hive_rescue::rescuer::{cut_off_since, lane_info};
 use ferryman_iroh::{ALPN, Lane, endpoint_hex};
 use iroh::endpoint::presets;
@@ -137,7 +136,7 @@ async fn cut_off_lanes_find_each_other_again_through_hive_and_the_rescue_relay()
 
     // 2. Twenty minutes later (the tick takes the time, so the test does not wait): the
     // master posts one record to Hive, naming the rescue relay.
-    let hive = MockHive::start("127.0.0.1:0").await.unwrap();
+    let hive = common::start_mock().await;
     let (sa, sb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     let master = fleet.rescuer(&fleet.beastly, &hive.url(), sa.path(), true, |c| {
         c.rescue_relay = Some(rescue_url.to_string());
@@ -192,4 +191,185 @@ async fn cut_off_lanes_find_each_other_again_through_hive_and_the_rescue_relay()
         fs::read_to_string(b_demo.communications.join("tasks/t-1/order.json")).unwrap(),
         "{\"from\":\"beastly\"}"
     );
+}
+
+/// Seal `body` as `who` to the whole roster and put it in the mock's history.
+fn post_as(
+    hive: &ferryman_hive_rescue::mock::MockHive,
+    fleet: &Fleet,
+    who: &common::Machine,
+    body: ferryman_hive_rescue::record::Body,
+) {
+    let view = fleet.view.lock().unwrap().clone();
+    let signed = ferryman_hive_rescue::record::sign(body.clone(), &who.signer()).unwrap();
+    let sealed = ferryman_hive_rescue::record::seal(
+        &signed,
+        &ferryman_hive_rescue::record::recipients(&view.roster, |_| false),
+    )
+    .unwrap();
+    hive.inject(
+        ACCOUNT,
+        "ferryman-rescue",
+        &ferryman_hive_rescue::record::op_json(&body.fleet, &sealed),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_the_masters_relays_join_the_shared_map_and_expiry_takes_them_back() {
+    use ferryman_hive_rescue::record::{Body, Kind, RescueRelay, Where, fleet_tag};
+
+    let fleet = Fleet::new();
+    let hive = common::start_mock().await;
+    let dead: RelayUrl = "https://127.0.0.1:9/".parse().unwrap();
+    let (endpoint, map) = relay_only(SecretKey::generate(), &dead).await;
+    let state = tempfile::tempdir().unwrap();
+    let reader = fleet.rescuer(&fleet.grouchly, &hive.url(), state.path(), false, |c| {
+        c.backup_agents = vec!["grouchly-ferry".into()];
+    });
+    reader.attach(&endpoint, Some(map.clone())).unwrap();
+
+    let tag = fleet_tag(
+        fleet.view.lock().unwrap().roster[0]
+            .public_key
+            .as_ref()
+            .unwrap(),
+    );
+    let (master_id, backup_id) = (
+        SecretKey::generate().public(),
+        SecretKey::generate().public(),
+    );
+    // grouchly is known by its own endpoint, which the backup record points at.
+    fleet.view.lock().unwrap().endpoints.insert(
+        "grouchly-ferry".into(),
+        std::collections::BTreeSet::from([endpoint_hex(&backup_id)]),
+    );
+    let now = Utc::now();
+    let base = |kind, signer: &str, seq, id: &iroh::EndpointId, relay: &str| Body {
+        v: 1,
+        fleet: tag.clone(),
+        kind,
+        signer: signer.into(),
+        seq,
+        issued: now,
+        expires: now + Duration::minutes(60),
+        at: Where {
+            id: endpoint_hex(id),
+            relay_url: Some(relay.into()),
+            direct: Vec::new(),
+        },
+        relay_list_version: None,
+        rescue_relay: None,
+        relays: None,
+    };
+    let mut master = base(
+        Kind::Master,
+        "beastly-ferry",
+        1,
+        &master_id,
+        "https://master-home.example/",
+    );
+    master.rescue_relay = Some(RescueRelay {
+        url: "https://rescue.example/".into(),
+        cert_sha256: None,
+    });
+    let backup = base(
+        Kind::Backup,
+        "grouchly-ferry",
+        1,
+        &backup_id,
+        "https://backup-home.example/",
+    );
+    post_as(&hive, &fleet, &fleet.beastly, master);
+    post_as(&hive, &fleet, &fleet.grouchly, backup);
+
+    assert!(reader.poll(now, true).await.unwrap().applied);
+    let url = |u: &str| u.parse::<RelayUrl>().unwrap();
+    // The master's relay and rescue relay joined the map every dial uses; the backup's did not.
+    assert!(map.contains(&url("https://master-home.example/")));
+    assert!(map.contains(&url("https://rescue.example/")));
+    assert!(!map.contains(&url("https://backup-home.example/")));
+    assert!(map.contains(&dead), "what was there before is untouched");
+    // Both machines are still dialable, the backup by its own address only.
+    let backup_info = reader
+        .lookup()
+        .get_endpoint_info(backup_id)
+        .expect("backup address");
+    assert!(
+        backup_info
+            .relay_urls()
+            .any(|u| *u == url("https://backup-home.example/"))
+    );
+    assert!(reader.lookup().get_endpoint_info(master_id).is_some());
+
+    // Past the records' expiry, what they taught is taken back; the relay that was
+    // already there stays.
+    reader.expire(now + Duration::minutes(61));
+    assert!(!map.contains(&url("https://master-home.example/")));
+    assert!(!map.contains(&url("https://rescue.example/")));
+    assert!(map.contains(&dead));
+    assert!(reader.lookup().get_endpoint_info(master_id).is_none());
+    assert!(reader.lookup().get_endpoint_info(backup_id).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cached_record_is_checked_again_when_the_lane_starts() {
+    use ferryman_hive_rescue::record::{Body, Kind, Where, fleet_tag};
+
+    let fleet = Fleet::new();
+    let hive = common::start_mock().await;
+    let dead: RelayUrl = "https://127.0.0.1:9/".parse().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let tag = fleet_tag(
+        fleet.view.lock().unwrap().roster[0]
+            .public_key
+            .as_ref()
+            .unwrap(),
+    );
+    let master_id = SecretKey::generate().public();
+    let now = Utc::now();
+    post_as(
+        &hive,
+        &fleet,
+        &fleet.beastly,
+        Body {
+            v: 1,
+            fleet: tag,
+            kind: Kind::Master,
+            signer: "beastly-ferry".into(),
+            seq: 1,
+            issued: now,
+            expires: now + Duration::minutes(60),
+            at: Where {
+                id: endpoint_hex(&master_id),
+                relay_url: None,
+                direct: Vec::new(),
+            },
+            relay_list_version: None,
+            rescue_relay: None,
+            relays: None,
+        },
+    );
+    // A first run reads it and writes it to the state file.
+    let first = fleet.rescuer(&fleet.grouchly, &hive.url(), state.path(), false, |_| {});
+    assert!(first.poll(now, true).await.unwrap().applied);
+
+    // A restart, the cache still good: it is applied at once.
+    let (endpoint, map) = relay_only(SecretKey::generate(), &dead).await;
+    let again = fleet.rescuer(&fleet.grouchly, &hive.url(), state.path(), false, |_| {});
+    again.attach(&endpoint, Some(map.clone())).unwrap();
+    assert!(again.lookup().get_endpoint_info(master_id).is_some());
+
+    // A restart after the master was revoked: the cache is a file on disk, and the
+    // fleet folder's word of today wins. Nothing is applied and the cache is dropped.
+    fleet
+        .view
+        .lock()
+        .unwrap()
+        .revoked
+        .insert("beastly-ferry".into());
+    let (endpoint, map) = relay_only(SecretKey::generate(), &dead).await;
+    let revoked = fleet.rescuer(&fleet.grouchly, &hive.url(), state.path(), false, |_| {});
+    revoked.attach(&endpoint, Some(map)).unwrap();
+    assert!(revoked.lookup().get_endpoint_info(master_id).is_none());
+    assert!(revoked.snapshot().latest_master.is_none());
 }

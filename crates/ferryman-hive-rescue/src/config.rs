@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::tx::PostingKey;
 
@@ -118,18 +119,22 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-fn from_env_file(path: &Path, name: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
+/// The value of `name` in a `KEY=VALUE` file. The whole file text (it may hold other
+/// secrets) and the value are wiped from memory when dropped.
+fn from_env_file(path: &Path, name: &str) -> Option<Zeroizing<String>> {
+    let text = Zeroizing::new(std::fs::read_to_string(path).ok()?);
     text.lines().find_map(|line| {
         let line = line.trim();
         let (key, value) = line.split_once('=')?;
-        (key.trim() == name).then(|| value.trim().trim_matches(['"', '\'']).to_owned())
+        (key.trim() == name)
+            .then(|| Zeroizing::new(value.trim().trim_matches(['"', '\'']).to_owned()))
     })
 }
 
-fn lookup(env_file: Option<&Path>, name: &str) -> Option<String> {
+fn lookup(env_file: Option<&Path>, name: &str) -> Option<Zeroizing<String>> {
     std::env::var(name)
         .ok()
+        .map(Zeroizing::new)
         .filter(|v| !v.trim().is_empty())
         .or_else(|| env_file.and_then(|p| from_env_file(p, name)))
         .filter(|v| !v.is_empty())
@@ -144,12 +149,13 @@ impl Credentials {
     pub fn load(config: &RescueConfig) -> anyhow::Result<Self> {
         let file = config.secrets_env.as_deref();
         let key = match lookup(file, "HIVE_RESCUE_POSTING_KEY") {
-            Some(wif) => Some(PostingKey::from_wif(&wif)?),
+            Some(wif) => Some(PostingKey::from_wif(wif.as_str())?),
             None => None,
         };
         Ok(Self {
-            account: lookup(file, "HIVE_RESCUE_ACCOUNT").unwrap_or_else(|| config.account.clone()),
-            poster: lookup(file, "HIVE_RESCUE_POSTER"),
+            account: lookup(file, "HIVE_RESCUE_ACCOUNT")
+                .map_or_else(|| config.account.clone(), |v| (*v).clone()),
+            poster: lookup(file, "HIVE_RESCUE_POSTER").map(|v| (*v).clone()),
             key,
         })
     }

@@ -20,6 +20,7 @@ use k256::ecdsa::hazmat::SignPrimitive;
 use k256::sha2::Sha256 as Sha256Old;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 /// Hive mainnet's chain id.
 pub const MAINNET_CHAIN_ID: &str =
@@ -49,9 +50,11 @@ impl PostingKey {
     /// Not base58, wrong length, wrong version byte, a bad checksum, or not a valid key.
     /// The error never includes the text.
     pub fn from_wif(wif: &str) -> Result<Self> {
-        let raw = bs58::decode(wif.trim())
-            .into_vec()
-            .map_err(|_| anyhow::anyhow!("the posting key is not base58"))?;
+        let raw = Zeroizing::new(
+            bs58::decode(wif.trim())
+                .into_vec()
+                .map_err(|_| anyhow::anyhow!("the posting key is not base58"))?,
+        );
         if raw.len() != 37 || raw[0] != 0x80 {
             bail!("the posting key is not a WIF private key");
         }
@@ -63,6 +66,38 @@ impl PostingKey {
         let key = SigningKey::from_slice(&body[1..])
             .map_err(|_| anyhow::anyhow!("the posting key is not a valid secp256k1 key"))?;
         Ok(Self(key))
+    }
+
+    /// The compressed public key, 33 bytes.
+    #[must_use]
+    pub fn public_key_bytes(&self) -> [u8; 33] {
+        let point = self.0.verifying_key().to_encoded_point(true);
+        let mut out = [0_u8; 33];
+        out.copy_from_slice(point.as_bytes());
+        out
+    }
+
+    /// Whether `stm` (a Hive public key string, `STM` and base58) is this key's public
+    /// key. Only the 33 key bytes are compared: the checksum guards typing, and the string
+    /// came from a node whose word is only used to catch a wrong key being configured.
+    #[must_use]
+    pub fn is_public_key(&self, stm: &str) -> bool {
+        let Some(encoded) = stm.strip_prefix("STM") else {
+            return false;
+        };
+        bs58::decode(encoded)
+            .into_vec()
+            .is_ok_and(|bytes| bytes.len() == 37 && bytes[..33] == self.public_key_bytes())
+    }
+
+    /// An `STM...` string for this key with a zeroed checksum: what the mock node says an
+    /// account's posting key is, since [`Self::is_public_key`] does not look at the checksum.
+    /// Not a real Hive public key string.
+    #[must_use]
+    pub fn mock_public_key_string(&self) -> String {
+        let mut bytes = self.public_key_bytes().to_vec();
+        bytes.extend_from_slice(&[0; 4]);
+        format!("STM{}", bs58::encode(bytes).into_string())
     }
 
     /// The compressed public key, hex (for tests and for comparing with an account).

@@ -168,6 +168,27 @@ mod enabled {
                 mock.url()
             );
             println!("point [hive_rescue] nodes = [\"{}\"] at it", mock.url());
+            // The posting key check asks the node what keys the account has: tell the mock
+            // about the configured key, if there is one here.
+            if let Some(root) = ferryman_channel::ferry::find_root()
+                && let Ok(cfg) = RescueConfig::load(&root.path)
+                && let Ok(creds) = Credentials::load(&cfg)
+                && let Some(key) = &creds.key
+                && !creds.account.is_empty()
+            {
+                let holder = creds.poster.as_deref().unwrap_or(&creds.account);
+                mock.authorize_key(holder, key);
+                if holder != creds.account {
+                    mock.set_account(
+                        &creds.account,
+                        serde_json::json!({
+                            "name": creds.account,
+                            "posting": {"account_auths": [[holder, 1]], "key_auths": []},
+                        }),
+                    );
+                }
+                println!("the mock lists your posting key for {holder}");
+            }
             mock.forever().await;
             return Ok(());
         }
