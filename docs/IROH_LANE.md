@@ -254,7 +254,11 @@ older, and the files go across and are written atomically.
   (`keys`, `*.key`, `*.seed`, executables, scripts, `local`, `*.tmp`).
 - Syncthing conflict copies, temporary files and Syncthing's own folders are never sent.
 - Nothing over 64 MiB.
-- Nothing is ever deleted. (erry root migrate moves a channel on disk; the lane then sees new paths under the root, and a peer that has not moved its own copy yet receives nothing deleted.)
+- Nothing is ever deleted, with one opt-in exception that sends no delete: when a project's
+  master has signed a `ttl.json`, each machine moves files under `handins/` and `outbox/` that
+  are older than the rule's days (14 at least) into a local quarantine, by its own clock. See
+  [TTL.md](TTL.md). A peer that still holds an expired file may send it back; the next pass
+  expires it again. A project Syncthing also carries is refused. (erry root migrate moves a channel on disk; the lane then sees new paths under the root, and a peer that has not moved its own copy yet receives nothing deleted.)
 - Nothing is written outside the channel folder: `..`, absolute paths, drive letters,
   backslashes and Windows device names are refused, and no folder on the path or file at
   the end may be a symlink. Symlinks are never sent.

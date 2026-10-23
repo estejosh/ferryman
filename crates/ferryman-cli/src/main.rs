@@ -1837,6 +1837,49 @@ enum Channel {
         #[command(subcommand)]
         command: FilesCommand,
     },
+    /// Opt-in expiry for small, short-lived files under `handins/` and `outbox/` (ADR 0027).
+    ///
+    /// The project's master signs a rule into the channel; nothing expires without one, and
+    /// nothing outside `handins/` and `outbox/` ever can. Each machine removes what is old
+    /// by its own clock, into a local quarantine kept seven days; no deletion is ever sent.
+    /// Refused for a project Syncthing carries. See docs/TTL.md.
+    Ttl {
+        #[command(subcommand)]
+        command: TtlCommand,
+    },
+    /// Run the expiry pass for this project now (the worker runs it on its own).
+    Expire {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// Say what would expire, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum TtlCommand {
+    /// Master only: expire files under the given paths after N days (14 at least).
+    Set {
+        /// The project.
+        project: String,
+        /// Days after a file landed here (and after its modification time).
+        #[arg(long)]
+        days: u32,
+        /// Comma-separated; each `handins/` or `outbox/` or a folder below one.
+        #[arg(long, value_delimiter = ',', default_value = "handins/,outbox/")]
+        paths: Vec<String>,
+    },
+    /// What the project expires, and whether this machine honours it.
+    Show {
+        /// The project.
+        project: String,
+    },
+    /// Master only: switch expiry off (a signed rule; the file is never deleted).
+    Clear {
+        /// The project.
+        project: String,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -6570,6 +6613,81 @@ enum AccessCommand {
     },
 }
 
+fn print_expiry(report: &ferryman_channel::ttl::Report) {
+    let (verb, purge) = if report.dry_run {
+        ("would expire", "would delete from quarantine")
+    } else {
+        ("expired", "deleted from quarantine")
+    };
+    if let Some(note) = &report.note {
+        println!("{note}");
+    }
+    for file in &report.expired {
+        println!("{verb} {file}");
+    }
+    for batch in &report.purged {
+        println!("{purge} {batch}");
+    }
+    if report.note.is_none() {
+        println!(
+            "{verb} {} file(s); {} not old enough yet; {} link(s) left alone",
+            report.expired.len(),
+            report.waiting,
+            report.links_skipped
+        );
+    }
+}
+
+/// `ferry channel ttl`: the master's expiry rule for hand-ins and the outbox.
+fn ttl_command(command: TtlCommand) -> Result<()> {
+    use ferryman_channel::ttl;
+    match command {
+        TtlCommand::Show { project } => {
+            let route = access_route(&project)?;
+            let summary = ttl::summary(&route);
+            println!("{project}: {}", summary.line().1);
+            if let ttl::Rule::Active(rule) = &summary.rule {
+                println!(
+                    "  rule {} signed by {} at {}",
+                    rule.seq,
+                    rule.signed_by,
+                    rule.at.format("%Y-%m-%d %H:%M UTC")
+                );
+            }
+        }
+        TtlCommand::Set {
+            project,
+            days,
+            paths,
+        } => {
+            let route = access_route(&project)?;
+            let master = master_of(&route, &project)?;
+            let rule = ttl::set(&route, &signing_identity(&route, &master)?, days, &paths)?;
+            println!(
+                "{project}: files under {} expire after {} days (rule {}). Each machine \
+                 applies it itself; nothing is sent to delete anything.",
+                rule.paths.join(", "),
+                rule.days,
+                rule.seq
+            );
+        }
+        TtlCommand::Clear { project } => {
+            let route = access_route(&project)?;
+            let master = master_of(&route, &project)?;
+            let rule = ttl::clear(&route, &signing_identity(&route, &master)?)?;
+            println!("{project}: expiry switched off (rule {})", rule.seq);
+        }
+    }
+    Ok(())
+}
+
+fn master_of(route: &ferryman_channel::ProjectRoute, project: &str) -> Result<String> {
+    let Some(declaration) = ferryman_channel::master::read_master(route)? else {
+        bail!("{project} has no master yet; claim it with 'ferry root master'");
+    };
+    Ok(declaration.master)
+}
+
 fn access_route(project: &str) -> Result<ferryman_channel::ProjectRoute> {
     let root = ferryman_channel::ferry::find_root().context(
         "no ferry root here; run this in the project, or make a root with 'ferry root init'",
@@ -8021,6 +8139,7 @@ async fn run_fleet(
     // The iroh lane, when this machine has it on: the channels as repaired above, served
     // and synced in the background beside Syncthing for as long as this worker runs.
     let mut live_lane = None;
+    let mut last_expiry_pass: Option<std::time::Instant> = None;
     if let Some(iroh) = iroh {
         let mut routes: Vec<ferryman_channel::ProjectRoute> = fleet
             .served
@@ -8168,6 +8287,11 @@ async fn run_fleet(
         // improvement order in a background or paused one).
         let focus = ferryman_channel::focus::current();
         ferryman_ops::fleet::in_focus_order(&mut fleet.served, &focus, chrono::Utc::now());
+        // Expiry (opt-in, ADR 0027) is looked at every ten minutes, not every pass.
+        let expiry_pass = last_expiry_pass.is_none_or(|at| at.elapsed() >= EXPIRY_EVERY);
+        if expiry_pass {
+            last_expiry_pass = Some(std::time::Instant::now());
+        }
         for (route, config) in &mut fleet.served {
             let closed = if serving_everywhere {
                 ferryman_ops::fleet::no_longer_served(route, config)
@@ -8181,6 +8305,7 @@ async fn run_fleet(
                 report.warn(&format!("{} not worked this pass: {why}", route.project_id));
                 continue;
             }
+            expire_when_due(route, expiry_pass, report);
             match agent::work_once(route, config, report).await {
                 Ok(0) => {}
                 Ok(count) => {
@@ -8228,6 +8353,32 @@ async fn run_fleet(
         tokio::time::sleep(poll).await;
     }
     Ok(())
+}
+
+const EXPIRY_EVERY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The worker's expiry pass for one project (ADR 0027), when this pass is one of the
+/// every-ten-minutes ones. A project without a master-signed `ttl.json` does nothing.
+fn expire_when_due(
+    route: &ferryman_channel::ProjectRoute,
+    due: bool,
+    report: &impl ferryman_ops::Progress,
+) {
+    if !due {
+        return;
+    }
+    match ferryman_channel::ttl::expire(route, chrono::Utc::now(), false) {
+        Ok(done) => {
+            if !done.expired.is_empty() {
+                report.info(&format!(
+                    "{}: expired {} file(s) into quarantine",
+                    route.project_id,
+                    done.expired.len()
+                ));
+            }
+        }
+        Err(error) => report.warn(&format!("{}: expiry: {error:#}", route.project_id)),
+    }
 }
 
 /// Start serving the projects that have become open to a running `--all-projects` worker.
@@ -10881,6 +11032,15 @@ fn channel(command: Channel) -> Result<()> {
         Channel::Files { workspace, command } => {
             let route = here(workspace)?;
             files_command(&route, command)?;
+        }
+        Channel::Ttl { command } => ttl_command(command)?,
+        Channel::Expire { workspace, dry_run } => {
+            let route = here(workspace)?;
+            print_expiry(&ferryman_channel::ttl::expire(
+                &route,
+                chrono::Utc::now(),
+                dry_run,
+            )?);
         }
         Channel::Status { workspace } => {
             let route = here(workspace)?;
