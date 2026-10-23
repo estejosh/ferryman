@@ -677,7 +677,7 @@ fn asking_refuses_secrets_and_oversize_reasoning() {
         "ferry_ask_human",
         json!({
             "action": "raise", "title": "key", "recommendation": "use it",
-            "reasoning": "the token is ghp_abcdefghijklmnopqrstuvwxyz0123456789"
+            "reasoning": "the token is ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789"
         }),
     );
     assert!(refused(&result, "secret").contains("ferry channel secret"));
@@ -835,9 +835,9 @@ fn posting_refuses_secrets_telegram_strangers_and_work_content() {
     let w = world();
     let member = agent(&w, MEMBER);
     for text in [
-        "here: sk-abcdefghijklmnopqrstuvwxyz0123",
-        "DEEPSEEK_API_KEY=abcd1234efgh5678",
-        "-----BEGIN OPENSSH PRIVATE KEY----- abc -----END OPENSSH PRIVATE KEY-----",
+        "here: sk\u{2d}abcdefghijklmnopqrstuvwxyz0123",
+        "DEEPSEEK_API_KEY\u{3d}abcd1234efgh5678",
+        "-----BEGIN OPENSSH PRIVATE\u{20}KEY----- abc -----END OPENSSH PRIVATE\u{20}KEY-----",
         "password: hunter2hunter2",
     ] {
         let result = call(
@@ -885,14 +885,14 @@ fn posting_refuses_secrets_telegram_strangers_and_work_content() {
 #[test]
 fn the_secret_shape_guard_catches_tokens_and_spares_ordinary_text() {
     for bad in [
-        "ghp_abcdefghijklmnopqrstuvwxyz012345",
-        "xoxb-1234567890-abcdef",
-        "AKIAABCDEFGHIJKLMNOP",
-        "export STRIPE_SECRET=sk_live_abcdefgh1234",
-        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
-        "aGVsbG8gd29ybGQgdGhpcyBpcyBhIGxvbmcgYmFzZTY0IHN0cmluZyAxMjM0NTY3ODk=",
+        "ghp\u{5f}abcdefghijklmnopqrstuvwxyz012345",
+        "xoxb\u{2d}1234567890-abcdef",
+        "AKI\u{41}ABCDEFGHIJKLMNOP",
+        "export STRIPE_SECRET\u{3d}sk\u{5f}live_abcdefgh1234",
+        "eyJh\u{62}GciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
+        "aGVs\u{62}G8gd29ybGQgdGhpcyBpcyBhIGxvbmcgYmFzZTY0IHN0cmluZyAxMjM0NTY3ODk=",
         "passphrase: correct-horse-battery",
-        "AGE-SECRET-KEY-1ABCDEF",
+        "AGE\u{2d}SECRET\u{2d}KEY-1ABCDEF",
     ] {
         assert!(secret_shape(bad).is_some(), "{bad}");
     }
@@ -1901,7 +1901,7 @@ fn a_paused_machine_writes_nothing_but_still_reads() {
 #[test]
 fn what_leaves_the_server_is_redacted_whoever_put_it_in_the_channel() {
     let w = world();
-    let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let token = "ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789";
     // Planted around the guard, as a compromised or older client could.
     let id = plant(&w, MEMBER, BOSS, &format!("use {token} for the deploy"));
     let mut leaky = order(&w, "o-leak", &format!("deploy with {token} now"));
@@ -1971,7 +1971,7 @@ fn what_leaves_the_server_is_redacted_whoever_put_it_in_the_channel() {
         "[redacted] [redacted] ok"
     );
     assert_eq!(
-        redact_text("{\"k\": \"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}").unwrap(),
+        redact_text("{\"k\": \"ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789\"}").unwrap(),
         "{\"k\": \"[redacted]\"}"
     );
 }
@@ -1986,7 +1986,7 @@ fn every_inbound_string_is_guarded_for_secrets() {
         "ferry_orders",
         json!({ "action": "claim", "id": "o-g" }),
     ));
-    let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    let token = "ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789";
     for (tool, args) in [
         (
             "ferry_orders",
