@@ -30,8 +30,12 @@ command = "ferry"
 args = ["mcp", "serve", "--as", "my-app", "--project", "my-project"]
 ```
 
-A new app starts at the Worker level. Raise it with `ferry access set <agent> member`
-(or `orchestrator`) like any other agent.
+The name after `--as` is only a name. The app can read and write nothing until that agent
+is seated: its key must already be on this machine and listed on the project roster (the
+dashboard, Agents, or `ferry channel join --as my-app` on this machine). Until then
+`ferry_join` says so, every other tool refuses, and joining creates no key and no roster
+entry. A seated agent starts at the Worker level; raise it with
+`ferry access set <agent> member` (or `orchestrator`) like any other agent.
 
 ## Tools
 
@@ -60,18 +64,20 @@ The same levels as the CLI (Worker, Member, Orchestrator).
 - Takeover works only when the primary has been silent past the quiet period, and not
   on a paused machine.
 - An agent can ask you for an approval. It can never give one.
-- Posts are refused if they look like a secret, code or a diff. Results are a git ref and
+- Writes are refused while the machine is paused. Anything you send is refused if it looks
+  like a secret; anything that comes back is redacted if it does (marked `redacted: true`).
+- Posts are also refused if they look like code or a diff. Results are a git ref and
   a short note; the work stays in the repo.
 
 ## Updates
 
-`ferry_join` and the catch-up header carry a short `update` field when a newer release
-is available, and only if it is signed and approved (by the master on the channel, or a
-verified public release). `ferry_update check` says the same; `apply` (admin group,
-Orchestrator only) runs the existing verified self-update. Agents are told to mention
-an update to you and not to update in the middle of an order. Set
-`FERRYMAN_MCP_NO_UPDATE_CHECK=1` to skip the public lookup.
-
+`ferry_join` and the catch-up header carry a short `update` field when the master has
+signed an approval for a release newer than the one running. A public tag or release page
+is never enough. `ferry_update check` says the same. `apply` (admin group, Orchestrator
+only, refused while paused) installs it through the existing self-update, but checks the
+download against the SHA-256 for this platform that the master signed into the approval,
+not a checksum file published beside the release; an approval that pins none is refused.
+Agents are told to mention an update to you and not to update in the middle of an order.
 ## Heavy orders (pending snifrig agreement)
 
 Orders may carry `heavy` and `hints` (`cores`, `ram_gb`, `gpu_mem_gb`,

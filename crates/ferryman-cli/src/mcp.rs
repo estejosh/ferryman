@@ -214,26 +214,79 @@ impl Server {
     }
 }
 
+/// The longest request line accepted. A longer one is answered with an error and skipped,
+/// so a client (or a stray pipe) cannot make this process buffer without bound.
+pub const MAX_LINE_BYTES: usize = 1 << 20;
+
 /// Run the MCP server on stdio until the client closes stdin.
 pub fn serve(options: &Options) -> Result<()> {
     let mut server = Server::build(options)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
-    for line in stdin.lock().lines() {
-        let line = line.context("read from stdin")?;
-        if let Some(response) = handle_line(&mut server, line.trim()) {
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
+    serve_io(&mut server, &mut stdin.lock(), &mut stdout)
+}
+
+/// One request line at a time from `reader`, one response line at a time to `writer`.
+pub fn serve_io(
+    server: &mut Server,
+    reader: &mut impl std::io::BufRead,
+    writer: &mut impl Write,
+) -> Result<()> {
+    loop {
+        let mut buf = Vec::new();
+        let read = std::io::Read::take(&mut *reader, MAX_LINE_BYTES as u64 + 1)
+            .read_until(b'\n', &mut buf)
+            .context("read from stdin")?;
+        if read == 0 {
+            return Ok(());
+        }
+        let response = if buf.len() > MAX_LINE_BYTES && buf.last() != Some(&b'\n') {
+            // Too long: throw the rest of the line away without keeping it.
+            loop {
+                let mut skipped = Vec::new();
+                let n = std::io::Read::take(&mut *reader, 64 * 1024)
+                    .read_until(b'\n', &mut skipped)
+                    .context("read from stdin")?;
+                if n == 0 || skipped.last() == Some(&b'\n') {
+                    break;
+                }
+            }
+            Some(rpc_error(Value::Null, -32600, "request too large").to_string())
+        } else {
+            let line = String::from_utf8_lossy(&buf);
+            handle_line(server, line.trim())
+        };
+        if let Some(response) = response {
+            writeln!(writer, "{response}")?;
+            writer.flush()?;
         }
     }
-    Ok(())
+}
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
 
 /// Dispatch one JSON-RPC line and return the response, if one is owed.
-/// Notifications carry no id and therefore get no response.
+/// Notifications carry no id and therefore get no response. A line that is not JSON is a
+/// parse error (-32700) and one that is not a request is invalid (-32600).
 pub fn handle_line(server: &mut Server, line: &str) -> Option<String> {
-    let request: Value = serde_json::from_str(line).ok()?;
-    let method = request.get("method")?.as_str()?;
+    if line.is_empty() {
+        return None;
+    }
+    let Ok(request) = serde_json::from_str::<Value>(line) else {
+        return Some(rpc_error(Value::Null, -32700, "parse error").to_string());
+    };
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return Some(
+            rpc_error(
+                request.get("id").cloned().unwrap_or(Value::Null),
+                -32600,
+                "invalid request",
+            )
+            .to_string(),
+        );
+    };
     let id = request.get("id").cloned()?;
     let response = match method {
         "initialize" => {

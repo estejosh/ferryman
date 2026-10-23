@@ -21,8 +21,8 @@ use serde_json::{Map, Value, json};
 use ferryman_channel::access::{self, Level};
 use ferryman_channel::marvin;
 use ferryman_channel::{
-    Acknowledgement, AgentIdentity, AgentRoute, Message, ProjectRoute, Review, SignatureCheck,
-    Task, TaskResult, TaskState,
+    Acknowledgement, AgentIdentity, Message, ProjectRoute, Review, SignatureCheck, Task,
+    TaskResult, TaskState,
 };
 
 /// Server instructions (T3: at most 250 tokens, enforced in CI).
@@ -48,7 +48,7 @@ pub const QUIET_AFTER_MINUTES: i64 = 10;
 /// The kind a question raised by `ferry_ask_human` carries.
 pub const ASK_KIND: &str = "ask";
 
-/// Per-response cap in tokens (chars / 4), T4/T10.
+/// Per-response cap in tokens, T4/T10.
 #[must_use]
 pub fn cap_tokens(tool: &str) -> usize {
     match tool {
@@ -56,6 +56,19 @@ pub fn cap_tokens(tool: &str) -> usize {
         "ferry_primary" | "ferry_ask_human" => 300,
         _ => 600,
     }
+}
+
+/// Tokens in `chars` characters of JSON or prose, deliberately pessimistic: 3.3 characters
+/// to a token, where chars / 4 undercounts symbol-dense JSON.
+#[cfg(test)]
+#[must_use]
+pub fn est_tokens(chars: usize) -> usize {
+    (chars * 10).div_ceil(33)
+}
+
+/// The most characters a response may spend under `tokens`.
+const fn chars_for(tokens: usize) -> usize {
+    tokens * 33 / 10
 }
 
 // ---------------------------------------------------------------------------------------
@@ -171,9 +184,9 @@ fn fit(reply: &mut Reply, tool: &str, order: &[&str]) {
             }
         }
     }
-    let cap = cap_tokens(tool) * 4;
+    let cap = chars_for(cap_tokens(tool));
     let extra =
-        |reply: &Reply| reply.text.len() + reply.links.iter().map(len_of).sum::<usize>() + 80;
+        |reply: &Reply| reply.text.len() + reply.links.iter().map(len_of).sum::<usize>() + 130;
     while len_of(&reply.data) + extra(reply) > cap || len_of(&reply.data) > MAX_CHARS {
         if !drop_one(&mut reply.data, order) {
             break;
@@ -186,17 +199,28 @@ fn fit(reply: &mut Reply, tool: &str, order: &[&str]) {
 }
 
 fn finish(mut reply: Reply, tool: &str) -> Value {
+    // What is dropped first when a catch-up has to shrink: the recent chatter, then the
+    // open queue. Decisions, asks and what waits on you go last.
     let order: &[&str] = match tool {
         "ferry_catchup" => &[
-            "decisions",
+            "recent",
             "open",
             "mine",
+            "decisions",
             "asks",
             "waiting_on_you",
-            "recent",
         ],
         _ => &[],
     };
+    // Nothing that looks like a secret leaves, whoever put it in the channel.
+    let mut redacted = redact_value(&mut reply.data);
+    if let Some(text) = redact_text(&reply.text) {
+        reply.text = text;
+        redacted = true;
+    }
+    if redacted && let Some(map) = reply.data.as_object_mut() {
+        map.insert("redacted".into(), json!(true));
+    }
     fit(&mut reply, tool, order);
     let mut content = vec![json!({ "type": "text", "text": reply.text })];
     content.extend(reply.links);
@@ -438,9 +462,167 @@ fn guard(field: &str, text: &str) -> Result<()> {
     }
 }
 
-/// Work content does not travel through the channel: refuse fenced code and diffs.
+/// Keys whose values are identifiers or cursors, never prose: a hash or a long id in one
+/// of them is not a secret and is not redacted.
+const ID_KEYS: &[&str] = &[
+    "id", "next", "since", "uri", "ref", "hash", "sha", "commit", "agent", "name", "to", "from",
+    "by", "holder", "project", "machine", "current", "latest", "how", "order",
+];
+
+/// `text` with every secret-shaped word replaced by `[redacted]`, or `None` when nothing
+/// needed replacing. Whitespace and the punctuation around a word stay, so JSON survives.
+#[must_use]
+pub fn redact_text(text: &str) -> Option<String> {
+    // Word spans: runs of non-whitespace.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        match (c.is_whitespace(), start) {
+            (false, None) => start = Some(i),
+            (true, Some(s)) => {
+                spans.push((s, i));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        spans.push((s, text.len()));
+    }
+    let mut flagged: Vec<bool> = spans
+        .iter()
+        .map(|&(s, e)| secret_shape(&text[s..e]).is_some())
+        .collect();
+    for i in 0..spans.len() {
+        let word = &text[spans[i].0..spans[i].1];
+        if !flagged[i]
+            && let Some(&(ns, ne)) = spans.get(i + 1)
+            && !flagged[i + 1]
+            && secret_shape(&format!("{word} {}", &text[ns..ne])).is_some()
+        {
+            // `password: hunter2hunter2`: the word and the value after it.
+            flagged[i] = true;
+            flagged[i + 1] = true;
+        }
+    }
+    if !flagged.iter().any(|f| *f) {
+        // A secret that is no single word (a key block) condemns the whole text.
+        return secret_shape(text).map(|_| "[redacted]".to_string());
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (i, (s, e)) in spans.iter().enumerate() {
+        out.push_str(&text[at..*s]);
+        let word = &text[*s..*e];
+        if flagged[i] {
+            let lead = word.len()
+                - word
+                    .trim_start_matches(['"', '\'', '(', '[', '{', '`'])
+                    .len();
+            let trail = word.len()
+                - word
+                    .trim_end_matches(['"', '\'', ')', ']', '}', ',', ';', '`'])
+                    .len();
+            out.push_str(&word[..lead.min(word.len())]);
+            out.push_str("[redacted]");
+            if trail > 0 && word.len() >= lead + trail {
+                out.push_str(&word[word.len() - trail..]);
+            }
+        } else {
+            out.push_str(word);
+        }
+        at = *e;
+    }
+    out.push_str(&text[at..]);
+    Some(out)
+}
+
+/// [`redact_text`] over every string in `value` (skipping identifier fields), in place.
+/// True when anything was replaced.
+pub fn redact_value(value: &mut Value) -> bool {
+    match value {
+        Value::String(text) => {
+            if let Some(clean) = redact_text(text) {
+                *text = clean;
+                true
+            } else {
+                false
+            }
+        }
+        Value::Array(items) => items.iter_mut().fold(false, |any, v| redact_value(v) | any),
+        Value::Object(map) => map.iter_mut().fold(false, |any, (key, v)| {
+            if ID_KEYS.contains(&key.as_str()) && v.is_string() {
+                any
+            } else {
+                redact_value(v) | any
+            }
+        }),
+        _ => false,
+    }
+}
+
+/// A reference (commit sha, hand-in id) is hex or a short path-safe word, never a token.
+fn guard_ref(field: &str, text: &str) -> Result<()> {
+    if text.len() <= 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(());
+    }
+    guard(field, text)
+}
+
+/// Lines that read as source code, not prose: dense in `{}();=<>` and the like, or
+/// opening with a keyword, or a path header over several lines.
+fn looks_like_code(text: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        "fn ", "pub ", "def ", "class ", "import ", "from ", "use ", "let ", "const ", "return ",
+        "#include", "package ", "func ", "impl ", "struct ",
+    ];
+    let mut lines = 0usize;
+    let mut codeish = 0usize;
+    let mut header = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        lines += 1;
+        let lower = t.to_ascii_lowercase();
+        if (lower.starts_with("file:")
+            || lower.starts_with("path:")
+            || lower.starts_with("// ")
+            || lower.starts_with("# ")
+            || lower.starts_with("--- ")
+            || lower.starts_with("+++ "))
+            && (t.contains('/') || t.contains('\\'))
+            && t.rsplit('.')
+                .next()
+                .is_some_and(|ext| (1..=5).contains(&ext.len()))
+            && t.len() <= 160
+        {
+            header = true;
+        }
+        let symbols = t.chars().filter(|c| "{}();=<>[]|&$\\".contains(*c)).count();
+        let dense = symbols * 100 >= t.chars().count() * 12;
+        let indented = line.starts_with("    ") || line.starts_with('\t');
+        if (dense && t.chars().count() >= 8)
+            || KEYWORDS.iter().any(|k| t.starts_with(k)) && symbols > 0
+            || (indented && symbols * 100 >= t.chars().count() * 8)
+        {
+            codeish += 1;
+        }
+    }
+    codeish >= 5 || (header && lines >= 4)
+}
+
+/// Work content does not travel through the channel: refuse fenced code, diffs, path-headed
+/// file bodies and long runs of code-like lines.
 fn not_work(field: &str, text: &str) -> Result<()> {
-    if text.contains("```") || text.contains("diff --git") || text.contains("\n+++ ") {
+    if text.contains("```")
+        || text.contains("diff --git")
+        || text.contains("\n+++ ")
+        || text.contains("\n--- a/")
+        || text.contains("*** Begin Patch")
+        || looks_like_code(text)
+    {
         return Err(bad(format!(
             "{field} looks like work content. Commit it in the work repo and pass the commit or hand-in as ref"
         )));
@@ -542,8 +724,6 @@ pub struct Agent {
     pub me: String,
     /// `--tools admin`.
     pub admin: bool,
-    /// The public release source: `force` bypasses the cache. Replaceable in tests.
-    pub public_release: Box<dyn Fn(bool) -> Option<String>>,
 }
 
 impl Agent {
@@ -553,7 +733,35 @@ impl Agent {
             route,
             me: ferryman_channel::canonical_agent_name(me),
             admin,
-            public_release: Box::new(real_public_release),
+        }
+    }
+
+    /// Is `--as <name>` an agent this machine actually holds the key for, seated on the
+    /// roster with that same key? A name alone proves nothing: anyone can type one. Until
+    /// this is true every tool but `ferry_join` refuses, and nothing is registered here.
+    #[must_use]
+    pub fn seated(&self) -> bool {
+        let Ok(Some(identity)) = AgentIdentity::load_existing(&self.me, &self.route.attachment)
+        else {
+            return false;
+        };
+        self.route().agents.iter().any(|a| {
+            is_me(&a.name, &self.me)
+                && a.public_key.as_deref() == Some(identity.public_key_hex().as_str())
+        })
+    }
+
+    fn require_seated(&self) -> Result<()> {
+        if self.seated() {
+            Ok(())
+        } else {
+            Err(refusal(
+                "locked",
+                format!(
+                    "'{}' is not a seated agent on this machine, so this app is read-only here. Seat it first: run `ferry channel join --as {}` here, or ask the owner (dashboard, Agents), then restart the app",
+                    self.me, self.me
+                ),
+            ))
         }
     }
 
@@ -574,6 +782,12 @@ impl Agent {
     fn require_write(&self, what: &str) -> Result<Level> {
         let level = self.level();
         if level.writes_channel() {
+            if let Some(note) = self.paused(&self.route()) {
+                return Err(denied(format!(
+                    "cannot {what} while paused ({}). Tell the human",
+                    short(&note, 120)
+                )));
+            }
             Ok(level)
         } else {
             Err(denied(format!(
@@ -597,7 +811,36 @@ impl Agent {
 
     /// Dispatch one `tools/call`.
     pub fn call(&self, name: &str, args: &Value) -> Value {
-        let outcome = match name {
+        match self.call_raw(name, args) {
+            Ok(reply) => finish(reply, name),
+            Err(error) => error_result(&error),
+        }
+    }
+
+    /// The reply before redaction and truncation, so a test can measure what a tool
+    /// produced against its cap and not only what survived the cut.
+    pub fn call_raw(&self, name: &str, args: &Value) -> Result<Reply> {
+        if name != "ferry_join" {
+            // Only a seated key reads or writes the channel through this server.
+            if name.starts_with("ferry_") {
+                self.require_seated()?;
+            }
+            // Every string the caller sends is checked for secrets, whichever tool it is
+            // for. Ids, cursors and refs have shapes of their own and are checked there.
+            if let Some(map) = args.as_object() {
+                for (key, value) in map {
+                    if let Some(text) = value.as_str()
+                        && !matches!(
+                            key.as_str(),
+                            "action" | "id" | "since" | "uri" | "to" | "ref"
+                        )
+                    {
+                        guard(key, text)?;
+                    }
+                }
+            }
+        }
+        match name {
             "ferry_join" => self.join(),
             "ferry_catchup" => self.catchup(args),
             "ferry_orders" => self.orders(args),
@@ -609,10 +852,6 @@ impl Agent {
             "ferry_status" if self.admin => self.status(),
             "ferry_update" if self.admin => self.update(args),
             other => Err(bad(format!("unknown tool: {other}"))),
-        };
-        match outcome {
-            Ok(reply) => finish(reply, name),
-            Err(error) => error_result(&error),
         }
     }
 
@@ -755,69 +994,42 @@ impl Agent {
     // -- join -------------------------------------------------------------------------
 
     fn join(&self) -> Result<Reply> {
-        let mut note = None;
-        let mut route = self.route();
-        let entry = route
-            .agents
-            .iter()
-            .find(|a| is_me(&a.name, &self.me))
-            .cloned();
-        let local = AgentIdentity::load_existing(&self.me, &self.route.attachment)
-            .ok()
-            .flatten();
-        let seated = match (&local, &entry) {
-            (Some(identity), Some(entry)) => {
-                entry.public_key.as_deref() == Some(identity.public_key_hex().as_str())
-            }
-            _ => false,
+        // A name is a claim, not a credential. Joining registers nothing and mints no key:
+        // the key must already be on this machine and seated on the roster.
+        let route = self.route();
+        let granted = self.seated();
+        let note = if granted {
+            None
+        } else {
+            Some(
+                match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
+                    Ok(Some(_)) => format!(
+                        "'{}' has a key here but is not seated on the roster. Ask the owner (dashboard, Agents)",
+                        self.me
+                    ),
+                    _ => format!(
+                        "no key for '{}' on this machine. Run `ferry channel join --as {}` here or ask the owner (dashboard, Agents), then restart the app. Until then this app can read nothing and write nothing",
+                        self.me, self.me
+                    ),
+                },
+            )
         };
-        let mut identity = local;
-        if !seated {
-            // Same as `ferry channel join`: take the name by publishing this machine's
-            // key. `register_agent_key` refuses to rebind a name to a different key, so
-            // this cannot speak as someone else.
-            let attempt = (|| -> Result<AgentIdentity> {
-                let identity = match identity.take() {
-                    Some(i) => i,
-                    None => AgentIdentity::load_or_create(&self.me, &self.route.attachment)?,
-                };
-                let encryption = ferryman_channel::secrets::EncryptionIdentity::load_or_create(
-                    &self.me,
-                    &self.route.attachment,
-                )?;
-                // The `mcp` capability designates THE fleet gateway and a second one is a
-                // conflict, so joining through MCP does not claim it.
-                let capabilities = entry
-                    .as_ref()
-                    .map(|a| a.capabilities.clone())
-                    .unwrap_or_default();
-                let agent = AgentRoute {
-                    name: self.me.clone(),
-                    role: entry
-                        .as_ref()
-                        .map_or_else(|| "worker".to_string(), |a| a.role.clone()),
-                    capabilities,
-                    public_key: None,
-                    encryption_key: Some(encryption.public_key_hex()),
-                };
-                ferryman_channel::register_agent_key(&route, &agent, &identity)?;
-                Ok(identity)
-            })();
-            match attempt {
-                Ok(i) => identity = Some(i),
-                Err(error) => note = Some(short(&format!("{error:#}"), 160)),
-            }
-            route = self.route();
+        if !granted {
+            let data = json!({
+                "agent": self.me,
+                "project": route.project_id,
+                "level": "none",
+                "granted": false,
+                "note": note,
+            });
+            return Ok(Reply::new(
+                format!(
+                    "Ferryman MCP (beta): {} is not seated on {}; read-only, nothing else",
+                    self.me, route.project_id
+                ),
+                data,
+            ));
         }
-        let granted = match (
-            &identity,
-            route.agents.iter().find(|a| is_me(&a.name, &self.me)),
-        ) {
-            (Some(identity), Some(entry)) => {
-                entry.public_key.as_deref() == Some(identity.public_key_hex().as_str())
-            }
-            _ => false,
-        };
         let level = self.level();
         let (primary, state, _) = self.primary_view(&route);
         let tasks = ferryman_channel::list_tasks(&route).unwrap_or_default();
@@ -841,26 +1053,16 @@ impl Agent {
         if let Some(update) = self.update_field(&route) {
             data["update"] = update;
         }
-        if !granted {
-            data["note"] = json!(note.unwrap_or_else(|| {
-                "key not seated yet: ask the owner (dashboard, Agents)".to_string()
-            }));
-        }
         let who = data["primary"]["name"]
             .as_str()
             .unwrap_or("nobody")
             .to_string();
         Ok(Reply::new(
             format!(
-                "Ferryman MCP (beta): {} on {}, level {}, primary {who} ({state}){}",
+                "Ferryman MCP (beta): {} on {}, level {}, primary {who} ({state})",
                 self.me,
                 route.project_id,
                 level.as_str(),
-                if granted {
-                    ""
-                } else {
-                    "; not seated yet, ask the owner"
-                }
             ),
             data,
         ))
@@ -909,7 +1111,7 @@ impl Agent {
         self.touch(&route);
         let detail = args.get("detail").and_then(Value::as_bool).unwrap_or(false);
         let since = arg_str(args, "since");
-        let (open_cap, decision_cap, line) = if detail { (20, 16, 200) } else { (10, 8, 90) };
+        let (open_cap, decision_cap, line) = if detail { (20, 16, 200) } else { (6, 4, 80) };
 
         let tasks = ferryman_channel::list_tasks(&route)?;
         let ledger = ferryman_channel::ledger::read_ledger(&route)
@@ -977,7 +1179,7 @@ impl Agent {
         let mine: Vec<Value> = tasks
             .iter()
             .filter(|t| self.is_mine(t) && !finished(&t.state()))
-            .take(5)
+            .take(3)
             .map(|t| json!({ "id": t.order.id, "title": title_of(t, 48), "state": state_name(&t.state()) }))
             .collect();
 
@@ -1033,11 +1235,11 @@ impl Agent {
                 .lines()
                 .map(str::trim)
                 .filter(|l| !l.is_empty())
-                .take(5)
-                .map(|l| json!(short(l, 90)))
+                .take(3)
+                .map(|l| json!(short(l, 80)))
                 .collect();
             brief_view = json!({
-                "objective": short(&b.objective, if detail { 300 } else { 140 }),
+                "objective": short(&b.objective, if detail { 300 } else { 120 }),
                 "constraints": constraints,
             });
         }
@@ -1059,8 +1261,8 @@ impl Agent {
                 .iter()
                 .skip(before.min(ledger.len()))
                 .rev()
-                .take(6)
-                .map(|e| json!({ "kind": e.kind, "by": e.actor, "line": short(&e.summary, 70) }))
+                .take(3)
+                .map(|e| json!({ "kind": e.kind, "by": e.actor, "line": short(&e.summary, 50) }))
                 .collect();
             data["recent"] = json!(recent);
         }
@@ -1114,6 +1316,32 @@ impl Agent {
                 self.require_write("claim orders")?;
                 let id = need(args, "id", "claim")?;
                 safe_id(id)?;
+                // The checks the worker makes before it takes an order, in the same
+                // order: is it signed and unblocked and addressed to this agent, then
+                // the holds (interface, file overlap, fleet width, project tier, order
+                // files). Only then the claim.
+                let task = ferryman_channel::read_task(&route, id)?;
+                if !task.holder().is_some_and(|h| is_me(h, &self.me)) {
+                    let open = ferryman_channel::work_among(&route, &self.me, vec![task.clone()])?
+                        .into_iter()
+                        .any(|t| matches!(t.state(), TaskState::Open | TaskState::Offered { .. }));
+                    if !open {
+                        return Err(refusal(
+                            "refused",
+                            format!(
+                                "{id} is not open to you: it is taken, finished, addressed to someone else, waiting on other orders, or not validly signed"
+                            ),
+                        ));
+                    }
+                    if let Some(reason) =
+                        ferryman_ops::agent::start_hold(&route, &self.me, &task.order)
+                    {
+                        return Err(refusal(
+                            "refused",
+                            format!("hold off {id}: {}", short(&reason, 200)),
+                        ));
+                    }
+                }
                 ferryman_channel::claim_order(&route, id, &self.me)?;
                 let task = ferryman_channel::read_task(&route, id)?;
                 let holder = task.holder().unwrap_or("nobody").to_string();
@@ -1157,6 +1385,7 @@ impl Agent {
                 let id = need(args, "id", "submit")?;
                 safe_id(id)?;
                 let reference = need(args, "ref", "submit")?;
+                guard_ref("ref", reference)?;
                 if reference.len() > 128
                     || !reference
                         .chars()
@@ -1421,11 +1650,7 @@ impl Agent {
                 args.get("peek").and_then(Value::as_bool).unwrap_or(false),
             ),
             "post" => {
-                if !self.level().writes_channel() {
-                    return Err(denied(
-                        "level worker cannot post. Workers hand work in with `ferry work hand-in`; they do not write the channel",
-                    ));
-                }
+                self.require_write("post")?;
                 let to = need(args, "to", "post")?.to_ascii_lowercase();
                 let text = need(args, "text", "post")?;
                 if text.chars().count() > 1500 {
@@ -1638,6 +1863,7 @@ impl Agent {
     /// `resources/read` for `ferry://<project>/{order,msg,brief}/<id>`. Nothing here takes
     /// a path from the caller, so nothing outside the channel's records can be reached.
     pub fn read_resource(&self, uri: &str) -> Result<Value> {
+        self.require_seated()?;
         let route = self.route();
         let rest = uri
             .strip_prefix("ferry://")
@@ -1708,7 +1934,15 @@ impl Agent {
             other => return Err(bad(format!("unknown resource kind '{other}'"))),
         };
         let text: String = text.chars().take(16_000).collect();
-        Ok(json!({ "contents": [{ "uri": uri, "mimeType": "text/plain", "text": text }] }))
+        let (text, redacted) = match redact_text(&text) {
+            Some(clean) => (clean, true),
+            None => (text, false),
+        };
+        let mut content = json!({ "uri": uri, "mimeType": "text/plain", "text": text });
+        if redacted {
+            content["redacted"] = json!(true);
+        }
+        Ok(json!({ "contents": [content] }))
     }
 
     // -- admin ------------------------------------------------------------------------
@@ -1721,10 +1955,12 @@ impl Agent {
             .unwrap_or("")
             .to_string();
         let capped: String = text.chars().take(3000).collect();
-        Ok(Reply::new(
-            format!("{} chars", text.chars().count()),
-            json!({ "uri": uri, "text": capped, "truncated": text.chars().count() > 3000 }),
-        ))
+        let mut data =
+            json!({ "uri": uri, "text": capped, "truncated": text.chars().count() > 3000 });
+        if read["contents"][0]["redacted"] == json!(true) {
+            data["redacted"] = json!(true);
+        }
+        Ok(Reply::new(format!("{} chars", text.chars().count()), data))
     }
 
     fn search(&self, args: &Value) -> Result<Reply> {
@@ -1765,38 +2001,39 @@ impl Agent {
 
     // -- updates ----------------------------------------------------------------------
 
-    /// The newest version a master-signed approval names, if any verifies.
-    fn approved_version(&self, route: &ProjectRoute) -> Option<String> {
+    /// The newest release the master signed an approval for, if any verifies. This is the
+    /// only source of "an update exists": a public tag or a release page is not consent.
+    fn approved_release(
+        &self,
+        route: &ProjectRoute,
+    ) -> Option<ferryman_channel::release::ReleaseApproval> {
         let master = ferryman_channel::master::read_master(route)
             .ok()
             .flatten()?;
         ferryman_channel::release::list_approvals(route)
             .into_iter()
             .filter(|a| is_me(&a.approved_by, &master.master))
+            .filter(|a| is_me(a.signed_by.as_deref().unwrap_or(""), &master.master))
             .filter(|a| {
                 ferryman_channel::release::verify_approval(a, &route.agents)
                     == SignatureCheck::Valid
             })
-            .map(|a| a.version)
-            .max_by_key(|v| crate::update::parts(v))
+            .max_by_key(|a| crate::update::parts(&a.version))
     }
 
-    /// The best signed, approved version available, newer than what is running.
-    fn newer_release(&self, route: &ProjectRoute, force: bool) -> Option<String> {
-        let channel = self.approved_version(route);
-        let public = (self.public_release)(force);
-        let latest = [channel, public]
-            .into_iter()
-            .flatten()
-            .max_by_key(|v| crate::update::parts(v))?;
-        crate::update::is_newer(&latest).then_some(latest)
+    /// The master-approved release newer than what is running.
+    fn newer_release(
+        &self,
+        route: &ProjectRoute,
+    ) -> Option<ferryman_channel::release::ReleaseApproval> {
+        self.approved_release(route)
+            .filter(|a| crate::update::is_newer(&a.version))
     }
 
-    /// The compact `update` field (about 40 tokens). Absent when nothing newer is
-    /// available. Only versions the master signed an approval for, or whose public release
-    /// tag verifies as signed, ever appear here.
+    /// The compact `update` field (about 40 tokens). Absent when the master has approved
+    /// nothing newer than what runs here.
     fn update_field(&self, route: &ProjectRoute) -> Option<Value> {
-        let latest = self.newer_release(route, false)?;
+        let latest = self.newer_release(route)?.version;
         let fleet = route.attachment.join("agent.toml").is_file();
         let auto = fleet
             && !std::env::var("FERRYMAN_NO_AUTO_UPDATE").is_ok_and(|v| !v.is_empty() && v != "0");
@@ -1821,11 +2058,11 @@ impl Agent {
         let action = need(args, "action", "ferry_update")?;
         match action {
             "check" => {
-                let view = self.newer_release(&route, true);
+                let view = self.newer_release(&route);
                 let mut data =
                     json!({ "current": env!("CARGO_PKG_VERSION"), "available": view.is_some() });
                 if let Some(latest) = &view {
-                    data["latest"] = json!(latest.trim_start_matches('v'));
+                    data["latest"] = json!(latest.version.trim_start_matches('v'));
                     if let Some(field) = self.update_field(&route) {
                         data["how"] = field["how"].clone();
                         data["auto"] = field["auto"].clone();
@@ -1833,7 +2070,9 @@ impl Agent {
                 }
                 Ok(Reply::new(
                     match &view {
-                        Some(v) => format!("update available: {}", v.trim_start_matches('v')),
+                        Some(a) => {
+                            format!("update available: {}", a.version.trim_start_matches('v'))
+                        }
                         None => "up to date".to_string(),
                     },
                     data,
@@ -1847,17 +2086,41 @@ impl Agent {
                         level.as_str()
                     )));
                 }
-                let Some(latest) = self.newer_release(&route, true) else {
+                if let Some(note) = self.paused(&route) {
+                    return Err(denied(format!(
+                        "cannot update while paused ({}). Tell the human",
+                        short(&note, 120)
+                    )));
+                }
+                let Some(approval) = self.newer_release(&route) else {
                     return Ok(Reply::new(
                         "already current",
                         json!({ "current": env!("CARGO_PKG_VERSION"), "available": false }),
                     ));
                 };
-                let tag = format!("v{}", latest.trim_start_matches('v'));
+                // The download is checked against the hash inside the master's signed
+                // approval, not a checksum file next to the release. No hash for this
+                // platform, no install.
+                let Some(target) = crate::update::target_triple() else {
+                    return Err(refusal(
+                        "refused",
+                        "there is no published build for this platform; build from source",
+                    ));
+                };
+                let Some(sha256) = approval.artifacts.get(target).cloned() else {
+                    return Err(refusal(
+                        "refused",
+                        format!(
+                            "the master's approval of {} pins no checksum for {target}, so it cannot be verified here. Ask the master to approve it with checksums, or run `ferry update`",
+                            approval.version
+                        ),
+                    ));
+                };
+                let tag = format!("v{}", approval.version.trim_start_matches('v'));
                 let installed = run_blocking({
                     let tag = tag.clone();
                     async move {
-                        crate::update::apply(&tag)
+                        crate::update::apply_pinned(&tag, &sha256)
                             .await
                             .map_err(|e| format!("{e:#}"))
                     }
@@ -1873,7 +2136,6 @@ impl Agent {
         }
     }
 }
-
 // ---------------------------------------------------------------------------------------
 // Pieces shared with mcp.rs
 
@@ -1948,49 +2210,6 @@ where
     .join()
     .ok()
     .flatten()
-}
-
-const PUBLIC_CACHE_HOURS: i64 = 6;
-
-fn public_cache_path() -> Option<std::path::PathBuf> {
-    ferryman_channel::licensing::machine_state_dir().map(|dir| dir.join("mcp-update-latest.json"))
-}
-
-/// The newest public release whose tag GitHub verifies as signed, cached so a call does
-/// not fetch. `FERRYMAN_MCP_NO_UPDATE_CHECK=1` turns the public lookup off.
-fn real_public_release(force: bool) -> Option<String> {
-    if std::env::var("FERRYMAN_MCP_NO_UPDATE_CHECK").is_ok_and(|v| !v.is_empty() && v != "0") {
-        return None;
-    }
-    let path = public_cache_path();
-    if !force
-        && let Some(path) = &path
-        && let Ok(text) = std::fs::read_to_string(path)
-        && let Ok(cached) = serde_json::from_str::<Value>(&text)
-        && let Some(at) = cached["at"]
-            .as_str()
-            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
-        && (Utc::now() - at).num_hours() < PUBLIC_CACHE_HOURS
-    {
-        return cached["latest"].as_str().map(str::to_string);
-    }
-    let latest = run_blocking(async {
-        crate::update::latest_verified_release()
-            .await
-            .ok()
-            .flatten()
-    })
-    .flatten();
-    if let Some(path) = &path {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            path,
-            json!({ "at": Utc::now().to_rfc3339(), "latest": latest }).to_string(),
-        );
-    }
-    latest
 }
 
 /// Fail early with a clear message when `--as` names something that cannot be an agent.

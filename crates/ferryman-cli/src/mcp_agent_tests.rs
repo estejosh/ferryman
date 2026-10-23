@@ -2,9 +2,9 @@
 //! cursors, the secret guard, updates, and the token budget (`mcp_budget`).
 
 use super::*;
-use crate::mcp::{Server, handle_line};
+use crate::mcp::{MAX_LINE_BYTES, Server, handle_line, serve_io};
 use ferryman_channel::release::{ReleaseApproval, write_approval};
-use ferryman_channel::{Order, Priority};
+use ferryman_channel::{AgentRoute, Order, Priority};
 
 struct World {
     _dir: tempfile::TempDir,
@@ -71,15 +71,11 @@ fn world() -> World {
 }
 
 fn agent(w: &World, name: &str) -> Agent {
-    let mut agent = Agent::new(w.route.clone(), name, true);
-    agent.public_release = Box::new(|_| None);
-    agent
+    Agent::new(w.route.clone(), name, true)
 }
 
 fn core_agent(w: &World, name: &str) -> Agent {
-    let mut agent = Agent::new(w.route.clone(), name, false);
-    agent.public_release = Box::new(|_| None);
-    agent
+    Agent::new(w.route.clone(), name, false)
 }
 
 fn call(agent: &Agent, tool: &str, args: Value) -> Value {
@@ -98,7 +94,7 @@ fn refused<'a>(result: &'a Value, kind: &str) -> &'a str {
 }
 
 fn tokens(value: &Value) -> usize {
-    value.to_string().len() / 4
+    est_tokens(value.to_string().len())
 }
 
 fn order(w: &World, id: &str, title: &str) -> Order {
@@ -330,17 +326,60 @@ fn an_order_that_needs_the_master_cannot_be_accepted_by_an_agent() {
 }
 
 #[test]
-fn an_agent_with_no_key_is_told_it_is_locked_and_does_nothing() {
+fn an_app_with_no_seated_key_is_a_stranger_and_gets_nothing() {
     let w = world();
+    issue(&w, "o-s", "secret plans");
     let stranger = agent(&w, "stranger");
-    let result = call(
-        &stranger,
-        "ferry_talk",
-        json!({ "action": "post", "to": BOSS, "text": "hi" }),
-    );
-    assert!(refused(&result, "denied").contains("worker"));
+    assert!(!stranger.seated());
+    // Every tool but join refuses, reads included.
+    for (tool, args) in [
+        ("ferry_catchup", json!({})),
+        ("ferry_orders", json!({ "action": "list" })),
+        ("ferry_orders", json!({ "action": "show", "id": "o-s" })),
+        ("ferry_talk", json!({ "action": "read" })),
+        (
+            "ferry_talk",
+            json!({ "action": "post", "to": BOSS, "text": "hi" }),
+        ),
+        ("ferry_primary", json!({ "action": "status" })),
+        ("ferry_ask_human", json!({ "action": "status" })),
+        ("ferry_get", json!({ "uri": "ferry://demo/order/o-s" })),
+    ] {
+        let result = call(&stranger, tool, args.clone());
+        assert!(
+            refused(&result, "locked").contains("not a seated agent"),
+            "{tool} {args}"
+        );
+    }
+    assert!(stranger.read_resource("ferry://demo/order/o-s").is_err());
 }
 
+#[test]
+fn a_key_that_is_not_on_the_roster_is_not_seated_either() {
+    let w = world();
+    // The machine holds a key for the name, but the roster has never heard of it.
+    AgentIdentity::load_or_create("orphan", &w.route.attachment).unwrap();
+    let orphan = agent(&w, "orphan");
+    assert!(!orphan.seated());
+    let joined = call(&orphan, "ferry_join", json!({}));
+    assert_eq!(ok(&joined)["granted"], false);
+    assert!(ok(&joined)["note"].as_str().unwrap().contains("not seated"));
+    refused(&call(&orphan, "ferry_catchup", json!({})), "locked");
+    // A roster entry holding a different key does not seat it either.
+    let other = AgentIdentity::load_or_create("twin", &w.route.attachment).unwrap();
+    ferryman_channel::register_agent(
+        &w.route,
+        &AgentRoute {
+            name: "orphan".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(other.public_key_hex()),
+            encryption_key: None,
+        },
+    )
+    .unwrap();
+    assert!(!agent(&w, "orphan").seated());
+}
 // -- continuity ----------------------------------------------------------------------------
 
 #[test]
@@ -973,6 +1012,7 @@ fn approve(w: &World, version: &str, signer: &AgentIdentity, approver: &str) {
         approved_by: approver.into(),
         approved_at: Utc::now(),
         via: "test".into(),
+        artifacts: Default::default(),
         signed_by: None,
         signature: None,
     };
@@ -1004,7 +1044,7 @@ fn the_update_field_is_absent_when_current_and_present_when_a_signed_release_is_
             .contains("github.com/estejosh/ferryman/releases")
     );
     // About 40 tokens at most.
-    assert!(tokens(update) <= 45, "{}", tokens(update));
+    assert!(tokens(update) <= 55, "{}", tokens(update));
     // The catch-up header carries it too.
     assert_eq!(
         ok(&call(&boss, "ferry_catchup", json!({})))["update"]["latest"],
@@ -1036,6 +1076,7 @@ fn an_unsigned_or_non_master_release_is_ignored() {
         approved_by: OLD_PRIMARY.into(),
         approved_at: Utc::now(),
         via: "x".into(),
+        artifacts: Default::default(),
         signed_by: None,
         signature: None,
     };
@@ -1078,27 +1119,23 @@ fn an_unsigned_or_non_master_release_is_ignored() {
 }
 
 #[test]
-fn the_public_source_counts_through_the_same_filter() {
+fn a_public_release_is_not_consent_and_never_shows_as_an_update() {
+    // Nothing in the channel from the master: nothing to offer, whatever GitHub says.
     let w = world();
-    let mut boss = agent(&w, BOSS);
-    boss.public_release = Box::new(|_| Some("v98.1.0".to_string()));
-    assert_eq!(
-        ok(&call(&boss, "ferry_join", json!({})))["update"]["latest"],
-        "98.1.0"
+    let boss = agent(&w, BOSS);
+    assert!(
+        ok(&call(&boss, "ferry_join", json!({})))
+            .get("update")
+            .is_none()
     );
-    // The newest of the two sources wins.
-    approve(&w, "99.5.0", &w.master, OLD_PRIMARY);
-    assert_eq!(
-        ok(&call(&boss, "ferry_join", json!({})))["update"]["latest"],
-        "99.5.0"
+    let checked = call(
+        &agent(&w, BOSS),
+        "ferry_update",
+        json!({ "action": "check" }),
     );
-    // Older than what runs: not shown.
-    boss.public_release = Box::new(|_| Some("v0.0.2".to_string()));
-    std::fs::remove_file(ferryman_channel::release::approval_path(
-        &w.route,
-        OLD_PRIMARY,
-    ))
-    .unwrap();
+    assert_eq!(ok(&checked)["available"], false);
+    // An approval for an older version than the one running is not an update either.
+    approve(&w, "0.0.2", &w.master, OLD_PRIMARY);
     assert!(
         ok(&call(&boss, "ferry_join", json!({})))
             .get("update")
@@ -1106,6 +1143,55 @@ fn the_public_source_counts_through_the_same_filter() {
     );
 }
 
+#[test]
+fn the_pinned_checksums_are_covered_by_the_masters_signature() {
+    let w = world();
+    let boss = agent(&w, BOSS);
+    let mut approval = ReleaseApproval {
+        version: "99.0.0".into(),
+        commit: "c0ffee".into(),
+        approved_by: OLD_PRIMARY.into(),
+        approved_at: Utc::now(),
+        via: "test".into(),
+        artifacts: Default::default(),
+        signed_by: None,
+        signature: None,
+    };
+    approval
+        .artifacts
+        .insert("x86_64-unknown-linux-gnu".into(), "ab".repeat(32));
+    let path = write_approval(&w.route, &approval, &w.master).unwrap();
+    assert_eq!(
+        ok(&call(&boss, "ferry_join", json!({})))["update"]["latest"],
+        "99.0.0"
+    );
+    // Swap the pinned hash after signing: the approval stops counting.
+    let mut edited: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    edited["artifacts"]["x86_64-unknown-linux-gnu"] = json!("cd".repeat(32));
+    std::fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+    let mirror = ferryman_channel::release::approval_path(&w.route, OLD_PRIMARY);
+    std::fs::write(mirror, serde_json::to_vec(&edited).unwrap()).unwrap();
+    assert!(
+        ok(&call(&boss, "ferry_join", json!({})))
+            .get("update")
+            .is_none()
+    );
+}
+
+#[test]
+fn apply_refuses_without_a_checksum_the_master_signed() {
+    let w = world();
+    approve(&w, "99.0.0", &w.master, OLD_PRIMARY); // approved, but pins nothing
+    let boss = agent(&w, BOSS);
+    let result = call(&boss, "ferry_update", json!({ "action": "apply" }));
+    // Either this platform has no published build, or the approval pins no checksum for
+    // it. Both are a refusal, and nothing is downloaded.
+    let why = refused(&result, "refused");
+    assert!(
+        why.contains("checksum") || why.contains("no published build"),
+        "{why}"
+    );
+}
 #[test]
 fn applying_an_update_is_refused_below_orchestrator_and_check_is_read_only() {
     let w = world();
@@ -1137,8 +1223,7 @@ fn applying_an_update_is_refused_below_orchestrator_and_check_is_read_only() {
 #[test]
 fn the_update_tool_exists_only_in_the_admin_group() {
     let w = world();
-    let mut plain = Agent::new(w.route.clone(), BOSS, false);
-    plain.public_release = Box::new(|_| None);
+    let plain = Agent::new(w.route.clone(), BOSS, false);
     refused(
         &call(&plain, "ferry_update", json!({ "action": "check" })),
         "bad_request",
@@ -1157,7 +1242,7 @@ fn the_update_tool_exists_only_in_the_admin_group() {
 // -- join ------------------------------------------------------------------------------------------
 
 #[test]
-fn join_says_who_you_are_and_who_is_primary_and_seats_a_new_agent() {
+fn join_says_who_you_are_and_who_is_primary_and_never_seats_a_stranger() {
     let w = world();
     take_as(&w, OLD_PRIMARY);
     let boss = agent(&w, BOSS);
@@ -1174,31 +1259,29 @@ fn join_says_who_you_are_and_who_is_primary_and_seats_a_new_agent() {
             .starts_with("Ferryman MCP (beta)")
     );
 
-    // An app that has never been here gets a key, and takes its name on the roster.
+    // An app that has never been here is not given a key or a seat by joining.
+    let before = ferryman_channel::read_agent_roster(&w.route.communications)
+        .unwrap()
+        .len();
     let newcomer = agent(&w, "claude-desktop-test");
     let joined = call(&newcomer, "ferry_join", json!({}));
-    assert_eq!(ok(&joined)["granted"], true, "{joined}");
-    assert_eq!(ok(&joined)["level"], "worker");
-    assert!(
+    assert_eq!(ok(&joined)["granted"], false, "{joined}");
+    assert_eq!(ok(&joined)["level"], "none");
+    assert!(ok(&joined)["note"].as_str().unwrap().contains("no key"));
+    assert_eq!(
         ferryman_channel::read_agent_roster(&w.route.communications)
             .unwrap()
-            .iter()
-            .any(|a| a.name == "claude-desktop-test" && a.public_key.is_some())
+            .len(),
+        before
     );
-    // And it did not claim to be the fleet's MCP gateway.
     assert!(
-        !ferryman_channel::read_agent_roster(&w.route.communications)
+        AgentIdentity::load_existing("claude-desktop-test", &w.route.attachment)
             .unwrap()
-            .iter()
-            .any(ferryman_channel::discovery::is_mcp)
+            .is_none()
     );
-    // Joining again is the same answer.
-    assert_eq!(
-        ok(&call(&newcomer, "ferry_join", json!({})))["granted"],
-        true
-    );
+    // And it learns nothing about the channel.
+    assert!(ok(&joined).get("primary").is_none());
 }
-
 // -- the server ------------------------------------------------------------------------------------
 
 fn rpc(server: &mut Server, line: &Value) -> Value {
@@ -1326,8 +1409,7 @@ fn the_groups_add_tools_and_read_only_serves_only_the_old_ones() {
     let core_only = Server::with(w.route.clone(), Some(core_agent(&w, MEMBER)), false);
     assert_eq!(core_only.tools().len(), 6);
     // Admin and legacy are opt-in; asked for, they are appended after the core six.
-    let mut admin = Agent::new(w.route.clone(), MEMBER, true);
-    admin.public_release = Box::new(|_| None);
+    let admin = Agent::new(w.route.clone(), MEMBER, true);
     let with_both = Server::with(w.route.clone(), Some(admin), true);
     let names: Vec<String> = with_both
         .tools()
@@ -1357,11 +1439,6 @@ fn the_groups_add_tools_and_read_only_serves_only_the_old_ones() {
 
 // -- the token budget (T1-T10) ----------------------------------------------------------------
 
-/// Round up to the next ten so a stray timestamp digit cannot flip a snapshot.
-fn bucket(n: usize) -> usize {
-    n.div_ceil(10) * 10
-}
-
 #[test]
 fn mcp_budget() {
     let w = world();
@@ -1369,21 +1446,25 @@ fn mcp_budget() {
 
     // T1: the core tool list.
     let core = core_tools();
-    let core_tokens = serde_json::to_string(&core).unwrap().len() / 4;
+    let core_tokens = est_tokens(serde_json::to_string(&core).unwrap().len());
     assert!(
         core_tokens <= 1500,
         "core tools/list is {core_tokens} tokens, cap 1500"
     );
     let mut per_tool = BTreeMap::new();
     for tool in &core {
-        per_tool.insert(
-            tool["name"].as_str().unwrap().to_string(),
-            bucket(tokens(tool)),
-        );
+        per_tool.insert(tool["name"].as_str().unwrap().to_string(), tokens(tool));
     }
 
+    // The admin group has a cap of its own and costs nothing unless asked for.
+    let admin_tokens = est_tokens(serde_json::to_string(&admin_tools()).unwrap().len());
+    assert!(
+        admin_tokens <= 700,
+        "admin tools are {admin_tokens} tokens, cap 700"
+    );
+
     // T3: instructions.
-    let instructions = INSTRUCTIONS.len() / 4;
+    let instructions = est_tokens(INSTRUCTIONS.len());
     assert!(
         instructions <= 250,
         "instructions are {instructions} tokens, cap 250"
@@ -1465,7 +1546,32 @@ fn mcp_budget() {
             json!({ "action": "post", "to": BOSS, "text": format!("message {n}: please look at order-{n:03}, I need a decision on the approach") }),
         ));
     }
+    // An update is on offer, so the header carries its worst case too.
+    approve(&w, "99.0.0", &w.master, OLD_PRIMARY);
+    // Measured BEFORE any truncation: the digest has to fit by construction, so growth in
+    // what it carries is caught here and not hidden by the cut that would follow.
+    let mut untruncated = BTreeMap::new();
+    for (label, args) in [
+        ("fresh", json!({})),
+        ("with_cursor", json!({ "since": "c.0.0.0" })),
+    ] {
+        let raw = boss.call_raw("ferry_catchup", &args).unwrap();
+        let size = est_tokens(
+            raw.data.to_string().len()
+                + raw.text.len()
+                + raw.links.iter().map(|l| l.to_string().len()).sum::<usize>(),
+        );
+        assert!(
+            size <= 800,
+            "the untruncated {label} catch-up is {size} tokens on the busy fixture, cap 800"
+        );
+        untruncated.insert(label.to_string(), size);
+    }
     let caught = call(&boss, "ferry_catchup", json!({}));
+    assert!(
+        ok(&caught).get("truncated").is_none(),
+        "the digest should fit without cutting"
+    );
     let catchup = tokens(&caught);
     assert!(
         catchup <= 800,
@@ -1502,7 +1608,7 @@ fn mcp_budget() {
                 );
             }
         }
-        typical.insert(label.to_string(), bucket(t));
+        typical.insert(label.to_string(), t);
     };
     check(
         "ferry_join",
@@ -1589,29 +1695,441 @@ fn mcp_budget() {
     assert_eq!(ok(&flood)["truncated"], true);
 
     // A committed snapshot makes growth visible in review. UPDATE_MCP_BUDGET=1 rewrites it.
+    // Exact numbers. The static ones (definitions, instructions) must match to the token;
+    // the ones that depend on ids and ages may move by a few tokens between runs.
     let snapshot = json!({
-        "note": "Estimated tokens (chars / 4), rounded up to ten. Regenerate with UPDATE_MCP_BUDGET=1 cargo test -p ferryman-cli mcp_budget",
-        "caps": { "core_tools_list": 1500, "instructions": 250, "catchup_busy": 800 },
-        "core_tools_list": bucket(core_tokens),
-        "instructions": bucket(instructions),
-        "catchup_busy": bucket(catchup),
+        "note": "Estimated tokens at 3.3 characters each. Regenerate with UPDATE_MCP_BUDGET=1 cargo test -p ferryman-cli mcp_budget",
+        "caps": { "core_tools_list": 1500, "admin_tools_list": 700, "instructions": 250, "catchup_busy": 800 },
+        "core_tools_list": core_tokens,
+        "admin_tools_list": admin_tokens,
+        "instructions": instructions,
         "tool_definitions": per_tool,
+        "catchup_busy_untruncated": untruncated,
+        "catchup_busy": catchup,
         "typical_responses": typical,
     });
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("mcp_budget.json");
-    let rendered = serde_json::to_string_pretty(&snapshot).unwrap() + "\n";
     if std::env::var("UPDATE_MCP_BUDGET").is_ok_and(|v| v == "1") {
-        std::fs::write(&path, &rendered).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&snapshot).unwrap() + "\n",
+        )
+        .unwrap();
     } else {
-        let committed = std::fs::read_to_string(&path).expect("tests/mcp_budget.json is committed");
-        assert_eq!(
-            committed.replace("\r\n", "\n"),
-            rendered,
-            "the MCP token budget changed; if that is intended, regenerate tests/mcp_budget.json with UPDATE_MCP_BUDGET=1"
+        let committed: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("tests/mcp_budget.json is committed"),
+        )
+        .unwrap();
+        let hint = "the MCP token budget changed; if that is intended, regenerate tests/mcp_budget.json with UPDATE_MCP_BUDGET=1";
+        for key in [
+            "caps",
+            "core_tools_list",
+            "admin_tools_list",
+            "instructions",
+            "tool_definitions",
+        ] {
+            assert_eq!(committed[key], snapshot[key], "{key}: {hint}");
+        }
+        for key in [
+            "catchup_busy_untruncated",
+            "catchup_busy",
+            "typical_responses",
+        ] {
+            let (was, now) = (&committed[key], &snapshot[key]);
+            let pairs: Vec<(String, i64, i64)> = match now {
+                Value::Object(map) => map
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            was[k].as_i64().unwrap_or(-1000),
+                            v.as_i64().unwrap(),
+                        )
+                    })
+                    .collect(),
+                other => vec![(
+                    key.to_string(),
+                    was.as_i64().unwrap_or(-1000),
+                    other.as_i64().unwrap(),
+                )],
+            };
+            for (name, was, now) in pairs {
+                assert!(
+                    (was - now).abs() <= 6,
+                    "{key}.{name} was {was}, is {now}: {hint}"
+                );
+            }
+        }
+    }
+}
+// -- review fixes -------------------------------------------------------------------------
+
+fn plant(w: &World, from: &str, to: &str, text: &str) -> String {
+    let identity = AgentIdentity::load_existing(from, &w.route.attachment)
+        .unwrap()
+        .unwrap();
+    agent(w, from).send(&w.route, &identity, to, text).unwrap()
+}
+
+fn pause() -> std::path::PathBuf {
+    let marker = ferryman_ops::governor::pause_marker().unwrap();
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, "paused for the test").unwrap();
+    marker
+}
+
+#[test]
+fn claim_goes_through_the_workers_checks_not_the_raw_claim() {
+    let w = world();
+    // Addressed to fang: boss may not take it, fang may.
+    let mut addressed = order(&w, "o-addr", "for fang only");
+    addressed.assigned_to = Some(MEMBER.into());
+    w.master.sign_order(&mut addressed);
+    ferryman_channel::issue_order(&w.route, &addressed).unwrap();
+    let result = call(
+        &agent(&w, BOSS),
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-addr" }),
+    );
+    assert!(refused(&result, "refused").contains("not open to you"));
+    assert!(
+        ferryman_channel::read_task(&w.route, "o-addr")
+            .unwrap()
+            .holder()
+            .is_none_or(|h| h != BOSS)
+    );
+    ok(&call(
+        &agent(&w, MEMBER),
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-addr" }),
+    ));
+
+    // Waiting on an order that is not done: not open yet.
+    let mut blocked = order(&w, "o-blocked", "after something");
+    blocked.depends_on = vec!["o-never".into()];
+    w.master.sign_order(&mut blocked);
+    ferryman_channel::issue_order(&w.route, &blocked).unwrap();
+    let result = call(
+        &agent(&w, BOSS),
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-blocked" }),
+    );
+    assert!(refused(&result, "refused").contains("not open to you"));
+
+    // Same files as an order someone holds: hold off, as the worker would.
+    for id in ["o-f1", "o-f2"] {
+        let mut o = order(&w, id, "touches a file");
+        o.touches = vec!["src/shared.rs".into()];
+        w.master.sign_order(&mut o);
+        ferryman_channel::issue_order(&w.route, &o).unwrap();
+    }
+    ok(&call(
+        &agent(&w, BOSS),
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-f1" }),
+    ));
+    let result = call(
+        &agent(&w, BOSS2),
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-f2" }),
+    );
+    assert!(refused(&result, "refused").contains("hold off"));
+    assert!(
+        ferryman_channel::read_task(&w.route, "o-f2")
+            .unwrap()
+            .holder()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_paused_machine_writes_nothing_but_still_reads() {
+    let w = world();
+    issue(&w, "o-p", "work");
+    let member = agent(&w, MEMBER);
+    ok(&call(
+        &member,
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-p" }),
+    ));
+    let marker = pause();
+    for (tool, args) in [
+        (
+            "ferry_talk",
+            json!({ "action": "post", "to": BOSS, "text": "hi" }),
+        ),
+        ("ferry_orders", json!({ "action": "claim", "id": "o-p" })),
+        (
+            "ferry_orders",
+            json!({ "action": "progress", "id": "o-p", "note": "x" }),
+        ),
+        (
+            "ferry_orders",
+            json!({ "action": "submit", "id": "o-p", "ref": "abc1234", "note": "done" }),
+        ),
+        (
+            "ferry_orders",
+            json!({ "action": "review", "id": "o-p", "verdict": "accept" }),
+        ),
+        (
+            "ferry_ask_human",
+            json!({ "action": "raise", "title": "t", "recommendation": "r", "reasoning": "w" }),
+        ),
+    ] {
+        let result = call(&member, tool, args.clone());
+        assert!(
+            refused(&result, "denied").contains("paused"),
+            "{tool} {args}"
         );
     }
+    ok(&call(&member, "ferry_catchup", json!({})));
+    ok(&call(
+        &member,
+        "ferry_talk",
+        json!({ "action": "read", "peek": true }),
+    ));
+    std::fs::remove_file(marker).unwrap();
+    ok(&call(
+        &member,
+        "ferry_talk",
+        json!({ "action": "post", "to": BOSS, "text": "back" }),
+    ));
+}
+
+#[test]
+fn what_leaves_the_server_is_redacted_whoever_put_it_in_the_channel() {
+    let w = world();
+    let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    // Planted around the guard, as a compromised or older client could.
+    let id = plant(&w, MEMBER, BOSS, &format!("use {token} for the deploy"));
+    let mut leaky = order(&w, "o-leak", &format!("deploy with {token} now"));
+    leaky.payload = json!({ "task": format!("deploy with {token} now") });
+    w.master.sign_order(&mut leaky);
+    ferryman_channel::issue_order(&w.route, &leaky).unwrap();
+
+    let boss = agent(&w, BOSS);
+    let read = call(
+        &boss,
+        "ferry_talk",
+        json!({ "action": "read", "peek": true }),
+    );
+    let text = read.to_string();
+    assert!(!text.contains(token), "{text}");
+    assert_eq!(ok(&read)["redacted"], true);
+    assert!(text.contains("[redacted]"));
+
+    let caught = call(&boss, "ferry_catchup", json!({}));
+    assert!(!caught.to_string().contains(token));
+    assert_eq!(ok(&caught)["redacted"], true);
+
+    let shown = call(
+        &boss,
+        "ferry_orders",
+        json!({ "action": "show", "id": "o-leak" }),
+    );
+    assert!(!shown.to_string().contains(token));
+
+    let body = boss
+        .read_resource(&format!("ferry://demo/msg/{id}"))
+        .unwrap();
+    assert!(!body.to_string().contains(token));
+    assert_eq!(body["contents"][0]["redacted"], true);
+    let body = boss.read_resource("ferry://demo/order/o-leak").unwrap();
+    assert!(!body.to_string().contains(token));
+
+    let got = call(
+        &boss,
+        "ferry_get",
+        json!({ "uri": "ferry://demo/order/o-leak" }),
+    );
+    assert!(!got.to_string().contains(token));
+    assert_eq!(ok(&got)["redacted"], true);
+
+    // Ordinary text, hashes and ids are left alone.
+    let id = plant(
+        &w,
+        MEMBER,
+        BOSS,
+        "pushed 9f2c1a7d3e5b4c6a8f0e1d2c3b4a5f6e7d8c9b0a to mcp-design",
+    );
+    let read = call(
+        &boss,
+        "ferry_talk",
+        json!({ "action": "read", "peek": true }),
+    );
+    assert!(
+        read.to_string()
+            .contains("9f2c1a7d3e5b4c6a8f0e1d2c3b4a5f6e7d8c9b0a")
+    );
+    assert!(read.to_string().contains(&id));
+    // The text-level function.
+    assert_eq!(redact_text("nothing to hide here"), None);
+    assert_eq!(
+        redact_text("password: hunter2hunter2 ok").unwrap(),
+        "[redacted] [redacted] ok"
+    );
+    assert_eq!(
+        redact_text("{\"k\": \"ghp_abcdefghijklmnopqrstuvwxyz0123456789\"}").unwrap(),
+        "{\"k\": \"[redacted]\"}"
+    );
+}
+
+#[test]
+fn every_inbound_string_is_guarded_for_secrets() {
+    let w = world();
+    issue(&w, "o-g", "work");
+    let member = agent(&w, MEMBER);
+    ok(&call(
+        &member,
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-g" }),
+    ));
+    let token = "ghp_abcdefghijklmnopqrstuvwxyz0123456789";
+    for (tool, args) in [
+        (
+            "ferry_orders",
+            json!({ "action": "submit", "id": "o-g", "ref": token, "note": "done" }),
+        ),
+        (
+            "ferry_orders",
+            json!({ "action": "submit", "id": "o-g", "ref": "abc1234", "note": token }),
+        ),
+        (
+            "ferry_orders",
+            json!({ "action": "progress", "id": "o-g", "note": token }),
+        ),
+        (
+            "ferry_orders",
+            json!({ "action": "review", "id": "o-g", "verdict": "changes", "notes": token }),
+        ),
+        (
+            "ferry_ask_human",
+            json!({ "action": "raise", "title": token, "recommendation": "r", "reasoning": "w" }),
+        ),
+        (
+            "ferry_ask_human",
+            json!({ "action": "raise", "title": "t", "recommendation": token, "reasoning": "w" }),
+        ),
+        (
+            "ferry_talk",
+            json!({ "action": "post", "to": BOSS, "text": token }),
+        ),
+    ] {
+        let result = call(&member, tool, args.clone());
+        assert_eq!(
+            result["structuredContent"]["error"], "secret",
+            "{tool} {args}: {result}"
+        );
+    }
+    // A commit sha, even a long one, is a ref.
+    ok(&call(
+        &member,
+        "ferry_orders",
+        json!({ "action": "submit", "id": "o-g", "ref": "9f2c1a7d3e5b4c6a8f0e1d2c3b4a5f6e7d8c9b0a", "note": "done" }),
+    ));
+}
+
+#[test]
+fn code_shaped_blobs_are_not_work_content_for_the_channel() {
+    let w = world();
+    let member = agent(&w, MEMBER);
+    let rust = "fn main() {\n    let x = vec![1, 2, 3];\n    for i in x.iter() {\n        println!(\"{}\", i);\n    }\n    let y = x.len();\n    if y > 2 { return; }\n}\n";
+    let headed =
+        "// crates/ferryman-cli/src/mcp.rs\nthe first line\nthe second line\nthe third line\n";
+    for body in [
+        rust,
+        headed,
+        "--- a/src/x.rs\n+++ b/src/x.rs\n@@ -1 +1 @@",
+        "*** Begin Patch\nx",
+    ] {
+        let result = call(
+            &member,
+            "ferry_talk",
+            json!({ "action": "post", "to": BOSS, "text": body }),
+        );
+        assert!(
+            refused(&result, "bad_request").contains("work content"),
+            "{body}"
+        );
+    }
+    for fine in [
+        "claimed o-12. Tests pass; pushed 9f2c1a7 to mcp-design.\nNext: review o-13.",
+        "I need a decision: use plan A (cheaper) or plan B (faster)?",
+    ] {
+        ok(&call(
+            &member,
+            "ferry_talk",
+            json!({ "action": "post", "to": BOSS, "text": fine }),
+        ));
+    }
+}
+
+#[test]
+fn a_catchup_that_must_shrink_drops_the_chatter_and_keeps_what_waits_on_you() {
+    let long = "x".repeat(150);
+    let rows = |n: usize| -> Vec<Value> {
+        (0..n)
+            .map(|i| json!({ "id": format!("r{i}"), "line": long }))
+            .collect()
+    };
+    let reply = Reply::new(
+        "digest",
+        json!({
+            "recent": rows(20), "open": rows(20), "mine": rows(5),
+            "decisions": rows(3), "asks": [json!({ "id": "a1", "state": "pending" })],
+            "waiting_on_you": ["review o-1"], "next": "c.1.2.3",
+        }),
+    );
+    let done = finish(reply, "ferry_catchup");
+    let data = &done["structuredContent"];
+    assert_eq!(data["truncated"], true);
+    assert_eq!(data["decisions"].as_array().unwrap().len(), 3);
+    assert_eq!(data["asks"].as_array().unwrap().len(), 1);
+    assert_eq!(data["waiting_on_you"].as_array().unwrap().len(), 1);
+    assert!(
+        data["recent"].as_array().unwrap().len() < 20,
+        "recent goes first"
+    );
+    assert!(
+        data["recent"].as_array().unwrap().len() <= data["open"].as_array().unwrap().len(),
+        "recent is cut before open"
+    );
+}
+
+#[test]
+fn malformed_and_oversized_input_gets_an_error_not_silence() {
+    let w = world();
+    let mut server = Server::with(w.route.clone(), Some(core_agent(&w, MEMBER)), false);
+    let reply = |server: &mut Server, line: &str| -> Value {
+        serde_json::from_str(&handle_line(server, line).unwrap()).unwrap()
+    };
+    let bad = reply(&mut server, "{nope");
+    assert_eq!(bad["error"]["code"], -32700);
+    assert_eq!(bad["id"], Value::Null);
+    assert_eq!(reply(&mut server, "[1,2]")["error"]["code"], -32600);
+    let no_method = reply(&mut server, r#"{"jsonrpc":"2.0","id":7}"#);
+    assert_eq!(no_method["error"]["code"], -32600);
+    assert_eq!(no_method["id"], 7);
+
+    // A line past the limit is answered once and skipped, and the next line still works.
+    let mut input = vec![b'x'; MAX_LINE_BYTES + 10];
+    input.push(b'\n');
+    input.extend_from_slice(br#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#);
+    input.push(b'\n');
+    input.extend_from_slice(b"not json\n");
+    let mut output = Vec::new();
+    serve_io(&mut server, &mut std::io::Cursor::new(input), &mut output).unwrap();
+    let lines: Vec<Value> = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(lines[0]["error"]["code"], -32600);
+    assert_eq!(lines[1]["id"], 2);
+    assert_eq!(lines[2]["error"]["code"], -32700);
 }
 
 use std::collections::BTreeMap;

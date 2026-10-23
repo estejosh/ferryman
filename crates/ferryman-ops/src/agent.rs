@@ -2819,7 +2819,7 @@ pub struct Plan {
 /// A failure to read the channel here is not a reason to refuse work: the checks are
 /// advisory, and a worker that stopped on every unreadable directory would be worse than
 /// one that occasionally started something it could have waited for.
-fn start_hold(
+pub fn start_hold(
     route: &ProjectRoute,
     agent: &str,
     order: &ferryman_channel::Order,

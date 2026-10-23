@@ -4932,6 +4932,7 @@ async fn approve_release(
         approved_by: identity.name().to_string(),
         approved_at: chrono::Utc::now(),
         via: "dashboard".to_string(),
+        artifacts: Default::default(),
         signed_by: None,
         signature: None,
     };
