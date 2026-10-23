@@ -1,4 +1,4 @@
-//! Lanes: several agents, one repository, no collisions (ADR 0028).
+//! Lanes: several agents, one repository, no collisions (ADR 0029).
 //!
 //! A git working tree has one index and one HEAD. Two agents in one checkout therefore
 //! share a staging area (`git add -A` commits the other agent's files), share a branch
