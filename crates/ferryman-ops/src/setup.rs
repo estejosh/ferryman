@@ -398,6 +398,9 @@ pub fn windows_wrapper(spec: &Spec, command: &str) -> String {
          \x20 }}\r\n\
          }}\r\n\
          $env:GIT_TERMINAL_PROMPT = '0'\r\n\
+         # The task restarts a failing exit: a worker that stops to take an update exits 75\r\n\
+         # (EX_TEMPFAIL) so this wrapper passes a failure on and the task starts it again.\r\n\
+         $env:FERRYMAN_SUPERVISED = 'task'\r\n\
          $env:GCM_INTERACTIVE = 'never'\r\n\
          Set-Location -LiteralPath {workspace}\r\n\
          & {ferry} {command}\r\n\
@@ -1393,6 +1396,123 @@ fn signing_lines(
             ));
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// A wrapper written before the worker could ask to be restarted
+
+/// The worker's wrapper script in the service folder.
+pub const WORKER_WRAPPER: &str = "ferryman-worker.ps1";
+
+/// `text`, a Windows worker wrapper, with `$env:FERRYMAN_SUPERVISED = 'task'` added after
+/// `$env:GIT_TERMINAL_PROMPT`, or `None` when it already has it or is not a wrapper this
+/// module wrote (a hand-edited one is left alone).
+#[must_use]
+pub fn mark_wrapper(text: &str) -> Option<String> {
+    if text.contains("FERRYMAN_SUPERVISED") {
+        return None;
+    }
+    let anchor = text.find("$env:GIT_TERMINAL_PROMPT")?;
+    let line_end = text[anchor..].find('\n').map(|at| anchor + at + 1)?;
+    let eol = if text[..line_end].ends_with("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = String::with_capacity(text.len() + 160);
+    out.push_str(&text[..line_end]);
+    out.push_str(&format!(
+        "# The worker stops with exit 75 to take an update; this marks it as supervised by this task.{eol}\
+         $env:FERRYMAN_SUPERVISED = 'task'{eol}"
+    ));
+    out.push_str(&text[line_end..]);
+    Some(out)
+}
+
+/// Mark this machine's existing worker wrapper (`<root>/service/ferryman-worker.ps1`) as
+/// supervised, so a task set up before 0.6.2 comes back by itself after an update without
+/// anyone re-running `ferry fleet setup --service`. The old wrapper is kept beside it once,
+/// as `<wrapper>.before-supervised`. Idempotent; returns whether the file changed. A
+/// wrapper that is not there, or is not ours, is left alone.
+///
+/// # Errors
+/// The wrapper exists and cannot be read or rewritten.
+pub fn refresh_worker_wrapper(root: &Root) -> Result<bool> {
+    let path = root.path.join("service").join(WORKER_WRAPPER);
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(false);
+    };
+    let bom = bytes.starts_with(&[0xEF, 0xBB, 0xBF]);
+    let Ok(text) = String::from_utf8(if bom {
+        bytes[3..].to_vec()
+    } else {
+        bytes.clone()
+    }) else {
+        return Ok(false);
+    };
+    let Some(marked) = mark_wrapper(&text) else {
+        return Ok(false);
+    };
+    let keep = path.with_extension("ps1.before-supervised");
+    if !keep.exists() {
+        fs::write(&keep, &bytes).with_context(|| format!("keep {}", keep.display()))?;
+    }
+    let mut out = Vec::new();
+    if bom {
+        out.extend_from_slice(&[0xEF, 0xBB, 0xBF]);
+    }
+    out.extend_from_slice(marked.as_bytes());
+    let temp = path.with_extension("ps1.new");
+    fs::write(&temp, out).with_context(|| format!("write {}", temp.display()))?;
+    fs::rename(&temp, &path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(true)
+}
+
+/// Whether a process command line is the PowerShell wrapper the worker's scheduled task runs.
+#[must_use]
+pub fn is_worker_wrapper_cmd(cmd: &[String]) -> bool {
+    cmd.iter().any(|part| {
+        part.trim_matches('"')
+            .to_ascii_lowercase()
+            .ends_with(&WORKER_WRAPPER.to_ascii_lowercase())
+    })
+}
+
+/// Whether this process was started, directly or through a few parents, by the worker's
+/// scheduled-task wrapper. That is how a wrapper written before 0.6.2 (which does not set
+/// `FERRYMAN_SUPERVISED`) is recognised, so the worker exits for the task to restart it
+/// rather than starting a copy that fights the task for the worker lock.
+#[must_use]
+pub fn under_worker_wrapper() -> bool {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let mut at = sysinfo::get_current_pid()
+        .ok()
+        .and_then(|pid| system.process(pid))
+        .and_then(sysinfo::Process::parent);
+    for _ in 0..8 {
+        let Some(pid) = at else {
+            return false;
+        };
+        let Some(process) = system.process(pid) else {
+            return false;
+        };
+        let cmd: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        if is_worker_wrapper_cmd(&cmd) {
+            return true;
+        }
+        at = process.parent();
+    }
+    false
 }
 
 #[cfg(test)]

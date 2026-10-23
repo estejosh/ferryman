@@ -683,12 +683,48 @@ pub fn examine(start: &Path) -> Report {
         checks.push(check("fleet_home", ok, false, line));
     }
 
+    // The iroh lane's alerts, when this machine's worker has checked: a peer failing or quiet,
+    // or no relay. Advice only; the worker keeps the file current.
+    if let Some(state) = ferryman_channel::lanealerts::read_here() {
+        let (ok, line) = lane_line(&state);
+        checks.push(check("lane", ok, false, line));
+    }
+
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {
         project: route.project_id,
         ready,
         checks,
     }
+}
+
+/// What the `lane` check says: the alerts the iroh lane has standing, or that it has none.
+fn lane_line(state: &ferryman_channel::lanealerts::State) -> (bool, String) {
+    if state.active.is_empty() {
+        return (
+            true,
+            format!(
+                "no iroh lane alerts (warns after {} min without a good sync)",
+                state.threshold_minutes
+            ),
+        );
+    }
+    let lines: Vec<String> = state
+        .active
+        .iter()
+        .map(|alert| {
+            format!(
+                "{} since {} - {}",
+                alert.title,
+                alert.since.format("%Y-%m-%d %H:%M UTC"),
+                alert.text
+            )
+        })
+        .collect();
+    (
+        false,
+        format!("{} iroh lane alert(s): {}", lines.len(), lines.join("; ")),
+    )
 }
 
 /// What the `fleet_home` check says: whether this machine is in the directory, what the fleet
@@ -805,6 +841,30 @@ mod tests {
 
     /// The defect, reproduced: grouchly on 0.5.10 beside beastly on 0.5.11 was told
     /// nothing was wrong, because the check only ever looked downhill.
+    #[test]
+    fn the_lane_check_names_each_standing_alert_and_is_quiet_otherwise() {
+        let now = chrono::Utc::now();
+        let quiet = ferryman_channel::lanealerts::State {
+            checked: Some(now),
+            threshold_minutes: 15,
+            active: Vec::new(),
+        };
+        let (ok, line) = lane_line(&quiet);
+        assert!(ok, "{line}");
+        assert!(line.contains("15 min"), "{line}");
+        let mut loud = quiet;
+        loud.active.push(ferryman_channel::lanealerts::Alert {
+            key: "relay".into(),
+            title: "iroh relay unreachable".into(),
+            text: "No relay for 4 minute(s).".into(),
+            since: now,
+        });
+        let (ok, line) = lane_line(&loud);
+        assert!(!ok);
+        assert!(line.contains("1 iroh lane alert(s)"), "{line}");
+        assert!(line.contains("iroh relay unreachable"), "{line}");
+    }
+
     #[test]
     fn a_machine_that_is_itself_behind_is_told_so() {
         let (level, detail) = version_skew("0.5.10", &fleet(&[("8799dfe2f32dc7aa", "0.5.11")]));

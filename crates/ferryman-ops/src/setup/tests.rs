@@ -225,9 +225,102 @@ fn the_windows_wrapper_loads_its_environment_from_a_file_and_is_read_as_the_work
     );
     assert!(text.contains("SetEnvironmentVariable"));
     assert!(text.contains("exit $LASTEXITCODE"));
+    // The worker reads this to know a failing exit will be restarted (the update restart).
+    assert!(text.contains("$env:FERRYMAN_SUPERVISED"), "{text}");
     assert!(!text.contains("API_KEY"));
     let (found, _) = machine::invocation_in_text(&text).expect("the wrapper runs a worker");
     assert!(found.all_projects);
+}
+
+fn wrapper_before_0_6_2() -> String {
+    let current = windows_wrapper(&spec(), "agent run --all-projects");
+    let old: String = current
+        .split_inclusive("\r\n")
+        .filter(|line| !line.contains("FERRYMAN_SUPERVISED") && !line.contains("EX_TEMPFAIL"))
+        .filter(|line| !line.contains("The task restarts a failing exit"))
+        .collect();
+    assert!(!old.contains("FERRYMAN_SUPERVISED"));
+    old
+}
+
+#[test]
+fn a_wrapper_written_before_the_worker_could_ask_to_restart_is_marked_in_place() {
+    let old = wrapper_before_0_6_2();
+    let marked = mark_wrapper(&old).expect("an old wrapper is marked");
+    assert!(
+        marked.contains("$env:FERRYMAN_SUPERVISED = 'task'\r\n"),
+        "{marked}"
+    );
+    // Exactly one line added after the git prompt line; the rest is byte for byte.
+    let without: String = marked
+        .split_inclusive("\r\n")
+        .filter(|line| {
+            !line.contains("FERRYMAN_SUPERVISED") && !line.starts_with("# The worker stops")
+        })
+        .collect();
+    assert_eq!(without, old);
+    // Marking is idempotent, and still reads as the worker.
+    assert_eq!(mark_wrapper(&marked), None);
+    assert!(machine::invocation_in_text(&marked).is_some());
+    // Something that is not our wrapper is left alone.
+    assert_eq!(mark_wrapper("Write-Host hello\r\n"), None);
+}
+
+#[test]
+fn the_existing_wrapper_on_disk_is_refreshed_once_and_the_old_one_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = Root::create_with_layout(&dir.path().join("ferry"), 1).unwrap();
+    assert!(
+        !refresh_worker_wrapper(&root).unwrap(),
+        "no wrapper, nothing to do"
+    );
+    let service = root.path.join("service");
+    fs::create_dir_all(&service).unwrap();
+    let path = service.join(WORKER_WRAPPER);
+    fs::write(&path, ps_bytes(&wrapper_before_0_6_2())).unwrap();
+    assert!(refresh_worker_wrapper(&root).unwrap());
+    let bytes = fs::read(&path).unwrap();
+    assert!(
+        bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+        "the byte-order mark stays"
+    );
+    assert!(
+        String::from_utf8(bytes)
+            .unwrap()
+            .contains("FERRYMAN_SUPERVISED")
+    );
+    assert!(
+        service
+            .join("ferryman-worker.ps1.before-supervised")
+            .is_file()
+    );
+    assert!(
+        !refresh_worker_wrapper(&root).unwrap(),
+        "the second time changes nothing"
+    );
+}
+
+#[test]
+fn the_task_wrapper_is_recognised_among_a_processs_ancestors_by_its_command_line() {
+    let args = |parts: &[&str]| parts.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
+    assert!(is_worker_wrapper_cmd(&args(&[
+        "powershell.exe",
+        "-NoProfile",
+        "-File",
+        r"X:\ferry\service\ferryman-worker.ps1"
+    ])));
+    assert!(is_worker_wrapper_cmd(&args(&[
+        r#""X:\ferry\service\FERRYMAN-WORKER.PS1""#
+    ])));
+    // The Syncthing task's wrapper, a person's shell and an editor are not it.
+    assert!(!is_worker_wrapper_cmd(&args(&[
+        "powershell.exe",
+        "-File",
+        r"X:\ferry\service\ferryman-syncthing.ps1"
+    ])));
+    assert!(!is_worker_wrapper_cmd(&args(&["pwsh.exe"])));
+    // This test process's parents are cargo and a shell, never the wrapper.
+    assert!(!under_worker_wrapper());
 }
 
 #[test]

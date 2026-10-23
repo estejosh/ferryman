@@ -1098,6 +1098,10 @@ pub fn read_machines(root: &Root) -> (Vec<MachineRow>, Findings) {
 // ---------------------------------------------------------------------------------------
 // Notices
 
+/// The kinds a notice may be. Machines on 0.5.30 and 0.6.1 reject a notice of a kind not in
+/// their copy of this list (and `ferry doctor` shows it as ignored), so a new kind is never
+/// added here for something old machines would only complain about: lane health has a
+/// folder of its own (`lane-health/`), which they never read.
 pub const NOTICE_KINDS: [&str; 5] = [
     "layout-change",
     "deprecation",
@@ -1256,6 +1260,115 @@ pub fn read_notices(root: &Root) -> (Vec<NoticeRow>, Findings) {
         });
     }
     rows.sort_by_key(|row| std::cmp::Reverse(row.body.issued));
+    (rows, findings)
+}
+
+// ---------------------------------------------------------------------------------------
+// Lane health
+
+/// The folder (in the fleet folder) where each machine says what is wrong with its lane.
+/// Not `notices/`: a notice of a kind an older machine does not know is rejected by it and
+/// reported as ignored, and an older machine never reads this folder.
+pub const HEALTH: &str = "lane-health";
+
+/// What one machine says about its own lane: the alerts standing now. An empty list is the
+/// all-clear; it replaces the alerts that were there.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthBody {
+    pub machine: String,
+    pub alerts: Vec<crate::lanealerts::Alert>,
+    pub updated: DateTime<Utc>,
+}
+
+/// A machine's lane report as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HealthRow {
+    pub body: HealthBody,
+    pub signed_by: String,
+}
+
+/// Say, in the fleet folder, which lane alerts stand on `machine` (signed by the machine's
+/// own identity, which may speak for that machine and no other). Returns whether a file was
+/// written: the same alerts again, or an all-clear with nothing said before, write nothing.
+///
+/// # Errors
+/// No fleet folder, the machine name is not fit for a file name, or the signer has no
+/// standing for that machine.
+pub fn publish_health(
+    root: &Root,
+    identity: &AgentIdentity,
+    machine: &str,
+    alerts: &[crate::lanealerts::Alert],
+) -> Result<bool> {
+    if !exists(root) {
+        bail!("no fleet folder in {} yet", root.path.display());
+    }
+    let machine = machine_ok(machine)?;
+    let dir = root.fleet_dir();
+    let trust = Trust::load(&dir);
+    trust.may_write(identity)?;
+    let path = dir.join(HEALTH).join(format!("{machine}.json"));
+    let existing =
+        read_signed(&path).and_then(|doc| serde_json::from_value::<HealthBody>(doc.body).ok());
+    match &existing {
+        Some(body) if body.alerts == alerts => return Ok(false),
+        None if alerts.is_empty() => return Ok(false),
+        _ => {}
+    }
+    let body = HealthBody {
+        machine: machine.clone(),
+        alerts: alerts.to_vec(),
+        updated: Utc::now(),
+    };
+    let doc = sign(HEALTH, &machine, serde_json::to_value(&body)?, identity);
+    if let Err(why) = trust.standing(&doc, Some(&machine)) {
+        bail!(
+            "{} may not report lane health for {machine}: {why}",
+            identity.name()
+        );
+    }
+    atomic(&path, &doc)?;
+    Ok(true)
+}
+
+/// Every machine's lane report that counts, by machine.
+#[must_use]
+pub fn read_health(root: &Root) -> (Vec<HealthRow>, Findings) {
+    let dir = root.fleet_dir();
+    let trust = Trust::load(&dir);
+    let mut findings = Findings::default();
+    let mut rows = Vec::new();
+    for path in json_files(&dir.join(HEALTH)) {
+        let name = path
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(doc) = read_signed(&path) else {
+            findings.reject(&dir, &path, "not a fleet file");
+            continue;
+        };
+        if doc.kind != HEALTH || doc.name != name {
+            findings.reject(&dir, &path, "the file is not what its name says it is");
+            continue;
+        }
+        let Ok(body) = serde_json::from_value::<HealthBody>(doc.body.clone()) else {
+            findings.reject(&dir, &path, "the body is not a lane report");
+            continue;
+        };
+        if !body.machine.eq_ignore_ascii_case(&name) {
+            findings.reject(&dir, &path, "the body names another machine");
+            continue;
+        }
+        if let Err(why) = trust.standing(&doc, Some(&name)) {
+            findings.reject(&dir, &path, why);
+            continue;
+        }
+        rows.push(HealthRow {
+            body,
+            signed_by: doc.signed_by.unwrap_or_default(),
+        });
+    }
+    rows.sort_by(|a, b| a.body.machine.cmp(&b.body.machine));
     (rows, findings)
 }
 
@@ -1596,6 +1709,8 @@ pub fn audit(root: &Root, own: &str) -> Findings {
     all.rejected.extend(read_machines(root).1.rejected);
     all.rejected.extend(read_notices(root).1.rejected);
     all.rejected.extend(read_orders_for(root, own).1.rejected);
+    all.rejected.extend(read_relays(root).findings.rejected);
+    all.rejected.extend(read_health(root).1.rejected);
     all
 }
 
@@ -1849,6 +1964,287 @@ pub fn releases_dir_near(start: &Path) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+// ---------------------------------------------------------------------------------------
+// The fleet's relay list
+
+/// The master's ordered list of relays, in the fleet folder (ADR 0026, ADR 0027).
+pub const RELAYS: &str = "relays.json";
+
+/// More than this and the list is more likely a mistake than a fleet.
+pub const MAX_RELAYS: usize = 16;
+
+/// One relay in the fleet's list. A struct so a field can be added later (a hosted relay
+/// that wants a per-device credential, say) without breaking a list an older machine reads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FleetRelay {
+    /// `https://host[:port]/`, the relay's address.
+    pub url: String,
+    /// SHA-256 of the relay's TLS certificate, 64 hex digits, when it is not one a public
+    /// CA signed (a bare IP or a self-signed certificate). The master signs it with the
+    /// rest, so a machine trusts a new relay's certificate on the master's word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_sha256: Option<String>,
+    /// What it is, for people.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+impl FleetRelay {
+    /// The host part of the URL, lowercase and without brackets.
+    #[must_use]
+    pub fn host(&self) -> Option<String> {
+        let rest = self.url.strip_prefix("https://")?;
+        let authority = rest.split(['/', '?', '#']).next()?;
+        let host = match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next()?,
+            None => authority.split(':').next()?,
+        };
+        (!host.is_empty()).then(|| host.to_ascii_lowercase())
+    }
+
+    /// The pinned certificate, when there is one.
+    #[must_use]
+    pub fn pin(&self) -> Option<[u8; 32]> {
+        let text = self.cert_sha256.as_deref()?;
+        let bytes = hex::decode(text).ok()?;
+        <[u8; 32]>::try_from(bytes.as_slice()).ok()
+    }
+
+    /// Fit to put in the list?
+    ///
+    /// # Errors
+    /// Why not: not an `https://` address, odd characters, or a bad certificate pin.
+    pub fn check(&self) -> Result<(), String> {
+        if !self.url.starts_with("https://")
+            || self.url.len() > 256
+            || self
+                .url
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '@')
+        {
+            return Err(format!(
+                "'{}' is not an https:// relay address",
+                self.url.chars().take(80).collect::<String>()
+            ));
+        }
+        if self.host().is_none() {
+            return Err(format!("'{}' names no host", self.url));
+        }
+        if let Some(text) = &self.cert_sha256
+            && self.pin().is_none()
+        {
+            return Err(format!(
+                "the certificate pin for {} is not 64 hex digits: '{}'",
+                self.url,
+                text.chars().take(80).collect::<String>()
+            ));
+        }
+        if self.note.as_ref().is_some_and(|note| note.len() > 200) {
+            return Err(format!("the note on {} is too long", self.url));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct RelaysBody {
+    relays: Vec<FleetRelay>,
+}
+
+/// The last relay list this machine accepted, kept in the machine state directory.
+const RELAYS_SEEN: &str = "fleet-relays-seen.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SeenRelays {
+    written_at: DateTime<Utc>,
+    relays: Vec<FleetRelay>,
+}
+
+/// The relays a machine should take from the fleet now, and whether something is wrong.
+#[derive(Debug, Clone, Default)]
+pub struct RelayChoice {
+    /// The list to use: the newest good one this machine has accepted, in the master's order.
+    pub relays: Vec<FleetRelay>,
+    /// Why the list on disk was not used (missing, unsigned, edited, empty, or older than
+    /// one already accepted). `None` when it was used, or when the fleet has no list.
+    pub problem: Option<String>,
+    /// This fleet has a relay list: one is in the folder, or one was accepted before.
+    pub expected: bool,
+}
+
+/// Decide which relay list to use. It fails closed and never forward-moves on a bad file:
+///
+/// - a valid, non-empty list at least as new as the last one accepted is used and remembered
+///   (in `state_dir`);
+/// - otherwise, if a list was accepted before, that one stays in use and the problem is
+///   reported;
+/// - otherwise (a list is in the folder but none was ever good) no relays, and the problem is
+///   reported;
+/// - a fleet that never had a list is not an error: `expected` is false.
+///
+/// An older list than the last accepted is refused, so a stale copy of the file (a restored
+/// backup, a replay from a peer) cannot take the fleet back to relays it has moved off.
+#[must_use]
+pub fn choose_relays(root: &Root, state_dir: Option<&Path>) -> RelayChoice {
+    let seen_path = state_dir.map(|dir| dir.join(RELAYS_SEEN));
+    let last: Option<SeenRelays> = seen_path
+        .as_ref()
+        .and_then(|path| fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let present = root.fleet_dir().join(RELAYS).exists();
+    if !present && last.is_none() {
+        return RelayChoice::default();
+    }
+    let current = read_relays(root);
+    let problem = if let Some(rejection) = current.findings.rejected.first() {
+        Some(format!(
+            "the fleet's relay list is not used: {}",
+            rejection.why
+        ))
+    } else if !present {
+        Some("the fleet's relay list has gone from the fleet folder".to_owned())
+    } else if current.relays.is_empty() {
+        Some("the fleet's relay list is empty".to_owned())
+    } else if let (Some(at), Some(last)) = (current.written_at, &last)
+        && at < last.written_at
+    {
+        Some(format!(
+            "the fleet's relay list is older than the one accepted on {}, so it is ignored",
+            last.written_at.format("%Y-%m-%d %H:%M UTC")
+        ))
+    } else {
+        None
+    };
+    if problem.is_none()
+        && let Some(at) = current.written_at
+    {
+        if last.as_ref().is_none_or(|last| at > last.written_at)
+            && let Some(path) = &seen_path
+        {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let _ = crate::atomic_json(
+                path,
+                &SeenRelays {
+                    written_at: at,
+                    relays: current.relays.clone(),
+                },
+            );
+        }
+        return RelayChoice {
+            relays: current.relays,
+            problem: None,
+            expected: true,
+        };
+    }
+    RelayChoice {
+        relays: last.map(|last| last.relays).unwrap_or_default(),
+        problem,
+        expected: true,
+    }
+}
+
+/// [`choose_relays`] with this machine's state directory.
+#[must_use]
+pub fn choose_relays_here(root: &Root) -> RelayChoice {
+    choose_relays(root, crate::licensing::machine_state_dir().as_deref())
+}
+
+/// The relay list as it counts.
+#[derive(Debug, Clone, Default)]
+pub struct RelayList {
+    /// In the order the master gave: first is tried first.
+    pub relays: Vec<FleetRelay>,
+    /// When the master wrote it; the list's version.
+    pub written_at: Option<DateTime<Utc>>,
+    pub findings: Findings,
+}
+
+/// Replace the fleet's relay list (master). The order is the order of preference: machines
+/// try the first and fail over down the list.
+///
+/// # Errors
+/// The signer is not the master, the list is too long or repeats a relay, or an entry is not
+/// fit to put in it.
+pub fn publish_relays(root: &Root, master: &AgentIdentity, relays: Vec<FleetRelay>) -> Result<()> {
+    let trust = Trust::load(&root.fleet_dir());
+    if trust.master() != Some(canonical_agent_name(master.name()).as_str()) {
+        bail!("only the fleet's master signs the relay list");
+    }
+    if relays.is_empty() {
+        bail!(
+            "the relay list cannot be empty: a machine treats an empty or missing list as a \
+             fault and runs without relays rather than with public ones"
+        );
+    }
+    if relays.len() > MAX_RELAYS {
+        bail!("at most {MAX_RELAYS} relays");
+    }
+    let mut seen = BTreeSet::new();
+    for relay in &relays {
+        relay.check().map_err(|why| anyhow::anyhow!(why))?;
+        if !seen.insert(relay.url.trim_end_matches('/').to_ascii_lowercase()) {
+            bail!("{} is in the list twice", relay.url);
+        }
+    }
+    let doc = sign(
+        "relays",
+        "relays",
+        serde_json::to_value(RelaysBody { relays })?,
+        master,
+    );
+    atomic(&root.fleet_dir().join(RELAYS), &doc)
+}
+
+/// Read the relay list: only the master's counts, and an entry that is not fit is left
+/// out and reported.
+#[must_use]
+pub fn read_relays(root: &Root) -> RelayList {
+    let dir = root.fleet_dir();
+    let path = dir.join(RELAYS);
+    let mut out = RelayList::default();
+    if !path.exists() {
+        return out;
+    }
+    let Some(doc) = read_signed(&path) else {
+        out.findings.reject(&dir, &path, "not a fleet file");
+        return out;
+    };
+    if doc.kind != "relays" || doc.name != "relays" {
+        out.findings
+            .reject(&dir, &path, "the file is not what its name says it is");
+        return out;
+    }
+    match Trust::load(&dir).standing(&doc, None) {
+        Ok(Standing::Master) => {}
+        Ok(_) => {
+            out.findings
+                .reject(&dir, &path, "the relay list only counts from the master");
+            return out;
+        }
+        Err(why) => {
+            out.findings.reject(&dir, &path, why);
+            return out;
+        }
+    }
+    let Ok(body) = serde_json::from_value::<RelaysBody>(doc.body.clone()) else {
+        out.findings
+            .reject(&dir, &path, "the body is not a relay list");
+        return out;
+    };
+    let mut seen = BTreeSet::new();
+    for relay in body.relays.into_iter().take(MAX_RELAYS) {
+        if let Err(why) = relay.check() {
+            out.findings.reject(&dir, &path, why);
+        } else if seen.insert(relay.url.trim_end_matches('/').to_ascii_lowercase()) {
+            out.relays.push(relay);
+        }
+    }
+    out.written_at = Some(doc.written_at);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1990,6 +2386,191 @@ mod tests {
         post_notice(&f.root, &f.josh, by_machine).unwrap();
     }
 
+    fn alert(key: &str, text: &str) -> crate::lanealerts::Alert {
+        crate::lanealerts::Alert {
+            key: key.into(),
+            title: format!("title {key}"),
+            text: text.into(),
+            since: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_machine_reports_its_lane_alerts_in_its_own_file_and_clears_them_in_place() {
+        let f = fleet();
+        let one = vec![alert("peer:aaaa", "quiet")];
+        assert!(publish_health(&f.root, &f.beastly, "beastly", &one).unwrap());
+        // The same alerts again write nothing.
+        assert!(!publish_health(&f.root, &f.beastly, "beastly", &one).unwrap());
+        let (rows, findings) = read_health(&f.root);
+        assert!(findings.rejected.is_empty(), "{findings:?}");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].body.alerts, one);
+        assert_eq!(rows[0].signed_by, "beastly-ferry");
+        // The all-clear replaces them.
+        assert!(publish_health(&f.root, &f.beastly, "beastly", &[]).unwrap());
+        assert!(read_health(&f.root).0[0].body.alerts.is_empty());
+        // An all-clear where nothing was ever said writes nothing.
+        assert!(!publish_health(&f.root, &f.josh, "josh-laptop", &[]).unwrap());
+    }
+
+    #[test]
+    fn a_machine_cannot_speak_for_another_machines_lane() {
+        let f = fleet();
+        let error =
+            publish_health(&f.root, &f.beastly, "tiny", &[alert("relay", "x")]).unwrap_err();
+        assert!(error.to_string().contains("may not report"), "{error}");
+        // A hand-written file that names another machine is ignored and reported.
+        let doc = sign(
+            HEALTH,
+            "tiny",
+            json!({"machine": "tiny", "alerts": [], "updated": Utc::now()}),
+            &f.beastly,
+        );
+        let path = f.root.fleet_dir().join(HEALTH).join("tiny.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        let (rows, findings) = read_health(&f.root);
+        assert!(rows.is_empty());
+        assert_eq!(findings.rejected.len(), 1);
+    }
+
+    #[test]
+    fn older_machines_never_see_lane_health_as_a_notice_they_would_reject() {
+        // Machines on 0.5.30 and 0.6.1 know exactly these five notice kinds and reject any
+        // other as ignored. Lane health must not be one of them, and must not be written
+        // where they read notices.
+        assert_eq!(
+            NOTICE_KINDS,
+            [
+                "layout-change",
+                "deprecation",
+                "update-available",
+                "migration",
+                "general"
+            ]
+        );
+        let f = fleet();
+        publish_health(&f.root, &f.beastly, "beastly", &[alert("relay", "down")]).unwrap();
+        let (notices, findings) = read_notices(&f.root);
+        assert!(notices.is_empty());
+        assert!(findings.rejected.is_empty(), "{findings:?}");
+        assert!(
+            !f.root
+                .fleet_dir()
+                .join(NOTICES)
+                .join("beastly.json")
+                .exists()
+        );
+        assert!(
+            f.root
+                .fleet_dir()
+                .join(HEALTH)
+                .join("beastly.json")
+                .is_file()
+        );
+        let mut notice = NoticeBody::new("lane-health", "warning", "x", "y");
+        notice.machine = Some("beastly".into());
+        assert!(post_notice(&f.root, &f.beastly, notice).is_err());
+    }
+
+    fn state_dir(f: &Fleet) -> PathBuf {
+        f._dir.path().join("state")
+    }
+
+    #[test]
+    fn a_good_relay_list_is_used_and_remembered() {
+        let f = fleet();
+        let state = state_dir(&f);
+        let none = choose_relays(&f.root, Some(&state));
+        assert!(!none.expected && none.relays.is_empty() && none.problem.is_none());
+        publish_relays(&f.root, &f.josh, vec![relay("https://a.example/")]).unwrap();
+        let chosen = choose_relays(&f.root, Some(&state));
+        assert!(chosen.expected && chosen.problem.is_none());
+        assert_eq!(chosen.relays.len(), 1);
+        assert!(state.join(RELAYS_SEEN).is_file());
+    }
+
+    #[test]
+    fn a_bad_relay_list_keeps_the_last_good_one_and_says_why() {
+        let f = fleet();
+        let state = state_dir(&f);
+        publish_relays(&f.root, &f.josh, vec![relay("https://a.example/")]).unwrap();
+        let path = f.root.fleet_dir().join(RELAYS);
+        let good = fs::read(&path).unwrap();
+        assert!(choose_relays(&f.root, Some(&state)).problem.is_none());
+
+        // Edited after signing.
+        let mut edited: Signed = serde_json::from_slice(&good).unwrap();
+        edited.body["relays"][0]["url"] = json!("https://evil.example/");
+        fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+        let chosen = choose_relays(&f.root, Some(&state));
+        assert!(chosen.problem.as_deref().unwrap().contains("not used"));
+        assert_eq!(chosen.relays[0].url, "https://a.example/");
+
+        // Signed by someone other than the master.
+        let doc = sign(
+            "relays",
+            "relays",
+            json!({"relays": [{"url": "https://evil.example/"}]}),
+            &f.beastly,
+        );
+        fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(
+            choose_relays(&f.root, Some(&state)).relays[0].url,
+            "https://a.example/"
+        );
+
+        // Empty, signed by the master.
+        let empty = sign("relays", "relays", json!({"relays": []}), &f.josh);
+        fs::write(&path, serde_json::to_vec(&empty).unwrap()).unwrap();
+        let chosen = choose_relays(&f.root, Some(&state));
+        assert!(chosen.problem.as_deref().unwrap().contains("empty"));
+        assert_eq!(chosen.relays.len(), 1, "the last good list stays in use");
+
+        // Gone altogether.
+        fs::remove_file(&path).unwrap();
+        let chosen = choose_relays(&f.root, Some(&state));
+        assert!(chosen.problem.as_deref().unwrap().contains("gone"));
+        assert_eq!(chosen.relays.len(), 1);
+    }
+
+    #[test]
+    fn with_no_good_list_ever_a_bad_one_means_no_relays_not_public_ones() {
+        let f = fleet();
+        let state = state_dir(&f);
+        let doc = sign("relays", "relays", json!({"relays": []}), &f.josh);
+        fs::write(
+            f.root.fleet_dir().join(RELAYS),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+        let chosen = choose_relays(&f.root, Some(&state));
+        assert!(chosen.expected, "a file is there, so a list is expected");
+        assert!(chosen.relays.is_empty());
+        assert!(chosen.problem.is_some());
+    }
+
+    #[test]
+    fn an_older_relay_list_than_the_last_accepted_is_a_replay_and_is_refused() {
+        let f = fleet();
+        let state = state_dir(&f);
+        publish_relays(&f.root, &f.josh, vec![relay("https://old.example/")]).unwrap();
+        let path = f.root.fleet_dir().join(RELAYS);
+        let old = fs::read(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        publish_relays(&f.root, &f.josh, vec![relay("https://new.example/")]).unwrap();
+        assert_eq!(
+            choose_relays(&f.root, Some(&state)).relays[0].url,
+            "https://new.example/"
+        );
+        // The old, perfectly validly signed file comes back (a restored backup, a peer).
+        fs::write(&path, old).unwrap();
+        let chosen = choose_relays(&f.root, Some(&state));
+        assert!(chosen.problem.as_deref().unwrap().contains("older"));
+        assert_eq!(chosen.relays[0].url, "https://new.example/");
+    }
+
     #[test]
     fn signed_directory_and_machine_entries_round_trip() {
         let f = fleet();
@@ -2027,6 +2608,117 @@ mod tests {
         assert_eq!(machines[0].body.version, "0.6.1");
         assert_eq!(machines[0].body.projects, vec!["demo".to_owned()]);
         assert_eq!(machines[0].signed_by, "beastly-ferry");
+    }
+
+    fn relay(url: &str) -> FleetRelay {
+        FleetRelay {
+            url: url.into(),
+            cert_sha256: None,
+            note: None,
+        }
+    }
+
+    #[test]
+    fn the_masters_relay_list_round_trips_in_order() {
+        let f = fleet();
+        assert!(read_relays(&f.root).relays.is_empty());
+        let mut first = relay("https://162.35.10.46/");
+        first.cert_sha256 = Some("ab".repeat(32));
+        publish_relays(
+            &f.root,
+            &f.josh,
+            vec![first.clone(), relay("https://relay.example.org:7843/")],
+        )
+        .unwrap();
+        let list = read_relays(&f.root);
+        assert!(list.findings.rejected.is_empty());
+        assert_eq!(list.relays[0], first);
+        assert_eq!(list.relays[1].host().as_deref(), Some("relay.example.org"));
+        assert_eq!(list.relays[0].pin(), Some([0xab; 32]));
+        assert!(list.written_at.is_some());
+        // Replaced, not appended to.
+        publish_relays(&f.root, &f.josh, vec![relay("https://b.example/")]).unwrap();
+        assert_eq!(read_relays(&f.root).relays.len(), 1);
+    }
+
+    #[test]
+    fn only_the_master_signs_the_relay_list_and_a_forgery_is_ignored() {
+        let f = fleet();
+        assert!(publish_relays(&f.root, &f.beastly, vec![relay("https://x.example/")]).is_err());
+        // A machine the master admitted writes one by hand: it does not count.
+        let doc = sign(
+            "relays",
+            "relays",
+            json!({"relays": [{"url": "https://evil.example/"}]}),
+            &f.beastly,
+        );
+        fs::write(
+            f.root.fleet_dir().join(RELAYS),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+        let list = read_relays(&f.root);
+        assert!(list.relays.is_empty());
+        assert!(list.findings.rejected[0].why.contains("master"));
+        assert!(
+            audit(&f.root, "beastly-ferry")
+                .rejected
+                .iter()
+                .any(|r| r.path == RELAYS),
+            "`ferry doctor` says the relay list was ignored"
+        );
+        // Edited after the master signed it.
+        publish_relays(&f.root, &f.josh, vec![relay("https://good.example/")]).unwrap();
+        let path = f.root.fleet_dir().join(RELAYS);
+        let mut good: Signed = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        good.body["relays"][0]["url"] = json!("https://evil.example/");
+        fs::write(&path, serde_json::to_vec(&good).unwrap()).unwrap();
+        let list = read_relays(&f.root);
+        assert!(list.relays.is_empty());
+        assert!(list.findings.rejected[0].why.contains("signature"));
+    }
+
+    #[test]
+    fn a_relay_that_is_not_fit_is_refused_or_left_out() {
+        let f = fleet();
+        for bad in [
+            "http://plain.example/",
+            "https://",
+            "https://user@host.example/",
+            "https://a b.example/",
+        ] {
+            assert!(
+                publish_relays(&f.root, &f.josh, vec![relay(bad)]).is_err(),
+                "{bad}"
+            );
+        }
+        let mut short = relay("https://x.example/");
+        short.cert_sha256 = Some("abc".into());
+        assert!(publish_relays(&f.root, &f.josh, vec![short]).is_err());
+        assert!(
+            publish_relays(
+                &f.root,
+                &f.josh,
+                vec![relay("https://x.example/"), relay("https://X.example")]
+            )
+            .is_err(),
+            "the same relay twice"
+        );
+        // A hand-edited entry that slips past is dropped on read, the rest kept.
+        let doc = sign(
+            "relays",
+            "relays",
+            json!({"relays": [{"url": "ftp://no"}, {"url": "https://ok.example/"}]}),
+            &f.josh,
+        );
+        fs::write(
+            f.root.fleet_dir().join(RELAYS),
+            serde_json::to_vec(&doc).unwrap(),
+        )
+        .unwrap();
+        let list = read_relays(&f.root);
+        assert_eq!(list.relays.len(), 1);
+        assert_eq!(list.findings.rejected.len(), 1);
     }
 
     #[test]

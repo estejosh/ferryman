@@ -422,6 +422,9 @@ pub struct Plan {
     pub want: Vec<String>,
     /// Paths to send to the other side.
     pub give: Vec<String>,
+    /// The answering side's version of ferry. Older peers say none; it decides nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Compare the other side's manifest with ours. `theirs` is trusted for nothing: entries

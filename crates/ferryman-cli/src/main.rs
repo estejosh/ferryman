@@ -10,6 +10,7 @@ mod license;
 mod licensor;
 mod mcp;
 mod mcp_client;
+mod restart;
 mod route;
 mod suggest;
 mod telegram;
@@ -4109,6 +4110,9 @@ const COMMAND_STACK: usize = 16 * 1024 * 1024;
 /// it.
 fn main() -> std::process::ExitCode {
     match run_ferry() {
+        // A worker that stopped to take an update asked to be started again; by now its
+        // locks and its lane are gone, so this process can become the new one (see `restart`).
+        Ok(()) if restart::wanted() => restart::perform(),
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             // The message, and the reasons behind it, and nothing else. `anyhow`'s own
@@ -4130,6 +4134,8 @@ fn main() -> std::process::ExitCode {
 }
 
 fn run_ferry() -> Result<()> {
+    // A replacement the old process started waits a moment for it to let go (see `restart`).
+    restart::honour_delay();
     // A backtrace is for whoever is fixing ferry, not for whoever is using it.
     //
     // `anyhow` prints one whenever RUST_BACKTRACE is set, and on a fresh Linux box it
@@ -7871,6 +7877,15 @@ async fn run_fleet(
     reevaluate: Option<Reevaluate>,
     report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
 ) -> Result<()> {
+    // A scheduled-task wrapper written before 0.6.2 does not say it will restart a failing
+    // exit. Mark it now, once, so the update that comes later does not leave this worker
+    // dead (the restart also recognises the old wrapper without this; see `restart`).
+    if cfg!(windows)
+        && let Some(root) = ferryman_channel::ferry::find_root()
+        && let Ok(true) = ferryman_ops::setup::refresh_worker_wrapper(&root)
+    {
+        report.info("marked the worker's scheduled-task wrapper so it restarts after an update");
+    }
     // One worker per identity per channel. Two under one name resume each other's
     // claims and run the same order twice; see WorkerLock.
     let mut fleet = fleet;
@@ -8048,8 +8063,15 @@ async fn run_fleet(
                 .map(|(route, _)| route.project_id.clone())
                 .collect();
             if let fleethome::Next::Stop(why) = home_pass.run(&engines, &projects, report).await {
-                report.info(&format!("stopping so the next start is fresh: {why}"));
-                return Ok(());
+                if restart::ask() {
+                    report.info(&format!("restarting so the next start is fresh: {why}"));
+                    return Ok(());
+                }
+                report.warn(&format!(
+                    "not restarting ({why}): either this worker has already restarted {} times \
+                     in the last hour or there is nowhere to keep that count, so it carries on",
+                    restart::MAX_PER_HOUR
+                ));
             }
         }
         // Keeping a long-running worker current.
@@ -8070,9 +8092,16 @@ async fn run_fleet(
         // version. Without a supervisor it stays stopped, which is why this says
         // so rather than exiting silently.
         if update::update_and_hand_over().await {
-            report.info("updated on disk; stopping so the next start runs the new version");
-            report.info("  (a supervised worker restarts by itself)");
-            return Ok(());
+            if restart::ask() {
+                report.info("updated on disk; restarting on the new version");
+                return Ok(());
+            }
+            report.warn(&format!(
+                "updated on disk, but this worker has already restarted {} times in the last \
+                 hour (or has nowhere to keep that count), so it carries on with the version \
+                 it is running until its next start",
+                restart::MAX_PER_HOUR
+            ));
         }
 
         // The transport is a process too, and one that nothing else supervises
@@ -8125,6 +8154,12 @@ async fn run_fleet(
         }
 
         anchor_maintenance(&fleet.served, report).await;
+
+        // The iroh lane's health: a peer failing or gone quiet, or no relay. Raised once,
+        // cleared once, and shown by `ferry doctor`, the dashboard and the fleet folder.
+        if let Some(lane) = live_lane.as_ref() {
+            lane.check_health(report);
+        }
 
         // The projects the fleet is focused on are looked at first, then the rest,
         // background and paused last, and an archived one after them all. Read afresh each

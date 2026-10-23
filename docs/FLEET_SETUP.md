@@ -106,6 +106,33 @@ Two workers on one machine claim the same orders, burn the same engines and race
 
 `ferry agent run` and `ferry doctor` both look for another live worker or service. `agent run --all-projects` refuses to start as a second all-projects worker, and says which one is running and how to stop it; `--allow-second-worker` overrides that for a test. Other cases are a warning. `ferry doctor --layout` makes it a check.
 
+## Coming back after an update (0.6.2)
+
+A long-running worker checks for a release between passes (at most every six hours). When it installs one, the process still running is the old code, so it has to stop and start again. It used to stop with exit status 0, which a supervisor that restarts only on failure reads as "done", and a worker with no supervisor simply stayed stopped. Now it asks to be restarted and comes back by itself, whatever supervises it:
+
+- **Linux and macOS:** the worker `exec`s the new binary in place, with the same arguments and environment, after its locks and its lane are released. Same process id, so systemd (or launchd, or nothing) sees one unbroken process. If the `exec` fails it exits 75, which any restart-on-failure supervisor treats as a failure.
+- **Windows, run by the scheduled task from `ferry fleet setup`:** the wrapper sets `FERRYMAN_SUPERVISED`, and the worker exits **75** (`EX_TEMPFAIL`). The wrapper passes the exit code on, the task's restart-on-failure policy sees a failure, and the worker is back within a minute. A wrapper written before 0.6.2 does not set the variable, so the worker also recognises the task by the wrapper script (ferryman-worker.ps1) being among its parent processes and exits 75 all the same. It also adds $env:FERRYMAN_SUPERVISED = 'task' to an old wrapper itself, once, when it starts and before it restarts (the old file is kept as ferryman-worker.ps1.before-supervised), so the first auto-update on a machine set up before 0.6.2 does not leave the worker stopped. A wrapper edited by hand, without the $env:GIT_TERMINAL_PROMPT line, is left alone.
+- **Windows, with no supervisor:** the worker starts a detached copy of itself that waits five seconds for the old process to let go of its locks, then exits 0.
+- **A fleet `restart-worker` order** (ADR 0026) goes the same way, so it works without a supervisor too.
+
+**Restart loops are capped.** Every restart request is recorded in `reexec.json` in the machine state directory. A fourth request in one hour is refused: the worker says so in its log and carries on with the version it is running until its next start. Delete `reexec.json` to reset the count.
+
+**Belt and braces: recommended supervisor settings.** None of this is needed for the restart to happen, but a supervisor that restarts on any exit also covers a crash during the exec or a binary that fails to start:
+
+- systemd (`~/.config/systemd/user/ferryman-worker.service`, then `systemctl --user daemon-reload`):
+
+  ```ini
+  [Service]
+  Restart=always
+  RestartSec=30
+  StartLimitIntervalSec=600
+  StartLimitBurst=10
+  ```
+
+  `ferry fleet setup --service` writes `Restart=on-failure`, which is enough now that the worker exits 75 when it cannot `exec`; `Restart=always` also restarts a worker that exits 0. Keep `RestartSec` so a crash loop is slow.
+- Windows scheduled task (`Ferryman Worker`): *Settings* tab, "If the task fails, restart every" **1 minute**, "Attempt to restart up to" **999** times (what setup writes), "Stop the task if it runs longer than" **unchecked**, and "If the task is already running, then the following rule applies" **Do not start a new instance**. Exit 75 counts as a failure to the task, which is what makes it restart.
+- No supervisor at all: nothing to set. Unix re-executes in place and Windows starts the detached copy.
+
 ## Keeping projects out of the swarm
 
 ```sh

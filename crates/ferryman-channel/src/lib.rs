@@ -42,6 +42,7 @@ pub mod interrupt;
 pub mod invite;
 pub mod keys;
 pub mod known;
+pub mod lanealerts;
 pub mod learning;
 pub mod lease;
 pub mod ledger;

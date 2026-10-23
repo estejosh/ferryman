@@ -4504,10 +4504,35 @@ async fn fleet(
         "devices": devices,
         "projects": projects,
         "fleet_home": fleet_home_json(),
+        "lane_alerts": lane_alerts_json(),
         "current": route.project_id,
         "home": state.route.project_id,
         "version": env!("CARGO_PKG_VERSION"),
     })))
+}
+
+/// What the iroh lane is complaining about on this machine (a peer failing or quiet, no
+/// relay), as the worker last worked it out. Empty when the worker has not checked yet; the
+/// same alerts reach the rest of the fleet as `lane-health` notices in `fleet_home`.
+fn lane_alerts_json() -> Value {
+    lane_alerts_value(ferryman_channel::lanealerts::read_here())
+}
+
+fn lane_alerts_value(state: Option<ferryman_channel::lanealerts::State>) -> Value {
+    let Some(state) = state else {
+        return json!({ "checked": null, "threshold_minutes": null, "alerts": [] });
+    };
+    json!({
+        "checked": state.checked.map(|at| at.to_rfc3339()),
+        "threshold_minutes": state.threshold_minutes,
+        "alerts": state.active.iter().map(|alert| json!({
+            "key": alert.key,
+            "title": alert.title,
+            "text": alert.text,
+            "since": alert.since.to_rfc3339(),
+            "severity": "warning",
+        })).collect::<Vec<_>>(),
+    })
 }
 
 /// The fleet's own folder as the Fleet page shows it (ADR 0026): live notices, the machines that
@@ -5535,6 +5560,26 @@ fn state_value(state: &TaskState) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_status_json_carries_the_lanes_alerts_and_is_empty_without_any() {
+        let none = super::lane_alerts_value(None);
+        assert_eq!(none["alerts"], json!([]));
+        let now = chrono::Utc::now();
+        let value = super::lane_alerts_value(Some(ferryman_channel::lanealerts::State {
+            checked: Some(now),
+            threshold_minutes: 15,
+            active: vec![ferryman_channel::lanealerts::Alert {
+                key: "peer:aaaa".into(),
+                title: "iroh lane: no sync with wisp".into(),
+                text: "quiet".into(),
+                since: now,
+            }],
+        }));
+        assert_eq!(value["threshold_minutes"], 15);
+        assert_eq!(value["alerts"][0]["severity"], "warning");
+        assert_eq!(value["alerts"][0]["key"], "peer:aaaa");
+    }
+
     use super::*;
     use axum::{
         body::Body,
