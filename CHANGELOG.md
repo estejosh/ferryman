@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.2 - 2026-10-23
 
 Fleet hardening (v0.6.2). A worker that updates itself now comes back by itself, the iroh lane says when it is unhealthy, it works with or without a relay of our own, and `ferry lane iroh status` says what each peer is doing.
 
