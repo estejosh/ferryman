@@ -690,6 +690,10 @@ pub fn examine(start: &Path) -> Report {
         checks.push(check("lane", ok, false, line));
     }
 
+    // Opt-in expiry of hand-ins and the outbox (ADR 0027): what goes, if anything.
+    let (ttl_ok, ttl_line) = ferryman_channel::ttl::summary(&route).line();
+    checks.push(check("ttl", ttl_ok, false, ttl_line));
+
     let ready = checks.iter().all(|check| !check.required || check.ok);
     Report {
         project: route.project_id,
