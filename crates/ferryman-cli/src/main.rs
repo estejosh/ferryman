@@ -5,6 +5,7 @@ mod fleethome;
 mod fleetsetup;
 mod focus;
 mod gitanchor;
+mod hive;
 mod lane;
 mod license;
 mod licensor;
@@ -2197,6 +2198,13 @@ enum RescueAction {
     /// Who this machine would let ask to join (its own saved copy), and which sessions
     /// are open.
     Status,
+    /// The Hive rescue channel (opt-in, ADR 0027): when the master is cut off from the relay
+    /// and every peer it posts one sealed record to Hive; a cut-off machine reads it to find
+    /// the master again. Needs a build with `--features hive-rescue`.
+    Hive {
+        #[command(subcommand)]
+        command: hive::HiveCommand,
+    },
 }
 
 #[derive(Subcommand, Clone)]
@@ -4604,6 +4612,7 @@ async fn run(cli: Cli) -> Result<()> {
                 RescueAction::Join { target } => {
                     ferryman_ops::rescue::join(&target, &machine)?;
                 }
+                RescueAction::Hive { command } => hive::run(command).await?,
                 RescueAction::Status => {
                     let dir = ferryman_ops::rescue::rescue_dir()?;
                     let keys = ferryman_ops::rescue::cache_keys(&machine)?;

@@ -192,6 +192,24 @@ impl EncryptionIdentity {
     fn public(&self) -> XPublicKey {
         XPublicKey::from(&self.secret)
     }
+
+    /// The public half as bytes.
+    #[must_use]
+    pub fn public_key_bytes(&self) -> [u8; 32] {
+        *self.public().as_bytes()
+    }
+
+    /// The raw X25519 agreement with a peer's public key, for a protocol of another
+    /// crate that seals to roster members (the Hive rescue record). The caller must run
+    /// the output through a KDF with both public keys in the salt, as `slot_cipher` does;
+    /// the private half never leaves this type.
+    #[must_use]
+    pub fn agree(&self, peer_public: &[u8; 32]) -> [u8; 32] {
+        *self
+            .secret
+            .diffie_hellman(&XPublicKey::from(*peer_public))
+            .as_bytes()
+    }
 }
 
 fn fs_read(path: &Path) -> Result<String> {

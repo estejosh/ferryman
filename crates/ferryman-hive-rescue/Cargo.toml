@@ -1,0 +1,42 @@
+[package]
+name = "ferryman-hive-rescue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Opt-in rescue channel: the master posts one sealed, signed record to Hive when it is cut off; every other machine only reads it."
+
+# Optional by construction: nothing else in the workspace depends on this crate unless
+# the CLI is built with `--features hive-rescue`, so a default build links no secp256k1,
+# no HTTP client for Hive and no mock server.
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bs58 = "0.5"
+chacha20poly1305.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+ferryman-channel = { path = "../ferryman-channel" }
+ferryman-iroh = { path = "../ferryman-iroh" }
+hex.workspace = true
+hkdf.workspace = true
+iroh = { version = "1.3", default-features = false, features = ["tls-ring"] }
+# Hive signs with secp256k1 ECDSA over a SHA-256 digest, with recovery. RustCrypto's k256
+# is pure Rust and maintained; its `sha2` (0.10) is re-exported so the RFC 6979 nonce
+# derivation uses the digest type k256 expects.
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_jcs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+x25519-dalek.workspace = true
+zeroize = "1"
+
+[dev-dependencies]
+iroh = { version = "1.3", default-features = false, features = ["tls-ring", "test-utils"] }
+tempfile = "3.20"

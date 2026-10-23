@@ -49,6 +49,8 @@ pub(crate) fn load_config_checked(
                 .into(),
         );
     }
+    #[cfg(feature = "hive-rescue")]
+    let config = crate::hive::with_rescue_trust(config, root);
     (config, choice.problem)
 }
 
@@ -96,7 +98,7 @@ fn root() -> Result<ferryman_channel::ferry::Root> {
 
 /// The routes this machine's all-projects worker serves, and its identity: exactly what
 /// `ferry agent run --all-projects` would serve, from the same plan.
-fn served(
+pub(crate) fn served(
     root: &ferryman_channel::ferry::Root,
     workspace: Option<PathBuf>,
 ) -> Result<(Vec<ProjectRoute>, ferryman_channel::AgentIdentity)> {
@@ -450,8 +452,8 @@ impl WorkerLane {
     ) -> Result<LiveLane> {
         let machine = ferryman_iroh::machine_dir()?;
         let (key, _) = ferryman_iroh::load_or_create_key(&machine)?;
-        let (endpoint, fallback_map) =
-            ferryman_iroh::lane::bind_with_map(&self.config, key).await?;
+        let (endpoint, fallback_map, shared_map) =
+            ferryman_iroh::lane::bind_shared(&self.config, key).await?;
         let id = endpoint.id();
         let (written, failed) = ferryman_iroh::publish_everywhere(
             &routes,
@@ -502,6 +504,10 @@ impl WorkerLane {
             intermittent: self.config.intermittent_peers.clone(),
             reported_health: std::sync::atomic::AtomicBool::new(false),
         };
+        #[cfg(feature = "hive-rescue")]
+        crate::hive::start_in_worker(&lane, shared_map, live.identity_ref(), report);
+        #[cfg(not(feature = "hive-rescue"))]
+        let _ = shared_map;
         tokio::spawn(lane.run(ferryman_iroh::lane::ROUND_EVERY));
         Ok(live)
     }
@@ -524,6 +530,11 @@ pub(crate) struct LiveLane {
 }
 
 impl LiveLane {
+    #[cfg(feature = "hive-rescue")]
+    fn identity_ref(&self) -> &ferryman_channel::AgentIdentity {
+        &self.identity
+    }
+
     /// The relays are fixed when the lane binds (the certificates it will trust are too), so
     /// a changed fleet list takes effect when the worker restarts: say so, once.
     fn check_relay_list(&self, report: &impl Progress) {
