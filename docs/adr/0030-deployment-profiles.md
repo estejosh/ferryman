@@ -1,6 +1,6 @@
 # ADR 0030: Deployment profiles (own VPS, home only, hosted)
 
-Status: proposed, for the master (josh). Design only; no code in this PR. Builds on 0014, 0021,
+Status: accepted by the master (josh) with the decisions at the end (2026-10-23). Design only; no code in this PR. Builds on 0014, 0021,
 0024, 0026, 0027 (phones, relay gate, Hive rescue; on `adr-0027-phones`) and 0028 (MCP server;
 on `mcp-design`). Related to docs/IROH_LANE.md (relay list, fail-closed relays, public-relay
 opt-in; v0.6.2). Numbers 0028 (MCP) and 0029 (lanes) are taken.
@@ -333,20 +333,31 @@ so a free invite-only beta is about 5 weeks after A.
 - A hosted tenant that suspends must never strand a user: direct paths, a second relay and Hive
   rescue all continue, and the user can walk to A with one entry.
 
-## Open questions for the master
+## Decisions of the master (2026-10-23)
 
-1. Default: ship B as first-run default now, and switch the dashboard's recommendation to C when it exists?
-2. Retention of connection logs on C (suggest none beyond counters and a 7-day abuse window)?
-3. Replace 0027's "gate reads grants through the lane" with the signed allow-list push? (This ADR assumes yes.)
-4. Public-relay disclosure wording, and whether n0 relays are acceptable for phones at all.
-5. Price and quota for C; free tier or invite-only beta first?
-6. Entity, terms and privacy policy owner and timing; which jurisdictions we may host in.
-7. Is the blind mailbox wanted for Custodly deposits before C?
-8. Domain for hosted relays (`relay.<domain>`).
+1. **B is the first-run default until C ships.** The dashboard then recommends C.
+2. **C keeps connection logs 7 days, then deletes them.** Counters needed for metering are not logs of connections.
+3. **The gate takes a master-signed allow-list push (endpoint ids only); it does not read grants through the lane. This amends ADR 0027, item 3 and section (c).** The gate holds only the master's public key.
+4. **Public n0 relays are acceptable for phones in B, opt-in only.** The opt-in shows one sentence: "The relay operator can see this device's IP address and when it connects."
+5. **C starts as a free, invite-only beta.** Pricing comes later; the figures above are placeholders.
+6. **Entity, terms, privacy policy and jurisdiction wait for the master's LLC. Nothing in C goes public before that.** Until then C is design and, at most, private testing.
+7. **Blind mailbox: not now** (the receiver on beastly is always on). Kept as a deferred option.
+8. **Hosted relay domain: to be decided by the master.**
+9. **The master's own fleet stays on profile A, using the existing relay VPS as it is for now (no gate yet).** Gate and allow-list work follow when phones are enrolled.
 
+## Updates, in every profile
+
+Update availability is surfaced through the **local** MCP: `ferry_join` (ADR 0028) reports the
+running version, the latest release signed by the master, and how to update. Machines pull signed
+releases themselves from the release source (GitHub releases or git tags), following the existing
+update policy (ADR 0026, section 7). No profile serves binaries through the relay, the
+mailbox or any host of ours, and the MCP never becomes a network service: it stays a stdio process
+that reads local state and the signed release record. A host (A's VPS or C's) therefore needs no
+update channel and cannot push code to a user's machines.
 ## Consequences
 
 - One lane, three configurations; every profile is reachable from every other without re-pairing.
 - 0027's gate, and its phone relay constant, change as described above; that ADR is amended when this lands.
 - C is a service with an operator's obligations; the design keeps those to metadata.
+
 
