@@ -91,7 +91,7 @@ pub fn running_version() -> String {
 
 /// A version as numbers, for comparing. Anything after a `-` is a pre-release suffix and
 /// is ignored: `0.5.5-rc1` and `0.5.5` are the same release for this purpose.
-fn parts(version: &str) -> Vec<u64> {
+pub(crate) fn parts(version: &str) -> Vec<u64> {
     version
         .trim()
         .trim_start_matches('v')
@@ -145,6 +145,17 @@ async fn fetch(url: &str) -> Result<Vec<u8>> {
 ///
 /// Returns the version installed.
 pub async fn apply(tag: &str) -> Result<String> {
+    apply_inner(tag, None).await
+}
+
+/// [`apply`], checking the archive against a SHA-256 the master signed into the release
+/// approval instead of the checksum file published beside it. Whoever can edit a GitHub
+/// release can edit that file; they cannot edit the approval.
+pub async fn apply_pinned(tag: &str, sha256: &str) -> Result<String> {
+    apply_inner(tag, Some(sha256)).await
+}
+
+async fn apply_inner(tag: &str, pinned: Option<&str>) -> Result<String> {
     let Some(target) = target_triple() else {
         bail!(
             "no published build for {} on {} - update by building from source",
@@ -156,16 +167,19 @@ pub async fn apply(tag: &str) -> Result<String> {
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
 
     let bytes = fetch(&format!("{base}/{archive}")).await?;
-    let sums = fetch(&format!("{base}/{archive}.sha256"))
-        .await
-        .context("fetch the checksum; refusing to install an unverified binary")?;
-
-    // The published file is `<hex>  <name>`, as sha256sum writes it.
-    let expected = String::from_utf8_lossy(&sums)
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_lowercase();
+    let expected = if let Some(pinned) = pinned {
+        pinned.trim().to_lowercase()
+    } else {
+        let sums = fetch(&format!("{base}/{archive}.sha256"))
+            .await
+            .context("fetch the checksum; refusing to install an unverified binary")?;
+        // The published file is `<hex>  <name>`, as sha256sum writes it.
+        String::from_utf8_lossy(&sums)
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_lowercase()
+    };
     let actual = hex::encode(Sha256::digest(&bytes));
     if expected.is_empty() || expected != actual {
         bail!(

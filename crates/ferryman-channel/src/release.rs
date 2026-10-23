@@ -80,6 +80,12 @@ pub struct ReleaseApproval {
     /// Where they were standing, for the tag message. Not load-bearing.
     #[serde(default)]
     pub via: String,
+    /// SHA-256 of each platform's release archive (target triple -> hex), signed along
+    /// with the rest. A machine that updates itself checks the download against this and
+    /// not against a file published beside the release. Empty on approvals that predate
+    /// it, which are signed over exactly the bytes they always were.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub artifacts: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -210,14 +216,19 @@ fn denial_payload(denial: &ReleaseDenial) -> String {
 }
 
 fn approval_payload(approval: &ReleaseApproval) -> String {
-    format!(
+    let mut payload = format!(
         "{}\n{}\n{}\n{}\n{}",
         approval.version,
         approval.commit,
         approval.approved_by,
         approval.approved_at.to_rfc3339(),
         approval.via,
-    )
+    );
+    // Appended only when present, so an older approval verifies over the same bytes.
+    for (target, sha256) in &approval.artifacts {
+        payload.push_str(&format!("\nartifact:{target}={sha256}"));
+    }
+    payload
 }
 
 /// Publish a release request. Signed, because a request nobody can attribute is a
@@ -615,6 +626,7 @@ mod tests {
             approved_by: "josh".into(),
             approved_at: Utc::now(),
             via: "dashboard".into(),
+            artifacts: Default::default(),
             signed_by: None,
             signature: None,
         }

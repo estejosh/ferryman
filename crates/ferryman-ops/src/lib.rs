@@ -26,6 +26,7 @@ pub mod eval;
 pub mod fleet;
 pub mod fleethome;
 pub mod governor;
+pub mod heavy;
 pub mod identity;
 pub mod improve;
 pub mod layout;

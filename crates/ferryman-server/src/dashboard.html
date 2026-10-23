@@ -413,6 +413,7 @@ textarea.notes:focus{border-color:var(--accent-dim)}
 <button data-page="engines">Engines</button>
       <button data-page="fleet">Fleet</button>
       <button data-page="vault">Vault</button>
+      <button data-page="connect">Connect an AI app <span class="pill">beta</span></button>
       <button data-page="identity">Identity</button>
     </div>
   </nav>
@@ -2793,6 +2794,87 @@ function wireVault() {
     }
   });
 }
+/* ---------- Connect an AI app (MCP server, beta) ---------- */
+
+const CONNECT_APPS = [
+  { id: "claude-desktop", label: "Claude Desktop" },
+  { id: "claude-code", label: "Claude Code" },
+  { id: "codex", label: "Codex" },
+];
+let connectInfo = null;
+
+pages.connect = async () => {
+  connectInfo = await api("/api/connect");
+  const projects = state.projects.length ? state.projects : [state.project || state.homeProject].filter(Boolean);
+  const current = state.project || state.homeProject || projects[0] || "";
+  return `
+    <div class="head">
+      <div><h1>Connect an AI app <span class="pill">beta</span></h1>
+      <p>Let Claude Desktop, Claude Code or Codex join this project: read the orders, report progress, talk to the other agents, and ask you when it needs a decision. Copy one block into that app. There is no token, key or passphrase in any of them; the app signs with its own agent key on this machine and can do no more than the level you give it.</p></div>
+    </div>
+    <div class="card" style="max-width:720px;margin-bottom:18px">
+      <label style="display:block">Project
+        <select id="connect-project">${projects.map((p) => `<option ${p === current ? "selected" : ""}>${esc(p)}</option>`).join("")}</select>
+      </label>
+      <label style="display:block;margin-top:12px">Agent name for the app
+        <input id="connect-agent" autocomplete="off" spellcheck="false" style="width:100%" value="${esc(connectInfo.machine ? "claude-desktop-" + connectInfo.machine : "claude-desktop")}">
+      </label>
+      <div class="s" style="color:var(--dim)">Letters, digits, - and _. Two apps on one machine need two names. The default is the app and this machine.</div>
+      <label style="display:block;margin-top:12px"><input type="checkbox" id="connect-admin"> Also give it the admin tools (search, fetch, status, update)</label>
+      <label style="display:block"><input type="checkbox" id="connect-readonly"> Read only (it can look, not act)</label>
+    </div>
+    ${CONNECT_APPS.map((app) => `
+      <div class="card" style="max-width:720px;margin-bottom:14px">
+        <div class="k">${esc(app.label)}</div>
+        <div class="s" style="color:var(--dim)" id="connect-where-${app.id}"></div>
+        <pre id="connect-${app.id}" style="white-space:pre-wrap;word-break:break-all;margin:8px 0"></pre>
+        <button class="btn" data-connect-copy="${app.id}">Copy</button> <span class="s" id="connect-copied-${app.id}"></span>
+      </div>`).join("")}
+    <div class="card" style="max-width:720px">
+      <div class="k">Then, once, on the machine that runs the project</div>
+      <pre id="connect-register" style="white-space:pre-wrap;word-break:break-all;margin:8px 0"></pre>
+      <div class="s" style="color:var(--dim)">The first line reserves the name. The app is a Member by default, which can read and write the channel. For an app that should only hand work in, set it to worker with the second line. The master signs that.</div>
+    </div>`;
+};
+
+function wireConnect() {
+  const project = $("#connect-project");
+  if (!project || !connectInfo) return;
+  const quote = (s) => (/[\s"]/.test(s) ? `"${s.replace(/"/g, '\\"')}"` : s);
+  const regenerate = () => {
+    const raw = $("#connect-agent").value.trim().replace(/[^A-Za-z0-9_.-]/g, "-");
+    const name = raw || "claude-desktop";
+    const args = ["mcp", "serve", "--as", name, "--project", project.value];
+    if ($("#connect-admin").checked) args.push("--tools", "admin");
+    if ($("#connect-readonly").checked) args.push("--read-only");
+    const ferry = connectInfo.ferry || "ferry";
+    const desktop = JSON.stringify({ mcpServers: { ferryman: { command: ferry, args } } }, null, 2);
+    const code = `claude mcp add ferryman -- ${[ferry, ...args].map(quote).join(" ")}`;
+    const codex = `[mcp_servers.ferryman]\ncommand = ${JSON.stringify(ferry)}\nargs = ${JSON.stringify(args)}`;
+    $("#connect-claude-desktop").textContent = desktop;
+    $("#connect-claude-code").textContent = code;
+    $("#connect-codex").textContent = codex;
+    $("#connect-where-claude-desktop").textContent = "Merge into claude_desktop_config.json (Settings, Developer, Edit config), then restart the app.";
+    $("#connect-where-claude-code").textContent = "Run in a terminal.";
+    $("#connect-where-codex").textContent = "Add to ~/.codex/config.toml.";
+    $("#connect-register").textContent =
+      `ferry channel expect --name ${name} --role worker\nferry access set ${project.value} ${name} worker   # optional: work only`;
+  };
+  regenerate();
+  [project, $("#connect-agent"), $("#connect-admin"), $("#connect-readonly")].forEach((el) =>
+    el.addEventListener("input", regenerate));
+  $$("[data-connect-copy]").forEach((button) => button.addEventListener("click", async () => {
+    const id = button.dataset.connectCopy;
+    const tag = $(`#connect-copied-${id}`);
+    try {
+      await navigator.clipboard.writeText($(`#connect-${id}`).textContent);
+      tag.textContent = "copied";
+    } catch (err) {
+      tag.textContent = "select the text and copy it";
+    }
+  }));
+}
+
 pages.identity = async () => {
   let d;
   try {
@@ -3210,6 +3292,7 @@ async function render() {
   wireFocus();
   wireSuggestions();
   wireVault();
+  wireConnect();
   wireNewOrder();
 }
 

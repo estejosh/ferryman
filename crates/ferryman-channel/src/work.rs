@@ -311,6 +311,69 @@ pub struct ExplicitNeeds {
     pub size: Option<Size>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_context_k: Option<u32>,
+    /// Heavy work (ADR 0028, pending agreement with snifrig): when this machine has a
+    /// snifrig queue and the operator enabled it, the command runs through the queue.
+    /// Absent means false, and an older worker ignores it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub heavy: bool,
+    /// What a heavy order expects to use. Every hint is optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hints: Option<ResourceHints>,
+}
+
+/// What a heavy order says it will use. Advisory: it is handed to the queue, never enforced
+/// here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceHints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cores: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ram_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_mem_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_minutes: Option<u32>,
+}
+
+impl ResourceHints {
+    /// Every hint present must be a sensible positive number.
+    ///
+    /// # Errors
+    /// A hint of zero or an absurd size.
+    pub fn validate(&self) -> Result<()> {
+        for (name, value, max) in [
+            ("cores", self.cores, 1024),
+            ("ram_gb", self.ram_gb, 16_384),
+            ("gpu_mem_gb", self.gpu_mem_gb, 1024),
+            ("expected_minutes", self.expected_minutes, 10_080),
+        ] {
+            if let Some(value) = value
+                && (value == 0 || value > max)
+            {
+                bail!("hint {name} must be between 1 and {max}, not {value}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `8 cores, 16 GB RAM, 8 GB GPU, ~45 min`
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(v) = self.cores {
+            parts.push(format!("{v} cores"));
+        }
+        if let Some(v) = self.ram_gb {
+            parts.push(format!("{v} GB RAM"));
+        }
+        if let Some(v) = self.gpu_mem_gb {
+            parts.push(format!("{v} GB GPU"));
+        }
+        if let Some(v) = self.expected_minutes {
+            parts.push(format!("~{v} min"));
+        }
+        parts.join(", ")
+    }
 }
 
 impl ExplicitNeeds {
@@ -341,6 +404,12 @@ impl ExplicitNeeds {
         }
         if let Some(k) = self.min_context_k {
             parts.push(format!("{k}k context"));
+        }
+        if self.heavy {
+            parts.push("heavy".to_string());
+        }
+        if let Some(hints) = &self.hints {
+            parts.push(hints.describe());
         }
         parts.join(", ")
     }
@@ -1940,6 +2009,7 @@ mod tests {
             size: Some(Size::Large),
             modalities: vec![Modality::Image, Modality::Vision],
             min_context_k: Some(64),
+            ..Default::default()
         });
         let got = classify(&o, &route());
         assert_eq!(
