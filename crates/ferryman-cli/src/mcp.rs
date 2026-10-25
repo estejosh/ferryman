@@ -103,7 +103,7 @@ impl Server {
                     route.clone(),
                     name,
                     groups.iter().any(|g| g == "admin"),
-                ))
+                )?)
             }
             _ => None,
         };

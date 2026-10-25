@@ -727,13 +727,18 @@ pub struct Agent {
 }
 
 impl Agent {
-    #[must_use]
-    pub fn new(route: ProjectRoute, me: &str, admin: bool) -> Self {
-        Self {
-            route,
-            me: ferryman_channel::canonical_agent_name(me),
-            admin,
+    pub fn new(route: ProjectRoute, me: &str, admin: bool) -> Result<Self> {
+        let me = ferryman_channel::canonical_agent_name(me);
+        let is_master = ferryman_channel::master::read_master(&route)
+            .ok()
+            .flatten()
+            .is_some_and(|m| is_me(&m.master, &me));
+        if is_master {
+            bail!(
+                "--as {me} is the master identity. Agents ask and never approve, so the master does not run this server; use an agent identity, and decide in the dashboard or with `ferry channel review`"
+            );
         }
+        Ok(Self { route, me, admin })
     }
 
     /// Is `--as <name>` an agent this machine actually holds the key for, seated on the
@@ -1454,9 +1459,9 @@ impl Agent {
                         "you submitted this result; another agent reviews it",
                     ));
                 }
-                if task.order.requires_approval && !self.is_master(&route) {
+                if task.order.requires_approval {
                     return Err(denied(
-                        "this order needs the master's approval, not an agent's. Use ferry_ask_human with a recommendation",
+                        "this order needs the master's approval, not an agent's. Use ferry_ask_human with a recommendation; the master decides in the dashboard or with `ferry channel review`",
                     ));
                 }
                 if accept
@@ -1492,13 +1497,6 @@ impl Agent {
             }
             other => Err(bad(format!("unknown action '{other}'"))),
         }
-    }
-
-    fn is_master(&self, route: &ProjectRoute) -> bool {
-        ferryman_channel::master::read_master(route)
-            .ok()
-            .flatten()
-            .is_some_and(|m| is_me(&m.master, &self.me))
     }
 
     /// The task, if this agent holds it.

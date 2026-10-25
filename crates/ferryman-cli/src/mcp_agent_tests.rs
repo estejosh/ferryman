@@ -71,11 +71,11 @@ fn world() -> World {
 }
 
 fn agent(w: &World, name: &str) -> Agent {
-    Agent::new(w.route.clone(), name, true)
+    Agent::new(w.route.clone(), name, true).unwrap()
 }
 
 fn core_agent(w: &World, name: &str) -> Agent {
-    Agent::new(w.route.clone(), name, false)
+    Agent::new(w.route.clone(), name, false).unwrap()
 }
 
 fn call(agent: &Agent, tool: &str, args: Value) -> Value {
@@ -323,6 +323,44 @@ fn an_order_that_needs_the_master_cannot_be_accepted_by_an_agent() {
         json!({ "action": "review", "id": "o-gate", "verdict": "accept" }),
     );
     assert!(refused(&result, "denied").contains("master"));
+}
+
+#[test]
+fn the_master_identity_cannot_run_the_agent_server() {
+    let w = world();
+    let err = Agent::new(w.route.clone(), OLD_PRIMARY, true)
+        .err()
+        .expect("master refused");
+    assert!(err.to_string().contains("master identity"), "{err}");
+    assert!(Agent::new(w.route.clone(), BOSS, true).is_ok());
+}
+
+#[test]
+fn no_agent_accepts_an_order_that_needs_approval_even_an_orchestrator() {
+    let w = world();
+    let mut gated = order(&w, "o-gate2", "ship it");
+    gated.requires_approval = true;
+    w.master.sign_order(&mut gated);
+    ferryman_channel::issue_order(&w.route, &gated).unwrap();
+    ok(&call(
+        &agent(&w, MEMBER),
+        "ferry_orders",
+        json!({ "action": "claim", "id": "o-gate2" }),
+    ));
+    ok(&call(
+        &agent(&w, MEMBER),
+        "ferry_orders",
+        json!({ "action": "submit", "id": "o-gate2", "ref": "abc1234", "note": "ready" }),
+    ));
+    for verdict in ["accept", "changes"] {
+        let result = call(
+            &agent(&w, BOSS),
+            "ferry_orders",
+            json!({ "action": "review", "id": "o-gate2", "verdict": verdict, "notes": "n" }),
+        );
+        let reason = refused(&result, "denied");
+        assert!(reason.contains("ferry channel review"), "{reason}");
+    }
 }
 
 #[test]
@@ -1223,7 +1261,7 @@ fn applying_an_update_is_refused_below_orchestrator_and_check_is_read_only() {
 #[test]
 fn the_update_tool_exists_only_in_the_admin_group() {
     let w = world();
-    let plain = Agent::new(w.route.clone(), BOSS, false);
+    let plain = Agent::new(w.route.clone(), BOSS, false).unwrap();
     refused(
         &call(&plain, "ferry_update", json!({ "action": "check" })),
         "bad_request",
@@ -1409,7 +1447,7 @@ fn the_groups_add_tools_and_read_only_serves_only_the_old_ones() {
     let core_only = Server::with(w.route.clone(), Some(core_agent(&w, MEMBER)), false);
     assert_eq!(core_only.tools().len(), 6);
     // Admin and legacy are opt-in; asked for, they are appended after the core six.
-    let admin = Agent::new(w.route.clone(), MEMBER, true);
+    let admin = Agent::new(w.route.clone(), MEMBER, true).unwrap();
     let with_both = Server::with(w.route.clone(), Some(admin), true);
     let names: Vec<String> = with_both
         .tools()
