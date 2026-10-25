@@ -47,6 +47,9 @@ pub const QUIET_AFTER_MINUTES: i64 = 10;
 
 /// The kind a question raised by `ferry_ask_human` carries.
 pub const ASK_KIND: &str = "ask";
+/// The option strings a question raised by `ferry_ask_human` offers.
+const ASK_APPROVE: &str = "approve";
+const ASK_REJECT: &str = "reject";
 
 /// Per-response cap in tokens, T4/T10.
 #[must_use]
@@ -1824,8 +1827,8 @@ impl Agent {
                 let id = format!("ask-{}-{}", self.me, Utc::now().timestamp_millis());
                 let text = format!("{title}\nRecommendation: {recommendation}\nWhy: {reasoning}");
                 let options = [
-                    "approve".to_string(),
-                    "reject".to_string(),
+                    ASK_APPROVE.to_string(),
+                    ASK_REJECT.to_string(),
                     "send back".to_string(),
                 ];
                 ferryman_channel::questions::ask(
@@ -2191,10 +2194,10 @@ pub fn ask_state(answer: Option<&str>) -> (&'static str, Option<String>) {
     match answer.map(str::trim) {
         None => ("pending", None),
         Some(text) => {
-            let lower = text.to_ascii_lowercase();
-            if lower.starts_with("approve") {
+            // Only the exact option strings count; "approve only if X" is a send back.
+            if text == ASK_APPROVE {
                 ("approved", None)
-            } else if lower.starts_with("reject") {
+            } else if text == ASK_REJECT {
                 ("rejected", None)
             } else {
                 ("sent_back", Some(text.to_string()))

@@ -2239,3 +2239,20 @@ fn free_text_keys_are_redacted_and_identifier_keys_are_not() {
     assert_eq!(value["nested"][0]["id"], "o-1");
     assert_eq!(value["commit"], "9f2c1a7d3e5b4c6a8f0e1d2c3b4a5f6e7d8c9b0a");
 }
+
+#[test]
+fn only_the_exact_option_strings_approve_or_reject() {
+    assert_eq!(ask_state(None).0, "pending");
+    assert_eq!(ask_state(Some("approve")).0, "approved");
+    assert_eq!(ask_state(Some(" reject ")).0, "rejected");
+    for answer in [
+        "approve only if X",
+        "approved?",
+        "rejection pending",
+        "Approve",
+    ] {
+        let (state, note) = ask_state(Some(answer));
+        assert_eq!(state, "sent_back", "{answer}");
+        assert_eq!(note.as_deref(), Some(answer));
+    }
+}
