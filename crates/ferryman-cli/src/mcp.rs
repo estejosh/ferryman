@@ -205,7 +205,15 @@ impl Server {
                     };
                 }
             }
-            return call_tool(&self.route, request);
+            if let Some(agent) = &self.agent {
+                // With an agent identity the old tools get the same gate, redaction and
+                // caps as the new ones.
+                return match agent.require_seated() {
+                    Ok(()) => call_tool(&self.route, request, true),
+                    Err(error) => mcp_agent::error_result(&error),
+                };
+            }
+            return call_tool(&self.route, request, false);
         }
         json!({
             "content": [{ "type": "text", "text": format!("unknown tool: {name}") }],
@@ -416,7 +424,7 @@ fn list_engines(route: &ProjectRoute) -> Result<Value> {
     Ok(json!(rows))
 }
 
-fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
+fn call_tool(route: &ProjectRoute, request: &Value, guarded: bool) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params
@@ -435,6 +443,7 @@ fn call_tool(route: &ProjectRoute, request: &Value) -> Value {
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
     match outcome {
+        Ok(value) if guarded => mcp_agent::finish_legacy(value, name),
         Ok(value) => json!({
             "content": [{
                 "type": "text",
@@ -493,6 +502,7 @@ fn get_task(route: &ProjectRoute, args: &Value) -> Result<Value> {
     let Some(id) = args.get("id").and_then(Value::as_str) else {
         bail!("get_task needs an 'id' argument");
     };
+    mcp_agent::safe_id(id)?;
     let task = ferryman_channel::read_task(route, id)?;
     let results: Vec<Value> = task
         .results
@@ -541,7 +551,16 @@ fn read_memory(route: &ProjectRoute, args: &Value) -> Result<Value> {
     files.sort_by(|a, b| a.0.cmp(&b.0));
     match requested {
         Some(name) => match files.into_iter().find(|(n, _)| *n == name) {
-            Some((_, content)) => Ok(json!({ "file": name, "content": content })),
+            Some((_, content)) => {
+                // Like every other response, a memory file comes back capped.
+                let cut = content.char_indices().nth(1500).map(|(i, _)| i);
+                match cut {
+                    Some(at) => {
+                        Ok(json!({ "file": name, "content": &content[..at], "truncated": true }))
+                    }
+                    None => Ok(json!({ "file": name, "content": content })),
+                }
+            }
             None => bail!("no memory file named {name}"),
         },
         None => Ok(json!({

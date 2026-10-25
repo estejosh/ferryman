@@ -2171,3 +2171,54 @@ fn malformed_and_oversized_input_gets_an_error_not_silence() {
 }
 
 use std::collections::BTreeMap;
+
+// -- legacy tools with an agent identity ---------------------------------------------------
+
+fn legacy_call(server: &mut Server, name: &str, args: Value) -> Value {
+    let line = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": name, "arguments": args },
+    })
+    .to_string();
+    let reply: Value = serde_json::from_str(&handle_line(server, &line).unwrap()).unwrap();
+    reply["result"].clone()
+}
+
+#[test]
+fn legacy_tools_with_an_agent_are_seated_redacted_and_capped() {
+    let w = world();
+    let token = "ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut leaky = order(&w, "o-leg", &format!("deploy with {token} now"));
+    leaky.payload = json!({ "task": format!("deploy with {token} now") });
+    w.master.sign_order(&mut leaky);
+    ferryman_channel::issue_order(&w.route, &leaky).unwrap();
+    let memory = w.route.communications.join("memory-bank");
+    std::fs::create_dir_all(&memory).unwrap();
+    std::fs::write(memory.join("big.md"), "lorem ipsum ".repeat(5000)).unwrap();
+
+    // An unseated name gets nothing from the old tools either.
+    let mut stranger = Server::with(w.route.clone(), Some(agent(&w, "stranger")), true);
+    let locked = legacy_call(&mut stranger, "list_tasks", json!({}));
+    assert_eq!(locked["isError"], true, "{locked}");
+    assert_eq!(locked["structuredContent"]["error"], "locked");
+
+    let mut server = Server::with(w.route.clone(), Some(agent(&w, MEMBER)), true);
+    let listed = legacy_call(&mut server, "list_tasks", json!({}));
+    assert_eq!(listed["isError"], false, "{listed}");
+    assert!(!listed.to_string().contains(token), "{listed}");
+    assert_eq!(listed["structuredContent"]["redacted"], true);
+    let got = legacy_call(&mut server, "get_task", json!({ "id": "o-leg" }));
+    assert!(!got.to_string().contains(token), "{got}");
+    let traversal = legacy_call(&mut server, "get_task", json!({ "id": "../../x" }));
+    assert_eq!(traversal["isError"], true);
+    assert!(traversal.to_string().contains("letters, digits"));
+
+    let mem = legacy_call(&mut server, "read_memory", json!({ "file": "big.md" }));
+    assert_eq!(mem["isError"], false, "{mem}");
+    assert_eq!(mem["structuredContent"]["truncated"], true);
+    assert!(
+        tokens(&mem) <= cap_tokens("read_memory"),
+        "{}",
+        tokens(&mem)
+    );
+}

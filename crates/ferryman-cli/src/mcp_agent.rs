@@ -198,6 +198,17 @@ fn fit(reply: &mut Reply, tool: &str, order: &[&str]) {
     }
 }
 
+/// A legacy tool's result, put through the same redaction and caps as the agent tools.
+#[must_use]
+pub(crate) fn finish_legacy(value: Value, tool: &str) -> Value {
+    let data = if value.is_object() {
+        value
+    } else {
+        json!({ "items": value })
+    };
+    finish(Reply::new(tool.to_string(), data), tool)
+}
+
 fn finish(mut reply: Reply, tool: &str) -> Value {
     // What is dropped first when a catch-up has to shrink: the recent chatter, then the
     // open queue. Decisions, asks and what waits on you go last.
@@ -671,7 +682,7 @@ fn need<'a>(args: &'a Value, key: &str, action: &str) -> Result<&'a str> {
     arg_str(args, key).ok_or_else(|| bad(format!("{action} needs '{key}'")))
 }
 
-fn safe_id(id: &str) -> Result<()> {
+pub(crate) fn safe_id(id: &str) -> Result<()> {
     if ferryman_channel::is_safe_component(id) {
         Ok(())
     } else {
@@ -756,7 +767,7 @@ impl Agent {
         })
     }
 
-    fn require_seated(&self) -> Result<()> {
+    pub(crate) fn require_seated(&self) -> Result<()> {
         if self.seated() {
             Ok(())
         } else {
