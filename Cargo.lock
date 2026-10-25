@@ -1507,6 +1507,7 @@ name = "ferryman-cli"
 version = "0.6.2"
 dependencies = [
  "anyhow",
+ "axum",
  "chacha20poly1305",
  "chrono",
  "clap",
@@ -1528,6 +1529,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "url",
  "uuid",
 ]
 

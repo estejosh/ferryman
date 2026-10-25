@@ -11,6 +11,8 @@ mod licensor;
 mod mcp;
 mod mcp_agent;
 mod mcp_client;
+mod mcp_http;
+mod mcp_oauth;
 mod restart;
 mod route;
 mod suggest;
@@ -1089,7 +1091,25 @@ enum McpCommand {
         /// Keep the old read-only behaviour even with --as.
         #[arg(long)]
         read_only: bool,
+        /// Serve every live, non-archived project in the ferry root (as `ferry agent run
+        /// --all-projects` does). Tools that act on a project take a `project` argument;
+        /// `ferry_join` lists the projects --as is seated in, with its level in each.
+        #[arg(long)]
+        all_projects: bool,
+        /// Serve MCP Streamable HTTP on this address (for example 127.0.0.1:8787) instead
+        /// of stdio, with a built-in OAuth login for cloud apps such as claude.ai. This is
+        /// plain HTTP: keep it behind TLS. Needs --as; see `ferry mcp pair`.
+        #[arg(long, value_name = "ADDR:PORT")]
+        http: Option<std::net::SocketAddr>,
+        /// The public https URL of the site that reaches --http, for example
+        /// https://mcp.example.com. The connector URL is that plus /mcp, and it is the
+        /// only Host the server answers to. Required unless --http is a loopback address.
+        #[arg(long, requires = "http")]
+        public_url: Option<String>,
     },
+    /// Print a single-use pairing code (valid 10 minutes) for connecting an app to
+    /// `ferry mcp serve --http`. The server stores only its hash.
+    Pair,
     /// Connect to an external MCP server and print the tools it advertises.
     List {
         /// The server command and its arguments, e.g.
@@ -5040,13 +5060,30 @@ async fn run(cli: Cli) -> Result<()> {
                 project,
                 tools,
                 read_only,
+                all_projects,
+                http,
+                public_url,
             } => mcp::serve(&mcp::Options {
                 workspace,
                 agent,
                 project,
                 tools,
                 read_only,
+                all_projects,
+                http: http.map(|addr| mcp_http::HttpOptions {
+                    addr,
+                    public_url,
+                    state_dir: None,
+                }),
             })?,
+            McpCommand::Pair => {
+                let dir = mcp_http::default_state_dir()?;
+                let code = mcp_oauth::mint_pairing_code(&dir, mcp_oauth::unix_now())?;
+                println!("pairing code: {code}");
+                println!(
+                    "valid for 10 minutes, works once. Enter it on the sign-in page the app opens."
+                );
+            }
             McpCommand::List { server } => mcp_client::list(&server)?,
             McpCommand::Call {
                 server,

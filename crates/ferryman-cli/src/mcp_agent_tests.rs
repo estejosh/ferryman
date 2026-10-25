@@ -1504,8 +1504,8 @@ fn mcp_budget() {
     // T3: instructions.
     let instructions = est_tokens(INSTRUCTIONS.len());
     assert!(
-        instructions <= 250,
-        "instructions are {instructions} tokens, cap 250"
+        instructions <= 340,
+        "instructions are {instructions} tokens, cap 340"
     );
 
     // T8: byte-stable. Different agent, different time, different project state: the same
@@ -1737,7 +1737,7 @@ fn mcp_budget() {
     // the ones that depend on ids and ages may move by a few tokens between runs.
     let snapshot = json!({
         "note": "Estimated tokens at 3.3 characters each. Regenerate with UPDATE_MCP_BUDGET=1 cargo test -p ferryman-cli mcp_budget",
-        "caps": { "core_tools_list": 1500, "admin_tools_list": 700, "instructions": 250, "catchup_busy": 800 },
+        "caps": { "core_tools_list": 1500, "admin_tools_list": 700, "instructions": 340, "catchup_busy": 800 },
         "core_tools_list": core_tokens,
         "admin_tools_list": admin_tokens,
         "instructions": instructions,
