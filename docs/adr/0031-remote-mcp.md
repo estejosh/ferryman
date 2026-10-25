@@ -1,6 +1,6 @@
-# ADR 0031: Remote MCP through the VPS, with login
+# ADR 0031: Remote MCP with login, served from home, reached through the VPS
 
-Status: proposed, for the master (josh). Design only; no code in this PR. Builds on 0014, 0021, 0023,
+Status: proposed, for the master (josh). Revised 2026-10-25: login and MCP on home machines, VPS as relay and blind edge only (see "Decision"). Design only; no code in this PR. Builds on 0014, 0021, 0023,
 0024, 0028 (local MCP; on `mcp-design`, PR #108 for the beta), 0030 (deployment profiles; on
 `deployment-profiles`) and docs/IROH_LANE.md. Amends 0030 (see "Amendments").
 
@@ -57,7 +57,59 @@ So the server needs Streamable HTTP, PRM, AS metadata, PKCE S256, DCR **and** CI
 binding, rotating refresh tokens, and a public-CA certificate on a stable hostname. All plain OAuth; no
 third-party identity provider is needed.
 
-## Decision in one paragraph
+## Decision (revised 2026-10-25, the master)
+
+The master's direction, in his words: "i type in the mcp as connector on claude... and then all of my
+folders magically work ... the communications happen on iroh, and vps is coordinator in case
+communications are for some reason not working." And: "if we make it so they use the vps, that means
+all communications depend on centralized server. that is not the intent."
+
+So the remote MCP is **not centralized on the VPS**. It replaces the hub-first decision below.
+
+1. **The MCP and the login live on the user's own machines.** `ferry mcp serve --http` runs on a home
+   machine (grouchly first, beastly as the second). That process is a full lane peer: it signs with
+   its own keys, syncs over iroh like any worker, terminates TLS, runs the authorization server
+   (OAuth 2.1, PKCE, DCR and CIMD, as specified under "Authorization server"), and shows the approval
+   card on that machine's dashboard. No round trip through a server is needed to approve an app.
+2. **One connector URL covers every live project.** The user pastes one URL into claude.ai (or
+   ChatGPT), logs in once and approves. Tools take a `project` argument; `ferry_join` lists the
+   projects the app may see, which is every live, non-archived project unless the master narrows it at
+   approval. This answers open question 12: one connection, all projects, not one URL per project.
+3. **Communication stays peer-to-peer on iroh.** The MCP process reads and writes the local channel
+   files; the lane carries them between machines directly. The MCP's server instructions and
+   `ferry_join` tell every AI how this works, so the AI never needs transport details of its own.
+4. **The VPS is only a coordinator of last resort.** It runs the iroh relay (already live) for when
+   direct paths fail, and a blind edge (shape 2, "passthrough") so cloud apps, which can only reach a
+   public HTTPS URL, can reach a home machine. The edge reads only SNI and pipes ciphertext. It holds no
+   keys, no channel copy and no login. A compromised VPS learns hostnames, IPs, timing and volume, and
+   nothing else.
+5. **No single door.** The edge forwards to any home endpoint named in the master-signed `edge.json`,
+   in order (grouchly, then beastly), so the connector keeps working while either is on. A second
+   ingress (another VPS, or a user's own tunnel) can be listed the same way. If the VPS is down, only
+   cloud connectors using that URL wait; machine-to-machine traffic and every local AI (stdio MCP) are
+   untouched. This answers open question 11: failover between home machines is in, not deferred.
+6. **Folder layout changes come only from the master.** An AI connected through the MCP can see fleet
+   notices and orders, but a layout change (moving repos, comms or work folders) is applied only when
+   it is a fleet order signed by the master (`ferry fleet order migrate`). An MCP tool that is asked to
+   change the layout without that signature refuses and says why.
+7. **The hub (shape 1) is an opt-in, not the default.** A user who wants the connector to answer while
+   every home machine is off can still enable a hub on their own VPS for chosen projects, accepting that
+   the VPS can then read those projects. It is built last, if at all.
+
+What this costs, plainly: the connector needs a home machine to be on (any one of the listed ones),
+and cloud apps still need a public way in, which the VPS edge provides. The cloud vendor still receives
+whatever its model reads through the connector (see "Privacy disclosure").
+
+Build order under this decision: (a) all-projects mode for the MCP; (b) `--http` transport with the
+authorization server, on a home machine, tested locally; (c) the blind edge on the VPS with failover by
+`edge.json`; (d) a real claude.ai connector on the master's fleet, Worker first, then Member;
+(e) ChatGPT. Hub, blobs and agentic setup follow only on request.
+
+The sections below were written for the hub-first decision. Where they conflict with this revision,
+this revision wins; the authorization, identity, tools and security sections apply unchanged to the
+home-machine endpoint.
+
+## Original decision (hub-first, superseded 2026-10-25)
 
 Profile A gets a **hub**: `ferry hub`, installed on the master's VPS, is a headless lane peer with its
 own machine identity, enrolled by a master-signed grant for the projects the master enables there. It
@@ -284,7 +336,7 @@ same words. C is gated on the LLC (0030 decision 6); until then design and priva
 
 | Profile | Recommendation |
 | --- | --- |
-| **A. Own VPS** (the master's fleet) | **Hub** (shape 1), default, on the existing relay VPS (162.35.10.46) as a separate unit; the relay is untouched. Passthrough (shape 2) is an opt-in for a user who wants no plaintext on the VPS, at the price of "down when home is off". |
+| **A. Own VPS** (the master's fleet) | **Passthrough** (shape 2) is the default since 2026-10-25, with failover across home machines; **Hub** (shape 1) is opt-in, on the existing relay VPS (162.35.10.46) as a separate unit; the relay is untouched. Passthrough (shape 2) is an opt-in for a user who wants no plaintext on the VPS, at the price of "down when home is off". |
 | **B. Home only** | Remote MCP not available natively: there is no public ingress without a server, and iroh public relays are not an HTTP ingress. The dashboard offers "get a relay" (A or C) or the user's own tunnel (outside this design). Local stdio MCP is unaffected. |
 | **C. Hosted** | Strictly passthrough, never a hub and never terminating TLS for a tenant. Hosting a hub for others would make us a reader of their channels, which 0030 forbids. |
 
