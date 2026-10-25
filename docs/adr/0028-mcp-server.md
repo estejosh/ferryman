@@ -85,9 +85,12 @@ In: `{action: raise|status, title, recommendation, reasoning, id?}`. Out: `{id, 
 Wraps the existing approval gate: signed pending items (`ferry agent pending`), the dashboard approve or send back, `jobs approve|reject`. `raise` writes a signed request; the human's signed answer is read by `status`. The MCP can ask, never approve. Reasoning capped at 1,200 chars; secrets refused.
 
 ### Opt-in groups (not in the default list)
-- `--tools admin`: `ferry_search` (paged text search over ledger, memory, learnings), `ferry_get` (by `ferry://` URI), `ferry_status`.
+- `--tools admin`: `ferry_search` (paged text search over ledger, memory, learnings), `ferry_get` (by `ferry://` URI), `ferry_status`, `ferry_update`.
 - `--tools legacy`: the 8 existing read tools, unchanged.
-Neither group can mint grants, change access levels, sign releases, touch the vault or unpause. Those stay CLI and dashboard only.
+
+`ferry_update` is a deliberate exception to the rule that the MCP wraps nothing that changes the machine. It is in the admin group only, so it costs nothing by default (T2; its definition counts in the `admin_tools_list` budget). `check` reports whether the master has signed an approval for a newer release. `apply` is Orchestrator only, refused while the machine is paused, and installs only a release the master signed an approval for, verified against the SHA-256 for this platform pinned in that approval. An approval that pins no checksum is refused, and a public tag or release page is never enough. The agent still cannot approve a release; it can only install one the master already approved.
+
+Apart from `ferry_update` apply, neither group can mint grants, change access levels, sign releases, touch the vault or unpause. Those stay CLI and dashboard only.
 
 ## Identity
 

@@ -74,7 +74,7 @@ The same levels as the CLI (Worker, Member, Orchestrator).
 `ferry_join` and the catch-up header carry a short `update` field when the master has
 signed an approval for a release newer than the one running. A public tag or release page
 is never enough. `ferry_update check` says the same. `apply` (admin group, Orchestrator
-only, refused while paused) installs it through the existing self-update, but checks the
+only, refused while paused; a deliberate exception in ADR 0028) installs it through the existing self-update, but checks the
 download against the SHA-256 for this platform that the master signed into the approval,
 not a checksum file published beside the release; an approval that pins none is refused.
 Agents are told to mention an update to you and not to update in the middle of an order.
