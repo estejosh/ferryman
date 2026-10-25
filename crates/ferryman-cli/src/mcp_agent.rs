@@ -474,10 +474,11 @@ fn guard(field: &str, text: &str) -> Result<()> {
 }
 
 /// Keys whose values are identifiers or cursors, never prose: a hash or a long id in one
-/// of them is not a secret and is not redacted.
+/// of them is not a secret and is not redacted. Agent names are validated identifiers.
+/// Free-text keys (`name`, `how`, `order`, ...) are not here and are redacted.
 const ID_KEYS: &[&str] = &[
-    "id", "next", "since", "uri", "ref", "hash", "sha", "commit", "agent", "name", "to", "from",
-    "by", "holder", "project", "machine", "current", "latest", "how", "order",
+    "id", "next", "since", "uri", "ref", "hash", "sha", "commit", "agent", "to", "from", "by",
+    "holder", "project", "machine", "current", "latest",
 ];
 
 /// `text` with every secret-shaped word replaced by `[redacted]`, or `None` when nothing

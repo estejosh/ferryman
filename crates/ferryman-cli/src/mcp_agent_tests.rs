@@ -2222,3 +2222,20 @@ fn legacy_tools_with_an_agent_are_seated_redacted_and_capped() {
         tokens(&mem)
     );
 }
+
+#[test]
+fn free_text_keys_are_redacted_and_identifier_keys_are_not() {
+    let token = "ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut value = json!({
+        "name": token, "how": token, "order": token, "from": token, "note": token,
+        "commit": "9f2c1a7d3e5b4c6a8f0e1d2c3b4a5f6e7d8c9b0a",
+        "nested": [{ "name": token, "id": "o-1" }],
+    });
+    assert!(redact_value(&mut value));
+    for key in ["name", "how", "order", "note"] {
+        assert_eq!(value[key], "[redacted]", "{key}");
+    }
+    assert_eq!(value["nested"][0]["name"], "[redacted]");
+    assert_eq!(value["nested"][0]["id"], "o-1");
+    assert_eq!(value["commit"], "9f2c1a7d3e5b4c6a8f0e1d2c3b4a5f6e7d8c9b0a");
+}
