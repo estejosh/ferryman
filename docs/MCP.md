@@ -2,7 +2,9 @@
 
 `ferry mcp serve` lets an AI app (Claude Desktop, Claude Code, Codex) join a Ferryman
 project as an agent: catch up, take orders, talk to the fleet, ask you for approvals. It
-runs on your machine over stdio. There is no network service, and it never serves files.
+runs on your machine over stdio. By default there is no network service, and it never
+serves files. `--all-projects` serves every live project through one connection, and
+`--http` is the opt-in network mode for cloud apps (see "Connect claude.ai").
 
 Design and decisions: [ADR 0028](adr/0028-mcp-server.md).
 
@@ -37,9 +39,68 @@ dashboard, Agents, or `ferry channel join --as my-app` on this machine). Until t
 entry. A seated agent starts at the Worker level; raise it with
 `ferry access set <agent> member` (or `orchestrator`) like any other agent.
 
+## All projects in one connection
+
+```
+ferry mcp serve --as my-app --all-projects
+```
+
+Serves every live, non-archived project in the ferry root, as `ferry agent run
+--all-projects` counts them. Every tool takes a `project` argument. `ferry_join` with no
+project lists the projects `my-app` is seated in and its level in each; the checks per
+project are the same as in single-project mode (the level comes from that project's
+master-signed grants). A project where the identity is not seated is not offered. With
+only one seat the `project` argument may be left out. `--project` and `--all-projects`
+do not combine.
+
+## How Ferryman works, as the AI is told
+
+The server instructions and `ferry_join` say it in a few lines: messages travel peer to
+peer over iroh; the VPS relay is only a fallback; the AI never handles transport; and
+folder layout changes are applied only from a master-signed fleet order (`ferry fleet
+order migrate`), never on anyone else's say-so. No MCP tool changes the layout: a tool or
+action that tries is refused with that explanation.
+
+## Connect claude.ai
+
+`ferry mcp serve --http` serves MCP over Streamable HTTP (protocol 2025-06-18, one `/mcp`
+endpoint) with its own sign-in, so a cloud app can connect to this machine.
+
+1. Seat the identity the app will act as (Worker or Member; `ferry access set` for the
+   level). Orchestrators and the master identity are refused over HTTP.
+2. Start the server, behind TLS (see below), naming the public address:
+
+   ```
+   ferry mcp serve --as claude-ai --all-projects \
+     --http 127.0.0.1:8787 --public-url https://mcp.example.com
+   ```
+
+   It prints the connector URL, `https://mcp.example.com/mcp`.
+3. Run `ferry mcp pair`. It prints a code that works once, for ten minutes.
+4. In claude.ai, Settings, Connectors, add a custom connector and paste the connector URL.
+5. The sign-in page opens on your server. It shows which host the app will return to and
+   which projects it will see. Enter the code. The app is then bound to `claude-ai` at the
+   level that identity already has in each project. No new identities are made.
+
+The server answers only to the host in `--public-url`, refuses request bodies over 1 MiB
+(16 KiB on the login endpoints), and locks the login for ten minutes after five wrong codes.
+Access tokens last 15 minutes; refresh tokens rotate, and replaying an old one revokes the
+grant; a grant ends after 90 days. Tokens are stored only as hashes in the machine state
+directory (`mcp-http/`), never synced. To revoke every connected app, stop the server and
+delete that folder's `oauth.json`.
+
+**TLS.** `--http` speaks plain HTTP and must sit behind TLS. claude.ai only reaches an
+https URL on a public name. Until the edge with automatic certificates exists, put a
+reverse proxy or tunnel you control in front, forwarding the `Host` header unchanged. Do
+not bind `--http` to a public address without it.
+
+Apps register themselves (dynamic client registration) and only `https://claude.ai/api/mcp/auth_callback`
+and loopback redirect addresses are accepted. Client ID metadata documents are not
+supported yet.
+
 ## Tools
 
-Six tools, about 630 tokens in all:
+Six tools, about 760 tokens in all (the `project` argument adds a little in all-projects mode):
 
 | Tool | What it does |
 | --- | --- |
