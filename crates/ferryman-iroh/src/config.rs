@@ -113,6 +113,12 @@ pub struct IrohConfig {
     /// Never implied; without it, no relay named means no relay.
     pub public_relays: bool,
     pub relay_cert_sha256: Option<[u8; 32]>,
+    /// The invite endpoint's own relay, when it must not use iroh's public relays. The
+    /// invite endpoint is a separate endpoint with its own key; `invite_relay_url` names
+    /// the one relay it is homed on, and `invite_relay_cert_sha256` pins its certificate
+    /// when no public CA signs it.
+    pub invite_relay_url: Option<String>,
+    pub invite_relay_cert_sha256: Option<[u8; 32]>,
     pub relay_token_file: Option<PathBuf>,
     pub relay_quic_port: u16,
     /// Minutes before a silent peer or an unreachable relay is raised as a warning.
@@ -138,6 +144,8 @@ impl Default for IrohConfig {
             direct_only: false,
             public_relays: false,
             relay_cert_sha256: None,
+            invite_relay_url: None,
+            invite_relay_cert_sha256: None,
             relay_token_file: None,
             relay_quic_port: DEFAULT_QUIC_PORT,
             alert_after_minutes: DEFAULT_ALERT_MINUTES,
@@ -282,6 +290,21 @@ impl IrohConfig {
                 Err(error) => config
                     .notes
                     .push(format!("[iroh] relay_cert_sha256: {error}")),
+            }
+        }
+        config.invite_relay_url = section
+            .get("invite_relay_url")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned);
+        if let Some(pin) = section
+            .get("invite_relay_cert_sha256")
+            .and_then(toml::Value::as_str)
+        {
+            match parse_fingerprint(pin) {
+                Ok(pin) => config.invite_relay_cert_sha256 = Some(pin),
+                Err(error) => config
+                    .notes
+                    .push(format!("[iroh] invite_relay_cert_sha256: {error}")),
             }
         }
         config.relay_token_file = section

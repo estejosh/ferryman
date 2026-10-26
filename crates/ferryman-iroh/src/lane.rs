@@ -116,6 +116,17 @@ fn fleet_host_pins(config: &IrohConfig) -> Vec<(String, [u8; 32])> {
         .collect()
 }
 
+/// Whether the lane's relay verifier also trusts a relay whose certificate a public CA
+/// signed, so it can be DIALED through. Always on: our own relays are pinned (or
+/// host-pinned), and any other relay a peer's signed transports record names is checked
+/// against the public CA roots. This is the dial-only public relay rule - a machine homed
+/// on iroh's public relays is reachable from a machine whose plan is "our relays only",
+/// without the second machine ever homing there or sending the relay token there.
+#[must_use]
+pub fn verifier_accepts_public_relays(_config: &IrohConfig) -> bool {
+    true
+}
+
 /// The host part of each relay URL, for telling our relays from public ones.
 fn relay_hosts(urls: &[String]) -> Vec<String> {
     urls.iter()
@@ -160,13 +171,6 @@ pub async fn bind_with_map(
         ) => Some(map.clone()),
         _ => None,
     };
-    let fallback = matches!(
-        config.relay_plan(),
-        RelayPlan::Custom {
-            fallback_public: true,
-            ..
-        }
-    );
     let builder = Endpoint::builder(presets::Minimal)
         .secret_key(key)
         .alpns(vec![ALPN.to_vec()])
@@ -178,9 +182,11 @@ pub async fn bind_with_map(
                 .filter(|_| !config.relays.is_empty() && !config.direct_only),
             &relay_hosts(&config.relays),
             &fleet_host_pins(config),
-            // A relay from the fleet's list with no certificate of its own must be one a
-            // public CA signed for.
-            fallback || config.fleet_relays.iter().any(|entry| entry.pin.is_none()),
+            // Dial-only public relays: any relay a peer's signed transports record names
+            // that is not one of ours is checked against the public CAs, so a peer homed
+            // on iroh's public relays can be reached even when this machine's plan is "our
+            // relays only". The machine never homes there and the token never goes there.
+            verifier_accepts_public_relays(config),
         ))
         .relay_mode(mode);
     let endpoint = builder.bind().await.context("bind the iroh endpoint")?;
@@ -1292,6 +1298,32 @@ mod relay_tests {
                 .iter()
                 .any(|h| h.eq_ignore_ascii_case("relay.example"))
         );
+    }
+
+    /// The dial-only public relay rule: "our relays only" still dials a peer homed on a
+    /// public relay, without ever homing there or sending the token there.
+    #[test]
+    fn our_relays_only_still_dials_a_public_relay_without_homing_there() {
+        let dir = tempfile::tempdir().unwrap();
+        // A machine that homes only on its own pinned relay: no public relays in the plan.
+        let pin = "49:32:08:E4:6F:B8:E3:9B:FD:F2:8D:B8:0F:8C:33:F9:9F:2A:57:A0:A1:71:B3:52:4A:9D:11:67:AD:BD:C0:D1";
+        let cfg = config(
+            &format!("relay_url = \"https://162.35.10.46\"\nrelay_cert_sha256 = \"{pin}\"\n"),
+            dir.path(),
+        );
+        assert_eq!(
+            cfg.relay_plan(),
+            RelayPlan::Custom {
+                urls: vec!["https://162.35.10.46".into()],
+                fallback_public: false,
+            }
+        );
+        // The home relay map is ours only: no public relay is homed.
+        let mode = relay_mode(&cfg).unwrap();
+        assert_eq!(urls(&mode), ["https://162.35.10.46/"]);
+        // But a peer homed on a public relay can still be DIALED through it: the verifier
+        // accepts a public-CA relay for any host that is not one of ours.
+        assert!(verifier_accepts_public_relays(&cfg));
     }
 
     #[tokio::test]

@@ -49,7 +49,7 @@ fn declaration_path(route: &ProjectRoute) -> PathBuf {
 }
 
 /// Exactly what a master declaration signature covers.
-fn master_payload(declaration: &MasterDeclaration) -> String {
+pub fn master_payload(declaration: &MasterDeclaration) -> String {
     format!(
         "ferryman-master-v1\n{}\n{}\n{}\n{}",
         declaration.project_id,

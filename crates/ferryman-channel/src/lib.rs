@@ -4005,6 +4005,36 @@ pub fn register_agent_key(
     register_agent(route, &published)
 }
 
+/// Publish a peer's key for `agent` under the first-key-wins rule, without holding that
+/// peer's identity locally. For an invitation handshake, where the key arrives signed by
+/// the peer rather than loaded from a keystore: the reserved name binds to the first key
+/// that passes, and a different key is refused.
+pub fn register_agent_public_key(
+    route: &ProjectRoute,
+    agent: &AgentRoute,
+    public_key_hex: &str,
+) -> Result<PathBuf> {
+    let published = AgentRoute {
+        name: canonical_agent_name(&agent.name),
+        role: agent.role.clone(),
+        capabilities: agent.capabilities.clone(),
+        public_key: Some(public_key_hex.to_ascii_lowercase()),
+        encryption_key: agent.encryption_key.clone(),
+    };
+    if let Some(existing) = read_agent_roster(&route.communications)?
+        .into_iter()
+        .find(|a| canonical_agent_name(&a.name) == published.name)
+        && let Some(known) = existing.public_key.filter(|k| !k.is_empty())
+        && Some(&known) != published.public_key.as_ref()
+    {
+        bail!(
+            "agent '{}' is already published in this channel with a different key",
+            published.name
+        );
+    }
+    register_agent(route, &published)
+}
+
 /// One roster entry, written atomically.
 fn write_roster_entry(directory: &Path, agent: &AgentRoute) -> Result<PathBuf> {
     let path = directory.join(format!("{}.json", canonical_agent_name(&agent.name)));

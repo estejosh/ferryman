@@ -52,6 +52,7 @@
 
 pub mod config;
 pub mod health;
+pub mod invite;
 pub mod lane;
 pub mod manifest;
 pub mod tls;
@@ -68,12 +69,20 @@ pub use lane::{Lane, Status};
 /// The protocol a connection speaks. A peer that offers anything else is not this lane.
 pub const ALPN: &[u8] = b"ferryman/channel-sync/1";
 
+/// The protocol the invite endpoint speaks, on its own endpoint and its own key. A peer
+/// that offers the channel-sync ALPN here, or this ALPN on the lane, is refused.
+pub const INVITE_ALPN: &[u8] = b"ferryman/invite/1";
+
 /// The largest file the lane carries. A channel is coordination, not storage: orders,
 /// results, records. Anything bigger is something that belongs in git or a hand-in.
 pub const MAX_FILE: u64 = 64 * 1024 * 1024;
 
 /// The machine's iroh secret key, beside its operator seed.
 pub const KEY_FILE: &str = "iroh.key";
+
+/// The invite endpoint's iroh secret key, its own key beside the lane's. Never `iroh.key`:
+/// the invite endpoint proves a different identity and must not be reachable as the lane.
+pub const INVITE_KEY_FILE: &str = "invite-iroh.key";
 
 /// Where the worker's lane writes what it last did.
 pub const STATUS_FILE: &str = "iroh-status.json";
@@ -95,7 +104,17 @@ pub fn machine_dir() -> Result<PathBuf> {
 /// A key file that exists and is not 32 bytes of hex: a key that is quietly replaced
 /// changes the endpoint id every channel has on record, so it is a failure, not a reset.
 pub fn load_key(machine_dir: &Path) -> Result<Option<iroh::SecretKey>> {
-    let path = machine_dir.join(KEY_FILE);
+    load_key_file(machine_dir, KEY_FILE)
+}
+
+/// The invite endpoint's iroh key, if it has one. Never creates. Kept apart from the lane's
+/// key so the invite endpoint is a different identity.
+pub fn load_invite_key(machine_dir: &Path) -> Result<Option<iroh::SecretKey>> {
+    load_key_file(machine_dir, INVITE_KEY_FILE)
+}
+
+fn load_key_file(machine_dir: &Path, file: &str) -> Result<Option<iroh::SecretKey>> {
+    let path = machine_dir.join(file);
     if !path.is_file() {
         return Ok(None);
     }
@@ -121,30 +140,43 @@ pub fn load_key(machine_dir: &Path) -> Result<Option<iroh::SecretKey>> {
 /// # Errors
 /// The key file is unreadable or cannot be written.
 pub fn load_or_create_key(machine_dir: &Path) -> Result<(iroh::SecretKey, bool)> {
-    if let Some(key) = load_key(machine_dir)? {
+    load_or_create_key_file(machine_dir, KEY_FILE)
+}
+
+/// The invite endpoint's iroh key, created on first use. Its own key, beside the lane's:
+/// the endpoint that serves `ferryman/invite/1` must never share the lane's identity.
+pub fn load_or_create_invite_key(machine_dir: &Path) -> Result<(iroh::SecretKey, bool)> {
+    load_or_create_key_file(machine_dir, INVITE_KEY_FILE)
+}
+
+fn load_or_create_key_file(
+    machine_dir: &Path,
+    file: &str,
+) -> Result<(iroh::SecretKey, bool)> {
+    if let Some(key) = load_key_file(machine_dir, file)? {
         return Ok((key, false));
     }
     fs::create_dir_all(machine_dir)?;
-    let path = machine_dir.join(KEY_FILE);
+    let path = machine_dir.join(file);
     let key = iroh::SecretKey::generate();
     // `create_new`: two processes starting at once must not each write a key and leave
     // the machine with whichever lost the race on record somewhere.
-    let mut file = match fs::OpenOptions::new()
+    let mut opened = match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
     {
-        Ok(file) => file,
+        Ok(opened) => opened,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return load_key(machine_dir)?
+            return load_key_file(machine_dir, file)?
                 .map(|key| (key, false))
                 .ok_or_else(|| anyhow!("{} appeared and then vanished", path.display()));
         }
         Err(error) => bail!("create {}: {error}", path.display()),
     };
-    file.write_all(hex::encode(key.to_bytes()).as_bytes())?;
-    file.sync_all()?;
-    drop(file);
+    opened.write_all(hex::encode(key.to_bytes()).as_bytes())?;
+    opened.sync_all()?;
+    drop(opened);
     ferryman_channel::restrict_to_owner(&path)?;
     Ok((key, true))
 }

@@ -73,7 +73,7 @@ pub struct Transports {
     pub signature: String,
 }
 
-fn payload(record: &Transports) -> String {
+pub fn payload(record: &Transports) -> String {
     format!(
         "ferryman-transports-v{}\n{}\n{}\n{}\n{}\n{}",
         record.version,

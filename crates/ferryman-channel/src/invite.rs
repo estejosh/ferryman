@@ -177,7 +177,7 @@ pub fn handshake_name(id: &str) -> String {
     format!("ferry:{id}")
 }
 
-fn invite_payload(invite: &Invite) -> String {
+pub fn invite_payload(invite: &Invite) -> String {
     let base = format!(
         "ferryman-invite-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         invite.id,
@@ -206,7 +206,7 @@ fn invite_payload(invite: &Invite) -> String {
     }
 }
 
-fn acceptance_payload(accept: &Acceptance) -> String {
+pub fn acceptance_payload(accept: &Acceptance) -> String {
     format!(
         "ferryman-invite-accept-v1\n{}\n{}\n{}\n{}\n{}\n{}",
         accept.invite_id,
@@ -220,6 +220,24 @@ fn acceptance_payload(accept: &Acceptance) -> String {
 
 fn hash_nonce(nonce: &str) -> String {
     hex::encode(Sha256::digest(nonce.as_bytes()))
+}
+
+/// Whether `nonce` is the one an invite's stored hash commits to, compared in constant
+/// time so a wrong guess learns nothing about which part was wrong.
+#[must_use]
+pub fn nonce_matches(invite: &Invite, nonce: &str) -> bool {
+    constant_time_eq(hash_nonce(nonce).as_bytes(), invite.nonce_hash.as_bytes())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn random_hex(bytes: usize) -> String {
@@ -525,6 +543,22 @@ pub fn write_acceptance(
     operator: &str,
     agent: Option<&str>,
 ) -> Result<PathBuf> {
+    let accept = build_acceptance(signer, code, device_id, operator, agent);
+    fs::create_dir_all(invites_dir(route))?;
+    let path = acceptance_path(route, &code.id);
+    crate::atomic_json(&path, &accept)?;
+    Ok(path)
+}
+
+/// Build and sign an acceptance without writing it anywhere. The v1 path writes it into
+/// the channel so it syncs; the v2 path sends it over the invite connection instead.
+pub fn build_acceptance(
+    signer: &AgentIdentity,
+    code: &InviteCode,
+    device_id: &str,
+    operator: &str,
+    agent: Option<&str>,
+) -> Acceptance {
     let mut accept = Acceptance {
         invite_id: code.id.clone(),
         nonce: code.nonce.clone(),
@@ -538,10 +572,7 @@ pub fn write_acceptance(
     let signature = signer.signing.sign(acceptance_payload(&accept).as_bytes());
     accept.signed_by = Some(signer.name().to_string());
     accept.signature = Some(hex::encode(signature.to_bytes()));
-    fs::create_dir_all(invites_dir(route))?;
-    let path = acceptance_path(route, &code.id);
-    crate::atomic_json(&path, &accept)?;
-    Ok(path)
+    accept
 }
 
 /// Where a joiner keeps the code between `accept` and the moment they create their
@@ -673,6 +704,11 @@ pub fn settle_pending(route: &ProjectRoute) -> Result<Settled> {
         let mut paired_this_pass: Vec<String> = Vec::new();
         for invite in &invites {
             if invite.accepted_device.is_some() {
+                continue;
+            }
+            // A v2 (iroh) invite is not paired through Syncthing knocking: its device is
+            // let in by the invite endpoint handshake, and nothing here touches Syncthing.
+            if invite.endpoint.is_some() {
                 continue;
             }
             let name = handshake_name(&invite.id);
@@ -832,6 +868,16 @@ pub fn mark_granted(route: &ProjectRoute, id: &str) -> Result<()> {
         bail!("no invite {id}");
     };
     invite.granted_at = Some(Utc::now());
+    write(route, &invite)
+}
+
+/// Burn an invite now (five failed nonce attempts, or a revoke). Persisted by writing the
+/// record with its expiry set to now.
+pub fn burn(route: &ProjectRoute, id: &str) -> Result<()> {
+    let Some(mut invite) = read(route, id)? else {
+        return Ok(());
+    };
+    invite.expires_at = Utc::now();
     write(route, &invite)
 }
 
