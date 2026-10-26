@@ -6462,6 +6462,7 @@ fn team_revoke_all(name: &str, reason: &str, as_master: Option<String>) -> Resul
                 revoked += 1;
                 println!("  {project}: revoked (signed by {master})");
                 unshare_revoked_devices(&root, project, name);
+                burn_open_invites_for(&root, project, name);
             }
             Revocation::AlreadyRevoked => {
                 there += 1;
@@ -6533,6 +6534,32 @@ fn unshare_revoked_devices(root: &ferryman_channel::ferry::Root, project: &str, 
     match ferryman_channel::syncthing_unshare_folder(&route, &devices) {
         Ok(_) => println!("    folder unshared from {} device(s)", devices.len()),
         Err(error) => println!("    could not unshare the folder: {error:#}"),
+    }
+}
+
+/// Burn any open invitation naming `name`, so a revoked v2 member's code stops working too.
+/// A v2 invite has no Syncthing device to unshare; its revocation is the signed revocation
+/// plus the burned invite.
+fn burn_open_invites_for(root: &ferryman_channel::ferry::Root, project: &str, name: &str) {
+    use ferryman_channel::invite;
+    let Some(entry) = root
+        .read()
+        .projects
+        .into_iter()
+        .find(|entry| entry.project_id == project)
+    else {
+        return;
+    };
+    let Ok((route, _)) = (ferryman_channel::ferry::Entry {
+        repo: None,
+        ..entry
+    })
+    .route(root) else {
+        return;
+    };
+    match invite::burn_for(&route, name) {
+        Ok(n) if n > 0 => println!("    burned {n} invitation(s)"),
+        _ => {}
     }
 }
 
@@ -6930,7 +6957,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     &identity,
                     &machine,
                     chrono::Duration::days(expires_days.max(1)),
-                    &device,
+                    &invite::Transport::Syncthing { device_id: device },
                 )?;
                 let joined_as = invite.operator.as_deref().unwrap_or(&machine);
                 println!("adding {joined_as} to {}", route.project_id);
