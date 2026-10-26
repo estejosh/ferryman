@@ -231,6 +231,8 @@ other. See its [README](crates/ferry-deadman/README.md).
 | [Running in a container](docs/CONTAINER.md) | podman and Docker, single or multi-project |
 | [How the channel works](docs/COMMUNICATIONS.md) | delivery, failover, health |
 | [MCP server (beta)](docs/MCP.md) | connect Claude Desktop, Claude Code or Codex |
+| [The iroh lane](docs/IROH_LANE.md) | channels over QUIC, through a relay of your choice |
+| [Run your own relay](docs/SELF_HOSTING.md) | a relay on a VPS or a home server, with certificates, tokens and `ferry.toml` |
 | [Architecture](docs/ARCHITECTURE.md) | boundaries and design constraints |
 | [Threat model](docs/THREAT_MODEL.md) | what it defends against, and what it does not |
 | [Writing a worker (server mode)](docs/WRITING_A_WORKER.md) | the lease-based worker protocol behind `ferryman-server` |

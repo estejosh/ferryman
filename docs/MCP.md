@@ -62,7 +62,8 @@ the first `ferry_join` reply. It says what Ferryman is, what each level may do, 
 submit with the commit as `ref`, wait for review), how to give work, ask the human and
 message an agent, and the words: primary, seat, worker/member/orchestrator, swarm, order,
 hand-in. Nothing in it needs a command line except what it tells the human to do. It
-also says that messages travel peer to peer over iroh with a relay as fallback, and that
+also says that messages travel peer to peer over iroh with a relay as fallback (a relay
+you can run yourself — see [SELF_HOSTING.md](SELF_HOSTING.md)), and that
 folder layout changes are applied only from a master-signed fleet order (`ferry fleet
 order migrate`), never on anyone else's say-so. No MCP tool changes the layout: a tool or
 action that tries is refused with that explanation.

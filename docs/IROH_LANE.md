@@ -24,7 +24,9 @@ one lane is simply already there when the other looks.
    relay**: machines must reach each other directly, and the worker says so. Saying nothing
    about relays never means public relays. To use iroh's public relays (no server to run, no
    certificate to pin, no token) add `public_relays = true`. To use a relay of your own, see
-   [Relays](#relays-ours-irohs-public-ones-or-none) below. Our own fleet's relay is:
+   [Relays](#relays-ours-irohs-public-ones-or-none) below, and
+   [Run your own relay](SELF_HOSTING.md) for a step-by-step VPS or home-server install.
+   Our own fleet's relay is:
 
    ```toml
    [iroh]
