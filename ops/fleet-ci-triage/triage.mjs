@@ -151,7 +151,40 @@ function fileTrackingIssue(repoFull, wfName, run) {
     "",
     "_Filed automatically by fleet-ci-triage. Close it once handled — it won't be re-opened for this commit._",
   ].join("\n");
-  sh(
+  const out = sh(
     `gh issue create --repo ${repoFull} --title ${JSON.stringify(title)} --body ${JSON.stringify(body)} --label ci-triage`,
   );
+  const issueNumber = out.trim().split("/").pop();
+  if (issueNumber) tryAssignCopilot(repoFull, Number(issueNumber));
+}
+
+// Copilot cloud agent is confirmed enabled (with safe review/approval policies)
+// on estejosh's repos as of 26 Oct 2026 — not on shindevlin's (Free plan, and
+// estejosh only has read access to shindevlin/hone). So: give flagged issues
+// to Copilot as a second opinion on estejosh repos; elsewhere they just sit as
+// plain tracking issues. Best-effort — never let this block the main report.
+function tryAssignCopilot(repoFull, issueNumber) {
+  const [owner, repo] = repoFull.split("/");
+  if (owner !== "estejosh") return;
+  try {
+    const q = `query($owner:String!,$repo:String!,$num:Int!){
+      repository(owner:$owner,name:$repo){
+        issue(number:$num){ id }
+        suggestedActors(capabilities:[CAN_BE_ASSIGNED], first:10){ nodes{ id login } }
+      }
+    }`;
+    const resp = ghApi(
+      `graphql -f query=${JSON.stringify(q)} -f owner=${owner} -f repo=${repo} -F num=${issueNumber}`,
+    );
+    const repoNode = resp?.data?.repository;
+    const issueId = repoNode?.issue?.id;
+    const copilot = repoNode?.suggestedActors?.nodes?.find((n) => n.login === "copilot-swe-agent");
+    if (!issueId || !copilot) return; // not assignable here — leave as a plain issue
+    const m = `mutation($assignableId:ID!,$actorId:ID!){
+      replaceActorsForAssignable(input:{assignableId:$assignableId,actorIds:[$actorId]}){ clientMutationId }
+    }`;
+    sh(`gh api graphql -f query=${JSON.stringify(m)} -f assignableId=${issueId} -f actorId=${copilot.id}`);
+  } catch {
+    /* best effort */
+  }
 }

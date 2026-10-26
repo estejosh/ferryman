@@ -56,16 +56,24 @@ safe and flags the rest — without that standing-agent shape.
 
 3. Edit `repos.json` any time to add/remove repos — no code change needed.
 
-## About GitHub Copilot
+## GitHub Copilot — wired in for estejosh's repos
 
-You mentioned you already have Copilot — worth pairing in, but I couldn't
-check or flip anything Copilot-related from here: whether "Copilot coding
-agent" is turned on is an account/repo setting in GitHub's own UI (Settings →
-Copilot), not exposed over the API with this session's access, and it's a
-billing/feature toggle I shouldn't guess at. Once you've confirmed it's
-enabled somewhere, the natural pairing is: a tracking issue that isn't safe
-for Claude to auto-fix gets assigned to `@copilot` as a second opinion,
-instead of just sitting for you. Say the word and I'll wire that in.
+Checked in-browser (26 Oct 2026): `estejosh` has Copilot Pro with "Copilot
+cloud agent" enabled account-wide, and the per-repo coding-agent settings on
+`ferryman` and `snifrig` (likely all estejosh repos, same Pro-plan defaults)
+already have safe policies on — approval required before Copilot's own
+workflow runs, automations restricted to write-access users, CodeQL/secret
+scanning/Copilot review as validation gates. `shindevlin` is on Copilot Free
+with cloud agent disabled there, and estejosh only has read access to
+`shindevlin/hone` anyway, so this doesn't reach Hone unless that changes.
+
+So: every tracking issue this files now also tries to assign `copilot-swe-agent`
+as a second opinion, but **only on repos under `estejosh`** (confirmed via
+GitHub's GraphQL `suggestedActors` query, which lists `copilot-swe-agent` as
+an assignable actor there). On `shindevlin/hone` and `shindevlin/phonehome`,
+issues stay plain tracking issues for you (or for `fleet-ci-fix.yml`, see
+below) until shindevlin has its own paid Copilot plan. The assignment is
+best-effort and never blocks filing the issue itself if it fails.
 
 ## Why this lives in `ferryman` and not its own repo
 
