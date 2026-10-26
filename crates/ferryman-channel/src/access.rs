@@ -785,6 +785,34 @@ pub fn comms_author_refused(
     None
 }
 
+/// The author(s) a channel file names, as canonical names: the `signed_by`, `sender`,
+/// `from`, `reviewer`, `releaser` or `offered_by` (and for a claim, heartbeat or result,
+/// `agent`) inside a JSON document, or on any line of a JSONL file, plus any word of the
+/// file name that reads as an agent (`claim.<agent>.json`, `<agent>.json`). Empty for a
+/// file that is not JSON and names no one.
+///
+/// This is the "who wrote this file" half of the access rules, without the Worker filter:
+/// a tombstone is honoured only when its `signed_by` is one of these, the master, or the
+/// head (see [`crate::tombstone`]).
+#[must_use]
+pub fn file_authors(relative: &str, bytes: &[u8]) -> Vec<String> {
+    let lower = relative.to_ascii_lowercase();
+    let file_name = lower.rsplit('/').next().unwrap_or_default();
+    let mut authors: Vec<String> = words(file_name)
+        .into_iter()
+        .map(|word| canonical_agent_name(&word))
+        .collect();
+    for value in json_values(file_name, bytes) {
+        for who in authors_in(&value, file_name) {
+            let who = canonical_agent_name(&who);
+            if !authors.iter().any(|have| have == &who) {
+                authors.push(who);
+            }
+        }
+    }
+    authors
+}
+
 /// The roster names that are Workers only because the master has not admitted them (no
 /// grant of theirs): a fresh name a Worker registered. Empty unless the project keeps
 /// hand-ins apart from the channel and has a Worker.
