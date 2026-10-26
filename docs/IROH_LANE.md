@@ -254,7 +254,13 @@ older, and the files go across and are written atomically.
   (`keys`, `*.key`, `*.seed`, executables, scripts, `local`, `*.tmp`).
 - Syncthing conflict copies, temporary files and Syncthing's own folders are never sent.
 - Nothing over 64 MiB.
-- Nothing is ever deleted. (erry root migrate moves a channel on disk; the lane then sees new paths under the root, and a peer that has not moved its own copy yet receives nothing deleted.)
+- A file is deleted only by a **tombstone** (`tombstones/<blake3 of the path>.json`), an
+  ordinary channel file signed by the deleted file's author, the project's master or the
+  head. A honoured tombstone removes the file it covers on every peer, and the manifest
+  never offers, wants or accepts that version again; a write after the tombstone with
+  different contents is a new file and survives. A tombstone for the channel's own
+  bookkeeping - `tombstones/`, `transports/`, `agents/`, `grants/`, `invites/`, `keys/`,
+  `local/`, `master.json`, or anything under the fleet folder - is refused.
 - Nothing is written outside the channel folder: `..`, absolute paths, drive letters,
   backslashes and Windows device names are refused, and no folder on the path or file at
   the end may be a symlink. Symlinks are never sent.
@@ -276,12 +282,11 @@ The fleet's own folder (`<root>/fleet/`, ADR 0026) is one more channel to the la
 A project's `data/` folder is machine-local and is never exchanged. By default it is `projects/<id>/data`, which is not a share. If a manifest records it somewhere that is inside a share (a hand edit, or an older record), the lane adds it to that share's exclusions; if it is the share itself, or the share is inside it, the lane exchanges nothing from that folder. `ferry doctor --layout` reports the same case.
 ## Not done yet
 
-- Channel compaction (`ferry channel compact`) is Syncthing-only for now. The lane never
-  deletes, so a peer would send back every message compaction removed and the space would
-  never be freed; and an archive file over 64 MiB would not be carried at all. `compact`
-  therefore refuses a channel the lane carries, or that has a `transports` record, with a
-  message saying so. Its archive files are split at 32 MiB (`<thread>.part2.jsonl`, ...)
-  so that they stay under the cap once the lane can propagate a removal.
+- A tombstone is kept for `tombstone_days` (`ferry.toml` `[iroh]`, default 90). Only
+  compaction drops older ones, and it records the oldest dropped `deleted_at` in the
+  channel; from a peer whose last good sync is older than that mark the lane refuses
+  incoming files older than the mark, so a long-offline peer cannot resurrect a
+  compacted file.
 - Files are checked by hash in transit, but not every file type's own signature is
   audited on arrival. The readers that already verify signatures (orders, results,
   policies, records) still do so when they read, exactly as for Syncthing.
