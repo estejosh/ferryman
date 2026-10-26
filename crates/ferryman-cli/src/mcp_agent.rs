@@ -11,7 +11,6 @@
 //!
 //! Token rules T1-T10 are enforced by the `mcp_budget` test in `mcp_agent_tests.rs`.
 
-use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
 use anyhow::{Result, anyhow, bail};
@@ -2706,10 +2705,19 @@ pub fn seat_app(route: &ProjectRoute, name: &str) -> Result<()> {
     }
     let identity = AgentIdentity::load_or_create(&name, &route.attachment)?;
     let key = identity.public_key_hex();
-    let on_roster = ferryman_channel::read_agent_roster(&route.communications)
-        .unwrap_or_default()
-        .iter()
-        .any(|a| is_me(&a.name, &name) && a.public_key.as_deref() == Some(key.as_str()));
+    // The project's own roster file, not the merged view: that one also lists the
+    // machine-wide fleet roster, which would say "seated" for every project after the first.
+    let on_roster = std::fs::read_to_string(
+        route
+            .communications
+            .join("agents")
+            .join(format!("{name}.json")),
+    )
+    .ok()
+    .and_then(|text| serde_json::from_str::<ferryman_channel::AgentRoute>(&text).ok())
+    .is_some_and(|entry| {
+        entry.public_key.as_deref() == Some(key.as_str()) && entry.role == access::APP_ROLE
+    });
     if on_roster {
         return Ok(());
     }
