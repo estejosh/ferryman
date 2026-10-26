@@ -443,6 +443,10 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/contracts", get(contracts_get))
         .route("/api/contracts/{reference}/lock", post(contract_lock))
         .route("/api/contracts/{reference}/reject", post(contract_reject))
+        .route("/api/apps", get(apps_get))
+        .route("/api/apps/{id}/approve", post(apps_approve))
+        .route("/api/apps/{id}/deny", post(apps_deny))
+        .route("/api/apps/{id}/revoke", post(apps_revoke))
         .route("/api/adversary", get(adversary_get))
         .route("/api/adversary/override", post(adversary_override))
         // Order matters: layers wrap outermost-last, so the Host guard runs BEFORE the
@@ -617,6 +621,190 @@ async fn shutdown_signal() {
 }
 
 type DashboardError = (StatusCode, String);
+
+// ---------------------------------------------------------------------------------------
+// Connected apps (ADR 0031): the apps that log in to `ferry mcp serve --http`.
+
+/// The routes an app decision applies to: every live project in this machine's root, or
+/// the one on screen when there is no root.
+fn app_routes(state: &DashboardState) -> Vec<ProjectRoute> {
+    let mut routes = ferryman_channel::apps::live_routes();
+    if routes.is_empty() {
+        routes.push(state.route.as_ref().clone());
+    }
+    ferryman_channel::apps::refreshed(&routes)
+}
+
+fn apps_dir_or_err() -> Result<PathBuf, DashboardError> {
+    ferryman_channel::apps::default_state_dir().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "this machine has no per-user state directory".to_string(),
+    ))
+}
+
+/// The signed-in person's key as the master's, in the projects they are master of.
+fn session_signer(current: &AgentIdentity) -> impl Fn(&ProjectRoute) -> Option<AgentIdentity> + '_ {
+    move |route| {
+        let master = ferryman_channel::master::read_master(route)
+            .ok()
+            .flatten()?;
+        master
+            .master
+            .eq_ignore_ascii_case(current.name())
+            .then(|| AgentIdentity::from_seed(current.name(), current.seed_bytes()))
+    }
+}
+
+fn app_card(dir: &std::path::Path, app: &ferryman_channel::apps::App) -> Value {
+    let used = ferryman_channel::apps::usage(dir, &app.id);
+    json!({
+        "id": app.id,
+        "agent": app.agent,
+        "client_name": app.client_name,
+        "redirect_host": app.redirect_host,
+        "state": app.state.as_str(),
+        "level": app.level.unwrap_or(app.requested).as_str(),
+        "projects": app.projects,
+        "created": app.created,
+        "last_used": used.last_used,
+        "calls": used.calls,
+    })
+}
+
+/// GET /api/apps - every connected app: who it is, its level, where, when it last called.
+/// Waiting apps whose grant has since synced here are settled first.
+async fn apps_get(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, DashboardError> {
+    let dir = apps_dir_or_err()?;
+    let routes = app_routes(&state);
+    let now = chrono::Utc::now().timestamp();
+    let cards: Vec<Value> = ferryman_channel::apps::list(&dir)
+        .into_iter()
+        .map(|mut app| {
+            if app.state == ferryman_channel::apps::State::Pending {
+                let _ = ferryman_channel::apps::settle(&dir, &mut app, &routes, now);
+            }
+            app_card(&dir, &app)
+        })
+        .collect();
+    let may_decide = !state.read_only
+        && state
+            .sessions
+            .resolve(session_token(&headers))
+            .is_some_and(|me| {
+                routes.iter().any(|route| {
+                    ferryman_channel::master::read_master(route)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.master.eq_ignore_ascii_case(me.name()))
+                })
+            });
+    Ok(Json(json!({ "apps": cards, "may_decide": may_decide })))
+}
+
+#[derive(Deserialize, Default)]
+struct AppApproveBody {
+    /// `worker` (the default) or `member`.
+    #[serde(default)]
+    level: Option<String>,
+    /// Only these projects; every live project the signed-in master owns when empty.
+    #[serde(default)]
+    projects: Vec<String>,
+}
+
+/// The signed-in session, or why not.
+fn decider(
+    state: &DashboardState,
+    headers: &HeaderMap,
+) -> Result<Arc<AgentIdentity>, DashboardError> {
+    if state.read_only {
+        return Err((StatusCode::FORBIDDEN, "dashboard is read-only".to_string()));
+    }
+    state.sessions.resolve(session_token(headers)).ok_or((
+        StatusCode::UNAUTHORIZED,
+        "no active session; sign in again".to_string(),
+    ))
+}
+
+/// POST /api/apps/{id}/approve - sign the app in: a roster entry and a Worker grant (a
+/// Member one when asked), by the master's key, in each live project the signed-in person
+/// is master of. Never an Orchestrator.
+async fn apps_approve(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<AppApproveBody>>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = decider(&state, &headers)?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let level = ferryman_channel::access::Level::parse(body.level.as_deref().unwrap_or("worker"))
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let dir = apps_dir_or_err()?;
+    let mut app = ferryman_channel::apps::find(&dir, &id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let report = ferryman_channel::apps::approve(
+        &dir,
+        &mut app,
+        level,
+        &body.projects,
+        &app_routes(&state),
+        &session_signer(&current),
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({
+        "app": app_card(&dir, &app),
+        "signed": report.signed,
+        "skipped": report.skipped.iter().map(|(p, why)| json!({ "project": p, "why": why })).collect::<Vec<_>>(),
+        "request_file": (app.state == ferryman_channel::apps::State::Pending)
+            .then(|| ferryman_channel::apps::request_file(&dir, &app.id).display().to_string()),
+    })))
+}
+
+/// POST /api/apps/{id}/deny - refuse a waiting app; its key is deleted.
+async fn apps_deny(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, DashboardError> {
+    decider(&state, &headers)?;
+    let dir = apps_dir_or_err()?;
+    let mut app = ferryman_channel::apps::find(&dir, &id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    ferryman_channel::apps::deny(&dir, &mut app, chrono::Utc::now().timestamp())
+        .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+    Ok(Json(json!({ "app": app_card(&dir, &app) })))
+}
+
+/// POST /api/apps/{id}/revoke - end an app in one click: its tokens stop at the server's
+/// next request, its grant is signed down and the revocation recorded where the signed-in
+/// master owns the project, and its key is deleted.
+async fn apps_revoke(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = decider(&state, &headers)?;
+    let dir = apps_dir_or_err()?;
+    let mut app = ferryman_channel::apps::find(&dir, &id)
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    let done = ferryman_channel::apps::revoke(
+        &dir,
+        &mut app,
+        &app_routes(&state),
+        &session_signer(&current),
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(internal)?;
+    Ok(Json(json!({
+        "app": app_card(&dir, &app),
+        "key_deleted": done.key_deleted,
+        "signed": done.signed,
+        "skipped": done.skipped.iter().map(|(p, why)| json!({ "project": p, "why": why })).collect::<Vec<_>>(),
+    })))
+}
 
 fn internal(error: Error) -> DashboardError {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
@@ -5775,6 +5963,7 @@ mod tests {
             "/api/improve/pending",
             "/api/focus",
             "/api/suggestions",
+            "/api/apps",
         ] {
             let response = app
                 .clone()
@@ -5799,6 +5988,9 @@ mod tests {
             ("/api/engine-policy/settings", r#"{"width":{"build":9}}"#),
             ("/api/focus", r#"{"projects":["ferryman"],"tier":"paused"}"#),
             ("/api/focus/clear", "{}"),
+            ("/api/apps/app-x/approve", "{}"),
+            ("/api/apps/app-x/deny", "{}"),
+            ("/api/apps/app-x/revoke", "{}"),
             (
                 "/api/suggestions/decide",
                 r#"{"issue":1,"choice":"accept"}"#,
@@ -8675,5 +8867,122 @@ mod tests {
             sessions.resolve(&token).is_none(),
             "idle session must expire"
         );
+    }
+
+    /// Connected apps: the master sees a waiting app, approves it as a Worker or a Member
+    /// (never an Orchestrator), and revokes it in one click.
+    #[tokio::test]
+    async fn connected_apps_are_approved_and_revoked_from_the_dashboard() {
+        use ferryman_channel::access::{Level, level_of};
+        use ferryman_channel::apps;
+        let dir = tempfile::tempdir().unwrap();
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.path().join("machine"));
+        let route = Arc::new(test_route(dir.path()));
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let token = signed_in(&app, &dashboard_state).await;
+        assert_eq!(
+            post(&app, "/api/master/init", "{}", Some(&token))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let dir_state = apps::default_state_dir().unwrap();
+        let now = Utc::now().timestamp();
+        let ask = |name: &str, host: &str, at: i64| {
+            apps::request(
+                &dir_state,
+                std::slice::from_ref(route.as_ref()),
+                &apps::Request {
+                    client_name: name,
+                    redirect_host: host,
+                },
+                now + at,
+            )
+            .unwrap()
+        };
+        let claude = ask("Claude", "claude.ai", 0);
+        assert_eq!(claude.agent, "claude-ai-alice");
+
+        let listed = get_json(&app, "/api/apps", Some(&token)).await;
+        assert_eq!(listed["may_decide"], true);
+        assert_eq!(listed["apps"][0]["state"], "pending", "{listed}");
+        assert_eq!(listed["apps"][0]["agent"], "claude-ai-alice");
+        assert_eq!(listed["apps"][0]["level"], "worker");
+
+        // Never an Orchestrator; an unknown app is not found.
+        let uri = |id: &str, verb: &str| format!("/api/apps/{id}/{verb}");
+        assert_eq!(
+            post(
+                &app,
+                &uri(&claude.id, "approve"),
+                r#"{"level":"orchestrator"}"#,
+                Some(&token)
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            post(&app, &uri("app-nope", "approve"), "{}", Some(&token))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        // Approved with an empty body: a Worker, signed by the master.
+        let approved = post(&app, &uri(&claude.id, "approve"), "{}", Some(&token)).await;
+        assert_eq!(approved.status(), StatusCode::OK);
+        let approved: Value =
+            serde_json::from_slice(&approved.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(approved["app"]["state"], "approved", "{approved}");
+        assert_eq!(approved["signed"][0], "ferryman");
+        assert_eq!(
+            level_of(&route.communications, &route.project_id, &claude.agent),
+            Level::Worker
+        );
+
+        // A second app, as a Member by choice; a third is refused.
+        let chat = ask("ChatGPT", "chatgpt.com", 1);
+        post(
+            &app,
+            &uri(&chat.id, "approve"),
+            r#"{"level":"member"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(
+            level_of(&route.communications, &route.project_id, &chat.agent),
+            Level::Member
+        );
+        let other = ask("Other", "example.org", 2);
+        let denied = post(&app, &uri(&other.id, "deny"), "{}", Some(&token)).await;
+        assert_eq!(denied.status(), StatusCode::OK);
+        assert!(apps::load_key(&dir_state, &other.agent).is_none());
+
+        // One click ends the Member: key gone, grant signed down, revocation recorded.
+        assert!(apps::load_key(&dir_state, &chat.agent).is_some());
+        let revoked = post(&app, &uri(&chat.id, "revoke"), "{}", Some(&token)).await;
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let revoked: Value =
+            serde_json::from_slice(&revoked.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(revoked["key_deleted"], true, "{revoked}");
+        assert_eq!(revoked["app"]["state"], "revoked");
+        assert!(apps::load_key(&dir_state, &chat.agent).is_none());
+        assert_eq!(
+            level_of(&route.communications, &route.project_id, &chat.agent),
+            Level::Worker
+        );
+        let fresh = &apps::refreshed(std::slice::from_ref(route.as_ref()))[0];
+        assert!(ferryman_channel::master::is_revoked(fresh, &chat.agent).unwrap());
+        let listed = get_json(&app, "/api/apps", Some(&token)).await;
+        let states: Vec<&str> = listed["apps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(states, ["approved", "revoked", "denied"]);
     }
 }

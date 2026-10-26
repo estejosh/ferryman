@@ -54,7 +54,7 @@ fn sha_hex(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
-fn random_hex(bytes: usize) -> String {
+pub fn random_hex(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
     hex::encode(buf)
@@ -537,20 +537,78 @@ impl Store {
         Ok(self.mint(&token.grant, now))
     }
 
-    /// Is `token` a live access token for this audience and this agent?
+    /// The agent a live access token for this audience belongs to.
     #[must_use]
-    pub fn verify_access(&self, token: &str, audience: &str, agent: &str, now: i64) -> bool {
-        let Some(access) = self.data.access.get(&sha_hex(token)) else {
-            return false;
-        };
-        let Some(grant) = self.data.grants.get(&access.grant) else {
-            return false;
-        };
-        access.expires > now
+    pub fn access_agent(&self, token: &str, audience: &str, now: i64) -> Option<String> {
+        let access = self.data.access.get(&sha_hex(token))?;
+        let grant = self.data.grants.get(&access.grant)?;
+        (access.expires > now
             && grant.expires > now
             && !grant.revoked
-            && grant.audience == audience
-            && grant.agent == agent
+            && grant.audience == audience)
+            .then(|| grant.agent.clone())
+    }
+
+    /// Is `token` a live access token for this audience and this agent?
+    #[cfg(test)]
+    #[must_use]
+    pub fn verify_access(&self, token: &str, audience: &str, agent: &str, now: i64) -> bool {
+        self.access_agent(token, audience, now).as_deref() == Some(agent)
+    }
+
+    /// End every grant `agent` holds, and with them every access and refresh token.
+    pub fn revoke_agent(&mut self, agent: &str) {
+        let ids: Vec<String> = self
+            .data
+            .grants
+            .iter()
+            .filter(|(_, g)| g.agent == agent && !g.revoked)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            self.revoke(&id);
+        }
+    }
+
+    /// Grants of `agent` that could still mint or honour a token.
+    #[must_use]
+    pub fn live_grants(&self, agent: &str, now: i64) -> usize {
+        self.data
+            .grants
+            .values()
+            .filter(|g| g.agent == agent && !g.revoked && g.expires > now)
+            .count()
+    }
+
+    /// RFC 7009: end the grant behind an access or refresh token, and with it both kinds.
+    /// `Ok(None)` for a token we do not know or that is already dead (the RFC wants a plain
+    /// success there). A token issued to another client is refused: a public client proves
+    /// itself with its `client_id` only, so that is the one check there is.
+    pub fn revoke_token(
+        &mut self,
+        token: &str,
+        client_id: &str,
+    ) -> Result<Option<String>, OAuthError> {
+        let hash = sha_hex(token);
+        let grant_id = self
+            .data
+            .access
+            .get(&hash)
+            .map(|a| a.grant.clone())
+            .or_else(|| self.data.refresh.get(&hash).map(|r| r.grant.clone()));
+        let Some(grant) =
+            grant_id.and_then(|id| self.data.grants.get(&id).cloned().map(|g| (id, g)))
+        else {
+            return Ok(None);
+        };
+        if grant.1.client_id != client_id {
+            return Err(oauth_error(
+                "invalid_client",
+                "that token was not issued to this client",
+            ));
+        }
+        self.revoke(&grant.0);
+        Ok(Some(grant.1.agent))
     }
 }
 
@@ -828,5 +886,93 @@ mod tests {
         // And they survive a restart.
         let reopened = Store::open(dir.path()).unwrap();
         assert!(reopened.verify_access(t["access_token"].as_str().unwrap(), AUD, "claude-ai", 1));
+    }
+
+    #[test]
+    fn revoking_a_token_ends_the_whole_grant_and_checks_the_client() {
+        let mut s = store();
+        let c = client(&mut s, 0);
+        let other = client(&mut s, 0);
+        let t = tokens(&mut s, &c, 0);
+        let (access, refresh) = (
+            t["access_token"].as_str().unwrap().to_string(),
+            t["refresh_token"].as_str().unwrap().to_string(),
+        );
+        assert_eq!(s.live_grants("claude-ai", 1), 1);
+        // Another client cannot end it; an unknown token is a quiet success.
+        assert_eq!(
+            s.revoke_token(&refresh, &other).unwrap_err().code,
+            "invalid_client"
+        );
+        assert_eq!(s.revoke_token("fmcp_rt_nope", &c).unwrap(), None);
+        assert!(s.verify_access(&access, AUD, "claude-ai", 1));
+        // Revoking the refresh token takes the access token with it.
+        assert_eq!(
+            s.revoke_token(&refresh, &c).unwrap().as_deref(),
+            Some("claude-ai")
+        );
+        assert!(!s.verify_access(&access, AUD, "claude-ai", 2));
+        assert_eq!(s.live_grants("claude-ai", 2), 0);
+        let dead = s.refresh(
+            &form(&[("refresh_token", &refresh), ("client_id", &c)]),
+            AUD,
+            3,
+        );
+        assert_eq!(dead.unwrap_err().code, "invalid_grant");
+        // And an access token does the same.
+        let t = tokens(&mut s, &c, 10);
+        let access = t["access_token"].as_str().unwrap();
+        s.revoke_token(access, &c).unwrap();
+        assert!(!s.verify_access(access, AUD, "claude-ai", 11));
+    }
+
+    #[test]
+    fn revoking_an_agent_kills_all_its_tokens_at_once_and_only_its_own() {
+        let mut s = store();
+        let c = client(&mut s, 0);
+        let first = tokens(&mut s, &c, 0);
+        let second = tokens(&mut s, &c, 1);
+        let code = s.issue_code(
+            &CodeRequest {
+                client_id: &c,
+                redirect_uri: CLAUDE_CALLBACK,
+                challenge: &s256(VERIFIER),
+                audience: AUD,
+                scope: SCOPE_READ,
+                agent: "chatgpt",
+            },
+            2,
+        );
+        let third = s
+            .exchange_code(
+                &form(&[
+                    ("code", &code),
+                    ("client_id", &c),
+                    ("redirect_uri", CLAUDE_CALLBACK),
+                    ("code_verifier", VERIFIER),
+                ]),
+                AUD,
+                2,
+            )
+            .unwrap();
+        s.revoke_agent("claude-ai");
+        for t in [&first, &second] {
+            assert!(!s.verify_access(t["access_token"].as_str().unwrap(), AUD, "claude-ai", 3));
+            let r = s.refresh(
+                &form(&[
+                    ("refresh_token", t["refresh_token"].as_str().unwrap()),
+                    ("client_id", &c),
+                ]),
+                AUD,
+                3,
+            );
+            assert_eq!(r.unwrap_err().code, "invalid_grant");
+        }
+        assert!(s.verify_access(third["access_token"].as_str().unwrap(), AUD, "chatgpt", 3));
+        assert_eq!(
+            s.access_agent(third["access_token"].as_str().unwrap(), AUD, 3)
+                .as_deref(),
+            Some("chatgpt")
+        );
     }
 }

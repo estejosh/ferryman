@@ -13,6 +13,7 @@
 
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -768,6 +769,9 @@ pub struct Agent {
     pub me: String,
     /// `--tools admin`.
     pub admin: bool,
+    /// The keystore of a connected app (ADR 0031): where this identity's key lives when it
+    /// is not an agent of this machine. `None` for every ordinary agent.
+    pub keys: Option<PathBuf>,
 }
 
 impl Agent {
@@ -782,7 +786,23 @@ impl Agent {
                 "--as {me} is the master identity. Agents ask and never approve, so the master does not run this server; use an agent identity, and decide in the dashboard or with `ferry channel review`"
             );
         }
-        Ok(Self { route, me, admin })
+        Ok(Self {
+            route,
+            me,
+            admin,
+            keys: None,
+        })
+    }
+
+    /// This identity's key: the attachment's, or else the connected-app keystore.
+    fn key(&self) -> Option<AgentIdentity> {
+        AgentIdentity::load_existing(&self.me, &self.route.attachment)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                let keys = self.keys.as_ref()?;
+                AgentIdentity::load_existing(&self.me, keys).ok().flatten()
+            })
     }
 
     /// Is `--as <name>` an agent this machine actually holds the key for, seated on the
@@ -790,8 +810,7 @@ impl Agent {
     /// this is true every tool but `ferry_join` refuses, and nothing is registered here.
     #[must_use]
     pub fn seated(&self) -> bool {
-        let Ok(Some(identity)) = AgentIdentity::load_existing(&self.me, &self.route.attachment)
-        else {
+        let Some(identity) = self.key() else {
             return false;
         };
         self.route().agents.iter().any(|a| {
@@ -846,9 +865,9 @@ impl Agent {
     }
 
     fn identity(&self) -> Result<AgentIdentity> {
-        match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
-            Ok(Some(identity)) => Ok(identity),
-            _ => Err(refusal(
+        match self.key() {
+            Some(identity) => Ok(identity),
+            None => Err(refusal(
                 "locked",
                 format!(
                     "no usable key for '{}' on this machine. Ask the owner to seat it: dashboard, Agents",
@@ -1051,18 +1070,16 @@ impl Agent {
         let note = if granted {
             None
         } else {
-            Some(
-                match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
-                    Ok(Some(_)) => format!(
-                        "'{}' has a key here but is not seated on the roster. Ask the owner (dashboard, Agents)",
-                        self.me
-                    ),
-                    _ => format!(
-                        "no key for '{}' on this machine. Run `ferry channel join --as {}` here or ask the owner (dashboard, Agents), then restart the app. Until then this app can read nothing and write nothing",
-                        self.me, self.me
-                    ),
-                },
-            )
+            Some(match self.key() {
+                Some(_) => format!(
+                    "'{}' has a key here but is not seated on the roster. Ask the owner (dashboard, Agents)",
+                    self.me
+                ),
+                None => format!(
+                    "no key for '{}' on this machine. Run `ferry channel join --as {}` here or ask the owner (dashboard, Agents), then restart the app. Until then this app can read nothing and write nothing",
+                    self.me, self.me
+                ),
+            })
         };
         if !granted {
             let data = json!({
@@ -2277,15 +2294,7 @@ pub type RouteSource = std::sync::Arc<dyn Fn() -> Vec<ProjectRoute> + Send + Syn
 /// be read here.
 #[must_use]
 pub fn root_routes() -> Vec<ProjectRoute> {
-    let Some(root) = ferryman_channel::ferry::find_root() else {
-        return Vec::new();
-    };
-    root.read()
-        .projects
-        .iter()
-        .filter(|entry| !entry.is_archived())
-        .filter_map(|entry| entry.route(&root).ok().map(|(route, _)| route))
-        .collect()
+    ferryman_channel::apps::live_routes()
 }
 
 /// One identity across many projects. The per-project checks are the single-project
@@ -2297,6 +2306,8 @@ pub struct AllProjects {
     pub admin: bool,
     /// Served over HTTP to a cloud app: only Worker and Member seats are offered.
     pub remote: bool,
+    /// A connected app's keystore (ADR 0031), when this identity is one.
+    keys: Option<PathBuf>,
     source: RouteSource,
 }
 
@@ -2307,8 +2318,22 @@ impl AllProjects {
             me: ferryman_channel::canonical_agent_name(me),
             admin,
             remote,
+            keys: None,
             source,
         })
+    }
+
+    /// This identity is a connected app whose key lives in `keys`.
+    #[must_use]
+    pub fn with_keys(mut self, keys: PathBuf) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    fn agent(&self, route: ProjectRoute) -> Result<Agent> {
+        let mut agent = Agent::new(route, &self.me, self.admin)?;
+        agent.keys.clone_from(&self.keys);
+        Ok(agent)
     }
 
     /// The projects this identity is seated in, with its level in each.
@@ -2318,7 +2343,7 @@ impl AllProjects {
             .into_iter()
             .filter_map(|route| {
                 // The master identity is refused here too (Agent::new).
-                let agent = Agent::new(route.clone(), &self.me, self.admin).ok()?;
+                let agent = self.agent(route.clone()).ok()?;
                 if !agent.seated() {
                     return None;
                 }
@@ -2368,7 +2393,7 @@ impl AllProjects {
             return Err(bad(format!("unknown tool: {name}")));
         }
         let (route, _) = self.pick(&open, project.as_deref())?;
-        Ok(Agent::new(route, &self.me, self.admin)?.call(name, &args))
+        Ok(self.agent(route)?.call(name, &args))
     }
 
     fn pick(
@@ -2437,7 +2462,7 @@ impl AllProjects {
             .and_then(|rest| rest.split('/').next())
             .unwrap_or("");
         let (route, _) = self.pick(&self.open(), Some(project))?;
-        Agent::new(route, &self.me, self.admin)?.read_resource(uri)
+        self.agent(route)?.read_resource(uri)
     }
 }
 

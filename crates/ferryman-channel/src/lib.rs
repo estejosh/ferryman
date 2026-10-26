@@ -15,6 +15,7 @@ use std::{
 pub mod access;
 pub mod adversary;
 pub mod anchor;
+pub mod apps;
 pub mod ask;
 pub mod automerge;
 pub mod capability;
@@ -2323,6 +2324,40 @@ impl AgentIdentity {
     /// absent is to refuse.
     pub fn load_existing(name: &str, state_dir: &Path) -> Result<Option<Self>> {
         Self::from_state_file(name, state_dir)
+    }
+
+    /// A new random key kept in `dir` and nowhere else: not in the machine's general
+    /// keystore and not in any attachment, so deleting it ([`Self::remove_key`]) ends the
+    /// identity. For a connected app (ADR 0031), which is not an agent of this machine.
+    ///
+    /// # Errors
+    /// An unsafe name, or a key of that name already in `dir`.
+    pub fn create_in(name: &str, dir: &Path) -> Result<Self> {
+        if !is_safe_component(name) {
+            bail!("agent name must be a path-safe identifier")
+        }
+        let name = canonical_agent_name(name);
+        if Self::from_state_file(&name, dir)?.is_some() {
+            bail!("{name} already has a key in {}", dir.display());
+        }
+        let mut seed = [0u8; 32];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut seed);
+        let signing = SigningKey::from_bytes(&seed);
+        Self::write_state_file(&name, dir, &signing)?;
+        Ok(Self { name, signing })
+    }
+
+    /// Delete the key of `name` kept in `dir`. Whether there was one.
+    ///
+    /// # Errors
+    /// The file exists and cannot be removed.
+    pub fn remove_key(name: &str, dir: &Path) -> Result<bool> {
+        let path = Self::key_path(name, dir);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+        }
     }
 
     fn key_path(name: &str, state_dir: &Path) -> PathBuf {

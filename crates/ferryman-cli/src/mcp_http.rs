@@ -2,20 +2,27 @@
 //! (ADR 0031, revised 2026-10-25: login and MCP live on the user's own machine).
 //!
 //! One process, one `/mcp` endpoint, plus the OAuth endpoints a cloud app needs
-//! (`/.well-known/*`, `/register`, `/authorize`, `/token`). The listener is plain HTTP:
-//! put it behind TLS (the edge/ACME step, or a tunnel you control). It answers only to the
-//! one `Host` named by `--public-url`, and every `/mcp` request is checked for a live
+//! (`/.well-known/*`, `/register`, `/authorize`, `/token`, `/revoke`). The listener is plain
+//! HTTP: put it behind TLS (the edge/ACME step, or a tunnel you control). It answers only to
+//! the one `Host` named by `--public-url`, and every `/mcp` request is checked for a live
 //! access token for that exact resource before its body is read.
+//!
+//! Every app that logs in becomes its own agent (`ferryman_channel::apps`): the pairing code
+//! lets it ask, the owner approves on this machine (`ferry mcp apps approve`, or the dashboard),
+//! and only then does the browser get its authorization code. A token speaks as its app and
+//! nobody else, and revoking the app ends every token at the next request.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use ferryman_channel::apps;
+
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -23,6 +30,7 @@ use axum::routing::{any, get, post};
 use serde_json::{Value, json};
 
 use crate::mcp::{HTTP_PROTOCOLS, MAX_LINE_BYTES, Server, handle_line};
+use crate::mcp_agent::RouteSource;
 use crate::mcp_oauth::{self as oauth, CodeRequest, OAuthError, Store};
 
 /// What `--http` was started with.
@@ -47,18 +55,11 @@ pub struct Config {
     pub resource: String,
     /// The only `Host` header accepted.
     pub host: String,
-    /// The agent identity every app is bound to.
-    pub agent: String,
     pub state_dir: PathBuf,
 }
 
 impl Config {
-    pub fn new(
-        addr: SocketAddr,
-        public_url: Option<&str>,
-        agent: &str,
-        state_dir: PathBuf,
-    ) -> Result<Self> {
+    pub fn new(addr: SocketAddr, public_url: Option<&str>, state_dir: PathBuf) -> Result<Self> {
         let raw = match public_url {
             Some(url) => url.to_string(),
             None if addr.ip().is_loopback() => format!("http://{addr}"),
@@ -91,7 +92,6 @@ impl Config {
             resource: format!("{origin}/mcp"),
             origin,
             host,
-            agent: ferryman_channel::canonical_agent_name(agent),
             state_dir,
         })
     }
@@ -103,27 +103,43 @@ impl Config {
 
 /// The machine-local directory for tokens and pairing codes.
 pub fn default_state_dir() -> Result<PathBuf> {
-    ferryman_channel::licensing::machine_state_dir()
-        .map(|dir| dir.join("mcp-http"))
-        .context("no per-user state directory on this machine")
+    apps::default_state_dir().context("no per-user state directory on this machine")
 }
 
 pub struct App {
     cfg: Config,
-    server: Mutex<Server>,
+    /// The live projects, asked again on every use.
+    source: RouteSource,
     store: Mutex<Store>,
     /// Times of recent wrong pairing codes.
     failures: Mutex<Vec<i64>>,
+    /// Logins that passed the pairing code and wait for the owner, by wait token.
+    waiting: Mutex<HashMap<String, Waiting>>,
 }
 
+/// A login held between the pairing code and the owner's decision.
+struct Waiting {
+    app: String,
+    client_id: String,
+    redirect_uri: String,
+    challenge: String,
+    state: Option<String>,
+    created: i64,
+}
+
+/// Who a request's token speaks as, set by [`require_token`].
+#[derive(Clone)]
+struct Caller(String);
+
 impl App {
-    pub fn new(server: Server, cfg: Config) -> Result<Arc<Self>> {
+    pub fn new(cfg: Config, source: RouteSource) -> Result<Arc<Self>> {
         let store = Store::open(&cfg.state_dir)?;
         Ok(Arc::new(Self {
             cfg,
-            server: Mutex::new(server),
+            source,
             store: Mutex::new(store),
             failures: Mutex::new(Vec::new()),
+            waiting: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -131,17 +147,44 @@ impl App {
         self.store.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The projects a remote app would see, and at which level.
-    async fn projects(self: &Arc<Self>) -> Vec<(String, ferryman_channel::access::Level)> {
-        let app = self.clone();
+    fn waiting(&self) -> std::sync::MutexGuard<'_, HashMap<String, Waiting>> {
+        self.waiting.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn server_for(&self, agent: &str) -> Result<Server> {
+        Server::for_app(
+            agent,
+            self.source.clone(),
+            apps::keys_dir(&self.cfg.state_dir),
+        )
+    }
+
+    /// The projects `agent` would see, and at which level.
+    async fn projects(
+        self: &Arc<Self>,
+        agent: &str,
+    ) -> Vec<(String, ferryman_channel::access::Level)> {
+        let (app, agent) = (self.clone(), agent.to_string());
         tokio::task::spawn_blocking(move || {
-            app.server
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remote_projects()
+            app.server_for(&agent)
+                .map(|server| server.remote_projects())
+                .unwrap_or_default()
         })
         .await
         .unwrap_or_default()
+    }
+
+    /// End the tokens of every app the owner has revoked (from the CLI or the dashboard,
+    /// which cannot reach this process's memory).
+    fn sweep(&self) {
+        let revoked = apps::revoked_agents(&self.cfg.state_dir);
+        if revoked.is_empty() {
+            return;
+        }
+        let mut store = self.store();
+        for agent in revoked {
+            store.revoke_agent(&agent);
+        }
     }
 }
 
@@ -162,7 +205,9 @@ pub fn router(app: Arc<App>) -> Router {
             "/authorize",
             get(authorize_page).post(authorize_submit).layer(small()),
         )
+        .route("/authorize/wait", get(authorize_wait))
         .route("/token", post(token).layer(small()))
+        .route("/revoke", post(revoke).layer(small()))
         .layer(middleware::from_fn_with_state(app.clone(), host_guard))
         .with_state(app)
 }
@@ -175,34 +220,27 @@ pub async fn serve_listener(listener: tokio::net::TcpListener, app: Arc<App>) ->
 }
 
 /// `ferry mcp serve --http`: bind, print how to connect, and serve until killed.
-pub fn run(server: Server, options: &HttpOptions, agent: &str) -> Result<()> {
+pub fn run(options: &HttpOptions) -> Result<()> {
     let state_dir = match &options.state_dir {
         Some(dir) => dir.clone(),
         None => default_state_dir()?,
     };
-    let cfg = Config::new(
-        options.addr,
-        options.public_url.as_deref(),
-        agent,
-        state_dir,
-    )?;
-    let eligible = server.remote_projects();
-    if eligible.is_empty() {
-        bail!(
-            "'{}' is not seated as a Worker or Member in any live project here, so there is nothing to serve. \
-             Seat it first (ferry channel join --as {0}); Orchestrators and the master identity are never served over HTTP",
-            cfg.agent
-        );
+    let cfg = Config::new(options.addr, options.public_url.as_deref(), state_dir)?;
+    let live = crate::mcp_agent::root_routes();
+    if live.is_empty() {
+        bail!("there is no live project in the ferry root here, so there is nothing to serve");
     }
-    let app = App::new(server, cfg.clone())?;
+    let app = App::new(cfg.clone(), Arc::new(crate::mcp_agent::root_routes))?;
     let addr = options.addr;
     eprintln!("ferry mcp: connector URL {}", cfg.resource);
     eprintln!(
-        "ferry mcp: serving {} project(s) as '{}' on http://{addr} (plain HTTP: keep it behind TLS)",
-        eligible.len(),
-        cfg.agent
+        "ferry mcp: serving {} project(s) on http://{addr} (plain HTTP: keep it behind TLS)",
+        live.len()
     );
     eprintln!("ferry mcp: run `ferry mcp pair` for a one-time code to connect an app");
+    eprintln!(
+        "ferry mcp: each app gets its own identity once you approve it: `ferry mcp apps approve <id>`, or the dashboard"
+    );
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -307,9 +345,9 @@ async fn host_guard(State(app): State<Arc<App>>, request: Request, next: Next) -
     next.run(request).await
 }
 
-/// Auth before any parsing of the body: a live access token for this resource and this
-/// identity, and an identity that is still eligible.
-async fn require_token(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+/// Auth before any parsing of the body: a live access token for this resource, held by an
+/// app the owner still has approved, and an identity that still has a seat.
+async fn require_token(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -322,18 +360,20 @@ async fn require_token(State(app): State<Arc<App>>, request: Request, next: Next
     let Some(token) = token else {
         return unauthorized(&app, None);
     };
-    let valid =
-        app.store()
-            .verify_access(token, &app.cfg.resource, &app.cfg.agent, oauth::unix_now());
-    if !valid {
+    app.sweep();
+    let now = oauth::unix_now();
+    let agent = app.store().access_agent(token, &app.cfg.resource, now);
+    let Some(agent) = agent.filter(|agent| apps::is_live(&app.cfg.state_dir, agent)) else {
         return unauthorized(&app, Some("invalid_token"));
-    }
-    if app.projects().await.is_empty() {
+    };
+    if app.projects(&agent).await.is_empty() {
         return plain(
             StatusCode::FORBIDDEN,
-            "this identity is not seated as a Worker or Member in any live project",
+            "this app is not seated as a Worker or Member in any live project",
         );
     }
+    apps::record_use(&app.cfg.state_dir, &agent, now);
+    request.extensions_mut().insert(Caller(agent));
     next.run(request).await
 }
 
@@ -362,6 +402,8 @@ async fn as_metadata(State(app): State<Arc<App>>) -> Response {
             "authorization_endpoint": format!("{o}/authorize"),
             "token_endpoint": format!("{o}/token"),
             "registration_endpoint": format!("{o}/register"),
+            "revocation_endpoint": format!("{o}/revoke"),
+            "revocation_endpoint_auth_methods_supported": ["none"],
             "response_types_supported": ["code"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "code_challenge_methods_supported": ["S256"],
@@ -424,11 +466,11 @@ struct Valid {
     client_id: String,
     client_name: String,
     redirect_uri: String,
+    redirect_host: String,
     challenge: String,
     state: Option<String>,
-    scope: String,
-    agent: String,
-    projects: Vec<(String, ferryman_channel::access::Level)>,
+    /// The live projects an approved app may be seated in.
+    projects: Vec<String>,
 }
 
 async fn validate(app: &Arc<App>, p: &HashMap<String, String>) -> Result<Valid, Refused> {
@@ -462,28 +504,26 @@ async fn validate(app: &Arc<App>, p: &HashMap<String, String>) -> Result<Valid, 
     {
         return Err(fail("invalid_target", "resource is not this server"));
     }
-    let projects = app.projects().await;
+    let source = app.source.clone();
+    let projects: Vec<String> = tokio::task::spawn_blocking(move || {
+        source().into_iter().map(|route| route.project_id).collect()
+    })
+    .await
+    .unwrap_or_default();
     if projects.is_empty() {
-        return Err(Refused::Page(
-            "This Ferryman has no identity it may share: it must be seated as a Worker or Member in a live project.",
-        ));
+        return Err(Refused::Page("This Ferryman has no live project to share."));
     }
-    let scope = if projects
-        .iter()
-        .any(|(_, level)| *level == ferryman_channel::access::Level::Member)
-    {
-        format!("{} {}", oauth::SCOPE_READ, oauth::SCOPE_WRITE)
-    } else {
-        oauth::SCOPE_READ.to_string()
-    };
+    let redirect_host = url::Url::parse(redirect_uri)
+        .ok()
+        .and_then(|u| u.host_str().map(String::from))
+        .unwrap_or_default();
     Ok(Valid {
         client_id: client_id.into(),
         client_name,
         redirect_uri: redirect_uri.into(),
+        redirect_host,
         challenge: challenge.into(),
         state,
-        scope,
-        agent: app.cfg.agent.clone(),
         projects,
     })
 }
@@ -540,20 +580,10 @@ fn page(body: &str) -> String {
 }
 
 fn consent(valid: &Valid, p: &HashMap<String, String>, error: Option<&str>) -> String {
-    let host = url::Url::parse(&valid.redirect_uri)
-        .ok()
-        .and_then(|u| u.host_str().map(String::from))
-        .unwrap_or_default();
     let seats: String = valid
         .projects
         .iter()
-        .map(|(project, level)| {
-            format!(
-                "<li><code>{}</code> as {}</li>",
-                escape(project),
-                level.as_str()
-            )
-        })
+        .map(|project| format!("<li><code>{}</code></li>", escape(project)))
         .collect();
     let hidden: String = [
         "client_id",
@@ -574,18 +604,32 @@ fn consent(valid: &Valid, p: &HashMap<String, String>, error: Option<&str>) -> S
         .unwrap_or_default();
     page(&format!(
         "<h1>Connect an app to Ferryman</h1>\
-         <p><b>{name}</b> wants to connect. After you enter the code, it is sent to <b>{host}</b>.</p>\
-         <p>It will act as <code>{agent}</code> and see:</p><ul>{seats}</ul>\
-         <p class=small>The app, and the company behind it, will receive everything it reads through this connection.</p>\
+         <p><b>{name}</b> wants to connect. After you enter the code and approve it on this machine, it is sent to <b>{host}</b>.</p>\
+         <p>It will get an identity of its own. By default that is a Worker: it can read the channel and ask you, and cannot write into it. You can make it a Member when you approve. It can only be seated in:</p><ul>{seats}</ul>\
+         <p class=small>The app, and the company behind it, will receive everything it reads through this connection. You can revoke it at any time.</p>\
          {error}\
          <form method=post action=/authorize>{hidden}\
          <label>Pairing code<input name=pairing_code autocomplete=off autofocus required></label>\
          <button>Connect</button></form>\
          <p class=small>Get a code by running <code>ferry mcp pair</code> on this machine. It works once, for ten minutes.</p>",
         name = escape(&valid.client_name),
-        host = escape(&host),
-        agent = escape(&valid.agent),
+        host = escape(&valid.redirect_host),
     ))
+}
+
+/// "Waiting for the owner", which reloads itself until the owner has decided.
+fn waiting_page(app: &apps::App, wait: &str) -> Response {
+    let body = format!(
+        "<meta http-equiv=refresh content=\"3;url=/authorize/wait?w={wait}\">\
+         <h1>Waiting for your approval</h1>\
+         <p><b>{name}</b> will act as <code>{agent}</code>. Approve it on the machine that runs Ferryman:</p>\
+         <p><code>ferry mcp apps approve {id}</code></p>\
+         <p>or open the dashboard, Connected apps. This page continues by itself once you have. It gives up in ten minutes.</p>",
+        name = escape(&app.client_name),
+        agent = escape(&app.agent),
+        id = escape(&app.id),
+    );
+    html(StatusCode::OK, &page(&body))
 }
 
 async fn authorize_page(State(app): State<Arc<App>>, uri: Uri) -> Response {
@@ -626,22 +670,126 @@ async fn authorize_submit(State(app): State<Arc<App>>, body: Bytes) -> Response 
             &consent(&valid, &params, Some("That code is wrong or has expired.")),
         );
     }
-    let code = app.store().issue_code(
-        &CodeRequest {
-            client_id: &valid.client_id,
-            redirect_uri: &valid.redirect_uri,
-            challenge: &valid.challenge,
-            audience: &app.cfg.resource,
-            scope: &valid.scope,
-            agent: &app.cfg.agent,
-        },
-        now,
-    );
-    let mut pairs = vec![("code", code.as_str())];
-    if let Some(state) = &valid.state {
+    // The code opened the door; it does not make an identity. Ask for one and wait for the
+    // owner, who decides on this machine.
+    let (source, state_dir) = (app.source.clone(), app.cfg.state_dir.clone());
+    let (name, host) = (valid.client_name.clone(), valid.redirect_host.clone());
+    let asked = tokio::task::spawn_blocking(move || {
+        apps::request(
+            &state_dir,
+            &source(),
+            &apps::Request {
+                client_name: &name,
+                redirect_host: &host,
+            },
+            now,
+        )
+    })
+    .await;
+    let record = match asked {
+        Ok(Ok(record)) => record,
+        Ok(Err(error)) => {
+            return html(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &page(&format!(
+                    "<h1>Not now</h1><p>{}</p>",
+                    escape(&format!("{error:#}"))
+                )),
+            );
+        }
+        Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+    };
+    let wait = oauth::random_hex(16);
+    {
+        let mut held = app.waiting();
+        held.retain(|_, w| w.created + apps::PENDING_SECS + 60 > now);
+        held.insert(
+            wait.clone(),
+            Waiting {
+                app: record.id.clone(),
+                client_id: valid.client_id,
+                redirect_uri: valid.redirect_uri,
+                challenge: valid.challenge,
+                state: valid.state,
+                created: now,
+            },
+        );
+    }
+    waiting_page(&record, &wait)
+}
+
+/// The page the browser reloads while the owner decides. Approved: the authorization code
+/// goes to the app's registered return address. Refused or too slow: `access_denied`.
+async fn authorize_wait(State(app): State<Arc<App>>, uri: Uri) -> Response {
+    let params = form(uri.query().unwrap_or("").as_bytes());
+    let wait = params.get("w").cloned().unwrap_or_default();
+    let now = oauth::unix_now();
+    let held = {
+        let held = app.waiting();
+        held.get(&wait).map(|w| {
+            (
+                w.app.clone(),
+                w.client_id.clone(),
+                w.redirect_uri.clone(),
+                w.challenge.clone(),
+                w.state.clone(),
+                w.created,
+            )
+        })
+    };
+    let Some((app_id, client_id, redirect_uri, challenge, state, created)) = held else {
+        return html(
+            StatusCode::BAD_REQUEST,
+            &page("<h1>Expired</h1><p>This sign-in is over. Start again from the app.</p>"),
+        );
+    };
+    let (source, state_dir) = (app.source.clone(), app.cfg.state_dir.clone());
+    let decided = tokio::task::spawn_blocking(move || -> anyhow::Result<apps::App> {
+        let mut record = apps::find(&state_dir, &app_id)?;
+        // A grant the master signed elsewhere counts, with no one at this machine.
+        apps::settle(&state_dir, &mut record, &source(), now)?;
+        if record.state == apps::State::Pending && created + apps::PENDING_SECS <= now {
+            apps::deny(&state_dir, &mut record, now)?;
+        }
+        Ok(record)
+    })
+    .await;
+    let Ok(Ok(record)) = decided else {
+        return plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    };
+    let mut pairs: Vec<(&str, &str)> = Vec::new();
+    let code;
+    match record.state {
+        apps::State::Pending => return waiting_page(&record, &wait),
+        apps::State::Approved => {
+            let scope = if record.level == Some(ferryman_channel::access::Level::Member) {
+                format!("{} {}", oauth::SCOPE_READ, oauth::SCOPE_WRITE)
+            } else {
+                oauth::SCOPE_READ.to_string()
+            };
+            code = app.store().issue_code(
+                &CodeRequest {
+                    client_id: &client_id,
+                    redirect_uri: &redirect_uri,
+                    challenge: &challenge,
+                    audience: &app.cfg.resource,
+                    scope: &scope,
+                    agent: &record.agent,
+                },
+                now,
+            );
+            pairs.push(("code", &code));
+        }
+        apps::State::Denied | apps::State::Revoked => {
+            pairs.push(("error", "access_denied"));
+            pairs.push(("error_description", "the owner did not approve this app"));
+        }
+    }
+    app.waiting().remove(&wait);
+    if let Some(state) = &state {
         pairs.push(("state", state));
     }
-    redirect(&valid.redirect_uri, &pairs)
+    redirect(&redirect_uri, &pairs)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -650,6 +798,7 @@ async fn authorize_submit(State(app): State<Arc<App>>, body: Bytes) -> Response 
 async fn token(State(app): State<Arc<App>>, body: Bytes) -> Response {
     let params = form(&body);
     let now = oauth::unix_now();
+    app.sweep();
     let result = {
         let mut store = app.store();
         match params.get("grant_type").map(String::as_str) {
@@ -667,6 +816,46 @@ async fn token(State(app): State<Arc<App>>, body: Bytes) -> Response {
     }
 }
 
+/// RFC 7009: the app ends its own session. Every token of the grant dies; when that was the
+/// app's last grant the app itself is revoked (its key deleted, its seat signed away where
+/// this machine holds the master key), so a disconnect leaves no identity behind.
+async fn revoke(State(app): State<Arc<App>>, body: Bytes) -> Response {
+    let params = form(&body);
+    let get = |k: &str| params.get(k).map(String::as_str).filter(|v| !v.is_empty());
+    let (Some(token), Some(client_id)) = (get("token"), get("client_id")) else {
+        return oauth_failure(&OAuthError {
+            code: "invalid_request",
+            description: "token and client_id are required".into(),
+        });
+    };
+    let now = oauth::unix_now();
+    let ended = app.store().revoke_token(token, client_id);
+    let agent = match ended {
+        Ok(agent) => agent,
+        Err(error) => return oauth_failure(&error),
+    };
+    if let Some(agent) = agent
+        && app.store().live_grants(&agent, now) == 0
+    {
+        let (source, state_dir) = (app.source.clone(), app.cfg.state_dir.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(mut record) = apps::by_agent(&state_dir, &agent)
+                && record.state != apps::State::Revoked
+            {
+                let _ = apps::revoke(
+                    &state_dir,
+                    &mut record,
+                    &source(),
+                    &apps::master_key_here,
+                    now,
+                );
+            }
+        })
+        .await;
+    }
+    no_store(StatusCode::OK.into_response())
+}
+
 // ---------------------------------------------------------------------------------------
 // MCP
 
@@ -679,6 +868,7 @@ fn rpc_failure(status: StatusCode, code: i64, message: &str) -> Response {
 
 async fn mcp(
     State(app): State<Arc<App>>,
+    Extension(Caller(agent)): Extension<Caller>,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -711,12 +901,12 @@ async fn mcp(
     let line = message.to_string();
     let worker = app.clone();
     let reply = tokio::task::spawn_blocking(move || {
-        let mut server = worker.server.lock().unwrap_or_else(PoisonError::into_inner);
-        handle_line(&mut server, &line)
+        let mut server = worker.server_for(&agent)?;
+        anyhow::Ok(handle_line(&mut server, &line))
     })
     .await;
     match reply {
-        Ok(Some(text)) => {
+        Ok(Ok(Some(text))) => {
             let mut response = (StatusCode::OK, text).into_response();
             response.headers_mut().insert(
                 header::CONTENT_TYPE,
@@ -724,8 +914,8 @@ async fn mcp(
             );
             no_store(response)
         }
-        Ok(None) => StatusCode::ACCEPTED.into_response(),
-        Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+        Ok(Ok(None)) => StatusCode::ACCEPTED.into_response(),
+        Ok(Err(_)) | Err(_) => plain(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
     }
 }
 

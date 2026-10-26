@@ -816,6 +816,56 @@ paths:
         '403': {description: only the channel master may grant}
         '404': {description: not in this channel}
         '409': {description: invited but not yet online, so there is no key to grant to}
+  /api/apps:
+    get:
+      summary: Apps connected to `ferry mcp serve --http`
+      description: >
+        Every app that has logged in with a pairing code: its own agent name, level
+        (`worker` unless the owner chose `member`), the projects where the master signed
+        it in, when it last called and how many calls. Waiting apps whose grant has since
+        synced here are settled first. `may_decide` is true only for a signed-in master.
+      responses:
+        '200': {description: 'apps and may_decide'}
+  /api/apps/{id}/approve:
+    post:
+      summary: Sign a waiting app in, as a Worker or (on request) a Member
+      description: >
+        Registers the app's public key and signs its level with the signed-in master's key
+        in every live project that person is master of (or only the listed `projects`).
+        Never an Orchestrator. When no project could be signed here the app stays waiting
+        and `request_file` names its signed request, to take to the master's machine.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: the app, the projects signed and the ones skipped with why}
+        '401': {description: no active session}
+        '403': {description: read-only}
+        '404': {description: no such app}
+        '409': {description: not waiting, or the level is refused}
+  /api/apps/{id}/deny:
+    post:
+      summary: Refuse a waiting app and delete its key
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: the app}
+        '401': {description: no active session}
+        '404': {description: no such app}
+        '409': {description: not waiting}
+  /api/apps/{id}/revoke:
+    post:
+      summary: Revoke an app in one click
+      description: >
+        Marks it revoked (the server stops honouring every one of its tokens at its next
+        request), deletes its key, and where the signed-in master owns the project signs its
+        grant down to Worker and records the revocation. Projects that need a master key
+        not held here are listed in `skipped`.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '200': {description: the app, whether its key was deleted, projects signed and skipped}
+        '401': {description: no active session}
+        '404': {description: no such app}
   /api/release:
     get:
       summary: The release waiting for a person, with the gate's own verdict

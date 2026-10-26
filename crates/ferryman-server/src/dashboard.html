@@ -1741,6 +1741,39 @@ function phonePanel(dl) {
     </div>`;
 }
 
+/* Connected apps: the apps that log in to `ferry mcp serve --http`, each its own agent.
+   Approve one that is waiting, or revoke one in a click: its tokens stop, its grant is signed
+   down, its key is deleted. */
+function appsPanel(ap) {
+  const ago = (t) => {
+    if (!t) return "never";
+    const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+    return s < 60 ? "just now" : s < 3600 ? `${Math.floor(s / 60)}m ago` : s < 86400 ? `${Math.floor(s / 3600)}h ago` : `${Math.floor(s / 86400)}d ago`;
+  };
+  const rows = (ap.apps || []).map((a) => {
+    const act = !ap.may_decide ? "" :
+      a.state === "pending"
+        ? `<button class="btn primary" data-app-approve="${esc(a.id)}" data-level="worker">Approve as Worker</button> ` +
+          `<button class="btn" data-app-approve="${esc(a.id)}" data-level="member">as Member</button> ` +
+          `<button class="btn" data-app-deny="${esc(a.id)}">Deny</button>`
+        : a.state === "approved"
+          ? `<button class="btn" data-app-revoke="${esc(a.id)}">Revoke</button>`
+          : "";
+    return `<tr><td>${esc(a.client_name)} <span class="s" style="color:var(--dim)">(${esc(a.redirect_host)})</span></td>` +
+      `<td><code>${esc(a.agent)}</code></td><td>${esc(a.level)}</td><td>${esc(a.state)}</td>` +
+      `<td>${esc((a.projects || []).join(", ") || "-")}</td><td>${ago(a.last_used)}</td><td>${esc(a.calls)}</td><td>${act}</td></tr>`;
+  });
+  return `
+    <div class="notice" style="margin-bottom:18px">
+      <div style="flex:1;min-width:0">
+        <b>Connected apps:</b> ${rows.length ? "" : "no app has connected yet."}
+        <div class="s" style="color:var(--dim);margin-top:6px">Each app that logs in to <code>ferry mcp serve --http</code> is its own agent with its own key: a Worker unless you make it a Member, never an Orchestrator. Revoking one ends all its tokens at once.</div>
+        ${rows.length ? `<div style="margin-top:12px;overflow-x:auto"><table class="grid"><thead><tr><th>App</th><th>Identity</th><th>Level</th><th>State</th><th>Projects</th><th>Last used</th><th>Calls</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table></div>` : ""}
+        <div class="s" id="tm-apps-msg" style="color:var(--dim);margin-top:8px"></div>
+      </div>
+    </div>`;
+}
+
 pages.teammates = async () => {
   let d = state.team;
   if (!d) { try { d = state.team = await api("/api/team"); } catch (_) { d = null; } }
@@ -1755,6 +1788,8 @@ pages.teammates = async () => {
   try { ep = await api("/api/engine-policy"); } catch (_) { ep = null; }
   let pd = null;
   try { pd = await api("/api/improve/pending"); } catch (_) { pd = null; }
+  let ap = null;
+  try { ap = await api("/api/apps"); } catch (_) { ap = null; }
 
   const grants = {};
   for (const g of (d.grants || [])) grants[g.grantee] = g;
@@ -1796,6 +1831,8 @@ pages.teammates = async () => {
     ${ep ? policyPanel(ep) : ""}
 
     ${dl ? phonePanel(dl) : ""}
+
+    ${ap ? appsPanel(ap) : ""}
 
     ${d.may_grant ? `
     <div class="panel" style="margin-bottom:18px">
@@ -1984,6 +2021,35 @@ function wireTeammates() {
         btn.disabled = false;
       }
     });
+  }
+
+  for (const [attr, path, body] of [
+    ["data-app-approve", "approve", (btn) => JSON.stringify({ level: btn.dataset.level })],
+    ["data-app-deny", "deny", () => "{}"],
+    ["data-app-revoke", "revoke", () => "{}"],
+  ]) {
+    for (const btn of document.querySelectorAll(`[${attr}]`)) {
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try {
+          const id = btn.getAttribute(attr);
+          const r = await api(`/api/apps/${encodeURIComponent(id)}/${path}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: body(btn),
+          });
+          const skipped = (r.skipped || []).map((x) => `${x.project}: ${x.why}`).join("; ");
+          const note = r.request_file ? ` Still waiting: carry ${r.request_file} to the machine that holds the master key.` : "";
+          const el = $("#tm-apps-msg");
+          if (el) el.textContent = (skipped ? `Not signed here - ${skipped}.` : "Done.") + note;
+          if (!skipped && !note) await render();
+        } catch (err) {
+          btn.disabled = false;
+          const el = $("#tm-apps-msg");
+          if (el) el.textContent = String(err.message || err).slice(0, 300);
+        }
+      });
+    }
   }
 
   for (const btn of document.querySelectorAll("[data-undelegate]")) {

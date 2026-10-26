@@ -10,6 +10,7 @@ mod license;
 mod licensor;
 mod mcp;
 mod mcp_agent;
+mod mcp_apps;
 mod mcp_client;
 mod mcp_http;
 mod mcp_oauth;
@@ -1067,6 +1068,33 @@ enum MarvinCommand {
 }
 
 #[derive(Subcommand, Clone)]
+enum McpAppsCommand {
+    /// Every app: waiting, approved, denied, revoked, with when it was last used.
+    List,
+    /// Approve a waiting app. It becomes a Worker unless you say member, in every live
+    /// project whose master key is on this machine (or only in --project). Without that key
+    /// the signed request is kept and the way to approve it elsewhere is printed.
+    Approve {
+        /// The app's id from `list` (a prefix is enough), or its agent name.
+        id: Option<String>,
+        /// A signed request file made on the machine that runs the server.
+        #[arg(long, conflicts_with = "id")]
+        request: Option<PathBuf>,
+        /// worker (read the channel, ask the human, write nothing into it) or member.
+        #[arg(long, default_value = "worker")]
+        level: String,
+        /// Only these projects, comma separated.
+        #[arg(long, value_delimiter = ',')]
+        project: Vec<String>,
+    },
+    /// Refuse a waiting app and delete its key.
+    Deny { id: String },
+    /// End an app: every token stops at the next request, its grant is signed down and
+    /// recorded as revoked, and its key is deleted.
+    Revoke { id: String },
+}
+
+#[derive(Subcommand, Clone)]
 enum McpCommand {
     /// Serve this project over MCP (Model Context Protocol) on stdio (beta). With
     /// `--as <agent>` an MCP client (Claude Desktop, Codex, Claude Code) gets six tools
@@ -1098,7 +1126,9 @@ enum McpCommand {
         all_projects: bool,
         /// Serve MCP Streamable HTTP on this address (for example 127.0.0.1:8787) instead
         /// of stdio, with a built-in OAuth login for cloud apps such as claude.ai. This is
-        /// plain HTTP: keep it behind TLS. Needs --as; see `ferry mcp pair`.
+        /// plain HTTP: keep it behind TLS. Serves every live project; takes no --as, since
+        /// each app that logs in gets an identity of its own. See `ferry mcp pair` and
+        /// `ferry mcp apps`.
         #[arg(long, value_name = "ADDR:PORT")]
         http: Option<std::net::SocketAddr>,
         /// The public https URL of the site that reaches --http, for example
@@ -1110,6 +1140,12 @@ enum McpCommand {
     /// Print a single-use pairing code (valid 10 minutes) for connecting an app to
     /// `ferry mcp serve --http`. The server stores only its hash.
     Pair,
+    /// The apps connected to `ferry mcp serve --http`: list them, approve or refuse one
+    /// that is waiting, revoke one. Each app is its own agent, with its own key.
+    Apps {
+        #[command(subcommand)]
+        command: McpAppsCommand,
+    },
     /// Connect to an external MCP server and print the tools it advertises.
     List {
         /// The server command and its arguments, e.g.
@@ -5083,6 +5119,33 @@ async fn run(cli: Cli) -> Result<()> {
                 println!(
                     "valid for 10 minutes, works once. Enter it on the sign-in page the app opens."
                 );
+            }
+            McpCommand::Apps { command } => {
+                let state = mcp_http::default_state_dir()?;
+                let routes = ferryman_channel::apps::live_routes();
+                let now = mcp_oauth::unix_now();
+                let lines = match command {
+                    McpAppsCommand::List => mcp_apps::list(&state, &routes, now),
+                    McpAppsCommand::Approve {
+                        id,
+                        request,
+                        level,
+                        project,
+                    } => mcp_apps::approve(
+                        &state,
+                        id.as_deref(),
+                        request.as_deref(),
+                        &level,
+                        &project,
+                        &routes,
+                        now,
+                    )?,
+                    McpAppsCommand::Deny { id } => mcp_apps::deny(&state, &id, now)?,
+                    McpAppsCommand::Revoke { id } => mcp_apps::revoke(&state, &id, &routes, now)?,
+                };
+                for line in lines {
+                    println!("{line}");
+                }
             }
             McpCommand::List { server } => mcp_client::list(&server)?,
             McpCommand::Call {

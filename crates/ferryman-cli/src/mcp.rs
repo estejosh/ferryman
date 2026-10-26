@@ -114,16 +114,15 @@ impl Server {
     /// the query surface is served.
     pub fn build(options: &Options) -> Result<Self> {
         let groups = parse_groups(&options.tools)?;
-        let http = options.http.is_some();
-        if options.all_projects || http {
+        let http = false;
+        if options.all_projects {
             if options.agent.is_none() || options.read_only {
-                bail!("--all-projects and --http need --as <agent> and cannot be --read-only");
+                bail!("--all-projects needs --as <agent> and cannot be --read-only");
             }
-            if groups.iter().any(|g| g == "legacy") || (http && groups.iter().any(|g| g == "admin"))
-            {
-                bail!("--tools legacy is for stdio, and --tools admin is not offered over --http");
+            if groups.iter().any(|g| g == "legacy") {
+                bail!("--tools legacy is for a single project");
             }
-            if options.all_projects && options.project.is_some() {
+            if options.project.is_some() {
                 bail!("--all-projects serves every project; drop --project");
             }
         }
@@ -171,6 +170,20 @@ impl Server {
             server.connect_gateways()?;
         }
         Ok(server)
+    }
+
+    /// The server one connected app talks to over HTTP: its own identity across every live
+    /// project, Worker and Member seats only, with its key in the app keystore.
+    pub fn for_app(me: &str, source: mcp_agent::RouteSource, keys: PathBuf) -> Result<Self> {
+        let all = AllProjects::new(me, false, true, source)?.with_keys(keys);
+        Ok(Server {
+            route: None,
+            agent: None,
+            all: Some(all),
+            http: true,
+            legacy: false,
+            gateways: Vec::new(),
+        })
     }
 
     /// A server for tests and embedding: no external servers connected.
@@ -334,10 +347,18 @@ pub const MAX_LINE_BYTES: usize = 1 << 20;
 
 /// Run the MCP server on stdio until the client closes stdin.
 pub fn serve(options: &Options) -> Result<()> {
-    let mut server = Server::build(options)?;
     if let Some(http) = &options.http {
-        return crate::mcp_http::run(server, http, options.agent.as_deref().unwrap_or_default());
+        if options.agent.is_some() || options.project.is_some() || options.read_only {
+            bail!(
+                "--http takes no --as, --project or --read-only: every app that logs in gets its own identity across every live project (see `ferry mcp apps`)"
+            );
+        }
+        if !options.tools.is_empty() {
+            bail!("--tools is for stdio; the apps served over --http get the core tools");
+        }
+        return crate::mcp_http::run(http);
     }
+    let mut server = Server::build(options)?;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     serve_io(&mut server, &mut stdin.lock(), &mut stdout)
