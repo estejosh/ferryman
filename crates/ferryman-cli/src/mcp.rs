@@ -237,14 +237,14 @@ impl Server {
                         self.route = Some(route);
                         self.agent = Some(agent);
                     }
-                    Err(error) => self.setup_error = Some(format!("{error:#}")),
+                    Err(error) => self.setup_error = Some(mcp_agent::plain_error(&error)),
                 }
             }
             None => {
                 mcp_agent::seat_everywhere(&name, &lazy.source);
                 match AllProjects::new(&name, lazy.admin, false, lazy.source) {
                     Ok(all) => self.all = Some(all),
-                    Err(error) => self.setup_error = Some(format!("{error:#}")),
+                    Err(error) => self.setup_error = Some(mcp_agent::plain_error(&error)),
                 }
             }
         }

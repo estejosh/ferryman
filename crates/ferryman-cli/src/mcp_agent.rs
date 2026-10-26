@@ -294,21 +294,49 @@ fn read_order(route: &ProjectRoute, id: &str) -> Result<Task> {
     })
 }
 
+/// A plain sentence for an io::Error, so no tool output or setup message ever shows
+/// "(os error N)". The tag matches what `error_result` reports as the machine-readable
+/// error kind.
+fn io_error(error: &anyhow::Error) -> Option<(&'static str, String)> {
+    let kind = io_kind(error)?;
+    let (tag, sentence) = match kind {
+        std::io::ErrorKind::NotFound => (
+            "not_found",
+            "something this call needs is not on this machine. Check the id or project (ferry_join, ferry_orders list)",
+        ),
+        std::io::ErrorKind::PermissionDenied => {
+            ("denied", "this machine does not allow that. Tell the human")
+        }
+        std::io::ErrorKind::AlreadyExists => (
+            "error",
+            "that name is already taken here; pick another (ferry_orders list shows the ids in use)",
+        ),
+        _ => (
+            "error",
+            "the machine's file system refused the request (a file may be open or in use). Tell the human",
+        ),
+    };
+    Some((tag, sentence.to_string()))
+}
+
+/// A plain sentence for any error: the io::Error sentence when there is one underneath,
+/// otherwise the error's own words. For setup messages that would otherwise print
+/// "(os error N)".
+#[must_use]
+pub fn plain_error(error: &anyhow::Error) -> String {
+    io_error(error)
+        .map(|(_, sentence)| sentence)
+        .unwrap_or_else(|| format!("{error:#}"))
+}
+
 /// The result for a failed call: one line of text, plus a machine-readable reason.
 #[must_use]
 pub fn error_result(error: &anyhow::Error) -> Value {
     let (kind, why) = match error.downcast_ref::<Refusal>() {
         Some(r) => (r.kind, r.why.clone()),
-        None => match io_kind(error) {
-            Some(std::io::ErrorKind::NotFound) => (
-                "not_found",
-                "something this call needs is not on this machine. Check the id or project (ferry_join, ferry_orders list)".to_string(),
-            ),
-            Some(std::io::ErrorKind::PermissionDenied) => (
-                "denied",
-                "this machine does not allow that. Tell the human".to_string(),
-            ),
-            _ => ("error", format!("{error:#}")),
+        None => match io_error(error) {
+            Some((kind, why)) => (kind, why),
+            None => ("error", format!("{error:#}")),
         },
     };
     json!({

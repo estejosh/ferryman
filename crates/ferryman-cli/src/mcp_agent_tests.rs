@@ -143,6 +143,40 @@ fn take_as(w: &World, name: &str) {
     marvin::take(&w.route, &identity, "test", false).unwrap();
 }
 
+#[test]
+fn an_io_error_is_a_plain_sentence_never_os_error_n() {
+    // AlreadyExists and a sharing-violation-like error (ErrorKind::Other, as a locked
+    // file reports on Windows) both map to a sentence, never "(os error N)".
+    for io in [
+        std::io::Error::new(std::io::ErrorKind::AlreadyExists, "exists"),
+        std::io::Error::other("sharing violation"),
+    ] {
+        let error = anyhow::Error::new(io);
+        let result = error_result(&error);
+        assert_eq!(result["isError"], true, "{result}");
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            !text.contains("os error"),
+            "raw io error leaked into the tool output: {text}"
+        );
+        assert_eq!(result["structuredContent"]["error"], "error");
+    }
+    // NotFound and PermissionDenied keep their specific tags and sentences.
+    let missing = anyhow::Error::new(std::io::Error::new(std::io::ErrorKind::NotFound, "missing"));
+    assert_eq!(
+        error_result(&missing)["structuredContent"]["error"],
+        "not_found"
+    );
+    let denied = anyhow::Error::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "denied",
+    ));
+    assert_eq!(
+        error_result(&denied)["structuredContent"]["error"],
+        "denied"
+    );
+}
+
 // -- the permission matrix ----------------------------------------------------------------
 
 #[test]
