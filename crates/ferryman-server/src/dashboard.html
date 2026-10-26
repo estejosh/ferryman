@@ -2074,7 +2074,7 @@ function wireTeammates() {
         `   Confirm with: ferry --version   (it must be 0.5.10 or newer; if older, run "ferry update").`,
         `   On Windows the binary is %LOCALAPPDATA%\\Ferryman\\bin\\ferry.exe if it is not on PATH yet.`,
         ``,
-        `2. Accept the invite. This starts Syncthing (installing it if missing), pairs with the inviter, creates the project folder, and registers this machine:`,
+        `2. Accept the invite. This creates the project folder and registers this machine with the inviter (a ferry2. code does it over iroh with no Syncthing step; a ferry1. code pairs Syncthing first):`,
         `     ferry team invite accept <THE CODE ABOVE> --email <MY EMAIL>`,
         `   It prints where the project folder is. If it fails, read the message - every failure says what to do - fix it and run the same line again; it is safe to repeat.`,
         ``,

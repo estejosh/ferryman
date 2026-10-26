@@ -13,11 +13,13 @@ recovery phrase once.
 What the prompt makes the agent do:
 
 1. Install `ferry` with the platform's install script and confirm the version.
-2. `ferry team invite accept <code> --email <theirs>` - starts the managed Syncthing
-   (installing it with winget or brew if absent), names this device after the invite,
-   trusts the inviter, creates the project folder under `~/Ferryman/<project>`,
-   registers the channel folder shared with the inviter, and writes a signed
-   acceptance. With no terminal attached, identity creation is deferred to the browser.
+2. `ferry team invite accept <code> --email <theirs>` - creates the project folder under
+   `~/Ferryman/<project>` and registers this machine with the inviter. A `ferry2.` code
+   does this over the iroh invite endpoint: no Syncthing is started, trusted or shared
+   anywhere in the path. A `ferry1.` code is the older path - it starts the managed
+   Syncthing (installing it with winget or brew if absent), names this device after the
+   invite, trusts the inviter, and registers the channel folder shared with the inviter.
+   With no terminal attached, identity creation is deferred to the browser.
 3. `ferry dashboard` from that folder - prints a one-time setup token and opens the tab.
    The agent relays the token and steps back.
 4. The person creates their identity in the tab: the reserved name, a password, the

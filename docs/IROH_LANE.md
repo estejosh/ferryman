@@ -296,3 +296,22 @@ A project's `data/` folder is machine-local and is never exchanged. By default i
   certificate check, not against n0's servers; try it on a machine before relying on it.
 - The relay certificate is pinned by hash: rotating it means changing
   `relay_cert_sha256` on every machine.
+
+## The invite endpoint (ferry2. codes)
+
+A v2 invitation (`ferry2.` code) carries the inviter's **invite endpoint** id instead of a
+Syncthing device id, so a newcomer joins over iroh with no Syncthing anywhere in the path.
+The invite endpoint is a second iroh endpoint with its own key (`invite-iroh.key`, never the
+lane's `iroh.key`), speaking only `ferryman/invite/1`, homed on iroh's public relays (or a
+pinned `invite_relay_url` / `invite_relay_cert_sha256`). It runs inside the worker and as
+`ferry team invite serve` for a master with no worker; it is bound only while at least one
+open v2 invite exists. It serves no channel-sync and reads only `invites/` and the bootstrap
+files it hands over.
+
+The handshake is one bi stream: the newcomer sends a signed `Join` (its agent key and signed
+`transports/<agent>.json` record), the inviter verifies the invite, the nonce (constant time),
+the reservation, the Join signature and the transports record, binds the reserved name to the
+first key that passes, and replies `Welcome` with the bootstrap files. The newcomer verifies
+every file before writing anything, then the ordinary lane takes over. A v2 member's
+revocation is the signed revocation plus a burned invite: there is no Syncthing device to
+unshare.

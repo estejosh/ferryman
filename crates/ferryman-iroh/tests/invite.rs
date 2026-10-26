@@ -147,7 +147,12 @@ async fn named_invite_happy_path_then_a_lane_round_moves_files_both_ways() {
     let inviter_lane_key = SecretKey::generate();
     let newcomer_key = SecretKey::generate();
 
-    let invite_end = endpoint(inviter_invite_key.clone(), &lookup, vec![INVITE_ALPN.to_vec()]).await;
+    let invite_end = endpoint(
+        inviter_invite_key.clone(),
+        &lookup,
+        vec![INVITE_ALPN.to_vec()],
+    )
+    .await;
     let inviter_lane_end = endpoint(inviter_lane_key.clone(), &lookup, vec![ALPN.to_vec()]).await;
     let newcomer_end = endpoint(newcomer_key.clone(), &lookup, vec![ALPN.to_vec()]).await;
     lookup.add_endpoint_info(addr(&invite_end));
@@ -190,7 +195,7 @@ async fn named_invite_happy_path_then_a_lane_round_moves_files_both_ways() {
     let invite_ep = InviteEndpoint::new(invite_end, vec![inv.route.clone()], inv.lane_agent);
     tokio::spawn(Arc::clone(&invite_ep).serve());
 
-    let welcome = invite::join(&newcomer_end, &addr(&invite_ep.endpoint()), &join, None)
+    let welcome = invite::join(&newcomer_end, &addr(invite_ep.endpoint()), &join, None)
         .await
         .unwrap();
 
@@ -205,7 +210,7 @@ async fn named_invite_happy_path_then_a_lane_round_moves_files_both_ways() {
     );
     invite::send_accept(
         &newcomer_end,
-        &addr(&invite_ep.endpoint()),
+        &addr(invite_ep.endpoint()),
         invite::Accept {
             acceptance: accept,
             operator_entry: None,
@@ -215,9 +220,11 @@ async fn named_invite_happy_path_then_a_lane_round_moves_files_both_ways() {
     .unwrap();
 
     // The invite is now bound and the acceptance recorded.
-    assert!(ferryman_channel::invite::read_acceptance(&inv.route, &inv.invite.id)
-        .unwrap()
-        .is_some());
+    assert!(
+        ferryman_channel::invite::read_acceptance(&inv.route, &inv.invite.id)
+            .unwrap()
+            .is_some()
+    );
 
     // Both sides hold each other's roster + transports, so one lane round moves files.
     let a = Lane::new(inviter_lane_end, vec![inv.route.clone()], None, None);
@@ -232,7 +239,9 @@ async fn named_invite_happy_path_then_a_lane_round_moves_files_both_ways() {
     .unwrap();
     fs::create_dir_all(newcomer_route.communications.join("handins/david-agent")).unwrap();
     fs::write(
-        newcomer_route.communications.join("handins/david-agent/out.json"),
+        newcomer_route
+            .communications
+            .join("handins/david-agent/out.json"),
         "{\"from\":\"newcomer\"}",
     )
     .unwrap();
@@ -240,11 +249,17 @@ async fn named_invite_happy_path_then_a_lane_round_moves_files_both_ways() {
     a.round().await;
 
     assert!(
-        newcomer_route.communications.join("tasks/t-1/order.json").is_file(),
+        newcomer_route
+            .communications
+            .join("tasks/t-1/order.json")
+            .is_file(),
         "the task file did not move inviter -> newcomer"
     );
     assert!(
-        inv.route.communications.join("handins/david-agent/out.json").is_file(),
+        inv.route
+            .communications
+            .join("handins/david-agent/out.json")
+            .is_file(),
         "the hand-in did not move newcomer -> inviter"
     );
 }
@@ -368,10 +383,13 @@ async fn the_invite_endpoint_refuses_channel_sync_and_the_lane_refuses_invite() 
 
     // The invite endpoint does not speak channel-sync.
     assert!(
-        tokio::time::timeout(std::time::Duration::from_secs(5), dialer.connect(addr(&invite_end), ALPN))
-            .await
-            .map(|r| r.is_err())
-            .unwrap_or(true),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dialer.connect(addr(&invite_end), ALPN)
+        )
+        .await
+        .map(|r| r.is_err())
+        .unwrap_or(true),
         "the invite endpoint must refuse ferryman/channel-sync/1"
     );
     // The lane does not speak the invite protocol.
@@ -386,5 +404,3 @@ async fn the_invite_endpoint_refuses_channel_sync_and_the_lane_refuses_invite() 
         "the lane must refuse ferryman/invite/1"
     );
 }
-
-

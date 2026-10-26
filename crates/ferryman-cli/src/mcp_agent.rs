@@ -2414,7 +2414,8 @@ impl Agent {
     /// only, via `create_for_identity`; the mcp never runs as master, so a master-level
     /// (new-person) invite is made in the dashboard (Teammates) instead.
     fn invite(&self, args: &Value) -> Result<Reply> {
-        let machine = arg_str(args, "machine").ok_or_else(|| bad("ferry_invite needs a machine label"))?;
+        let machine =
+            arg_str(args, "machine").ok_or_else(|| bad("ferry_invite needs a machine label"))?;
         let days = args
             .get("expires_days")
             .and_then(Value::as_i64)

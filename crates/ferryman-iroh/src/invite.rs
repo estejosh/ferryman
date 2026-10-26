@@ -33,7 +33,9 @@ use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode,
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use ferryman_channel::{AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck, canonical_agent_name};
+use ferryman_channel::{
+    AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck, canonical_agent_name,
+};
 
 use crate::{INVITE_ALPN, IrohConfig};
 
@@ -149,13 +151,17 @@ pub fn endpoint_id_from_hex(hex: &str) -> Result<EndpointId> {
     let bytes: [u8; 32] = bytes
         .try_into()
         .map_err(|_| anyhow!("an endpoint id is 32 bytes"))?;
-    Ok(EndpointId::from_bytes(&bytes).map_err(|_| anyhow!("not a valid endpoint id"))?)
+    EndpointId::from_bytes(&bytes).map_err(|_| anyhow!("not a valid endpoint id"))
 }
 
 /// The address a newcomer dials for a v2 code: the inviter's invite endpoint id, through
 /// the relay the code names when it names one.
 pub fn inviter_addr(code: &ferryman_channel::invite::InviteCode) -> Result<EndpointAddr> {
-    let id = endpoint_id_from_hex(code.endpoint.as_deref().context("no invite endpoint in this code")?)?;
+    let id = endpoint_id_from_hex(
+        code.endpoint
+            .as_deref()
+            .context("no invite endpoint in this code")?,
+    )?;
     let mut addr = EndpointAddr::new(id);
     if let Some(relay) = code.relay.as_deref() {
         let relay: RelayUrl = relay.parse().context("the invite relay is not a URL")?;
@@ -207,7 +213,8 @@ pub fn verify_join(
     let agent_ok = match &invite.agent {
         Some(reserved) => join.agent.eq_ignore_ascii_case(reserved),
         None => {
-            join.agent.eq_ignore_ascii_case(&format!("guest-{}", invite.id))
+            join.agent
+                .eq_ignore_ascii_case(&format!("guest-{}", invite.id))
                 || matches!(
                     ferryman_channel::invite::check_name(&route, &join.agent),
                     Ok(ferryman_channel::invite::NameCheck::Free)
@@ -290,37 +297,56 @@ pub fn welcome_files(
         }
         Ok(())
     };
-    add(&mut files, "master.json".into(), route.communications.join("master.json"))?;
+    add(
+        &mut files,
+        "master.json".into(),
+        route.communications.join("master.json"),
+    )?;
     if let Ok(Some(declaration)) = ferryman_channel::master::read_master(route) {
         let master = canonical_agent_name(&declaration.master);
         add(
             &mut files,
             format!("agents/{master}.json"),
-            route.communications.join("agents").join(format!("{master}.json")),
+            route
+                .communications
+                .join("agents")
+                .join(format!("{master}.json")),
         )?;
     }
     let inviter = canonical_agent_name(inviter_agent);
     add(
         &mut files,
         format!("agents/{inviter}.json"),
-        route.communications.join("agents").join(format!("{inviter}.json")),
+        route
+            .communications
+            .join("agents")
+            .join(format!("{inviter}.json")),
     )?;
     add(
         &mut files,
         format!("transports/{inviter}.json"),
-        route.communications.join("transports").join(format!("{inviter}.json")),
+        route
+            .communications
+            .join("transports")
+            .join(format!("{inviter}.json")),
     )?;
     add(
         &mut files,
         format!("invites/{}.json", invite.id),
-        route.communications.join("invites").join(format!("{}.json", invite.id)),
+        route
+            .communications
+            .join("invites")
+            .join(format!("{}.json", invite.id)),
     )?;
     if let Some(operator) = &invite.operator {
         let name = canonical_agent_name(operator);
         add(
             &mut files,
             format!("agents/{name}.json"),
-            route.communications.join("agents").join(format!("{name}.json")),
+            route
+                .communications
+                .join("agents")
+                .join(format!("{name}.json")),
         )?;
     }
     Ok(files)
@@ -398,7 +424,10 @@ impl InviteEndpoint {
     /// The TLS trust for the invite endpoint's relay: the pin when there is one, public CAs
     /// (iroh's public relays) otherwise.
     fn ca_config(config: &IrohConfig) -> iroh::tls::CaTlsConfig {
-        match (config.invite_relay_url.as_deref(), config.invite_relay_cert_sha256) {
+        match (
+            config.invite_relay_url.as_deref(),
+            config.invite_relay_cert_sha256,
+        ) {
             (Some(url), Some(pin)) => {
                 let host = url
                     .parse::<RelayUrl>()
@@ -440,7 +469,11 @@ impl InviteEndpoint {
     /// Wrap an endpoint that is already bound (the in-process tests bind one with
     /// `RelayMode::Disabled` and a `MemoryLookup`).
     #[must_use]
-    pub fn new(endpoint: Endpoint, routes: Vec<ProjectRoute>, identity: AgentIdentity) -> Arc<Self> {
+    pub fn new(
+        endpoint: Endpoint,
+        routes: Vec<ProjectRoute>,
+        identity: AgentIdentity,
+    ) -> Arc<Self> {
         Arc::new(Self {
             endpoint,
             routes: Mutex::new(routes),
@@ -484,14 +517,18 @@ impl InviteEndpoint {
         };
         let message = tokio::time::timeout(STEP_TIMEOUT, read_frame::<Message>(&mut recv)).await;
         let outcome = match message {
-            Ok(Ok(Message::Join(join))) => {
-                self.process_join(&mut send, &mut recv, &join).await
-            }
+            Ok(Ok(Message::Join(join))) => self.process_join(&mut send, &mut recv, &join).await,
             Ok(Ok(Message::Accept(accept))) => self.process_accept(&accept),
             _ => Err(refuse()),
         };
         if outcome.is_err() {
-            let _ = write_frame(&mut send, &Reply::Refused { reason: refuse().to_string() }).await;
+            let _ = write_frame(
+                &mut send,
+                &Reply::Refused {
+                    reason: refuse().to_string(),
+                },
+            )
+            .await;
         }
         let _ = send.finish();
     }
@@ -708,7 +745,10 @@ pub fn verify_welcome(files: &BTreeMap<String, Vec<u8>>, project: &str) -> Resul
     ) {
         bail!("master declaration signature does not verify");
     }
-    let mut verified = vec!["master.json".to_string(), format!("agents/{master_name}.json")];
+    let mut verified = vec![
+        "master.json".to_string(),
+        format!("agents/{master_name}.json"),
+    ];
 
     // The inviter's transports record against its roster key.
     for (rel, bytes) in files {
@@ -801,10 +841,11 @@ pub async fn join(
     join: &Join,
     acceptance: Option<Accept>,
 ) -> Result<Welcome> {
-    let connection = tokio::time::timeout(STEP_TIMEOUT, endpoint.connect(inviter.clone(), INVITE_ALPN))
-        .await
-        .context("no answer from the inviter")?
-        .context("connect")?;
+    let connection =
+        tokio::time::timeout(STEP_TIMEOUT, endpoint.connect(inviter.clone(), INVITE_ALPN))
+            .await
+            .context("no answer from the inviter")?
+            .context("connect")?;
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(&mut send, &Message::Join(join.clone())).await?;
     let reply: Reply = tokio::time::timeout(STEP_TIMEOUT, read_frame(&mut recv))
@@ -824,11 +865,16 @@ pub async fn join(
 
 /// Send an acceptance on a later dial (a generic invite's operator accepts after the
 /// browser step). Refuses on the inviter's answer.
-pub async fn send_accept(endpoint: &Endpoint, inviter: &EndpointAddr, accept: Accept) -> Result<()> {
-    let connection = tokio::time::timeout(STEP_TIMEOUT, endpoint.connect(inviter.clone(), INVITE_ALPN))
-        .await
-        .context("no answer from the inviter")?
-        .context("connect")?;
+pub async fn send_accept(
+    endpoint: &Endpoint,
+    inviter: &EndpointAddr,
+    accept: Accept,
+) -> Result<()> {
+    let connection =
+        tokio::time::timeout(STEP_TIMEOUT, endpoint.connect(inviter.clone(), INVITE_ALPN))
+            .await
+            .context("no answer from the inviter")?
+            .context("connect")?;
     let (mut send, mut recv) = connection.open_bi().await?;
     write_frame(&mut send, &Message::Accept(accept)).await?;
     send.finish()?;
@@ -839,11 +885,3 @@ pub async fn send_accept(endpoint: &Endpoint, inviter: &EndpointAddr, accept: Ac
     }
     Ok(())
 }
-
-
-
-
-
-
-
-

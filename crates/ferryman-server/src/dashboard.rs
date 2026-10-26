@@ -1534,7 +1534,9 @@ async fn invite_teammate(
         ));
     }
     // The code carries this machine's Syncthing device id so the newcomer can trust
-    // it; without a running Syncthing there is nothing to put in the code.
+    // it; without a running Syncthing there is nothing to put in the code. (The iroh
+    // invite endpoint is served by the worker and `ferry team invite create`, whose v2
+    // codes need no Syncthing; the server does not link the iroh stack.)
     let device = ferryman_channel::syncthing_my_id().map_err(|e| {
         (
             StatusCode::CONFLICT,

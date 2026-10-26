@@ -149,10 +149,7 @@ pub fn load_or_create_invite_key(machine_dir: &Path) -> Result<(iroh::SecretKey,
     load_or_create_key_file(machine_dir, INVITE_KEY_FILE)
 }
 
-fn load_or_create_key_file(
-    machine_dir: &Path,
-    file: &str,
-) -> Result<(iroh::SecretKey, bool)> {
+fn load_or_create_key_file(machine_dir: &Path, file: &str) -> Result<(iroh::SecretKey, bool)> {
     if let Some(key) = load_key_file(machine_dir, file)? {
         return Ok((key, false));
     }
