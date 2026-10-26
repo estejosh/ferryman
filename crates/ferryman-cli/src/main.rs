@@ -4495,9 +4495,13 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let report = ferryman_ops::doctor::examine(&start);
             let (workers_ok, workers) = fleetsetup::workers_line();
+            let dangling = ferryman_channel::ferry::doctor_root_pointer_line();
             if json {
                 let mut value = serde_json::to_value(&report)?;
                 value["workers"] = json!({ "ok": workers_ok, "detail": workers });
+                if let Some(pointer) = dangling {
+                    value["root_pointer"] = json!({ "ok": false, "detail": pointer });
+                }
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!(
@@ -4506,6 +4510,9 @@ async fn run(cli: Cli) -> Result<()> {
                     "workers",
                     workers
                 );
+                if let Some(pointer) = dangling {
+                    println!("  {:<4} {:<17} {}", "note", "root pointer", pointer);
+                }
                 for check in &report.checks {
                     // Informational checks are marked as such rather than as
                     // failures: a machine without Syncthing still works locally.

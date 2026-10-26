@@ -1984,13 +1984,43 @@ fn root_pointer() -> Option<PathBuf> {
     crate::licensing::machine_state_dir().map(|dir| dir.join("ferry-root"))
 }
 
+/// Whether remembering `path` would file scratch into durable state: a root under the OS
+/// temporary directory, while the machine's pointer is not. Such a pointer dangles the
+/// moment the temporary directory is cleaned up, and - the bug this guards against - a
+/// test that forgot to redirect the machine state writes a deleted `...\Temp\.tmp*` path
+/// into the operator's real pointer. Tests opt in by pointing the machine state at a
+/// temporary directory too (`use_machine_state_dir_per_thread`, or `FERRYMAN_STATE_DIR`),
+/// so the two vanish together.
+fn scratch_root_clobbers_pointer(path: &Path, pointer: Option<&Path>) -> bool {
+    under_temp_dir(path) && pointer.is_some_and(|pointer| !under_temp_dir(pointer))
+}
+
 fn remember_root(path: &Path) {
+    if scratch_root_clobbers_pointer(path, root_pointer().as_deref()) {
+        return;
+    }
     if let Some(pointer) = root_pointer() {
         if let Some(parent) = pointer.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(pointer, path.display().to_string());
     }
+}
+
+/// `ferry doctor`'s line about the remembered root: `Some(detail)` when the pointer names
+/// a directory that is gone, with the one fix. `None` when the pointer is healthy or absent.
+#[must_use]
+pub fn doctor_root_pointer_line() -> Option<String> {
+    let pointer = root_pointer()?;
+    let recorded = std::fs::read_to_string(pointer).ok()?;
+    let path = recorded.trim();
+    if path.is_empty() || Path::new(path).is_dir() {
+        return None;
+    }
+    Some(format!(
+        "the remembered root {path} is gone (it was a temp folder that was cleaned up); \
+         fix: ferry root init"
+    ))
 }
 
 thread_local! {
@@ -3204,5 +3234,48 @@ mod tests {
             Placement::Custom,
             "it was adopted where it stood"
         );
+    }
+
+    #[test]
+    fn a_scratch_root_is_not_filed_into_a_durable_pointer() {
+        let temp = std::env::temp_dir();
+        let durable = std::path::PathBuf::from("/home/user/.local/state/ferryman/ferry-root");
+        // Scratch into durable is the bug: a temp root must never overwrite a real pointer.
+        assert!(scratch_root_clobbers_pointer(
+            &temp.join("ferry"),
+            Some(&durable)
+        ));
+        // A temp root into a temp pointer is fine: both vanish together.
+        assert!(!scratch_root_clobbers_pointer(
+            &temp.join("ferry"),
+            Some(&temp.join("state").join("ferry-root"))
+        ));
+        // A durable root is always remembered, wherever the pointer lives.
+        assert!(!scratch_root_clobbers_pointer(
+            std::path::Path::new("/home/user/ferry"),
+            Some(&durable)
+        ));
+    }
+
+    #[test]
+    fn a_dangling_pointer_is_reported_with_the_one_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        // No pointer yet: nothing to say.
+        assert_eq!(doctor_root_pointer_line(), None);
+
+        let pointer = crate::licensing::machine_state_dir()
+            .unwrap()
+            .join("ferry-root");
+        let gone = dir.path().join("gone");
+        std::fs::write(&pointer, gone.display().to_string()).unwrap();
+        let line = doctor_root_pointer_line().expect("a missing target is reported");
+        assert!(line.contains("gone"), "{line}");
+        assert!(line.contains("ferry root init"), "the fix is named: {line}");
+
+        // A pointer to a folder that exists is healthy.
+        std::fs::create_dir_all(dir.path().join("here")).unwrap();
+        std::fs::write(&pointer, dir.path().join("here").display().to_string()).unwrap();
+        assert_eq!(doctor_root_pointer_line(), None);
     }
 }
