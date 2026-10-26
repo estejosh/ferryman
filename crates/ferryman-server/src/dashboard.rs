@@ -401,6 +401,7 @@ pub fn router(state: DashboardState) -> Router {
         .route("/api/release/{version}/approve", post(approve_release))
         .route("/api/release/{version}/deny", post(deny_release))
         .route("/api/team/invite", post(invite_teammate))
+        .route("/api/questions/{id}/answer", post(answer_question))
         .route("/api/master/init", post(master_init))
         .route("/api/master/claim-all", post(master_claim_all))
         .route("/api/head/revoke", post(head_revoke))
@@ -1166,6 +1167,8 @@ async fn team(
     let master = ferryman_channel::master::read_master(&route)
         .map_err(internal)?
         .map(|declaration| declaration.master);
+    let live = route_with_live_roster(&route);
+    let now = chrono::Utc::now();
     let teammates = names
         .into_iter()
         .map(|name| {
@@ -1182,13 +1185,19 @@ async fn team(
             } else {
                 "channel"
             };
-            let revoked = ferryman_channel::master::is_revoked(&route, &name).unwrap_or(false);
+            // The master ending it, which is not the same as time running out: the page
+            // says "revoked" for one and "ended <date>" for the other.
+            let revoked =
+                ferryman_channel::master::is_explicitly_revoked(&route, &name).unwrap_or(false);
+            let (access_ends, access_lapsed) = access_window(&live, &name, now);
             json!({
                 "name": name,
                 "role": role,
                 "current": is_current,
                 "scope": scope,
                 "revoked": revoked,
+                "access_ends": access_ends,
+                "access_lapsed": access_lapsed,
             })
         })
         .collect::<Vec<_>>();
@@ -1319,69 +1328,7 @@ async fn team(
             .as_deref()
             .is_some_and(|m| m.eq_ignore_ascii_case(current.name()))
         {
-            let roster_now =
-                ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
-            for (invite, accept) in settled.ready_to_grant {
-                let mut names = vec![accept.operator.clone()];
-                names.extend(accept.agent.clone());
-                let mut all_ok = true;
-                for who in &names {
-                    let Some(entry) = roster_now.iter().find(|a| a.name.eq_ignore_ascii_case(who))
-                    else {
-                        all_ok = false;
-                        continue;
-                    };
-                    let Some(key) = entry.public_key.clone() else {
-                        all_ok = false;
-                        continue;
-                    };
-                    let roles = if who == &accept.operator {
-                        invite.roles.clone()
-                    } else {
-                        vec!["worker".to_string()]
-                    };
-                    if ferryman_channel::master::grant_member(
-                        &route,
-                        &current,
-                        &entry.name,
-                        &key,
-                        vec![route.project_id.clone()],
-                        roles.clone(),
-                        Vec::new(),
-                    )
-                    .is_ok()
-                    {
-                        let _ = ferryman_channel::ledger::append_ledger_entry(
-                            &route,
-                            &current,
-                            "grant",
-                            current.name(),
-                            &format!(
-                                "granted {} roles [{}] on {} from invite {}",
-                                entry.name,
-                                roles.join(", "),
-                                route.project_id,
-                                invite.id
-                            ),
-                            None,
-                        );
-                    } else {
-                        all_ok = false;
-                    }
-                }
-                if all_ok {
-                    let _ = ferryman_channel::invite::mark_granted(&route, &invite.id);
-                    // The placeholder a generic joiner carried until they claimed a
-                    // name has no key anyone will use again.
-                    let _ = std::fs::remove_file(
-                        route
-                            .communications
-                            .join("agents")
-                            .join(format!("guest-{}.json", invite.id)),
-                    );
-                    settled_notes.push(format!("{} has joined and is granted", accept.operator));
-                }
-            }
+            grant_invited(&route, &current, settled.ready_to_grant, &mut settled_notes);
         }
     }
     let invites: Vec<Value> = ferryman_channel::invite::list(&route)
@@ -1409,6 +1356,7 @@ async fn team(
                 "roles": invite.roles,
                 "state": state,
                 "expires_at": invite.expires_at.to_rfc3339(),
+                "access_days": invite.access_days,
                 "signature": format!("{check:?}"),
             })
         })
@@ -1418,16 +1366,33 @@ async fn team(
         .map_err(internal)?
         .into_iter()
         .map(|(grant, check)| {
+            let (access_ends, access_lapsed) = access_window(&live, &grant.grantee, now);
             json!({
                 "grantee": grant.grantee,
                 "projects": grant.projects,
                 "roles": grant.roles,
                 "capabilities": grant.capabilities,
                 "granted_at": grant.granted_at.to_rfc3339(),
+                "access_ends": access_ends,
+                "access_lapsed": access_lapsed,
                 "signature": sig(&check),
             })
         })
         .collect::<Vec<_>>();
+    // Renewal questions waiting for the master, in the words they were asked in, so the
+    // page can put Renew / Let it end beside the people they are about.
+    let pending_access: Vec<Value> = ferryman_channel::questions::pending(&live)
+        .into_iter()
+        .filter(|question| question.kind == ferryman_channel::questions::ACCESS)
+        .map(|question| {
+            json!({
+                "id": question.id,
+                "text": question.text,
+                "options": question.options,
+                "asked_at": question.asked_at.to_rfc3339(),
+            })
+        })
+        .collect();
     Ok(Json(json!({
         "current": current.name(),
         "invites": invites,
@@ -1449,6 +1414,7 @@ async fn team(
         "teammates": teammates,
         "agents": agents,
         "grants": grants,
+        "pending_access": pending_access,
         // The projects a grant can name, so the page offers what exists rather than
         // asking a person to type an id correctly from memory.
         "projects": ferryman_channel::known::known()
@@ -1456,6 +1422,105 @@ async fn team(
             .map(|project| project.project_id)
             .collect::<Vec<_>>(),
     })))
+}
+
+/// When `name`'s timed access ends (RFC 3339) and whether it already has, for a screen.
+/// Both are empty/false for access with no end, and for someone with no grant.
+fn access_window(
+    route: &ProjectRoute,
+    name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<String>, bool) {
+    match ferryman_channel::master::access_end_of(route, name) {
+        Some(end) => (Some(end.to_rfc3339()), end <= now),
+        None => (None, false),
+    }
+}
+
+/// Sign the grants that accepted invitations promised, as the master.
+///
+/// An invitation that promised timed access (`access_days`) is granted with an end that many
+/// days from now - from the moment the master's signature goes on, not from when the code
+/// was made, since a person who took a week to join should still get what was offered. The
+/// person and their agent get the same end, so the agent goes when the person does.
+fn grant_invited(
+    route: &ProjectRoute,
+    current: &AgentIdentity,
+    ready: Vec<(
+        ferryman_channel::invite::Invite,
+        ferryman_channel::invite::Acceptance,
+    )>,
+    notes: &mut Vec<String>,
+) {
+    let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap_or_default();
+    for (invite, accept) in ready {
+        let mut names = vec![accept.operator.clone()];
+        names.extend(accept.agent.clone());
+        let expires_at = invite
+            .access_days
+            .map(|days| chrono::Utc::now() + chrono::Duration::days(i64::from(days)));
+        let term = match (invite.access_days, expires_at) {
+            (Some(days), Some(at)) => format!("for {days} days (until {})", at.format("%Y-%m-%d")),
+            _ => "with no expiry".to_string(),
+        };
+        let mut all_ok = true;
+        for who in &names {
+            let Some(entry) = roster.iter().find(|a| a.name.eq_ignore_ascii_case(who)) else {
+                all_ok = false;
+                continue;
+            };
+            let Some(key) = entry.public_key.clone() else {
+                all_ok = false;
+                continue;
+            };
+            let roles = if who == &accept.operator {
+                invite.roles.clone()
+            } else {
+                vec!["worker".to_string()]
+            };
+            if ferryman_channel::master::grant_member_until(
+                route,
+                current,
+                &entry.name,
+                &key,
+                vec![route.project_id.clone()],
+                roles.clone(),
+                Vec::new(),
+                expires_at,
+            )
+            .is_ok()
+            {
+                let _ = ferryman_channel::ledger::append_ledger_entry(
+                    route,
+                    current,
+                    "grant",
+                    current.name(),
+                    &format!(
+                        "granted {} roles [{}] on {} from invite {} {term}",
+                        entry.name,
+                        roles.join(", "),
+                        route.project_id,
+                        invite.id
+                    ),
+                    None,
+                );
+            } else {
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            let _ = ferryman_channel::invite::mark_granted(route, &invite.id);
+            // The placeholder a generic joiner carried until they claimed a name has no
+            // key anyone will use again.
+            let _ = std::fs::remove_file(
+                route
+                    .communications
+                    .join("agents")
+                    .join(format!("guest-{}.json", invite.id)),
+            );
+            notes.push(format!("{} has joined and is granted", accept.operator));
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1469,8 +1534,43 @@ struct InviteBody {
     /// Roles the grant will carry once their keys arrive. Empty means reader; ["full"] means every role.
     #[serde(default)]
     roles: Vec<String>,
+    /// How many days the CODE works for joining (default 7). Not how long the access lasts.
     #[serde(default)]
     expires_days: Option<i64>,
+    /// How many days the ACCESS lasts once granted. Exactly one of this and
+    /// `access_forever` must be given: how long somebody keeps access is the master's
+    /// decision on every invitation, never a default.
+    #[serde(default)]
+    access_days: Option<u32>,
+    /// Access that does not end.
+    #[serde(default)]
+    access_forever: Option<bool>,
+}
+
+/// What an invitation promised about how long the access lasts: `Some(days)`, or `None` for
+/// no end. Anything else (neither said, both said, a nonsense number) is the master's
+/// mistake to hear about now, not a default to guess at.
+fn access_choice(body: &InviteBody) -> Result<Option<u32>, DashboardError> {
+    let choose = || {
+        (
+            StatusCode::BAD_REQUEST,
+            "choose how long their access lasts: a number of days, or no expiry".to_string(),
+        )
+    };
+    match (body.access_days, body.access_forever.unwrap_or(false)) {
+        (Some(days), false) if (1..=ferryman_channel::invite::MAX_ACCESS_DAYS).contains(&days) => {
+            Ok(Some(days))
+        }
+        (Some(_), false) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "access lasts 1 to {} days; for no end, choose no expiry",
+                ferryman_channel::invite::MAX_ACCESS_DAYS
+            ),
+        )),
+        (None, true) => Ok(None),
+        _ => Err(choose()),
+    }
 }
 
 /// POST /api/team/invite - reserve a name for a person who has not joined yet.
@@ -1499,6 +1599,7 @@ async fn invite_teammate(
         StatusCode::UNAUTHORIZED,
         "no active session; sign in again".to_string(),
     ))?;
+    let access_days = access_choice(&body)?;
     let route = state.route_for(params.project.as_deref());
     // The operator signs on the roster of the project acted on. A key this project
     // has never seen would sign declarations nobody there could verify.
@@ -1547,6 +1648,7 @@ async fn invite_teammate(
         name.as_deref(),
         agent.as_deref(),
         body.roles.clone(),
+        access_days,
         chrono::Duration::days(body.expires_days.unwrap_or(7).max(1)),
         &device,
     )
@@ -1557,7 +1659,7 @@ async fn invite_teammate(
         "invite",
         current.name(),
         &format!(
-            "invited {}{} to {}; code {} expires {}",
+            "invited {}{} to {}; code {} expires {}; access {}",
             name.as_deref().unwrap_or("someone (they pick their name)"),
             agent
                 .as_ref()
@@ -1565,7 +1667,11 @@ async fn invite_teammate(
                 .unwrap_or_default(),
             route.project_id,
             invite.id,
-            invite.expires_at.format("%Y-%m-%d")
+            invite.expires_at.format("%Y-%m-%d"),
+            match access_days {
+                Some(days) => format!("lasts {days} days once they join"),
+                None => "has no expiry".to_string(),
+            }
         ),
         None,
     )
@@ -1590,6 +1696,7 @@ async fn invite_teammate(
         "id": invite.id,
         "code": code,
         "expires_at": invite.expires_at.to_rfc3339(),
+        "access_days": invite.access_days,
         "windows": format!("irm https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/join.ps1 | iex; ferry-join {code}"),
         "unix": format!("curl -fsSL https://raw.githubusercontent.com/estejosh/ferryman/main/scripts/join.sh | sh -s -- {code}"),
         "grants_required": grants_flipped || route.requires_grants(),
@@ -1629,6 +1736,83 @@ fn ensure_operator_on_roster(
     };
     ferryman_channel::register_agent_key(route, &published, identity)?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+struct AnswerBody {
+    answer: String,
+}
+
+/// POST /api/questions/{id}/answer - the master answers a question about access that is
+/// about to end: Renew, or Let it end.
+///
+/// Only `access` questions, and only with one of the buttons they were asked with. The other
+/// kinds keep the pages that answer them (a merge, a policy, a contract, a suggestion each
+/// do something more than record a word), and a free-text reply here would be a way to put
+/// words in the master's mouth that no button on the page offers. The answer is the master's
+/// own signed one, from the session's unlocked key; it renews nothing by itself - the
+/// channel counts it, if it verifies, the next time it works out when the access ends.
+async fn answer_question(
+    State(state): State<DashboardState>,
+    headers: HeaderMap,
+    Query(params): Query<ProjectParam>,
+    Path(id): Path<String>,
+    Json(body): Json<AnswerBody>,
+) -> Result<Json<Value>, DashboardError> {
+    let current = session_identity(&state, &headers)?;
+    let route = route_with_live_roster(&state.route_for(params.project.as_deref()));
+    let Some(question) = ferryman_channel::questions::read(&route, &id) else {
+        return Err((StatusCode::NOT_FOUND, format!("there is no question {id}")));
+    };
+    if question.kind != ferryman_channel::questions::ACCESS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "only questions about access are answered here".to_string(),
+        ));
+    }
+    let answer = body.answer.trim();
+    if !question.options.iter().any(|option| option == answer) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("answer one of: {}", question.options.join(", ")),
+        ));
+    }
+    let is_master = ferryman_channel::ferry::master_of(&route.communications)
+        .ok()
+        .flatten()
+        .is_some_and(|master| master.eq_ignore_ascii_case(current.name()));
+    if !is_master {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "only the master answers this".to_string(),
+        ));
+    }
+    if ferryman_channel::questions::answer_to(&route, &question).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            "that question is already answered".to_string(),
+        ));
+    }
+    let recorded =
+        ferryman_channel::questions::answer(&route, &id, answer, current.name(), &current)
+            .map_err(|error| (StatusCode::FORBIDDEN, format!("{error:#}")))?;
+    let _ = ferryman_channel::ledger::append_ledger_entry(
+        &route,
+        &current,
+        "access",
+        current.name(),
+        &format!(
+            "answered \"{}\" to: {}",
+            recorded.answer,
+            question.text.lines().next().unwrap_or_default()
+        ),
+        None,
+    );
+    Ok(Json(json!({
+        "id": id,
+        "answer": recorded.answer,
+        "answered_at": recorded.answered_at.to_rfc3339(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -3815,7 +3999,20 @@ async fn set_access(
             ),
         ));
     };
-    let grant = ferryman_channel::master::grant_member(
+    // Changing what somebody may do must not quietly change how long they may do it: a
+    // timed person keeps the end they have (renewals included). Access that has already
+    // ended is not brought back by editing its roles; that is a renewal or a new invitation.
+    let live = route_with_live_roster(&route);
+    let keeps_until = ferryman_channel::master::access_end_of(&live, &person.name);
+    if keeps_until.is_some_and(|end| end <= chrono::Utc::now()) {
+        return Err((
+            StatusCode::CONFLICT,
+            format!(
+                "{name}'s access has ended; renew it when the master is asked, or invite them again"
+            ),
+        ));
+    }
+    let grant = ferryman_channel::master::grant_member_until(
         &route,
         &current,
         &person.name,
@@ -3823,6 +4020,7 @@ async fn set_access(
         body.projects.clone(),
         body.roles.clone(),
         body.capabilities.clone(),
+        keeps_until,
     )
     // grant_member refuses anyone who is not the master, and says so in words.
     .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
@@ -3849,6 +4047,7 @@ async fn set_access(
         "projects": grant.projects,
         "roles": grant.roles,
         "capabilities": grant.capabilities,
+        "access_ends": grant.expires_at.map(|at| at.to_rfc3339()),
     })))
 }
 
@@ -5803,6 +6002,8 @@ mod tests {
                 "/api/suggestions/decide",
                 r#"{"issue":1,"choice":"accept"}"#,
             ),
+            ("/api/team/invite", r#"{"access_days":7}"#),
+            ("/api/questions/q1/answer", r#"{"answer":"Renew"}"#),
         ] {
             let response = post(&app, path, body, None).await;
             assert_eq!(
@@ -8674,6 +8875,330 @@ mod tests {
         assert!(
             sessions.resolve(&token).is_none(),
             "idle session must expire"
+        );
+    }
+
+    // --- timed access for invited people (ADR 0029) ---
+
+    /// A project whose master (alice) is signed in to the dashboard.
+    struct Team {
+        route: Arc<ProjectRoute>,
+        app: Router,
+        token: String,
+        alice: Arc<AgentIdentity>,
+    }
+
+    async fn team_with_master(dir: &std::path::Path) -> Team {
+        ferryman_channel::licensing::use_machine_state_dir_per_thread(dir.join("machine-state"));
+        let mut route = test_route(dir);
+        let alice = crate::operators::test_store(&route.attachment)
+            .create("alice", "hunter2-secret")
+            .unwrap();
+        // The route carries the master's key, as a running dashboard's does.
+        route.agents.push(AgentRoute {
+            name: "alice".into(),
+            role: "operator".into(),
+            capabilities: Vec::new(),
+            public_key: Some(alice.public_key_hex()),
+            encryption_key: None,
+        });
+        let route = Arc::new(route);
+        let dashboard_state = state(&route, false);
+        let app = router(dashboard_state.clone());
+        let login = post(
+            &app,
+            "/api/auth/login",
+            r#"{"name":"alice","password":"hunter2-secret"}"#,
+            None,
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::OK);
+        let body = login.into_body().collect().await.unwrap().to_bytes();
+        let token = serde_json::from_slice::<Value>(&body).unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let claimed = post(&app, "/api/master/init", "{}", Some(&token)).await;
+        assert_eq!(claimed.status(), StatusCode::OK);
+        let alice = dashboard_state.sessions.resolve(&token).unwrap();
+        Team {
+            route,
+            app,
+            token,
+            alice,
+        }
+    }
+
+    /// Everything the newcomer's machine does that the master's dashboard then sees: the
+    /// master's invitation, the person's and their agent's keys on the roster, and the
+    /// signed acceptance. Returns the invite id.
+    fn invite_and_join(
+        team: &Team,
+        person: &AgentIdentity,
+        agent: &AgentIdentity,
+        access_days: Option<u32>,
+    ) -> String {
+        let (invite, code) = ferryman_channel::invite::create(
+            &team.route,
+            &team.alice,
+            Some(person.name()),
+            Some(agent.name()),
+            vec!["worker".to_string()],
+            access_days,
+            chrono::Duration::days(7),
+            "INVITER-DEVICE",
+        )
+        .unwrap();
+        for (identity, role) in [(person, "operator"), (agent, "worker")] {
+            ferryman_channel::register_agent(
+                &team.route,
+                &AgentRoute {
+                    name: identity.name().into(),
+                    role: role.into(),
+                    capabilities: Vec::new(),
+                    public_key: Some(identity.public_key_hex()),
+                    encryption_key: None,
+                },
+            )
+            .unwrap();
+        }
+        ferryman_channel::invite::write_acceptance(
+            &team.route,
+            person,
+            &ferryman_channel::invite::decode_code(&code).unwrap(),
+            "THEIR-DEVICE",
+            person.name(),
+            Some(agent.name()),
+        )
+        .unwrap();
+        invite.id
+    }
+
+    #[tokio::test]
+    async fn an_invitation_must_say_how_long_the_access_lasts() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = team_with_master(dir.path()).await;
+        let uri = "/api/team/invite";
+
+        let anonymous = post(&team.app, uri, r#"{"access_days":7}"#, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+        let choose = "choose how long their access lasts: a number of days, or no expiry";
+        for body in [
+            r#"{}"#,
+            r#"{"name":"carol","roles":["worker"]}"#,
+            r#"{"access_forever":false}"#,
+            r#"{"access_days":7,"access_forever":true}"#,
+        ] {
+            let refused = post(&team.app, uri, body, Some(&team.token)).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{body}");
+            let text = refused.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(String::from_utf8_lossy(&text), choose, "{body}");
+        }
+        for body in [r#"{"access_days":0}"#, r#"{"access_days":3651}"#] {
+            let refused = post(&team.app, uri, body, Some(&team.token)).await;
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        // A choice, either way, gets past this check. What happens next needs Syncthing
+        // running, which a test does not have; anything but this 400 is the point.
+        for body in [r#"{"access_days":30}"#, r#"{"access_forever":true}"#] {
+            let next = post(&team.app, uri, body, Some(&team.token)).await;
+            assert_ne!(next.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_ne!(next.status(), StatusCode::UNAUTHORIZED, "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_grant_an_invitation_promised_carries_its_end_for_the_person_and_their_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = team_with_master(dir.path()).await;
+        let carol = AgentIdentity::from_seed("carol", [5u8; 32]);
+        let carol_agent = AgentIdentity::from_seed("carol-agent", [6u8; 32]);
+        let dave = AgentIdentity::from_seed("dave", [7u8; 32]);
+        let dave_agent = AgentIdentity::from_seed("dave-agent", [8u8; 32]);
+        invite_and_join(&team, &carol, &carol_agent, Some(30));
+        invite_and_join(&team, &dave, &dave_agent, None);
+
+        // The master opens the Team page: the dashboard signs what the invitations promised.
+        let before = Utc::now();
+        let view = get_json(&team.app, "/api/team", Some(&team.token)).await;
+        let grants = ferryman_channel::master::member_grants(&team.route).unwrap();
+        let grant = |name: &str| {
+            grants
+                .iter()
+                .find(|(grant, _)| grant.grantee == name)
+                .unwrap_or_else(|| panic!("{name} was not granted: {view}"))
+                .0
+                .clone()
+        };
+        for name in ["carol", "carol-agent"] {
+            let end = grant(name)
+                .expires_at
+                .unwrap_or_else(|| panic!("{name} has no end"));
+            let days = (end - before).num_days();
+            assert!((29..=30).contains(&days), "{name}: {end}");
+        }
+        assert_eq!(
+            grant("carol").expires_at,
+            grant("carol-agent").expires_at,
+            "the agent goes when the person does"
+        );
+        assert_eq!(grant("dave").expires_at, None);
+        assert_eq!(grant("dave-agent").expires_at, None);
+        assert!(
+            grants
+                .iter()
+                .all(|(_, check)| *check == ferryman_channel::SignatureCheck::Valid)
+        );
+
+        // And the page is told, per person.
+        let view = get_json(&team.app, "/api/team", Some(&team.token)).await;
+        let row = |name: &str| {
+            view["teammates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in {view}"))
+                .clone()
+        };
+        assert!(row("carol")["access_ends"].is_string(), "{view}");
+        assert_eq!(row("carol")["access_lapsed"], false);
+        assert!(row("dave")["access_ends"].is_null(), "{view}");
+        assert_eq!(row("dave")["access_lapsed"], false);
+        assert_eq!(view["pending_access"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn the_master_answers_a_renewal_question_from_the_team_page_and_only_the_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let team = team_with_master(dir.path()).await;
+        let live = route_with_live_roster(&team.route);
+        let carol = AgentIdentity::from_seed("carol", [5u8; 32]);
+        let carol_agent = AgentIdentity::from_seed("carol-agent", [6u8; 32]);
+        invite_and_join(&team, &carol, &carol_agent, Some(30));
+        get_json(&team.app, "/api/team", Some(&team.token)).await;
+
+        // The worker loop asks as the access nears its end.
+        let live = route_with_live_roster(&live);
+        let ends = ferryman_channel::master::access_end_of(&live, "carol").unwrap();
+        let asked = ferryman_channel::master::ask_renewals(
+            &live,
+            &team.alice,
+            ends - chrono::Duration::days(1),
+        );
+        assert_eq!(asked.len(), 2, "the person and their agent: {asked:?}");
+        let id = asked
+            .iter()
+            .find(|id| id.starts_with("access-carol-") && !id.starts_with("access-carol-agent-"))
+            .cloned()
+            .unwrap();
+
+        let view = get_json(&team.app, "/api/team", Some(&team.token)).await;
+        let waiting = view["pending_access"].as_array().unwrap();
+        assert_eq!(waiting.len(), 2, "{view}");
+        let ours = waiting.iter().find(|q| q["id"] == id.as_str()).unwrap();
+        assert_eq!(ours["options"], json!(["Renew", "Let it end"]));
+        assert!(ours["text"].as_str().unwrap().contains("carol"));
+
+        let uri = format!("/api/questions/{id}/answer");
+        let renew = r#"{"answer":"Renew"}"#;
+        assert_eq!(
+            post(&team.app, &uri, renew, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            post(&team.app, &uri, r#"{"answer":"Maybe"}"#, Some(&team.token))
+                .await
+                .status(),
+            StatusCode::BAD_REQUEST,
+            "only the buttons the question was asked with"
+        );
+        assert_eq!(
+            post(
+                &team.app,
+                "/api/questions/nope/answer",
+                renew,
+                Some(&team.token)
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Another question of another kind is not answered here, however it is worded.
+        ferryman_channel::questions::ask(
+            &live,
+            &team.alice,
+            "clarify-1",
+            ferryman_channel::questions::CLARIFY,
+            "Which license?",
+            &["MIT".to_string()],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            post(
+                &team.app,
+                "/api/questions/clarify-1/answer",
+                r#"{"answer":"MIT"}"#,
+                Some(&team.token)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        // Somebody signed in who is not the master gets nowhere.
+        crate::operators::test_store(&team.route.attachment)
+            .create("bob", "bob-secret-pass")
+            .unwrap();
+        let bob = post(
+            &team.app,
+            "/api/auth/login",
+            r#"{"name":"bob","password":"bob-secret-pass"}"#,
+            None,
+        )
+        .await;
+        let bob =
+            serde_json::from_slice::<Value>(&bob.into_body().collect().await.unwrap().to_bytes())
+                .unwrap()["token"]
+                .as_str()
+                .unwrap()
+                .to_string();
+        assert_eq!(
+            post(&team.app, &uri, renew, Some(&bob)).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ferryman_channel::questions::pending(&live).len(),
+            3,
+            "nothing was answered"
+        );
+
+        // The master renews. The access now runs one term further.
+        let done = post(&team.app, &uri, renew, Some(&team.token)).await;
+        assert_eq!(done.status(), StatusCode::OK);
+        let live = route_with_live_roster(&team.route);
+        let renewed = ferryman_channel::master::access_end_of(&live, "carol").unwrap();
+        let extra = (renewed - ends).num_seconds();
+        assert!(
+            (30 * 86_400 - 1..=30 * 86_400).contains(&extra),
+            "one more term of 30 days: {ends} -> {renewed}"
+        );
+        assert_eq!(
+            post(&team.app, &uri, renew, Some(&team.token))
+                .await
+                .status(),
+            StatusCode::CONFLICT,
+            "answered once"
+        );
+        let view = get_json(&team.app, "/api/team", Some(&team.token)).await;
+        assert_eq!(
+            view["pending_access"].as_array().unwrap().len(),
+            1,
+            "{view}"
         );
     }
 }

@@ -128,10 +128,55 @@ paths:
         to send. A name may be reserved; without one the person picks any free name when
         they create their identity, and the acceptance carries it. It cannot create their
         identity - that happens on their machine, under their own password.
+
+        Two lengths are separate. `expires_days` is how long the CODE works for joining
+        (default 7). The ACCESS it leads to is chosen on every invitation, with no default:
+        send exactly one of `access_days` (1 to 3650) or `access_forever: true`. Timed access
+        ends that many days after the master's grant is signed unless the master renews it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                agent: {type: string}
+                roles: {type: array, items: {type: string}}
+                expires_days: {type: integer, minimum: 1}
+                access_days: {type: integer, minimum: 1, maximum: 3650}
+                access_forever: {type: boolean}
       responses:
-        '200': {description: the reserved name}
-        '400': {description: not a path-safe identifier}
+        '200': {description: 'the reserved name, the code, and `access_days` (null for no expiry)'}
+        '400': {description: not a path-safe identifier, or the length of the access was not chosen}
         '409': {description: already in the channel}
+  /api/questions/{id}/answer:
+    post:
+      summary: The master renews, or lets end, access that is about to run out
+      description: >
+        Master only. Answers a question of kind `access` (the ones listed as `pending_access`
+        by `GET /api/team`) with exactly one of its options, `Renew` or `Let it end`, as the
+        master's own signed answer. Nothing else is answered here; every other kind has its
+        own page. A renewal extends the access by one more term from the date it would have
+        ended; no answer, or `Let it end`, leaves the end where it was.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [answer]
+              properties:
+                answer: {type: string}
+      responses:
+        '200': {description: the recorded answer}
+        '400': {description: not an access question, or not one of its options}
+        '401': {description: no active session}
+        '403': {description: dashboard is read-only, or the signed-in person is not the master}
+        '404': {description: no such question}
+        '409': {description: already answered}
   /api/master/init:
     post:
       summary: The signed-in operator becomes this project's master
@@ -815,7 +860,7 @@ paths:
         '200': {description: the grant}
         '403': {description: only the channel master may grant}
         '404': {description: not in this channel}
-        '409': {description: invited but not yet online, so there is no key to grant to}
+        '409': {description: invited but not yet online so there is no key to grant to, or their timed access has already ended}
   /api/release:
     get:
       summary: The release waiting for a person, with the gate's own verdict
@@ -920,8 +965,13 @@ paths:
         Combines locally available operator identities with remote operator entries from
         the signed channel roster. Agent ownership is deliberately null until a signed
         ownership and access-policy contract exists; clients must not infer authority.
+
+        Each teammate and grant carries `access_ends` (RFC 3339, or null for access that does
+        not end) and `access_lapsed` (true once a timed access has run out unrenewed);
+        `revoked` stays true only for a revocation the master signed. `pending_access` lists
+        the renewal questions waiting for the master (`id`, `text`, `options`, `asked_at`).
       responses:
-        '200': {description: current operator, channel master, human teammates, and agents}
+        '200': {description: current operator, channel master, human teammates, agents, grants, and pending access questions}
         '401': {description: no active session}
   /api/orders:
     post:

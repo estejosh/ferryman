@@ -37,6 +37,9 @@ pub const ADVERSARY: &str = "adversary";
 /// An outside suggestion waiting for the master: accept, decline or ask more. Nothing is
 /// built from one until the master's signed answer says Accept; see [`crate::suggestions`].
 pub const SUGGESTION: &str = "suggestion";
+/// A timed grant is about to end: renew it or let it end. The question id carries the grant
+/// it is about and the date a renewal would run to; see [`crate::master::ask_renewals`].
+pub const ACCESS: &str = "access";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {
@@ -208,6 +211,14 @@ pub fn answer_to(route: &ProjectRoute, question: &Question) -> Option<Answer> {
 /// Every question that verifies, oldest first, each with its answer if it has one.
 #[must_use]
 pub fn list(route: &ProjectRoute) -> Vec<(Question, Option<Answer>)> {
+    list_with_prefix(route, "")
+}
+
+/// [`list`], for the questions whose id starts with `prefix`. The prefix is checked before
+/// anything is read or verified, so a caller that knows the shape of the ids it wants (a
+/// grant's renewal questions) does not pay to verify every other question in the channel.
+#[must_use]
+pub fn list_with_prefix(route: &ProjectRoute, prefix: &str) -> Vec<(Question, Option<Answer>)> {
     let Ok(entries) = fs::read_dir(dir(route)) else {
         return Vec::new();
     };
@@ -216,7 +227,8 @@ pub fn list(route: &ProjectRoute) -> Vec<(Question, Option<Answer>)> {
         .filter_map(|entry| {
             let name = entry.file_name().to_str()?.to_string();
             let id = name.strip_suffix(".json")?;
-            (!id.ends_with(".answer") && !id.contains(".sync-conflict-")).then(|| id.to_string())
+            (id.starts_with(prefix) && !id.ends_with(".answer") && !id.contains(".sync-conflict-"))
+                .then(|| id.to_string())
         })
         .filter_map(|id| read(route, &id))
         .map(|question| {
