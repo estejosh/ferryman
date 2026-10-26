@@ -269,7 +269,7 @@ older, and the files go across and are written atomically.
 
 ## Hand-ins, and who may write the channel (layout 2)
 
-In a layout-2 project (docs/LAYOUT.md) the lane exchanges two folders per project with each trusted peer: the channel (`projects/<id>/comms`) and the hand-ins folder (`projects/<id>/handins`, or the path the manifest records). The second is a separate share under the key `<id>+handins`, on the same trust rules (the peer's endpoint id must be in a roster-signed `transports` record) and the same safety rules: the `.stignore` exclusions, no deletes, no `..`, absolute paths or symlinks, the 64 MiB cap. A peer that predates this refuses the share it does not know, and the channel syncs as before.
+In a layout-2 project (docs/LAYOUT.md) the lane exchanges two folders per project with each trusted peer: the channel (`projects/<id>/comms`) and the hand-ins folder (`projects/<id>/handins`, or the path the manifest records). The second is a separate share under the key `<id>+handins`, on the same trust rules (the peer's endpoint id must be in a roster-signed `transports` record) and the same safety rules: the `.stignore` exclusions, tombstones for channel files, no `..`, absolute paths or symlinks, and the 64 MiB cap. A peer that predates this refuses the share it does not know, and the channel syncs as before.
 
 Access levels (ADR 0024) are enforced by the machine that **receives** a file. A channel file authored by a Worker-level agent, by its name or by the `signed_by`, `sender` or `from` inside it, is dropped on arrival, signed or not; a Worker's files are accepted only from `handins/<agent>/`. `accepted.json` and `rejected.json` in the hand-ins folder are accepted only from the project's head or master. On a Worker's own machine the lane listens to the channel and publishes none of it (`Lane::set_local_agents`); under Syncthing the same machine's channel folder is made receive-only by `ferry access set`. A Worker's `transports` record is written to its hand-ins folder and honoured from there only.
 ## The fleet folder, and data (0.6.1)
@@ -278,15 +278,11 @@ The fleet's own folder (`<root>/fleet/`, ADR 0026) is one more channel to the la
 
 - `fleet/local/` is this machine's own part (its keys for the folder, the pins it mirrors, which notices it has shown). The lane's built-in `local` exclusion keeps it out both ways, and so does the folder's own `.stignore` under Syncthing.
 - A file authored by a Worker-level agent is dropped on arrival, as in any channel, and a Worker never writes the folder. What counts in it is decided by signatures when it is read (`fleethome`), not by who sent it: a peer cannot make a forged entry count by being trusted to sync.
+- A tombstone is kept for `tombstone_days` (`ferry.toml` `[iroh]`, default 90). Compaction drops older tombstones and records the oldest dropped `deleted_at` in the channel; from a peer whose last good sync is older than that mark the lane refuses incoming files older than the mark, so a long-offline peer cannot resurrect a compacted file.
 
 A project's `data/` folder is machine-local and is never exchanged. By default it is `projects/<id>/data`, which is not a share. If a manifest records it somewhere that is inside a share (a hand edit, or an older record), the lane adds it to that share's exclusions; if it is the share itself, or the share is inside it, the lane exchanges nothing from that folder. `ferry doctor --layout` reports the same case.
 ## Not done yet
 
-- A tombstone is kept for `tombstone_days` (`ferry.toml` `[iroh]`, default 90). Only
-  compaction drops older ones, and it records the oldest dropped `deleted_at` in the
-  channel; from a peer whose last good sync is older than that mark the lane refuses
-  incoming files older than the mark, so a long-offline peer cannot resurrect a
-  compacted file.
 - Files are checked by hash in transit, but not every file type's own signature is
   audited on arrival. The readers that already verify signatures (orders, results,
   policies, records) still do so when they read, exactly as for Syncthing.
