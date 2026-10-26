@@ -471,6 +471,14 @@ pub fn admin_tools() -> Vec<Value> {
             &json!({"type":"object","properties":{"action":{"enum":["check","apply"]}},"required":["action"]}),
             &["current", "latest", "available", "installed"],
         ),
+        tool(
+            "ferry_invite",
+            "Invite one of your own machines onto a project you are already on (owners only). Returns the one-use code and the paste-in prompt; run the accept line on the new machine.",
+            &json!({"type":"object","properties":{
+                "machine":text("a short label for the machine joining, e.g. laptop; it joins as <you>-<machine>"),
+                "expires_days":text("how long the code stays valid, in days (default 7)")},"required":["machine"]}),
+            &["code", "project", "machine", "expires_at", "prompt"],
+        ),
     ];
     tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     tools
@@ -585,6 +593,9 @@ fn guard(field: &str, text: &str) -> Result<()> {
 const ID_KEYS: &[&str] = &[
     "id", "next", "since", "uri", "ref", "hash", "sha", "commit", "agent", "to", "from", "by",
     "holder", "project", "machine", "current", "latest",
+    // The one-use invite code and its paste-in prompt carry a long base64url body, so the
+    // secret-shape redactor would eat them; they are identifiers/commands, not secrets.
+    "code", "prompt",
 ];
 
 /// `text` with every secret-shaped word replaced by `[redacted]`, or `None` when nothing
@@ -1033,6 +1044,7 @@ impl Agent {
             "ferry_search" if self.admin => self.search(args),
             "ferry_status" if self.admin => self.status(),
             "ferry_update" if self.admin => self.update(args),
+            "ferry_invite" if self.admin => self.invite(args),
             other => Err(bad(format!("unknown tool: {other}"))),
         }
     }
@@ -2398,6 +2410,42 @@ impl Agent {
 
     // -- admin ------------------------------------------------------------------------
 
+    /// `ferry_invite`: invite one of the caller's own machines onto this project. Owners
+    /// only, via `create_for_identity`; the mcp never runs as master, so a master-level
+    /// (new-person) invite is made in the dashboard (Teammates) instead.
+    fn invite(&self, args: &Value) -> Result<Reply> {
+        let machine = arg_str(args, "machine").ok_or_else(|| bad("ferry_invite needs a machine label"))?;
+        let days = args
+            .get("expires_days")
+            .and_then(Value::as_i64)
+            .unwrap_or(7)
+            .max(1);
+        let route = self.route();
+        let identity = self.identity()?;
+        let transport = crate::invite_transport_for(false)?;
+        let (invite, code) = ferryman_channel::invite::create_for_identity(
+            &route,
+            &identity,
+            machine,
+            chrono::Duration::days(days),
+            &transport,
+        )
+        .map_err(|e| bad(e.to_string()))?;
+        let prompt = format!(
+            "Paste this into the agent on {machine}: `ferry team invite accept {code} --email <their-email>`"
+        );
+        Ok(Reply::new(
+            format!("invite for {machine} on {} created", route.project_id),
+            json!({
+                "code": code,
+                "project": route.project_id,
+                "machine": machine,
+                "expires_at": invite.expires_at.to_rfc3339(),
+                "prompt": prompt,
+            }),
+        ))
+    }
+
     fn get(&self, args: &Value) -> Result<Reply> {
         let uri = need(args, "uri", "ferry_get")?;
         let read = self.read_resource(uri)?;
@@ -2954,7 +3002,7 @@ impl AllProjects {
                 }),
             None if open.len() == 1 => Ok(open[0].clone()),
             None if open.is_empty() => Err(bad(
-                "you are not seated in any project on this machine. Tell the human to run `ferry enable` in a project folder, or to seat you in the Ferryman dashboard (Agents)",
+                "you are not seated in any project on this machine. Ask the inviter for a code, then run `ferry team invite accept <code> --email <yours>`; to use your own relay see docs/SELF_HOSTING.md",
             )),
             None => Err(bad(format!("pass project on this call. {}", seats(open)))),
         }
@@ -2992,7 +3040,7 @@ impl AllProjects {
         });
         if open.is_empty() {
             data["note"] = json!(format!(
-                "'{}' is not seated in any live project on this machine. Tell the human to run `ferry enable` in a project folder, or to seat this app in the Ferryman dashboard (Agents)",
+                "'{}' is not seated in any live project on this machine. Ask the inviter for a code, then run `ferry team invite accept <code> --email <yours>`; to use your own relay see docs/SELF_HOSTING.md",
                 self.me
             ));
         }

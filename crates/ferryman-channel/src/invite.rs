@@ -663,6 +663,30 @@ pub fn read_acceptance(route: &ProjectRoute, id: &str) -> Result<Option<Acceptan
     Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
 }
 
+/// What a v2 invite's binding record says, written by the invite endpoint when a Join
+/// passes: which key bound, and the endpoint it published.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Bind {
+    pub invite_id: String,
+    pub bound_key: String,
+    pub agent: String,
+    pub endpoint: String,
+    pub at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// The binding a v2 invite recorded, if its handshake has completed.
+pub fn read_bind(route: &ProjectRoute, id: &str) -> Result<Option<Bind>> {
+    let path = invites_dir(route).join(format!("{id}.bind.json"));
+    if !path.is_file() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(&fs::read_to_string(path)?)?))
+}
+
 /// What the inviter's machine did on one pass over pending devices and acceptances.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Settled {

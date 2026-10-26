@@ -152,6 +152,18 @@ pub fn endpoint_id_from_hex(hex: &str) -> Result<EndpointId> {
     Ok(EndpointId::from_bytes(&bytes).map_err(|_| anyhow!("not a valid endpoint id"))?)
 }
 
+/// The address a newcomer dials for a v2 code: the inviter's invite endpoint id, through
+/// the relay the code names when it names one.
+pub fn inviter_addr(code: &ferryman_channel::invite::InviteCode) -> Result<EndpointAddr> {
+    let id = endpoint_id_from_hex(code.endpoint.as_deref().context("no invite endpoint in this code")?)?;
+    let mut addr = EndpointAddr::new(id);
+    if let Some(relay) = code.relay.as_deref() {
+        let relay: RelayUrl = relay.parse().context("the invite relay is not a URL")?;
+        addr = addr.with_relay_url(relay);
+    }
+    Ok(addr)
+}
+
 // ---------------------------------------------------------------------------------------
 // The inviter's checks, as pure functions so they can be unit-tested.
 

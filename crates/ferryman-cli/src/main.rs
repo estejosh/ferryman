@@ -2205,6 +2205,9 @@ enum InviteAction {
         /// How long the code stays valid, in days.
         #[arg(long, default_value_t = 7)]
         expires_days: i64,
+        /// Force a v1 (Syncthing) invitation even when this machine has an iroh lane.
+        #[arg(long)]
+        syncthing: bool,
         /// Sign as this operator (the master). Defaults to this machine's agent.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
@@ -2223,6 +2226,12 @@ enum InviteAction {
     },
     /// Every invitation on this project and where each one has got to.
     List {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Serve the invite endpoint in the foreground, for a master with no worker. Exits when
+    /// no open v2 invite remains, or on ctrl-c.
+    Serve {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
@@ -6924,6 +6933,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     agent,
                     roles,
                     expires_days,
+                    syncthing,
                     signer,
                 },
         } => {
@@ -6936,9 +6946,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 (None, None) => ferryman_ops::identity::resolve(None, &route.attachment)?,
             };
             let identity = signing_identity(&route, &signer_name)?;
-            let device = ferryman_channel::syncthing_my_id().context(
-                "the inviter's Syncthing must be running so the code can carry its device id",
-            )?;
+            let transport = invite_transport_for(syncthing)?;
 
             if let Some(owner) = as_identity {
                 if name.is_some() || agent.is_some() || roles.is_some() {
@@ -6957,7 +6965,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     &identity,
                     &machine,
                     chrono::Duration::days(expires_days.max(1)),
-                    &invite::Transport::Syncthing { device_id: device },
+                    &transport,
                 )?;
                 let joined_as = invite.operator.as_deref().unwrap_or(&machine);
                 println!("adding {joined_as} to {}", route.project_id);
@@ -6993,7 +7001,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 agent.as_deref(),
                 roles,
                 chrono::Duration::days(expires_days.max(1)),
-                &invite::Transport::Syncthing { device_id: device },
+                &transport,
             )?;
             println!(
                 "invited {} to {}",
@@ -7028,6 +7036,9 @@ async fn team_command(command: TeamCommand) -> Result<()> {
             action: InviteAction::Accept { code, into, email },
         } => accept_invite(&code, into, email).await?,
         TeamCommand::Invite {
+            action: InviteAction::Serve { workspace },
+        } => invite_serve(workspace).await?,
+        TeamCommand::Invite {
             action: InviteAction::List { workspace },
         } => {
             let route = here(workspace)?;
@@ -7052,11 +7063,19 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     .map(|a| a.operator)
                     .or_else(|| invite.operator.clone())
                     .unwrap_or_else(|| "(anyone)".to_string());
+                let version = if invite.endpoint.is_some() { "v2" } else { "v1" };
+                let bound = invite::read_bind(&route, &invite.id)
+                    .ok()
+                    .flatten()
+                    .map(|b| b.endpoint)
+                    .unwrap_or_default();
                 println!(
-                    "{}  {:<14} {:<30} {}  [{check:?}]",
+                    "{}  {:<14} {:<28} {:<3} {:<8} {}  [{check:?}]",
                     invite.id,
                     who,
                     state,
+                    version,
+                    if bound.is_empty() { "-".into() } else { bound[..bound.len().min(12)].to_string() },
                     invite.agent.as_deref().unwrap_or("-")
                 );
             }
@@ -7820,6 +7839,59 @@ fn print_standing(route: &ferryman_channel::ProjectRoute, master: &str) -> Resul
 /// The newcomer's whole join, in order, stopping with a plain reason at the first thing
 /// it cannot do. Runs `ferry enable` as a child so its prompts - password, recovery
 /// phrase - reach the person exactly as they always have.
+/// The transport a new invitation rides on: v2 (the iroh invite endpoint) when this machine
+/// has an iroh lane and `--syncthing` was not given, else v1 (Syncthing).
+pub(crate) fn invite_transport_for(force_syncthing: bool) -> Result<ferryman_channel::invite::Transport> {
+    use ferryman_channel::invite;
+    if !force_syncthing
+        && let Some(root) = ferryman_channel::ferry::find_root()
+    {
+        let config = ferryman_iroh::IrohConfig::load(&root.path);
+        if config.enabled {
+            let machine_dir = ferryman_iroh::machine_dir()?;
+            let endpoint = ferryman_iroh::invite::code_endpoint(&config, &machine_dir)?;
+            return Ok(invite::Transport::Iroh(endpoint));
+        }
+    }
+    let device = ferryman_channel::syncthing_my_id().context(
+        "the inviter's Syncthing must be running so the code can carry its device id (or \
+         enable an iroh lane, or pass --syncthing)",
+    )?;
+    Ok(invite::Transport::Syncthing { device_id: device })
+}
+
+/// Serve the invite endpoint in the foreground, for a master with no worker. Exits when no
+/// open v2 invite remains, or on ctrl-c.
+async fn invite_serve(workspace: Option<PathBuf>) -> Result<()> {
+    let start = match workspace {
+        Some(path) => path,
+        None => std::env::current_dir().context("read the current directory")?,
+    };
+    let route = ferryman_channel::route_for(&start)?;
+    let agent_name = ferryman_ops::identity::resolve(None, &route.attachment)?;
+    let identity = signing_identity(&route, &agent_name)?;
+    let root = ferryman_channel::ferry::find_root().context("no ferry root yet")?;
+    let config = ferryman_iroh::IrohConfig::load(&root.path);
+    let machine_dir = ferryman_iroh::machine_dir()?;
+    let (key, _) = ferryman_iroh::load_or_create_invite_key(&machine_dir)?;
+    let endpoint = ferryman_iroh::invite::InviteEndpoint::bind(&config, key, vec![route.clone()], identity).await?;
+    println!(
+        "invite endpoint serving as {}",
+        ferryman_iroh::endpoint_hex(&endpoint.endpoint().id())
+    );
+    let serve = tokio::spawn(std::sync::Arc::clone(&endpoint).serve());
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        if !ferryman_iroh::invite::has_open_invites(&[route.clone()], chrono::Utc::now()) {
+            break;
+        }
+    }
+    endpoint.endpoint().close().await;
+    serve.abort();
+    println!("no open v2 invitation remains; closing");
+    Ok(())
+}
+
 async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>) -> Result<()> {
     use ferryman_channel::invite;
     let code = invite::decode_code(code)?;
@@ -7829,6 +7901,10 @@ async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>)
             "joining {} (you pick your name in the browser)",
             code.project
         ),
+    }
+    // A v2 code rides the iroh invite endpoint: no Syncthing anywhere in the join path.
+    if code.is_v2() {
+        return accept_invite_v2(&code, into, email).await;
     }
 
     // 1. Syncthing, running and ours.
@@ -7940,6 +8016,207 @@ async fn accept_invite(code: &str, into: Option<PathBuf>, email: Option<String>)
         "Open the dashboard:  ferry dashboard    (in {})",
         workspace.display()
     );
+    Ok(())
+}
+
+/// The v2 accept path: install nothing but ferry, then one command. No Syncthing call
+/// anywhere in it; the newcomer dials the inviter's invite endpoint over iroh instead.
+async fn accept_invite_v2(
+    code: &ferryman_channel::invite::InviteCode,
+    into: Option<PathBuf>,
+    email: Option<String>,
+) -> Result<()> {
+    // 1. The project folder on this machine, and a ferry root if there is none.
+    let workspace = match into {
+        Some(path) => path,
+        None => {
+            let home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .context("no home directory")?;
+            home.join("Ferryman").join(&code.project)
+        }
+    };
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("create {}", workspace.display()))?;
+    println!("  folder      {}", workspace.display());
+
+    // 2. The email, as the v1 path asks for it.
+    let email = match email {
+        Some(e) => e,
+        None => {
+            if !std::io::stdin().is_terminal() {
+                bail!("pass --email when not at a terminal");
+            }
+            print!("Your email (for the licence seat count, nothing else): ");
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            line.trim().to_string()
+        }
+    };
+
+    // 3. The iroh lane on this machine: enabled, on iroh's public relays, unless the code
+    //    carries a pinned relay of the inviter's.
+    let root_path = match ferryman_channel::ferry::find_root() {
+        Some(root) => root.path.clone(),
+        None => {
+            let home = std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(PathBuf::from)
+                .context("no home directory")?;
+            let root_path = home.join("Ferryman");
+            std::fs::create_dir_all(&root_path).context("make the ferry root")?;
+            root_path
+        }
+    };
+    let pinned = code
+        .pin
+        .as_ref()
+        .zip(code.relay.as_ref())
+        .map(|(pin, relay)| (relay.as_str(), pin.as_str()));
+    ensure_iroh_enabled(&root_path, pinned)?;
+
+    // 4. Enable the project without Syncthing; the iroh lane picks it up.
+    let exe = std::env::current_exe().context("find ferry")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("enable")
+        .arg("--workspace")
+        .arg(&workspace)
+        .arg("--project")
+        .arg(&code.project)
+        .arg("--email")
+        .arg(&email)
+        .arg("--no-syncthing")
+        .arg("--dashboard")
+        .arg("--joining");
+    if let Some(operator) = &code.operator {
+        cmd.arg("--dashboard-operator").arg(operator);
+    }
+    match &code.agent {
+        Some(agent) => {
+            cmd.arg("--agent").arg(agent);
+        }
+        None if code.operator.is_none() => {
+            cmd.arg("--agent").arg(format!("guest-{}", code.id));
+        }
+        None => {}
+    }
+    let status = cmd.status().context("run ferry enable")?;
+    if !status.success() {
+        bail!("ferry enable did not finish; fix what it reported and run this again");
+    }
+    accept_invite_v2_handshake(code, &workspace, &root_path).await
+}
+
+/// The dial half of the v2 accept path: the lane key, its transports record, the handshake
+/// against the inviter's invite endpoint, and the atomic write of the bootstrap.
+async fn accept_invite_v2_handshake(
+    code: &ferryman_channel::invite::InviteCode,
+    workspace: &std::path::Path,
+    root_path: &std::path::Path,
+) -> Result<()> {
+    use ferryman_channel::invite;
+    let route = ferryman_channel::route_for(workspace)?;
+    let agent_name = ferryman_ops::identity::resolve(None, &route.attachment)?;
+    let identity = signing_identity(&route, &agent_name)?;
+    let machine_dir = ferryman_iroh::machine_dir()?;
+    let (lane_key, _) = ferryman_iroh::load_or_create_key(&machine_dir)?;
+    let lane_id = ferryman_iroh::endpoint_hex(&lane_key.public());
+    ferryman_channel::transports::publish(&route, &identity, &lane_id, None)?;
+
+    let config = ferryman_iroh::IrohConfig::load(root_path);
+    let endpoint = ferryman_iroh::lane::bind(&config, lane_key).await?;
+    let addr = ferryman_iroh::invite::inviter_addr(code)?;
+    let join = ferryman_iroh::invite::build_join(
+        code,
+        &identity,
+        transports_record_for(&identity, &code.project, &lane_id),
+    );
+    let acceptance = code.operator.as_ref().map(|operator| ferryman_iroh::invite::Accept {
+        acceptance: invite::build_acceptance(&identity, code, &lane_id, operator, code.agent.as_deref()),
+        operator_entry: None,
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let welcome = loop {
+        match ferryman_iroh::invite::join(&endpoint, &addr, &join, acceptance.clone()).await {
+            Ok(welcome) => break welcome,
+            Err(error) => {
+                if std::time::Instant::now() >= deadline {
+                    bail!(
+                        "the inviter's machine is not reachable right now; ask them to keep \
+                         ferry running, then run this again ({error:#})"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
+    };
+    ferryman_iroh::invite::verify_welcome(&welcome.files, &code.project)?;
+    ferryman_iroh::invite::write_welcome(&route, &welcome.files)?;
+    endpoint.close().await;
+
+    println!();
+    println!("done. {} will appear on this machine now.", code.project);
+    println!(
+        "Open the dashboard:  ferry dashboard    (in {})",
+        workspace.display()
+    );
+    println!("Create your identity there, and your keys land in the channel.");
+    Ok(())
+}
+
+/// A signed transports record for the newcomer's lane endpoint, in the shape the Join sends.
+fn transports_record_for(
+    identity: &ferryman_channel::AgentIdentity,
+    project: &str,
+    endpoint_id: &str,
+) -> ferryman_channel::transports::Transports {
+    let mut record = ferryman_channel::transports::Transports {
+        version: ferryman_channel::transports::VERSION,
+        project_id: project.to_string(),
+        agent: identity.name().to_string(),
+        endpoint_id: endpoint_id.to_string(),
+        relay_url: None,
+        at: chrono::Utc::now(),
+        signed_by: identity.name().to_string(),
+        signature: String::new(),
+    };
+    record.signature = identity.sign_bytes(ferryman_channel::transports::payload(&record).as_bytes());
+    record
+}
+
+/// Write `[iroh]` into the ferry root's `ferry.toml`: the lane on, on iroh's public relays,
+/// or on the inviter's pinned relay when the code carries one.
+fn ensure_iroh_enabled(root_path: &std::path::Path, pinned: Option<(&str, &str)>) -> Result<()> {
+    let path = root_path.join("ferry.toml");
+    let mut doc: toml::Table = if path.is_file() {
+        toml::from_str(&std::fs::read_to_string(&path)?).unwrap_or_default()
+    } else {
+        toml::Table::new()
+    };
+    let iroh = doc
+        .entry("iroh")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let table = iroh
+        .as_table_mut()
+        .context("ferry.toml [iroh] is not a table")?;
+    if !table.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+        table.insert("enabled".into(), toml::Value::Boolean(true));
+    }
+    match pinned {
+        Some((relay, pin)) => {
+            table.insert("relay_url".into(), toml::Value::String(relay.to_string()));
+            table.insert("relay_cert_sha256".into(), toml::Value::String(pin.to_string()));
+        }
+        None => {
+            if !table.contains_key("relay_url") && !table.contains_key("invite_relay_url") {
+                table.insert("public_relays".into(), toml::Value::Boolean(true));
+            }
+        }
+    }
+    std::fs::write(&path, toml::to_string_pretty(&doc)?)?;
     Ok(())
 }
 
