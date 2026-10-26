@@ -13,6 +13,7 @@ mod mcp_agent;
 mod mcp_client;
 mod mcp_http;
 mod mcp_oauth;
+mod mcp_setup;
 mod restart;
 mod route;
 mod suggest;
@@ -1068,17 +1069,19 @@ enum MarvinCommand {
 
 #[derive(Subcommand, Clone)]
 enum McpCommand {
-    /// Serve this project over MCP (Model Context Protocol) on stdio (beta). With
-    /// `--as <agent>` an MCP client (Claude Desktop, Codex, Claude Code) gets six tools
-    /// to join, catch up, take orders, talk, follow the primary and ask the human, signed
-    /// with that agent's own key and capped by its grant. Without `--as`, or with
-    /// `--read-only`, it is the read-only query surface: a stranger, not the operator.
+    /// Serve Ferryman over MCP (Model Context Protocol) on stdio (beta). With no flags an
+    /// MCP client (Codex, Claude Code, Claude Desktop, Cursor) makes its own identity,
+    /// `<client>-<machine>`, seated as a Worker in every live project on this machine, and
+    /// gets the tools to join, catch up, take orders, talk, follow the primary and ask the
+    /// human, signed with that identity's own key. `--as <agent>` speaks as a named agent
+    /// instead; `--read-only` is the read-only query surface (a stranger, not the operator).
     Serve {
         /// The project directory. Defaults to where you are.
         #[arg(long)]
         workspace: Option<PathBuf>,
-        /// Speak as this agent (for example claude-desktop-beastly). The name is bound
-        /// to a key by the roster; this cannot speak as another agent.
+        /// Speak as this agent (for example claude-desktop-beastly). Without it the client's
+        /// own name and this machine make one. The name is bound to a key by the roster;
+        /// this cannot speak as another agent, or as the master.
         #[arg(long = "as", value_parser = agent_name)]
         agent: Option<String>,
         /// The project, by id, in the ferry root. Defaults to the one in --workspace.
@@ -1106,6 +1109,18 @@ enum McpCommand {
         /// only Host the server answers to. Required unless --http is a loopback address.
         #[arg(long, requires = "http")]
         public_url: Option<String>,
+    },
+    /// Put Ferryman into an MCP client's config (merged, never clobbering other servers).
+    Setup {
+        /// codex, claude-code, claude-desktop or cursor.
+        #[arg(long)]
+        client: String,
+        /// Show what would be written and where, and write nothing.
+        #[arg(long)]
+        print: bool,
+        /// The client's config file, when it is not in the usual place.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Print a single-use pairing code (valid 10 minutes) for connecting an app to
     /// `ferry mcp serve --http`. The server stores only its hash.
@@ -5076,6 +5091,11 @@ async fn run(cli: Cli) -> Result<()> {
                     state_dir: None,
                 }),
             })?,
+            McpCommand::Setup {
+                client,
+                print,
+                config,
+            } => mcp_setup::run(&client, print, config)?,
             McpCommand::Pair => {
                 let dir = mcp_http::default_state_dir()?;
                 let code = mcp_oauth::mint_pairing_code(&dir, mcp_oauth::unix_now())?;
