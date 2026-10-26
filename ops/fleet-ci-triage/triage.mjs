@@ -159,13 +159,16 @@ function fileTrackingIssue(repoFull, wfName, run) {
 }
 
 // Copilot cloud agent is confirmed enabled (with safe review/approval policies)
-// on estejosh's repos as of 26 Oct 2026 — not on shindevlin's (Free plan, and
-// estejosh only has read access to shindevlin/hone). So: give flagged issues
-// to Copilot as a second opinion on estejosh repos; elsewhere they just sit as
-// plain tracking issues. Best-effort — never let this block the main report.
+// on estejosh's repos as of 26 Oct 2026. estejosh is also now a write
+// collaborator on shindevlin/hone (26 Oct 2026), and GraphQL confirms
+// copilot-swe-agent is assignable there too via estejosh's own Copilot Pro
+// entitlement — so this isn't restricted to the estejosh owner anymore.
+// Checked dynamically per-repo below rather than hardcoded by owner, since
+// that's the actual gate (whether copilot-swe-agent shows up as an assignable
+// actor), not which account owns the repo. Best-effort — never blocks the
+// main report if it fails.
 function tryAssignCopilot(repoFull, issueNumber) {
   const [owner, repo] = repoFull.split("/");
-  if (owner !== "estejosh") return;
   try {
     const q = `query($owner:String!,$repo:String!,$num:Int!){
       repository(owner:$owner,name:$repo){

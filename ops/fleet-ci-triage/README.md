@@ -56,24 +56,28 @@ safe and flags the rest — without that standing-agent shape.
 
 3. Edit `repos.json` any time to add/remove repos — no code change needed.
 
-## GitHub Copilot — wired in for estejosh's repos
+## GitHub Copilot — wired in, including on shindevlin/hone
 
 Checked in-browser (26 Oct 2026): `estejosh` has Copilot Pro with "Copilot
 cloud agent" enabled account-wide, and the per-repo coding-agent settings on
 `ferryman` and `snifrig` (likely all estejosh repos, same Pro-plan defaults)
 already have safe policies on — approval required before Copilot's own
 workflow runs, automations restricted to write-access users, CodeQL/secret
-scanning/Copilot review as validation gates. `shindevlin` is on Copilot Free
-with cloud agent disabled there, and estejosh only has read access to
-`shindevlin/hone` anyway, so this doesn't reach Hone unless that changes.
+scanning/Copilot review as validation gates.
 
-So: every tracking issue this files now also tries to assign `copilot-swe-agent`
-as a second opinion, but **only on repos under `estejosh`** (confirmed via
-GitHub's GraphQL `suggestedActors` query, which lists `copilot-swe-agent` as
-an assignable actor there). On `shindevlin/hone` and `shindevlin/phonehome`,
-issues stay plain tracking issues for you (or for `fleet-ci-fix.yml`, see
-below) until shindevlin has its own paid Copilot plan. The assignment is
-best-effort and never blocks filing the issue itself if it fails.
+`shindevlin` itself is still on Copilot Free with cloud agent disabled on that
+account, but estejosh was added as a write collaborator on `shindevlin/hone`
+(26 Oct 2026, invite accepted), and GitHub's GraphQL `suggestedActors` query
+confirms `copilot-swe-agent` is now assignable there too — it rides on
+estejosh's own Copilot Pro entitlement once estejosh has write access, not
+shindevlin's plan. So the triage script no longer special-cases this by owner:
+every tracking issue checks, per-repo, whether `copilot-swe-agent` is
+assignable (dynamic `suggestedActors` lookup) and assigns it if so. Right now
+that's every estejosh repo plus `shindevlin/hone`. `shindevlin/phonehome`
+would need the same collaborator treatment to get the same coverage.
+
+The assignment is best-effort and never blocks filing the issue itself if it
+fails.
 
 ## Why this lives in `ferryman` and not its own repo
 
