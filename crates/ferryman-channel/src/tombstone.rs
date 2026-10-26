@@ -560,6 +560,28 @@ mod tests {
     }
 
     #[test]
+    fn dropping_expired_tombstones_records_the_oldest_deleted_at() {
+        let (_dir, route) = fixture();
+        let fang = AgentIdentity::load_or_create("fang", &route.attachment).unwrap();
+        enrol(&route, &fang);
+        let file = route.communications.join("claim.fang.json");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, b"{\"signed_by\":\"fang\"}").unwrap();
+        // A tombstone dated two days ago.
+        let past = now_ms() - 2 * 86_400_000;
+        write(&route, "claim.fang.json", None, past, &fang).unwrap();
+
+        // With a one-day window it is dropped, and the channel records how far back the
+        // deletions reach.
+        let retention = drop_expired(&route, 1)
+            .unwrap()
+            .expect("a tombstone dropped");
+        assert_eq!(retention.oldest_deleted_at, past);
+        assert!(honoured(&route).is_empty());
+        assert_eq!(retention_mark(&route).unwrap().oldest_deleted_at, past);
+    }
+
+    #[test]
     fn apply_removes_a_covered_file_and_leaves_a_newer_write() {
         let (_dir, route) = fixture();
         let fang = AgentIdentity::load_or_create("fang", &route.attachment).unwrap();
