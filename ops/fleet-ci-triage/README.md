@@ -73,8 +73,8 @@ estejosh's own Copilot Pro entitlement once estejosh has write access, not
 shindevlin's plan. So the triage script no longer special-cases this by owner:
 every tracking issue checks, per-repo, whether `copilot-swe-agent` is
 assignable (dynamic `suggestedActors` lookup) and assigns it if so. Right now
-that's every estejosh repo plus `shindevlin/hone`. `shindevlin/phonehome`
-would need the same collaborator treatment to get the same coverage.
+that's every estejosh repo plus `shindevlin/hone`. (`shindevlin/phonehome`
+was dropped from `repos.json` — deprecated.)
 
 The assignment is best-effort and never blocks filing the issue itself if it
 fails.
