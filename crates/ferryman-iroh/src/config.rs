@@ -117,6 +117,9 @@ pub struct IrohConfig {
     pub relay_quic_port: u16,
     /// Minutes before a silent peer or an unreachable relay is raised as a warning.
     pub alert_after_minutes: u64,
+    /// Days a honoured tombstone is kept before compaction drops it and records how far
+    /// back the channel's deletions reach.
+    pub tombstone_days: u32,
     /// Peers that come and go (a laptop): agent names, or the start of an endpoint id. The
     /// lane never raises an alert about them. Every other peer is expected to be on all the
     /// time, as a machine with a worker service is.
@@ -141,6 +144,7 @@ impl Default for IrohConfig {
             relay_token_file: None,
             relay_quic_port: DEFAULT_QUIC_PORT,
             alert_after_minutes: DEFAULT_ALERT_MINUTES,
+            tombstone_days: ferryman_channel::tombstone::DEFAULT_TOMBSTONE_DAYS,
             intermittent_peers: Vec::new(),
             fleet_relays: Vec::new(),
             notes: Vec::new(),
@@ -307,6 +311,18 @@ impl IrohConfig {
                 None => config
                     .notes
                     .push("[iroh] alert_after_minutes is not a positive number".into()),
+            }
+        }
+        if let Some(days) = section.get("tombstone_days") {
+            match days
+                .as_integer()
+                .and_then(|d| u32::try_from(d).ok())
+                .filter(|d| *d > 0)
+            {
+                Some(days) => config.tombstone_days = days,
+                None => config
+                    .notes
+                    .push("[iroh] tombstone_days is not a positive number".into()),
             }
         }
         for url in &relays {

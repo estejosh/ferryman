@@ -35,7 +35,7 @@ use iroh::{
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use ferryman_channel::{ProjectRoute, access, ferry, syncscope};
+use ferryman_channel::{ProjectRoute, access, ferry, syncscope, tombstone};
 
 use crate::config::RelayPlan;
 use crate::manifest::{self, Entry, HashCache, Plan, Rules};
@@ -340,6 +340,12 @@ struct Share {
     /// machine whose agents are all Workers: it hears the fleet and says nothing back
     /// through it (ADR 0024).
     send: bool,
+    /// The honoured tombstones of this channel. Empty for a hand-ins folder: a tombstone
+    /// deletes channel files, and hand-ins already move a Worker's writes apart.
+    tombstones: tombstone::Resolved,
+    /// The oldest deletion the channel no longer keeps a tombstone for (compaction's
+    /// retention mark). A long-offline peer offering a file older than this is refused.
+    retention: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -532,6 +538,8 @@ impl Lane {
                 dir: channel.clone(),
                 rules: Rules::for_channel(channel).transports_only(route.clone()),
                 send: !access::machine_is_worker_only(channel, id, &local),
+                tombstones: tombstone::Resolved::default(),
+                retention: None,
             }];
         }
         let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
@@ -562,6 +570,8 @@ impl Lane {
                     &peer.agents.iter().cloned().collect::<Vec<_>>(),
                 )),
             send: !access::machine_is_worker_only(channel, id, &local),
+            tombstones: tombstone::Resolved::read(route),
+            retention: tombstone::retention_mark(route).map(|mark| mark.oldest_deleted_at),
         }];
         if skip_channel {
             shares.clear();
@@ -583,6 +593,8 @@ impl Lane {
                 rules,
                 dir: handins,
                 send: true,
+                tombstones: tombstone::Resolved::default(),
+                retention: None,
             });
         }
         shares
@@ -682,7 +694,7 @@ impl Lane {
             return;
         };
         while let Ok((send, recv)) = connection.accept_bi().await {
-            let mut outcome = self.answer(&peer, send, recv).await;
+            let mut outcome = self.answer(&peer, &remote, send, recv).await;
             if let Ok(done) = &mut outcome {
                 done.path = path_of(&connection);
             }
@@ -693,6 +705,7 @@ impl Lane {
     async fn answer(
         &self,
         peer: &Peer,
+        id: &EndpointId,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<Outcome> {
@@ -726,8 +739,21 @@ impl Lane {
             return Ok(Outcome::default());
         };
         let (channel, rules) = (&share.dir, &share.rules);
-        let ours = self.scan(channel, rules);
-        let mut plan = manifest::plan(&hello.manifest, &ours, rules);
+        let mut ours = self.scan(channel, rules);
+        // A file a honoured tombstone covers is not offered: deleting on one machine must
+        // remove it everywhere, so the lane must not hand it back out.
+        ours.retain(|path, entry| !share.tombstones.is_covered(path, &entry.hash, entry.mtime));
+        let theirs: Vec<Entry> = hello
+            .manifest
+            .iter()
+            .filter(|entry| {
+                !share
+                    .tombstones
+                    .is_covered(&entry.path, &entry.hash, entry.mtime)
+            })
+            .cloned()
+            .collect();
+        let mut plan = manifest::plan(&theirs, &ours, rules);
         // A folder this machine only listens to gives nothing; a dialer that only listens
         // is asked for nothing.
         if !share.send {
@@ -738,15 +764,33 @@ impl Lane {
         }
         plan.version = Some(VERSION.to_owned());
         write_frame(&mut send, &Reply::Plan(plan.clone())).await?;
+        let stale = share
+            .retention
+            .is_some_and(|mark| self.peer_stale(id, mark));
         let mut received = 0;
         for path in &plan.want {
-            received += u64::from(receive_item(&mut recv, channel, rules, path).await?);
+            received += u64::from(
+                receive_item(
+                    &mut recv,
+                    channel,
+                    rules,
+                    &share.tombstones,
+                    share.retention,
+                    stale,
+                    path,
+                )
+                .await?,
+            );
         }
         let mut sent = 0;
         for path in &plan.give {
             sent += u64::from(send_item(&mut send, channel, rules, &ours, path).await?);
         }
         send.finish()?;
+        // Files arrived; apply any honoured tombstone the exchange just carried in.
+        if let Some(route) = route {
+            let _ = tombstone::apply(route);
+        }
         Ok(Outcome {
             received,
             sent,
@@ -763,6 +807,10 @@ impl Lane {
                 .await
                 .unwrap_or_else(|_| Err(anyhow::anyhow!("took longer than {PEER_TIMEOUT:?}")));
             self.note(&id, &peer, outcome);
+        }
+        // Files arrived on both sides of every exchange; honour the tombstones they carried.
+        for route in self.routes() {
+            let _ = tombstone::apply(&route);
         }
         self.record_relay();
     }
@@ -787,7 +835,7 @@ impl Lane {
             peer.projects.contains(&route.project_id) || peer.bootstrap.contains(&route.project_id)
         }) {
             for share in self.shares(route, peer) {
-                match self.sync_share(&connection, &share).await {
+                match self.sync_share(&connection, &share, &id).await {
                     Ok(Some((received, sent, version))) => {
                         totals.received += received;
                         totals.sent += sent;
@@ -815,9 +863,12 @@ impl Lane {
         &self,
         connection: &Connection,
         share: &Share,
+        id: &EndpointId,
     ) -> Result<Option<(u64, u64, Option<String>)>> {
         let (channel, rules) = (&share.dir, &share.rules);
-        let ours = self.scan(channel, rules);
+        let mut ours = self.scan(channel, rules);
+        // A file a honoured tombstone covers is not offered, so a deletion is never undone.
+        ours.retain(|path, entry| !share.tombstones.is_covered(path, &entry.hash, entry.mtime));
         // What this side offers: everything it has, or - for a folder it only listens to -
         // nothing, so even a peer that asks is told "skip" (the sender enforces it too).
         let offered = if share.send {
@@ -845,15 +896,46 @@ impl Lane {
             sent += u64::from(send_item(&mut send, channel, rules, &offered, path).await?);
         }
         send.finish()?;
+        let stale = share
+            .retention
+            .is_some_and(|mark| self.peer_stale(id, mark));
         let mut received = 0;
         for path in &plan.give {
-            received += u64::from(receive_item(&mut recv, channel, rules, path).await?);
+            received += u64::from(
+                receive_item(
+                    &mut recv,
+                    channel,
+                    rules,
+                    &share.tombstones,
+                    share.retention,
+                    stale,
+                    path,
+                )
+                .await?,
+            );
         }
         // Wait for the answerer to finish its side: it does that only after it has read and
         // written everything sent to it. Closing the connection before then discards what
         // is still in flight, which is exactly the case where there was nothing to receive.
         let _ = recv.read_to_end(64).await;
         Ok(Some((received, sent, plan.version)))
+    }
+
+    /// Whether `id` has not had a good sync since `mark` (milliseconds since the epoch), so
+    /// a file older than `mark` it offers could be a resurrected deletion that compaction
+    /// has stopped keeping a tombstone for.
+    fn peer_stale(&self, id: &EndpointId, mark: i64) -> bool {
+        let last = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .peers
+            .get(&endpoint_hex(id))
+            .and_then(|peer| peer.last_sync);
+        match last {
+            Some(at) => at.timestamp_millis() < mark,
+            None => true,
+        }
     }
 
     fn scan(&self, channel: &Path, rules: &Rules) -> BTreeMap<String, Entry> {
@@ -1013,13 +1095,17 @@ async fn send_item(
     }
 }
 
-/// Receive the item for `expected`. A file this side cannot take (it breaks a rule, or a
-/// newer copy is here) is read and dropped, so the stream stays in step; a peer that sends
-/// a different path than the one asked for is a peer that is not speaking the protocol.
+/// Receive the item for `expected`. A file this side cannot take (it breaks a rule, a
+/// honoured tombstone or the retention mark covers it, or a newer copy is here) is read and
+/// dropped, so the stream stays in step; a peer that sends a different path than the one
+/// asked for is a peer that is not speaking the protocol.
 async fn receive_item(
     recv: &mut RecvStream,
     channel: &Path,
     rules: &Rules,
+    tombstones: &tombstone::Resolved,
+    retention: Option<i64>,
+    stale: bool,
     expected: &str,
 ) -> Result<bool> {
     let Some(entry) = read_frame::<Option<Entry>>(recv).await? else {
@@ -1037,6 +1123,14 @@ async fn receive_item(
     }
     let mut bytes = vec![0_u8; usize::try_from(entry.size)?];
     recv.read_exact(&mut bytes).await?;
+    // A deletion must never come back: the version a honoured tombstone covers, and - from
+    // a peer that has not synced since compaction dropped the tombstone - any file older
+    // than the retention mark, are read and dropped, not written.
+    if tombstones.is_covered(&entry.path, &entry.hash, entry.mtime)
+        || (stale && retention.is_some_and(|mark| entry.mtime < mark))
+    {
+        return Ok(false);
+    }
     Ok(manifest::write_received(channel, rules, &entry, &bytes).unwrap_or(false))
 }
 
