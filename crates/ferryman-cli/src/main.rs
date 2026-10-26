@@ -32,6 +32,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
@@ -1729,8 +1730,8 @@ enum Channel {
     /// originals are removed on a later pass, after the grace, once the archive is seen to
     /// hold them. `ferry channel log` and `ferry channel inbox --all` still show them.
     ///
-    /// Syncthing channels only, for now: the iroh lane never deletes, so its peers would
-    /// send back what was compacted. A channel the lane carries is refused.
+    /// Works on a channel the iroh lane carries: each original it removes is also covered
+    /// by a tombstone, signed by the compactor, so the lane deletes it on every peer.
     Compact {
         #[arg(long)]
         workspace: Option<PathBuf>,
@@ -1744,6 +1745,18 @@ enum Channel {
         #[arg(long)]
         force_no_grace: bool,
         /// Who is compacting. Defaults to this machine's name.
+        #[arg(long, value_parser = agent_name)]
+        agent: Option<String>,
+    },
+    /// Delete one channel file, signed and propagated: writes a tombstone and removes it
+    /// here; the lane (and Syncthing) then remove it on every peer. Only the file's
+    /// author, the project's master or the head may do this.
+    Rm {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        /// The channel-relative path, `/`-separated.
+        path: String,
+        /// Who is deleting. Defaults to this machine's name.
         #[arg(long, value_parser = agent_name)]
         agent: Option<String>,
     },
@@ -12121,29 +12134,27 @@ fn channel(command: Channel) -> Result<()> {
             agent,
         } => {
             let route = here(workspace)?;
-            if lane::carried_by_iroh(&route).is_some()
-                || !ferryman_channel::transports::honoured_records(&route).is_empty()
-            {
-                bail!(
-                    "this channel is carried by the iroh lane, and compaction is Syncthing-only \
-                     for now: iroh never deletes, so its peers would send back every message \
-                     compaction removed and no space would be freed"
-                )
-            }
             let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
             let identity = signing_identity(&route, &agent)?;
-            let pass = if force_no_grace {
-                ferryman_channel::compaction::compact_unchecked
+            let tombstone_days = lane::tombstone_days();
+            let report = if force_no_grace {
+                ferryman_channel::compaction::compact_unchecked_retaining(
+                    &route,
+                    &identity,
+                    chrono::Utc::now(),
+                    chrono::Duration::hours(i64::from(grace_hours)),
+                    dry_run,
+                    tombstone_days,
+                )
             } else {
-                ferryman_channel::compaction::compact
-            };
-            let report = pass(
-                &route,
-                &identity,
-                chrono::Utc::now(),
-                chrono::Duration::hours(i64::from(grace_hours)),
-                dry_run,
-            )?;
+                ferryman_channel::compaction::compact(
+                    &route,
+                    &identity,
+                    chrono::Utc::now(),
+                    chrono::Duration::hours(i64::from(grace_hours)),
+                    dry_run,
+                )
+            }?;
             let (archive, remove) = if dry_run {
                 ("would archive", "would remove")
             } else {
@@ -12157,12 +12168,63 @@ fn channel(command: Channel) -> Result<()> {
             }
             println!("{archive} {} message(s)", report.archived.len());
             if let Some(record) = &report.record {
-                println!("signed record {}", record.display());
+                println!("signed record {}\n", record.display());
             }
             println!("{remove} {} original(s)", report.removed.len());
             for (id, why) in &report.kept {
                 println!("kept {id}: {why}");
             }
+        }
+
+        Channel::Rm {
+            workspace,
+            path,
+            agent,
+        } => {
+            let route = here(workspace)?;
+            if ferryman_channel::tombstone::refused(&path, &route.project_id) {
+                bail!("'{}' is a path a channel never deletes", path);
+            }
+            let agent = ferryman_ops::identity::resolve(agent, &route.attachment)?;
+            let identity = signing_identity(&route, &agent)?;
+            // Only the file's author, the master or the head may delete it.
+            let bytes = fs::read(route.communications.join(&path)).unwrap_or_default();
+            let authors = ferryman_channel::access::file_authors(&path, &bytes);
+            let master_or_head = ferryman_channel::master::read_master(&route)
+                .ok()
+                .flatten()
+                .is_some_and(|master| master.master.eq_ignore_ascii_case(&agent))
+                || ferryman_channel::head::current(&route.communications, &route.project_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|head| head.agent.eq_ignore_ascii_case(&agent));
+            if !master_or_head && !authors.iter().any(|who| who.eq_ignore_ascii_case(&agent)) {
+                bail!(
+                    "only the file's author, the master or the head may delete '{}', not {agent}",
+                    path
+                );
+            }
+            let content = fs::read(route.communications.join(&path))
+                .ok()
+                .map(|bytes| blake3::hash(&bytes).to_hex().to_string());
+            let deleted_at = chrono::Utc::now().timestamp_millis();
+            ferryman_channel::tombstone::write(
+                &route,
+                &path,
+                content.as_deref(),
+                deleted_at,
+                &identity,
+            )?;
+            // Remove it here, as the author asked; the tombstone travels to every peer.
+            let full = route.communications.join(&path);
+            if full.exists() {
+                fs::remove_file(&full)?;
+            }
+            println!(
+                "deleted '{}' (tombstone {})",
+                path,
+                ferryman_channel::tombstone::path_for(&path)
+            );
         }
 
         Channel::Log { workspace, limit } => {

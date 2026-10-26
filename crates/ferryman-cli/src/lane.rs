@@ -728,6 +728,15 @@ pub(crate) fn carried_by_iroh(route: &ProjectRoute) -> Option<Carried> {
     carried_in(route, config.enabled, &machine, chrono::Utc::now())
 }
 
+/// Days a honoured tombstone is kept before compaction drops it, from `ferry.toml`
+/// `[iroh]`. The default when the root or the section is absent.
+pub(crate) fn tombstone_days() -> u32 {
+    match ferryman_channel::ferry::find_root() {
+        Some(root) => IrohConfig::load(&root.path).tombstone_days,
+        None => ferryman_channel::tombstone::DEFAULT_TOMBSTONE_DAYS,
+    }
+}
+
 /// The lane carries a channel from this machine when it is switched on, the machine has an
 /// iroh key, and the channel holds a record, honoured by its roster, that names that key.
 fn carried_in(
