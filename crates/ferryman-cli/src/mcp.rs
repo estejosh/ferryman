@@ -265,6 +265,21 @@ impl Server {
         }
     }
 
+    /// The server for one paired app over HTTP: its own identity, every project it is seated
+    /// in, and never an Orchestrator seat.
+    pub fn for_app(name: &str, source: mcp_agent::RouteSource) -> Result<Self> {
+        Ok(Server {
+            route: None,
+            agent: None,
+            all: Some(AllProjects::new(name, false, true, source)?),
+            http: true,
+            legacy: false,
+            gateways: Vec::new(),
+            lazy: None,
+            setup_error: None,
+        })
+    }
+
     /// A test server over several projects.
     #[cfg(test)]
     pub fn with_all(all: AllProjects, http: bool) -> Self {

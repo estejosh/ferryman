@@ -23,6 +23,7 @@ use axum::routing::{any, get, post};
 use serde_json::{Value, json};
 
 use crate::mcp::{HTTP_PROTOCOLS, MAX_LINE_BYTES, Server, handle_line};
+use crate::mcp_agent::RouteSource;
 use crate::mcp_oauth::{self as oauth, CodeRequest, OAuthError, Store};
 
 /// What `--http` was started with.
@@ -47,7 +48,8 @@ pub struct Config {
     pub resource: String,
     /// The only `Host` header accepted.
     pub host: String,
-    /// The agent identity every app is bound to.
+    /// The agent identity every app is bound to. Empty means each paired app makes its own
+    /// (`<app>-<machine>`, a Worker) when it is paired.
     pub agent: String,
     pub state_dir: PathBuf,
 }
@@ -96,6 +98,12 @@ impl Config {
         })
     }
 
+    /// Each paired app gets an identity of its own.
+    #[must_use]
+    pub fn per_app(&self) -> bool {
+        self.agent.is_empty()
+    }
+
     fn prm_url(&self) -> String {
         format!("{}/.well-known/oauth-protected-resource/mcp", self.origin)
     }
@@ -108,9 +116,17 @@ pub fn default_state_dir() -> Result<PathBuf> {
         .context("no per-user state directory on this machine")
 }
 
+/// The identity a request's token was granted to, put on the request by `require_token`.
+#[derive(Clone)]
+struct AppAgent(String);
+
 pub struct App {
     cfg: Config,
     server: Mutex<Server>,
+    /// Where the projects come from, for apps that make their own identity.
+    source: RouteSource,
+    /// One server per paired app, made on its first request.
+    apps: Mutex<HashMap<String, Server>>,
     store: Mutex<Store>,
     /// Times of recent wrong pairing codes.
     failures: Mutex<Vec<i64>>,
@@ -118,10 +134,16 @@ pub struct App {
 
 impl App {
     pub fn new(server: Server, cfg: Config) -> Result<Arc<Self>> {
+        Self::with_source(server, cfg, Arc::new(crate::mcp_agent::root_routes))
+    }
+
+    pub fn with_source(server: Server, cfg: Config, source: RouteSource) -> Result<Arc<Self>> {
         let store = Store::open(&cfg.state_dir)?;
         Ok(Arc::new(Self {
             cfg,
             server: Mutex::new(server),
+            source,
+            apps: Mutex::new(HashMap::new()),
             store: Mutex::new(store),
             failures: Mutex::new(Vec::new()),
         }))
@@ -139,6 +161,35 @@ impl App {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remote_projects()
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The projects the app `name` is seated in (Orchestrator seats are never served).
+    async fn projects_of(self: &Arc<Self>, name: String) -> Vec<(String, ferryman_channel::access::Level)> {
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut apps = app.apps.lock().unwrap_or_else(PoisonError::into_inner);
+            match apps.entry(name.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.get().remote_projects(),
+                std::collections::hash_map::Entry::Vacant(e) => Server::for_app(&name, app.source.clone())
+                    .map(|server| e.insert(server).remote_projects())
+                    .unwrap_or_default(),
+            }
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// Make `client` an identity of its own and seat it, as a Worker, in every project here.
+    /// Returns its name and how many projects it now has a seat in.
+    async fn seat_app(self: &Arc<Self>, client: String) -> (String, usize) {
+        let app = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let name = crate::mcp_agent::app_name(Some(&client));
+            let seated = crate::mcp_agent::seat_everywhere(&name, &app.source);
+            (name, seated)
         })
         .await
         .unwrap_or_default()
@@ -187,7 +238,14 @@ pub fn run(server: Server, options: &HttpOptions, agent: &str) -> Result<()> {
         state_dir,
     )?;
     let eligible = server.remote_projects();
-    if eligible.is_empty() {
+    if cfg.per_app() {
+        eprintln!("ferry mcp: connector URL {}", cfg.resource);
+        eprintln!(
+            "ferry mcp: each app you pair gets its own identity, a Worker in every project here (plain HTTP on http://{}: keep it behind TLS)",
+            options.addr
+        );
+        eprintln!("ferry mcp: run `ferry mcp pair` for a one-time code to connect an app");
+    } else if eligible.is_empty() {
         bail!(
             "'{}' is not seated as a Worker or Member in any live project here, so there is nothing to serve. \
              Seat it first (ferry channel join --as {0}); Orchestrators and the master identity are never served over HTTP",
@@ -196,13 +254,15 @@ pub fn run(server: Server, options: &HttpOptions, agent: &str) -> Result<()> {
     }
     let app = App::new(server, cfg.clone())?;
     let addr = options.addr;
-    eprintln!("ferry mcp: connector URL {}", cfg.resource);
-    eprintln!(
-        "ferry mcp: serving {} project(s) as '{}' on http://{addr} (plain HTTP: keep it behind TLS)",
-        eligible.len(),
-        cfg.agent
-    );
-    eprintln!("ferry mcp: run `ferry mcp pair` for a one-time code to connect an app");
+    if !cfg.per_app() {
+        eprintln!("ferry mcp: connector URL {}", cfg.resource);
+        eprintln!(
+            "ferry mcp: serving {} project(s) as '{}' on http://{addr} (plain HTTP: keep it behind TLS)",
+            eligible.len(),
+            cfg.agent
+        );
+        eprintln!("ferry mcp: run `ferry mcp pair` for a one-time code to connect an app");
+    }
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -309,7 +369,7 @@ async fn host_guard(State(app): State<Arc<App>>, request: Request, next: Next) -
 
 /// Auth before any parsing of the body: a live access token for this resource and this
 /// identity, and an identity that is still eligible.
-async fn require_token(State(app): State<Arc<App>>, request: Request, next: Next) -> Response {
+async fn require_token(State(app): State<Arc<App>>, mut request: Request, next: Next) -> Response {
     let token = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -322,18 +382,29 @@ async fn require_token(State(app): State<Arc<App>>, request: Request, next: Next
     let Some(token) = token else {
         return unauthorized(&app, None);
     };
-    let valid =
+    let who = if app.cfg.per_app() {
         app.store()
-            .verify_access(token, &app.cfg.resource, &app.cfg.agent, oauth::unix_now());
-    if !valid {
+            .access_agent(token, &app.cfg.resource, oauth::unix_now())
+    } else {
+        app.store()
+            .verify_access(token, &app.cfg.resource, &app.cfg.agent, oauth::unix_now())
+            .then(|| app.cfg.agent.clone())
+    };
+    let Some(who) = who else {
         return unauthorized(&app, Some("invalid_token"));
-    }
-    if app.projects().await.is_empty() {
+    };
+    let seats = if app.cfg.per_app() {
+        app.projects_of(who.clone()).await
+    } else {
+        app.projects().await
+    };
+    if seats.is_empty() {
         return plain(
             StatusCode::FORBIDDEN,
             "this identity is not seated as a Worker or Member in any live project",
         );
     }
+    request.extensions_mut().insert(AppAgent(who));
     next.run(request).await
 }
 
@@ -462,15 +533,28 @@ async fn validate(app: &Arc<App>, p: &HashMap<String, String>) -> Result<Valid, 
     {
         return Err(fail("invalid_target", "resource is not this server"));
     }
-    let projects = app.projects().await;
+    let (agent, projects) = if app.cfg.per_app() {
+        let name = crate::mcp_agent::app_name(Some(&client_name));
+        let source = app.source.clone();
+        let seats = {
+            let name = name.clone();
+            tokio::task::spawn_blocking(move || crate::mcp_agent::app_seats(&name, &source))
+                .await
+                .unwrap_or_default()
+        };
+        (name, seats)
+    } else {
+        (app.cfg.agent.clone(), app.projects().await)
+    };
     if projects.is_empty() {
         return Err(Refused::Page(
             "This Ferryman has no identity it may share: it must be seated as a Worker or Member in a live project.",
         ));
     }
-    let scope = if projects
-        .iter()
-        .any(|(_, level)| *level == ferryman_channel::access::Level::Member)
+    let scope = if app.cfg.per_app()
+        || projects
+            .iter()
+            .any(|(_, level)| *level == ferryman_channel::access::Level::Member)
     {
         format!("{} {}", oauth::SCOPE_READ, oauth::SCOPE_WRITE)
     } else {
@@ -483,7 +567,7 @@ async fn validate(app: &Arc<App>, p: &HashMap<String, String>) -> Result<Valid, 
         challenge: challenge.into(),
         state,
         scope,
-        agent: app.cfg.agent.clone(),
+        agent,
         projects,
     })
 }
@@ -544,9 +628,10 @@ fn consent(valid: &Valid, p: &HashMap<String, String>, error: Option<&str>) -> S
         .ok()
         .and_then(|u| u.host_str().map(String::from))
         .unwrap_or_default();
-    let seats: String = valid
+    let mut seats: String = valid
         .projects
         .iter()
+        .take(12)
         .map(|(project, level)| {
             format!(
                 "<li><code>{}</code> as {}</li>",
@@ -555,6 +640,9 @@ fn consent(valid: &Valid, p: &HashMap<String, String>, error: Option<&str>) -> S
             )
         })
         .collect();
+    if valid.projects.len() > 12 {
+        seats.push_str(&format!("<li>and {} more</li>", valid.projects.len() - 12));
+    }
     let hidden: String = [
         "client_id",
         "redirect_uri",
@@ -626,6 +714,19 @@ async fn authorize_submit(State(app): State<Arc<App>>, body: Bytes) -> Response 
             &consent(&valid, &params, Some("That code is wrong or has expired.")),
         );
     }
+    let agent = if app.cfg.per_app() {
+        // The pairing code is the human's yes: only now is the app given its identity.
+        let (name, seated) = app.seat_app(valid.client_name.clone()).await;
+        if seated == 0 {
+            return html(
+                StatusCode::BAD_REQUEST,
+                &page("<h1>Cannot connect</h1><p>This machine has no project this app can join.</p>"),
+            );
+        }
+        name
+    } else {
+        app.cfg.agent.clone()
+    };
     let code = app.store().issue_code(
         &CodeRequest {
             client_id: &valid.client_id,
@@ -633,7 +734,7 @@ async fn authorize_submit(State(app): State<Arc<App>>, body: Bytes) -> Response 
             challenge: &valid.challenge,
             audience: &app.cfg.resource,
             scope: &valid.scope,
-            agent: &app.cfg.agent,
+            agent: &agent,
         },
         now,
     );
@@ -679,6 +780,7 @@ fn rpc_failure(status: StatusCode, code: i64, message: &str) -> Response {
 
 async fn mcp(
     State(app): State<Arc<App>>,
+    axum::Extension(AppAgent(who)): axum::Extension<AppAgent>,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -711,6 +813,19 @@ async fn mcp(
     let line = message.to_string();
     let worker = app.clone();
     let reply = tokio::task::spawn_blocking(move || {
+        if worker.cfg.per_app() {
+            let mut apps = worker.apps.lock().unwrap_or_else(PoisonError::into_inner);
+            let server = match apps.entry(who.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    match Server::for_app(&who, worker.source.clone()) {
+                        Ok(server) => e.insert(server),
+                        Err(_) => return None,
+                    }
+                }
+            };
+            return handle_line(server, &line);
+        }
         let mut server = worker.server.lock().unwrap_or_else(PoisonError::into_inner);
         handle_line(&mut server, &line)
     })

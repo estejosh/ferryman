@@ -2737,6 +2737,27 @@ pub fn seat_app(route: &ProjectRoute, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The projects `name` is, or would be, seated in, with the level it has or would get (a
+/// Worker). For showing a person what they are connecting before anything is written.
+#[must_use]
+pub fn app_seats(name: &str, source: &RouteSource) -> Vec<(String, Level)> {
+    source()
+        .into_iter()
+        .filter(|route| {
+            let master = ferryman_channel::master::read_master(route).ok().flatten();
+            !master.is_some_and(|m| is_me(&m.master, name))
+        })
+        .map(|route| {
+            let level = match Agent::new(route.clone(), name, false) {
+                Ok(agent) if agent.seated() => agent.level(),
+                _ => Level::Worker,
+            };
+            (route.project_id, level)
+        })
+        .filter(|(_, level)| *level != Level::Orchestrator)
+        .collect()
+}
+
 /// Seat `name` in every project `source` offers. Returns how many it is now seated in.
 pub fn seat_everywhere(name: &str, source: &RouteSource) -> usize {
     source()

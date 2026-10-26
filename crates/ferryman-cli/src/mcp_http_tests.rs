@@ -341,12 +341,23 @@ struct Live {
 }
 
 async fn start() -> Live {
+    start_as(APP).await
+}
+
+/// `agent` empty is `ferry mcp serve --http` with no `--as`: every app makes its own identity.
+async fn start_as(agent: &str) -> Live {
     let fleet = fleet();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let state = fleet.dir.path().join("mcp-state");
-    let cfg = Config::new(addr, None, APP, state).unwrap();
-    let app = App::new(Server::with_all(all(&fleet, true), true), cfg.clone()).unwrap();
+    let cfg = Config::new(addr, None, agent, state).unwrap();
+    let routes = fleet.routes.clone();
+    let app = App::with_source(
+        Server::with_all(all(&fleet, true), true),
+        cfg.clone(),
+        Arc::new(move || routes.clone()),
+    )
+    .unwrap();
     tokio::spawn(serve_listener(listener, app));
     let http = reqwest::Client::builder()
         .no_proxy()
@@ -447,6 +458,10 @@ impl Live {
             .await;
         assert_eq!(response.status(), 200);
         response.json().await.unwrap()
+    }
+
+    fn fleet_routes(&self) -> Vec<ProjectRoute> {
+        self._fleet.routes.clone()
     }
 
     async fn rpc(&self, token: Option<&str>, body: Value) -> reqwest::Response {
@@ -835,4 +850,69 @@ async fn five_wrong_pairing_codes_lock_the_login() {
         )
         .await;
     assert_eq!(locked.status(), 429);
+}
+
+#[tokio::test]
+async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_identity() {
+    let live = start_as("").await;
+    assert!(live.cfg.per_app());
+    let client = live.register().await;
+
+    // Pairing is still the gate: no token, no /mcp; a wrong code, no authorization code.
+    let denied = live
+        .rpc(None, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .await;
+    assert_eq!(denied.status(), 401);
+    let challenge = oauth::s256(VERIFIER);
+    let wrong = live
+        .form(
+            "/authorize",
+            &live.authorize_pairs(&client, &challenge, &live.cfg.resource, "not-a-code"),
+        )
+        .await;
+    assert_eq!(wrong.status(), 403);
+    let me = mcp_agent::app_name(Some("Claude"));
+    for route in &live.fleet_routes() {
+        let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
+        assert!(
+            !roster.iter().any(|a| a.name == me),
+            "nothing is seated before the human says yes"
+        );
+    }
+
+    // The right code: the app is given an identity, seated as a Worker, bound to its token.
+    let code = live.authorize(&client).await;
+    let issued = live.tokens(&client, &code).await;
+    let access = issued["access_token"].as_str().unwrap().to_string();
+    let init = live
+        .rpc(
+            Some(&access),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } }),
+        )
+        .await;
+    assert_eq!(init.status(), 200);
+    let join: Value = live
+        .rpc(
+            Some(&access),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "ferry_join", "arguments": {} } }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let data = &join["result"]["structuredContent"];
+    assert_eq!(data["agent"], me);
+    assert_eq!(data["level"], "worker");
+    assert_eq!(data["total"], 3);
+    for route in &live.fleet_routes() {
+        assert_eq!(
+            access::level_of(&route.communications, &route.project_id, &me),
+            Level::Worker
+        );
+        let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
+        assert_eq!(
+            roster.iter().find(|a| a.name == me).unwrap().role,
+            access::APP_ROLE
+        );
+    }
 }

@@ -540,17 +540,17 @@ impl Store {
     /// Is `token` a live access token for this audience and this agent?
     #[must_use]
     pub fn verify_access(&self, token: &str, audience: &str, agent: &str, now: i64) -> bool {
-        let Some(access) = self.data.access.get(&sha_hex(token)) else {
-            return false;
-        };
-        let Some(grant) = self.data.grants.get(&access.grant) else {
-            return false;
-        };
-        access.expires > now
-            && grant.expires > now
-            && !grant.revoked
-            && grant.audience == audience
-            && grant.agent == agent
+        self.access_agent(token, audience, now)
+            .is_some_and(|holder| holder == agent)
+    }
+
+    /// The agent a live access token for this audience was granted to.
+    #[must_use]
+    pub fn access_agent(&self, token: &str, audience: &str, now: i64) -> Option<String> {
+        let access = self.data.access.get(&sha_hex(token))?;
+        let grant = self.data.grants.get(&access.grant)?;
+        (access.expires > now && grant.expires > now && !grant.revoked && grant.audience == audience)
+            .then(|| grant.agent.clone())
     }
 }
 
