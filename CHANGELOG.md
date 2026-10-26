@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+The MCP server works for a new user with no setup. `ferry mcp serve` with no flags makes the client an identity of its own (`<client>-<machine>`), seats it as a Worker in every live project on the machine and serves all of them; an unseated `--as` is seated instead of refused. `ferry mcp setup --client codex|claude-code|claude-desktop|cursor` writes the client's config (merged, never clobbering other servers; `--print` shows it). `ferry_orders` can `create` (members and up) and `list` takes `scope` (mine, claimable, open, all; default open) and says its total, how many are hidden and the next cursor. `ferry_join` pages every seat instead of dropping the ones past twenty, describes each project and says what each level may do; the guide is the server instructions, the new `ferry_help` tool and the first join. Workers can claim, report progress, submit and message (their files go to their hand-ins folder). Errors are plain: no such order, agents never approve (use `ferry_ask_human`), and your seats. A silent primary with no live worker behind its name is reported as stale with one question to the human. Over HTTP each paired app gets its own Worker identity. A name registered with the `mcp-app` role is a Worker unless the master signs otherwise.
+
 ## v0.6.2 - 2026-10-23
 
 Fleet hardening (v0.6.2). A worker that updates itself now comes back by itself, the iroh lane says when it is unhealthy, it works with or without a relay of our own, and `ferry lane iroh status` says what each peer is doing.

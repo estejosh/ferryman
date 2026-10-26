@@ -79,7 +79,7 @@ impl Spec {
 fn home() -> Result<PathBuf> {
     ["HOME", "USERPROFILE"]
         .iter()
-        .filter_map(|key| std::env::var_os(key))
+        .filter_map(std::env::var_os)
         .map(PathBuf::from)
         .find(|path| path.is_dir())
         .context("cannot find your home folder; pass --config <file>")
@@ -143,8 +143,9 @@ pub fn render_toml(spec: &Spec) -> String {
 /// `existing` with Ferryman added to `[mcp_servers]`. Text that is not mentioning Ferryman
 /// is appended to, not rewritten, so comments and other servers stay byte for byte.
 pub fn merge_toml(existing: &str, spec: &Spec) -> Result<String> {
-    let parsed: toml::Table = toml::from_str(existing)
-        .context("the Codex config is not valid TOML; fix it or move it aside, nothing was changed")?;
+    let parsed: toml::Table = toml::from_str(existing).context(
+        "the Codex config is not valid TOML; fix it or move it aside, nothing was changed",
+    )?;
     let has = parsed
         .get("mcp_servers")
         .and_then(toml::Value::as_table)
@@ -259,7 +260,11 @@ pub fn run(client: &str, print: bool, config: Option<PathBuf>) -> Result<()> {
     let existing = read_existing(&path)?;
     let text = merged(client, &existing, &spec)?;
     if text == existing {
-        println!("{} already has Ferryman: {}", client.label(), path.display());
+        println!(
+            "{} already has Ferryman: {}",
+            client.label(),
+            path.display()
+        );
     } else {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -275,8 +280,7 @@ pub fn run(client: &str, print: bool, config: Option<PathBuf>) -> Result<()> {
         let temporary = path.with_extension("ferryman-new");
         std::fs::write(&temporary, &text)
             .with_context(|| format!("write {}", temporary.display()))?;
-        std::fs::rename(&temporary, &path)
-            .with_context(|| format!("write {}", path.display()))?;
+        std::fs::rename(&temporary, &path).with_context(|| format!("write {}", path.display()))?;
         println!("added Ferryman to {}", path.display());
     }
     if spec.root.is_none() {
@@ -318,7 +322,10 @@ mod tests {
         assert!(after.starts_with(before), "the existing text is untouched");
         let parsed: toml::Table = toml::from_str(&after).unwrap();
         assert_eq!(parsed["model"].as_str().unwrap(), "gpt-5");
-        assert_eq!(parsed["mcp_servers"]["other"]["command"].as_str().unwrap(), "npx");
+        assert_eq!(
+            parsed["mcp_servers"]["other"]["command"].as_str().unwrap(),
+            "npx"
+        );
         assert!(parsed["mcp_servers"]["ferryman"]["command"].is_str());
         // Again: same file, and an out-of-date entry is replaced, not duplicated.
         assert_eq!(merge_toml(&after, &spec()).unwrap(), after);
@@ -327,7 +334,12 @@ mod tests {
             ..spec()
         };
         let updated: toml::Table = toml::from_str(&merge_toml(&after, &moved).unwrap()).unwrap();
-        assert_eq!(updated["mcp_servers"]["ferryman"]["command"].as_str().unwrap(), "/new/ferry");
+        assert_eq!(
+            updated["mcp_servers"]["ferryman"]["command"]
+                .as_str()
+                .unwrap(),
+            "/new/ferry"
+        );
         assert!(updated["mcp_servers"]["other"].is_table());
     }
 
@@ -335,13 +347,21 @@ mod tests {
     fn json_clients_keep_their_other_servers_and_settings() {
         for client in [Client::ClaudeCode, Client::ClaudeDesktop, Client::Cursor] {
             let before = r#"{"theme":"dark","mcpServers":{"github":{"command":"gh-mcp"}}}"#;
-            let after: Value = serde_json::from_str(&merge_json(before, &spec(), client).unwrap()).unwrap();
+            let after: Value =
+                serde_json::from_str(&merge_json(before, &spec(), client).unwrap()).unwrap();
             assert_eq!(after["theme"], "dark");
             assert_eq!(after["mcpServers"]["github"]["command"], "gh-mcp");
-            assert_eq!(after["mcpServers"]["ferryman"]["args"], json!(["mcp", "serve"]));
-            assert_eq!(after["mcpServers"]["ferryman"]["env"]["FERRYMAN_ROOT"], r"X:\ferry");
+            assert_eq!(
+                after["mcpServers"]["ferryman"]["args"],
+                json!(["mcp", "serve"])
+            );
+            assert_eq!(
+                after["mcpServers"]["ferryman"]["env"]["FERRYMAN_ROOT"],
+                r"X:\ferry"
+            );
             // From nothing at all.
-            let fresh: Value = serde_json::from_str(&merge_json("", &spec(), client).unwrap()).unwrap();
+            let fresh: Value =
+                serde_json::from_str(&merge_json("", &spec(), client).unwrap()).unwrap();
             assert!(fresh["mcpServers"]["ferryman"].is_object());
         }
     }

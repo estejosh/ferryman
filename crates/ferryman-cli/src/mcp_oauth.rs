@@ -549,7 +549,10 @@ impl Store {
     pub fn access_agent(&self, token: &str, audience: &str, now: i64) -> Option<String> {
         let access = self.data.access.get(&sha_hex(token))?;
         let grant = self.data.grants.get(&access.grant)?;
-        (access.expires > now && grant.expires > now && !grant.revoked && grant.audience == audience)
+        (access.expires > now
+            && grant.expires > now
+            && !grant.revoked
+            && grant.audience == audience)
             .then(|| grant.agent.clone())
     }
 }

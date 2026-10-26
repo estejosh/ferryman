@@ -273,9 +273,8 @@ pub fn use_machine_state_dir_per_thread(base: PathBuf) {
     // while they are still writing keys and pause markers there. So the base is not the
     // caller's: it is one directory that lives as long as the process.
     let _ = base;
-    let _ = MACHINE_STATE_DIR.set(
-        std::env::temp_dir().join(format!("ferryman-test-machine-{}", std::process::id())),
-    );
+    let _ = MACHINE_STATE_DIR
+        .set(std::env::temp_dir().join(format!("ferryman-test-machine-{}", std::process::id())));
 }
 
 /// The per-user directory that holds what belongs to this *machine* rather than to any

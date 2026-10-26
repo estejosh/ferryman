@@ -1101,7 +1101,8 @@ enum McpCommand {
         all_projects: bool,
         /// Serve MCP Streamable HTTP on this address (for example 127.0.0.1:8787) instead
         /// of stdio, with a built-in OAuth login for cloud apps such as claude.ai. This is
-        /// plain HTTP: keep it behind TLS. Needs --as; see `ferry mcp pair`.
+        /// plain HTTP: keep it behind TLS. Without --as each app that pairs gets an identity of its
+        /// own, a Worker; see `ferry mcp pair`.
         #[arg(long, value_name = "ADDR:PORT")]
         http: Option<std::net::SocketAddr>,
         /// The public https URL of the site that reaches --http, for example

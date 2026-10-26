@@ -179,7 +179,7 @@ fn a_fresh_machine_starts_with_no_flags_and_is_seated_as_a_worker_in_25_projects
     // Paged, never silent: what is not here is counted and has a cursor.
     let shown = page1["shown"].as_u64().unwrap() as usize;
     assert_eq!(ids(&page1).len(), shown);
-    assert!(shown >= 1 && shown < 25);
+    assert!((1..25).contains(&shown));
     assert_eq!(page1["hidden"], 25 - shown as u64);
     let mut seen = ids(&page1);
     let mut next = page1["next"].as_str().unwrap().to_string();
@@ -273,7 +273,9 @@ fn the_zero_config_agent_runs_the_whole_loop_to_awaiting_review() {
     let submitted = tool(
         &mut server,
         "ferry_orders",
-        with(json!({ "action": "submit", "id": "o-loop", "ref": "abc1234", "note": "fixed, tests pass" })),
+        with(
+            json!({ "action": "submit", "id": "o-loop", "ref": "abc1234", "note": "fixed, tests pass" }),
+        ),
     );
     assert_eq!(ok(&submitted)["state"], "awaiting_review");
     // Read with the roster as it is now: the app joined it after `route` was made.
@@ -317,7 +319,7 @@ fn a_member_creates_an_order_and_another_worker_sees_it_in_list_open() {
     // Claimable is what the worker could take right now: not the one that waits.
     args["scope"] = json!("claimable");
     let claimable = tool(&mut worker, "ferry_orders", args.clone());
-    assert_eq!(order_ids(ok(&claimable)), [id.clone()]);
+    assert_eq!(order_ids(ok(&claimable)), std::slice::from_ref(&id));
     assert_eq!(ok(&claimable)["scope"], "claimable");
     // Signed by the member, who is the issuer, and set to come back reviewed.
     let task = ferryman_channel::read_task(route, &id).unwrap();
@@ -353,9 +355,7 @@ fn agents_never_approve_and_a_missing_order_is_called_that() {
     let root = root(3);
     let route = &root.routes[0];
     open_order(&root, route, "o-plain", "plain");
-    let mut gated = ferryman_channel::read_task(route, "o-plain")
-        .unwrap()
-        .order;
+    let mut gated = ferryman_channel::read_task(route, "o-plain").unwrap().order;
     gated.id = "o-gated".into();
     gated.requires_approval = true;
     root.master.sign_order(&mut gated);
@@ -364,10 +364,13 @@ fn agents_never_approve_and_a_missing_order_is_called_that() {
     let mut worker = root.server();
     initialize(&mut worker, "codex");
     let mut member = root.member();
-    let review =
-        |id: &str| json!({ "project": "proj00", "action": "review", "id": id, "verdict": "accept" });
+    let review = |id: &str| json!({ "project": "proj00", "action": "review", "id": id, "verdict": "accept" });
 
-    let why = refused(&tool(&mut worker, "ferry_orders", review("o-plain")), "denied").to_string();
+    let why = refused(
+        &tool(&mut worker, "ferry_orders", review("o-plain")),
+        "denied",
+    )
+    .to_string();
     assert!(
         why.contains("agents never approve") && why.contains("ferry_talk"),
         "{why}"

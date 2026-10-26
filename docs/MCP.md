@@ -10,42 +10,43 @@ Design and decisions: [ADR 0028](adr/0028-mcp-server.md).
 
 ## Connect an app
 
-Open the dashboard, choose **Connect an AI app (beta)**, pick the agent name and project,
-and copy the config. It holds no secrets. By hand:
+One command per client, then restart it. Nothing to read, nothing to seat first:
 
 ```
-claude mcp add ferryman -- ferry mcp serve --as my-app --project my-project
+ferry mcp setup --client codex            # or claude-code, claude-desktop, cursor
+ferry mcp setup --client codex --print    # show what it would write, and where
 ```
 
-Claude Desktop (`claude_desktop_config.json`):
-
-```json
-{ "mcpServers": { "ferryman": { "command": "ferry",
-  "args": ["mcp", "serve", "--as", "my-app", "--project", "my-project"] } } }
-```
-
-Codex (`~/.codex/config.toml`):
+It adds Ferryman to the client's own config (merged: other servers and settings stay, a
+backup of the old file is kept the first time), with this program's absolute path and
+`FERRYMAN_ROOT`, and prints the one line to restart. Written by hand it is just:
 
 ```toml
+# ~/.codex/config.toml
 [mcp_servers.ferryman]
-command = "ferry"
-args = ["mcp", "serve", "--as", "my-app", "--project", "my-project"]
+command = "/path/to/ferry"
+args = ["mcp", "serve"]
+[mcp_servers.ferryman.env]
+FERRYMAN_ROOT = "/path/to/ferry-root"
 ```
 
-The name after `--as` is only a name. The app can read and write nothing until that agent
-is seated: its key must already be on this machine and listed on the project roster (the
-dashboard, Agents, or `ferry channel join --as my-app` on this machine). Until then
-`ferry_join` says so, every other tool refuses, and joining creates no key and no roster
-entry. A seated agent starts at the Worker level; raise it with
-`ferry access set <agent> member` (or `orchestrator`) like any other agent.
+With no flags, `ferry mcp serve` makes the app an identity of its own, `<client>-<machine>`
+(for example `codex-grouchly`; the client says its name when it connects), keeps its key
+in the machine keystore, and seats it as a **Worker** in every live project this machine
+serves. A Worker needs no approval from the master. It is never the master identity, and
+Member or Orchestrator only ever come from the master (`ferry access set <agent> member`).
+`--project` or `--workspace` limits it to one project; `--as <name>` speaks as a named
+agent instead, and an `--as` name nobody has seated is seated as a Worker rather than refused.
+
+The dashboard, **Connect an AI app (beta)**, shows the same config.
 
 ## All projects in one connection
 
 ```
-ferry mcp serve --as my-app --all-projects
+ferry mcp serve --all-projects
 ```
 
-Serves every live, non-archived project in the ferry root, as `ferry agent run
+This is the default whenever no `--project` or `--workspace` is given. It serves every live, non-archived project in the ferry root, as `ferry agent run
 --all-projects` counts them. Every tool takes a `project` argument. `ferry_join` with no
 project lists the projects `my-app` is seated in and its level in each; the checks per
 project are the same as in single-project mode (the level comes from that project's
@@ -53,10 +54,15 @@ master-signed grants). A project where the identity is not seated is not offered
 only one seat the `project` argument may be left out. `--project` and `--all-projects`
 do not combine.
 
-## How Ferryman works, as the AI is told
+## The guide the AI is given
 
-The server instructions and `ferry_join` say it in a few lines: messages travel peer to
-peer over iroh; the VPS relay is only a fallback; the AI never handles transport; and
+One short guide (under 650 tokens) is the server instructions, the `ferry_help` tool, and
+the first `ferry_join` reply. It says what Ferryman is, what each level may do, the loop
+(join, catch up, list, claim, work in the work repo `ferry_orders show` names, commit,
+submit with the commit as `ref`, wait for review), how to give work, ask the human and
+message an agent, and the words: primary, seat, worker/member/orchestrator, swarm, order,
+hand-in. Nothing in it needs a command line except what it tells the human to do. It
+also says that messages travel peer to peer over iroh with a relay as fallback, and that
 folder layout changes are applied only from a master-signed fleet order (`ferry fleet
 order migrate`), never on anyone else's say-so. No MCP tool changes the layout: a tool or
 action that tries is refused with that explanation.
@@ -66,21 +72,24 @@ action that tries is refused with that explanation.
 `ferry mcp serve --http` serves MCP over Streamable HTTP (protocol 2025-06-18, one `/mcp`
 endpoint) with its own sign-in, so a cloud app can connect to this machine.
 
-1. Seat the identity the app will act as (Worker or Member; `ferry access set` for the
-   level). Orchestrators and the master identity are refused over HTTP.
-2. Start the server, behind TLS (see below), naming the public address:
+1. Start the server, behind TLS (see below), naming the public address:
 
    ```
-   ferry mcp serve --as claude-ai --all-projects \
-     --http 127.0.0.1:8787 --public-url https://mcp.example.com
+   ferry mcp serve --http 127.0.0.1:8787 --public-url https://mcp.example.com
    ```
 
    It prints the connector URL, `https://mcp.example.com/mcp`.
-3. Run `ferry mcp pair`. It prints a code that works once, for ten minutes.
-4. In claude.ai, Settings, Connectors, add a custom connector and paste the connector URL.
-5. The sign-in page opens on your server. It shows which host the app will return to and
-   which projects it will see. Enter the code. The app is then bound to `claude-ai` at the
-   level that identity already has in each project. No new identities are made.
+2. Run `ferry mcp pair`. It prints a code that works once, for ten minutes.
+3. In claude.ai, Settings, Connectors, add a custom connector and paste the connector URL.
+4. The sign-in page opens on your server. It shows which host the app will return to, the
+   identity it will get and which projects it will see. Enter the code. The app is then
+   given an identity of its own (`<app>-<machine>`, for example `claude-grouchly`), seated as
+   a **Worker** in every live project here: nothing to seat by hand. Each app that pairs gets
+   its own, and sees only its own seats. Raise one with `ferry access set` like any agent.
+   Orchestrators and the master identity are refused over HTTP.
+
+To bind every app to one identity you seat yourself, add `--as <name>` (and `--all-projects`);
+that identity keeps the level it already has in each project.
 
 The server answers only to the host in `--public-url`, refuses request bodies over 1 MiB
 (16 KiB on the login endpoints), and locks the login for ten minutes after five wrong codes.
@@ -100,31 +109,49 @@ supported yet.
 
 ## Tools
 
-Six tools, about 760 tokens in all (the `project` argument adds a little in all-projects mode):
+Seven tools; every argument is explained in its schema (the `project` argument adds a
+little in all-projects mode):
 
 | Tool | What it does |
 | --- | --- |
-| `ferry_join` | who you are, your level, who is primary, whether an update exists |
-| `ferry_catchup` | a short digest; pass the returned cursor to get only what changed |
-| `ferry_orders` | list, show, claim, progress, submit, review |
+| `ferry_join` | who you are, your level, your seats (every one, paged with `since` = `next`, each with what the project is about), who is primary, whether an update exists; the guide on the first call |
+| `ferry_help` | the guide, whenever it is wanted |
+| `ferry_catchup` | a short digest with the brief inline; pass the returned cursor to get only what changed |
+| `ferry_orders` | `list` (`scope` mine, claimable, open or all; default open), `show`, `claim`, `progress`, `submit`, `review`, `create` |
 | `ferry_talk` | read new messages, post to an agent |
 | `ferry_primary` | status, standby, takeover, release |
 | `ferry_ask_human` | raise a question for you, check the answer |
 
+Every list says its `scope`, its `total`, how many are `hidden` (not on this page), and a
+`next` cursor: call again with `since` set to it for the following page. Nothing is cut
+without a cursor to the rest.
+
+`ferry_orders create` takes `title`, `task`, `to` (an agent or machine name; leave it out
+for an order open to anyone), `kind`, `size`, `priority` and `depends_on`. The order is
+signed by the caller, goes through the same path as `ferry channel order`, and comes back
+reviewed.
+
 Optional groups: `--tools admin` adds `ferry_get`, `ferry_search`, `ferry_status` and
 `ferry_update`; `--tools legacy` keeps the older read-only tools. `--read-only` serves
-only those, and with no `--as` the server is read-only as before.
+only those.
 
 ## What an agent may do
 
 The same levels as the CLI (Worker, Member, Orchestrator).
 
-- Workers read, and hand work in. They cannot post to the channel.
-- Members claim, progress, submit and post. They cannot take over as primary.
-- Orchestrators also review, take over as primary, and apply updates.
+- Workers read, claim an order, report progress, submit work and message agents. What
+  they write lands in their own hand-ins folder, which readers honour. They cannot create
+  orders, review, ask the human or take over; the refusal says whom to ask (the master, or a
+  member agent, with `ferry_talk`).
+- Members also create orders, review changes and raise questions for you.
+- Orchestrators also take over as primary and apply updates.
 - Takeover works only when the primary has been silent past the quiet period, and not
   on a paused machine.
-- An agent can ask you for an approval. It can never give one.
+- An agent can ask you for an approval. It can never give one: an order that needs the
+  master is refused to an agent with "agents never approve, use ferry_ask_human".
+- A primary that is silent and has no live worker behind its name (a retired machine name)
+  is called stale by `ferry_catchup` and `ferry_primary`, with what the master should do,
+  and one question is raised to you, once.
 - Writes are refused while the machine is paused. Anything you send is refused if it looks
   like a secret; anything that comes back is redacted if it does (marked `redacted: true`).
 - Posts are also refused if they look like code or a diff. Results are a git ref and

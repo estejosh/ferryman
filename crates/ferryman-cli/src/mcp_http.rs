@@ -167,15 +167,20 @@ impl App {
     }
 
     /// The projects the app `name` is seated in (Orchestrator seats are never served).
-    async fn projects_of(self: &Arc<Self>, name: String) -> Vec<(String, ferryman_channel::access::Level)> {
+    async fn projects_of(
+        self: &Arc<Self>,
+        name: String,
+    ) -> Vec<(String, ferryman_channel::access::Level)> {
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
             let mut apps = app.apps.lock().unwrap_or_else(PoisonError::into_inner);
             match apps.entry(name.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.get().remote_projects(),
-                std::collections::hash_map::Entry::Vacant(e) => Server::for_app(&name, app.source.clone())
-                    .map(|server| e.insert(server).remote_projects())
-                    .unwrap_or_default(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    Server::for_app(&name, app.source.clone())
+                        .map(|server| e.insert(server).remote_projects())
+                        .unwrap_or_default()
+                }
             }
         })
         .await
@@ -720,7 +725,9 @@ async fn authorize_submit(State(app): State<Arc<App>>, body: Bytes) -> Response 
         if seated == 0 {
             return html(
                 StatusCode::BAD_REQUEST,
-                &page("<h1>Cannot connect</h1><p>This machine has no project this app can join.</p>"),
+                &page(
+                    "<h1>Cannot connect</h1><p>This machine has no project this app can join.</p>",
+                ),
             );
         }
         name

@@ -860,7 +860,10 @@ async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_ide
 
     // Pairing is still the gate: no token, no /mcp; a wrong code, no authorization code.
     let denied = live
-        .rpc(None, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
+        .rpc(
+            None,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
         .await;
     assert_eq!(denied.status(), 401);
     let challenge = oauth::s256(VERIFIER);

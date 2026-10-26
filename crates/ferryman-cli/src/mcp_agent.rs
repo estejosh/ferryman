@@ -416,7 +416,9 @@ pub fn core_tools() -> Vec<Value> {
                 "priority":{"enum":["low","normal","high"],"description":"create: queue order"},
                 "depends_on":{"type":"array","items":{"type":"string"},"description":"create: order ids that must be done first"}},
                 "required":["action"]}),
-            &["orders", "id", "state", "run_via", "scope", "total", "hidden", "next"],
+            &[
+                "orders", "id", "state", "run_via", "scope", "total", "hidden", "next",
+            ],
         ),
         tool(
             "ferry_primary",
@@ -1896,7 +1898,9 @@ impl Agent {
         self.require_write("create orders")?;
         let title = need(args, "title", "create")?;
         if title.chars().count() > 120 {
-            return Err(bad("a title is at most 120 characters; the detail goes in task"));
+            return Err(bad(
+                "a title is at most 120 characters; the detail goes in task",
+            ));
         }
         let detail = arg_str(args, "task").unwrap_or("");
         if detail.chars().count() > 3000 {
@@ -1911,7 +1915,9 @@ impl Agent {
             }
             Some(who) => {
                 if !ferryman_channel::is_safe_component(who) {
-                    return Err(bad("to is an agent or machine name: letters, digits, '.', '-' and '_'"));
+                    return Err(bad(
+                        "to is an agent or machine name: letters, digits, '.', '-' and '_'",
+                    ));
                 }
                 let known = self
                     .route()
@@ -2684,7 +2690,8 @@ pub fn app_name(client: Option<&str>) -> String {
         out.trim_end_matches('-').chars().take(24).collect()
     };
     let client = client.map(words).filter(|c| !c.is_empty());
-    let machine = Some(words(&ferryman_channel::receipts::machine_label())).filter(|m| !m.is_empty());
+    let machine =
+        Some(words(&ferryman_channel::receipts::machine_label())).filter(|m| !m.is_empty());
     match (client, machine) {
         (Some(c), Some(m)) if c.ends_with(&format!("-{m}")) => c,
         (Some(c), Some(m)) => format!("{c}-{m}"),
@@ -2701,7 +2708,10 @@ pub fn seat_app(route: &ProjectRoute, name: &str) -> Result<()> {
     let name = ferryman_channel::canonical_agent_name(name);
     let master = ferryman_channel::master::read_master(route).ok().flatten();
     if master.is_some_and(|m| is_me(&m.master, &name)) {
-        bail!("'{name}' is the master of {}; the master is never an app", route.project_id);
+        bail!(
+            "'{name}' is the master of {}; the master is never an app",
+            route.project_id
+        );
     }
     let identity = AgentIdentity::load_or_create(&name, &route.attachment)?;
     let key = identity.public_key_hex();
@@ -2916,9 +2926,12 @@ impl AllProjects {
         let agent = Agent::new(route, &self.me, self.admin)?;
         // The guide goes out once per connection, not once per project.
         if self.guided.load(std::sync::atomic::Ordering::Relaxed) {
-            agent.guided.store(true, std::sync::atomic::Ordering::Relaxed);
+            agent
+                .guided
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         } else if name == "ferry_join" {
-            self.guided.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.guided
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(agent.call(name, &args))
     }
@@ -2943,10 +2956,7 @@ impl AllProjects {
             None if open.is_empty() => Err(bad(
                 "you are not seated in any project on this machine. Tell the human to run `ferry enable` in a project folder, or to seat you in the Ferryman dashboard (Agents)",
             )),
-            None => Err(bad(format!(
-                "pass project on this call. {}",
-                seats(open)
-            ))),
+            None => Err(bad(format!("pass project on this call. {}", seats(open)))),
         }
     }
 
@@ -3021,7 +3031,8 @@ impl AllProjects {
         if offset + count < total {
             data["hidden"] = json!(total - offset - count);
             data["next"] = json!(format!("o{}", offset + count));
-            data["more"] = json!("call ferry_join again with since = next for the rest of your projects");
+            data["more"] =
+                json!("call ferry_join again with since = next for the rest of your projects");
         } else {
             data["next"] = json!("ferry_catchup with project");
         }

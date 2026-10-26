@@ -2,10 +2,10 @@
 //! cursors, the secret guard, updates, and the token budget (`mcp_budget`).
 
 use super::*;
-use std::collections::BTreeSet;
 use crate::mcp::{MAX_LINE_BYTES, Server, handle_line, serve_io};
 use ferryman_channel::release::{ReleaseApproval, write_approval};
 use ferryman_channel::{AgentRoute, Order, Priority};
+use std::collections::BTreeSet;
 
 struct World {
     _dir: tempfile::TempDir,
