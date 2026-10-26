@@ -268,7 +268,14 @@ pub fn use_machine_state_dir(dir: PathBuf) {
 /// and share agent names, so one directory means concurrent writes to one key file.
 pub fn use_machine_state_dir_per_thread(base: PathBuf) {
     PER_THREAD.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = MACHINE_STATE_DIR.set(base);
+    // First call wins, and that caller's `base` is usually its own tempdir, which is
+    // deleted the moment its test ends - with every other test's thread directory in it,
+    // while they are still writing keys and pause markers there. So the base is not the
+    // caller's: it is one directory that lives as long as the process.
+    let _ = base;
+    let _ = MACHINE_STATE_DIR.set(
+        std::env::temp_dir().join(format!("ferryman-test-machine-{}", std::process::id())),
+    );
 }
 
 /// The per-user directory that holds what belongs to this *machine* rather than to any

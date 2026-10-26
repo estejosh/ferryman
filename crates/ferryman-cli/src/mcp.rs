@@ -89,6 +89,18 @@ pub struct Server {
     /// Serve the eight query tools (and the gateway).
     legacy: bool,
     gateways: Vec<Gateway>,
+    /// Zero-config: no `--as`, so the identity is made from the client's name at `initialize`.
+    lazy: Option<Lazy>,
+    /// Why the identity could not be made, said on every call instead of a silent lock.
+    setup_error: Option<String>,
+}
+
+/// What a zero-config server needs to make its identity once it knows the client.
+struct Lazy {
+    admin: bool,
+    /// `--project` or `--workspace` was given: one project, not all of them.
+    single: Option<ProjectRoute>,
+    source: mcp_agent::RouteSource,
 }
 
 /// Parse `--tools` values (each may itself be comma separated) into group names.
@@ -115,62 +127,127 @@ impl Server {
     pub fn build(options: &Options) -> Result<Self> {
         let groups = parse_groups(&options.tools)?;
         let http = options.http.is_some();
-        if options.all_projects || http {
-            if options.agent.is_none() || options.read_only {
-                bail!("--all-projects and --http need --as <agent> and cannot be --read-only");
-            }
-            if groups.iter().any(|g| g == "legacy") || (http && groups.iter().any(|g| g == "admin"))
-            {
-                bail!("--tools legacy is for stdio, and --tools admin is not offered over --http");
-            }
-            if options.all_projects && options.project.is_some() {
-                bail!("--all-projects serves every project; drop --project");
-            }
+        let admin = groups.iter().any(|g| g == "admin");
+        let single = options.project.is_some() || options.workspace.is_some();
+        if (options.all_projects || http) && options.read_only {
+            bail!("--all-projects and --http cannot be --read-only");
         }
-        if options.all_projects {
-            let all = AllProjects::new(
-                options.agent.as_deref().unwrap_or_default(),
-                groups.iter().any(|g| g == "admin"),
-                http,
-                std::sync::Arc::new(mcp_agent::root_routes),
-            )?;
-            return Ok(Server {
-                route: None,
-                agent: None,
-                all: Some(all),
-                http,
-                legacy: false,
-                gateways: Vec::new(),
-            });
+        if (options.all_projects || http)
+            && (groups.iter().any(|g| g == "legacy") || (http && admin))
+        {
+            bail!("--tools legacy is for stdio, and --tools admin is not offered over --http");
         }
-        let route = match &options.project {
-            Some(project) => crate::access_route(project)?,
-            None => route_for(options.workspace.clone())?,
-        };
-        let agent = match (&options.agent, options.read_only) {
-            (Some(name), false) => {
-                mcp_agent::check_agent_name(name)?;
-                Some(Agent::new(
-                    route.clone(),
-                    name,
-                    groups.iter().any(|g| g == "admin"),
-                )?)
-            }
-            _ => None,
-        };
-        let legacy = agent.is_none() || groups.iter().any(|g| g == "legacy");
+        if options.all_projects && options.project.is_some() {
+            bail!("--all-projects serves every project; drop --project");
+        }
+        let source: mcp_agent::RouteSource = std::sync::Arc::new(mcp_agent::root_routes);
         let mut server = Server {
-            route: Some(route),
-            agent,
+            route: None,
+            agent: None,
             all: None,
             http,
-            legacy,
+            legacy: false,
             gateways: Vec::new(),
+            lazy: None,
+            setup_error: None,
         };
-        if server.legacy {
+        let single_route = || -> Result<ProjectRoute> {
+            match &options.project {
+                Some(project) => crate::access_route(project),
+                None => route_for(options.workspace.clone()),
+            }
+        };
+        if options.read_only {
+            server.route = Some(single_route()?);
+            server.legacy = true;
             server.connect_gateways()?;
+            return Ok(server);
+        }
+        // Over HTTP with no `--as`, every paired app makes its own identity (mcp_http).
+        let all_mode = options.all_projects || (!single && !(http && options.agent.is_none()));
+        match &options.agent {
+            None if http => {}
+            None => {
+                server.lazy = Some(Lazy {
+                    admin,
+                    single: if single { Some(single_route()?) } else { None },
+                    source,
+                });
+            }
+            Some(name) if all_mode => {
+                mcp_agent::check_agent_name(name)?;
+                let all = AllProjects::new(name, admin, http, source.clone())?;
+                // Stdio: a name nobody has seated yet is seated here as a Worker, so a new
+                // user is not told to run a CLI command first.
+                if !http && all.open().is_empty() {
+                    mcp_agent::seat_everywhere(name, &source);
+                }
+                server.all = Some(all);
+            }
+            Some(name) => {
+                mcp_agent::check_agent_name(name)?;
+                let route = single_route()?;
+                let agent = Agent::new(route.clone(), name, admin)?;
+                if !http && !agent.seated() {
+                    let _ = mcp_agent::seat_app(&route, name);
+                }
+                server.route = Some(route);
+                server.agent = Some(agent);
+                server.legacy = groups.iter().any(|g| g == "legacy");
+                if server.legacy {
+                    server.connect_gateways()?;
+                }
+            }
         }
         Ok(server)
+    }
+
+    /// A zero-config server over the projects `source` offers (tests and embedding).
+    #[cfg(test)]
+    pub fn zero_config(source: mcp_agent::RouteSource, admin: bool) -> Self {
+        Server {
+            route: None,
+            agent: None,
+            all: None,
+            http: false,
+            legacy: false,
+            gateways: Vec::new(),
+            lazy: Some(Lazy {
+                admin,
+                single: None,
+                source,
+            }),
+            setup_error: None,
+        }
+    }
+
+    /// Make the identity of a zero-config server from the client's announced name:
+    /// `<client>-<machine>`, seated as a Worker wherever this machine serves a project.
+    fn resolve_identity(&mut self, client: Option<&str>) {
+        let Some(lazy) = self.lazy.take() else {
+            return;
+        };
+        let name = mcp_agent::app_name(client);
+        match lazy.single {
+            Some(route) => {
+                let seated = mcp_agent::seat_app(&route, &name)
+                    .and_then(|()| Agent::new(route.clone(), &name, lazy.admin));
+                match seated {
+                    Ok(agent) => {
+                        self.route = Some(route);
+                        self.agent = Some(agent);
+                    }
+                    Err(error) => self.setup_error = Some(format!("{error:#}")),
+                }
+            }
+            None => {
+                mcp_agent::seat_everywhere(&name, &lazy.source);
+                match AllProjects::new(&name, lazy.admin, false, lazy.source) {
+                    Ok(all) => self.all = Some(all),
+                    Err(error) => self.setup_error = Some(format!("{error:#}")),
+                }
+            }
+        }
     }
 
     /// A server for tests and embedding: no external servers connected.
@@ -183,6 +260,8 @@ impl Server {
             http: false,
             legacy,
             gateways: Vec::new(),
+            lazy: None,
+            setup_error: None,
         }
     }
 
@@ -196,12 +275,14 @@ impl Server {
             http,
             legacy: false,
             gateways: Vec::new(),
+            lazy: None,
+            setup_error: None,
         }
     }
 
     /// The agent surface is served (one project or all of them).
     fn has_agent(&self) -> bool {
-        self.agent.is_some() || self.all.is_some()
+        self.agent.is_some() || self.all.is_some() || self.lazy.is_some()
     }
 
     /// The projects a remote app may use, with its level in each: Worker and Member seats
@@ -291,6 +372,9 @@ impl Server {
             .get("arguments")
             .cloned()
             .unwrap_or_else(|| json!({}));
+        if let Some(why) = &self.setup_error {
+            return mcp_agent::error_result(&mcp_agent::bad(why.clone()));
+        }
         if let Some(all) = &self.all {
             return all.call(name, &args);
         }
@@ -405,6 +489,12 @@ pub fn handle_line(server: &mut Server, line: &str) -> Option<String> {
         );
     };
     let id = request.get("id").cloned()?;
+    if server.lazy.is_some() {
+        let client = (method == "initialize")
+            .then(|| request["params"]["clientInfo"]["name"].as_str())
+            .flatten();
+        server.resolve_identity(client);
+    }
     let response = match method {
         "initialize" => {
             let protocol = if server.http {
@@ -419,11 +509,7 @@ pub fn handle_line(server: &mut Server, line: &str) -> Option<String> {
             });
             if server.has_agent() {
                 result["capabilities"]["resources"] = json!({});
-                let mut text = mcp_agent::INSTRUCTIONS.to_string();
-                if server.all.is_some() {
-                    text.push_str(mcp_agent::INSTRUCTIONS_ALL_PROJECTS);
-                }
-                result["instructions"] = json!(text);
+                result["instructions"] = json!(mcp_agent::INSTRUCTIONS);
             }
             json!({ "jsonrpc": "2.0", "id": id, "result": result })
         }
@@ -991,3 +1077,7 @@ done
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+#[cfg(test)]
+#[path = "mcp_zero_tests.rs"]
+mod zero_tests;

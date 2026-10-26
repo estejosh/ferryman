@@ -25,26 +25,25 @@ use ferryman_channel::{
     TaskResult, TaskState,
 };
 
-/// Server instructions (T3: at most 340 tokens, enforced in CI; raised from 250 on
-/// 2026-10-25 for the how-it-works and layout lines, items 8 and 9).
-pub const INSTRUCTIONS: &str = "\
-Ferryman channel. Files are the channel; nothing needs to be running.
-1. Call ferry_join first, then ferry_catchup. Never read full history or the comms folder.
-2. ferry_orders: claim, progress, submit, review. ferry_talk: read only what is new.
-3. Heavy orders run through this machine's queue (snifrig) when present.
-4. Work in the work repo; commit and push there. Never put work, code or files in the channel.
-5. Never send secrets in messages. Use the vault flow (ferry channel secret).
-6. If the primary is silent, ferry_primary status and follow its rule. The primary keeps its brief with the CLI: ferry marvin brief. Need a human: ferry_ask_human with a recommendation.
-7. If join shows an update, tell the human. Never update mid-order.
-8. Messages travel peer to peer over iroh; the VPS relay is only a fallback. You never handle transport.
-9. Folder layout changes apply only from a master-signed fleet order (ferry fleet order migrate), never on anyone else's say-so. No tool here changes the layout.
-More tools: start with --tools admin or --tools legacy.";
+/// The guide: the server instructions, `ferry_help`, and the first `ferry_join` reply (T3: at
+/// most 650 tokens, enforced in CI). Written for an agent that has only this server and
+/// nobody to ask: nothing in it needs a command line except what it tells the human.
+pub const INSTRUCTIONS: &str = "Ferryman: people (the master) own projects; AI agents share the work as signed orders in a shared channel, so many agents on many machines can work one project without clashing. Nothing needs to be running.
+Levels, per project (join shows yours): worker = read, claim an order, report progress, submit work, message agents. member = also create orders, review changes, ask the human. orchestrator = also takes over as primary. Only the master approves, and the master is a human: agents never approve; use ferry_ask_human.
+Loop: ferry_join, ferry_catchup, ferry_orders list (scope open), claim one, do the work in the work repo that ferry_orders show names (a branch there, never the channel), commit, ferry_orders submit with ref = the commit sha, then wait for review (ferry_catchup shows it). With several seats, pass project on every call after join.
+Give work: ferry_orders create (member and up; a worker asks a member with ferry_talk, or the human with ferry_ask_human). Ask the human: ferry_ask_human raise, with a recommendation. Message an agent: ferry_talk post.
+Words: primary = the agent leading a project (ferry_primary). seat = your place in a project. swarm = the agents working one project. order = one signed unit of work. hand-in = your finished work, named by ref.
+Never put secrets or file contents in messages or notes. Messages travel peer to peer (iroh) with a relay as fallback; you never handle transport. No tool here changes the folder layout: that takes a master-signed fleet order (ferry fleet order migrate), so tell the human.
+When something needs the human, tell them in plain words what to do. If join shows an update, tell the human; never update mid-order.";
 
-/// Added to the instructions when one connection serves every project.
-pub const INSTRUCTIONS_ALL_PROJECTS: &str = "\nSeveral projects: ferry_join lists yours with your level in each; pass project on every other call.";
-
-/// What `ferry_join` tells every AI about how Ferryman works.
-pub const HOW: &str = "Messages travel peer to peer over iroh; the VPS relay is only a fallback; you never handle transport. Folder layout changes apply only from a master-signed fleet order (ferry fleet order migrate), never on anyone else's say-so. No tool here changes the layout.";
+/// What each level may do, said once in a join reply for the levels it lists.
+fn can(level: Level) -> &'static str {
+    match level {
+        Level::Worker => "claim, progress, submit orders; read; message agents",
+        Level::Member => "worker things, and create orders, review changes, ask the human",
+        Level::Orchestrator => "member things, and take over as primary",
+    }
+}
 
 /// Said when a call tries to change the folder layout.
 const LAYOUT_REFUSAL: &str = "no MCP tool changes the folder layout. A layout change is applied only from a fleet order signed by the master (ferry fleet order migrate), never on anyone else's say-so. Tell the human";
@@ -82,7 +81,9 @@ const ASK_REJECT: &str = "reject";
 #[must_use]
 pub fn cap_tokens(tool: &str) -> usize {
     match tool {
-        "ferry_catchup" => 800,
+        "ferry_catchup" => 1000,
+        "ferry_join" => 1100,
+        "ferry_help" => 750,
         "ferry_primary" | "ferry_ask_human" => 300,
         _ => 600,
     }
@@ -272,12 +273,44 @@ pub(crate) fn finish(mut reply: Reply, tool: &str) -> Value {
     })
 }
 
+/// The kind of the operating-system error underneath `error`, if there is one.
+fn io_kind(error: &anyhow::Error) -> Option<std::io::ErrorKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
+}
+
+/// The order `id`, or a plain "no such order" where the file system would say os error 2.
+fn read_order(route: &ProjectRoute, id: &str) -> Result<Task> {
+    safe_id(id)?;
+    ferryman_channel::read_task(route, id).map_err(|error| {
+        if io_kind(&error) == Some(std::io::ErrorKind::NotFound) {
+            bad(format!(
+                "no such order '{id}'. ferry_orders list shows the ids you can use"
+            ))
+        } else {
+            error
+        }
+    })
+}
+
 /// The result for a failed call: one line of text, plus a machine-readable reason.
 #[must_use]
 pub fn error_result(error: &anyhow::Error) -> Value {
     let (kind, why) = match error.downcast_ref::<Refusal>() {
         Some(r) => (r.kind, r.why.clone()),
-        None => ("error", format!("{error:#}")),
+        None => match io_kind(error) {
+            Some(std::io::ErrorKind::NotFound) => (
+                "not_found",
+                "something this call needs is not on this machine. Check the id or project (ferry_join, ferry_orders list)".to_string(),
+            ),
+            Some(std::io::ErrorKind::PermissionDenied) => (
+                "denied",
+                "this machine does not allow that. Tell the human".to_string(),
+            ),
+            _ => ("error", format!("{error:#}")),
+        },
     };
     json!({
         "content": [{ "type": "text", "text": short(&format!("{kind}: {why}"), 400) }],
@@ -302,20 +335,28 @@ fn tool(name: &str, description: &str, input: &Value, output: &[&str]) -> Value 
     })
 }
 
-/// The six core tools, sorted by name.
+/// The seven core tools, sorted by name. Every argument is explained where it is declared.
 #[must_use]
 pub fn core_tools() -> Vec<Value> {
+    let text = |what: &str| json!({ "type": "string", "description": what });
     let mut tools = vec![
         tool(
             "ferry_ask_human",
-            "Ask the human to decide. raise needs title, recommendation, reasoning; status takes id. You can ask, never approve.",
-            &json!({"type":"object","properties":{"action":{"enum":["raise","status"]},"title":{"type":"string"},"recommendation":{"type":"string"},"reasoning":{"type":"string"},"id":{"type":"string"}},"required":["action"]}),
-            &["id", "state", "note"],
+            "Ask the human to decide something. You can ask, never approve. raise needs title, recommendation and reasoning; status shows one ask (id) or your recent ones.",
+            &json!({"type":"object","properties":{
+                "action":{"enum":["raise","status"]},
+                "title":text("the question in one line, at most 120 characters"),
+                "recommendation":text("what you suggest they decide, at most 300 characters"),
+                "reasoning":text("why, at most 1200 characters"),
+                "id":text("an ask id from raise, for status")},"required":["action"]}),
+            &["id", "state", "note", "asks"],
         ),
         tool(
             "ferry_catchup",
-            "Resume in one call: primary, brief, decisions, open orders, yours, asks. Pass since for only what changed.",
-            &json!({"type":"object","properties":{"since":{"type":"string"},"detail":{"type":"boolean"}}}),
+            "Resume in one call: who leads (and if that is stale), the project brief, decisions, open orders, yours, your asks and what waits on you. Use the returned next as since to get only what changed.",
+            &json!({"type":"object","properties":{
+                "since":text("the next value from your last catchup; returns only what changed"),
+                "detail":{"type":"boolean","description":"true for longer lines and more rows"}}}),
             &[
                 "primary",
                 "brief",
@@ -329,9 +370,16 @@ pub fn core_tools() -> Vec<Value> {
             ],
         ),
         tool(
-            "ferry_join",
-            "Announce yourself. Returns your level, who is primary and who is alive. Call first.",
+            "ferry_help",
+            "The short guide: what Ferryman is, what your level may do, the work loop, how to give work or ask the human, and the glossary. Call it whenever unsure.",
             &json!({"type":"object","properties":{}}),
+            &["guide", "agent", "levels"],
+        ),
+        tool(
+            "ferry_join",
+            "Start here. Returns your name, level, your seats (projects, with what each is about), who leads and, on the first call, the guide. More than fit: call again with since = next.",
+            &json!({"type":"object","properties":{
+                "since":text("the next cursor from the last join, for the next page of projects")}}),
             &[
                 "agent",
                 "level",
@@ -343,25 +391,49 @@ pub fn core_tools() -> Vec<Value> {
                 "update",
                 "how",
                 "projects",
+                "total",
+                "can",
+                "guide",
                 "next",
             ],
         ),
         tool(
             "ferry_orders",
-            "Orders. list, show, claim, progress (note), submit (ref = commit or hand-in id, note), review (verdict accept|changes).",
-            &json!({"type":"object","properties":{"action":{"enum":["list","show","claim","progress","submit","review"]},"id":{"type":"string"},"note":{"type":"string"},"ref":{"type":"string"},"verdict":{"enum":["accept","changes"]},"notes":{"type":"string"},"since":{"type":"string"}},"required":["action"]}),
-            &["orders", "id", "state", "run_via", "next"],
+            "Orders (units of work). list: scope mine|claimable|open|all (default open), page with since. show/claim (id). progress (id, note). submit (id, ref, note). review (id, verdict, notes; member+). create (title, task; member+).",
+            &json!({"type":"object","properties":{
+                "action":{"enum":["list","show","claim","progress","submit","review","create"]},
+                "id":text("an order id, from list"),
+                "scope":{"enum":["mine","claimable","open","all"],"description":"list: mine = yours, claimable = you may claim now, open = not finished (default), all = also finished"},
+                "since":text("list: the next cursor from the last list, for the next page"),
+                "note":text("progress: one line of status; submit: a short summary (the work itself is a commit)"),
+                "ref":text("submit: the commit sha or hand-in id of the finished work"),
+                "verdict":{"enum":["accept","changes"],"description":"review: accept, or send back with changes (then notes says what)"},
+                "notes":text("review: what to change"),
+                "title":text("create: the order in one line"),
+                "task":text("create: what to do and how it is judged done"),
+                "to":text("create: an agent or machine name; leave out for open to anyone"),
+                "kind":text("create: code-change, docs, tests, review, plan, chore, research"),
+                "size":{"enum":["small","medium","large"],"description":"create: how big"},
+                "priority":{"enum":["low","normal","high"],"description":"create: queue order"},
+                "depends_on":{"type":"array","items":{"type":"string"},"description":"create: order ids that must be done first"}},
+                "required":["action"]}),
+            &["orders", "id", "state", "run_via", "scope", "total", "hidden", "next"],
         ),
         tool(
             "ferry_primary",
-            "Who leads. status, standby, takeover (only when the primary is silent), release.",
+            "Who leads this project and whether it is alive. status or standby look; takeover (orchestrator, only when the primary is silent) leads; release gives the lead up.",
             &json!({"type":"object","properties":{"action":{"enum":["status","standby","takeover","release"]}},"required":["action"]}),
-            &["primary", "age_s", "state", "rule"],
+            &["primary", "age_s", "state", "rule", "stale", "fix"],
         ),
         tool(
             "ferry_talk",
-            "Messages. read gives only new ones; post sends to an agent name.",
-            &json!({"type":"object","properties":{"action":{"enum":["read","post"]},"to":{"type":"string"},"text":{"type":"string"},"since":{"type":"string"},"peek":{"type":"boolean"}},"required":["action"]}),
+            "Messages between agents. read returns only new ones; post sends text to the agent named in to.",
+            &json!({"type":"object","properties":{
+                "action":{"enum":["read","post"]},
+                "to":text("post: the agent's name, from the alive list in join"),
+                "text":text("post: the message, at most 1500 characters; no secrets, no files"),
+                "since":text("read: the next cursor from the last read"),
+                "peek":{"type":"boolean","description":"read: true to look without marking messages read"}},"required":["action"]}),
             &["messages", "id", "next"],
         ),
     ];
@@ -372,17 +444,18 @@ pub fn core_tools() -> Vec<Value> {
 /// The opt-in admin group (`--tools admin`), sorted by name.
 #[must_use]
 pub fn admin_tools() -> Vec<Value> {
+    let text = |what: &str| json!({ "type": "string", "description": what });
     let mut tools = vec![
         tool(
             "ferry_get",
-            "Fetch one ferry:// resource (order, msg, brief) as text.",
-            &json!({"type":"object","properties":{"uri":{"type":"string"}},"required":["uri"]}),
+            "Fetch one ferry:// resource (an order, message or brief) as text.",
+            &json!({"type":"object","properties":{"uri":text("a ferry://<project>/<order|msg|brief>/<id> link")},"required":["uri"]}),
             &["uri", "text"],
         ),
         tool(
             "ferry_search",
             "Search the channel's memory, ledger, learnings and results. Paged.",
-            &json!({"type":"object","properties":{"query":{"type":"string"},"since":{"type":"string"}},"required":["query"]}),
+            &json!({"type":"object","properties":{"query":text("words to look for"),"since":text("the next cursor from the last search")},"required":["query"]}),
             &["hits", "next"],
         ),
         tool(
@@ -393,7 +466,7 @@ pub fn admin_tools() -> Vec<Value> {
         ),
         tool(
             "ferry_update",
-            "check: is a signed, approved release available. apply: install it (Orchestrator only; same path as ferry update).",
+            "check: is a signed, approved release available. apply: install it (orchestrator only).",
             &json!({"type":"object","properties":{"action":{"enum":["check","apply"]}},"required":["action"]}),
             &["current", "latest", "available", "installed"],
         ),
@@ -737,16 +810,24 @@ fn is_me(a: &str, b: &str) -> bool {
     ferryman_channel::canonical_agent_name(a) == ferryman_channel::canonical_agent_name(b)
 }
 
+/// The order's first line, shortened only when it is longer than `max`.
 fn title_of(task: &Task, max: usize) -> String {
-    short(
-        task.order
-            .payload
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or("(structured)"),
-        max,
-    )
+    let text = task
+        .order
+        .payload
+        .get("task")
+        .and_then(Value::as_str)
+        .unwrap_or("(structured)");
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(text);
+    short(first, max)
 }
+
+/// How long a title is shown in full.
+const TITLE_CHARS: usize = 80;
 
 fn message_text(message: &Message) -> String {
     match message.payload.get("text").and_then(Value::as_str) {
@@ -759,6 +840,32 @@ fn age_s(at: DateTime<Utc>) -> i64 {
     (Utc::now() - at).num_seconds().max(0)
 }
 
+/// One line about a project for `ferry_join`: its id, your level, and what it is about (the
+/// first line of its brief, when it has one).
+fn project_row(route: &ProjectRoute, level: Level) -> Value {
+    let about = marvin::list_briefs(route)
+        .ok()
+        .and_then(|briefs| briefs.into_iter().next())
+        .map(|brief| short(&brief.objective, 60))
+        .unwrap_or_default();
+    let mut row = json!({ "project": route.project_id, "level": level.as_str() });
+    if !about.is_empty() {
+        row["about"] = json!(about);
+    }
+    row
+}
+
+/// "17 days", "5 h", "12 min".
+fn how_long(minutes: i64) -> String {
+    if minutes >= 48 * 60 {
+        format!("{} days", minutes / (24 * 60))
+    } else if minutes >= 120 {
+        format!("{} h", minutes / 60)
+    } else {
+        format!("{minutes} min")
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // The agent
 
@@ -768,6 +875,8 @@ pub struct Agent {
     pub me: String,
     /// `--tools admin`.
     pub admin: bool,
+    /// The guide has been sent with a `ferry_join` already.
+    pub guided: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
@@ -782,7 +891,12 @@ impl Agent {
                 "--as {me} is the master identity. Agents ask and never approve, so the master does not run this server; use an agent identity, and decide in the dashboard or with `ferry channel review`"
             );
         }
-        Ok(Self { route, me, admin })
+        Ok(Self {
+            route,
+            me,
+            admin,
+            guided: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Is `--as <name>` an agent this machine actually holds the key for, seated on the
@@ -828,19 +942,35 @@ impl Agent {
         access::level_of(&self.route.communications, &self.route.project_id, &self.me)
     }
 
+    /// The human who owns this project, for messages that tell a worker whom to ask.
+    fn master_name(&self) -> String {
+        ferryman_channel::master::read_master(&self.route())
+            .ok()
+            .flatten()
+            .map_or_else(|| "the project owner".to_string(), |m| m.master)
+    }
+
+    /// What every level may do: claim, report progress, submit, message. A worker's files
+    /// land in its own hand-ins folder, which the readers honour (ADR 0024).
+    fn require_work(&self, what: &str) -> Result<Level> {
+        if let Some(note) = self.paused(&self.route()) {
+            return Err(denied(format!(
+                "cannot {what} while paused ({}). Tell the human",
+                short(&note, 120)
+            )));
+        }
+        Ok(self.level())
+    }
+
+    /// What a member and up may do: review, create orders, ask the human.
     fn require_write(&self, what: &str) -> Result<Level> {
-        let level = self.level();
+        let level = self.require_work(what)?;
         if level.writes_channel() {
-            if let Some(note) = self.paused(&self.route()) {
-                return Err(denied(format!(
-                    "cannot {what} while paused ({}). Tell the human",
-                    short(&note, 120)
-                )));
-            }
             Ok(level)
         } else {
             Err(denied(format!(
-                "level worker cannot {what}. Workers hand work in with `ferry work hand-in`; they do not write the channel"
+                "your level is worker, which cannot {what}. Ask instead: ferry_talk post to {} (the human who owns this project) or to a member agent, saying what you need; they can do it or raise your level",
+                self.master_name()
             )))
         }
     }
@@ -870,7 +1000,7 @@ impl Agent {
     /// produced against its cap and not only what survived the cut.
     pub fn call_raw(&self, name: &str, args: &Value) -> Result<Reply> {
         layout_guard(name, args)?;
-        if name != "ferry_join" {
+        if name != "ferry_join" && name != "ferry_help" {
             // Only a seated key reads or writes the channel through this server.
             if name.starts_with("ferry_") {
                 self.require_seated()?;
@@ -891,7 +1021,8 @@ impl Agent {
             }
         }
         match name {
-            "ferry_join" => self.join(),
+            "ferry_join" => self.join(args),
+            "ferry_help" => self.help(),
             "ferry_catchup" => self.catchup(args),
             "ferry_orders" => self.orders(args),
             "ferry_talk" => self.talk(args),
@@ -934,6 +1065,63 @@ impl Agent {
         }
     }
 
+    /// The primary is silent and nothing answers to its name (a retired machine name, say):
+    /// how long it has been quiet, and what the master should do. The channel's holder stays
+    /// where it was left; only the master or an orchestrator can move it.
+    fn stale_primary(
+        &self,
+        route: &ProjectRoute,
+        state: &str,
+        holder: Option<&marvin::Holding>,
+    ) -> Option<(String, String)> {
+        let holder = holder?;
+        if state != "silent" {
+            return None;
+        }
+        let answering = ferryman_channel::receipts::list_presence(route)
+            .unwrap_or_default()
+            .iter()
+            .any(|(p, _)| {
+                is_me(&p.agent, &holder.agent)
+                    && age_s(p.seen_at) < ferryman_channel::receipts::PRESENCE_ABSENT_AFTER_SECS
+            });
+        if answering {
+            return None;
+        }
+        let quiet = how_long(holder.quiet_minutes(Utc::now()));
+        let fix = format!(
+            "No live worker answers to '{}' (it may be a retired name). The master should choose a new primary: in the dashboard (Agents), or ask an orchestrator agent to run ferry_primary takeover",
+            holder.agent
+        );
+        Some((quiet, fix))
+    }
+
+    /// Raise one ask to the human about a stale primary. The id is the primary's name, so
+    /// however many agents see it, and however often, there is one ask.
+    fn raise_stale_ask(&self, route: &ProjectRoute, name: &str, quiet: &str) {
+        if !self.level().writes_channel() || self.paused(route).is_some() {
+            return;
+        }
+        let Ok(identity) = self.identity() else {
+            return;
+        };
+        let id = format!(
+            "ask-stale-primary-{}",
+            ferryman_channel::canonical_agent_name(name)
+        );
+        let text = format!(
+            "Primary '{name}' has been silent for {quiet} and no worker answers to that name.\nRecommendation: choose a new primary (dashboard, Agents).\nWhy: until then nobody leads this project, and a takeover is waiting on you."
+        );
+        let options = [
+            ASK_APPROVE.to_string(),
+            ASK_REJECT.to_string(),
+            "send back".to_string(),
+        ];
+        let _ = ferryman_channel::questions::ask(
+            route, &identity, &id, ASK_KIND, &text, &options, None,
+        );
+    }
+
     /// While this agent is the primary, every call it makes is a word from it. Without
     /// this the holder would go quiet while very much at work.
     fn touch(&self, route: &ProjectRoute) {
@@ -971,6 +1159,10 @@ impl Agent {
             }
         };
         let me_primary = holder.as_ref().is_some_and(|h| is_me(&h.agent, &self.me));
+        let stale = self.stale_primary(&route, state, holder.as_ref());
+        if let (Some((quiet, _)), Some(h)) = (&stale, &holder) {
+            self.raise_stale_ask(&route, &h.agent, quiet);
+        }
         let status = |extra: Option<(&str, Value)>| {
             let mut data = json!({
                 "primary": view["name"],
@@ -978,6 +1170,11 @@ impl Agent {
                 "state": state,
                 "rule": rule,
             });
+            if let Some((quiet, fix)) = &stale {
+                data["stale"] = json!(true);
+                data["silent_for"] = json!(quiet);
+                data["fix"] = json!(fix);
+            }
             if me_primary {
                 data["you_are_primary"] = json!(true);
             }
@@ -989,7 +1186,15 @@ impl Agent {
         match action {
             "status" | "standby" => {
                 let who = view["name"].as_str().unwrap_or("nobody");
-                Ok(Reply::new(format!("primary {who}, {state}"), status(None)))
+                let note = if stale.is_some() {
+                    " (stale: tell the master)"
+                } else {
+                    ""
+                };
+                Ok(Reply::new(
+                    format!("primary {who}, {state}{note}"),
+                    status(None),
+                ))
             }
             "takeover" => {
                 let level = self.level();
@@ -1043,35 +1248,28 @@ impl Agent {
 
     // -- join -------------------------------------------------------------------------
 
-    fn join(&self) -> Result<Reply> {
+    fn join(&self, _args: &Value) -> Result<Reply> {
         // A name is a claim, not a credential. Joining registers nothing and mints no key:
         // the key must already be on this machine and seated on the roster.
         let route = self.route();
         let granted = self.seated();
-        let note = if granted {
-            None
-        } else {
-            Some(
-                match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
-                    Ok(Some(_)) => format!(
-                        "'{}' has a key here but is not seated on the roster. Ask the owner (dashboard, Agents)",
-                        self.me
-                    ),
-                    _ => format!(
-                        "no key for '{}' on this machine. Run `ferry channel join --as {}` here or ask the owner (dashboard, Agents), then restart the app. Until then this app can read nothing and write nothing",
-                        self.me, self.me
-                    ),
-                },
-            )
-        };
         if !granted {
+            let note = match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
+                Ok(Some(_)) => format!(
+                    "'{}' is not seated: it has a key here but is not on this project's roster. Tell the human: ask the owner to seat it in the Ferryman dashboard (Agents)",
+                    self.me
+                ),
+                _ => format!(
+                    "'{}' is not seated: it has no key on this machine yet. Restart this server (it seats itself on start), or tell the human to seat it in the Ferryman dashboard (Agents). Until then this app can read nothing and write nothing",
+                    self.me
+                ),
+            };
             let data = json!({
                 "agent": self.me,
                 "project": route.project_id,
                 "level": "none",
                 "granted": false,
                 "note": note,
-                "how": HOW,
             });
             return Ok(Reply::new(
                 format!(
@@ -1095,15 +1293,20 @@ impl Agent {
             "machine": ferryman_channel::receipts::machine_label(),
             "level": level.as_str(),
             "granted": granted,
+            "total": 1,
+            "projects": [project_row(&route, level)],
+            "can": { level.as_str(): can(level) },
             "primary": primary,
             "alive": alive,
             "mine_open": mine_open,
             "queue": { "snifrig": ferryman_ops::heavy::snifrig_on_path().is_some() },
-            "how": HOW,
             "next": "ferry_catchup",
         });
         if let Some(update) = self.update_field(&route) {
             data["update"] = update;
+        }
+        if !self.guided.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            data["guide"] = json!(INSTRUCTIONS);
         }
         let who = data["primary"]["name"]
             .as_str()
@@ -1117,6 +1320,19 @@ impl Agent {
                 level.as_str(),
             ),
             data,
+        ))
+    }
+
+    fn help(&self) -> Result<Reply> {
+        let level = self.level();
+        Ok(Reply::new(
+            "the Ferryman guide",
+            json!({
+                "guide": INSTRUCTIONS,
+                "agent": self.me,
+                "levels": { self.route.project_id.clone(): level.as_str() },
+                "can": { level.as_str(): can(level) },
+            }),
         ))
     }
 
@@ -1170,6 +1386,10 @@ impl Agent {
             .map(|log| log.entries)
             .unwrap_or_default();
         let (primary, state, holder) = self.primary_view(&route);
+        let stale = self.stale_primary(&route, state, holder.as_ref());
+        if let (Some((quiet, _)), Some(h)) = (&stale, &holder) {
+            self.raise_stale_ask(&route, &h.agent, quiet);
+        }
         let brief = match &holder {
             Some(h) => marvin::read_brief(&route, &h.agent).ok().flatten(),
             None => None,
@@ -1219,7 +1439,7 @@ impl Agent {
         let row = |t: &Task| {
             let mut r = json!({
                 "id": t.order.id,
-                "title": title_of(t, 48),
+                "title": title_of(t, TITLE_CHARS),
                 "state": state_name(&t.state()),
             });
             if let Some(h) = t.holder().or(t.order.assigned_to.as_deref()) {
@@ -1232,7 +1452,7 @@ impl Agent {
             .iter()
             .filter(|t| self.is_mine(t) && !finished(&t.state()))
             .take(3)
-            .map(|t| json!({ "id": t.order.id, "title": title_of(t, 48), "state": state_name(&t.state()) }))
+            .map(|t| json!({ "id": t.order.id, "title": title_of(t, TITLE_CHARS), "state": state_name(&t.state()) }))
             .collect();
 
         let decisions: Vec<Value> = brief
@@ -1267,9 +1487,18 @@ impl Agent {
 
         let mut waiting: Vec<Value> = Vec::new();
         if self.level().writes_channel() {
+            // Only what this agent could actually decide: not an order that needs the
+            // master, and not a result it submitted itself.
             for t in tasks
                 .iter()
                 .filter(|t| matches!(t.state(), TaskState::AwaitingReview { .. }))
+                .filter(|t| !t.order.requires_approval)
+                .filter(|t| {
+                    let revision = t.latest_revision();
+                    !t.results
+                        .iter()
+                        .any(|r| Some(r.revision) == revision && is_me(&r.agent, &self.me))
+                })
                 .take(3)
             {
                 waiting.push(json!(format!("review {}", t.order.id)));
@@ -1291,12 +1520,20 @@ impl Agent {
                 .map(|l| json!(short(l, 80)))
                 .collect();
             brief_view = json!({
-                "objective": short(&b.objective, if detail { 300 } else { 120 }),
+                "objective": short(&b.objective, if detail { 300 } else { 160 }),
                 "constraints": constraints,
+                "now": short(&b.in_flight, if detail { 300 } else { 140 }),
+                "next_up": short(&b.next, if detail { 300 } else { 100 }),
             });
         }
+        let mut primary_view = json!({ "name": primary["name"], "state": state });
+        if let Some((quiet, fix)) = &stale {
+            primary_view["stale"] = json!(true);
+            primary_view["silent_for"] = json!(quiet);
+            primary_view["fix"] = json!(fix);
+        }
         let mut data = json!({
-            "primary": { "name": primary["name"], "state": state },
+            "primary": primary_view,
             "brief": brief_view,
             "decisions": decisions,
             "open": open_rows,
@@ -1323,10 +1560,11 @@ impl Agent {
         }
         let mut reply = Reply::new(
             format!(
-                "{} open, {} yours; primary {} ({state})",
+                "{} open, {} yours; primary {} ({state}{})",
                 open_total,
                 mine.len(),
-                primary["name"].as_str().unwrap_or("nobody")
+                primary["name"].as_str().unwrap_or("nobody"),
+                if stale.is_some() { ", stale" } else { "" }
             ),
             data,
         );
@@ -1362,17 +1600,18 @@ impl Agent {
         let action = need(args, "action", "ferry_orders")?;
         self.touch(&route);
         match action {
-            "list" => self.orders_list(&route, arg_str(args, "since")),
+            "list" => self.orders_list(&route, arg_str(args, "scope"), arg_str(args, "since")),
+            "create" => self.orders_create(&route, args),
             "show" => self.orders_show(&route, need(args, "id", "show")?),
             "claim" => {
-                self.require_write("claim orders")?;
+                self.require_work("claim orders")?;
                 let id = need(args, "id", "claim")?;
                 safe_id(id)?;
                 // The checks the worker makes before it takes an order, in the same
                 // order: is it signed and unblocked and addressed to this agent, then
                 // the holds (interface, file overlap, fleet width, project tier, order
                 // files). Only then the claim.
-                let task = ferryman_channel::read_task(&route, id)?;
+                let task = read_order(&route, id)?;
                 if !task.holder().is_some_and(|h| is_me(h, &self.me)) {
                     let open = ferryman_channel::work_among(&route, &self.me, vec![task.clone()])?
                         .into_iter()
@@ -1395,7 +1634,7 @@ impl Agent {
                     }
                 }
                 ferryman_channel::claim_order(&route, id, &self.me)?;
-                let task = ferryman_channel::read_task(&route, id)?;
+                let task = read_order(&route, id)?;
                 let holder = task.holder().unwrap_or("nobody").to_string();
                 let ok = is_me(&holder, &self.me);
                 Ok(Reply::new(
@@ -1408,7 +1647,7 @@ impl Agent {
                 ))
             }
             "progress" => {
-                self.require_write("report progress")?;
+                self.require_work("report progress")?;
                 let id = need(args, "id", "progress")?;
                 safe_id(id)?;
                 let note = need(args, "note", "progress")?;
@@ -1433,7 +1672,7 @@ impl Agent {
                 ))
             }
             "submit" => {
-                self.require_write("submit results")?;
+                self.require_work("submit results")?;
                 let id = need(args, "id", "submit")?;
                 safe_id(id)?;
                 let reference = need(args, "ref", "submit")?;
@@ -1469,16 +1708,17 @@ impl Agent {
                 };
                 identity.sign_result(&mut result);
                 ferryman_channel::submit_result(&route, &result)?;
-                let after = ferryman_channel::read_task(&route, id)?;
+                let after = read_order(&route, id)?;
                 Ok(Reply::new(
                     format!("submitted revision {revision} of {id}"),
                     json!({ "id": id, "revision": revision, "state": state_name(&after.state()) }),
                 ))
             }
             "review" => {
-                self.require_write("review")?;
                 let id = need(args, "id", "review")?;
-                safe_id(id)?;
+                // A missing order is said first, in words, whoever asks.
+                read_order(&route, id)?;
+                self.require_review()?;
                 let accept = match need(args, "verdict", "review")? {
                     "accept" => true,
                     "changes" => false,
@@ -1493,7 +1733,7 @@ impl Agent {
                         return Err(bad("review notes are at most 1000 characters"));
                     }
                 }
-                let task = ferryman_channel::read_task(&route, id)?;
+                let task = read_order(&route, id)?;
                 let revision = task
                     .latest_revision()
                     .ok_or_else(|| bad("there is no result to review yet"))?;
@@ -1508,7 +1748,7 @@ impl Agent {
                 }
                 if task.order.requires_approval {
                     return Err(denied(
-                        "this order needs the master's approval, not an agent's. Use ferry_ask_human with a recommendation; the master decides in the dashboard or with `ferry channel review`",
+                        "agents never approve: this order needs the master's approval. Use ferry_ask_human with a recommendation; the master decides in the Ferryman dashboard",
                     ));
                 }
                 if accept
@@ -1546,9 +1786,21 @@ impl Agent {
         }
     }
 
+    /// Review is a member's job, and never an approval: a worker is told who decides.
+    fn require_review(&self) -> Result<()> {
+        let level = self.require_work("review")?;
+        if level.writes_channel() {
+            return Ok(());
+        }
+        Err(denied(format!(
+            "agents never approve, and a worker cannot review. If a decision is needed, ask the human: ferry_talk post to {} (a member uses ferry_ask_human)",
+            self.master_name()
+        )))
+    }
+
     /// The task, if this agent holds it.
     fn holding(&self, route: &ProjectRoute, id: &str) -> Result<Task> {
-        let task = ferryman_channel::read_task(route, id)?;
+        let task = read_order(route, id)?;
         if task.holder().is_some_and(|h| is_me(h, &self.me)) {
             Ok(task)
         } else {
@@ -1562,44 +1814,57 @@ impl Agent {
         }
     }
 
-    fn orders_list(&self, route: &ProjectRoute, since: Option<&str>) -> Result<Reply> {
+    fn orders_list(
+        &self,
+        route: &ProjectRoute,
+        scope: Option<&str>,
+        since: Option<&str>,
+    ) -> Result<Reply> {
+        let scope = scope.unwrap_or("open");
+        if !matches!(scope, "mine" | "claimable" | "open" | "all") {
+            return Err(bad(format!(
+                "scope is mine, claimable, open or all, not '{scope}'"
+            )));
+        }
         let offset = parse_offset(since)?;
-        let mut seen = BTreeSet::new();
         let mut tasks: Vec<Task> = Vec::new();
         for task in ferryman_channel::list_tasks(route)? {
-            if finished(&task.state()) {
-                continue;
-            }
-            let claimable = ferryman_channel::work_among(route, &self.me, vec![task.clone()])
-                .map(|w| !w.is_empty())
-                .unwrap_or(false);
-            if (self.is_mine(&task) || claimable) && seen.insert(task.order.id.clone()) {
+            let done = finished(&task.state());
+            let keep = match scope {
+                "all" => true,
+                "open" => !done,
+                "mine" => !done && self.is_mine(&task),
+                // Claimable is the costly one: it checks signatures and dependencies.
+                _ => {
+                    !done
+                        && ferryman_channel::work_among(route, &self.me, vec![task.clone()])
+                            .map(|w| !w.is_empty())
+                            .unwrap_or(false)
+                }
+            };
+            if keep {
                 tasks.push(task);
             }
         }
         let total = tasks.len();
-        let identity = if self.level().writes_channel() {
-            self.identity().ok()
-        } else {
-            None
-        };
+        let identity = self.identity().ok();
         let page: Vec<&Task> = tasks.iter().skip(offset).take(MAX_ITEMS).collect();
         let mut shown: Vec<Value> = Vec::new();
         for task in &page {
             if let Some(identity) = &identity {
                 let _ = ferryman_channel::receipts::record_read(route, &task.order.id, identity);
             }
-            let mut r = json!({ "id": task.order.id, "title": title_of(task, 50), "state": state_name(&task.state()) });
+            let mut r = json!({ "id": task.order.id, "title": title_of(task, TITLE_CHARS), "state": state_name(&task.state()) });
             if let Some(h) = task.holder() {
                 r["holder"] = json!(h);
             }
             shown.push(r);
         }
-        let mut data = json!({ "orders": shown });
+        let mut data = json!({ "orders": shown, "scope": scope, "total": total });
         // Fit to the cap before deciding where the cursor points, so `next` names the
         // first order the caller has not been shown.
-        let mut reply = Reply::new(format!("{total} order(s) for you or claimable"), json!({}));
-        let cap = cap_tokens("ferry_orders") * 4 - reply.text.len() - 160;
+        let mut reply = Reply::new(String::new(), json!({}));
+        let cap = cap_tokens("ferry_orders") * 4 - 260;
         while len_of(&data) > cap.min(MAX_CHARS - 200) {
             match data.get_mut("orders") {
                 Some(Value::Array(rows)) if !rows.is_empty() => {
@@ -1609,22 +1874,158 @@ impl Agent {
             }
         }
         let count = data["orders"].as_array().map_or(0, Vec::len);
-        if offset + count < total {
+        let hidden = total.saturating_sub(offset + count);
+        data["shown"] = json!(count);
+        data["hidden"] = json!(hidden);
+        if hidden > 0 {
             data["next"] = json!(format!("o{}", offset + count));
             data["truncated"] = json!(true);
         }
+        reply.text = format!(
+            "{total} order(s), scope {scope}; showing {count}, {hidden} not shown{}",
+            if hidden > 0 {
+                ". More: list again with since = next"
+            } else {
+                ""
+            }
+        );
         reply.data = data;
         Ok(reply)
     }
 
+    fn orders_create(&self, route: &ProjectRoute, args: &Value) -> Result<Reply> {
+        self.require_write("create orders")?;
+        let title = need(args, "title", "create")?;
+        if title.chars().count() > 120 {
+            return Err(bad("a title is at most 120 characters; the detail goes in task"));
+        }
+        let detail = arg_str(args, "task").unwrap_or("");
+        if detail.chars().count() > 3000 {
+            return Err(bad(
+                "task is at most 3000 characters; put the long brief in the work repo and name the file",
+            ));
+        }
+        let to = match arg_str(args, "to") {
+            None => None,
+            Some(who) if matches!(who.to_ascii_lowercase().as_str(), "open" | "anyone" | "all") => {
+                None
+            }
+            Some(who) => {
+                if !ferryman_channel::is_safe_component(who) {
+                    return Err(bad("to is an agent or machine name: letters, digits, '.', '-' and '_'"));
+                }
+                let known = self
+                    .route()
+                    .agents
+                    .iter()
+                    .any(|a| ferryman_channel::addressed_to(who, &a.name));
+                if !known {
+                    return Err(bad(format!(
+                        "nobody called '{who}' is on this project. ferry_join shows who is alive; leave to out for an order open to anyone"
+                    )));
+                }
+                Some(who.to_ascii_lowercase())
+            }
+        };
+        let kind = match arg_str(args, "kind") {
+            Some(kind) => Some(
+                serde_json::from_value::<ferryman_channel::work::WorkKind>(json!(
+                    kind.to_ascii_lowercase()
+                ))
+                .map_err(|_| bad(format!("kind '{kind}' is not one this server knows")))?,
+            ),
+            None => None,
+        };
+        let size = match arg_str(args, "size") {
+            Some(size) => {
+                Some(ferryman_channel::work::Size::parse(size).map_err(|e| bad(format!("{e}")))?)
+            }
+            None => None,
+        };
+        let priority = match arg_str(args, "priority") {
+            Some(p) => Some(ferryman_channel::Priority::parse(p).map_err(|e| bad(format!("{e}")))?),
+            None => None,
+        };
+        let mut depends_on = Vec::new();
+        for dep in args
+            .get("depends_on")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            read_order(route, dep).map_err(|_| {
+                bad(format!(
+                    "depends_on names '{dep}', which is not an order here"
+                ))
+            })?;
+            depends_on.push(dep.to_string());
+        }
+        let identity = self.identity()?;
+        let id = format!("o-{}-{}", self.me, Utc::now().timestamp_millis());
+        let text = if detail.is_empty() {
+            title.to_string()
+        } else {
+            format!("{title}\n\n{detail}")
+        };
+        let needs = Some(ferryman_channel::work::ExplicitNeeds {
+            kind,
+            size,
+            ..ferryman_channel::work::ExplicitNeeds::default()
+        })
+        .filter(|needs| !needs.is_empty());
+        let mut order = ferryman_channel::Order {
+            id: id.clone(),
+            project_id: route.project_id.clone(),
+            issued_by: self.me.clone(),
+            assigned_to: to.clone(),
+            created_at: Utc::now(),
+            payload: json!({ "task": text }),
+            // What an agent hands out comes back reviewed.
+            requires_review: true,
+            requires_approval: false,
+            depends_on,
+            signed_by: None,
+            signature: None,
+            result_contract: None,
+            interface: None,
+            touches: Vec::new(),
+            needs,
+            allow_overlap: false,
+            priority,
+        };
+        identity.sign_order(&mut order);
+        ferryman_channel::issue_order(route, &order)?;
+        let _ = ferryman_channel::ledger::append_ledger_entry(
+            route,
+            &identity,
+            "order",
+            &self.me,
+            &format!("issued order {id}"),
+            Some(&id),
+        );
+        Ok(Reply::new(
+            format!(
+                "created {id}, {}",
+                match &to {
+                    Some(who) => format!("addressed to {who}"),
+                    None => "open to anyone".to_string(),
+                }
+            ),
+            json!({ "id": id, "state": "open", "to": to, "next": "ferry_orders list" }),
+        ))
+    }
+
     fn orders_show(&self, route: &ProjectRoute, id: &str) -> Result<Reply> {
         safe_id(id)?;
-        let task = ferryman_channel::read_task(route, id)?;
+        let task = read_order(route, id)?;
         let needs = task.order.needs.clone();
         let mut data = json!({
             "id": id,
-            "title": title_of(&task, 100),
+            "title": title_of(&task, 120),
             "state": state_name(&task.state()),
+            "issued_by": task.order.issued_by,
+            "work_repo": route.workspace.display().to_string(),
             "results": task.results.len(),
             "run_via": ferryman_ops::heavy::run_via(route, needs.as_ref()).as_str(),
         });
@@ -1695,7 +2096,7 @@ impl Agent {
                 args.get("peek").and_then(Value::as_bool).unwrap_or(false),
             ),
             "post" => {
-                self.require_write("post")?;
+                self.require_work("post")?;
                 let to = need(args, "to", "post")?.to_ascii_lowercase();
                 let text = need(args, "text", "post")?;
                 if text.chars().count() > 1500 {
@@ -1923,7 +2324,7 @@ impl Agent {
         safe_id(id)?;
         let text = match *kind {
             "order" => {
-                let task = ferryman_channel::read_task(&route, id)?;
+                let task = read_order(&route, id)?;
                 let mut out = format!(
                     "{}\n\nstate: {}\nissued by: {}\n",
                     task.order
@@ -2266,7 +2667,113 @@ pub fn check_agent_name(name: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Zero-config identities: an app seats itself as a Worker.
+
+/// The identity an app gets on this machine: `<client>-<machine>`, from the name the client
+/// announced in `initialize` (`codex`, `claude-code`, ...) and this machine's name.
+#[must_use]
+pub fn app_name(client: Option<&str>) -> String {
+    let words = |text: &str| -> String {
+        let mut out = String::new();
+        for c in text.to_ascii_lowercase().chars() {
+            if c.is_ascii_alphanumeric() {
+                out.push(c);
+            } else if !out.ends_with('-') && !out.is_empty() {
+                out.push('-');
+            }
+        }
+        out.trim_end_matches('-').chars().take(24).collect()
+    };
+    let client = client.map(words).filter(|c| !c.is_empty());
+    let machine = Some(words(&ferryman_channel::receipts::machine_label())).filter(|m| !m.is_empty());
+    match (client, machine) {
+        (Some(c), Some(m)) if c.ends_with(&format!("-{m}")) => c,
+        (Some(c), Some(m)) => format!("{c}-{m}"),
+        (Some(c), None) => c,
+        (None, Some(m)) => format!("app-{m}"),
+        (None, None) => "app".to_string(),
+    }
+}
+
+/// Seat `name` in `route` as an app: its key from the machine keystore (made if this is
+/// the first time), published on the roster under [`access::APP_ROLE`], which makes it a
+/// Worker. Never the master, and never over a name another key already holds. Idempotent.
+pub fn seat_app(route: &ProjectRoute, name: &str) -> Result<()> {
+    let name = ferryman_channel::canonical_agent_name(name);
+    let master = ferryman_channel::master::read_master(route).ok().flatten();
+    if master.is_some_and(|m| is_me(&m.master, &name)) {
+        bail!("'{name}' is the master of {}; the master is never an app", route.project_id);
+    }
+    let identity = AgentIdentity::load_or_create(&name, &route.attachment)?;
+    let key = identity.public_key_hex();
+    let on_roster = ferryman_channel::read_agent_roster(&route.communications)
+        .unwrap_or_default()
+        .iter()
+        .any(|a| is_me(&a.name, &name) && a.public_key.as_deref() == Some(key.as_str()));
+    if on_roster {
+        return Ok(());
+    }
+    let encryption =
+        ferryman_channel::secrets::EncryptionIdentity::load_or_create(&name, &route.attachment)?;
+    ferryman_channel::register_agent_key(
+        route,
+        &ferryman_channel::AgentRoute {
+            name,
+            role: access::APP_ROLE.to_string(),
+            capabilities: vec!["messages.receive".to_string()],
+            public_key: None,
+            encryption_key: Some(encryption.public_key_hex()),
+        },
+        &identity,
+    )?;
+    Ok(())
+}
+
+/// Seat `name` in every project `source` offers. Returns how many it is now seated in.
+pub fn seat_everywhere(name: &str, source: &RouteSource) -> usize {
+    source()
+        .iter()
+        .filter(|route| seat_app(route, name).is_ok())
+        .count()
+}
+
+// ---------------------------------------------------------------------------------------
 // All-projects mode: one connection, every live project (ADR 0031, "Decision" 2).
+
+/// How many seats are at each level, `{"worker": 24, "member": 1}`.
+fn level_counts(open: &[(ProjectRoute, Level)]) -> Value {
+    let mut counts = std::collections::BTreeMap::new();
+    for (_, level) in open {
+        *counts.entry(level.as_str()).or_insert(0usize) += 1;
+    }
+    json!(counts)
+}
+
+/// What each level present among `open` may do, said once.
+fn can_map(open: &[(ProjectRoute, Level)]) -> Value {
+    let mut map = Map::new();
+    for (_, level) in open {
+        map.insert(level.as_str().to_string(), json!(can(*level)));
+    }
+    Value::Object(map)
+}
+
+/// "Your seats: a, b, c ..." for a message that tells the caller where it can act.
+fn seats(open: &[(ProjectRoute, Level)]) -> String {
+    if open.is_empty() {
+        return "You have no seats on this machine.".to_string();
+    }
+    let names: Vec<&str> = open
+        .iter()
+        .map(|(route, _)| route.project_id.as_str())
+        .take(8)
+        .collect();
+    format!(
+        "Your seats: {}{} (ferry_join lists them all)",
+        names.join(", "),
+        if open.len() > 8 { ", ..." } else { "" }
+    )
+}
 
 /// Where an all-projects server finds its projects. Asked again on every call, so a project
 /// that is archived or added shows up without a restart.
@@ -2298,6 +2805,8 @@ pub struct AllProjects {
     /// Served over HTTP to a cloud app: only Worker and Member seats are offered.
     pub remote: bool,
     source: RouteSource,
+    /// The guide has been sent with a join already.
+    guided: std::sync::atomic::AtomicBool,
 }
 
 impl AllProjects {
@@ -2308,6 +2817,7 @@ impl AllProjects {
             admin,
             remote,
             source,
+            guided: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2340,7 +2850,10 @@ impl AllProjects {
         }
         for tool in &mut all {
             if let Some(props) = tool["inputSchema"]["properties"].as_object_mut() {
-                props.insert("project".into(), json!({ "type": "string" }));
+                props.insert(
+                    "project".into(),
+                    json!({ "type": "string", "description": "which project, from ferry_join" }),
+                );
             }
         }
         all
@@ -2362,13 +2875,23 @@ impl AllProjects {
             .and_then(|v| v.as_str().map(String::from));
         let open = self.open();
         if name == "ferry_join" && project.is_none() {
-            return Ok(self.join_all(&open));
+            return self.join_all(&open, arg_str(&args, "since"));
+        }
+        if name == "ferry_help" && project.is_none() {
+            return Ok(self.help_all(&open));
         }
         if !name.starts_with("ferry_") {
             return Err(bad(format!("unknown tool: {name}")));
         }
         let (route, _) = self.pick(&open, project.as_deref())?;
-        Ok(Agent::new(route, &self.me, self.admin)?.call(name, &args))
+        let agent = Agent::new(route, &self.me, self.admin)?;
+        // The guide goes out once per connection, not once per project.
+        if self.guided.load(std::sync::atomic::Ordering::Relaxed) {
+            agent.guided.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if name == "ferry_join" {
+            self.guided.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(agent.call(name, &args))
     }
 
     fn pick(
@@ -2383,51 +2906,97 @@ impl AllProjects {
                 .cloned()
                 .ok_or_else(|| {
                     bad(format!(
-                        "'{}' is not seated in project '{id}'. ferry_join lists your projects",
-                        self.me
+                        "you are not seated in project '{id}'. {}",
+                        seats(open)
                     ))
                 }),
             None if open.len() == 1 => Ok(open[0].clone()),
+            None if open.is_empty() => Err(bad(
+                "you are not seated in any project on this machine. Tell the human to run `ferry enable` in a project folder, or to seat you in the Ferryman dashboard (Agents)",
+            )),
             None => Err(bad(format!(
-                "pass project: one of {}",
-                open.iter()
-                    .map(|(r, _)| r.project_id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "pass project on this call. {}",
+                seats(open)
             ))),
         }
     }
 
-    fn join_all(&self, open: &[(ProjectRoute, Level)]) -> Value {
-        let projects: Vec<Value> = open
-            .iter()
-            .take(MAX_ITEMS)
-            .map(|(route, level)| json!({ "project": route.project_id, "level": level.as_str() }))
-            .collect();
+    /// The guide with this identity's levels, for `ferry_help` with no project.
+    fn help_all(&self, open: &[(ProjectRoute, Level)]) -> Value {
+        let mut data = json!({
+            "guide": INSTRUCTIONS,
+            "agent": self.me,
+            "levels": level_counts(open),
+        });
+        data["can"] = can_map(open);
+        finish(Reply::new("the Ferryman guide", data), "ferry_help")
+    }
+
+    /// Every seat, a page at a time: what fits under the cap, then `next`. Nothing is
+    /// dropped without a cursor to the rest.
+    fn join_all(&self, open: &[(ProjectRoute, Level)], since: Option<&str>) -> Result<Value> {
+        let offset = parse_offset(since)?.min(open.len());
+        let total = open.len();
+        let counts = level_counts(open);
+        let level = match counts.as_object() {
+            Some(map) if map.len() == 1 => map.keys().next().cloned().unwrap_or_default(),
+            Some(map) if map.is_empty() => "none".to_string(),
+            _ => "varies".to_string(),
+        };
         let mut data = json!({
             "agent": self.me,
             "granted": !open.is_empty(),
-            "projects": projects,
-            "how": HOW,
-            "next": "ferry_join or ferry_catchup with project",
+            "level": level,
+            "levels": counts,
+            "total": total,
+            "can": can_map(open),
         });
         if open.is_empty() {
             data["note"] = json!(format!(
-                "'{}' is not seated in any live project on this machine. Ask the owner (dashboard, Agents)",
+                "'{}' is not seated in any live project on this machine. Tell the human to run `ferry enable` in a project folder, or to seat this app in the Ferryman dashboard (Agents)",
                 self.me
             ));
         }
-        finish(
-            Reply::new(
-                format!(
-                    "Ferryman MCP (beta): {} in {} project(s)",
-                    self.me,
-                    open.len()
-                ),
-                data,
-            ),
-            "ferry_join",
-        )
+        if offset == 0 {
+            if let Some((route, _)) = open.first()
+                && let Ok(agent) = Agent::new(route.clone(), &self.me, self.admin)
+                && let Some(update) = agent.update_field(route)
+            {
+                data["update"] = update;
+            }
+            if !self.guided.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                data["guide"] = json!(INSTRUCTIONS);
+            }
+        }
+        let rows: Vec<Value> = open
+            .iter()
+            .skip(offset)
+            .take(MAX_ITEMS)
+            .map(|(route, level)| project_row(route, *level))
+            .collect();
+        let text = format!(
+            "Ferryman MCP (beta): {} seated in {total} project(s), level {level}",
+            self.me
+        );
+        // Leave room for the envelope and the paging fields, then take as many rows as fit.
+        let budget = chars_for(cap_tokens("ferry_join")).min(MAX_CHARS) - text.len() - 330;
+        let mut count = rows.len();
+        data["projects"] = json!(rows);
+        while count > 1 && len_of(&data) > budget {
+            count -= 1;
+            if let Some(Value::Array(rows)) = data.get_mut("projects") {
+                rows.truncate(count);
+            }
+        }
+        data["shown"] = json!(count);
+        if offset + count < total {
+            data["hidden"] = json!(total - offset - count);
+            data["next"] = json!(format!("o{}", offset + count));
+            data["more"] = json!("call ferry_join again with since = next for the rest of your projects");
+        } else {
+            data["next"] = json!("ferry_catchup with project");
+        }
+        Ok(finish(Reply::new(text, data), "ferry_join"))
     }
 
     /// `resources/read` for a `ferry://<project>/...` uri: the project in it picks the seat.

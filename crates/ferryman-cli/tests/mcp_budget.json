@@ -1,35 +1,36 @@
 {
-  "admin_tools_list": 350,
+  "admin_tools_list": 391,
   "caps": {
     "admin_tools_list": 700,
-    "catchup_busy": 800,
-    "core_tools_list": 1500,
-    "instructions": 340
+    "catchup_busy": 1000,
+    "core_tools_list": 1800,
+    "instructions": 650
   },
-  "catchup_busy": 705,
+  "catchup_busy": 784,
   "catchup_busy_untruncated": {
-    "fresh": 681,
-    "with_cursor": 765
+    "fresh": 760,
+    "with_cursor": 844
   },
-  "core_tools_list": 761,
-  "instructions": 324,
+  "core_tools_list": 1613,
+  "instructions": 513,
   "note": "Estimated tokens at 3.3 characters each. Regenerate with UPDATE_MCP_BUDGET=1 cargo test -p ferryman-cli mcp_budget",
   "tool_definitions": {
-    "ferry_ask_human": 138,
-    "ferry_catchup": 124,
-    "ferry_join": 106,
-    "ferry_orders": 172,
-    "ferry_primary": 104,
-    "ferry_talk": 117
+    "ferry_ask_human": 224,
+    "ferry_catchup": 190,
+    "ferry_help": 97,
+    "ferry_join": 175,
+    "ferry_orders": 584,
+    "ferry_primary": 135,
+    "ferry_talk": 208
   },
   "typical_responses": {
     "ferry_ask_human raise": 50,
     "ferry_ask_human status": 48,
-    "ferry_catchup": 705,
-    "ferry_join": 241,
+    "ferry_catchup": 784,
+    "ferry_join": 737,
     "ferry_orders claim": 48,
-    "ferry_orders list": 583,
-    "ferry_orders show": 111,
+    "ferry_orders list": 572,
+    "ferry_orders show": 140,
     "ferry_primary status": 74,
     "ferry_talk post": 41,
     "ferry_talk read": 587,

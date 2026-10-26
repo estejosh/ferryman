@@ -55,6 +55,11 @@ use crate::{AgentIdentity, ProjectRoute, SignatureCheck, canonical_agent_name, i
 /// The folder inside a channel that holds the master's signed grants.
 pub const DIR: &str = "access";
 
+/// The role an AI app (an MCP client with no seat of its own) registers under. A role is a
+/// label anyone can write into the roster, so this one can only lower a level: a name with
+/// this role is a Worker unless the master has signed a grant that says otherwise.
+pub const APP_ROLE: &str = "mcp-app";
+
 /// What an agent may do in a project.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -290,8 +295,8 @@ pub fn level_of(channel: &Path, project_id: &str, agent: &str) -> Level {
 
 /// The level of each of `names` (canonical), computed once over one read of the channel.
 ///
-/// Order: the master is Orchestrator; then the master's explicit grant; then the current
-/// head is Orchestrator; then a name the master has not admitted is a Worker as soon as the
+/// Order: the master is Orchestrator; then the master's explicit grant; then a name that
+/// registered as an app ([`APP_ROLE`]) is a Worker; then the current head is Orchestrator; then a name the master has not admitted is a Worker as soon as the
 /// project has any Worker grant (the roster is unsigned and trusted on first use, so a
 /// Worker that registered a fresh name would otherwise start as a Member); else Member.
 fn resolve_levels(channel: &Path, project_id: &str, names: &[String]) -> BTreeMap<String, Level> {
@@ -301,6 +306,11 @@ fn resolve_levels(channel: &Path, project_id: &str, names: &[String]) -> BTreeMa
         .flatten()
         .map(|declaration| canonical_agent_name(&declaration.master));
     let grants = grants(channel, project_id);
+    let apps: BTreeSet<String> = roster
+        .iter()
+        .filter(|agent| agent.role == APP_ROLE)
+        .map(|agent| canonical_agent_name(&agent.name))
+        .collect();
     let restrict = grants.values().any(|grant| grant.level == Level::Worker);
     let admitted = if restrict {
         crate::master::admitted_at(channel, &roster)
@@ -318,6 +328,8 @@ fn resolve_levels(channel: &Path, project_id: &str, names: &[String]) -> BTreeMa
                 Level::Orchestrator
             } else if let Some(grant) = grants.get(name) {
                 grant.level
+            } else if apps.contains(name) {
+                Level::Worker
             } else if head.as_deref() == Some(name.as_str()) {
                 Level::Orchestrator
             } else if restrict && !admitted.contains(name) {
