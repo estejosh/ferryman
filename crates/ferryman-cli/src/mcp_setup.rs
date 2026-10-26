@@ -141,7 +141,8 @@ pub fn render_toml(spec: &Spec) -> String {
 }
 
 /// `existing` with Ferryman added to `[mcp_servers]`. Text that is not mentioning Ferryman
-/// is appended to, not rewritten, so comments and other servers stay byte for byte.
+/// is appended to, not rewritten, so comments and other servers stay byte for byte; and a
+/// ferryman entry that differs is replaced in place, so comments survive that too.
 pub fn merge_toml(existing: &str, spec: &Spec) -> Result<String> {
     let parsed: toml::Table = toml::from_str(existing).context(
         "the Codex config is not valid TOML; fix it or move it aside, nothing was changed",
@@ -169,15 +170,36 @@ pub fn merge_toml(existing: &str, spec: &Spec) -> Result<String> {
     if listed == Some(&toml_table(spec)) {
         return Ok(existing.to_string());
     }
-    // Listed differently: replace its table, keep every other server.
-    let mut table = parsed;
-    if let Some(servers) = table
+    // Listed differently: replace its table in place, keeping every other server and all
+    // comments. `toml::to_string` would rewrite the whole file and drop the comments.
+    let mut doc: toml_edit::DocumentMut = existing.parse().context(
+        "the Codex config is not valid TOML; fix it or move it aside, nothing was changed",
+    )?;
+    if let Some(servers) = doc
+        .as_table_mut()
         .get_mut("mcp_servers")
-        .and_then(toml::Value::as_table_mut)
+        .and_then(toml_edit::Item::as_table_mut)
     {
-        servers.insert(NAME.into(), toml::Value::Table(toml_table(spec)));
+        servers.insert(NAME, toml_edit::Item::Table(toml_edit_table(spec)));
     }
-    Ok(toml::to_string(&table)?)
+    Ok(doc.to_string())
+}
+
+/// The ferryman `[mcp_servers.ferryman]` block as a `toml_edit` table, for an in-place edit.
+fn toml_edit_table(spec: &Spec) -> toml_edit::Table {
+    let mut entry = toml_edit::Table::new();
+    entry.insert("command", toml_edit::value(spec.command.clone()));
+    let args: toml_edit::Array = spec.args.iter().cloned().collect();
+    entry.insert(
+        "args",
+        toml_edit::Item::Value(toml_edit::Value::Array(args)),
+    );
+    if let Some(root) = &spec.root {
+        let mut env = toml_edit::Table::new();
+        env.insert("FERRYMAN_ROOT", toml_edit::value(root.clone()));
+        entry.insert("env", toml_edit::Item::Table(env));
+    }
+    entry
 }
 
 fn json_entry(spec: &Spec, client: Client) -> Value {
@@ -341,6 +363,35 @@ mod tests {
             "/new/ferry"
         );
         assert!(updated["mcp_servers"]["other"].is_table());
+    }
+
+    #[test]
+    fn replacing_a_ferryman_entry_keeps_other_comments() {
+        let before = "# keep me\nmodel = \"gpt-5\"\n\n[mcp_servers.ferryman]\ncommand = \"/old/ferry\"\nargs = [\"mcp\", \"serve\"]\n\n# other server's comment\n[mcp_servers.other]\ncommand = \"npx\"\n";
+        let moved = Spec {
+            command: "/new/ferry".into(),
+            ..spec()
+        };
+        let after = merge_toml(before, &moved).unwrap();
+        assert!(after.contains("# keep me"), "top comment dropped: {after}");
+        assert!(
+            after.contains("# other server's comment"),
+            "another server's comment dropped: {after}"
+        );
+        assert!(after.contains("[mcp_servers.other]"), "{after}");
+        assert!(after.contains("/new/ferry"), "{after}");
+        assert!(!after.contains("/old/ferry"), "{after}");
+        let parsed: toml::Table = toml::from_str(&after).unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["ferryman"]["command"]
+                .as_str()
+                .unwrap(),
+            "/new/ferry"
+        );
+        assert_eq!(
+            parsed["mcp_servers"]["other"]["command"].as_str().unwrap(),
+            "npx"
+        );
     }
 
     #[test]
