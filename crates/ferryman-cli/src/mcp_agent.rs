@@ -1922,6 +1922,14 @@ impl Agent {
         Ok(reply)
     }
 
+    /// A short random hex suffix for a created order id, so two orders made in the same
+    /// millisecond still get different ids.
+    fn random_suffix() -> String {
+        let mut buf = [0u8; 4];
+        rand::Rng::fill_bytes(&mut rand::rng(), &mut buf);
+        hex::encode(buf)
+    }
+
     fn orders_create(&self, route: &ProjectRoute, args: &Value) -> Result<Reply> {
         self.require_write("create orders")?;
         let title = need(args, "title", "create")?;
@@ -1995,7 +2003,12 @@ impl Agent {
             depends_on.push(dep.to_string());
         }
         let identity = self.identity()?;
-        let id = format!("o-{}-{}", self.me, Utc::now().timestamp_millis());
+        let id = format!(
+            "o-{}-{}-{}",
+            self.me,
+            Utc::now().timestamp_millis(),
+            Self::random_suffix()
+        );
         let text = if detail.is_empty() {
             title.to_string()
         } else {

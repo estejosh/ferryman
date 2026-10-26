@@ -330,6 +330,28 @@ fn a_member_creates_an_order_and_another_worker_sees_it_in_list_open() {
 }
 
 #[test]
+fn two_orders_created_back_to_back_get_distinct_ids() {
+    let root = root(3);
+    let route = &root.routes[0];
+    let mut member = root.member();
+    let mut create = |title: &str| {
+        tool(
+            &mut member,
+            "ferry_orders",
+            json!({ "project": route.project_id, "action": "create", "title": title }),
+        )
+    };
+    let first = ok(&create("first")).clone();
+    let second = ok(&create("second")).clone();
+    let a = first["id"].as_str().unwrap();
+    let b = second["id"].as_str().unwrap();
+    assert_ne!(a, b, "two orders made together must not share an id");
+    // The suffix is what separates them: both still carry the same author and a millis stamp.
+    assert!(a.starts_with("o-fang-"), "{a}");
+    assert!(b.starts_with("o-fang-"), "{b}");
+}
+
+#[test]
 fn a_worker_cannot_create_an_order_and_is_told_whom_to_ask() {
     let root = root(3);
     let mut worker = root.server();
