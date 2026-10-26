@@ -1,0 +1,20 @@
+{
+  "_comment": "Active, non-fork, non-archived repos to triage. Edit freely — add/remove a line to change scope.",
+  "repos": [
+    "estejosh/ferryman",
+    "estejosh/snifrig",
+    "estejosh/graea",
+    "estejosh/Custodly",
+    "estejosh/UFL-Usufruct-License",
+    "estejosh/oddsports",
+    "estejosh/obscura",
+    "estejosh/bullship",
+    "estejosh/feraltrek",
+    "estejosh/SovGit",
+    "estejosh/bullship_public",
+    "estejosh/ferry-pixel",
+    "estejosh/podcast-archive",
+    "shindevlin/hone",
+    "shindevlin/phonehome"
+  ]
+}
