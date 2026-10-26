@@ -922,8 +922,8 @@ impl Agent {
             Err(refusal(
                 "locked",
                 format!(
-                    "'{}' is not a seated agent on this machine, so this app is read-only here. Seat it first: run `ferry channel join --as {}` here, or ask the owner (dashboard, Agents), then restart the app",
-                    self.me, self.me
+                    "'{}' is not seated on this machine, so this app is read-only here. Ask the person who runs this machine to seat it (dashboard, Agents), then restart the app",
+                    self.me
                 ),
             ))
         }

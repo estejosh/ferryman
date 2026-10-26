@@ -398,7 +398,7 @@ fn an_app_with_no_seated_key_is_a_stranger_and_gets_nothing() {
     ] {
         let result = call(&stranger, tool, args.clone());
         assert!(
-            refused(&result, "locked").contains("not a seated agent"),
+            refused(&result, "locked").contains("is not seated on this machine"),
             "{tool} {args}"
         );
     }
