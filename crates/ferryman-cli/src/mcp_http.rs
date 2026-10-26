@@ -189,10 +189,10 @@ impl App {
 
     /// Make `client` an identity of its own and seat it, as a Worker, in every project here.
     /// Returns its name and how many projects it now has a seat in.
-    async fn seat_app(self: &Arc<Self>, client: String) -> (String, usize) {
+    async fn seat_app(self: &Arc<Self>, client: String, client_id: String) -> (String, usize) {
         let app = self.clone();
         tokio::task::spawn_blocking(move || {
-            let name = crate::mcp_agent::app_name(Some(&client));
+            let name = crate::mcp_agent::app_web_name(&client, &client_id);
             let seated = crate::mcp_agent::seat_everywhere(&name, &app.source);
             (name, seated)
         })
@@ -539,7 +539,7 @@ async fn validate(app: &Arc<App>, p: &HashMap<String, String>) -> Result<Valid, 
         return Err(fail("invalid_target", "resource is not this server"));
     }
     let (agent, projects) = if app.cfg.per_app() {
-        let name = crate::mcp_agent::app_name(Some(&client_name));
+        let name = crate::mcp_agent::app_web_name(&client_name, client_id);
         let source = app.source.clone();
         let seats = {
             let name = name.clone();
@@ -721,7 +721,9 @@ async fn authorize_submit(State(app): State<Arc<App>>, body: Bytes) -> Response 
     }
     let agent = if app.cfg.per_app() {
         // The pairing code is the human's yes: only now is the app given its identity.
-        let (name, seated) = app.seat_app(valid.client_name.clone()).await;
+        let (name, seated) = app
+            .seat_app(valid.client_name.clone(), valid.client_id.clone())
+            .await;
         if seated == 0 {
             return html(
                 StatusCode::BAD_REQUEST,

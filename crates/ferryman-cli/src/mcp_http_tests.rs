@@ -874,7 +874,7 @@ async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_ide
         )
         .await;
     assert_eq!(wrong.status(), 403);
-    let me = mcp_agent::app_name(Some("Claude"));
+    let me = mcp_agent::app_web_name("Claude", &client);
     for route in &live.fleet_routes() {
         let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
         assert!(
@@ -918,4 +918,26 @@ async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_ide
             access::APP_ROLE
         );
     }
+}
+
+#[test]
+fn two_web_apps_that_announce_the_same_name_get_different_identities() {
+    let a = mcp_agent::app_web_name("Claude", "fmcp_c_aaaa");
+    let b = mcp_agent::app_web_name("Claude", "fmcp_c_bbbb");
+    assert_ne!(
+        a, b,
+        "the pairing suffix must separate two apps with one name"
+    );
+    assert!(a.ends_with("-web") || a.contains("-web-"), "{a}");
+}
+
+#[test]
+fn a_web_app_named_like_a_stdio_client_is_in_its_own_namespace() {
+    let stdio = mcp_agent::app_name(Some("codex"));
+    let web = mcp_agent::app_web_name("codex", "fmcp_c_0000");
+    assert_ne!(
+        stdio, web,
+        "an http app must not collide with the local stdio app"
+    );
+    assert!(web.contains("-web-"), "{web}");
 }

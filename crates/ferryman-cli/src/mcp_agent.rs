@@ -2702,24 +2702,26 @@ pub fn check_agent_name(name: &str) -> Result<()> {
 // ---------------------------------------------------------------------------------------
 // Zero-config identities: an app seats itself as a Worker.
 
+/// Lowercase, alphanumeric-and-hyphen form of `text`, cut to 24 characters.
+fn word(text: &str) -> String {
+    let mut out = String::new();
+    for c in text.to_ascii_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    out.trim_end_matches('-').chars().take(24).collect()
+}
+
 /// The identity an app gets on this machine: `<client>-<machine>`, from the name the client
 /// announced in `initialize` (`codex`, `claude-code`, ...) and this machine's name.
 #[must_use]
 pub fn app_name(client: Option<&str>) -> String {
-    let words = |text: &str| -> String {
-        let mut out = String::new();
-        for c in text.to_ascii_lowercase().chars() {
-            if c.is_ascii_alphanumeric() {
-                out.push(c);
-            } else if !out.ends_with('-') && !out.is_empty() {
-                out.push('-');
-            }
-        }
-        out.trim_end_matches('-').chars().take(24).collect()
-    };
-    let client = client.map(words).filter(|c| !c.is_empty());
+    let client = client.map(word).filter(|c| !c.is_empty());
     let machine =
-        Some(words(&ferryman_channel::receipts::machine_label())).filter(|m| !m.is_empty());
+        Some(word(&ferryman_channel::receipts::machine_label())).filter(|m| !m.is_empty());
     match (client, machine) {
         (Some(c), Some(m)) if c.ends_with(&format!("-{m}")) => c,
         (Some(c), Some(m)) => format!("{c}-{m}"),
@@ -2727,6 +2729,34 @@ pub fn app_name(client: Option<&str>) -> String {
         (None, Some(m)) => format!("app-{m}"),
         (None, None) => "app".to_string(),
     }
+}
+
+/// A short, path-safe suffix from an HTTP pairing's client id, so two apps that announce the
+/// same name still get different identities. The client id is `fmcp_c_<random hex>`; the last
+/// few characters of its safe form are enough to tell two pairings apart.
+fn pairing_suffix(client_id: &str) -> String {
+    let safe: String = client_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let start = safe.len().saturating_sub(8);
+    safe[start..].to_string()
+}
+
+/// The identity a paired HTTP app gets: `<client>-web-<machine>-<suffix>`. Its own namespace
+/// (never colliding with the local stdio app `<client>-<machine>`), plus a short suffix from
+/// the pairing so two cloud apps that announce the same name still differ.
+#[must_use]
+pub fn app_web_name(client: &str, client_id: &str) -> String {
+    let client = word(client);
+    let machine = word(&ferryman_channel::receipts::machine_label());
+    let base = match (client.is_empty(), machine.is_empty()) {
+        (false, false) => format!("{client}-web-{machine}"),
+        (false, true) => format!("{client}-web"),
+        (true, false) => format!("app-web-{machine}"),
+        (true, true) => "app-web".to_string(),
+    };
+    format!("{base}-{}", pairing_suffix(client_id))
 }
 
 /// Seat `name` in `route` as an app: its key from the machine keystore (made if this is
