@@ -40,10 +40,13 @@ use crate::{AgentIdentity, ProjectRoute, SignatureCheck, check_signature, is_saf
 pub struct Invite {
     pub id: String,
     pub project_id: String,
-    /// The Syncthing folder id the newcomer must configure.
+    /// The Syncthing folder id the newcomer must configure. Empty on a v2 (iroh) invite.
     pub folder: String,
-    /// The inviter's Syncthing device id.
+    /// The inviter's Syncthing device id. Empty on a v2 (iroh) invite.
     pub device_id: String,
+    /// The inviter's iroh INVITE endpoint id (v2). Present only on an iroh invite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     /// Reserved operator (human) name. Absent on a generic invite: the person picks any
     /// free name when they create their identity, and the acceptance carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -83,14 +86,60 @@ pub struct InviteCode {
     pub v: u8,
     pub id: String,
     pub project: String,
+    /// v1: the Syncthing folder id. Empty on v2.
+    #[serde(default)]
     pub folder: String,
+    /// v1: the inviter's Syncthing device id. Empty on v2.
+    #[serde(default)]
     pub device: String,
+    /// v2: the inviter's iroh INVITE endpoint id (see [`InviteEndpoint`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// v2: the relay the invite endpoint is homed on. Empty when the code carries a
+    /// pinned relay's pin, or when the endpoint is dialed directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// v2: SHA-256 of a relay certificate no public CA signs, when the invite endpoint's
+    /// relay is one of our own. Absent for iroh's public relays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     pub expires: i64,
     pub nonce: String,
+}
+
+impl InviteCode {
+    /// Whether this code rides the iroh invite endpoint rather than Syncthing.
+    #[must_use]
+    pub fn is_v2(&self) -> bool {
+        self.v >= 2
+    }
+}
+
+/// Where a v2 invite's endpoint lives: the inviter's iroh INVITE endpoint. Carried in the
+/// signed invite record and the code, so the newcomer can dial the inviter directly over
+/// iroh with no Syncthing device id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteEndpoint {
+    /// The inviter's INVITE endpoint id (64 hex characters).
+    pub id: String,
+    /// The relay that endpoint is homed on, as a URL. `None` when dialed directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<String>,
+    /// SHA-256 of the relay's certificate when no public CA signs it. `None` for iroh's
+    /// public relays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+}
+
+/// The transport an invite rides on: v1 is Syncthing, v2 is the iroh invite endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transport {
+    Syncthing { device_id: String },
+    Iroh(InviteEndpoint),
 }
 
 /// The newcomer's signed acceptance, written into their copy of the channel so it
@@ -145,9 +194,15 @@ fn invite_payload(invite: &Invite) -> String {
     // field existed still signs over exactly the bytes it was signed over. A field
     // that quietly changes what old signatures cover is how a channel wakes up one
     // morning unable to verify its own history.
-    match &invite.owner {
+    let with_owner = match &invite.owner {
         Some(owner) => format!("{base}\nowner={owner}"),
         None => base,
+    };
+    // `endpoint` follows the same rule: appended only when present, so a v1 invite (or an
+    // old signature test) signs over exactly the bytes it always did.
+    match &invite.endpoint {
+        Some(endpoint) => format!("{with_owner}\nendpoint={endpoint}"),
+        None => with_owner,
     }
 }
 
@@ -184,7 +239,7 @@ pub fn create(
     agent: Option<&str>,
     roles: Vec<String>,
     ttl: Duration,
-    inviter_device_id: &str,
+    transport: &Transport,
 ) -> Result<(Invite, String)> {
     let Some(declaration) = crate::master::read_master(route)? else {
         bail!("this project has no master yet; become the master first");
@@ -227,11 +282,16 @@ pub fn create(
     let id = random_hex(4);
     let nonce = random_hex(16);
     let now = Utc::now();
+    let (device_id, endpoint, v) = match transport {
+        Transport::Syncthing { device_id } => (device_id.clone(), None, 1),
+        Transport::Iroh(endpoint) => (String::new(), Some(endpoint.id.clone()), 2),
+    };
     let mut invite = Invite {
         id: id.clone(),
         project_id: route.project_id.clone(),
         folder: crate::channel_folder_id(route),
-        device_id: inviter_device_id.to_string(),
+        device_id,
+        endpoint,
         operator: operator.map(str::to_string),
         agent: agent.map(str::to_string),
         // An unscoped invite is read-only, never everything: "full" is the one word
@@ -257,17 +317,44 @@ pub fn create(
     crate::atomic_json(&invite_path(route, &id), &invite)?;
 
     let code = encode_code(&InviteCode {
-        v: 1,
+        v,
         id,
         project: route.project_id.clone(),
         folder: invite.folder.clone(),
-        device: inviter_device_id.to_string(),
+        device: match transport {
+            Transport::Syncthing { device_id } => device_id.clone(),
+            Transport::Iroh(_) => String::new(),
+        },
+        endpoint: endpoint_from_transport(transport),
+        relay: relay_from_transport(transport),
+        pin: pin_from_transport(transport),
         operator: operator.map(str::to_string),
         agent: agent.map(str::to_string),
         expires: invite.expires_at.timestamp(),
         nonce,
     });
     Ok((invite, code))
+}
+
+fn endpoint_from_transport(transport: &Transport) -> Option<String> {
+    match transport {
+        Transport::Iroh(endpoint) => Some(endpoint.id.clone()),
+        Transport::Syncthing { .. } => None,
+    }
+}
+
+fn relay_from_transport(transport: &Transport) -> Option<String> {
+    match transport {
+        Transport::Iroh(endpoint) => endpoint.relay.clone(),
+        Transport::Syncthing { .. } => None,
+    }
+}
+
+fn pin_from_transport(transport: &Transport) -> Option<String> {
+    match transport {
+        Transport::Iroh(endpoint) => endpoint.pin.clone(),
+        Transport::Syncthing { .. } => None,
+    }
 }
 
 /// The name a machine takes when it joins under an existing identity.
@@ -299,7 +386,7 @@ pub fn create_for_identity(
     identity: &AgentIdentity,
     machine: &str,
     ttl: Duration,
-    inviter_device_id: &str,
+    transport: &Transport,
 ) -> Result<(Invite, String)> {
     if !is_safe_component(machine) {
         bail!("the machine label must be a plain identifier, e.g. beastly");
@@ -332,11 +419,16 @@ pub fn create_for_identity(
     let id = random_hex(4);
     let nonce = random_hex(16);
     let now = Utc::now();
+    let (device_id, endpoint, v) = match transport {
+        Transport::Syncthing { device_id } => (device_id.clone(), None, 1),
+        Transport::Iroh(endpoint) => (String::new(), Some(endpoint.id.clone()), 2),
+    };
     let mut invite = Invite {
         id: id.clone(),
         project_id: route.project_id.clone(),
         folder: crate::channel_folder_id(route),
-        device_id: inviter_device_id.to_string(),
+        device_id,
+        endpoint,
         // The machine joins under its own name, which is what the joiner's side
         // already knows how to do. Nothing on that side has to learn a new mode.
         operator: Some(name.clone()),
@@ -358,11 +450,17 @@ pub fn create_for_identity(
     crate::atomic_json(&invite_path(route, &id), &invite)?;
 
     let code = encode_code(&InviteCode {
-        v: 1,
+        v,
         id,
         project: route.project_id.clone(),
         folder: invite.folder.clone(),
-        device: inviter_device_id.to_string(),
+        device: match transport {
+            Transport::Syncthing { device_id } => device_id.clone(),
+            Transport::Iroh(_) => String::new(),
+        },
+        endpoint: endpoint_from_transport(transport),
+        relay: relay_from_transport(transport),
+        pin: pin_from_transport(transport),
         operator: Some(name),
         agent: None,
         expires: invite.expires_at.timestamp(),
@@ -782,22 +880,35 @@ fn b64url_decode(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Codes are prefixed so a person can tell what they are holding.
+/// Codes are prefixed so a person can tell what they are holding. `ferry1.` is the
+/// Syncthing invitation; `ferry2.` rides the iroh invite endpoint instead.
 const CODE_PREFIX: &str = "ferry1.";
+const CODE_PREFIX_V2: &str = "ferry2.";
 
 pub fn encode_code(code: &InviteCode) -> String {
     let json = serde_json::to_vec(code).expect("invite code serialises");
-    format!("{CODE_PREFIX}{}", b64url_encode(&json))
+    let prefix = if code.is_v2() {
+        CODE_PREFIX_V2
+    } else {
+        CODE_PREFIX
+    };
+    format!("{prefix}{}", b64url_encode(&json))
 }
 
 pub fn decode_code(text: &str) -> Result<InviteCode> {
     let text = text.trim();
-    let Some(body) = text.strip_prefix(CODE_PREFIX) else {
-        bail!("that is not a Ferryman invite code (it should start with {CODE_PREFIX})");
+    let (version, body) = if let Some(body) = text.strip_prefix(CODE_PREFIX_V2) {
+        (2, body)
+    } else if let Some(body) = text.strip_prefix(CODE_PREFIX) {
+        (1, body)
+    } else {
+        bail!(
+            "that is not a Ferryman invite code (it should start with {CODE_PREFIX} or {CODE_PREFIX_V2})"
+        );
     };
     let bytes = b64url_decode(body).context("the invite code is damaged")?;
     let code: InviteCode = serde_json::from_slice(&bytes).context("the invite code is damaged")?;
-    if code.v != 1 {
+    if code.v != version {
         bail!("this invite code is from a newer Ferryman; update and try again");
     }
     if code.expires < Utc::now().timestamp() {
@@ -818,6 +929,9 @@ mod tests {
             project: "redaktly".into(),
             folder: "redaktly-ferryman".into(),
             device: "AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH".into(),
+            endpoint: None,
+            relay: None,
+            pin: None,
             operator: Some("david".into()),
             agent: Some("david-agent".into()),
             expires: Utc::now().timestamp() + 3600,
@@ -837,6 +951,9 @@ mod tests {
             project: "p".into(),
             folder: "p-ferryman".into(),
             device: "D".into(),
+            endpoint: None,
+            relay: None,
+            pin: None,
             operator: None,
             agent: None,
             expires: Utc::now().timestamp() - 1,
@@ -864,6 +981,7 @@ mod tests {
             project_id: "redaktly".into(),
             folder: "redaktly-ferryman".into(),
             device_id: "DEVICE".into(),
+            endpoint: None,
             operator: Some("david".into()),
             agent: Some("david-agent".into()),
             roles: vec!["worker".into()],
@@ -890,6 +1008,111 @@ mod tests {
             format!("{payload}\nowner=josh"),
             "the owner is appended, never interleaved"
         );
+    }
+
+    /// `endpoint` is appended exactly like `owner`: an invitation without it signs over
+    /// the bytes it always did, so a v1 invite's signature still verifies.
+    #[test]
+    fn adding_the_endpoint_field_did_not_change_what_an_old_invite_signs_over() {
+        let now = Utc::now();
+        let base = Invite {
+            id: "1a2b3c4d".into(),
+            project_id: "redaktly".into(),
+            folder: "redaktly-ferryman".into(),
+            device_id: "DEVICE".into(),
+            endpoint: None,
+            operator: Some("david".into()),
+            agent: Some("david-agent".into()),
+            roles: vec!["worker".into()],
+            owner: None,
+            created_at: now,
+            expires_at: now + Duration::days(7),
+            nonce_hash: hash_nonce("n"),
+            accepted_device: None,
+            granted_at: None,
+            signed_by: None,
+            signature: None,
+        };
+        let payload = invite_payload(&base);
+        assert!(!payload.contains("endpoint="), "{payload}");
+        let with_endpoint = Invite {
+            endpoint: Some("abc".repeat(32)),
+            ..base
+        };
+        assert_eq!(
+            invite_payload(&with_endpoint),
+            format!("{payload}\nendpoint={}", "abc".repeat(32))
+        );
+    }
+
+    /// A v2 code starts with `ferry2.`, carries the invite endpoint and no Syncthing id.
+    #[test]
+    fn a_v2_code_round_trips_without_a_syncthing_device() {
+        let code = InviteCode {
+            v: 2,
+            id: "1a2b3c4d".into(),
+            project: "redaktly".into(),
+            folder: String::new(),
+            device: String::new(),
+            endpoint: Some("11".repeat(32)),
+            relay: Some("https://use1-1.relay.n0.iroh.link".into()),
+            pin: None,
+            operator: Some("david".into()),
+            agent: Some("david-agent".into()),
+            expires: Utc::now().timestamp() + 3600,
+            nonce: "00112233445566778899aabbccddeeff".into(),
+        };
+        let text = encode_code(&code);
+        assert!(text.starts_with("ferry2."), "{text}");
+        assert!(!text.contains(' '));
+        let decoded = decode_code(&text).unwrap();
+        assert_eq!(decoded, code);
+        assert!(decoded.is_v2());
+        assert!(decoded.device.is_empty());
+        assert_eq!(decoded.endpoint.as_deref(), Some("11".repeat(32).as_str()));
+    }
+
+    /// v1 still decodes; only the prefix changes what a code rides on.
+    #[test]
+    fn a_v1_code_still_decodes() {
+        let code = InviteCode {
+            v: 1,
+            id: "1a2b3c4d".into(),
+            project: "redaktly".into(),
+            folder: "redaktly-ferryman".into(),
+            device: "DEVICE".into(),
+            endpoint: None,
+            relay: None,
+            pin: None,
+            operator: None,
+            agent: None,
+            expires: Utc::now().timestamp() + 3600,
+            nonce: "n".into(),
+        };
+        let text = encode_code(&code);
+        assert!(text.starts_with("ferry1."), "{text}");
+        assert_eq!(decode_code(&text).unwrap(), code);
+    }
+
+    /// An expired v2 code is refused with the reason, before anyone dials anything.
+    #[test]
+    fn an_expired_v2_code_is_refused() {
+        let code = InviteCode {
+            v: 2,
+            id: "x".into(),
+            project: "p".into(),
+            folder: String::new(),
+            device: String::new(),
+            endpoint: Some("22".repeat(32)),
+            relay: None,
+            pin: None,
+            operator: None,
+            agent: None,
+            expires: Utc::now().timestamp() - 1,
+            nonce: "n".into(),
+        };
+        let err = decode_code(&encode_code(&code)).unwrap_err().to_string();
+        assert!(err.contains("expired"), "{err}");
     }
 
     fn channel(dir: &std::path::Path) -> ProjectRoute {
@@ -945,8 +1168,16 @@ mod tests {
         )
         .unwrap();
 
-        let (invite, code) =
-            create_for_identity(&route, &josh, "beastly", Duration::days(7), "DEVICE").unwrap();
+        let (invite, code) = create_for_identity(
+            &route,
+            &josh,
+            "beastly",
+            Duration::days(7),
+            &Transport::Syncthing {
+                device_id: "DEVICE".into(),
+            },
+        )
+        .unwrap();
 
         assert_eq!(invite.operator.as_deref(), Some("josh-beastly"));
         assert_eq!(invite.owner.as_deref(), Some("josh"));
@@ -979,9 +1210,17 @@ mod tests {
         publish(&mut route, &mallory);
         crate::master::initialize_master(&route, &ada, "ada").unwrap();
 
-        let error = create_for_identity(&route, &mallory, "box", Duration::days(7), "DEVICE")
-            .expect_err("a name with no access has nothing for a machine to inherit")
-            .to_string();
+        let error = create_for_identity(
+            &route,
+            &mallory,
+            "box",
+            Duration::days(7),
+            &Transport::Syncthing {
+                device_id: "DEVICE".into(),
+            },
+        )
+        .expect_err("a name with no access has nothing for a machine to inherit")
+        .to_string();
         assert!(error.contains("holds no access"), "{error}");
     }
 }

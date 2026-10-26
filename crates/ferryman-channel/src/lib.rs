@@ -2720,6 +2720,31 @@ fn check_signature(
     }
 }
 
+/// Verify one detached ed25519 signature against a public key given directly, not looked
+/// up on a roster. For protocols that must check a signature before the signer is on any
+/// roster (an invitation handshake), so a forged key cannot bind a name to a machine.
+#[must_use]
+pub fn verify_detached(public_key_hex: &str, signature_hex: &str, payload: &str) -> bool {
+    let Ok(key_bytes) = hex::decode(public_key_hex) else {
+        return false;
+    };
+    let Ok(key_bytes): Result<[u8; 32], _> = key_bytes.try_into() else {
+        return false;
+    };
+    let Ok(verifying) = VerifyingKey::from_bytes(&key_bytes) else {
+        return false;
+    };
+    let Ok(signature_bytes) = hex::decode(signature_hex) else {
+        return false;
+    };
+    let Ok(signature_bytes): Result<[u8; 64], _> = signature_bytes.try_into() else {
+        return false;
+    };
+    verifying
+        .verify_strict(payload.as_bytes(), &Signature::from_bytes(&signature_bytes))
+        .is_ok()
+}
+
 /// Who issued this order, checkably.
 #[must_use]
 pub fn verify_order(order: &Order, roster: &[AgentRoute]) -> SignatureCheck {

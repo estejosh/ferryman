@@ -1548,7 +1548,7 @@ async fn invite_teammate(
         agent.as_deref(),
         body.roles.clone(),
         chrono::Duration::days(body.expires_days.unwrap_or(7).max(1)),
-        &device,
+        &ferryman_channel::invite::Transport::Syncthing { device_id: device },
     )
     .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
     ferryman_channel::ledger::append_ledger_entry(

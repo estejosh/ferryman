@@ -6966,7 +6966,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 agent.as_deref(),
                 roles,
                 chrono::Duration::days(expires_days.max(1)),
-                &device,
+                &invite::Transport::Syncthing { device_id: device },
             )?;
             println!(
                 "invited {} to {}",
