@@ -456,13 +456,17 @@ fn a_stale_primary_is_reported_and_exactly_one_ask_is_raised() {
     )
     .unwrap();
     let asks = || {
-        ferryman_channel::questions::list(route)
+        // The roster has grown since `route` was made (the worker seated itself), so read
+        // it afresh; a stale roster cannot verify the worker's signature.
+        let mut fresh = route.clone();
+        fresh.agents = ferryman_channel::read_agent_roster(&route.communications).unwrap();
+        ferryman_channel::questions::list(&fresh)
             .into_iter()
             .filter(|(q, _)| q.id.starts_with("ask-stale-primary"))
             .count()
     };
 
-    // A worker is told, and cannot write the channel, so it raises nothing.
+    // A worker is told, and asks too: it is asking the human, not approving.
     let mut worker = root.server();
     initialize(&mut worker, "codex");
     let caught = tool(&mut worker, "ferry_catchup", json!({ "project": "proj01" }));
@@ -470,9 +474,9 @@ fn a_stale_primary_is_reported_and_exactly_one_ask_is_raised() {
     assert_eq!(primary["stale"], true);
     assert_eq!(primary["silent_for"], "17 days");
     assert!(primary["fix"].as_str().unwrap().contains("beastly"));
-    assert_eq!(asks(), 0);
+    assert_eq!(asks(), 1);
 
-    // A member says so and raises one ask to the human, however often it looks.
+    // A member says so too, and the ask stays de-duplicated: however often anyone looks.
     let mut member = root.member();
     for _ in 0..2 {
         let caught = tool(&mut member, "ferry_catchup", json!({ "project": "proj01" }));

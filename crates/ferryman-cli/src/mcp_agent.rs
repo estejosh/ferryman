@@ -1126,9 +1126,10 @@ impl Agent {
     }
 
     /// Raise one ask to the human about a stale primary. The id is the primary's name, so
-    /// however many agents see it, and however often, there is one ask.
+    /// however many agents see it, and however often, there is one ask. A Worker raises it
+    /// too: it is asking the human, not approving anything.
     fn raise_stale_ask(&self, route: &ProjectRoute, name: &str, quiet: &str) {
-        if !self.level().writes_channel() || self.paused(route).is_some() {
+        if self.paused(route).is_some() {
             return;
         }
         let Ok(identity) = self.identity() else {
