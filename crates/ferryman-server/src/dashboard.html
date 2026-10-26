@@ -1759,11 +1759,38 @@ pages.teammates = async () => {
   const grants = {};
   for (const g of (d.grants || [])) grants[g.grantee] = g;
   const projects = d.projects || [];
+  const day = (at) => esc(String(at || "").slice(0, 10));
+  // How long somebody's access lasts, in the words the table uses.
+  const accessEnds = (who) => {
+    const g = grants[who.name || who.grantee];
+    if (!g) return "&mdash;";
+    if (!who.access_ends) return `<span class="badge">no expiry</span>`;
+    return who.access_lapsed
+      ? `<span class="badge bad">ended ${day(who.access_ends)}</span>`
+      : `<span class="badge">access ends ${day(who.access_ends)}</span>`;
+  };
 
   return `
     <div class="head">
       <div><h1>Teammates</h1><p>People with an identity in this project. The master is whoever the channel says it is.</p></div>
     </div>
+
+    ${(d.pending_access || []).length ? `
+    <div class="notice" style="margin-bottom:18px">
+      <div>
+        <b>Access is about to end.</b> If nobody answers, it ends on the date shown.
+        ${(d.pending_access || []).map((q) => `
+        <div class="row" style="margin-top:10px;align-items:center;gap:12px;flex-wrap:wrap">
+          <div style="flex:1;min-width:240px">${esc(q.text)}</div>
+          <div style="display:flex;gap:8px;align-items:center">
+            ${d.may_grant
+              ? (q.options || []).map((o) => `<button class="btn${o === "Renew" ? " primary" : ""}" data-access-answer="${esc(q.id)}" data-answer="${esc(o)}">${esc(o)}</button>`).join("")
+              : `<span class="s" style="color:var(--dim)">waiting for ${esc(d.master || "the master")}</span>`}
+            <span class="s" style="color:var(--dim)" data-access-msg="${esc(q.id)}"></span>
+          </div>
+        </div>`).join("")}
+      </div>
+    </div>` : ""}
 
     ${!d.master ? `
     <div class="notice">
@@ -1812,8 +1839,27 @@ pages.teammates = async () => {
           <select id="tm-role">
             ${ACCESS_LEVELS.map((l) => `<option value="${esc(l.id)}"${l.id === "reader" ? " selected" : ""}>${esc(l.label)} &mdash; ${esc(l.hint)}</option>`).join("")}
           </select>
+          <label class="s" style="display:inline-flex;gap:6px;align-items:center;color:var(--dim)">Access lasts
+            <select id="tm-access" required>
+              <option value="" selected>Choose&hellip;</option>
+              <option value="1">1 day</option>
+              <option value="7">7 days</option>
+              <option value="14">14 days</option>
+              <option value="30">30 days</option>
+              <option value="90">90 days</option>
+              <option value="forever">No expiry</option>
+            </select>
+          </label>
+          <label class="s" style="display:inline-flex;gap:6px;align-items:center;color:var(--dim)">Code valid for
+            <select id="tm-code-days">
+              <option value="1">1 day</option>
+              <option value="3">3 days</option>
+              <option value="7" selected>7 days</option>
+            </select>
+          </label>
           <button class="btn primary" id="tm-invite">Make the code</button>
         </div>
+        <div class="s" style="color:var(--dim)">Timed access ends on its date unless you renew it; you are asked a few days before. Choose how long on every invitation.</div>
         <div class="s" id="tm-msg" style="color:var(--dim)"></div>
         <div id="tm-code" ${state.inviteText ? "" : "hidden"} style="display:flex;flex-direction:column;gap:10px">
           <div class="k">Send them this - they paste it into their AI agent, or run the steps themselves</div>
@@ -1837,7 +1883,7 @@ pages.teammates = async () => {
 
     <div class="panel scroll">
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Identity lives</th><th>Can do</th><th>Where</th>${d.may_grant ? "<th></th>" : ""}</tr></thead>
+        <thead><tr><th>Person</th><th>Role</th><th>Identity lives</th><th>Can do</th><th>Where</th><th>Access</th>${d.may_grant ? "<th></th>" : ""}</tr></thead>
         <tbody>${(d.teammates || []).map((t) => {
           const g = grants[t.name];
           return `
@@ -1847,6 +1893,7 @@ pages.teammates = async () => {
             <td>${esc(t.scope)}${t.scope === "channel" ? ` <span class="badge">not on this machine</span>` : ""}</td>
             <td>${g ? `${esc(accessLabel(g))} ${sigBadge(g.signature)}` : `<span class="badge warn">no grant</span>`}</td>
             <td>${g ? esc(scopeLabel(g)) : "&mdash;"}</td>
+            <td>${accessEnds(t)}</td>
             ${d.may_grant ? `<td style="white-space:nowrap">${t.revoked ? `<span class="badge bad">revoked</span> ` : ""}${t.current ? "" : `<button class="btn" data-grant="${esc(t.name)}">Access</button> <button class="btn" data-revoke="${esc(t.name)}" title="End their access">Remove</button>`}</td>` : ""}
           </tr>`;
         }).join("")}
@@ -2016,6 +2063,28 @@ function wireTeammates() {
     }
   });
 
+  // Renew / Let it end: the master's signed answer, then the page is drawn again from what
+  // the channel now says.
+  document.querySelectorAll("[data-access-answer]").forEach((b) => {
+    b.addEventListener("click", async () => {
+      const id = b.dataset.accessAnswer;
+      const msg = document.querySelector(`[data-access-msg="${CSS.escape(id)}"]`);
+      document.querySelectorAll(`[data-access-answer="${CSS.escape(id)}"]`).forEach((x) => { x.disabled = true; });
+      try {
+        await api(`/api/questions/${encodeURIComponent(id)}/answer`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ answer: b.dataset.answer }),
+        });
+        state.team = null;
+        await render();
+      } catch (err) {
+        if (msg) msg.textContent = String(err.message || err).slice(0, 200);
+        document.querySelectorAll(`[data-access-answer="${CSS.escape(id)}"]`).forEach((x) => { x.disabled = false; });
+      }
+    });
+  });
+
   const claimAll = $("#tm-claim-all");
   if (claimAll) claimAll.addEventListener("click", async () => {
     const msg = $("#tm-master-msg");
@@ -2038,6 +2107,13 @@ function wireTeammates() {
   if (invite) invite.addEventListener("click", async () => {
     const msg = $("#tm-msg");
     msg.textContent = "";
+    // How long their access lasts is the master's call on every invitation; there is no
+    // default to fall back on, so say so here instead of sending something the server refuses.
+    const access = ($("#tm-access") || {}).value || "";
+    if (!access) {
+      msg.textContent = "Choose how long their access lasts: a number of days, or no expiry.";
+      return;
+    }
     invite.disabled = true;
     try {
       const level = ACCESS_LEVELS.find((l) => l.id === ($("#tm-role") || {}).value) || ACCESS_LEVELS.find((l) => l.id === "reader");
@@ -2048,6 +2124,8 @@ function wireTeammates() {
           name: ($("#tm-name") || {}).value || null,
           agent: ($("#tm-agent") || {}).value || "",
           roles: level.roles.length ? level.roles : ["full"],
+          expires_days: Number(($("#tm-code-days") || {}).value) || 7,
+          ...(access === "forever" ? { access_forever: true } : { access_days: Number(access) }),
         }),
       });
       const who = r.name || "USER";

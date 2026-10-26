@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+Timed access for invited people (ADR 0029). Access an invitation gives is now either timed or open, and the master chooses on every invitation: `ferry team invite create` requires `--access <DAYS|forever>` (a machine added with `--as-identity` takes none; it lapses with its owner), and the dashboard's invitation form has a required "Access lasts" choice next to "Code valid for", which is the code's own lifetime as before (`--expires-days`, default 7). Timed access ends N days after the master's grant is signed, for the person and their agent alike, and counts as revoked everywhere a revocation does: the gate, workers, the iroh lane, delegations, the doctor. A few days before it ends (three, or a third of the term for terms under nine days) the master is asked Renew or Let it end, on Telegram and on the Team page; the answer is their signed answer, renewing one more term, and no answer lets it end. The agent loop unshares the Syncthing folder from the devices of people whose time ran out. `MasterGrant` gains a signed `expires_at` and `Invite` a signed `access_days`, both appended to the signed bytes only when present, so grants and invitations written before this verify unchanged. What had already synced stays on their disk, and secrets sealed to them should be rotated. New API: `POST /api/questions/{id}/answer`; `/api/team` rows gain `access_ends`, `access_lapsed` and `pending_access`; `POST /api/team/invite` requires `access_days` or `access_forever`.
+
 ## v0.6.2 - 2026-10-23
 
 Fleet hardening (v0.6.2). A worker that updates itself now comes back by itself, the iroh lane says when it is unhealthy, it works with or without a relay of our own, and `ferry lane iroh status` says what each peer is doing.

@@ -2166,9 +2166,22 @@ enum InviteAction {
         /// means "reader" (look, nothing else); "full" means every role on this project.
         #[arg(long)]
         roles: Option<String>,
-        /// How long the code stays valid, in days.
+        /// How long the CODE can be used to join, in days. This is not how long their
+        /// access lasts - that is --access.
         #[arg(long, default_value_t = 7)]
         expires_days: i64,
+        /// How long their ACCESS lasts once they have joined: a number of days, or
+        /// `forever` for access that does not end. There is no default; every invitation
+        /// says. Timed access ends on its date unless you answer the renewal question
+        /// (Renew / Let it end) that is asked a few days before.
+        #[arg(
+            long,
+            value_name = "DAYS|forever",
+            value_parser = access_length,
+            required_unless_present = "as_identity",
+            conflicts_with = "as_identity"
+        )]
+        access: Option<AccessLength>,
         /// Sign as this operator (the master). Defaults to this machine's agent.
         #[arg(long = "as", value_parser = agent_name)]
         signer: Option<String>,
@@ -2190,6 +2203,28 @@ enum InviteAction {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+}
+
+/// How long an invitation's access lasts: chosen on every invitation, never defaulted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccessLength {
+    Days(u32),
+    Forever,
+}
+
+/// `30`, or `forever` (`none` says the same).
+fn access_length(value: &str) -> Result<AccessLength, String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("forever") || value.eq_ignore_ascii_case("none") {
+        return Ok(AccessLength::Forever);
+    }
+    let max = ferryman_channel::invite::MAX_ACCESS_DAYS;
+    match value.parse::<u32>() {
+        Ok(days) if (1..=max).contains(&days) => Ok(AccessLength::Days(days)),
+        _ => Err(format!(
+            "'{value}' is not a length of access: give a number of days from 1 to {max}, or 'forever'"
+        )),
+    }
 }
 
 #[derive(Subcommand, Clone)]
@@ -6839,6 +6874,7 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                     agent,
                     roles,
                     expires_days,
+                    access,
                     signer,
                 },
         } => {
@@ -6901,12 +6937,21 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 .filter(|r| !r.is_empty())
                 .map(str::to_string)
                 .collect();
+            // clap requires --access here; the error is for a caller that skipped clap.
+            let Some(access) = access else {
+                bail!("say how long their access lasts: --access <DAYS|forever>");
+            };
+            let access_days = match access {
+                AccessLength::Days(days) => Some(days),
+                AccessLength::Forever => None,
+            };
             let (invite, code) = invite::create(
                 &route,
                 &identity,
                 name.as_deref(),
                 agent.as_deref(),
                 roles,
+                access_days,
                 chrono::Duration::days(expires_days.max(1)),
                 &device,
             )?;
@@ -6922,9 +6967,15 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 println!("  with agent {agent}");
             }
             println!(
-                "  expires {}",
+                "  code valid until {}",
                 invite.expires_at.format("%Y-%m-%d %H:%M UTC")
             );
+            match invite.access_days {
+                Some(days) => println!(
+                    "  access: {days} days once they join (you are asked about renewing a few days before it ends)"
+                ),
+                None => println!("  access: no expiry"),
+            }
             println!();
             println!("Send them this. It is not a secret, but it is one-use.");
             println!();
@@ -7309,6 +7360,58 @@ async fn team_command(command: TeamCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Stop sharing the channel with the devices of people whose timed access has run out.
+///
+/// The iroh lane turns a lapsed person away by itself (the revocation check it already runs
+/// counts a lapse). Syncthing does not look: the device stays trusted and the folder shared
+/// until somebody unshares it. This is that somebody, and it needs no key - the end date is
+/// in the person's signed grant. It asks Syncthing which devices still have the folder
+/// first, so a device already unshared is not written again on every pass.
+fn unshare_lapsed_devices(route: &ferryman_channel::ProjectRoute, report: &impl Progress) {
+    let now = chrono::Utc::now();
+    let lapsed = ferryman_channel::invite::lapsed_devices(route, now);
+    if lapsed.is_empty() {
+        return;
+    }
+    let Ok(shared) = ferryman_channel::syncthing_folder_device_ids(route) else {
+        return;
+    };
+    let still: Vec<(String, String)> = lapsed
+        .into_iter()
+        .filter(|(_, device)| shared.contains(device))
+        .collect();
+    if still.is_empty() {
+        return;
+    }
+    let devices: Vec<String> = still.iter().map(|(_, device)| device.clone()).collect();
+    if let Err(error) = ferryman_channel::syncthing_unshare_folder(route, &devices) {
+        report.warn(&format!(
+            "{}: could not unshare the folder from {} lapsed device(s): {error:#}",
+            route.project_id,
+            devices.len()
+        ));
+        return;
+    }
+    // The roster as the channel has it now: the route's may be older than a grant.
+    let mut live = route.clone();
+    if let Ok(agents) = ferryman_channel::read_agent_roster(&route.communications) {
+        live.agents = agents;
+    }
+    let people: std::collections::BTreeSet<&str> =
+        still.iter().map(|(person, _)| person.as_str()).collect();
+    for person in people {
+        let count = still.iter().filter(|(who, _)| who == person).count();
+        let ended = ferryman_channel::master::access_end_of(&live, person).map_or_else(
+            || "its date".to_string(),
+            |at| at.format("%Y-%m-%d").to_string(),
+        );
+        report.info(&format!(
+            "{}: access for {person} ended on {ended}: folder unshared from {count} device(s)",
+            route.project_id
+        ));
+    }
 }
 
 /// Claiming a git account, checking a claim, and reporting where one stands.
@@ -8164,6 +8267,7 @@ async fn run_fleet(
                 }
                 Err(err) => report.warn(&format!("{}: invites: {err:#}", route.project_id)),
             }
+            unshare_lapsed_devices(route, report);
         }
 
         // Who is on each roster and which projects are open to this worker are read again
@@ -14062,6 +14166,49 @@ mod tests {
         );
         assert_eq!(slug_of(Path::new("/tmp/foo--bar--")), "foo-bar");
         assert_eq!(slug_of(Path::new("/")), "");
+    }
+
+    /// How long the access lasts is chosen on every invitation: no `--access`, no code, and
+    /// the value is a number of days or `forever`. A machine added under your own identity
+    /// has no term of its own, so it neither needs nor takes one.
+    #[test]
+    fn an_invitation_has_to_say_how_long_the_access_lasts() {
+        use clap::Parser;
+        let create = |words: &[&str]| {
+            let mut all = vec!["ferry", "team", "invite", "create"];
+            all.extend_from_slice(words);
+            super::Cli::try_parse_from(all)
+        };
+        let access = |words: &[&str]| match create(words).unwrap().command {
+            super::Command::Team {
+                command:
+                    super::TeamCommand::Invite {
+                        action: super::InviteAction::Create { access, .. },
+                    },
+            } => access,
+            _ => panic!("not an invitation"),
+        };
+        assert!(create(&["--name", "carol"]).is_err(), "no default");
+        assert_eq!(
+            access(&["--name", "carol", "--access", "30"]),
+            Some(super::AccessLength::Days(30))
+        );
+        for forever in ["forever", "FOREVER", "none"] {
+            assert_eq!(
+                access(&["--access", forever]),
+                Some(super::AccessLength::Forever)
+            );
+        }
+        for bad in ["0", "-3", "3651", "soon", ""] {
+            assert!(create(&["--access", bad]).is_err(), "{bad:?}");
+        }
+        // The CODE's validity is a different flag with its own default.
+        assert!(create(&["--access", "7", "--expires-days", "1"]).is_ok());
+        let machine = ["--as-identity", "josh", "--machine", "beastly"];
+        assert_eq!(access(&machine), None);
+        let mut with_access = machine.to_vec();
+        with_access.extend(["--access", "7"]);
+        assert!(create(&with_access).is_err(), "a machine inherits; no term");
     }
 
     /// `--file` repeats and takes `path[=name]`; `--seal-to` needs a file; the `files`

@@ -12,11 +12,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::Signer;
 use serde::{Deserialize, Serialize};
 
-use crate::{AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck, check_signature};
+use crate::{
+    AgentIdentity, AgentRoute, ProjectRoute, SignatureCheck, canonical_agent_name, check_signature,
+    questions,
+};
 
 /// The canonical Syncthing folder ID for a project's master folder.
 ///
@@ -341,6 +344,11 @@ pub struct MasterGrant {
     #[serde(default)]
     pub capabilities: Vec<String>,
     pub granted_at: DateTime<Utc>,
+    /// When the access this grant gives ends, if it was given for a time. `None` is the
+    /// grant every project has always had: it lasts until someone revokes it. Signed (see
+    /// [`grant_payload`]), so an edited date no longer verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -357,7 +365,7 @@ fn grant_path(route: &ProjectRoute, grantee: &str) -> PathBuf {
 
 /// Exactly what a grant signature covers.
 fn grant_payload(grant: &MasterGrant) -> String {
-    format!(
+    let base = format!(
         "ferryman-master-grant-v1\n{}\n{}\n{}\n{}\n{}\n{}",
         grant.grantee,
         grant.public_key,
@@ -365,7 +373,15 @@ fn grant_payload(grant: &MasterGrant) -> String {
         grant.roles.join(","),
         grant.capabilities.join(","),
         grant.granted_at.to_rfc3339(),
-    )
+    );
+    // Appended only when the grant ends, so every grant written before the field existed
+    // signs over exactly the bytes it was signed over (the same trick as an invite's
+    // `owner`). Without it an edited date would verify; with it unconditionally, every
+    // existing grant on every channel would stop verifying.
+    match grant.expires_at {
+        Some(at) => format!("{base}\nexpires:{}", at.to_rfc3339()),
+        None => base,
+    }
 }
 
 /// The master's roster entry, if the master is declared and in the roster.
@@ -384,7 +400,8 @@ fn master_agent(route: &ProjectRoute) -> Result<Option<AgentRoute>> {
         .cloned())
 }
 
-/// Grant roles/capabilities to a member, signed by the master.
+/// Grant roles/capabilities to a member, signed by the master. The grant lasts until it is
+/// revoked; [`grant_member_until`] is the one that ends.
 pub fn grant_member(
     route: &ProjectRoute,
     master: &AgentIdentity,
@@ -393,6 +410,61 @@ pub fn grant_member(
     projects: Vec<String>,
     roles: Vec<String>,
     capabilities: Vec<String>,
+) -> Result<MasterGrant> {
+    grant_member_until(
+        route,
+        master,
+        grantee,
+        public_key,
+        projects,
+        roles,
+        capabilities,
+        None,
+    )
+}
+
+/// [`grant_member`], for access that ends on `expires_at` unless the master renews it.
+///
+/// A re-grant replaces the file, as it always has, so granting again starts a fresh term:
+/// it carries a new `granted_at`, which is also what stops an old renewal answer from
+/// extending it (see [`access_ends`]).
+#[allow(clippy::too_many_arguments)]
+pub fn grant_member_until(
+    route: &ProjectRoute,
+    master: &AgentIdentity,
+    grantee: &str,
+    public_key: &str,
+    projects: Vec<String>,
+    roles: Vec<String>,
+    capabilities: Vec<String>,
+    expires_at: Option<DateTime<Utc>>,
+) -> Result<MasterGrant> {
+    write_grant(
+        route,
+        master,
+        grantee,
+        public_key,
+        projects,
+        roles,
+        capabilities,
+        Utc::now(),
+        expires_at,
+    )
+}
+
+/// The one place a grant is signed and written. `granted_at` is a parameter only so the
+/// tests can build a grant whose term is already over.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_grant(
+    route: &ProjectRoute,
+    master: &AgentIdentity,
+    grantee: &str,
+    public_key: &str,
+    projects: Vec<String>,
+    roles: Vec<String>,
+    capabilities: Vec<String>,
+    granted_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
 ) -> Result<MasterGrant> {
     if !crate::is_safe_component(grantee) {
         bail!("grantee name must be a path-safe identifier");
@@ -408,13 +480,17 @@ pub fn grant_member(
     // the power to widen access on a project that may no longer be theirs.
     crate::anchor::refuse_if_paused(route, &declaration.master, "grant new access")?;
 
+    if expires_at.is_some_and(|at| at <= granted_at) {
+        bail!("access has to end after it starts");
+    }
     let mut grant = MasterGrant {
         grantee: grantee.to_owned(),
         public_key: public_key.to_owned(),
         projects,
         roles,
         capabilities,
-        granted_at: Utc::now(),
+        granted_at,
+        expires_at,
         signed_by: None,
         signature: None,
     };
@@ -577,8 +653,30 @@ pub fn revoke_member(
     Ok(revocation)
 }
 
-/// Whether a valid master-signed revocation exists for `grantee`.
+/// Whether `grantee` has no access here any more: the master revoked it, or access that
+/// was given for a time has run out unrenewed.
+///
+/// Lapsing is treated as revoking on purpose. Everything that already asks this question
+/// (the gate, a worker taking work, the iroh lane's admission, a delegate's standing, the
+/// doctor) then stops a lapsed person without each learning about expiry. A grant with no
+/// `expires_at` is exactly as before.
 pub fn is_revoked(route: &ProjectRoute, grantee: &str) -> Result<bool> {
+    if is_explicitly_revoked(route, grantee)? {
+        return Ok(true);
+    }
+    Ok(has_lapsed(
+        &route.communications,
+        &route.agents,
+        &route.project_id,
+        grantee,
+        Utc::now(),
+    ))
+}
+
+/// Whether a valid master-signed revocation exists for `grantee`. Unlike [`is_revoked`],
+/// a lapsed term is not one: this is for a screen that tells "the master ended it" from
+/// "it ran out".
+pub fn is_explicitly_revoked(route: &ProjectRoute, grantee: &str) -> Result<bool> {
     let path = revocation_path(route, grantee);
     if !path.is_file() {
         return Ok(false);
@@ -599,6 +697,11 @@ pub fn is_revoked(route: &ProjectRoute, grantee: &str) -> Result<bool> {
 /// a route.
 #[must_use]
 pub fn is_revoked_in(communications: &Path, roster: &[AgentRoute], grantee: &str) -> bool {
+    explicitly_revoked_in(communications, roster, grantee)
+        || lapsed_in(communications, roster, grantee)
+}
+
+fn explicitly_revoked_in(communications: &Path, roster: &[AgentRoute], grantee: &str) -> bool {
     let path = communications
         .join("grants")
         .join(format!("{grantee}.revoked.json"));
@@ -625,6 +728,299 @@ pub fn is_revoked_in(communications: &Path, roster: &[AgentRoute], grantee: &str
     ) == SignatureCheck::Valid
 }
 
+// --- access that ends (ADR 0029) ---
+
+/// What the master's answer to a renewal question says to extend the access.
+pub const RENEW: &str = "Renew";
+/// ...and what it says to leave it alone. Nothing is signed or changed by choosing it: the
+/// access ends on the date it always had. It is a button so the question gets an answer.
+pub const LET_IT_END: &str = "Let it end";
+
+/// The grant in `grants/<grantee>.json` when it is timed and the master signed it, with
+/// the project id of the verified declaration.
+///
+/// The cheap exit comes first: a grant with no `expires_at` (all of them, until someone
+/// asks for a timed one) costs one file read here and nothing else, because
+/// `is_revoked_in` runs on every poll of every gate.
+fn timed_grant(
+    communications: &Path,
+    roster: &[AgentRoute],
+    grantee: &str,
+) -> Option<(MasterGrant, String)> {
+    let dir = communications.join("grants");
+    let read = |name: &str| {
+        fs::read_to_string(dir.join(format!("{name}.json")))
+            .ok()
+            .and_then(|text| serde_json::from_str::<MasterGrant>(&text).ok())
+    };
+    let grant = read(grantee).or_else(|| read(&canonical_agent_name(grantee)))?;
+    grant.expires_at?;
+    if !grant.grantee.eq_ignore_ascii_case(grantee) {
+        return None;
+    }
+    let declaration = read_master_at(communications, roster).ok().flatten()?;
+    let master = roster
+        .iter()
+        .find(|agent| agent.name.eq_ignore_ascii_case(&declaration.master))?;
+    (check_signature(
+        grant.signed_by.as_ref(),
+        grant.signature.as_ref(),
+        &grant_payload(&grant),
+        std::slice::from_ref(master),
+    ) == SignatureCheck::Valid)
+        .then_some((grant, declaration.project_id))
+}
+
+thread_local! {
+    /// Grants whose renewals are being worked out on this thread. See [`access_ends`].
+    static RENEWING: std::cell::RefCell<Vec<(PathBuf, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Marks a grant as being worked out for as long as it lives.
+struct Renewing;
+
+impl Renewing {
+    fn enter(communications: &Path, grantee: &str) -> Option<Self> {
+        let key = (communications.to_path_buf(), canonical_agent_name(grantee));
+        RENEWING.with(|active| {
+            let mut active = active.borrow_mut();
+            if active.contains(&key) {
+                return None;
+            }
+            active.push(key);
+            Some(Self)
+        })
+    }
+}
+
+impl Drop for Renewing {
+    fn drop(&mut self) {
+        RENEWING.with(|active| {
+            active.borrow_mut().pop();
+        });
+    }
+}
+
+/// When `grant`'s access ends, counting the renewals the master has answered. `None` when
+/// the grant has no end at all.
+///
+/// A renewal is the master's signed answer to an `access` question (so no key has to be on
+/// the machine that asks, and the history is the question and answer files). Four things
+/// must all hold for one to count, and each is what stops a different forgery:
+///
+/// - the question verifies as signed by a roster member, and the answer as the master's
+///   (or their `improve` delegate's), by `questions::answer_to`;
+/// - the question's id names THIS grantee and THIS grant's `granted_at`, so a renewal of
+///   an earlier grant never extends a fresh one;
+/// - the answer is exactly [`RENEW`];
+/// - the date it runs to is at most one term past the end reached so far. The id (and so
+///   the date) is chosen by whoever asked; without this bound any member could ask for
+///   "renew until 2099" in the master's name and rely on the master tapping the button.
+///   The questions this module asks always sit exactly on the bound.
+///
+/// Working this out can re-enter itself: verifying an answer given by a delegate asks
+/// whether the delegate is revoked, and a delegate may itself be on a timed grant. A grant
+/// met again while it is already being worked out counts only up to its own date, which
+/// means a person whose time has run out cannot renew their own access by answering as
+/// the master's delegate.
+#[must_use]
+pub fn access_ends(
+    communications: &Path,
+    roster: &[AgentRoute],
+    project_id: &str,
+    grant: &MasterGrant,
+) -> Option<DateTime<Utc>> {
+    let base = grant.expires_at?;
+    let term = base - grant.granted_at;
+    if term <= Duration::zero() {
+        return Some(base);
+    }
+    let Some(_working) = Renewing::enter(communications, &grant.grantee) else {
+        return Some(base);
+    };
+    let route = channel_route(communications, roster, project_id);
+    let prefix = format!(
+        "access-{}-{}-",
+        canonical_agent_name(&grant.grantee),
+        grant.granted_at.timestamp()
+    );
+    let mut dates: Vec<DateTime<Utc>> = questions::list_with_prefix(&route, &prefix)
+        .into_iter()
+        .filter(|(question, answer)| {
+            question.kind == questions::ACCESS
+                && answer.as_ref().is_some_and(|answer| answer.answer == RENEW)
+        })
+        .filter_map(|(question, _)| {
+            let seconds = question.id.strip_prefix(&prefix)?.parse::<i64>().ok()?;
+            DateTime::from_timestamp(seconds, 0)
+        })
+        .collect();
+    dates.sort();
+    let mut end = base;
+    for until in dates {
+        if until > end + term {
+            break;
+        }
+        end = end.max(until);
+    }
+    Some(end)
+}
+
+/// A route that knows a channel and its roster and nothing else, which is all the
+/// questions need to verify themselves.
+fn channel_route(communications: &Path, roster: &[AgentRoute], project_id: &str) -> ProjectRoute {
+    ProjectRoute {
+        project_id: project_id.to_owned(),
+        workspace: communications.to_path_buf(),
+        attachment: communications
+            .parent()
+            .unwrap_or(communications)
+            .to_path_buf(),
+        communications: communications.to_path_buf(),
+        shared_remote: String::new(),
+        git_remote: String::new(),
+        git_visibility: String::new(),
+        agents: roster.to_vec(),
+    }
+}
+
+/// Whether `grantee`'s timed access has run out by `now`. False for access with no end,
+/// for a grantee with no grant, and for a grant the master did not sign.
+#[must_use]
+pub fn has_lapsed(
+    communications: &Path,
+    roster: &[AgentRoute],
+    project_id: &str,
+    grantee: &str,
+    now: DateTime<Utc>,
+) -> bool {
+    timed_grant(communications, roster, grantee).is_some_and(|(grant, _)| {
+        access_ends(communications, roster, project_id, &grant).is_some_and(|end| end <= now)
+    })
+}
+
+/// [`has_lapsed`] as of now, for a caller that has no project id to hand: it comes from
+/// the verified master declaration.
+fn lapsed_in(communications: &Path, roster: &[AgentRoute], grantee: &str) -> bool {
+    timed_grant(communications, roster, grantee).is_some_and(|(grant, project_id)| {
+        access_ends(communications, roster, &project_id, &grant)
+            .is_some_and(|end| end <= Utc::now())
+    })
+}
+
+/// When `grantee`'s timed access ends (or ended), if it is timed and the grant verifies.
+#[must_use]
+pub fn access_end_of(route: &ProjectRoute, grantee: &str) -> Option<DateTime<Utc>> {
+    let (grant, _) = timed_grant(&route.communications, &route.agents, grantee)?;
+    access_ends(
+        &route.communications,
+        &route.agents,
+        &route.project_id,
+        &grant,
+    )
+}
+
+/// How long before the end a renewal is asked about: three days, or a third of the term
+/// when the term is shorter than nine days (a one-day trial is not asked about three days
+/// before it is over).
+fn notice_before(term: Duration) -> Duration {
+    if term < Duration::days(9) {
+        term / 3
+    } else {
+        Duration::days(3)
+    }
+}
+
+/// Ask the master whether to renew each timed access that is about to end.
+///
+/// For every valid, unrevoked, timed grant whose end is ahead of `now` but inside the
+/// notice window, asks once (the question id is the idempotency key) with the two buttons
+/// [`RENEW`] and [`LET_IT_END`]. The id is `access-{grantee}-{granted_at}-{until}`: bound
+/// to the grant it is about, and to the date a renewal would run to (one more term past
+/// the current end). Anyone on the roster may ask; only the master's answer counts, so
+/// the machine that notices does not need the master's key. Nothing is asked after the
+/// end, or for access with none. Returns the ids asked now.
+///
+/// An invited person's agent is granted for the same time as the person and is asked
+/// about separately, because the master may reasonably keep one and not the other.
+#[must_use]
+pub fn ask_renewals(
+    route: &ProjectRoute,
+    asker: &AgentIdentity,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let mut asked = Vec::new();
+    // A question signed by a key the roster does not carry would never verify, so it
+    // would be a question nobody ever sees.
+    let key = asker.public_key_hex();
+    if !route.agents.iter().any(|agent| {
+        agent.name.eq_ignore_ascii_case(asker.name()) && agent.public_key.as_deref() == Some(&key)
+    }) {
+        return asked;
+    }
+    let Ok(grants) = member_grants(route) else {
+        return asked;
+    };
+    for (grant, check) in grants {
+        let (Some(expires_at), SignatureCheck::Valid) = (grant.expires_at, check) else {
+            continue;
+        };
+        let term = expires_at - grant.granted_at;
+        if term <= Duration::zero() || is_explicitly_revoked(route, &grant.grantee).unwrap_or(true)
+        {
+            continue;
+        }
+        let Some(end) = access_ends(
+            &route.communications,
+            &route.agents,
+            &route.project_id,
+            &grant,
+        ) else {
+            continue;
+        };
+        if end <= now || end - notice_before(term) > now {
+            continue;
+        }
+        let until = end + term;
+        let id = format!(
+            "access-{}-{}-{}",
+            canonical_agent_name(&grant.grantee),
+            grant.granted_at.timestamp(),
+            until.timestamp()
+        );
+        let days = term.num_days();
+        let length = if days >= 1 {
+            format!("{days} day{}", if days == 1 { "" } else { "s" })
+        } else {
+            format!("{} hours", term.num_hours().max(1))
+        };
+        let text = format!(
+            "{}'s access to {} ends {} UTC. Renew for another {length}, until {}? \
+             If nobody answers, it ends on {}.",
+            grant.grantee,
+            route.project_id,
+            end.format("%Y-%m-%d"),
+            until.format("%Y-%m-%d"),
+            end.format("%Y-%m-%d"),
+        );
+        if questions::ask(
+            route,
+            asker,
+            &id,
+            questions::ACCESS,
+            &text,
+            &[RENEW.to_string(), LET_IT_END.to_string()],
+            None,
+        )
+        .unwrap_or(false)
+        {
+            asked.push(id);
+        }
+    }
+    asked
+}
+
 /// Every valid revocation on this project, by grantee.
 pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
     let dir = grants_dir(route);
@@ -638,7 +1034,7 @@ pub fn revoked_members(route: &ProjectRoute) -> Result<Vec<MasterRevocation>> {
         let Some(grantee) = name.strip_suffix(".revoked.json") else {
             continue;
         };
-        if is_revoked(route, grantee)? {
+        if is_explicitly_revoked(route, grantee)? {
             out.push(serde_json::from_str(&fs::read_to_string(&path)?)?);
         }
     }
@@ -1159,6 +1555,580 @@ mod tests {
         assert!(
             is_granted(&route, "josh", "worker").unwrap(),
             "losing a laptop is not losing your access"
+        );
+    }
+
+    // --- access that ends (ADR 0029) ---
+
+    /// The master is `josh`; `bob` is a person who joined; `mallory` is on the roster too
+    /// and is nobody's master.
+    fn timed_fixture(dir: &std::path::Path) -> (ProjectRoute, AgentIdentity, AgentIdentity) {
+        let mut route = test_route(dir);
+        std::fs::create_dir_all(&route.communications).unwrap();
+        let josh = AgentIdentity::from_seed("josh", [1u8; 32]);
+        let bob = AgentIdentity::from_seed("bob", [2u8; 32]);
+        let mallory = AgentIdentity::from_seed("mallory", [3u8; 32]);
+        route.agents = [&josh, &bob, &mallory]
+            .into_iter()
+            .map(|identity| AgentRoute {
+                name: identity.name().to_owned(),
+                role: "worker".into(),
+                capabilities: Vec::new(),
+                public_key: Some(identity.public_key_hex()),
+                encryption_key: None,
+            })
+            .collect();
+        // The delegation tests read the roster from the channel, not from the route.
+        for agent in &route.agents {
+            crate::register_agent(&route, agent).unwrap();
+        }
+        initialize_master(&route, &josh, "josh").unwrap();
+        (route, josh, bob)
+    }
+
+    /// Grant `bob` access for the given window, in the past if the test wants it over.
+    fn grant_window(
+        route: &ProjectRoute,
+        josh: &AgentIdentity,
+        bob: &AgentIdentity,
+        granted_at: DateTime<Utc>,
+        expires_at: Option<DateTime<Utc>>,
+    ) -> MasterGrant {
+        write_grant(
+            route,
+            josh,
+            "bob",
+            &bob.public_key_hex(),
+            vec!["hone".into()],
+            vec!["worker".into()],
+            Vec::new(),
+            granted_at,
+            expires_at,
+        )
+        .unwrap()
+    }
+
+    /// An answer written by someone who is not the master, in the master's name, signed
+    /// properly by themselves: what a member with write access to the channel can do.
+    fn forge_answer(route: &ProjectRoute, id: &str, forger: &AgentIdentity, master: &str) {
+        let at = Utc::now();
+        let payload = format!(
+            "ferryman-answer-v1\n{id}\n{}\n{master}\n{}\n{RENEW}",
+            route.project_id,
+            at.to_rfc3339()
+        );
+        let forged = questions::Answer {
+            question_id: id.to_owned(),
+            project_id: route.project_id.clone(),
+            answer: RENEW.to_owned(),
+            by: master.to_owned(),
+            answered_at: at,
+            signed_by: forger.name().to_owned(),
+            signature: forger.sign_bytes(payload.as_bytes()),
+        };
+        crate::atomic_json(
+            &route
+                .communications
+                .join("questions")
+                .join(format!("{id}.answer.json")),
+            &forged,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_grant_with_no_end_signs_the_bytes_it_always_did() {
+        let at = DateTime::parse_from_rfc3339("2026-01-02T03:04:05+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut grant = MasterGrant {
+            grantee: "bob".into(),
+            public_key: "KEY".into(),
+            projects: vec!["hone".into()],
+            roles: vec!["worker".into()],
+            capabilities: vec!["code".into()],
+            granted_at: at,
+            expires_at: None,
+            signed_by: None,
+            signature: None,
+        };
+        let payload = grant_payload(&grant);
+        assert_eq!(
+            payload,
+            "ferryman-master-grant-v1\nbob\nKEY\nhone\nworker\ncode\n2026-01-02T03:04:05+00:00"
+        );
+        assert!(!payload.contains("expires:"));
+        grant.expires_at = Some(at + Duration::days(30));
+        assert_eq!(
+            grant_payload(&grant),
+            format!("{payload}\nexpires:2026-02-01T03:04:05+00:00"),
+            "the end is appended, never interleaved"
+        );
+    }
+
+    #[test]
+    fn a_timed_grant_verifies_and_an_edited_end_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let until = Utc::now() + Duration::days(30);
+        let grant = grant_member_until(
+            &route,
+            &josh,
+            "bob",
+            &bob.public_key_hex(),
+            vec!["hone".into()],
+            vec!["worker".into()],
+            Vec::new(),
+            Some(until),
+        )
+        .unwrap();
+        assert_eq!(grant.expires_at, Some(until));
+        let (read, check) = member_grants(&route).unwrap().remove(0);
+        assert_eq!(read.expires_at, Some(until));
+        assert_eq!(check, SignatureCheck::Valid);
+        assert!(is_granted(&route, "bob", "worker").unwrap());
+
+        // Moving the end later is exactly what someone who wanted more time would do.
+        let path = grant_path(&route, "bob");
+        let mut forged: MasterGrant = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        forged.expires_at = Some(until + Duration::days(3000));
+        fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        assert_eq!(member_grants(&route).unwrap()[0].1, SignatureCheck::Invalid);
+        assert!(!is_granted(&route, "bob", "worker").unwrap());
+
+        // And stripping the end altogether fails the same way.
+        forged.expires_at = None;
+        fs::write(&path, serde_json::to_vec(&forged).unwrap()).unwrap();
+        assert_eq!(member_grants(&route).unwrap()[0].1, SignatureCheck::Invalid);
+    }
+
+    #[test]
+    fn an_end_before_the_start_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let error = grant_member_until(
+            &route,
+            &josh,
+            "bob",
+            &bob.public_key_hex(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Some(Utc::now() - Duration::days(1)),
+        )
+        .expect_err("access that has already ended is not a grant");
+        assert!(error.to_string().contains("end after it starts"), "{error}");
+    }
+
+    #[test]
+    fn access_that_ran_out_counts_as_revoked_everywhere_and_before_that_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+
+        grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(1),
+            Some(now + Duration::days(9)),
+        );
+        assert!(!is_revoked(&route, "bob").unwrap());
+        assert!(!is_revoked_in(&route.communications, &route.agents, "bob"));
+        assert!(is_granted(&route, "bob", "worker").unwrap());
+        assert!(may_work(&route, "bob", "worker").unwrap());
+        assert!(has_any_access(&route, "bob").unwrap());
+        assert!(admitted_at(&route.communications, &route.agents).contains("bob"));
+
+        grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(10),
+            Some(now - Duration::days(1)),
+        );
+        assert!(is_revoked(&route, "bob").unwrap());
+        assert!(is_revoked_in(&route.communications, &route.agents, "bob"));
+        assert!(!is_granted(&route, "bob", "worker").unwrap());
+        assert!(
+            !may_work(&route, "bob", "worker").unwrap(),
+            "a worker lapses too"
+        );
+        assert!(!has_any_access(&route, "bob").unwrap());
+        assert!(!admitted_at(&route.communications, &route.agents).contains("bob"));
+        assert!(
+            !is_explicitly_revoked(&route, "bob").unwrap(),
+            "running out is not the master revoking"
+        );
+        assert!(revoked_members(&route).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_grant_the_master_did_not_sign_cannot_lapse_anyone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(1),
+            Some(now + Duration::days(9)),
+        );
+        // Somebody rewrites bob's file with an old end, to switch him off.
+        let path = grant_path(&route, "bob");
+        let mut edited: MasterGrant = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        edited.expires_at = Some(now - Duration::days(1));
+        fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+        assert!(!has_lapsed(
+            &route.communications,
+            &route.agents,
+            "hone",
+            "bob",
+            now
+        ));
+    }
+
+    #[test]
+    fn a_grant_with_no_end_never_lapses_and_reads_no_questions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        grant_window(&route, &josh, &bob, Utc::now() - Duration::days(4000), None);
+        assert!(!is_revoked(&route, "bob").unwrap());
+        assert!(!has_lapsed(
+            &route.communications,
+            &route.agents,
+            "hone",
+            "bob",
+            Utc::now() + Duration::days(40000)
+        ));
+        let (grant, _) = member_grants(&route).unwrap().remove(0);
+        assert_eq!(
+            access_ends(&route.communications, &route.agents, "hone", &grant),
+            None
+        );
+    }
+
+    /// Ask at a moment inside the notice window and return the one question's id.
+    fn ask_one(route: &ProjectRoute, asker: &AgentIdentity, grant: &MasterGrant) -> String {
+        let at = grant.expires_at.unwrap() - Duration::days(1);
+        let mut ids = ask_renewals(route, asker, at);
+        assert_eq!(ids.len(), 1, "{ids:?}");
+        ids.remove(0)
+    }
+
+    #[test]
+    fn the_masters_renew_extends_access_and_let_it_end_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        // A ten-day term that ended five days ago.
+        let grant = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(15),
+            Some(now - Duration::days(5)),
+        );
+        assert!(is_revoked(&route, "bob").unwrap());
+        let id = ask_one(&route, &josh, &grant);
+
+        // Let it end changes nothing.
+        questions::answer(&route, &id, LET_IT_END, "josh", &josh).unwrap();
+        assert!(is_revoked(&route, "bob").unwrap());
+        assert_eq!(
+            access_ends(&route.communications, &route.agents, "hone", &grant),
+            grant.expires_at
+        );
+
+        // A different grant of the same person answered Renew does.
+        let grant = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(16),
+            Some(now - Duration::days(6)),
+        );
+        let id = ask_one(&route, &josh, &grant);
+        questions::answer(&route, &id, RENEW, "josh", &josh).unwrap();
+        let end = access_ends(&route.communications, &route.agents, "hone", &grant).unwrap();
+        assert_eq!(
+            end.timestamp(),
+            (grant.expires_at.unwrap() + Duration::days(10)).timestamp()
+        );
+        assert!(end > now, "five days of the ten-day renewal are left");
+        assert!(!is_revoked(&route, "bob").unwrap());
+        assert!(is_granted(&route, "bob", "worker").unwrap());
+    }
+
+    #[test]
+    fn a_renewal_from_anyone_but_the_master_extends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let mallory = AgentIdentity::from_seed("mallory", [3u8; 32]);
+        let now = Utc::now();
+        let grant = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(15),
+            Some(now - Duration::days(5)),
+        );
+        let id = ask_one(&route, &josh, &grant);
+
+        // The honest route refuses her, and so does a file she writes herself.
+        assert!(questions::answer(&route, &id, RENEW, "josh", &mallory).is_err());
+        forge_answer(&route, &id, &mallory, "josh");
+        assert!(
+            is_revoked(&route, "bob").unwrap(),
+            "a forged renewal renews nothing"
+        );
+
+        // Nor does the person whose time it is renew themselves.
+        forge_answer(&route, &id, &bob, "josh");
+        assert!(is_revoked(&route, "bob").unwrap());
+    }
+
+    #[test]
+    fn a_question_that_asks_for_more_than_one_term_extends_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        let grant = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(15),
+            Some(now - Duration::days(5)),
+        );
+        // A member asks "renew until 2099" in the master's name and the master taps Renew.
+        let id = format!(
+            "access-bob-{}-{}",
+            grant.granted_at.timestamp(),
+            4_070_908_800_i64
+        );
+        questions::ask(
+            &route,
+            &bob,
+            &id,
+            questions::ACCESS,
+            "bob's access ends soon. Renew?",
+            &[RENEW.to_string(), LET_IT_END.to_string()],
+            None,
+        )
+        .unwrap();
+        questions::answer(&route, &id, RENEW, "josh", &josh).unwrap();
+        assert!(is_revoked(&route, "bob").unwrap());
+        assert_eq!(
+            access_ends(&route.communications, &route.agents, "hone", &grant),
+            grant.expires_at
+        );
+    }
+
+    #[test]
+    fn a_renewal_of_an_older_grant_does_not_extend_a_fresh_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        let old = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(30),
+            Some(now - Duration::days(20)),
+        );
+        let id = ask_one(&route, &josh, &old);
+        questions::answer(&route, &id, RENEW, "josh", &josh).unwrap();
+
+        // The master grants again: a new term, a new granted_at.
+        let fresh = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(1),
+            Some(now + Duration::days(9)),
+        );
+        assert_eq!(
+            access_ends(&route.communications, &route.agents, "hone", &fresh),
+            fresh.expires_at,
+            "the old renewal belongs to the old grant"
+        );
+    }
+
+    #[test]
+    fn renewals_are_asked_once_inside_the_notice_window_and_not_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        let granted = now - Duration::days(27);
+        let ends = granted + Duration::days(30);
+        let grant = grant_window(&route, &josh, &bob, granted, Some(ends));
+
+        assert!(
+            ask_renewals(&route, &josh, ends - Duration::days(4)).is_empty(),
+            "four days out is before the three-day notice"
+        );
+        let asked = ask_renewals(&route, &josh, ends - Duration::days(2));
+        let id = format!(
+            "access-bob-{}-{}",
+            grant.granted_at.timestamp(),
+            (ends + Duration::days(30)).timestamp()
+        );
+        assert_eq!(asked, vec![id.clone()]);
+        assert!(
+            ask_renewals(&route, &josh, ends - Duration::days(1)).is_empty(),
+            "asked once, not on every pass"
+        );
+
+        let question = questions::read(&route, &id).unwrap();
+        assert_eq!(question.kind, questions::ACCESS);
+        assert_eq!(
+            question.options,
+            vec![RENEW.to_string(), LET_IT_END.to_string()]
+        );
+        assert!(question.text.contains("bob"), "{}", question.text);
+        assert!(question.text.contains("30 days"), "{}", question.text);
+        assert_eq!(questions::pending(&route).len(), 1);
+
+        // After the end, nobody is asked.
+        assert!(ask_renewals(&route, &josh, ends + Duration::seconds(1)).is_empty());
+    }
+
+    #[test]
+    fn a_short_term_is_asked_about_a_third_of_the_way_from_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let granted = Utc::now() - Duration::days(1);
+        let ends = granted + Duration::days(6);
+        grant_window(&route, &josh, &bob, granted, Some(ends));
+        assert!(ask_renewals(&route, &josh, ends - Duration::days(3)).is_empty());
+        assert_eq!(
+            ask_renewals(&route, &josh, ends - Duration::days(1)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn access_with_no_end_or_already_revoked_is_never_asked_about() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        grant_window(&route, &josh, &bob, now - Duration::days(1), None);
+        assert!(ask_renewals(&route, &josh, now).is_empty());
+
+        let ends = now + Duration::days(2);
+        grant_window(&route, &josh, &bob, now - Duration::days(28), Some(ends));
+        revoke_member(&route, &josh, "bob", "left").unwrap();
+        assert!(ask_renewals(&route, &josh, now).is_empty());
+    }
+
+    #[test]
+    fn someone_the_roster_does_not_carry_cannot_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        let now = Utc::now();
+        grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(28),
+            Some(now + Duration::days(2)),
+        );
+        let stranger = AgentIdentity::from_seed("stranger", [9u8; 32]);
+        assert!(ask_renewals(&route, &stranger, now).is_empty());
+        let impostor = AgentIdentity::from_seed("josh", [9u8; 32]);
+        assert!(
+            ask_renewals(&route, &impostor, now).is_empty(),
+            "the name, not the key"
+        );
+    }
+
+    #[test]
+    fn a_machine_loses_the_access_it_inherited_when_its_owner_runs_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut route, josh, bob) = timed_fixture(dir.path());
+        let laptop = AgentIdentity::from_seed("bob-laptop", [4u8; 32]);
+        route.agents.push(AgentRoute {
+            name: "bob-laptop".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(laptop.public_key_hex()),
+            encryption_key: None,
+        });
+        let now = Utc::now();
+        grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(1),
+            Some(now + Duration::days(9)),
+        );
+        crate::owner::attest_owner(&route, &bob, "bob-laptop", &laptop.public_key_hex()).unwrap();
+        assert!(is_granted(&route, "bob-laptop", "worker").unwrap());
+
+        grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(10),
+            Some(now - Duration::days(1)),
+        );
+        assert!(!is_granted(&route, "bob", "worker").unwrap());
+        assert!(
+            !is_granted(&route, "bob-laptop", "worker").unwrap(),
+            "a machine is exactly as lapsed as its owner"
+        );
+        assert!(!may_work(&route, "bob-laptop", "worker").unwrap());
+    }
+
+    /// A delegate on a timed grant is the one place working out a grant's end meets itself:
+    /// the delegate's standing asks whether they are revoked, which asks whether they ran
+    /// out, which reads the answers they may have signed. It must finish, and a delegate
+    /// whose time is up must not be able to renew their own access.
+    #[test]
+    fn a_delegate_whose_time_ran_out_cannot_renew_themselves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (route, josh, bob) = timed_fixture(dir.path());
+        crate::delegation::grant(
+            &route.communications,
+            "hone",
+            &josh,
+            "bob",
+            &["improve".to_string()],
+            None,
+        )
+        .unwrap();
+        let now = Utc::now();
+        let grant = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(15),
+            Some(now - Duration::days(5)),
+        );
+        let id = ask_one(&route, &josh, &grant);
+        assert!(questions::answer(&route, &id, RENEW, "josh", &bob).is_err());
+        // Written by hand, as a delegate's properly signed answer would be.
+        forge_answer(&route, &id, &bob, "josh");
+        assert!(
+            is_revoked(&route, "bob").unwrap(),
+            "bob's own answer, as a lapsed delegate, does not count"
+        );
+        // While bob is in time, the same delegate may answer for the master.
+        let grant = grant_window(
+            &route,
+            &josh,
+            &bob,
+            now - Duration::days(9),
+            Some(now + Duration::days(1)),
+        );
+        let id = ask_one(&route, &josh, &grant);
+        questions::answer(&route, &id, RENEW, "josh", &bob).unwrap();
+        assert_eq!(
+            access_ends(&route.communications, &route.agents, "hone", &grant)
+                .unwrap()
+                .timestamp(),
+            (grant.expires_at.unwrap() + Duration::days(10)).timestamp()
         );
     }
 }

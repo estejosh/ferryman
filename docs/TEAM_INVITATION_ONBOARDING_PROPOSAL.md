@@ -79,7 +79,7 @@ after verification completes.
 ## Proposed CLI
 
 ```text
-ferry team invite create --email alex@example.com --role reviewer --project ferryman --expires 7d
+ferry team invite create --email alex@example.com --role reviewer --project ferryman --expires 7d --access 30
 ferry team invite inspect <code-or-url> --json
 ferry team invite accept <code-or-url>
 ferry setup doctor --project ferryman --json
@@ -88,6 +88,9 @@ ferry team invite revoke <invitation-id>
 
 Every command should support structured JSON output so the dashboard can show
 progress without parsing prose.
+
+`--access <DAYS|forever>` is required on `create`: how long the access lasts is chosen
+on every invitation, separately from how long the code works (`--expires`). See ADR 0029.
 
 ## Proposed dashboard API
 

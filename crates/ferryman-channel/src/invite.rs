@@ -60,6 +60,11 @@ pub struct Invite {
     /// machine inherits, it is not granted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
+    /// How long the access this invite grants lasts once it is granted, in days. `None`
+    /// means it does not end. This is the ACCESS; `expires_at` below is the CODE, which
+    /// stops working for joining whether or not the access it leads to is timed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_days: Option<u32>,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     /// SHA-256 of the nonce the code carries. The acceptance must present the nonce.
@@ -145,11 +150,22 @@ fn invite_payload(invite: &Invite) -> String {
     // field existed still signs over exactly the bytes it was signed over. A field
     // that quietly changes what old signatures cover is how a channel wakes up one
     // morning unable to verify its own history.
-    match &invite.owner {
+    let base = match &invite.owner {
         Some(owner) => format!("{base}\nowner={owner}"),
+        None => base,
+    };
+    // The same again for the length of the access: an invitation that promised thirty
+    // days must not be editable into one that promised forever, and one written before
+    // the field existed (no end) signs the bytes it always did.
+    match invite.access_days {
+        Some(days) => format!("{base}\naccess_days={days}"),
         None => base,
     }
 }
+
+/// The longest access an invitation may promise: ten years. Past that it is a typo, or a
+/// way of saying "no expiry" that should say so.
+pub const MAX_ACCESS_DAYS: u32 = 3650;
 
 fn acceptance_payload(accept: &Acceptance) -> String {
     format!(
@@ -176,16 +192,25 @@ fn random_hex(bytes: usize) -> String {
 /// Create an invitation. Only the declared master may.
 ///
 /// Reserves the names on the roster (first-key-wins protects them from then on), writes
-/// the signed record, and returns it with the code to hand over.
+/// the signed record, and returns it with the code to hand over. `ttl` is how long the
+/// CODE works for joining; `access_days` is how long the ACCESS lasts once granted, or
+/// `None` for access that does not end. The caller must say which: there is no default.
+#[allow(clippy::too_many_arguments)]
 pub fn create(
     route: &ProjectRoute,
     master: &AgentIdentity,
     operator: Option<&str>,
     agent: Option<&str>,
     roles: Vec<String>,
+    access_days: Option<u32>,
     ttl: Duration,
     inviter_device_id: &str,
 ) -> Result<(Invite, String)> {
+    if let Some(days) = access_days
+        && !(1..=MAX_ACCESS_DAYS).contains(&days)
+    {
+        bail!("access lasts 1 to {MAX_ACCESS_DAYS} days; for no end, leave the length out");
+    }
     let Some(declaration) = crate::master::read_master(route)? else {
         bail!("this project has no master yet; become the master first");
     };
@@ -242,6 +267,7 @@ pub fn create(
             _ => roles,
         },
         owner: None,
+        access_days,
         created_at: now,
         expires_at: now + ttl,
         nonce_hash: hash_nonce(&nonce),
@@ -343,6 +369,9 @@ pub fn create_for_identity(
         agent: None,
         roles: vec![INHERITED.to_string()],
         owner: Some(owner),
+        // A machine inherits its owner's access, ending when theirs does; it has no term
+        // of its own to promise.
+        access_days: None,
         created_at: now,
         expires_at: now + ttl,
         nonce_hash: hash_nonce(&nonce),
@@ -728,6 +757,51 @@ pub fn burn_for(route: &ProjectRoute, operator: &str) -> Result<usize> {
     Ok(burned)
 }
 
+/// The Syncthing devices of people whose timed access has run out, as (person, device).
+///
+/// Iroh stops at the revocation check, so a lapsed person's transports record is simply
+/// not honoured any more. Syncthing does not: the device stays shared until somebody
+/// unshares the folder. This finds who that is without the master's key, so an agent
+/// loop on any machine that runs Syncthing can do it. A machine that joined under an
+/// owner is the owner's: it goes when they do. The device id on an invite is not covered
+/// by its signature, but the only thing it can be used for here is to stop sharing with
+/// it, and only for a person whose own signed grant says their time is up.
+#[must_use]
+pub fn lapsed_devices(route: &ProjectRoute, now: DateTime<Utc>) -> Vec<(String, String)> {
+    let (Ok(invites), Ok(roster)) = (list(route), crate::read_agent_roster(&route.communications))
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (invite, check) in invites {
+        let Some(device) = invite.accepted_device.clone() else {
+            continue;
+        };
+        if check != SignatureCheck::Valid || invite.granted_at.is_none() {
+            continue;
+        }
+        let joined = read_acceptance(route, &invite.id)
+            .ok()
+            .flatten()
+            .map(|accept| accept.operator)
+            .or_else(|| invite.operator.clone());
+        let Some(person) = invite.owner.clone().or(joined) else {
+            continue;
+        };
+        if crate::master::has_lapsed(
+            &route.communications,
+            &roster,
+            &route.project_id,
+            &person,
+            now,
+        ) && !out.iter().any(|(_, seen)| *seen == device)
+        {
+            out.push((person, device));
+        }
+    }
+    out
+}
+
 /// Mark an invite granted, after the master has signed the grants it promised.
 pub fn mark_granted(route: &ProjectRoute, id: &str) -> Result<()> {
     let Some(mut invite) = read(route, id)? else {
@@ -868,6 +942,7 @@ mod tests {
             agent: Some("david-agent".into()),
             roles: vec!["worker".into()],
             owner: None,
+            access_days: None,
             created_at: now,
             expires_at: now + Duration::days(7),
             nonce_hash: hash_nonce("n"),
@@ -983,5 +1058,179 @@ mod tests {
             .expect_err("a name with no access has nothing for a machine to inherit")
             .to_string();
         assert!(error.contains("holds no access"), "{error}");
+    }
+
+    fn bare_invite() -> Invite {
+        let now = Utc::now();
+        Invite {
+            id: "1a2b3c4d".into(),
+            project_id: "redaktly".into(),
+            folder: "redaktly-ferryman".into(),
+            device_id: "DEVICE".into(),
+            operator: Some("david".into()),
+            agent: None,
+            roles: vec!["worker".into()],
+            owner: None,
+            access_days: None,
+            created_at: now,
+            expires_at: now + Duration::days(7),
+            nonce_hash: hash_nonce("n"),
+            accepted_device: None,
+            granted_at: None,
+            signed_by: None,
+            signature: None,
+        }
+    }
+
+    /// An invitation written before access could end signs the bytes it always did, and
+    /// the length of the access is covered once it is there.
+    #[test]
+    fn the_length_of_the_access_is_signed_and_a_legacy_invite_signs_as_before() {
+        let legacy = bare_invite();
+        let payload = invite_payload(&legacy);
+        assert!(!payload.contains("access_days"), "{payload}");
+
+        let timed = Invite {
+            access_days: Some(30),
+            ..legacy.clone()
+        };
+        assert_eq!(invite_payload(&timed), format!("{payload}\naccess_days=30"));
+        let both = Invite {
+            owner: Some("josh".into()),
+            access_days: Some(30),
+            ..legacy
+        };
+        assert!(invite_payload(&both).ends_with("\nowner=josh\naccess_days=30"));
+    }
+
+    #[test]
+    fn an_invite_edited_to_promise_more_time_stops_verifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = channel(dir.path());
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        publish(&mut route, &ada);
+        crate::master::initialize_master(&route, &ada, "ada").unwrap();
+        let (invite, _) = create(
+            &route,
+            &ada,
+            Some("carol"),
+            None,
+            vec!["worker".into()],
+            Some(30),
+            Duration::days(7),
+            "DEVICE",
+        )
+        .unwrap();
+        assert_eq!(invite.access_days, Some(30));
+        let check = |route: &ProjectRoute| list(route).unwrap().remove(0).1;
+        route.agents = crate::read_agent_roster(&route.communications).unwrap();
+        assert_eq!(check(&route), SignatureCheck::Valid);
+
+        for edit in [Some(3650), None] {
+            let mut forged = invite.clone();
+            forged.access_days = edit;
+            write(&route, &forged).unwrap();
+            assert_eq!(check(&route), SignatureCheck::Invalid, "{edit:?}");
+        }
+    }
+
+    #[test]
+    fn no_end_is_a_choice_that_signs_and_nonsense_lengths_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = channel(dir.path());
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        publish(&mut route, &ada);
+        crate::master::initialize_master(&route, &ada, "ada").unwrap();
+        let make = |name: &str, days: Option<u32>| {
+            create(
+                &route,
+                &ada,
+                Some(name),
+                None,
+                vec!["worker".into()],
+                days,
+                Duration::days(7),
+                "DEVICE",
+            )
+        };
+        assert_eq!(make("dave", None).unwrap().0.access_days, None);
+        assert_eq!(make("erin", Some(3650)).unwrap().0.access_days, Some(3650));
+        for bad in [0, 3651] {
+            let error = make("frank", Some(bad))
+                .expect_err("out of range")
+                .to_string();
+            assert!(error.contains("1 to 3650"), "{error}");
+        }
+        assert!(
+            list(&route)
+                .unwrap()
+                .iter()
+                .all(|(i, _)| i.operator.as_deref() != Some("frank")),
+            "a refused invite leaves nothing behind"
+        );
+    }
+
+    /// Only the accepted device of someone whose own signed grant has run out is named.
+    #[test]
+    fn lapsed_devices_names_the_device_of_a_lapsed_person_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut route = channel(dir.path());
+        let ada = AgentIdentity::from_seed("ada", [7u8; 32]);
+        publish(&mut route, &ada);
+        crate::master::initialize_master(&route, &ada, "ada").unwrap();
+        let now = Utc::now();
+        let accepted = |name: &str, device: &str, granted: bool| {
+            let (mut invite, _) = create(
+                &route,
+                &ada,
+                Some(name),
+                None,
+                vec!["worker".into()],
+                Some(10),
+                Duration::days(7),
+                "INVITER",
+            )
+            .unwrap();
+            invite.accepted_device = Some(device.to_string());
+            invite.granted_at = granted.then_some(now);
+            write(&route, &invite).unwrap();
+        };
+        accepted("carol", "DEVICE-CAROL", true);
+        accepted("dave", "DEVICE-DAVE", true);
+        accepted("erin", "DEVICE-ERIN", true);
+        accepted("gus", "DEVICE-GUS", false);
+        route.agents = crate::read_agent_roster(&route.communications).unwrap();
+
+        let grant = |name: &str, granted: i64, ends: Option<i64>| {
+            crate::master::write_grant(
+                &route,
+                &ada,
+                name,
+                "KEY",
+                vec!["hone".into()],
+                vec!["worker".into()],
+                Vec::new(),
+                now + Duration::days(granted),
+                ends.map(|days| now + Duration::days(days)),
+            )
+            .unwrap();
+        };
+        grant("carol", -10, Some(-1)); // ran out
+        grant("dave", -1, Some(9)); // still in time
+        grant("erin", -400, None); // never ends
+        grant("gus", -10, Some(-1)); // ran out, but this invite was never granted
+
+        assert_eq!(
+            lapsed_devices(&route, now),
+            vec![("carol".to_string(), "DEVICE-CAROL".to_string())]
+        );
+        assert!(
+            lapsed_devices(&route, now - Duration::days(5)).is_empty(),
+            "nobody had run out five days ago"
+        );
+        // A revocation is the dashboard's own path, which unshares at once; this is only
+        // for access that ran out.
+        crate::master::revoke_member(&route, &ada, "dave", "left").unwrap();
+        assert_eq!(lapsed_devices(&route, now).len(), 1);
     }
 }

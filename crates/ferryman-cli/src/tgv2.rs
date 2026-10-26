@@ -1944,6 +1944,10 @@ impl Bridge {
                     format!("{project} - engine policy")
                 } else if question.kind == questions::CONTRACT {
                     format!("{project} - interface contract, waiting for your lock")
+                } else if question.kind == questions::ACCESS {
+                    // Renew / Let it end: the master's signed answer, through the same
+                    // generic path as any other question. Nobody answering lets it end.
+                    format!("{project} - access ending, waiting for you")
                 } else if question.kind == questions::SUGGESTION {
                     // The buttons are Accept, Decline and Ask more: the same signed answer
                     // `ferry suggestions accept` gives. Everything below the heading is the
@@ -3198,6 +3202,44 @@ mod tests {
         assert_eq!(question.id, "clarify-2026-w39-1");
         assert_eq!(answer.unwrap().answer, "No");
         assert!(bridge.tick(Utc::now()).is_empty());
+    }
+
+    /// Access that is about to end arrives once, with Renew and Let it end, and the button is
+    /// the master's signed answer the channel counts when it works out when access ends.
+    #[test]
+    fn access_that_is_about_to_end_is_asked_with_renew_and_let_it_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut bridge, ferryman, _) = bridge(dir.path());
+        delegate(&ferryman, &["improve"]);
+        let options = [
+            ferryman_channel::master::RENEW,
+            ferryman_channel::master::LET_IT_END,
+        ]
+        .map(String::from);
+        questions::ask(
+            &ferryman,
+            &wisp(),
+            "access-carol-1-2",
+            questions::ACCESS,
+            "carol's access to ferryman ends 2026-11-25 UTC. Renew for another 30 days?",
+            &options,
+            None,
+        )
+        .unwrap();
+        let posted = bridge.tick(Utc::now());
+        let shown = texts(&posted);
+        assert!(
+            shown[0].starts_with("ferryman - access ending, waiting for you"),
+            "{shown:?}"
+        );
+        let choices = buttons(&posted);
+        let labels: Vec<&str> = choices.iter().map(|(label, _)| label.as_str()).collect();
+        assert_eq!(labels, ["Renew", "Let it end", "Answer in words"]);
+        assert!(bridge.tick(Utc::now()).is_empty(), "posted once");
+        let answered = bridge.handle(press(JOSH_TG, GROUP, 82, &choices[0].1), Utc::now());
+        assert!(texts(&answered)[0].contains("Answered \"Renew\" - josh via telegram-grouchly"));
+        let (_, answer) = questions::list(&ferryman).remove(0);
+        assert_eq!(answer.unwrap().answer, ferryman_channel::master::RENEW);
     }
 
     /// An outsider's suggestion that triage sent up arrives once, with Accept, Decline and

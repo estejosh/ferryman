@@ -391,4 +391,41 @@ mod tests {
         fs::remove_file(f.route.communications.join("agents").join("fang.json")).unwrap();
         assert!(honoured_records(&f.route).is_empty());
     }
+
+    /// Access that ran out ends the iroh lane's welcome exactly as a revocation does, and
+    /// before it ran out the same record is honoured.
+    #[test]
+    fn a_member_whose_access_ran_out_is_no_longer_reachable() {
+        let mut f = fixture();
+        let master = member(&f.route, "ada");
+        let fang = member(&f.route, "fang");
+        f.route.agents = crate::read_agent_roster(&f.route.communications).unwrap();
+        crate::master::initialize_master(&f.route, &master, "ada").unwrap();
+        publish(&f.route, &fang, ENDPOINT, None).unwrap();
+        let grant = |granted: i64, ends: i64| {
+            crate::master::write_grant(
+                &f.route,
+                &master,
+                "fang",
+                &fang.public_key_hex(),
+                vec!["demo".into()],
+                vec!["worker".into()],
+                Vec::new(),
+                Utc::now() + chrono::Duration::days(granted),
+                Some(Utc::now() + chrono::Duration::days(ends)),
+            )
+            .unwrap();
+        };
+
+        grant(-1, 9);
+        assert_eq!(honoured_records(&f.route).len(), 1, "in time");
+
+        grant(-10, -1);
+        assert!(honoured_records(&f.route).is_empty(), "out of time");
+        let bytes = fs::read(path(&f.route, "fang")).unwrap();
+        assert!(
+            !acceptable(&f.route, "transports/fang.json", &bytes),
+            "and a peer cannot hand the record back in"
+        );
+    }
 }

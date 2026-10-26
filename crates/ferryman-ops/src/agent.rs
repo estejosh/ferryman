@@ -3467,6 +3467,13 @@ async fn note_engines(
 ) {
     let now = chrono::Utc::now();
     apply_owner_answers(route, config, report);
+    // Access that was given for a time and is about to end becomes a question for the
+    // master (Renew / Let it end). Any worker on the roster may ask, since only the
+    // master's answer counts; asking is idempotent, so every pass is harmless. Best
+    // effort: a failure here must never stop a worker taking work.
+    for id in ferryman_channel::master::ask_renewals(route, identity, now) {
+        report.info(&format!("asked the master whether to renew {id}"));
+    }
     if crate::governor::paused().is_none() {
         crate::engines::probe_due(route, &config.agent, &config.engines, now).await;
         prove_cli_engines(route, config, report).await;

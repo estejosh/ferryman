@@ -23,6 +23,20 @@ What the prompt makes the agent do:
 4. The person creates their identity in the tab: the reserved name, a password, the
    24 words. Their keys land in their copy of the channel.
 
+How long the access lasts is the inviter's choice, made on every invitation, and is separate
+from how long the code works. On the dashboard the form has "Access lasts" (1, 7, 14, 30 or 90
+days, or no expiry; no default) and "Code valid for" (1, 3 or 7 days). From a terminal:
+
+```text
+ferry team invite create --name david --agent david-agent --access 30            # 30 days of access
+ferry team invite create --name david --agent david-agent --access forever       # no expiry
+ferry team invite create --name david --access 30 --expires-days 3               # code valid 3 days
+```
+
+`--access` is required (a machine added under your own identity, `--as-identity`, takes none and
+lapses with its owner). Timed access runs from the moment the grant is signed; a few days before
+it ends the inviter is asked to Renew or Let it end, and no answer lets it end. See ADR 0029.
+
 Meanwhile the inviter's Ferryman (the worker loop, or the dashboard while it is open)
 sees a device knocking under the invite's name, trusts it and shares the folder. When the
 newcomer's keys and acceptance sync back, the dashboard signs the grant the invite
