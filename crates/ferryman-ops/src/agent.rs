@@ -497,10 +497,12 @@ impl AgentConfig {
                 .cloned()
                 .with_context(|| format!("missing '{key}'"))
         };
-        let args_raw = fields
-            .get("args")
-            .cloned()
-            .unwrap_or_else(|| r#"["-p","{prompt}"]"#.to_string());
+        // No args line: the engine's own default, so a claude config written by hand or by an
+        // older version still streams instead of going silent until the watchdog kills it.
+        let command = take("command")?;
+        let args_raw = fields.get("args").cloned().unwrap_or_else(|| {
+            serde_json::to_string(&Self::default_args(&command)).unwrap_or_default()
+        });
         let args: Vec<String> = serde_json::from_str(&args_raw)
             .context("args must be a JSON array of strings, e.g. [\"-p\",\"{prompt}\"]")?;
         let number = |key: &str, default: u64| -> Result<u64> {
@@ -511,7 +513,6 @@ impl AgentConfig {
                     .with_context(|| format!("{key} must be a whole number of seconds")),
             }
         };
-        let command = take("command")?;
         let model = fields.get("model").cloned().filter(|m| !m.is_empty());
         let engines = crate::engines::parse_engines(&fields, &command, &args, model.as_deref())?;
         Ok(Self {
@@ -6247,7 +6248,10 @@ mod tests {
         let config = AgentConfig::parse("agent = \"w\"\ncommand = \"claude\"\n").unwrap();
         let (binary, args) = run_command(&config, Path::new("/ws"), "hello", &[]);
         assert_eq!(binary, "claude");
-        assert_eq!(args, vec!["-p", "hello"]);
+        assert_eq!(
+            args,
+            vec!["-p", "--output-format", "stream-json", "--verbose", "hello"]
+        );
     }
 
     #[test]
@@ -6270,7 +6274,8 @@ mod tests {
                 "/workspace",
                 "node:22",
                 "codex",
-                "-p",
+                "exec",
+                "--full-auto",
                 "hello"
             ]
         );
@@ -10004,6 +10009,14 @@ mod default_args_tests {
                 "{prompt}".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn a_claude_config_with_no_args_line_streams_too() {
+        let config =
+            AgentConfig::parse("agent = \"a\"\nrole = \"worker\"\ncommand = \"claude\"\n").unwrap();
+        assert_eq!(config.args, AgentConfig::default_args("claude"));
+        assert!(config.args.iter().any(|a| a == "stream-json"));
     }
 
     /// Claude streams events (so a long quiet run is not killed as frozen); unknown
