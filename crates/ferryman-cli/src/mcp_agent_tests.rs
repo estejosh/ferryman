@@ -1285,7 +1285,13 @@ fn the_update_tool_exists_only_in_the_admin_group() {
         .collect();
     assert_eq!(
         names,
-        ["ferry_get", "ferry_search", "ferry_status", "ferry_update"]
+        [
+            "ferry_get",
+            "ferry_invite",
+            "ferry_search",
+            "ferry_status",
+            "ferry_update"
+        ]
     );
     assert!(!core_tools().iter().any(|t| t["name"] == "ferry_update"));
 }
@@ -1468,7 +1474,7 @@ fn the_groups_add_tools_and_read_only_serves_only_the_old_ones() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names.len(), 7 + 4 + 8);
+    assert_eq!(names.len(), 7 + 5 + 8);
     assert!(
         names.contains(&"ferry_update".to_string()) && names.contains(&"list_ledger".to_string())
     );

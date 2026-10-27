@@ -1,5 +1,5 @@
 {
-  "admin_tools_list": 391,
+  "admin_tools_list": 578,
   "caps": {
     "admin_tools_list": 700,
     "catchup_busy": 1000,
@@ -8,7 +8,7 @@
   },
   "catchup_busy": 784,
   "catchup_busy_untruncated": {
-    "fresh": 760,
+    "fresh": 761,
     "with_cursor": 844
   },
   "core_tools_list": 1613,
@@ -27,10 +27,10 @@
     "ferry_ask_human raise": 50,
     "ferry_ask_human status": 48,
     "ferry_catchup": 784,
-    "ferry_join": 737,
+    "ferry_join": 738,
     "ferry_orders claim": 48,
     "ferry_orders list": 572,
-    "ferry_orders show": 140,
+    "ferry_orders show": 129,
     "ferry_primary status": 74,
     "ferry_talk post": 41,
     "ferry_talk read": 587,

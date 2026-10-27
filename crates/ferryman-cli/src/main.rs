@@ -7892,7 +7892,10 @@ async fn invite_serve(workspace: Option<PathBuf>) -> Result<()> {
     let serve = tokio::spawn(std::sync::Arc::clone(&endpoint).serve());
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        if !ferryman_iroh::invite::has_open_invites(std::slice::from_ref(&route), chrono::Utc::now()) {
+        if !ferryman_iroh::invite::has_open_invites(
+            std::slice::from_ref(&route),
+            chrono::Utc::now(),
+        ) {
             break;
         }
     }
