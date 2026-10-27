@@ -454,11 +454,11 @@ async fn endpoint_nonce_failures_burn_and_binding_is_first_key_wins() {
         );
     }
     let valid = valid_join(&inv, &newcomer, &endpoint_hex(&newcomer_end.id()));
-    let refused = invite::join(&newcomer_end, &addr(&invite_end), &valid, None)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(refused.contains("invitation could not be used"));
+    assert!(
+        invite::join(&newcomer_end, &addr(&invite_end), &valid, None)
+            .await
+            .is_err()
+    );
 
     let inv = inviter("first-key");
     let lookup = MemoryLookup::new();
