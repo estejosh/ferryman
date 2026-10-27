@@ -8699,11 +8699,11 @@ mod tests {
         assert_eq!(engine.name, "seer", "only it can see the picture");
         assert!(decision.is_some_and(|d| d.needs.iter().any(|n| n == "vision")));
 
-        // The same words with no picture: the operator's own order, plain first.
+        // Words with no picture and no code change: the operator's own order, plain first.
         let other = tempfile::tempdir().unwrap();
         let (route, config) =
             channel_with_shaped_order_for_wisp(other.path(), "t-noshot", &engines, |order| {
-                order.payload = json!({ "task": "fix the layout shown here" });
+                order.payload = json!({ "task": "say in one line what the page is for" });
             });
         let task = ferryman_channel::read_task(&route, "t-noshot").unwrap();
         let (engine, decision) = next_routed(&route, &config, &task, &[]).unwrap();

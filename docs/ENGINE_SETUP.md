@@ -32,7 +32,7 @@ the isolation note at the top of `.ferryman/agent.toml`.
 
 | Engine | Written contract | Notes |
 |---|---|---|
-| `claude` | `["-p","--output-format","stream-json","--verbose","{prompt}"]` | | Streams events so a long quiet run is not killed as frozen (the runner folds it back to the final answer). The permission grant (`--dangerously-skip-permissions`) is deliberately **not** added for you; add it yourself if you accept what it grants |
+| `claude` | `["-p","--output-format","stream-json","--verbose","{prompt}"]` | Streams events so a long quiet run is not killed as frozen; the runner folds the stream back to the final answer on stdout, progress goes to stderr. The permission grant (`--dangerously-skip-permissions`) is deliberately **not** added for you; add it yourself if you accept what it grants |
 | `opencode` | `["run","--auto","{prompt}"]` | `opencode run` is the non-interactive mode; `--auto` approves permissions not explicitly denied |
 | `codex` | `["exec","--full-auto","{prompt}"]` | |
 | *(anything else)* | `["-p","{prompt}"]` | Almost certainly wrong; edit `args`, and enable warns at setup time |
