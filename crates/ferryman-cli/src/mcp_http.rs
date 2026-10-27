@@ -253,7 +253,7 @@ pub fn run(server: Server, options: &HttpOptions, agent: &str) -> Result<()> {
     } else if eligible.is_empty() {
         bail!(
             "'{}' is not seated as a Worker or Member in any live project here, so there is nothing to serve. \
-             Seat it first (ferry channel join --as {0}); Orchestrators and the master identity are never served over HTTP",
+             Ask the master to seat it as a Worker or Member; Orchestrators and the master identity are never served over HTTP",
             cfg.agent
         );
     }
