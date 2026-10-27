@@ -2719,6 +2719,9 @@ pub struct Fleet {
     /// Reported rather than silently dropped: a project missing from this list is a
     /// project whose orders will sit unread, and that must not be discovered later.
     pub skipped: Vec<(PathBuf, String)>,
+    /// What else the plan did that a person should hear about once: a connector identity
+    /// seated in a project, or refused there (ADR 0030). Not a reason a project is unserved.
+    pub notes: Vec<String>,
 }
 
 /// Find the channels under `dir` and work out how each should be run.
@@ -2788,7 +2791,11 @@ pub fn fleet_under(dir: &Path) -> Result<Fleet> {
         }
         served.push((route, config));
     }
-    Ok(Fleet { served, skipped })
+    Ok(Fleet {
+        served,
+        skipped,
+        notes: Vec::new(),
+    })
 }
 
 /// Do one pass of available work. Returns how many tasks were acted on.

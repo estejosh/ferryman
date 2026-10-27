@@ -679,6 +679,17 @@ pub struct DirBody {
     /// `live` or `archived`.
     pub lifecycle: String,
     pub paths: Paths,
+    /// Where the project's managed clone came from (its `origin`), with any credential taken
+    /// out, so a machine that has never seen the project can clone it (ADR 0030). Optional
+    /// and signed with the rest of the entry: an entry written before this existed has none,
+    /// and readers cope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_remote: Option<String>,
+    /// The project's master, as read from its verified `master.json` on the machine that
+    /// wrote the entry (ADR 0030). A receiver files the project only when this is the
+    /// fleet's own master.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master: Option<String>,
 }
 
 fn text(path: &Path) -> String {
@@ -717,6 +728,8 @@ pub fn dir_body(root: &Root, entry: &Entry, machine: &str) -> DirBody {
             work: Some(text(&entry.work_path(root))),
             checkouts: entry.human_checkouts.iter().map(|p| text(p)).collect(),
         },
+        git_remote: None,
+        master: None,
     }
 }
 
@@ -754,6 +767,31 @@ fn machine_ok(machine: &str) -> Result<String> {
     Ok(machine)
 }
 
+/// What a machine adds to a directory entry so another machine can take the project up
+/// (ADR 0030): where the clone came from, and who the project's master is. Both are covered
+/// by the entry's signature and both are optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Advert {
+    pub git_remote: Option<String>,
+    pub master: Option<String>,
+}
+
+/// Whether `remote` is fit to put in a signed, synced file. Nothing with a password, token or
+/// user name in the address (`https://user:token@host/x`, `ssh://git@host/x`), nothing with a
+/// control character, and nothing absurdly long. The caller strips and checks it first with
+/// the root config's rules; this is the last line, so a caller's mistake cannot publish a
+/// credential.
+#[must_use]
+pub fn remote_is_clean(remote: &str) -> bool {
+    if remote.trim().is_empty() || remote.len() > 2048 || remote.chars().any(char::is_control) {
+        return false;
+    }
+    match remote.split_once("://") {
+        Some((_, rest)) => !rest.split('/').next().unwrap_or_default().contains('@'),
+        None => true,
+    }
+}
+
 /// Publish `machine`'s directory entries, one per project in the root's manifest, signed by
 /// `identity`. A file that already says the same thing is left alone.
 ///
@@ -763,6 +801,20 @@ pub fn publish_directory(
     root: &Root,
     machine: &str,
     identity: &AgentIdentity,
+) -> Result<Published> {
+    publish_directory_with(root, machine, identity, &BTreeMap::new())
+}
+
+/// [`publish_directory`], with each project's [`Advert`] (by project id). A project with no
+/// advert is published as before.
+///
+/// # Errors
+/// As [`publish_directory`].
+pub fn publish_directory_with(
+    root: &Root,
+    machine: &str,
+    identity: &AgentIdentity,
+    adverts: &BTreeMap<String, Advert>,
 ) -> Result<Published> {
     let machine = machine_ok(machine)?;
     if !exists(root) {
@@ -776,7 +828,19 @@ pub fn publish_directory(
         if !crate::is_safe_component(&entry.project_id) {
             continue;
         }
-        let body = serde_json::to_value(dir_body(root, &entry, &machine))?;
+        let mut entry_body = dir_body(root, &entry, &machine);
+        if let Some(advert) = adverts.get(&entry.project_id) {
+            entry_body.git_remote = advert
+                .git_remote
+                .clone()
+                .filter(|remote| remote_is_clean(remote));
+            entry_body.master = advert
+                .master
+                .as_deref()
+                .map(canonical_agent_name)
+                .filter(|master| crate::is_safe_component(master));
+        }
+        let body = serde_json::to_value(entry_body)?;
         let path = dir
             .join(DIRECTORY)
             .join(&entry.project_id)
@@ -926,10 +990,16 @@ pub fn read_directory(root: &Root) -> Directory {
                     continue;
                 }
             };
-            let Ok(body) = serde_json::from_value::<DirBody>(doc.body.clone()) else {
+            let Ok(mut body) = serde_json::from_value::<DirBody>(doc.body.clone()) else {
                 reject(&mut out, "the body is not a directory entry".into());
                 continue;
             };
+            // Text another machine wrote (ADR 0030): a remote with a credential in it, or a
+            // master that is not a name, is dropped; the entry still counts for where
+            // the project is.
+            body.git_remote.take_if(|remote| !remote_is_clean(remote));
+            body.master
+                .take_if(|master| !crate::is_safe_component(master));
             if body.project != project || !body.machine.eq_ignore_ascii_case(&machine) {
                 reject(&mut out, "the body names another project or machine".into());
                 continue;
@@ -990,6 +1060,36 @@ pub struct MachineBody {
     /// The fleet orders this machine has acted on (the last few).
     #[serde(default)]
     pub orders_done: Vec<String>,
+    /// The machine's all-projects worker, so a peer can put it on a project's roster
+    /// (ADR 0030). The chain is master -> the machine the master admitted -> its worker's
+    /// public key. Never a private key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerId>,
+    /// Projects this machine keeps out of its swarm (`[swarm] exclude` in its `ferry.toml`),
+    /// so a peer does not make room for a worker that will never serve them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excludes: Vec<String>,
+}
+
+/// A worker identity as a machine record names it: the name and the public half of its key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkerId {
+    pub name: String,
+    pub public_key: String,
+}
+
+impl WorkerId {
+    /// Whether this is a name a roster file can be filed under and a public key as this crate
+    /// writes one (32 bytes of lowercase hex). A record names it in text another machine wrote.
+    #[must_use]
+    pub fn is_well_formed(&self) -> bool {
+        crate::is_safe_component(&canonical_agent_name(&self.name))
+            && self.public_key.len() == 64
+            && self
+                .public_key
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
 }
 
 /// What the caller knows about the machine; the rest is read from the root.
@@ -998,6 +1098,10 @@ pub struct Facts {
     pub version: String,
     pub engines: Vec<String>,
     pub projects: Vec<String>,
+    /// This machine's all-projects worker, when it has one (ADR 0030).
+    pub worker: Option<WorkerId>,
+    /// The projects this machine keeps out of its swarm.
+    pub excludes: Vec<String>,
 }
 
 /// Publish this machine's record. Returns whether anything was written (a record that says
@@ -1029,6 +1133,8 @@ pub fn publish_machine(
         projects: facts.projects.clone(),
         last_seen: Utc::now(),
         orders_done: done,
+        worker: facts.worker.clone().filter(WorkerId::is_well_formed),
+        excludes: facts.excludes.clone(),
     };
     let body = serde_json::to_value(body)?;
     let path = dir.join(MACHINES).join(format!("{machine}.json"));
@@ -1074,10 +1180,15 @@ pub fn read_machines(root: &Root) -> (Vec<MachineRow>, Findings) {
             findings.reject(&dir, &path, why);
             continue;
         }
-        let Ok(body) = serde_json::from_value::<MachineBody>(doc.body.clone()) else {
+        let Ok(mut body) = serde_json::from_value::<MachineBody>(doc.body.clone()) else {
             findings.reject(&dir, &path, "the body is not a machine record");
             continue;
         };
+        // Text another machine wrote: a worker that is not a name and a key is dropped (the
+        // record still counts for everything else), and so is an exclusion that is not a name.
+        body.worker.take_if(|worker| !worker.is_well_formed());
+        body.excludes
+            .retain(|project| crate::is_safe_component(project));
         if !body.machine.eq_ignore_ascii_case(&name) || safe_path(&body.root).is_err() {
             findings.reject(
                 &dir,
@@ -2302,6 +2413,7 @@ mod tests {
             version: "0.6.1".into(),
             engines: vec!["claude".into()],
             projects: vec!["demo".into()],
+            ..Facts::default()
         }
     }
 
@@ -3202,5 +3314,308 @@ mod tests {
         assert!(old.join("a.pub").is_file() && old.join("b.pub").is_file());
         assert_eq!(copy_forward(&old, &new).unwrap(), 0);
         assert_eq!(copy_forward(&dir.path().join("none"), &new).unwrap(), 0);
+    }
+
+    // --- ADR 0030: what a machine adds so another can take a project up --------------------
+
+    fn worker_id(name: &str, seed: u8) -> WorkerId {
+        WorkerId {
+            name: name.into(),
+            public_key: AgentIdentity::from_seed(name, [seed; 32]).public_key_hex(),
+        }
+    }
+
+    fn adverts(remote: Option<&str>) -> BTreeMap<String, Advert> {
+        BTreeMap::from([(
+            "demo".to_owned(),
+            Advert {
+                git_remote: remote.map(str::to_owned),
+                master: Some("Josh".into()),
+            },
+        )])
+    }
+
+    #[test]
+    fn an_entry_and_a_record_written_before_these_fields_still_verify_and_read() {
+        let f = fleet();
+        // Exactly what an older build wrote: none of the new fields.
+        let old_entry = json!({
+            "project": "demo", "machine": "beastly", "root": "/r", "placement": "managed",
+            "layout": 2, "lifecycle": "live",
+            "paths": { "code": "/r/projects/demo/repo", "checkouts": [] }
+        });
+        let doc = sign("entry", "demo/beastly", old_entry, &f.beastly);
+        atomic(&entry_path(&f, "beastly"), &doc).unwrap();
+        let old_machine = json!({
+            "machine": "beastly", "version": "0.6.1", "layout": 2, "root": "/r", "os": "linux",
+            "engines": [], "projects": ["demo"], "last_seen": Utc::now(), "orders_done": []
+        });
+        let doc = sign("machine", "beastly", old_machine, &f.beastly);
+        atomic(
+            &f.root.fleet_dir().join(MACHINES).join("beastly.json"),
+            &doc,
+        )
+        .unwrap();
+
+        let directory = read_directory(&f.root);
+        assert!(
+            directory.findings.rejected.is_empty(),
+            "{:?}",
+            directory.findings.rejected
+        );
+        let body = &directory.projects["demo"]["beastly"].body;
+        assert_eq!((body.git_remote.clone(), body.master.clone()), (None, None));
+        let (rows, findings) = read_machines(&f.root);
+        assert!(findings.rejected.is_empty(), "{:?}", findings.rejected);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].body.worker.is_none() && rows[0].body.excludes.is_empty());
+
+        // And a reader that predates the fields reads a new entry: the extra keys are ignored
+        // by a struct that does not name them.
+        #[derive(Deserialize)]
+        struct OldBody {
+            project: String,
+        }
+        publish_directory_with(
+            &f.root,
+            "beastly",
+            &f.beastly,
+            &adverts(Some("https://h/x.git")),
+        )
+        .unwrap();
+        let written: Signed =
+            serde_json::from_slice(&fs::read(entry_path(&f, "beastly")).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::from_value::<OldBody>(written.body)
+                .unwrap()
+                .project,
+            "demo"
+        );
+    }
+
+    #[test]
+    fn the_new_fields_are_covered_by_the_signature() {
+        let f = fleet();
+        publish_directory_with(
+            &f.root,
+            "beastly",
+            &f.beastly,
+            &adverts(Some("https://h/x.git")),
+        )
+        .unwrap();
+        let mut machine_facts = facts();
+        machine_facts.worker = Some(worker_id("beastly-worker", 12));
+        machine_facts.excludes = vec!["phonehome".into()];
+        publish_machine(&f.root, "beastly", &f.beastly, &machine_facts).unwrap();
+        assert_eq!(
+            read_directory(&f.root).projects["demo"]["beastly"]
+                .body
+                .git_remote
+                .as_deref(),
+            Some("https://h/x.git")
+        );
+        assert!(
+            read_directory(&f.root).projects["demo"]["beastly"]
+                .body
+                .master
+                .as_deref()
+                == Some("josh")
+        );
+        assert_eq!(
+            read_machines(&f.root).0[0].body.worker,
+            machine_facts.worker
+        );
+
+        // Edit each new field after signing: nothing counts.
+        let path = entry_path(&f, "beastly");
+        let good: Signed = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        for (field, value) in [
+            ("git_remote", json!("https://evil.example/x.git")),
+            ("master", json!("mallory")),
+        ] {
+            let mut doc = good.clone();
+            doc.body[field] = value;
+            fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            let directory = read_directory(&f.root);
+            assert!(directory.projects.is_empty(), "{field} was editable");
+            assert!(
+                directory.findings.rejected[0].why.contains("signature"),
+                "{field}"
+            );
+        }
+        // Adding a field that was not there is an edit too.
+        let mut doc = good.clone();
+        doc.body.as_object_mut().unwrap().remove("git_remote");
+        fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert!(read_directory(&f.root).projects.is_empty());
+
+        let machine = f.root.fleet_dir().join(MACHINES).join("beastly.json");
+        let good: Signed = serde_json::from_slice(&fs::read(&machine).unwrap()).unwrap();
+        for (field, value) in [
+            (
+                "worker",
+                json!({"name": "mallory-worker", "public_key": worker_id("mallory-worker", 13).public_key}),
+            ),
+            ("excludes", json!([])),
+        ] {
+            let mut doc = good.clone();
+            doc.body[field] = value;
+            fs::write(&machine, serde_json::to_vec(&doc).unwrap()).unwrap();
+            let (rows, findings) = read_machines(&f.root);
+            assert!(rows.is_empty(), "{field} was editable");
+            assert!(findings.rejected[0].why.contains("signature"), "{field}");
+        }
+    }
+
+    #[test]
+    fn a_git_remote_with_credentials_is_never_published_or_read() {
+        let f = fleet();
+        for dirty in [
+            "https://user:hunter2@github.com/x/y.git",
+            "https://token@github.com/x/y.git",
+            "ssh://git@host/x.git",
+            "https://h/x.git\nsecond line",
+        ] {
+            publish_directory_with(&f.root, "beastly", &f.beastly, &adverts(Some(dirty))).unwrap();
+            let text = fs::read_to_string(entry_path(&f, "beastly")).unwrap();
+            assert!(
+                !text.contains("hunter2") && !text.contains("token@") && !text.contains("git@"),
+                "{dirty}: {text}"
+            );
+            assert!(
+                read_directory(&f.root).projects["demo"]["beastly"]
+                    .body
+                    .git_remote
+                    .is_none(),
+                "{dirty}"
+            );
+        }
+        // An entry another machine signed with a credential in it: the entry counts for where
+        // the project is; the remote is dropped on the way in.
+        let mut body = serde_json::to_value(dir_body(&f.root, &demo(&f), "beastly")).unwrap();
+        body["git_remote"] = json!("https://user:hunter2@github.com/x/y.git");
+        let doc = sign("entry", "demo/beastly", body, &f.beastly);
+        atomic(&entry_path(&f, "beastly"), &doc).unwrap();
+        let directory = read_directory(&f.root);
+        assert!(
+            directory.projects["demo"]["beastly"]
+                .body
+                .git_remote
+                .is_none()
+        );
+        // A clean one is kept.
+        publish_directory_with(
+            &f.root,
+            "beastly",
+            &f.beastly,
+            &adverts(Some("git@github.com:x/y.git")),
+        )
+        .unwrap();
+        assert_eq!(
+            read_directory(&f.root).projects["demo"]["beastly"]
+                .body
+                .git_remote
+                .as_deref(),
+            Some("git@github.com:x/y.git")
+        );
+    }
+
+    #[test]
+    fn a_worker_in_a_machine_record_must_be_a_name_and_a_public_key() {
+        let f = fleet();
+        for bad in [
+            WorkerId {
+                name: "../x".into(),
+                public_key: worker_id("a", 1).public_key,
+            },
+            WorkerId {
+                name: "ok".into(),
+                public_key: "not-a-key".into(),
+            },
+            WorkerId {
+                name: "ok".into(),
+                public_key: "AB".repeat(32),
+            },
+        ] {
+            assert!(!bad.is_well_formed());
+        }
+        // Published as such, it is not published: the record says nothing of a worker.
+        let mut with = facts();
+        with.worker = Some(WorkerId {
+            name: "ok".into(),
+            public_key: "zz".into(),
+        });
+        publish_machine(&f.root, "beastly", &f.beastly, &with).unwrap();
+        assert!(read_machines(&f.root).0[0].body.worker.is_none());
+        // Signed as such by a machine, it is dropped on the way in; the record still counts.
+        let mut body = serde_json::to_value(read_machines(&f.root).0[0].body.clone()).unwrap();
+        body["worker"] = json!({"name": "../../etc", "public_key": worker_id("a", 1).public_key});
+        body["excludes"] = json!(["fine", "../not"]);
+        let doc = sign("machine", "beastly", body, &f.beastly);
+        atomic(
+            &f.root.fleet_dir().join(MACHINES).join("beastly.json"),
+            &doc,
+        )
+        .unwrap();
+        let (rows, findings) = read_machines(&f.root);
+        assert!(findings.rejected.is_empty());
+        assert!(rows[0].body.worker.is_none());
+        assert_eq!(rows[0].body.excludes, vec!["fine".to_owned()]);
+    }
+
+    #[test]
+    fn a_peers_key_goes_on_a_roster_by_its_public_half_and_the_first_key_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::licensing::use_machine_state_dir_per_thread(dir.path().join("state"));
+        let channel = dir.path().join("comms");
+        fs::create_dir_all(&channel).unwrap();
+        let route = ProjectRoute {
+            project_id: "demo".into(),
+            workspace: dir.path().to_path_buf(),
+            attachment: dir.path().to_path_buf(),
+            communications: channel.clone(),
+            shared_remote: "demo-ferryman".into(),
+            git_remote: String::new(),
+            git_visibility: String::new(),
+            agents: Vec::new(),
+        };
+        let agent = AgentRoute {
+            name: "Peer-Worker".into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: None,
+            encryption_key: None,
+        };
+        let key = worker_id("peer-worker", 5).public_key;
+        assert!(
+            crate::register_peer_key(&route, &agent, &key).unwrap(),
+            "written"
+        );
+        assert!(
+            !crate::register_peer_key(&route, &agent, &key).unwrap(),
+            "left alone"
+        );
+        let listed: AgentRoute = serde_json::from_slice(
+            &fs::read(channel.join("agents").join("peer-worker.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(listed.public_key.as_deref(), Some(key.as_str()));
+        assert_eq!(listed.role, "worker");
+        // A different key for the same name is an error and changes nothing.
+        let other = worker_id("peer-worker", 6).public_key;
+        let error = crate::register_peer_key(&route, &agent, &other).unwrap_err();
+        assert!(format!("{error:#}").contains("different key"), "{error:#}");
+        let still: AgentRoute = serde_json::from_slice(
+            &fs::read(channel.join("agents").join("peer-worker.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(still.public_key.as_deref(), Some(key.as_str()));
+        // Not a public key at all.
+        assert!(crate::register_peer_key(&route, &agent, "hello").is_err());
+        assert!(crate::register_peer_key(&route, &agent, &"AB".repeat(32)).is_err());
+        // The machine-wide roster is not touched: the name does not look enrolled everywhere.
+        let machine_wide =
+            crate::licensing::fleet_dir().map(|d| d.join("agents").join("peer-worker.json"));
+        assert!(machine_wide.is_none_or(|path| !path.exists()));
     }
 }

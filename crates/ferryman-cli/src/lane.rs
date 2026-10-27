@@ -555,6 +555,11 @@ impl LiveLane {
             .or_else(|| self.relay_url.clone())
     }
 
+    /// Whether the lane carries the channel `id` now.
+    pub(crate) fn carries(&self, id: &str) -> bool {
+        self.lane.project_ids().iter().any(|have| have == id)
+    }
+
     /// Publish this worker's record in `route`'s channel and serve the channel from now on.
     pub(crate) fn add(&self, route: &ProjectRoute, report: &impl Progress) {
         let id = self.lane.endpoint().id();

@@ -3938,11 +3938,62 @@ pub fn register_agent_key(
     agent: &AgentRoute,
     identity: &AgentIdentity,
 ) -> Result<PathBuf> {
+    let published = first_key_wins(route, agent, &identity.public_key_hex())?;
+    // Published to the fleet channel too, so identity is the same fact wherever it is
+    // asked about. Failure here is not fatal: a machine with no per-user directory must
+    // still be able to join a project.
+    if let Some(fleet) = licensing::fleet_dir() {
+        let _ = write_roster_entry(&fleet.join("agents"), &published);
+    }
+    register_agent(route, &published)
+}
+
+/// Put another machine's agent on a roster by its PUBLIC key, under the same first-key-wins
+/// rule as [`register_agent_key`]. Returns whether a file was written: an entry that already
+/// carries exactly this key is left alone.
+///
+/// For a key this machine does not hold and must not (ADR 0030): a peer worker named in a
+/// machine record the fleet's master admitted. Nothing private is involved, nothing is
+/// minted, and the machine-wide copy that [`register_agent_key`] keeps is not touched, so
+/// the name does not look enrolled in every channel on this machine.
+///
+/// # Errors
+/// The name or role is not path-safe, the key is not a public key, or the roster already
+/// holds a DIFFERENT key for the name (nothing is changed).
+pub fn register_peer_key(
+    route: &ProjectRoute,
+    agent: &AgentRoute,
+    public_key: &str,
+) -> Result<bool> {
+    let published = first_key_wins(route, agent, public_key)?;
+    let unchanged = read_agent_roster(&route.communications)?
+        .iter()
+        .any(|a| a.name == published.name && a.public_key == published.public_key);
+    if unchanged {
+        return Ok(false);
+    }
+    register_agent(route, &published)?;
+    Ok(true)
+}
+
+/// The roster entry to publish for `agent` under `public_key`, or why it must not be.
+fn first_key_wins(
+    route: &ProjectRoute,
+    agent: &AgentRoute,
+    public_key: &str,
+) -> Result<AgentRoute> {
+    if public_key.len() != 64
+        || !public_key
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        bail!("that is not a public key (64 lowercase hex characters)");
+    }
     let published = AgentRoute {
         name: canonical_agent_name(&agent.name),
         role: agent.role.clone(),
         capabilities: agent.capabilities.clone(),
-        public_key: Some(identity.public_key_hex()),
+        public_key: Some(public_key.to_owned()),
         encryption_key: agent.encryption_key.clone(),
     };
     if let Some(existing) = read_agent_roster(&route.communications)?
@@ -3971,13 +4022,7 @@ pub fn register_agent_key(
             published.name
         )
     }
-    // Published to the fleet channel too, so identity is the same fact wherever it is
-    // asked about. Failure here is not fatal: a machine with no per-user directory must
-    // still be able to join a project.
-    if let Some(fleet) = licensing::fleet_dir() {
-        let _ = write_roster_entry(&fleet.join("agents"), &published);
-    }
-    register_agent(route, &published)
+    Ok(published)
 }
 
 /// One roster entry, written atomically.

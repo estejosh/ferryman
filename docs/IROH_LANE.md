@@ -241,9 +241,22 @@ records of that channel and nothing else, in both directions. Nothing else is op
   (a round is every 30 seconds): the same rules as any trusted peer, and the same revocation.
 
 One limit remains, deliberately: the agent's roster entry, `agents/<agent>.json`, must already
-be in the new channel on the receiving machine (from the invite, a git checkout or Syncthing).
-The lane will not carry a roster entry before trust, because a roster entry is what trust is
-made of. Without it the record is dropped and first contact simply does not happen yet.
+be in the new channel on the receiving machine. The lane will not carry a roster entry before
+trust, because a roster entry is what trust is made of. Without it the record is dropped and
+first contact simply does not happen yet.
+
+Nobody has to put it there by hand any more (ADR 0030). Each worker publishes its all-projects
+worker's NAME AND PUBLIC KEY in its signed machine record in the fleet folder, and its directory
+entries say where each project's clone came from and who masters it. On every pass a machine
+(1) puts the other admitted machines' workers on the rosters of the projects it serves, and (2)
+files a project another admitted machine advertised, as a channel with its own worker and the
+advertiser's on the roster, then clones and attaches it. Both sides then hold both roster entries
+and first contact goes through on the next round. Only records signed by the fleet master or a
+machine the master admitted count; only projects the fleet master masters; a project the
+receiving machine excludes (`[swarm] exclude`), an archived one, and one its master took out of
+the swarm are skipped; a roster entry holding a different key is never overwritten; and no
+private key ever travels. The fleet-home channel itself is added to a running lane on the pass
+after its folder appears.
 ## What moves, and what never does
 
 Every 30 seconds the worker sends each trusted peer, per shared project, a manifest

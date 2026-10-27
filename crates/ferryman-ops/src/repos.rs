@@ -39,8 +39,10 @@
 //! # Which remote
 //!
 //! In this order: `[git.remotes]` for the project, the machine's `[git] remote_template`,
-//! its `[git] fallback_template`, then the `origin` of a checkout of it this machine already
-//! has. Each is tried until one clones. A password in any of them is refused, and the origin
+//! its `[git] fallback_template`, the remote another machine of the fleet advertised when the
+//! project arrived here (ADR 0030; held in the fleet folder's `local/`, never in `ferry.toml`),
+//! then the `origin` of a checkout of it this machine already has. Each is tried until one
+//! clones. A password in any of them is refused, and the origin
 //! of a person's checkout has any credential stripped before it is used. Credentials are the
 //! machine's: a credential helper, an ssh alias, a read-only token the helper holds.
 //!
@@ -54,8 +56,10 @@
 //! runs as "repair layout".
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use ferryman_channel::ferry::{Entry, Root};
@@ -153,6 +157,64 @@ pub struct Options {
     /// Folders searched for remote helpers (`git-remote-<scheme>`) before PATH, and put in
     /// front of PATH for the git commands this runs. Empty in normal use.
     pub helper_dirs: Vec<PathBuf>,
+    /// The longest any one git command may run before it is killed and the project is
+    /// reported as not synced. `None` (a person at a terminal) waits as long as git does; a
+    /// running worker sets one, so a slow clone cannot hold up its loop for long.
+    pub git_timeout: Option<Duration>,
+}
+
+/// Run `command` to the end, or kill it when `limit` passes.
+fn run_bounded(
+    mut command: Command,
+    limit: Option<Duration>,
+) -> std::io::Result<std::process::Output> {
+    let Some(limit) = limit else {
+        return command.output();
+    };
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(std::process::Output {
+                status,
+                stdout: out.join().unwrap_or_default(),
+                stderr: err.join().unwrap_or_default(),
+            });
+        }
+        if Instant::now() >= deadline {
+            // The readers are left to finish on their own: a grandchild (a remote helper) can
+            // keep a pipe open after git is gone, and waiting for it is the stall this avoids.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("git did not finish in {} seconds", limit.as_secs()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Run git, with `extra_path` folders in front of PATH so a remote helper in one is found.
@@ -160,6 +222,7 @@ fn git_with(
     dir: Option<&Path>,
     args: &[&str],
     extra_path: &[PathBuf],
+    limit: Option<Duration>,
 ) -> std::io::Result<std::process::Output> {
     let mut command = Command::new("git");
     if let Some(dir) = dir {
@@ -186,19 +249,20 @@ fn git_with(
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000);
     }
-    command.output()
+    run_bounded(command, limit)
 }
 
 fn git_ok(dir: Option<&Path>, args: &[&str]) -> Result<String, String> {
-    git_ok_with(dir, args, &[])
+    git_ok_with(dir, args, &[], None)
 }
 
 fn git_ok_with(
     dir: Option<&Path>,
     args: &[&str],
     extra_path: &[PathBuf],
+    limit: Option<Duration>,
 ) -> Result<String, String> {
-    match git_with(dir, args, extra_path) {
+    match git_with(dir, args, extra_path, limit) {
         Ok(out) if out.status.success() => {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
         }
@@ -281,7 +345,7 @@ fn advance(clone: &Path) -> Option<String> {
 }
 
 /// The `origin` of a checkout, with any credential taken out.
-fn origin_of(checkout: &Path) -> Option<String> {
+pub(crate) fn origin_of(checkout: &Path) -> Option<String> {
     if !checkout.join(".git").exists() {
         return None;
     }
@@ -292,7 +356,7 @@ fn origin_of(checkout: &Path) -> Option<String> {
 }
 
 /// Where a project could be cloned from, best first.
-fn candidates(entry: &Entry, config: &RootConfig, root: &Root) -> Vec<String> {
+pub(crate) fn candidates(entry: &Entry, config: &RootConfig, root: &Root) -> Vec<String> {
     let mut found: Vec<String> = Vec::new();
     let mut push = |remote: String| {
         if rootconfig::check_remote(&remote).is_ok() && !found.contains(&remote) {
@@ -307,6 +371,12 @@ fn candidates(entry: &Entry, config: &RootConfig, root: &Root) -> Vec<String> {
     }
     if let Some(template) = &config.fallback_template {
         push(template.replace("{project}", &entry.project_id));
+    }
+    // What another machine of the fleet advertised when the project arrived here (ADR 0030):
+    // after this machine's own way of forming a remote, which knows its credentials, and
+    // before the origin of a checkout.
+    if let Some(remote) = crate::propagate::arrival_remote(root, &entry.project_id) {
+        push(remote);
     }
     let managed = entry.managed_clone_path(root);
     for checkout in entry
@@ -353,6 +423,26 @@ fn remote_refs(clone: &Path) -> String {
 /// Whether the clone has uncommitted changes. Information only.
 fn dirty(clone: &Path) -> bool {
     git_ok(Some(clone), &["status", "--porcelain"]).is_ok_and(|status| !status.is_empty())
+}
+
+/// Seat the root's connector identities in `project`'s fresh checkout. Says what it did in
+/// `details`; returns `"seated"` when it put something there.
+fn seat_connectors(root: &Root, project: &str, details: &mut Vec<String>) -> Option<&'static str> {
+    let entry = root
+        .read()
+        .projects
+        .into_iter()
+        .find(|entry| entry.project_id == project)?;
+    let (route, attached) = entry.route(root).ok()?;
+    if !attached {
+        return None;
+    }
+    let seats = crate::seat::seat_configured(root, &[&route]);
+    details.extend(seats.iter().filter_map(crate::seat::Seat::line));
+    seats
+        .iter()
+        .any(|seat| seat.outcome == crate::seat::Outcome::Seated)
+        .then_some("seated")
 }
 
 /// Sync one project.
@@ -455,6 +545,7 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
                     None,
                     &["clone", "--quiet", "--", remote, &target],
                     &options.helper_dirs,
+                    options.git_timeout,
                 ) {
                     Ok(_) => {
                         cloned_from = Some(remote.clone());
@@ -502,6 +593,7 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
                     Some(&managed),
                     &["fetch", "--quiet", "--prune", "origin"],
                     &options.helper_dirs,
+                    options.git_timeout,
                 ) {
                     Ok(_) => {
                         if remote_refs(&managed) != before {
@@ -561,6 +653,11 @@ fn sync_one(root: &Root, entry: &Entry, config: &RootConfig, options: &Options) 
                 details,
             };
         }
+    }
+    // The connector identities this machine serves to apps (`[seat] agents`) go into the
+    // project as soon as it has a checkout (ADR 0030).
+    if !dry && let Some(line) = seat_connectors(root, &id, &mut details) {
+        steps.push(line);
     }
     // The person's checkout the link pointed at is remembered, as information.
     if let Some(target) = linked_to

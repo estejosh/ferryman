@@ -767,6 +767,7 @@ impl WorkerPass {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             engines: engines.to_vec(),
             projects: projects.to_vec(),
+            ..home::Facts::default()
         };
         match ops::publish(&root, &identity, &machine, &facts) {
             Publish::Pending(why) => {

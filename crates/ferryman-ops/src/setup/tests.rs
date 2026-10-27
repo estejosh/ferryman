@@ -107,6 +107,7 @@ fn options(machine: &Machine) -> Options {
         retire: Vec::new(),
         exclude: Vec::new(),
         remote_template: Some(template(machine.dir.path())),
+        seat: Vec::new(),
         dry_run: false,
         service: false,
         with_syncthing: false,
@@ -417,6 +418,57 @@ fn setup_makes_the_layout_the_clone_and_the_identity_and_is_safe_to_repeat() {
         .unwrap()
         .public_key_hex();
     assert_eq!(first, again, "the key is reused, never replaced");
+}
+
+#[test]
+fn a_seat_option_lists_the_connector_and_seats_it_where_the_machine_holds_its_key() {
+    let machine = machine_with(&["quantly"]);
+    let store = ferryman_channel::licensing::machine_state_dir().unwrap();
+    let connector = AgentIdentity::from_seed("claude-ai-josh", [61u8; 32]);
+    connector.seat_in(&store).unwrap();
+    let mut opts = options(&machine);
+    opts.seat = vec!["claude-ai-josh".into(), "claude-ai-nobody".into()];
+    let mut run = |_: &str, _: &[String]| None;
+
+    // A dry run says what it would do and writes neither the list nor a key.
+    opts.dry_run = true;
+    let dry = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert!(
+        dry.seated.iter().any(|line| line.contains("would seat")),
+        "{:?}",
+        dry.seated
+    );
+    assert!(
+        rootconfig::RootConfig::load(&machine.root)
+            .seat_agents
+            .is_empty()
+    );
+
+    opts.dry_run = false;
+    let report = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
+    assert_eq!(
+        rootconfig::RootConfig::load(&machine.root).seat_agents,
+        vec!["claude-ai-josh".to_owned(), "claude-ai-nobody".to_owned()]
+    );
+    let attachment = machine.root.managed_clone("quantly").join(".ferryman");
+    let seated = AgentIdentity::load_existing("claude-ai-josh", &attachment)
+        .unwrap()
+        .expect("seated from the machine key store");
+    assert_eq!(seated.public_key_hex(), connector.public_key_hex());
+    // A name with no key here is said so, and nothing is made for it.
+    assert!(
+        AgentIdentity::load_existing("claude-ai-nobody", &attachment)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        report
+            .seated
+            .iter()
+            .any(|line| line.contains("claude-ai-nobody") && line.contains("no key")),
+        "{:?}",
+        report.seated
+    );
 }
 
 #[test]

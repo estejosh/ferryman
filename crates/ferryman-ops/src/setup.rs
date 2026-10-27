@@ -84,6 +84,9 @@ pub struct Options {
     pub exclude: Vec<String>,
     /// Where to clone projects from, written to the root's `ferry.toml` when given.
     pub remote_template: Option<String>,
+    /// Identities this machine serves to apps (an MCP connector): added to `[seat] agents`
+    /// in the root's `ferry.toml` and seated in every project it serves (ADR 0030).
+    pub seat: Vec<String>,
     pub dry_run: bool,
     /// Write and enable the service, and turn the others off.
     pub service: bool,
@@ -122,6 +125,7 @@ impl Options {
             retire: Vec::new(),
             exclude: Vec::new(),
             remote_template: None,
+            seat: Vec::new(),
             dry_run: false,
             service: false,
             with_syncthing: crate::syncthing::managed_home_exists(),
@@ -146,6 +150,8 @@ pub struct Report {
     pub service: Vec<String>,
     pub disabled: Vec<String>,
     pub excluded: Vec<String>,
+    /// Connector identities put in the projects this machine serves, and any refused.
+    pub seated: Vec<String>,
     /// What only the master can run, exact.
     pub signing: Vec<String>,
     /// What this user has to run themselves: elevation, or stopping a running process.
@@ -192,6 +198,7 @@ impl Report {
             &self.identity_lines,
         );
         section("this machine keeps out of the swarm", &self.excluded);
+        section("connector identities seated", &self.seated);
         section("service", &self.service);
         section("other workers turned off (never deleted)", &self.disabled);
         section("notes", &self.notes);
@@ -703,6 +710,38 @@ pub fn setup(root: &Root, options: &Options, scan: &Scan, run: &mut Run<'_>) -> 
     };
     report.repos = repos::sync(root, &sync_options)?;
 
+    // 3b. the connector identities this machine serves to apps, seated in every project it
+    // serves, now that each has its clone. A key it does not hold is not made.
+    for name in &options.seat {
+        if !dry {
+            rootconfig::set_seat(root, name, true)?;
+        } else if !ferryman_channel::is_safe_component(&ferryman_channel::canonical_agent_name(
+            name,
+        )) {
+            bail!("--seat '{name}' is not a name: use letters, digits, '.', '-' and '_'");
+        }
+    }
+    let mut seat_names = rootconfig::RootConfig::load(root).seat_agents;
+    seat_names.extend(
+        options
+            .seat
+            .iter()
+            .map(|name| ferryman_channel::canonical_agent_name(name)),
+    );
+    seat_names.sort();
+    seat_names.dedup();
+    if !dry {
+        report.seated = describe_seats(
+            &seat_names,
+            &crate::seat::seat_everywhere(root, &seat_names),
+        );
+    } else if !seat_names.is_empty() {
+        report.seated = seat_names
+            .iter()
+            .map(|name| format!("would seat '{name}' in every project this machine serves"))
+            .collect();
+    }
+
     // 4. identity
     let found = found_configs(root);
     let (identity, why) = choose_identity(options, scan, &found)?;
@@ -774,6 +813,39 @@ pub fn setup(root: &Root, options: &Options, scan: &Scan, run: &mut Run<'_>) -> 
     // 6. what the master signs
     signing_lines(root, options, &identity, &retired, &mut report);
     Ok(report)
+}
+
+/// One line per name for the report: how many projects it was put in, and any refusal. A
+/// name this machine holds no key for says so: nothing is made and nothing is copied.
+fn describe_seats(names: &[String], seats: &[crate::seat::Seat]) -> Vec<String> {
+    use crate::seat::Outcome;
+    let mut lines = Vec::new();
+    for name in names {
+        let mine: Vec<_> = seats.iter().filter(|seat| seat.name == *name).collect();
+        if mine.iter().any(|seat| seat.outcome == Outcome::NoKey) {
+            lines.push(format!(
+                "'{name}': this machine holds no key for it, so nothing was seated (a key is \
+                 never made here or copied from another machine)"
+            ));
+            continue;
+        }
+        let put = mine
+            .iter()
+            .filter(|seat| seat.outcome == Outcome::Seated)
+            .count();
+        let already = mine
+            .iter()
+            .filter(|seat| seat.outcome == Outcome::Already)
+            .count();
+        lines.push(format!(
+            "'{name}': seated in {put} project(s), already in {already}"
+        ));
+        lines.extend(mine.iter().filter_map(|seat| match &seat.outcome {
+            Outcome::Refused(why) => Some(format!("  {}: {why}", seat.project)),
+            _ => None,
+        }));
+    }
+    lines
 }
 
 /// The agent.toml and the key in the worker's home.

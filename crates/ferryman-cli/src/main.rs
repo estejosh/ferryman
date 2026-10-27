@@ -862,6 +862,23 @@ enum RootCommand {
         #[command(subcommand)]
         command: fleetsetup::SwarmCommand,
     },
+    /// Serve an identity to apps here (an MCP connector): put its key in every project this
+    /// machine serves, and in each new one as it arrives (ADR 0030).
+    ///
+    /// Adds the name to `[seat] agents` in the root's `ferry.toml` and seats it everywhere at
+    /// once. It uses the key this machine already holds for the name (in a project's
+    /// checkout or the machine's key store); it never makes one, never copies one to another
+    /// machine and never puts one in a channel. It gives a key file and a roster line, not
+    /// authority: the master still grants it (`ferry team approve <name> --all`). `--remove`
+    /// takes the name out of the list and leaves the keys where they are.
+    Seat {
+        /// The identity, for example `claude-ai-josh`.
+        #[arg(value_parser = agent_name)]
+        name: String,
+        /// Stop seating this name in new projects.
+        #[arg(long)]
+        remove: bool,
+    },
     /// Move a layout-1 root (comms/ repos/ work/) to layout 2: one folder per project.
     ///
     /// Dry run unless you pass --apply: a dry run writes nothing at all. Per managed
@@ -8170,8 +8187,12 @@ async fn run_fleet(
     }
     // What was last said about each project that is not open to this worker, so a pass says
     // it again only when the reason changes.
-    let mut told: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    let mut told = reevaluate
+        .as_ref()
+        .map(|reevaluate| told_at_startup(reevaluate, &fleet))
+        .unwrap_or_default();
     let mut home_pass = fleethome::WorkerPass::default();
+    let mut propagation = Propagation::default();
     loop {
         // The fleet folder (ADR 0026): publish this machine's entries, say what the fleet has
         // said, and act on what the master ordered. Best-effort: it never stops the work.
@@ -8275,6 +8296,10 @@ async fn run_fleet(
         // worker now, not at its next restart.
         if let Some(reevaluate) = &reevaluate {
             ferryman_ops::fleet::refresh_rosters(&mut fleet.served);
+            // A project another machine of the fleet created arrives here as a channel, is
+            // cloned and attached, and is served by the re-plan just below, in this same
+            // pass or the next. No restart (ADR 0030).
+            propagation.run(reevaluate, report).await;
             take_newly_approved(
                 reevaluate,
                 &mut fleet,
@@ -8283,6 +8308,12 @@ async fn run_fleet(
                 live_lane.as_ref(),
                 report,
             );
+            // The fleet folder can appear after the lane started (it arrives by Syncthing, or
+            // the master makes it): it joins the lane on the pass that finds it, the way a
+            // project does.
+            if let Some(lane) = live_lane.as_ref() {
+                follow_fleet_home(reevaluate, lane, report);
+            }
         }
 
         anchor_maintenance(&fleet.served, report).await;
@@ -8362,6 +8393,117 @@ async fn run_fleet(
     Ok(())
 }
 
+/// What a running all-projects worker remembers about projects that arrive from the fleet
+/// (ADR 0030): which clones it tried and when, and which things it has already said.
+#[derive(Default)]
+struct Propagation {
+    state: ferryman_ops::propagate::SyncState,
+    told: std::collections::BTreeSet<String>,
+}
+
+/// At most this many projects are cloned in one pass, so a burst of new projects is taken a
+/// couple per pass and the worker's own work never waits on a long queue of clones.
+const CLONES_PER_PASS: usize = 2;
+
+impl Propagation {
+    /// One pass: make room for the other machines' workers on the rosters here, file what
+    /// the fleet advertised, and clone and attach what is filed with no checkout. The git
+    /// work is blocking, so it runs off the async runtime, each command on a clock.
+    async fn run(&mut self, reevaluate: &Reevaluate, report: &impl ferryman_ops::Progress) {
+        let (root, home, agent) = (
+            reevaluate.root.clone(),
+            reevaluate.home.clone(),
+            reevaluate.config.agent.clone(),
+        );
+        let state = std::mem::take(&mut self.state);
+        let done = tokio::task::spawn_blocking(move || {
+            let mut state = state;
+            let mut events = Vec::new();
+            let Ok(machine) = ferryman_ops::identity::machine_name() else {
+                return (state, events);
+            };
+            let Ok(Some(worker)) = ferryman_channel::AgentIdentity::load_existing(&agent, &home)
+            else {
+                return (state, events);
+            };
+            ferryman_ops::propagate::remember_worker(&root, &worker);
+            events.extend(ferryman_ops::propagate::make_room(&root, &machine));
+            events.extend(ferryman_ops::propagate::receive(&root, &machine, &worker));
+            events.extend(ferryman_ops::propagate::sync_arrivals(
+                &root,
+                &mut state,
+                CLONES_PER_PASS,
+                ferryman_ops::propagate::GIT_TIMEOUT,
+                std::time::Instant::now(),
+            ));
+            (state, events)
+        })
+        .await;
+        let Ok((state, events)) = done else {
+            report.warn("could not look for projects from the fleet: the check stopped");
+            return;
+        };
+        self.state = state;
+        for event in events {
+            if self.told.insert(event.key.clone()) {
+                if event.warn {
+                    report.warn(&event.line);
+                } else {
+                    report.info(&event.line);
+                }
+            }
+        }
+    }
+}
+
+/// Put the fleet folder in the lane when it has appeared since the lane started. The worker
+/// goes on the folder's roster first so its transports record can be written there.
+fn follow_fleet_home(
+    reevaluate: &Reevaluate,
+    lane: &lane::LiveLane,
+    report: &impl ferryman_ops::Progress,
+) {
+    use ferryman_channel::fleethome;
+    if lane.carries(fleethome::PROJECT) || !fleethome::exists(&reevaluate.root) {
+        return;
+    }
+    let Ok(Some(worker)) =
+        ferryman_channel::AgentIdentity::load_existing(&reevaluate.config.agent, &reevaluate.home)
+    else {
+        return;
+    };
+    self::fleethome::WorkerPass::enrol_worker(&reevaluate.root, &worker);
+    lane.add(&fleethome::route(&reevaluate.root), report);
+    report.info("iroh lane: serving the fleet folder, which appeared after this worker started");
+}
+
+/// What the worker's startup already said about each project it does not serve, in the form
+/// [`take_newly_approved`] compares with: so a pass says a reason only when it is new.
+fn told_at_startup(
+    reevaluate: &Reevaluate,
+    fleet: &agent::Fleet,
+) -> std::collections::BTreeMap<String, String> {
+    let already = fleet
+        .served
+        .iter()
+        .map(|(route, _)| route.project_id.clone())
+        .collect();
+    let mut told = std::collections::BTreeMap::new();
+    if let Ok((plan, _)) = ferryman_ops::fleet::plan_worker_except(
+        &reevaluate.root,
+        &reevaluate.home,
+        &reevaluate.config,
+        &already,
+    ) {
+        for row in plan.rows {
+            if let ferryman_ops::fleet::Standing::Skips(why) = row.standing {
+                told.insert(row.project, why);
+            }
+        }
+    }
+    told
+}
+
 /// Start serving the projects that have become open to a running `--all-projects` worker.
 ///
 /// Each gets what a project gets at startup: the worker lock (one worker per identity per
@@ -8373,7 +8515,7 @@ fn take_newly_approved(
     locks: &mut Vec<agent::WorkerLock>,
     told: &mut std::collections::BTreeMap<String, String>,
     lane: Option<&lane::LiveLane>,
-    report: &ferryman_ops::runlog::Logged<ferryman_ops::Stdout>,
+    report: &impl ferryman_ops::Progress,
 ) {
     let found = match ferryman_ops::fleet::newly_served(
         &reevaluate.root,
@@ -8396,11 +8538,12 @@ fn take_newly_approved(
         };
         still_closed.insert(project.to_owned());
         if told.get(project).is_none_or(|said| said != reason) {
-            // The first pass repeats what startup already said about each; only a change
-            // is news after that.
-            if told.contains_key(project) {
-                report.info(&format!("  {project}: {reason}"));
-            }
+            // What startup already said about each project is in `told` (see
+            // `told_at_startup`), so this is news: a change of reason, or a project that
+            // appeared after the worker started and so was never said anything about. That
+            // one used to be recorded without a word, and a project the worker was not
+            // serving looked, from the log, like one it had not noticed.
+            report.info(&format!("  {project}: not serving yet - {reason}"));
             told.insert(project.to_owned(), reason.to_owned());
         }
     }
@@ -8542,9 +8685,15 @@ async fn agent_command(command: Agent) -> Result<()> {
             }
             fleetsetup::guard_worker_start(true, allow_second_worker)?;
             let report = worker_progress();
+            // The fleet folder's machine record names this worker, so its peers can put it on
+            // their rosters (ADR 0030). The public half only.
+            ferryman_ops::propagate::remember_worker(&root, &identity);
             let fleet = ferryman_ops::fleet::serve(plan, &identity, &config);
             for (path, why) in &fleet.skipped {
                 report.warn(&format!("  not watching {}: {why}", path.display()));
+            }
+            for note in &fleet.notes {
+                report.info(&format!("  {note}"));
             }
             if fleet.served.is_empty() {
                 bail!(
@@ -13456,6 +13605,10 @@ fn root_command(command: RootCommand) -> Result<()> {
             return fleetsetup::swarm_command(command);
         }
 
+        RootCommand::Seat { name, remove } => {
+            return fleetsetup::seat_command(&name, remove);
+        }
+
         RootCommand::Archive { project, restore } => {
             let Some(root) = ferry::find_root() else {
                 bail!("no ferry root yet - make one with `ferry root init`")
@@ -14150,6 +14303,9 @@ fn marvin_command(command: MarvinCommand) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod live_pickup_tests;
 
 #[cfg(test)]
 mod tests {
