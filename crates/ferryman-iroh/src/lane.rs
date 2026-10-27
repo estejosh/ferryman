@@ -135,9 +135,9 @@ pub fn dial_relay_for_peer(config: &IrohConfig, peer: &Peer) -> Option<RelayUrl>
     let relay = peer.relay.clone()?;
     let ours = relay_hosts(&config.relays);
     let host = relay.host_str()?;
-    if ours.iter().any(|known| known.eq_ignore_ascii_case(host)) {
-        Some(relay)
-    } else if verifier_accepts_public_relays(config) {
+    if ours.iter().any(|known| known.eq_ignore_ascii_case(host))
+        || verifier_accepts_public_relays(config)
+    {
         Some(relay)
     } else {
         None
