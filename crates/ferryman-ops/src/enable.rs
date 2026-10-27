@@ -214,6 +214,36 @@ fn person_identity_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Why `workspace` is not a place to enable: the user's home folder (a stray `.git` there
+/// makes it look like a project), or a folder inside a git repository that is not the top
+/// of it. `None` for a repository's top and for a folder under no repository at all.
+#[must_use]
+pub fn not_a_project_top(workspace: &Path) -> Option<String> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    if home.is_some_and(|home| crate::attach::same_path(Path::new(&home), workspace)) {
+        return Some(format!(
+            "{} is your home folder, not a project. Run this in a project's own folder, or              pass --workspace <folder>.",
+            workspace.display()
+        ));
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let top = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    (!crate::attach::same_path(&top, workspace)).then(|| {
+        format!(
+            "{} is inside the git repository at {} but is not its top, so enabling here would              make a channel for a folder that is not a project. Run it in {}, or pass              --workspace.",
+            workspace.display(),
+            top.display(),
+            top.display()
+        )
+    })
+}
+
 /// Why making a channel at `communications` for `project` would split it from the one it
 /// already has, or `None` when nothing is in the way.
 ///
@@ -271,6 +301,10 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // Windows canonicalisation yields \\?\X:\... , which then appeared in bridge.toml,
     // in every path in --json, and in the folder path given to Syncthing.
     let workspace = ferryman_channel::real_path(&workspace);
+
+    if let Some(why) = not_a_project_top(&workspace) {
+        bail!("{why}");
+    }
 
     let project = match request.project {
         Some(id) => id,
@@ -1203,6 +1237,31 @@ mod tests {
             "the roster entry went to the filed channel, not a new one"
         );
         assert!(real.join("agents/tester.json").is_file());
+    }
+
+    #[test]
+    fn enable_refuses_a_folder_that_is_not_the_top_of_its_repository() {
+        let dir = tempdir();
+        hermetic_machine();
+        let git = |args: &[&str], at: &Path| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(at)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"], &dir);
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let said = format!("{:#}", perform(request_in(&sub)).err().expect("refused"));
+        assert!(said.contains("not its top"), "{said}");
+        assert!(!sub.join(".ferryman").exists(), "nothing was written");
+        // The top itself is fine.
+        perform(request_in(&dir)).unwrap();
     }
 
     #[test]

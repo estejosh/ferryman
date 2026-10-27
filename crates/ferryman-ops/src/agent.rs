@@ -355,10 +355,20 @@ impl AgentConfig {
             "opencode" => vec!["run".into(), "--auto".into(), "{prompt}".into()],
             // The contract the generated config has documented all along.
             "codex" => vec!["exec".into(), "--full-auto".into(), "{prompt}".into()],
-            // Claude Code, and anything unrecognised. The permission flag Claude
-            // needs to actually work is NOT added here: it is a large grant, the
+            // Claude Code streams events, because plain `claude -p` prints nothing until
+            // it is done and the stall watchdog kills a long, healthy run as frozen.
+            // `run_agent` folds the stream back to the final answer. The permission flag
+            // Claude needs to actually work is NOT added here: it is a large grant, the
             // generated comment spells it out, and adding it uninvited would hand
             // every new worker more authority than its operator chose.
+            "claude" => vec![
+                "-p".into(),
+                "--output-format".into(),
+                "stream-json".into(),
+                "--verbose".into(),
+                "{prompt}".into(),
+            ],
+            // Anything unrecognised.
             _ => vec!["-p".into(), "{prompt}".into()],
         }
     }
@@ -642,7 +652,7 @@ role = "{role}"
 #
 # So whichever engine you use, find its non-interactive flag and put it here:
 #
-#   claude   args = ["-p","--dangerously-skip-permissions","{{prompt}}"]
+#   claude   args = ["-p","--output-format","stream-json","--verbose","--dangerously-skip-permissions","{{prompt}}"]
 #   opencode args = ["run","--auto","{{prompt}}"]
 #   codex    args = ["exec","--full-auto","{{prompt}}"]
 #
@@ -1631,12 +1641,16 @@ async fn run_agent(
         if let Some(status) = child.try_wait()? {
             let stdout = stdout_task.await??;
             let stderr = stderr_task.await??;
-            return Ok(AgentRun {
+            let mut run = AgentRun {
                 stdout,
                 stderr,
                 ok: status.success(),
                 ..AgentRun::default()
-            });
+            };
+            if config.args.iter().any(|a| a == "stream-json") {
+                fold_event_stream(&mut run);
+            }
+            return Ok(run);
         }
         poll.tick().await;
 
@@ -1727,6 +1741,42 @@ async fn run_agent(
 async fn kill_child(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
     let _ = child.wait().await;
+}
+
+/// Claude's `--output-format stream-json` run, folded back to what a plain run prints: the
+/// final `result` text alone on stdout, a short line per event on stderr (the stream is
+/// what kept the stall watchdog fed), and the usage and cost the result event reports.
+/// A stream with no `result` event is left as it was.
+fn fold_event_stream(run: &mut AgentRun) {
+    let mut progress = Vec::new();
+    let mut result: Option<Value> = None;
+    for line in run.stdout.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let kind = event.get("type").and_then(Value::as_str).unwrap_or("event");
+        if kind == "result" {
+            result = Some(event);
+        } else {
+            progress.push(format!("[claude] {kind}"));
+        }
+    }
+    let Some(result) = result else { return };
+    if result.get("is_error").and_then(Value::as_bool) == Some(true) {
+        run.ok = false;
+    }
+    run.cost_usd = result.get("total_cost_usd").and_then(Value::as_f64);
+    run.usage = engine_usage(&run.stdout);
+    run.stdout = result
+        .get("result")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let tail = progress.len().saturating_sub(20);
+    for line in &progress[tail..] {
+        run.stderr.push_str(line);
+        run.stderr.push('\n');
+    }
 }
 
 /// Read a pipe to EOF into a string, stamping `last_output` (milliseconds since
@@ -4445,10 +4495,15 @@ fn next_routed(
     }
     if policy.routing == Routing::Smart {
         let needs = ferryman_channel::work::classify_cached(&task.order, route).needs;
-        // A person's order is routed by the router only when it needs something the
-        // operator's own engine order cannot know an engine has: a modality beyond text and
-        // code (vision included).
-        if needs.modalities.iter().any(|m| !m.is_plain()) {
+        // A person's order is routed by the router when it needs something the operator's
+        // own engine order cannot know an engine has: a modality beyond text (code and
+        // vision included - an engine without code must never be handed a code order, first
+        // pick or hand-on). Plain text keeps the operator's order.
+        if needs
+            .modalities
+            .iter()
+            .any(|m| *m != ferryman_channel::capability::Modality::Text)
+        {
             let failed = failed_engines(route, task, &config.agent);
             return crate::engines::choose_routed(
                 &config.engines,
@@ -8656,6 +8711,42 @@ mod tests {
         assert!(decision.is_none());
     }
 
+    /// A person's order that needs code never goes to an engine that lacks it - not as the
+    /// first pick, and not as the hand-on after the capable engine failed. With nothing
+    /// capable left it is an error (the order is held), never a downgrade.
+    #[test]
+    fn a_code_order_is_never_handed_to_an_engine_without_code() {
+        hermetic_machine();
+        let engines = fleet(
+            "engines = [\"coder\", \"texty\"]
+             engine.coder.command = \"ferryman-no-such-engine\"
+             engine.coder.modalities = \"text, code\"
+             engine.texty.command = \"ferryman-no-such-engine\"
+             engine.texty.modalities = \"text\"
+",
+        );
+        let comms = tempfile::tempdir().unwrap();
+        let (route, config) = channel_with_shaped_order_for_wisp(
+            comms.path(),
+            "t-code",
+            &engines,
+            |order| {
+                order.payload = json!({
+                    "task": "implement the parser change in src/lib.rs, fix the failing test and commit the code",
+                });
+            },
+        );
+        let task = ferryman_channel::read_task(&route, "t-code").unwrap();
+        let first = next_routed(&route, &config, &task, &[]).unwrap().0;
+        assert_eq!(first.name, "coder");
+        let held = next_routed(&route, &config, &task, &["coder".to_string()]);
+        assert!(
+            held.is_err(),
+            "texty lacks code: {:?}",
+            held.map(|h| h.0.name)
+        );
+    }
+
     /// What the worker does with an improvement order whose kind the rules cannot tell: it asks
     /// a model to label it, once - the answer is cached for the order, and the router reads it
     /// from there - and never for a person's own order. The order's text goes out fenced as
@@ -9915,19 +10006,86 @@ mod default_args_tests {
         );
     }
 
-    /// Claude keeps the historical args, and unknown engines fall back to them
-    /// rather than to a guess. In particular the permission-granting flag Claude
-    /// needs in practice must NOT appear here: enable writes it only if the
-    /// operator adds it, because that grant is theirs to make.
+    /// Claude streams events (so a long quiet run is not killed as frozen); unknown
+    /// engines fall back to the historical args rather than to a guess. In particular the
+    /// permission-granting flag Claude needs in practice must NOT appear here: enable
+    /// writes it only if the operator adds it, because that grant is theirs to make.
     #[test]
-    fn claude_and_unknown_engines_keep_the_historical_default_without_added_grants() {
+    fn claude_streams_and_unknown_engines_keep_the_historical_default_without_added_grants() {
         let historical = vec!["-p".to_string(), "{prompt}".to_string()];
-        assert_eq!(AgentConfig::default_args("claude"), historical);
+        assert_eq!(
+            AgentConfig::default_args("claude"),
+            [
+                "-p",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "{prompt}"
+            ]
+        );
         assert_eq!(AgentConfig::default_args("./vendor/engine-x"), historical);
         assert!(
             !AgentConfig::default_args("claude")
                 .iter()
                 .any(|a| a.contains("skip"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod fold_event_stream_tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_folds_to_the_result_text_with_progress_on_stderr() {
+        let mut run = AgentRun {
+            stdout: concat!(
+                "{\"type\":\"system\"}
+",
+                "{\"type\":\"assistant\"}
+",
+                "{\"type\":\"result\",\"is_error\":false,\"result\":\"done\",",
+                "\"total_cost_usd\":0.5,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}
+"
+            )
+            .into(),
+            ok: true,
+            ..AgentRun::default()
+        };
+        fold_event_stream(&mut run);
+        assert_eq!(run.stdout, "done");
+        assert_eq!(
+            run.stderr,
+            "[claude] system
+[claude] assistant
+"
+        );
+        assert_eq!(run.cost_usd, Some(0.5));
+        assert_eq!(run.usage.map(|u| u.completion_tokens), Some(4));
+        assert!(run.ok);
+    }
+
+    #[test]
+    fn an_error_result_fails_the_run_and_a_stream_without_one_is_left_alone() {
+        let mut run = AgentRun {
+            stdout: "{\"type\":\"result\",\"is_error\":true,\"result\":\"nope\"}".into(),
+            ok: true,
+            ..AgentRun::default()
+        };
+        fold_event_stream(&mut run);
+        assert!(!run.ok);
+        assert_eq!(run.stdout, "nope");
+        let mut cut = AgentRun {
+            stdout: "{\"type\":\"assistant\"}
+"
+            .into(),
+            ..AgentRun::default()
+        };
+        fold_event_stream(&mut cut);
+        assert_eq!(
+            cut.stdout,
+            "{\"type\":\"assistant\"}
+"
         );
     }
 }

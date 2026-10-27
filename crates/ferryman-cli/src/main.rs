@@ -5542,11 +5542,20 @@ fn git_configured_email() -> Option<String> {
         return None;
     }
     let email = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    // The shape, not the deliverability: one `@`, something either side, a dot after it.
-    let plausible = email
-        .split_once('@')
-        .is_some_and(|(user, host)| !user.is_empty() && host.contains('.') && !host.ends_with('.'));
-    plausible.then_some(email)
+    plausible_email(&email).then_some(email)
+}
+
+/// The shape, not the deliverability: one `@`, something either side, a dot after it - and
+/// not a placeholder (`test@example.com`), which would register nobody and silently.
+fn plausible_email(email: &str) -> bool {
+    email.split_once('@').is_some_and(|(user, host)| {
+        let host = host.to_ascii_lowercase();
+        let placeholder = ["example.com", "example.org", "example.net"].contains(&host.as_str())
+            || ["test", "invalid", "example", "localhost", "local"]
+                .iter()
+                .any(|tld| host.ends_with(&format!(".{tld}")));
+        !user.is_empty() && host.contains('.') && !host.ends_with('.') && !placeholder
+    })
 }
 
 /// The contact address, asked for rather than demanded.
@@ -14049,8 +14058,23 @@ fn marvin_command(command: MarvinCommand) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::slug_of;
+    use super::{plausible_email, slug_of};
     use std::path::Path;
+
+    #[test]
+    fn a_placeholder_git_email_is_not_taken_as_the_contact_address() {
+        assert!(plausible_email("a@b.io"));
+        assert!(plausible_email("1+x@users.noreply.github.com"));
+        for bad in [
+            "test@example.com",
+            "t@Example.ORG",
+            "me@box.local",
+            "x@y",
+            "@z.io",
+        ] {
+            assert!(!plausible_email(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn slug_derives_from_the_directory_name() {
