@@ -363,10 +363,23 @@ impl Default for NextOptions {
     }
 }
 
+/// How long to wait for another allocation of the same counter on this machine. Generous on
+/// purpose: a loaded CI runner can starve a holder for many seconds, and giving up early
+/// fails an allocation that would have succeeded. `FERRY_COUNTER_LOCK_SECS` overrides it.
+fn lock_wait() -> StdDuration {
+    let secs = std::env::var("FERRY_COUNTER_LOCK_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(60);
+    StdDuration::from_secs(secs)
+}
+
 fn local_lock(route: &ProjectRoute, name: &str) -> Result<fs::File> {
     let dir = route.attachment.join("runtime");
     fs::create_dir_all(&dir)?;
-    let deadline = Instant::now() + StdDuration::from_secs(15);
+    let wait = lock_wait();
+    let deadline = Instant::now() + wait;
     loop {
         let file = fs::OpenOptions::new()
             .create(true)
@@ -377,7 +390,10 @@ fn local_lock(route: &ProjectRoute, name: &str) -> Result<fs::File> {
             return Ok(file);
         }
         if Instant::now() >= deadline {
-            bail!("another allocation of '{name}' has held the lock for 15s");
+            bail!(
+                "another allocation of '{name}' has held the lock for {}s",
+                wait.as_secs()
+            );
         }
         std::thread::sleep(StdDuration::from_millis(20));
     }
