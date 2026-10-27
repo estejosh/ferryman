@@ -6,6 +6,7 @@ mod fleetsetup;
 mod focus;
 mod gitanchor;
 mod lane;
+mod lanes;
 mod license;
 mod licensor;
 mod mcp;
@@ -334,6 +335,20 @@ enum Command {
     Lane {
         #[command(subcommand)]
         command: lane::LaneCommand,
+    },
+    /// Lanes: several agents, one repository. Each lane is its own worktree and branch
+    /// (`<repo>/.lanes/<lane>`, `lane/<lane>`) with paths it owns, a pre-commit hook that
+    /// refuses what another lane owns, and one serialized, rebasing way onto main.
+    /// (`ferry lane iroh` is the transport lane, a different thing.) See docs/LANES.md.
+    Lanes {
+        #[command(subcommand)]
+        command: lanes::LanesCommand,
+    },
+    /// Shared counters: decision numbers and asset ids that two agents never both take.
+    /// `ferry counter next <name>` prints the number. See docs/LANES.md.
+    Counter {
+        #[command(subcommand)]
+        command: lanes::CounterCommand,
     },
     /// Break-glass: a live terminal on one of your own machines, from anywhere, while a
     /// person on that machine keeps it open.
@@ -4553,10 +4568,12 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             }
             let report = ferryman_ops::doctor::examine(&start);
+            let lane_findings = lanes::doctor_findings(&start);
             let (workers_ok, workers) = fleetsetup::workers_line();
             if json {
                 let mut value = serde_json::to_value(&report)?;
                 value["workers"] = json!({ "ok": workers_ok, "detail": workers });
+                value["lanes"] = serde_json::to_value(&lane_findings)?;
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 println!(
@@ -4565,6 +4582,9 @@ async fn run(cli: Cli) -> Result<()> {
                     "workers",
                     workers
                 );
+                for finding in &lane_findings {
+                    println!("  {:<4} {:<17} {}", finding.level, "lanes", finding.what);
+                }
                 for check in &report.checks {
                     // Informational checks are marked as such rather than as
                     // failures: a machine without Syncthing still works locally.
@@ -5008,6 +5028,8 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Improve { command } => improve_command(command).await?,
         Command::Focus { command } => focus::command(command)?,
         Command::Lane { command } => lane::command(command).await?,
+        Command::Lanes { command } => lanes::command(command)?,
+        Command::Counter { command } => lanes::counter_command(command)?,
         Command::Suggest { project, command } => suggest::suggest(project, command).await?,
         Command::Suggestions { project, command } => {
             suggest::suggestions(project, command).await?;
@@ -13656,6 +13678,11 @@ fn root_command(command: RootCommand) -> Result<()> {
                     entry.project_id,
                     entry.channel.display()
                 );
+                let lane_lines = entry
+                    .attachment()
+                    .and_then(|a| ferryman_channel::load_route(&a).ok())
+                    .and_then(|r| ferryman_channel::lanes::summary(&r, false).ok())
+                    .unwrap_or_default();
                 match entry.repo {
                     // Said out loud, because it is the promise this layout makes: an
                     // adopted repository was never moved and never will be.
@@ -13668,6 +13695,19 @@ fn root_command(command: RootCommand) -> Result<()> {
                     }
                     Some(repo) => println!("  {:width$}  {}", "", repo.display()),
                     None => println!("  {:width$}  channel only on this machine", ""),
+                }
+                for lane in lane_lines {
+                    println!(
+                        "  {:width$}  lane {} ({}, {}) owns {}{}",
+                        "",
+                        lane.lane,
+                        lane.owner,
+                        lane.branch,
+                        lane.owns.join(","),
+                        lane.path
+                            .as_ref()
+                            .map_or_else(String::new, |p| format!("  {}", p.display()))
+                    );
                 }
             }
             // Named, not hidden. A listing that silently omits things is how this index
