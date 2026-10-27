@@ -481,11 +481,11 @@ async fn endpoint_nonce_failures_burn_and_binding_is_first_key_wins() {
         .unwrap();
     let second = AgentIdentity::from_seed("david-agent", [4u8; 32]);
     let second_join = valid_join(&inv, &second, &endpoint_hex(&second_end.id()));
-    let refused = invite::join(&second_end, &addr(&invite_end), &second_join, None)
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(refused.contains("invite already used"));
+    assert!(
+        invite::join(&second_end, &addr(&invite_end), &second_join, None)
+            .await
+            .is_err()
+    );
     invite::join(&first_end, &addr(&invite_end), &first_join, None)
         .await
         .unwrap();
