@@ -2710,10 +2710,15 @@ fn check_signature(
     let Ok(signature_bytes): Result<[u8; 64], _> = signature_bytes.try_into() else {
         return SignatureCheck::Invalid;
     };
+    let digest = readcache::signature_digest(&key_bytes, &signature_bytes, payload.as_bytes());
+    if readcache::known_good(&digest) {
+        return SignatureCheck::Valid;
+    }
     if verifying
         .verify_strict(payload.as_bytes(), &Signature::from_bytes(&signature_bytes))
         .is_ok()
     {
+        readcache::remember_good(digest);
         SignatureCheck::Valid
     } else {
         SignatureCheck::Invalid
@@ -4303,6 +4308,38 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
     // The attachment (`.ferryman`) is the operator-local, non-synced side of the
     // channel; `communications` is its `ferryman` subdirectory.
     let attachment = communications.parent().unwrap_or(communications);
+    let fleet = licensing::fleet_dir();
+    let mirror = fleet_pin_dir(attachment);
+    // Everything the read below looks at, so a remembered answer is only served while
+    // all of it is unchanged (readcache::roster).
+    let mut files = readcache::Fingerprint::default();
+    files.add_dir("agents/", &communications.join("agents"));
+    files.add_dir("pinned/", &attachment.join("agents-pinned"));
+    if let Some(mirror) = &mirror {
+        files.add_dir("mirror/", mirror);
+    }
+    if let Some(fleet) = &fleet {
+        files.add_dir("fleet/", &fleet.join("agents"));
+    }
+    let files = files.sorted();
+    let key = (
+        communications.to_path_buf(),
+        fleet.clone(),
+        mirror.is_some(),
+    );
+    if let Some(agents) = readcache::roster(&key, &files) {
+        return Ok(agents);
+    }
+    let agents = read_agent_roster_uncached(communications, attachment, fleet.as_deref())?;
+    readcache::remember_roster(key, files, &agents);
+    Ok(agents)
+}
+
+fn read_agent_roster_uncached(
+    communications: &Path,
+    attachment: &Path,
+    fleet: Option<&Path>,
+) -> Result<Vec<AgentRoute>> {
     // Folded before the pinning loop below, not after: pins are keyed by agent name, and
     // pinning `Fang` and `fang` separately would re-create the split in the one
     // store whose whole job is to notice when an agent's key changes.
@@ -4342,7 +4379,7 @@ pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {
     // An agent's public key should not depend on which repository you ask about. The
     // fleet channel is where identity belongs; the project copy stays authoritative for
     // anyone already in it, so an existing channel keeps verifying exactly as it did.
-    if let Some(fleet) = licensing::fleet_dir() {
+    if let Some(fleet) = fleet {
         for entry in fold_case_variants(read_roster_in(&fleet.join("agents"))?) {
             if !agents.iter().any(|known| known.name == entry.name) {
                 agents.push(entry);
@@ -9768,6 +9805,116 @@ mod identity_tests {
         assert_eq!(carried.trim(), real.public_key_hex());
         // The old file is left where it is rather than deleted.
         assert!(attachment.join("agents-pinned").join("fang.key").is_file());
+    }
+
+    /// Every file under `dir`, dated `secs` into the past: old enough for a read to be kept.
+    fn settled(dir: &Path, secs: u64) {
+        let when = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        for entry in walkdir_files(dir) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&entry)
+                .unwrap();
+            file.set_modified(when).unwrap();
+        }
+    }
+
+    fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walkdir_files(&path));
+            } else {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// A remembered roster is served only while its files are unchanged, and a key
+    /// overwritten in the shared folder after that is still reverted to the pin.
+    #[test]
+    fn a_remembered_roster_is_read_again_when_a_file_changes_and_pins_still_win() {
+        hermetic_machine();
+        let dir = tempfile::tempdir().unwrap();
+        let attachment = dir.path().join(".ferryman");
+        let communications = attachment.join("ferryman");
+        let fang = AgentIdentity::from_seed("fang", [7u8; 32]);
+        let impostor = AgentIdentity::from_seed("mallory", [9u8; 32]);
+        published(
+            &communications.join("agents"),
+            "fang",
+            &fang.public_key_hex(),
+        );
+        // First sight pins fang; then everything is old enough to be remembered.
+        read_agent_roster(&communications).unwrap();
+        settled(&attachment, 60);
+        let first = read_agent_roster(&communications).unwrap();
+        assert_eq!(first, read_agent_roster(&communications).unwrap());
+
+        // A new agent appears: seen at once, though it was written a moment ago.
+        let wisp = AgentIdentity::from_seed("wisp", [3u8; 32]);
+        published(
+            &communications.join("agents"),
+            "wisp",
+            &wisp.public_key_hex(),
+        );
+        let roster = read_agent_roster(&communications).unwrap();
+        assert!(roster.iter().any(|a| a.name == "wisp"));
+
+        // A peer overwrites fang's key after the roster was remembered.
+        settled(&attachment, 60);
+        read_agent_roster(&communications).unwrap();
+        published(
+            &communications.join("agents"),
+            "fang",
+            &impostor.public_key_hex(),
+        );
+        let roster = read_agent_roster(&communications).unwrap();
+        let read = roster.iter().find(|a| a.name == "fang").unwrap();
+        assert_eq!(
+            read.public_key.as_deref(),
+            Some(fang.public_key_hex().as_str()),
+            "the pin must still override a forged entry written after the cache filled"
+        );
+    }
+
+    /// A signature remembered as good vouches for those exact bytes and nothing else.
+    #[test]
+    fn a_remembered_good_signature_does_not_cover_other_bytes_or_signers() {
+        let fang = AgentIdentity::from_seed("fang", [7u8; 32]);
+        let wisp = AgentIdentity::from_seed("wisp", [3u8; 32]);
+        let route = |identity: &AgentIdentity, name: &str| AgentRoute {
+            name: name.into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
+        };
+        let roster = vec![route(&fang, "fang")];
+        let payload = "an order to ship";
+        let signature = hex::encode(fang.signing.sign(payload.as_bytes()).to_bytes());
+        let by = "fang".to_string();
+        for _ in 0..2 {
+            assert_eq!(
+                check_signature(Some(&by), Some(&signature), payload, &roster),
+                SignatureCheck::Valid
+            );
+        }
+        assert_eq!(
+            check_signature(Some(&by), Some(&signature), "an order to delete", &roster),
+            SignatureCheck::Invalid
+        );
+        // The same name with another key on the roster: the remembered verdict is not it.
+        let forged_roster = vec![route(&wisp, "fang")];
+        assert_eq!(
+            check_signature(Some(&by), Some(&signature), payload, &forged_roster),
+            SignatureCheck::Invalid
+        );
     }
 
     /// A machine that has never seen this agent pins under the new name only.
