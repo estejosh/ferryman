@@ -1611,6 +1611,7 @@ dependencies = [
  "clap",
  "ferryman-channel",
  "ferryman-core",
+ "ferryman-iroh",
  "fs2",
  "futures-util",
  "hex",

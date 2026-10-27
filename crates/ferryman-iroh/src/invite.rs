@@ -521,11 +521,15 @@ impl InviteEndpoint {
             Ok(Ok(Message::Accept(accept))) => self.process_accept(&accept),
             _ => Err(refuse()),
         };
-        if outcome.is_err() {
+        if let Err(error) = outcome {
             let _ = write_frame(
                 &mut send,
                 &Reply::Refused {
-                    reason: refuse().to_string(),
+                    reason: if error.to_string() == "invite already used" {
+                        "invite already used".to_string()
+                    } else {
+                        refuse().to_string()
+                    },
                 },
             )
             .await;
@@ -544,6 +548,15 @@ impl InviteEndpoint {
             .iter()
             .find(|r| r.project_id == join.project)
             .ok_or_else(refuse)?;
+        if let Ok(Some(invite)) = ferryman_channel::invite::read(route, &join.invite_id)
+            && invite.endpoint.is_some()
+            && ferryman_channel::invite::is_open(&invite, chrono::Utc::now())
+            && join.project == invite.project_id
+            && !ferryman_channel::invite::nonce_matches(&invite, &join.nonce)
+        {
+            record_failure(route, &invite.id)?;
+            return Err(refuse());
+        }
         let invite = verify_join(route, join, chrono::Utc::now())?;
         self.bind_reservation(route, join)?;
         clear_failures(route, &invite.id);
@@ -581,6 +594,25 @@ impl InviteEndpoint {
     /// binding record. First-key-wins is unchanged.
     fn bind_reservation(&self, route: &ProjectRoute, join: &Join) -> Result<()> {
         let agent = canonical_agent_name(&join.agent);
+        let bind_path = route
+            .communications
+            .join("invites")
+            .join(format!("{}.bind.json", join.invite_id));
+        if bind_path.is_file() {
+            let existing: serde_json::Value = serde_json::from_slice(&std::fs::read(&bind_path)?)?;
+            let same_key = existing
+                .get("bound_key")
+                .and_then(serde_json::Value::as_str)
+                == Some(join.agent_key.as_str());
+            let same_agent = existing
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|name| canonical_agent_name(name) == agent);
+            if !same_key || !same_agent {
+                bail!("invite already used");
+            }
+            return Ok(());
+        }
         let role = ferryman_channel::read_agent_roster(&route.communications)?
             .into_iter()
             .find(|a| canonical_agent_name(&a.name) == agent)
@@ -813,7 +845,65 @@ pub fn verify_welcome(files: &BTreeMap<String, Vec<u8>>, project: &str) -> Resul
 
 /// Write the verified Welcome files atomically: everything lands, or nothing does.
 pub fn write_welcome(route: &ProjectRoute, files: &BTreeMap<String, Vec<u8>>) -> Result<()> {
+    let mut allowed = 0usize;
+    for rel in files.keys() {
+        if rel.starts_with('/') || rel.contains('\\') {
+            bail!("welcome contains an unsafe path");
+        }
+        let parts: Vec<_> = rel.split('/').collect();
+        if parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        {
+            bail!("welcome contains an unsafe path");
+        }
+        let valid = match parts.as_slice() {
+            [name] => *name == "master.json",
+            [folder, name]
+                if *folder == "agents" || *folder == "transports" || *folder == "invites" =>
+            {
+                name.ends_with(".json")
+                    && ferryman_channel::is_safe_component(name.trim_end_matches(".json"))
+            }
+            _ => false,
+        };
+        if !valid {
+            bail!("welcome contains an unlisted file");
+        }
+        if rel.starts_with("transports/") {
+            allowed += 1;
+        }
+    }
+    let master: ferryman_channel::master::MasterDeclaration =
+        serde_json::from_slice(files.get("master.json").context("missing master.json")?)?;
+    let transport_path = files
+        .keys()
+        .find(|path| path.starts_with("transports/"))
+        .context("missing inviter transports")?;
+    let transport: ferryman_channel::transports::Transports =
+        serde_json::from_slice(&files[transport_path])?;
+    let invite_path = files
+        .keys()
+        .find(|path| path.starts_with("invites/") && path.ends_with(".json"))
+        .context("missing invite record")?;
+    let invite: ferryman_channel::invite::Invite = serde_json::from_slice(&files[invite_path])?;
+    let mut expected = std::collections::BTreeSet::from([
+        "master.json".to_string(),
+        format!("agents/{}.json", canonical_agent_name(&master.master)),
+        format!("agents/{}.json", canonical_agent_name(&transport.agent)),
+        transport_path.clone(),
+        invite_path.clone(),
+    ]);
+    if let Some(operator) = invite.operator.as_deref() {
+        expected.insert(format!("agents/{}.json", canonical_agent_name(operator)));
+    }
+    if files.keys().cloned().collect::<std::collections::BTreeSet<_>>() != expected
+        || allowed != 1
+    {
+        bail!("welcome does not contain the required files");
+    }
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
     for (rel, bytes) in files {
         let mut path = route.communications.clone();
         for part in rel.split('/') {
@@ -823,11 +913,38 @@ pub fn write_welcome(route: &ProjectRoute, files: &BTreeMap<String, Vec<u8>>) ->
             std::fs::create_dir_all(parent)?;
         }
         let temp = path.with_extension("welcome.tmp");
-        std::fs::write(&temp, bytes)?;
+        if path.exists() {
+            let backup = path.with_extension("welcome.backup");
+            std::fs::rename(&path, &backup)?;
+            backups.push((backup, path.clone()));
+        }
+        if let Err(error) = std::fs::write(&temp, bytes) {
+            for (left, _) in &staged {
+                let _ = std::fs::remove_file(left);
+            }
+            for (backup, original) in &backups {
+                let _ = std::fs::rename(backup, original);
+            }
+            return Err(error.into());
+        }
         staged.push((temp, path));
     }
     for (temp, path) in &staged {
-        std::fs::rename(temp, path)?;
+        if let Err(error) = std::fs::rename(temp, path) {
+            for (left, _) in &staged {
+                let _ = std::fs::remove_file(left);
+            }
+            for (_, path) in &staged {
+                let _ = std::fs::remove_file(path);
+            }
+            for (backup, original) in &backups {
+                let _ = std::fs::rename(backup, original);
+            }
+            return Err(error.into());
+        }
+    }
+    for (backup, _) in backups {
+        let _ = std::fs::remove_file(backup);
     }
     Ok(())
 }

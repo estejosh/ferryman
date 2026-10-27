@@ -319,6 +319,29 @@ fn a_tampered_welcome_is_refused_before_anything_is_written() {
 }
 
 #[test]
+fn welcome_writer_rejects_traversal_and_unlisted_files_before_writing() {
+    let inv = inviter("welcome-paths");
+    let newcomer_route = route(inv._dir.path(), "welcome-paths-new");
+    let files = invite::welcome_files(&inv.route, &inv.invite, "fang").unwrap();
+    let mut traversal = files.clone();
+    traversal.insert("../x.json".into(), b"nope".to_vec());
+    assert!(invite::write_welcome(&newcomer_route, &traversal).is_err());
+    assert!(
+        !newcomer_route
+            .communications
+            .parent()
+            .unwrap()
+            .join("x.json")
+            .exists()
+    );
+
+    let mut extra = files;
+    extra.insert("secrets.json".into(), b"nope".to_vec());
+    assert!(invite::write_welcome(&newcomer_route, &extra).is_err());
+    assert!(!newcomer_route.communications.join("secrets.json").exists());
+}
+
+#[test]
 fn a_generic_invite_joins_as_guest_then_accepts_from_a_new_operator() {
     let dir = tempfile::tempdir().unwrap();
     let mut route = route(dir.path(), "generic");
@@ -403,4 +426,67 @@ async fn the_invite_endpoint_refuses_channel_sync_and_the_lane_refuses_invite() 
         .unwrap_or(true),
         "the lane must refuse ferryman/invite/1"
     );
+}
+
+#[tokio::test]
+async fn endpoint_nonce_failures_burn_and_binding_is_first_key_wins() {
+    let inv = inviter("endpoint-security");
+    let lookup = MemoryLookup::new();
+    let invite_end = endpoint(SecretKey::generate(), &lookup, vec![INVITE_ALPN.to_vec()]).await;
+    let newcomer_end = endpoint(SecretKey::generate(), &lookup, vec![]).await;
+    lookup.add_endpoint_info(addr(&invite_end));
+    lookup.add_endpoint_info(addr(&newcomer_end));
+    let service = InviteEndpoint::new(
+        invite_end.clone(),
+        vec![inv.route.clone()],
+        AgentIdentity::from_seed("fang", [1u8; 32]),
+    );
+    tokio::spawn(Arc::clone(&service).serve());
+    let newcomer = AgentIdentity::from_seed("david-agent", [3u8; 32]);
+    let mut wrong = valid_join(&inv, &newcomer, &endpoint_hex(&newcomer_end.id()));
+    wrong.nonce = "00".repeat(16);
+    wrong.signature = newcomer.sign_bytes(invite::join_payload(&wrong).as_bytes());
+    for _ in 0..5 {
+        assert!(
+            invite::join(&newcomer_end, &addr(&invite_end), &wrong, None)
+                .await
+                .is_err()
+        );
+    }
+    let valid = valid_join(&inv, &newcomer, &endpoint_hex(&newcomer_end.id()));
+    let refused = invite::join(&newcomer_end, &addr(&invite_end), &valid, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("invitation could not be used"));
+
+    let inv = inviter("first-key");
+    let lookup = MemoryLookup::new();
+    let invite_end = endpoint(SecretKey::generate(), &lookup, vec![INVITE_ALPN.to_vec()]).await;
+    let first_end = endpoint(SecretKey::generate(), &lookup, vec![]).await;
+    let second_end = endpoint(SecretKey::generate(), &lookup, vec![]).await;
+    for ep in [&invite_end, &first_end, &second_end] {
+        lookup.add_endpoint_info(addr(ep));
+    }
+    let service = InviteEndpoint::new(
+        invite_end.clone(),
+        vec![inv.route.clone()],
+        AgentIdentity::from_seed("fang", [1u8; 32]),
+    );
+    tokio::spawn(Arc::clone(&service).serve());
+    let first = AgentIdentity::from_seed("david-agent", [3u8; 32]);
+    let first_join = valid_join(&inv, &first, &endpoint_hex(&first_end.id()));
+    invite::join(&first_end, &addr(&invite_end), &first_join, None)
+        .await
+        .unwrap();
+    let second = AgentIdentity::from_seed("david-agent", [4u8; 32]);
+    let second_join = valid_join(&inv, &second, &endpoint_hex(&second_end.id()));
+    let refused = invite::join(&second_end, &addr(&invite_end), &second_join, None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("invite already used"));
+    invite::join(&first_end, &addr(&invite_end), &first_join, None)
+        .await
+        .unwrap();
 }

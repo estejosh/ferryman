@@ -38,9 +38,10 @@ One master (Josh) over both. David's dashboard shows one project because
 only one syncs to him. Josh's shows both.
 
 **2. Invite.** Teammates → *Add someone* → reserve `david` on
-`redaktly-business`. Today this reserves the name; David creates his own
-identity on his own machine. Send him the `Ferryman-Setup` file and the
-Syncthing folder invitation for `redaktly-business` only. That pair is the
+`redaktly-business`. An iroh-enabled machine produces a `ferry2.` code; send David that
+code and nothing else. `ferry team invite accept <code> --email <theirs>` carries the
+bootstrap over the invite endpoint without starting, trusting, or sharing Syncthing. A
+legacy `ferry1.` code still uses the existing Syncthing folder invitation. That pair is the
 "link and login" - his login is a password he sets on his own machine, and
 his machine never sees Josh's.
 
@@ -104,7 +105,8 @@ Until then, two channels and a sealed token do the job.
 ## The message a teammate receives now
 
 Teammates -> *Make the code* on the inviter's dashboard produces a prompt the newcomer
-pastes into their Claude; see `JOIN_PROMPT.md`. No terminal on their side.
+pastes into their Claude; see `JOIN_PROMPT.md`. For a `ferry2.` code there is no Syncthing
+step; the only human step after the command is creating the identity in the browser.
 
 ## The three-line target
 

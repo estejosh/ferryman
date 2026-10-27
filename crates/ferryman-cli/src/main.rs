@@ -8440,6 +8440,13 @@ async fn run_fleet(
     prepare_work_folders(fleet.served.iter().map(|(route, _)| route), report);
     // The iroh lane, when this machine has it on: the channels as repaired above, served
     // and synced in the background beside Syncthing for as long as this worker runs.
+    let invite_identity = iroh.as_ref().map(|worker| {
+        (
+            worker.identity().name().to_string(),
+            worker.identity().seed_bytes(),
+        )
+    });
+    let mut invite_task = None;
     let mut live_lane = None;
     if let Some(iroh) = iroh {
         let mut routes: Vec<ferryman_channel::ProjectRoute> = fleet
@@ -8455,8 +8462,39 @@ async fn run_fleet(
             fleethome::WorkerPass::enrol_worker(&root, iroh.identity());
             routes.push(ferryman_channel::fleethome::route(&root));
         }
+        if ferryman_iroh::invite::has_open_invites(&routes, chrono::Utc::now()) {
+            let root = ferryman_channel::ferry::find_root();
+            match (root, invite_identity.clone(), ferryman_iroh::machine_dir()) {
+                (Some(root), Some((name, seed)), Ok(machine_dir)) => {
+                    match ferryman_iroh::load_or_create_invite_key(&machine_dir) {
+                        Ok((key, _)) => match ferryman_iroh::invite::InviteEndpoint::bind(
+                            &ferryman_iroh::IrohConfig::load(&root.path),
+                            key,
+                            routes.clone(),
+                            ferryman_channel::AgentIdentity::from_seed(&name, seed),
+                        )
+                        .await
+                        {
+                            Ok(endpoint) => {
+                                report.info("iroh invite endpoint serving open invitations");
+                                invite_task =
+                                    Some(tokio::spawn(std::sync::Arc::clone(&endpoint).serve()));
+                            }
+                            Err(error) => {
+                                report.warn(&format!("iroh invite endpoint not started: {error:#}"))
+                            }
+                        },
+                        Err(error) => {
+                            report.warn(&format!("iroh invite key unavailable: {error:#}"))
+                        }
+                    }
+                }
+                _ => report.warn("iroh invite endpoint not started: no machine state"),
+            }
+        }
         live_lane = iroh.start(routes, report).await;
     }
+    let _invite_task_alive = &invite_task;
     // What was last said about each project that is not open to this worker, so a pass says
     // it again only when the reason changes.
     let mut told: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();

@@ -795,20 +795,61 @@ async fn create_operator(
     // moment the acceptance can be written - signed by the identity just made. This
     // machine's agent, if enable made one, rides along as theirs.
     let mut joined = None;
-    if let Some(code) = ferryman_channel::invite::take_pending_code(&state.route)
-        && let Ok(device) = ferryman_channel::syncthing_my_id()
-    {
-        let agent = machine_agent_name(&state.route);
-        match ferryman_channel::invite::write_acceptance(
-            &state.route,
-            &identity,
-            &code,
-            &device,
-            identity.name(),
-            agent.as_deref(),
-        ) {
-            Ok(_) => joined = Some(code.project.clone()),
-            Err(err) => tracing::warn!("could not write the invitation acceptance: {err:#}"),
+    if let Some(code) = ferryman_channel::invite::take_pending_code(&state.route) {
+        if code.endpoint.is_some() {
+            let root = ferryman_channel::ferry::find_root();
+            let sent = async {
+                let root = root.ok_or_else(|| anyhow::anyhow!("no ferry root"))?;
+                let machine_dir = ferryman_iroh::machine_dir()?;
+                let (key, _) = ferryman_iroh::load_or_create_key(&machine_dir)?;
+                let lane_id = ferryman_iroh::endpoint_hex(&key.public());
+                let endpoint =
+                    ferryman_iroh::lane::bind(&ferryman_iroh::IrohConfig::load(&root.path), key)
+                        .await?;
+                let acceptance = ferryman_channel::invite::build_acceptance(
+                    &identity,
+                    &code,
+                    &lane_id,
+                    identity.name(),
+                    code.agent.as_deref(),
+                );
+                let operator_entry = ferryman_channel::AgentRoute {
+                    name: identity.name().to_string(),
+                    role: "operator".to_string(),
+                    capabilities: vec!["messages.receive".to_string()],
+                    public_key: Some(identity.public_key_hex()),
+                    encryption_key: None,
+                };
+                let result = ferryman_iroh::invite::send_accept(
+                    &endpoint,
+                    &ferryman_iroh::invite::inviter_addr(&code)?,
+                    ferryman_iroh::invite::Accept {
+                        acceptance,
+                        operator_entry: (code.operator.is_none()).then_some(operator_entry),
+                    },
+                )
+                .await;
+                endpoint.close().await;
+                result
+            }
+            .await;
+            match sent {
+                Ok(()) => joined = Some(code.project.clone()),
+                Err(err) => tracing::warn!("could not send the v2 invitation acceptance: {err:#}"),
+            }
+        } else if let Ok(device) = ferryman_channel::syncthing_my_id() {
+            let agent = machine_agent_name(&state.route);
+            match ferryman_channel::invite::write_acceptance(
+                &state.route,
+                &identity,
+                &code,
+                &device,
+                identity.name(),
+                agent.as_deref(),
+            ) {
+                Ok(_) => joined = Some(code.project.clone()),
+                Err(err) => tracing::warn!("could not write the invitation acceptance: {err:#}"),
+            }
         }
     }
 

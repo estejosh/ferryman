@@ -123,8 +123,25 @@ fn fleet_host_pins(config: &IrohConfig) -> Vec<(String, [u8; 32])> {
 /// on iroh's public relays is reachable from a machine whose plan is "our relays only",
 /// without the second machine ever homing there or sending the relay token there.
 #[must_use]
-pub fn verifier_accepts_public_relays(_config: &IrohConfig) -> bool {
-    true
+pub fn verifier_accepts_public_relays(config: &IrohConfig) -> bool {
+    !config.direct_only && !config.public_relays
+}
+
+/// Select a peer's signed relay for dialing only. A relay named by this machine is already
+/// in its home map; a different relay is admitted only to the public-CA verifier. It is never
+/// added to the home map and therefore never receives this machine's relay token.
+#[must_use]
+pub fn dial_relay_for_peer(config: &IrohConfig, peer: &Peer) -> Option<RelayUrl> {
+    let relay = peer.relay.clone()?;
+    let ours = relay_hosts(&config.relays);
+    let host = relay.host_str()?;
+    if ours.iter().any(|known| known.eq_ignore_ascii_case(host)) {
+        Some(relay)
+    } else if verifier_accepts_public_relays(config) {
+        Some(relay)
+    } else {
+        None
+    }
 }
 
 /// The host part of each relay URL, for telling our relays from public ones.
@@ -405,6 +422,7 @@ pub struct Lane {
     /// later (`fallback_public_relays`): the endpoint shares it, so an entry added here is
     /// seen by iroh.
     fallback_map: Mutex<Option<RelayMap>>,
+    allow_public_relay_dial: Mutex<bool>,
 }
 
 impl Lane {
@@ -433,6 +451,7 @@ impl Lane {
             status_file,
             local_agents: Mutex::new(Vec::new()),
             fallback_map: Mutex::new(None),
+            allow_public_relay_dial: Mutex::new(false),
         })
     }
 
@@ -449,6 +468,10 @@ impl Lane {
             .fallback_map
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = fallback;
+        *self
+            .allow_public_relay_dial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = expected;
     }
 
     /// Note (or clear, with `None`) a fault in the relay configuration, for the health check.
@@ -779,8 +802,13 @@ impl Lane {
     /// The peer cannot be reached, refuses, or breaks the protocol.
     pub async fn sync_peer(&self, id: EndpointId, peer: &Peer) -> Result<Outcome> {
         let mut addr = EndpointAddr::new(id);
-        if let Some(relay) = &peer.relay {
-            addr = addr.with_relay_url(relay.clone());
+        if let Some(relay) = peer.relay.clone().filter(|_| {
+            *self
+                .allow_public_relay_dial
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }) {
+            addr = addr.with_relay_url(relay);
         }
         let connection = tokio::time::timeout(CONNECT_TIMEOUT, self.endpoint.connect(addr, ALPN))
             .await
@@ -1321,9 +1349,18 @@ mod relay_tests {
         // The home relay map is ours only: no public relay is homed.
         let mode = relay_mode(&cfg).unwrap();
         assert_eq!(urls(&mode), ["https://162.35.10.46/"]);
-        // But a peer homed on a public relay can still be DIALED through it: the verifier
-        // accepts a public-CA relay for any host that is not one of ours.
-        assert!(verifier_accepts_public_relays(&cfg));
+        let peer = Peer {
+            relay: Some("https://use1-1.relay.n0.iroh.link".parse().unwrap()),
+            ..Peer::default()
+        };
+        // The peer's signed public relay is selected for dialing, but it is absent from the
+        // home map above, so the endpoint never homes there or sends it our token.
+        assert_eq!(
+            dial_relay_for_peer(&cfg, &peer).unwrap().host_str(),
+            Some("use1-1.relay.n0.iroh.link")
+        );
+        let direct = config("direct_only = true\n", dir.path());
+        assert!(dial_relay_for_peer(&direct, &peer).is_none());
     }
 
     #[tokio::test]
