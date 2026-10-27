@@ -167,6 +167,22 @@ ferry fleet order restart-worker                        # have the fleet pick th
 
 Running a relay on a fleet machine (`ferry relay serve`) is not built; see ADR 0027.
 
+### The Hive rescue channel (opt-in, `--features hive-rescue`)
+
+When a machine is cut off from the relay and from every peer, it has no way to learn that the relay moved. The rescue channel is a last-resort mailbox on the Hive blockchain: one fleet account, one sealed, master-signed `custom_json` only when it is needed, read by cut-off machines that poll a few Hive nodes.
+
+- **Off by default**, in a separate crate (`ferryman-hive-rescue`) and behind a CLI feature. `[hive_rescue] enabled = true` in `ferry.toml` turns it on.
+- **The record grants nothing.** It says where to reach the master (an iroh endpoint id, optionally relay URL) and which rescue relay to try. A reader verifies the signature against the roster, then iroh's normal peer checks still apply.
+- **Posted** by the master after `cut_off_minutes` (15) cut off from relay and peers, re-posted every `repost_minutes` (45) while still cut off, and when the relay list changes. A non-master `backup` poster is optional (cut off and no fresh master record for 60 minutes). Routine posting is off.
+- **Sealed** to the roster members that published an `encryption_key`: a per-record ephemeral X25519 key wraps a content key for each member, the body is ChaCha20-Poly1305. Anyone reading Hive sees only ciphertext of about 80 bytes per member.
+- **Replay**: per-signer sequence numbers and an expiry (60 minutes). The numbers are kept in the machine's state file, written to disk before a record is used, with the previous good copy beside it. A machine that starts with no readable state takes only records issued from five minutes before it started on, so a lost file cannot be used to replay an hour-old record. A record cached from before a restart is checked again when the lane starts (signature, revocation, expiry), and what a record taught iroh (its addresses, and the relays it added) is taken back when it expires.
+- **Reading**: anyone can put entries in an account's history (a dust transfer), so a reader asks the node for `custom_json` only and pages back through the history until a record that counts turns up, at most 2,000 operations, 7 days and 40 pages per node. A node's answer over 1 MiB, or an operation over 16 KiB, is dropped before it is parsed.
+- **Who counts**: a revoked machine's records count for nothing. A backup record may point only at the backup machine's own iroh endpoint (the one its own TRANSPORTS record names), and the relay it names is not added to the shared relay map; only the master's relays are.
+- **Keys**: the fleet account's own keys are never on a machine. The poster signs with its own posting key via account-authority delegation; set `HIVE_RESCUE_ACCOUNT` (the fleet account), `HIVE_RESCUE_POSTING_KEY` and optionally `HIVE_RESCUE_POSTER` in the environment or in the file `secrets_env` names. The key is never logged, and the text of the key and of the file are wiped from memory once read. Before every post the node is asked for the account's keys: the key must be one of its posting keys, and is refused if it is also an owner, active or memo key (with a delegated poster, the fleet account's posting authority must list the poster).
+- **CLI**: `ferry rescue hive status | post --dry-run | read | mock` (the plain `ferry rescue` stays the break-glass terminal).
+
+See `docs/testing/rescue-drill.md` for the drill.
+
 ## Is the lane healthy? Alerts
 
 Once per worker pass the lane works out what is wrong with itself, from what it last did:

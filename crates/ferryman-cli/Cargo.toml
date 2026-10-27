@@ -9,11 +9,17 @@ default-run = "ferry"
 name = "ferry"
 path = "src/main.rs"
 
+[features]
+# The Hive rescue channel (ADR 0027): opt-in, off by default.
+hive-rescue = ["dep:ferryman-hive-rescue", "dep:iroh"]
+
 [dependencies]
 anyhow.workspace = true
 chrono.workspace = true
 ferryman-channel = { path = "../ferryman-channel" }
 ferryman-iroh = { path = "../ferryman-iroh" }
+ferryman-hive-rescue = { path = "../ferryman-hive-rescue", optional = true }
+iroh = { version = "1.3", default-features = false, features = ["tls-ring"], optional = true }
 ferryman-ops = { path = "../ferryman-ops" }
 ferryman-server = { path = "../ferryman-server" }
 clap.workspace = true

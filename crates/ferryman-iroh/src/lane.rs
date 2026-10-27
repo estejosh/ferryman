@@ -108,6 +108,7 @@ fn fleet_host_pins(config: &IrohConfig) -> Vec<(String, [u8; 32])> {
     config
         .fleet_relays
         .iter()
+        .chain(config.rescue_relays.iter())
         .filter_map(|entry| {
             let pin = entry.pin?;
             let url: RelayUrl = entry.url.parse().ok()?;
@@ -149,7 +150,25 @@ pub async fn bind_with_map(
     config: &IrohConfig,
     key: iroh::SecretKey,
 ) -> Result<(Endpoint, Option<RelayMap>)> {
+    let (endpoint, keep, _) = bind_shared(config, key).await?;
+    Ok((endpoint, keep))
+}
+
+/// [`bind_with_map`], and also the relay map the endpoint shares whenever the plan is a
+/// custom one (not only with `fallback_public_relays`): the Hive rescue channel adds the
+/// relay a master-signed record names to it while the machine is cut off.
+///
+/// # Errors
+/// As [`bind`].
+pub async fn bind_shared(
+    config: &IrohConfig,
+    key: iroh::SecretKey,
+) -> Result<(Endpoint, Option<RelayMap>, Option<RelayMap>)> {
     let mode = relay_mode(config)?;
+    let shared = match &mode {
+        RelayMode::Custom(map) => Some(map.clone()),
+        _ => None,
+    };
     let keep = match (&mode, config.relay_plan()) {
         (
             RelayMode::Custom(map),
@@ -180,11 +199,16 @@ pub async fn bind_with_map(
             &fleet_host_pins(config),
             // A relay from the fleet's list with no certificate of its own must be one a
             // public CA signed for.
-            fallback || config.fleet_relays.iter().any(|entry| entry.pin.is_none()),
+            fallback
+                || config
+                    .fleet_relays
+                    .iter()
+                    .chain(config.rescue_relays.iter())
+                    .any(|entry| entry.pin.is_none()),
         ))
         .relay_mode(mode);
     let endpoint = builder.bind().await.context("bind the iroh endpoint")?;
-    Ok((endpoint, keep))
+    Ok((endpoint, keep, shared))
 }
 
 /// Whether the relay in `config` lets an endpoint in: `Ok` once one is connected to it,

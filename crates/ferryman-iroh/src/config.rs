@@ -124,6 +124,10 @@ pub struct IrohConfig {
     /// Relays from the fleet's master-signed list, in its order, after [`Self::relays`].
     /// Not read from `ferry.toml`: [`Self::with_fleet_relays`] fills it.
     pub fleet_relays: Vec<FleetRelayEntry>,
+    /// Relays the Hive rescue channel may name (ADR 0027): trusted at bind (their pin, or a
+    /// public CA) but NOT in the relay plan, so the lane never homes on one until a rescue
+    /// record asks for it. Filled by the rescue feature, never read from `ferry.toml`.
+    pub rescue_relays: Vec<FleetRelayEntry>,
     /// What was wrong with the section, if anything.
     pub notes: Vec<String>,
 }
@@ -143,6 +147,7 @@ impl Default for IrohConfig {
             alert_after_minutes: DEFAULT_ALERT_MINUTES,
             intermittent_peers: Vec::new(),
             fleet_relays: Vec::new(),
+            rescue_relays: Vec::new(),
             notes: Vec::new(),
         }
     }
