@@ -897,7 +897,11 @@ pub fn write_welcome(route: &ProjectRoute, files: &BTreeMap<String, Vec<u8>>) ->
     if let Some(operator) = invite.operator.as_deref() {
         expected.insert(format!("agents/{}.json", canonical_agent_name(operator)));
     }
-    if files.keys().cloned().collect::<std::collections::BTreeSet<_>>() != expected
+    if files
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>()
+        != expected
         || allowed != 1
     {
         bail!("welcome does not contain the required files");
