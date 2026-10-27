@@ -477,7 +477,13 @@ pub fn admin_tools() -> Vec<Value> {
             &json!({"type":"object","properties":{
                 "machine":text("a short label for the machine joining, e.g. laptop; it joins as <you>-<machine>"),
                 "expires_days":text("how long the code stays valid, in days (default 7)")},"required":["machine"]}),
-            &["code", "project", "machine", "expires_at", "prompt"],
+            &[
+                "invite_id_code",
+                "project",
+                "machine",
+                "expires_at",
+                "prompt",
+            ],
         ),
     ];
     tools.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
@@ -2423,6 +2429,11 @@ impl Agent {
             .max(1);
         let route = self.route();
         let identity = self.identity()?;
+        if ferryman_channel::master::read_master(&route)?
+            .is_some_and(|master| master.master.eq_ignore_ascii_case(identity.name()))
+        {
+            return Err(bad("make it in the dashboard (Teammates)"));
+        }
         let transport = crate::invite_transport_for(false)?;
         let (invite, code) = ferryman_channel::invite::create_for_identity(
             &route,
@@ -2438,7 +2449,7 @@ impl Agent {
         Ok(Reply::new(
             format!("invite for {machine} on {} created", route.project_id),
             json!({
-                "code": code,
+                "invite_id_code": code,
                 "project": route.project_id,
                 "machine": machine,
                 "expires_at": invite.expires_at.to_rfc3339(),
