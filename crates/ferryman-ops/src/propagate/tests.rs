@@ -710,14 +710,12 @@ fn a_template_of_this_machines_own_is_tried_before_the_advertised_remote() {
             mine.to_str().unwrap(),
         ],
     );
-    rootconfig::set_remote_template(
-        &f.g.root,
-        &format!("{}/{{project}}.git", mine.parent().unwrap().display()),
-    )
-    .unwrap();
+    let base = mine.parent().unwrap().display().to_string();
+    rootconfig::set_remote_template(&f.g.root, &format!("{base}/{{project}}.git")).unwrap();
     let entry = f.g.root.read().projects.into_iter().next().unwrap();
     let candidates = repos::candidates(&entry, &RootConfig::load(&f.g.root), &f.g.root);
-    assert_eq!(candidates[0], mine.display().to_string());
+    // The template joins with '/', which git accepts on every platform.
+    assert_eq!(candidates[0], format!("{base}/snifrig.git"));
     assert_eq!(candidates[1], advertised.display().to_string());
 }
 
