@@ -572,7 +572,7 @@ fn guard(field: &str, text: &str) -> Result<()> {
         Some(reason) => Err(refusal(
             "secret",
             format!(
-                "{field} looks like a secret ({reason}). Messages are not the place for one; seal it to the machines that need it with `ferry channel secret set`"
+                "{field} looks like a secret ({reason}). Messages are not the place for one. Tell the human to seal it to the machines that need it"
             ),
         )),
         None => Ok(()),

@@ -731,7 +731,7 @@ fn asking_refuses_secrets_and_oversize_reasoning() {
             "reasoning": "the token is ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789"
         }),
     );
-    assert!(refused(&result, "secret").contains("ferry channel secret"));
+    assert!(refused(&result, "secret").contains("Tell the human"));
     let long = "x ".repeat(700);
     let result = call(
         &member,
@@ -897,7 +897,7 @@ fn posting_refuses_secrets_telegram_strangers_and_work_content() {
             json!({ "action": "post", "to": BOSS, "text": text }),
         );
         assert!(
-            refused(&result, "secret").contains("ferry channel secret"),
+            refused(&result, "secret").contains("Tell the human"),
             "{text}"
         );
     }
