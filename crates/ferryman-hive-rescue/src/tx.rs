@@ -16,8 +16,6 @@ use std::fmt;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use k256::ecdsa::SigningKey;
-use k256::ecdsa::hazmat::SignPrimitive;
-use k256::sha2::Sha256 as Sha256Old;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -71,7 +69,7 @@ impl PostingKey {
     /// The compressed public key, 33 bytes.
     #[must_use]
     pub fn public_key_bytes(&self) -> [u8; 33] {
-        let point = self.0.verifying_key().to_encoded_point(true);
+        let point = self.0.verifying_key().to_sec1_point(true);
         let mut out = [0_u8; 33];
         out.copy_from_slice(point.as_bytes());
         out
@@ -103,7 +101,7 @@ impl PostingKey {
     /// The compressed public key, hex (for tests and for comparing with an account).
     #[must_use]
     pub fn public_key_hex(&self) -> String {
-        hex::encode(self.0.verifying_key().to_encoded_point(true).as_bytes())
+        hex::encode(self.0.verifying_key().to_sec1_point(true).as_bytes())
     }
 
     /// Sign a 32-byte digest the way Hive nodes expect: low-S, recoverable, and canonical
@@ -115,7 +113,6 @@ impl PostingKey {
     /// The signing primitive failed (never expected for a valid key).
     pub fn sign_digest(&self, digest: &[u8; 32]) -> Result<String> {
         let scalar = self.0.as_nonzero_scalar();
-        let z = k256::FieldBytes::from(*digest);
         for attempt in 1_u8..=255 {
             // dhive passes sha256(digest || attempt) as the RFC 6979 additional data on
             // every attempt, the first included.
@@ -123,19 +120,11 @@ impl PostingKey {
             extra.extend_from_slice(digest);
             extra.push(attempt);
             let ad = Sha256::digest(&extra);
-            let (signature, recovery) = scalar
-                .try_sign_prehashed_rfc6979::<Sha256Old>(&z, &ad)
-                .map_err(|_| anyhow::anyhow!("signing failed"))?;
-            let Some(recovery) = recovery else {
-                bail!("signing produced no recovery id");
-            };
-            let (signature, recovery) = match signature.normalize_s() {
-                Some(low) => (
-                    low,
-                    k256::ecdsa::RecoveryId::new(!recovery.is_y_odd(), recovery.is_x_reduced()),
-                ),
-                None => (signature, recovery),
-            };
+            // secp256k1 is low-S: the primitive normalizes and fixes the recovery id.
+            let (signature, recovery) = ecdsa::hazmat::sign_prehashed_rfc6979::<
+                k256::Secp256k1,
+                Sha256,
+            >(scalar, digest, &ad);
             let compact = signature.to_bytes();
             if canonical(&compact) {
                 let mut out = Vec::with_capacity(65);

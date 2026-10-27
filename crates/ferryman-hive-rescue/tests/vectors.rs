@@ -124,7 +124,7 @@ fn a_signature_recovers_the_signing_key() {
         )
         .unwrap();
         assert_eq!(
-            hex::encode(recovered.to_encoded_point(true).as_bytes()),
+            hex::encode(recovered.to_sec1_point(true).as_bytes()),
             key.public_key_hex()
         );
     }
