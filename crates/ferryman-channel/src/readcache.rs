@@ -181,3 +181,80 @@ pub fn remembered_under(root: &Path) -> usize {
         cache.keys().filter(|path| path.starts_with(root)).count()
     })
 }
+
+/// What a roster read depends on: the folder it was asked about, the fleet folder it was
+/// widened with, and whether this root has a fleet pin mirror (the read writes one).
+pub(crate) type RosterKey = (PathBuf, Option<PathBuf>, bool);
+
+struct RosterEntry {
+    stamp: Stamp,
+    agents: Vec<crate::AgentRoute>,
+}
+
+/// Rosters already read, by what they were read from.
+///
+/// A roster is asked for from dozens of places, several times per task, and every ask
+/// opened each agent file, both pins of each agent and the whole fleet roster again: a
+/// quiet worker on a 50-project root spent about half a core doing it. The same rules as
+/// tasks apply: served only while every file in every folder it came from has the same
+/// name, size and modified time, and never remembered when one was written a moment ago.
+static ROSTERS: LazyLock<Mutex<HashMap<RosterKey, RosterEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The remembered roster for `key`, if none of its files changed.
+pub(crate) fn roster(key: &RosterKey, files: &Fingerprint) -> Option<Vec<crate::AgentRoute>> {
+    let cache = ROSTERS.lock().ok()?;
+    let entry = cache.get(key)?;
+    (entry.stamp == files.stamp).then(|| entry.agents.clone())
+}
+
+/// Remember `agents`, read from `files`. Ignored when anything was written too recently.
+pub(crate) fn remember_roster(key: RosterKey, files: Fingerprint, agents: &[crate::AgentRoute]) {
+    if !files.is_settled() {
+        return;
+    }
+    if let Ok(mut cache) = ROSTERS.lock() {
+        // A root has one entry per project; a bound only matters for a test process.
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            RosterEntry {
+                stamp: files.stamp,
+                agents: agents.to_vec(),
+            },
+        );
+    }
+}
+
+/// Signatures already checked and found good, by digest of key, signature and message.
+///
+/// Verifying is the same answer every time for the same three inputs, and a worker
+/// re-checks every message, grant and declaration on every pass. Only a good verdict is
+/// kept: a bad one is rare and stays as expensive as it was. SHA-256 over all three, so a
+/// hit means the very same bytes, not merely the same signer.
+static VERIFIED: LazyLock<Mutex<std::collections::HashSet<[u8; 32]>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+pub(crate) fn signature_digest(key: &[u8; 32], signature: &[u8; 64], message: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(key);
+    hasher.update(signature);
+    hasher.update(message);
+    hasher.finalize().into()
+}
+
+pub(crate) fn known_good(digest: &[u8; 32]) -> bool {
+    VERIFIED.lock().is_ok_and(|seen| seen.contains(digest))
+}
+
+pub(crate) fn remember_good(digest: [u8; 32]) {
+    if let Ok(mut seen) = VERIFIED.lock() {
+        if seen.len() > 200_000 {
+            seen.clear();
+        }
+        seen.insert(digest);
+    }
+}
