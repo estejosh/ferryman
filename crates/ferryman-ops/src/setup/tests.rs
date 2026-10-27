@@ -51,11 +51,21 @@ fn git(dir: &Path, args: &[&str]) {
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
-        // No background maintenance: after a push, git can start `maintenance run
-        // --auto` detached in the bare repo, and the lock it later removes made the
-        // dry-run snapshot differ by a file Ferryman never touched (flaky on Linux/macOS).
+        // No background work in any repo the fixture touches. After a push or commit git
+        // can start a detached `maintenance run --auto` whose objects/maintenance.lock
+        // appears and disappears while a snapshot is taken (#101). Flags alone are not
+        // enough: the environment reaches every child git too (receive-pack, hooks).
         .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
-        .args(["-c", "receive.autoGc=false"])
+        .args(["-c", "receive.autoGc=false", "-c", "core.fsmonitor=false"])
+        .env("GIT_CONFIG_COUNT", "4")
+        .env("GIT_CONFIG_KEY_0", "maintenance.auto")
+        .env("GIT_CONFIG_VALUE_0", "false")
+        .env("GIT_CONFIG_KEY_1", "gc.auto")
+        .env("GIT_CONFIG_VALUE_1", "0")
+        .env("GIT_CONFIG_KEY_2", "receive.autoGc")
+        .env("GIT_CONFIG_VALUE_2", "false")
+        .env("GIT_CONFIG_KEY_3", "core.fsmonitor")
+        .env("GIT_CONFIG_VALUE_3", "false")
         .args(args)
         .output()
         .unwrap();
@@ -157,6 +167,29 @@ fn unit_worker(name: &str, user: bool, identity: &str) -> Worker {
     }
 }
 
+/// Files git creates and removes by itself (detached maintenance, gc); never part of what
+/// a dry run is judged on.
+const TRANSIENT: [&str; 3] = ["maintenance.lock", "gc.pid", "gc.log"];
+
+/// Both trees must match; on a difference say which paths, not a wall of bytes.
+fn assert_same_tree(before: &[(PathBuf, Vec<u8>)], after: &[(PathBuf, Vec<u8>)], what: &str) {
+    if before == after {
+        return;
+    }
+    let names = |tree: &[(PathBuf, Vec<u8>)]| -> Vec<PathBuf> {
+        tree.iter().map(|(path, _)| path.clone()).collect()
+    };
+    let (was, now) = (names(before), names(after));
+    let gone: Vec<_> = was.iter().filter(|path| !now.contains(path)).collect();
+    let new: Vec<_> = now.iter().filter(|path| !was.contains(path)).collect();
+    let changed: Vec<_> = before
+        .iter()
+        .filter(|(path, bytes)| after.iter().any(|(p, b)| p == path && b != bytes))
+        .map(|(path, _)| path)
+        .collect();
+    panic!("{what}: removed {gone:?}, added {new:?}, changed {changed:?}");
+}
+
 fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     fn walk(dir: &Path, out: &mut Vec<(PathBuf, Vec<u8>)>) {
         let Ok(entries) = fs::read_dir(dir) else {
@@ -166,6 +199,9 @@ fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, out);
+            } else if TRANSIENT.contains(&entry.file_name().to_string_lossy().as_ref()) {
+                // Git's own housekeeping, not something a dry run wrote.
+                continue;
             } else {
                 out.push((path.clone(), fs::read(&path).unwrap_or_default()));
             }
@@ -352,10 +388,10 @@ fn a_dry_run_changes_nothing_and_still_prints_the_masters_lines() {
     let before = snapshot(machine.dir.path());
     let (log, mut run) = recorder();
     let report = setup(&machine.root, &opts, &machine::Scan::default(), &mut run).unwrap();
-    assert_eq!(
-        before,
-        snapshot(machine.dir.path()),
-        "a dry run writes nothing"
+    assert_same_tree(
+        &before,
+        &snapshot(machine.dir.path()),
+        "a dry run writes nothing",
     );
     assert!(
         log.borrow().is_empty(),
