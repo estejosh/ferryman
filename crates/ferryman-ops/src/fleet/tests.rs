@@ -1166,3 +1166,85 @@ fn a_served_projects_roster_is_read_again_each_pass() {
             .any(|agent| agent.name == "newcomer")
     );
 }
+
+/// What a hand-filed project goes through while the worker runs: the channel, then a clone
+/// attached to it, then its roster listing the worker. At each step the re-plan names what is
+/// missing, and the pass after the last one serves it. Whatever order the three happen in.
+#[test]
+fn a_project_filed_attached_and_listed_while_the_worker_runs_is_served_at_whichever_step_completes_it()
+ {
+    for roster_first in [false, true] {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::create(&dir.path().join("ferry")).unwrap();
+        project(dir.path(), &root, "alpha", &josh(), true);
+        enrolled_everywhere(&root);
+        let (home, config) = home(dir.path(), "");
+        let (plan, identity) = plan_worker(&root, &home, &config).unwrap();
+        let running = serve(plan, &identity, &config);
+        assert_eq!(running.served.len(), 1);
+        let say = |why: &str| {
+            let pass = newly_served(&root, &home, &config, &running.served).unwrap();
+            assert!(pass.served.is_empty(), "served too early: {why}");
+            pass.skipped
+                .first()
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default()
+        };
+
+        // 1. The channel arrives and is filed: no checkout, no listing.
+        project(dir.path(), &root, "beta", &josh(), false);
+        let channel = root.comms_home("beta");
+        let list = || {
+            ferryman_channel::register_agent(
+                &route_of(&root, "beta"),
+                &AgentRoute {
+                    name: "ichabod-test".into(),
+                    role: "worker".into(),
+                    capabilities: Vec::new(),
+                    public_key: Some(worker().public_key_hex()),
+                    encryption_key: None,
+                },
+            )
+            .unwrap();
+        };
+        assert!(say("channel only").contains("no checkout"));
+        if roster_first {
+            list();
+            assert!(say("listed, no checkout").contains("no checkout"));
+        }
+
+        // 2. A clone is attached to it.
+        let workspace = dir.path().join("repos").join("beta");
+        let attachment = workspace.join(".ferryman");
+        fs::create_dir_all(&attachment).unwrap();
+        fs::write(workspace.join(".gitignore"), "/.ferryman/\n").unwrap();
+        fs::write(
+            attachment.join("bridge.toml"),
+            format!(
+                "project = \"beta\"\nworkspace = \"{}\"\nattachment = \"{}\"\ncommunications = \"{}\"\n",
+                workspace.display(),
+                attachment.display(),
+                channel.display()
+            ),
+        )
+        .unwrap();
+        root.adopt("beta", &channel, Some(&workspace)).unwrap();
+        if !roster_first {
+            assert!(say("attached, not listed").contains("not on its roster"));
+            list();
+        }
+
+        // 3. Complete: the very next pass serves it.
+        let pass = newly_served(&root, &home, &config, &running.served).unwrap();
+        assert_eq!(
+            pass.served
+                .iter()
+                .map(|(r, _)| r.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["beta"],
+            "roster_first={roster_first}: {:?}",
+            pass.skipped
+        );
+    }
+}

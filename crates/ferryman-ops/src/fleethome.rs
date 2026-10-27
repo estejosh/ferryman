@@ -50,11 +50,28 @@ pub fn publish(root: &Root, identity: &AgentIdentity, machine: &str, facts: &Fac
     if let Err(error) = home::enrol(root, identity) {
         return Publish::Pending(format!("{error:#}"));
     }
-    let directory = match home::publish_directory(root, machine, identity) {
+    // What lets another machine take a project up (ADR 0030): where its clone came from and
+    // who masters it, on each directory entry; which worker this machine runs and what it
+    // keeps out of its swarm, on the machine record. Filled in here, whoever publishes, so a
+    // publish by `ferry enable` does not take back what the worker said.
+    let directory = match home::publish_directory_with(
+        root,
+        machine,
+        identity,
+        &crate::propagate::adverts(root),
+    ) {
         Ok(done) => done.written.len() + done.unchanged,
         Err(error) => return Publish::Pending(format!("{error:#}")),
     };
-    match home::publish_machine(root, machine, identity, facts) {
+    let mut facts = facts.clone();
+    if facts.worker.is_none() {
+        facts.worker = crate::propagate::own_worker(root);
+    }
+    facts.excludes = crate::rootconfig::RootConfig::load(root).swarm_exclude;
+    facts
+        .excludes
+        .retain(|project| ferryman_channel::is_safe_component(project));
+    match home::publish_machine(root, machine, identity, &facts) {
         Ok(machine_written) => Publish::Done {
             entries: directory,
             machine_written,
@@ -69,12 +86,14 @@ pub fn publish(root: &Root, identity: &AgentIdentity, machine: &str, facts: &Fac
 pub fn basic_facts(root: &Root, engines: Vec<String>) -> Facts {
     Facts {
         version: env!("CARGO_PKG_VERSION").to_owned(),
+        worker: crate::propagate::own_worker(root),
         engines,
         projects: root
             .projects()
             .into_iter()
             .map(|entry| entry.project_id)
             .collect(),
+        excludes: Vec::new(),
     }
 }
 

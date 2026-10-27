@@ -255,6 +255,11 @@ pub enum FleetCommand {
         /// Do not fetch (no network). Clones and attaches still happen.
         #[arg(long)]
         no_fetch: bool,
+        /// Serve an identity to apps here (an MCP connector) and seat its key in every
+        /// project this machine serves (`[seat] agents` in the root's `ferry.toml`; ADR 0030).
+        /// Repeatable. Uses the key this machine already holds; never makes or copies one.
+        #[arg(long, value_parser = super::agent_name)]
+        seat: Vec<String>,
     },
     /// The fleet's own folder, and what is in it (ADR 0026).
     #[command(flatten)]
@@ -280,6 +285,7 @@ fn fleet_setup(command: FleetCommand) -> Result<()> {
         service,
         no_syncthing,
         no_fetch,
+        seat,
     } = command
     else {
         bail!("not a setup command")
@@ -306,6 +312,7 @@ fn fleet_setup(command: FleetCommand) -> Result<()> {
     options.retire = retire;
     options.exclude = exclude;
     options.remote_template = remote_template;
+    options.seat = seat;
     options.dry_run = dry_run;
     options.service = service;
     options.no_fetch = no_fetch;
@@ -315,6 +322,59 @@ fn fleet_setup(command: FleetCommand) -> Result<()> {
     let scan = machine::scan();
     let report = setup::setup(&root, &options, &scan, &mut setup::run_quietly)?;
     print!("{}", report.render());
+    Ok(())
+}
+
+// --- ferry root seat ------------------------------------------------------------------
+
+/// `ferry root seat <name> [--remove]`: add the name to `[seat] agents` and seat it in every
+/// project this machine serves, now. Says what it did, project by project.
+pub fn seat_command(name: &str, remove: bool) -> Result<()> {
+    use ferryman_ops::seat::Outcome;
+    let root = ferryman_channel::ferry::find_root()
+        .context("no ferry root yet - make one with `ferry root init`")?;
+    let name = ferryman_channel::canonical_agent_name(name);
+    if remove {
+        if rootconfig::set_seat(&root, &name, false)? {
+            println!(
+                "'{name}' is no longer seated in new projects (keys already seated stay where \
+                 they are)"
+            );
+        } else {
+            println!("'{name}' was not in [seat] agents; nothing to do");
+        }
+        return Ok(());
+    }
+    let added = rootconfig::set_seat(&root, &name, true)?;
+    println!(
+        "'{name}' {} [seat] agents ({})",
+        if added { "added to" } else { "is already in" },
+        rootconfig::path(&root).display()
+    );
+    let seats = ferryman_ops::seat::seat_everywhere(&root, std::slice::from_ref(&name));
+    if seats.iter().any(|seat| seat.outcome == Outcome::NoKey) {
+        bail!(
+            "this machine holds no key for '{name}', so nothing was seated. A key is never made \
+             here or copied from another machine: set the identity up on the machine it belongs \
+             to (`ferry channel seat`), then run this again"
+        );
+    }
+    let (mut put, mut already) = (0, 0);
+    for seat in &seats {
+        match &seat.outcome {
+            Outcome::Seated => {
+                put += 1;
+                println!("  {}: seated", seat.project);
+            }
+            Outcome::Already => already += 1,
+            Outcome::Refused(why) => println!("  {}: NOT seated - {why}", seat.project),
+            Outcome::NoKey => {}
+        }
+    }
+    println!(
+        "{put} project(s) seated, {already} already had it. The master still grants it what it \
+         may do: ferry team approve {name} --all"
+    );
     Ok(())
 }
 

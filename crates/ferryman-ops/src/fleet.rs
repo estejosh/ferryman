@@ -73,6 +73,9 @@ impl Row {
 /// Every project in the ferry root, in order, and what this worker does about each.
 pub struct WorkerPlan {
     pub rows: Vec<Row>,
+    /// The root the plan was made in, so [`serve`] can seat this machine's connector
+    /// identities (`[seat] agents`) in what it serves (ADR 0030).
+    pub root: Root,
 }
 
 impl WorkerPlan {
@@ -104,7 +107,7 @@ pub fn engines_line(config: &AgentConfig) -> String {
 /// The roster file for `agent` in this channel itself - not the machine-wide copy that
 /// [`ferryman_channel::read_agent_roster`] folds in, which would make a name look
 /// enrolled in every channel as soon as it was enrolled in one.
-fn listed(channel: &Path, agent: &str) -> Option<AgentRoute> {
+pub(crate) fn listed(channel: &Path, agent: &str) -> Option<AgentRoute> {
     let path = channel
         .join("agents")
         .join(format!("{}.json", canonical_agent_name(agent)));
@@ -120,7 +123,7 @@ fn key_of_listing(listing: Option<&AgentRoute>) -> Option<&str> {
 /// Whether git, where it governs the checkout that `attachment` sits in, leaves a key file
 /// there out of a commit. Not a git repository, or no git here to ask, is a yes: nothing
 /// could commit it from this machine.
-fn keeps_keys_out_of_git(attachment: &Path, agent: &str) -> bool {
+pub(crate) fn keeps_keys_out_of_git(attachment: &Path, agent: &str) -> bool {
     // The checkout's own repository, which is where `ferry enable` writes the entry. A
     // directory that is merely somewhere inside another repository is that repository's
     // business, as it is for `enable`.
@@ -229,7 +232,13 @@ pub fn plan_worker_except(
             }
         })
         .collect();
-    Ok((WorkerPlan { rows }, identity))
+    Ok((
+        WorkerPlan {
+            rows,
+            root: root.clone(),
+        },
+        identity,
+    ))
 }
 
 fn judge(
@@ -428,6 +437,7 @@ pub fn in_focus_order(
 pub fn serve(plan: WorkerPlan, identity: &AgentIdentity, config: &AgentConfig) -> Fleet {
     let mut served = Vec::new();
     let mut skipped = Vec::new();
+    let mut notes = Vec::new();
     for row in plan.rows {
         match row.standing {
             Standing::Serves { route, seat } => {
@@ -450,7 +460,20 @@ pub fn serve(plan: WorkerPlan, identity: &AgentIdentity, config: &AgentConfig) -
             Standing::Skips(why) => skipped.push((row.channel, format!("{}: {why}", row.project))),
         }
     }
-    Fleet { served, skipped }
+    // The connector identities this machine serves to apps (`[seat] agents`) go where the
+    // worker's own key just went: a connector is only usable in a project whose checkout
+    // holds its key (ADR 0030). A key this machine does not hold is not made.
+    let routes: Vec<&ProjectRoute> = served.iter().map(|(route, _)| route).collect();
+    notes.extend(
+        crate::seat::seat_configured(&plan.root, &routes)
+            .iter()
+            .filter_map(crate::seat::Seat::line),
+    );
+    Fleet {
+        served,
+        skipped,
+        notes,
+    }
 }
 
 /// What enrolling an identity did in one project.

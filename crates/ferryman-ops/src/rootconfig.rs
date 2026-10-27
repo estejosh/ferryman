@@ -22,6 +22,12 @@
 //! [swarm]
 //! # Never cloned, served or enrolled on this machine, whatever the channel says.
 //! exclude = ["pc-secrets", "phonehome"]
+//!
+//! [seat]
+//! # Identities this machine serves to apps (an MCP connector, say). Each one whose key this
+//! # machine already holds is put in every project it serves, as a new project arrives
+//! # (ADR 0030). A name here never makes a key and never copies one to another machine.
+//! agents = ["claude-ai-josh"]
 //! ```
 //!
 //! # What is never in it
@@ -40,6 +46,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use ferryman_channel::canonical_agent_name;
 use ferryman_channel::ferry::Root;
 
 /// The config's file name, in the ferry root.
@@ -57,6 +64,8 @@ pub struct RootConfig {
     pub remotes: BTreeMap<String, String>,
     /// `[swarm] exclude`: projects this machine keeps out of the swarm.
     pub swarm_exclude: Vec<String>,
+    /// `[seat] agents`: identities this machine serves to apps, canonical names.
+    pub seat_agents: Vec<String>,
     /// What was wrong with the file, if anything.
     pub notes: Vec<String>,
 }
@@ -142,6 +151,26 @@ impl RootConfig {
                 .filter_map(toml::Value::as_str)
                 .map(str::to_owned)
                 .collect();
+        }
+        if let Some(list) = table
+            .get("seat")
+            .and_then(toml::Value::as_table)
+            .and_then(|seat| seat.get("agents"))
+            .and_then(toml::Value::as_array)
+        {
+            // A name becomes a key file name under every checkout, so only a path-safe one
+            // is kept, and the rest is said.
+            for name in list.iter().filter_map(toml::Value::as_str) {
+                let name = canonical_agent_name(name);
+                if !ferryman_channel::is_safe_component(&name) {
+                    config.notes.push(format!(
+                        "[seat] agents: '{name}' is not a name (letters, digits, '.', '-' and \
+                         '_'); ignored"
+                    ));
+                } else if !config.seat_agents.contains(&name) {
+                    config.seat_agents.push(name);
+                }
+            }
         }
         config
     }
@@ -377,6 +406,52 @@ pub fn set_excluded(root: &Root, project: &str, excluded: bool) -> Result<bool> 
     names.sort();
     swarm.insert(
         "exclude".into(),
+        toml::Value::Array(names.into_iter().map(toml::Value::String).collect()),
+    );
+    write(root, &table)?;
+    Ok(true)
+}
+
+/// Add an identity to (or take it out of) `[seat] agents`: the names this machine serves to
+/// apps and keeps seated in every project it serves. Returns whether the file changed.
+///
+/// # Errors
+/// The name is not a path-safe identifier, the existing file is not valid TOML (it is not
+/// overwritten), or it cannot be written.
+pub fn set_seat(root: &Root, name: &str, seated: bool) -> Result<bool> {
+    let name = canonical_agent_name(name);
+    if !ferryman_channel::is_safe_component(&name) {
+        bail!("'{name}' is not a name: use letters, digits, '.', '-' and '_'");
+    }
+    let mut table = read_table(root)?;
+    let seat = table
+        .entry("seat")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(seat) = seat.as_table_mut() else {
+        bail!("[seat] in {FILE} is not a table; fix it by hand first");
+    };
+    let mut names: Vec<String> = seat
+        .get("agents")
+        .and_then(toml::Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(toml::Value::as_str)
+                .map(canonical_agent_name)
+                .collect()
+        })
+        .unwrap_or_default();
+    let present = names.contains(&name);
+    if present == seated {
+        return Ok(false);
+    }
+    if seated {
+        names.push(name);
+    } else {
+        names.retain(|have| *have != name);
+    }
+    names.sort();
+    seat.insert(
+        "agents".into(),
         toml::Value::Array(names.into_iter().map(toml::Value::String).collect()),
     );
     write(root, &table)?;

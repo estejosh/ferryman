@@ -772,3 +772,73 @@ fn a_half_migrated_root_keeps_the_clone_of_the_project_that_moved() {
     let folders = after.checks.iter().find(|c| c.name == "projects").unwrap();
     assert!(folders.ok, "{}", after.render());
 }
+
+#[test]
+fn a_connector_the_machine_holds_a_key_for_is_seated_in_the_clone_it_has_just_attached() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    origin(dir.path(), "quantly");
+    with_template(&root, dir.path());
+    rootconfig::set_seat(&root, "claude-ai-josh", true).unwrap();
+    // The machine holds the connector's key in its own store, as it does for a connector
+    // that has only ever been used through another project.
+    let store = ferryman_channel::licensing::machine_state_dir().unwrap();
+    let connector = AgentIdentity::from_seed("claude-ai-josh", [61u8; 32]);
+    connector.seat_in(&store).unwrap();
+
+    let rows = sync(&root, &Options::default()).unwrap();
+    let r = row(&rows, "quantly");
+    assert_eq!(
+        r.status,
+        Status::Done(vec!["cloned", "attached", "seated"]),
+        "{r:?}"
+    );
+    let managed = root.managed_clone("quantly");
+    let seated = AgentIdentity::load_existing("claude-ai-josh", &managed.join(".ferryman"))
+        .unwrap()
+        .expect("the key is in the checkout");
+    assert_eq!(seated.public_key_hex(), connector.public_key_hex());
+    // Once is enough: syncing again has nothing left to do.
+    let again = sync(&root, &Options::default()).unwrap();
+    assert_eq!(row(&again, "quantly").status, Status::AlreadyOk);
+}
+
+#[test]
+fn a_connector_the_machine_holds_no_key_for_is_not_given_one_by_a_sync() {
+    let (dir, root) = setup();
+    filed(&root, "quantly");
+    origin(dir.path(), "quantly");
+    with_template(&root, dir.path());
+    rootconfig::set_seat(&root, "claude-ai-nobody", true).unwrap();
+
+    let rows = sync(&root, &Options::default()).unwrap();
+    assert_eq!(
+        row(&rows, "quantly").status,
+        Status::Done(vec!["cloned", "attached"])
+    );
+    let managed = root.managed_clone("quantly");
+    assert!(
+        AgentIdentity::load_existing("claude-ai-nobody", &managed.join(".ferryman"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_command_that_outlives_its_limit_is_killed_and_one_that_does_not_is_left_alone() {
+    let mut slow = Command::new("sleep");
+    slow.arg("30");
+    let started = Instant::now();
+    let error = run_bounded(slow, Some(Duration::from_millis(300))).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "killed, not waited for"
+    );
+
+    let mut quick = Command::new("echo");
+    quick.arg("done");
+    let output = run_bounded(quick, Some(Duration::from_secs(30))).unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+}
