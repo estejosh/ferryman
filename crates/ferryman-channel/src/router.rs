@@ -29,10 +29,8 @@
 //!   rule is the honest one.)
 //! - **Context.** An engine whose window is known and smaller than the work wants is out. An
 //!   unknown window is not a reason to exclude.
-//! - **Code needs an engine that can edit files, unless there is none.** When no engine the
-//!   policy lets through has `code` (a fleet of `http` engines only), code work is not
-//!   held: the router drops the `code` requirement, as builds on such a fleet always ran,
-//!   and the reason says so. With one cli engine up, http engines are never given code work.
+//! - **Code needs an engine that can edit files.** A fleet of text-only HTTP engines cannot
+//!   satisfy code work, so the order is held until a CLI/tool-using engine is available.
 //! - **Planning** prefers a judge-tier engine only as a tie-break (the existing rule: a plan
 //!   a judge wrote needs no second reading); a builder the operator listed, or one that is
 //!   cheaper and sufficient, can plan, marked unreviewed as before.
@@ -919,31 +917,7 @@ pub fn route(
         excluded.push(considered(&engines[*index], Some(why.clone())));
     }
 
-    // Only a cli engine can edit files, so code work goes to one. But a fleet of http
-    // engines only has always been able to take build orders (they answer in text and own
-    // up to changing nothing), so when no engine at all could do the work with `code`
-    // required, `code` is not required: nothing is worse than a hold.
-    let relaxed_code = smart
-        && needs.modalities.contains(&Modality::Code)
-        && !ranking
-            .order
-            .iter()
-            .any(|&index| unable(&engines[index], needs).is_ok());
-    let relaxed;
-    let needs_here = if relaxed_code {
-        relaxed = Needs {
-            modalities: needs
-                .modalities
-                .iter()
-                .filter(|modality| **modality != Modality::Code)
-                .cloned()
-                .collect(),
-            ..needs.clone()
-        };
-        &relaxed
-    } else {
-        needs
-    };
+    let needs_here = needs;
 
     // What the policy let through, less what this call leaves out. An engine that failed
     // this order is out - unless it is all there is, below.
@@ -1049,8 +1023,7 @@ pub fn route(
     // Smart: score what is left.
     // What a retry must beat: what this worker's own ledger says of each failed engine now.
     // An estimate carried by a result is only a fallback for an engine that is not here
-    // (a payload is whatever its writer says), and not at all when retrying the same
-    // engines, which have nothing better to be compared with.
+    // (a payload is whatever its writer says).
     let floor = if retrying {
         None
     } else {
@@ -1076,9 +1049,8 @@ pub fn route(
         .map(|(place, &index)| {
             let engine = &engines[index];
             let estimate = estimate(engine, needs, context.now);
-            let sufficient = !retrying
-                && estimate.p + 1e-9 >= threshold
-                && floor.is_none_or(|f| estimate.p > f + 1e-9);
+            let sufficient =
+                estimate.p + 1e-9 >= threshold && floor.is_none_or(|f| estimate.p > f + 1e-9);
             let level = i16::from(engine.level());
             Scored {
                 index,
@@ -1097,11 +1069,56 @@ pub fn route(
             }
         })
         .collect();
+    if smart
+        && needs.modalities.contains(&Modality::Code)
+        && scored.is_empty()
+        && !excluded.is_empty()
+    {
+        decision.reason = format!(
+            "waiting: no sufficient engine for {} >= {:.2}; {}",
+            needs.kind.as_str(),
+            threshold,
+            none_reason(&ranking.why_none(role, engines), &excluded)
+        );
+        decision.candidates = finish(Vec::new(), excluded);
+        return Routed {
+            decision,
+            order: Vec::new(),
+        };
+    }
 
     // The order they would be tried in: the winner among the sufficient first, and so on.
     let mut order_positions: Vec<usize> = Vec::new();
     let mut left: Vec<usize> = (0..scored.len()).collect();
     let mut tied_with_winner: Vec<usize> = Vec::new();
+    if smart
+        && needs.modalities.contains(&Modality::Code)
+        && !scored.is_empty()
+        && scored.iter().all(|candidate| !candidate.sufficient)
+    {
+        let candidates = scored
+            .iter()
+            .map(|s| Considered {
+                p: Some(round3(s.estimate.p)),
+                cost_usd: Some(round3(s.price.usd)),
+                price: Some(s.price.note.clone()),
+                basis: Some(s.estimate.basis.clone()),
+                sufficient: false,
+                ..considered(&engines[s.index], None)
+            })
+            .collect();
+        decision.reason = format!(
+            "waiting: no sufficient engine for {} >= {:.2}; {}",
+            needs.kind.as_str(),
+            threshold,
+            none_reason(&ranking.why_none(role, engines), &excluded)
+        );
+        decision.candidates = finish(candidates, excluded);
+        return Routed {
+            decision,
+            order: Vec::new(),
+        };
+    }
     while !left.is_empty() {
         let sufficient: Vec<usize> = left
             .iter()
@@ -1155,16 +1172,9 @@ pub fn route(
                 engines,
                 floor,
             );
-            if relaxed_code {
-                decision.reason.push_str(
-                    "; no engine that can edit files is up, so a text-only one takes it as \
-                     it always has",
-                );
-            }
             if retrying {
                 decision.reason.push_str(
-                    "; every engine that can do this work has already failed this order, so \
-                     the likeliest of them tries again",
+                    "; every other engine failed this order, so this sufficient engine tries again",
                 );
             }
         }
@@ -2065,13 +2075,10 @@ mod tests {
             failure("steady", None),
         ];
         let again = retry(&all, &engines, &docs);
-        assert_eq!(pick(&again, &engines).as_deref(), Some("steady"));
+        assert_eq!(pick(&again, &engines).as_deref(), Some("nvidia"));
         assert_eq!(again.order.len(), 3, "all of them, likeliest first");
         assert!(
-            again
-                .decision
-                .reason
-                .contains("every engine that can do this work has already failed this order"),
+            again.decision.reason.contains("tries again"),
             "{}",
             again.decision.reason
         );
@@ -2103,7 +2110,7 @@ mod tests {
             "{}",
             again.decision.reason
         );
-        assert!(!again.decision.candidates[0].sufficient);
+        assert!(again.decision.candidates[0].sufficient);
     }
 
     #[test]
@@ -2263,15 +2270,14 @@ mod tests {
             "{:?}",
             routed.decision
         );
-        // With no engine that can edit files at all, the work is not held: a fleet of http
-        // engines only has always taken build orders, and still does - and says so.
+        // With no engine that can edit files at all, the work is held.
         let routed = run(&Policy::default(), &code, &only_api);
-        assert_eq!(pick(&routed, &only_api).as_deref(), Some("api"));
+        assert_eq!(pick(&routed, &only_api), None);
         assert!(
             routed
                 .decision
                 .reason
-                .contains("no engine that can edit files"),
+                .contains("waiting: no sufficient engine"),
             "{}",
             routed.decision.reason
         );

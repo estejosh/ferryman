@@ -829,6 +829,19 @@ pub fn order_id(week: &str, rank: usize) -> String {
     format!("improve-{}-{rank}", week.to_ascii_lowercase())
 }
 
+fn ferryman_scoped(item: &Improvement) -> bool {
+    let text = format!("{} {}", item.title, item.why).to_ascii_lowercase();
+    text.contains("ferryman") || text.contains("ferry cli") || text.contains("ferryman-cli")
+}
+
+fn ferryman_route() -> Option<ProjectRoute> {
+    let root = ferryman_channel::ferry::find_root()?;
+    root.projects()
+        .into_iter()
+        .find(|entry| entry.project_id.eq_ignore_ascii_case("ferryman"))
+        .and_then(|entry| ferryman_channel::route_for(&entry.channel).ok())
+}
+
 /// Pull the first JSON object out of whatever an engine printed around it.
 fn extract_json(text: &str) -> Option<Value> {
     let end = text.rfind('}')?;
@@ -1080,24 +1093,30 @@ fn order_text(
 fn issue_missing(
     route: &ProjectRoute,
     config: &AgentConfig,
-    identity: &AgentIdentity,
+    _identity: &AgentIdentity,
     plan: &PlanFile,
 ) -> Result<usize> {
     let mut issued = 0;
     let total = plan.improvements.len();
     for (index, (item, id)) in plan.improvements.iter().zip(&plan.orders).enumerate() {
-        if ferryman_channel::read_task(route, id).is_ok() {
+        let target = if ferryman_scoped(item) {
+            ferryman_route().unwrap_or_else(|| route.clone())
+        } else {
+            route.clone()
+        };
+        if ferryman_channel::read_task(&target, id).is_ok() {
             continue;
         }
+        let target_identity = signing_identity(&target, config)?;
         let rank = index + 1;
         let mut order = Order {
             id: id.clone(),
-            project_id: route.project_id.clone(),
+            project_id: target.project_id.clone(),
             issued_by: config.agent.clone(),
             assigned_to: None,
             created_at: Utc::now(),
             payload: json!({
-                "task": order_text(&route.project_id, &plan.week, rank, total, item, plan.unreviewed),
+                "task": order_text(&target.project_id, &plan.week, rank, total, item, plan.unreviewed),
                 "tags": [TAG],
                 "tier": Tier::Build.as_str(),
                 "improvement": {
@@ -1122,8 +1141,8 @@ fn issue_missing(
             allow_overlap: false,
             priority: None,
         };
-        identity.sign_order(&mut order);
-        match ferryman_channel::issue_order(route, &order) {
+        target_identity.sign_order(&mut order);
+        match ferryman_channel::issue_order(&target, &order) {
             Ok(_) => issued += 1,
             // Another machine got there first: the order exists, which is the point.
             Err(error) if format!("{error}").contains("already exists") => {}
@@ -1378,6 +1397,39 @@ fn here(route: &ProjectRoute, config: &AgentConfig, policy: &Policy) -> Result<(
     .map_err(|why| format!("{}: {why}", route.project_id))
 }
 
+/// A plan is a batch: do not generate another one after every order in the most
+/// recent completed batch was rejected.  An accepted order, or a human clearing
+/// the batch by accepting/reopening one, is the explicit resume signal.
+fn rejected_previous_batch(route: &ProjectRoute, week: &str) -> Option<String> {
+    let mut batches: BTreeMap<String, Vec<Task>> = BTreeMap::new();
+    for task in ferryman_channel::list_tasks(route).ok()? {
+        if !is_improvement(&task)
+            || task.order.payload["improvement"]["kind"] == Value::String(VERIFICATION.into())
+        {
+            continue;
+        }
+        let Some(batch) = task.order.payload["improvement"]["week"].as_str() else {
+            continue;
+        };
+        if batch < week {
+            batches.entry(batch.to_string()).or_default().push(task);
+        }
+    }
+    let (batch, tasks) = batches.into_iter().next_back()?;
+    if tasks.is_empty()
+        || tasks.iter().any(|task| {
+            !task.reviews.is_empty() && task.reviews.iter().any(|review| review.accepted)
+        })
+        || tasks.iter().any(|task| task.reviews.is_empty())
+    {
+        return None;
+    }
+    Some(format!(
+        "improvement loop paused: last {} rejected (batch {batch})",
+        tasks.len()
+    ))
+}
+
 /// Turn this week's evidence into at most `max` ranked improvements, each issued as a
 /// signed order tagged `improvement`, open to any worker.
 ///
@@ -1393,6 +1445,9 @@ pub async fn plan(
     let week = engines::iso_week(now);
     if ferryman_channel::ferry::is_archived(&route.communications, &route.project_id) {
         return Ok(PlanOutcome::Archived);
+    }
+    if let Some(why) = rejected_previous_batch(route, &week) {
+        return Ok(PlanOutcome::Paused(why));
     }
     if let Some(existing) = read_plan(route, &week) {
         let identity = signing_identity(route, config)?;

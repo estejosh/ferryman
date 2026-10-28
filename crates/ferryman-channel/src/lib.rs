@@ -1535,6 +1535,18 @@ pub fn issue_order(route: &ProjectRoute, order: &Order) -> Result<PathBuf> {
     if !is_safe_component(&order.id) {
         bail!("order id must be a path-safe identifier")
     }
+    if let Some(recipient) = order.assigned_to.as_deref()
+        && route.communications.join("agents").is_dir()
+        && !read_agent_roster(&route.communications)?
+            .iter()
+            .any(|agent| agent.name.eq_ignore_ascii_case(recipient))
+    {
+        bail!(
+            "order {} is addressed to retired or unknown agent '{}'; choose a live roster identity",
+            order.id,
+            recipient
+        )
+    }
     // A master whose git anchor has stopped verifying directs no NEW work (ADR 0022).
     // This is the acquisition case rather than the dramatic one: the repository has
     // moved, the outgoing master's fleet is still running, and the thing that has to

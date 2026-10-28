@@ -4456,6 +4456,11 @@ async fn roster(
                         "sig": sig(check),
                     })
                 });
+            let retirement_candidate = absent.iter().any(|a| {
+                a.agent.eq_ignore_ascii_case(&agent.name)
+                    && !agent.role.eq_ignore_ascii_case("operator")
+                    && !agent.role.eq_ignore_ascii_case("master")
+            });
             let (engine, last_active, runs) = match runs.get(&agent.name) {
                 Some(info) => (
                     Some(info.engine.clone()),
@@ -4480,6 +4485,7 @@ async fn roster(
                 "runs": runs,
                 "presence": seen,
                 "absent": absent.iter().any(|a| a.agent.eq_ignore_ascii_case(&agent.name)),
+                "retirement_candidate": retirement_candidate,
             })
         })
         .collect();
