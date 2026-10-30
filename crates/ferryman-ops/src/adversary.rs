@@ -1803,6 +1803,7 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            daily_usd: None,
             provider: None,
             route: Vec::new(),
             class: None,

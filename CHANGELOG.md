@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+Daily budgets that a CLI engine cannot slip past. `engine.<name>.daily_usd` caps what an engine may spend in one UTC day; over it, the engine is exhausted until midnight. Spending used to be only what a run reported, and a CLI that wraps an API (`ferryman-cline` on DeepSeek) reports nothing, so 174 DeepSeek requests in one week on grouchly recorded $0.00 while the account emptied. Now the probe's balance reading (DeepSeek, OpenRouter) is kept as a number with the day's and the week's opening balance, top-ups added to the opening rather than counted as negative spending, and today's and this week's spending are the larger of what runs reported and what the balance fell by; `weekly_usd` uses the same figure and the published billing line shows it. Engines on one key see the account's spending and so share its budget. The cost table prices DeepSeek's flash and v4-pro apart ($0.30/$1.20 and $1.32/$3.96 per million tokens, peak), and ENGINE_SETUP.md says to declare `cost_per_mtok_*` on prepaid engines so the smart router can prefer the cheaper one where it will do. New ledger fields are optional; old ledgers read unchanged.
+
 ## v0.6.3 - 2026-10-27
 
 v0.6.3. v0.6.2 was not published separately; its changes (below) ship in this release together with everything merged since.

@@ -198,6 +198,10 @@ pub struct EngineSpec {
     pub probe_chat: bool,
     pub weekly_requests: Option<u64>,
     pub weekly_usd: Option<f64>,
+    /// The most it may spend in one UTC day (`engine.<name>.daily_usd = "1"`). For a
+    /// prepaid provider whose balance the probe reads, what the account spent is measured
+    /// from the balance, so engines that share one key share the day's budget.
+    pub daily_usd: Option<f64>,
     /// `omniroute` for an OmniRoute gateway; see [`crate::omniroute`].
     pub provider: Option<String>,
     /// For a gateway engine: the provider/models its route ends at, as its probe found.
@@ -236,6 +240,7 @@ impl EngineSpec {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            daily_usd: None,
             provider: None,
             route: Vec::new(),
             class: None,
@@ -533,6 +538,13 @@ pub fn parse_engines(
                     .with_context(|| format!("engine.{name}.weekly_usd must be a number"))
             })
             .transpose()?;
+        let daily_usd = get("daily_usd")
+            .map(|value| {
+                value
+                    .parse::<f64>()
+                    .with_context(|| format!("engine.{name}.daily_usd must be a number"))
+            })
+            .transpose()?;
         let class = get("class")
             .map(|value| ModelClass::parse(&value).with_context(|| format!("engine.{name}.class")))
             .transpose()?;
@@ -599,6 +611,7 @@ pub fn parse_engines(
             probe_chat,
             weekly_requests: number("weekly_requests")?,
             weekly_usd,
+            daily_usd,
             provider,
             route: Vec::new(),
             class,
@@ -659,6 +672,31 @@ pub struct EngineState {
     pub requests: u64,
     #[serde(default)]
     pub spend_usd: f64,
+    /// The UTC day the two counts below belong to, `2026-10-30`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub day: String,
+    #[serde(default)]
+    pub day_requests: u64,
+    /// What today's runs reported, or were priced at from the tokens they reported.
+    #[serde(default)]
+    pub day_spend_usd: f64,
+    /// The provider's balance in dollars at the last probe that could read one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_at: Option<DateTime<Utc>>,
+    /// The UTC day [`Self::day_start_balance_usd`] belongs to.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub balance_day: String,
+    /// The balance as the day began, raised by every top-up seen since: this minus the
+    /// balance now is what the account spent today, whoever spent it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_start_balance_usd: Option<f64>,
+    /// The ISO week [`Self::week_start_balance_usd`] belongs to.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub balance_week: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub week_start_balance_usd: Option<f64>,
     /// Results whose worker-recorded evidence agreed with the claim.
     #[serde(default)]
     pub verified: u64,
@@ -771,6 +809,97 @@ pub struct CliProbe {
 }
 
 impl EngineState {
+    /// What the provider's account spent today by its balance: the day's opening balance,
+    /// top-ups included, less the balance now. `None` when no balance was read today.
+    #[must_use]
+    pub fn measured_today(&self, now: DateTime<Utc>) -> Option<f64> {
+        if self.balance_day != utc_day(now) {
+            return None;
+        }
+        Some((self.day_start_balance_usd? - self.balance_usd?).max(0.0))
+    }
+
+    /// [`Self::measured_today`] for the ISO week.
+    #[must_use]
+    pub fn measured_week(&self, now: DateTime<Utc>) -> Option<f64> {
+        if self.balance_week != iso_week(now) {
+            return None;
+        }
+        Some((self.week_start_balance_usd? - self.balance_usd?).max(0.0))
+    }
+
+    /// What was spent today: the larger of what the runs reported and what the balance
+    /// fell by. A CLI that wraps an API often reports nothing at all, and an account's
+    /// balance falls for every machine and every engine on its key, so the balance is the
+    /// figure a daily budget can trust.
+    #[must_use]
+    pub fn spent_today(&self, now: DateTime<Utc>) -> f64 {
+        let recorded = if self.day == utc_day(now) {
+            self.day_spend_usd
+        } else {
+            0.0
+        };
+        recorded.max(self.measured_today(now).unwrap_or(0.0))
+    }
+
+    /// [`Self::spent_today`] for the ISO week.
+    #[must_use]
+    pub fn spent_week(&self, now: DateTime<Utc>) -> f64 {
+        let recorded = if self.week == iso_week(now) {
+            self.spend_usd
+        } else {
+            0.0
+        };
+        recorded.max(self.measured_week(now).unwrap_or(0.0))
+    }
+
+    /// Requests counted today.
+    #[must_use]
+    pub fn requests_today(&self, now: DateTime<Utc>) -> u64 {
+        if self.day == utc_day(now) {
+            self.day_requests
+        } else {
+            0
+        }
+    }
+
+    /// Note a balance a probe read. A rise is a top-up, not negative spending: it raises
+    /// the day's and the week's opening balance by as much. A new day or week opens at the
+    /// last balance read, when that is under an hour old, so what was spent between the
+    /// last probe and midnight is not lost; otherwise at this one.
+    pub fn note_balance(&mut self, balance: f64, now: DateTime<Utc>) {
+        let last = self.balance_usd;
+        let recent = self.balance_at.is_some_and(|at| {
+            let since = now.signed_duration_since(at);
+            since >= chrono::Duration::zero() && since < chrono::Duration::hours(1)
+        });
+        let topped_up = last.map_or(0.0, |last| (balance - last).max(0.0));
+        let opening = match last {
+            Some(last) if recent && topped_up == 0.0 => last,
+            _ => balance,
+        };
+        let day = utc_day(now);
+        if self.balance_day == day {
+            if let Some(start) = self.day_start_balance_usd.as_mut() {
+                *start += topped_up;
+            }
+        } else {
+            self.balance_day = day;
+            self.day_start_balance_usd = Some(opening);
+        }
+        let week = iso_week(now);
+        if self.balance_week == week {
+            if let Some(start) = self.week_start_balance_usd.as_mut() {
+                *start += topped_up;
+            }
+        } else {
+            self.balance_week = week;
+            self.week_start_balance_usd = Some(opening);
+        }
+        self.balance_usd = Some(balance);
+        self.balance_at = Some(now);
+    }
+
     /// Whether refuted results have demoted this engine to chore work.
     #[must_use]
     pub fn demoted(&self) -> bool {
@@ -916,7 +1045,29 @@ pub fn record_use(agent: &str, engine: &str, cost_usd: f64, now: DateTime<Utc>) 
         }
         state.requests += 1;
         state.spend_usd += cost_usd.max(0.0);
+        let day = utc_day(now);
+        if state.day != day {
+            state.day = day;
+            state.day_requests = 0;
+            state.day_spend_usd = 0.0;
+        }
+        state.day_requests += 1;
+        state.day_spend_usd += cost_usd.max(0.0);
     });
+}
+
+/// `2026-10-30`: the UTC day `now` falls in.
+#[must_use]
+pub fn utc_day(now: DateTime<Utc>) -> String {
+    now.format("%Y-%m-%d").to_string()
+}
+
+/// The next midnight, UTC.
+#[must_use]
+pub fn next_day(now: DateTime<Utc>) -> DateTime<Utc> {
+    (now.date_naive() + chrono::Days::new(1))
+        .and_hms_opt(0, 0, 0)
+        .map_or(now, |midnight| midnight.and_utc())
 }
 
 /// `2026-W39`: the ISO week `now` falls in.
@@ -1041,22 +1192,29 @@ pub fn availability(spec: &EngineSpec, state: &EngineState, now: DateTime<Utc>) 
                 .unwrap_or_else(|| "out of credit".to_string()),
         };
     }
-    if state.week == iso_week(now) {
-        let over = match (spec.weekly_requests, spec.weekly_usd) {
-            (Some(cap), _) if state.requests >= cap => {
-                Some(format!("weekly cap of {cap} requests reached"))
-            }
-            (_, Some(cap)) if state.spend_usd >= cap => {
-                Some(format!("weekly budget of ${cap:.2} spent"))
-            }
-            _ => None,
-        };
-        if let Some(reason) = over {
+    if let Some(cap) = spec.daily_usd {
+        let spent = state.spent_today(now);
+        if spent >= cap {
             return Availability::Exhausted {
-                until: next_week(now),
-                reason,
+                until: next_day(now),
+                reason: format!("daily budget of ${cap:.2} spent (${spent:.2} today)"),
             };
         }
+    }
+    let over = match (spec.weekly_requests, spec.weekly_usd) {
+        (Some(cap), _) if state.week == iso_week(now) && state.requests >= cap => {
+            Some(format!("weekly cap of {cap} requests reached"))
+        }
+        (_, Some(cap)) if state.spent_week(now) >= cap => {
+            Some(format!("weekly budget of ${cap:.2} spent"))
+        }
+        _ => None,
+    };
+    if let Some(reason) = over {
+        return Availability::Exhausted {
+            until: next_week(now),
+            reason,
+        };
     }
     // Runs failed on it: left alone until the cool-off ends, however its last probe went.
     if let Some(until) = state.cooloff_until
@@ -2103,6 +2261,8 @@ pub struct Probe {
     /// The provider's balance endpoint says there is credit.
     pub funded: Option<bool>,
     pub balance: Option<String>,
+    /// The same balance as a number of dollars, when the provider gives it in USD.
+    pub balance_usd: Option<f64>,
     /// What an OmniRoute gateway offers.
     pub catalog: Option<crate::omniroute::Catalog>,
     /// What this probe proved: a real completion, an address that answered, or nothing.
@@ -2334,6 +2494,12 @@ async fn balance(http: &reqwest::Client, base: &str, key: &str, found: &mut Prob
                     info["total_balance"].as_str().unwrap_or("?"),
                     info["currency"].as_str().unwrap_or("")
                 ));
+                if info["currency"].as_str() == Some("USD") {
+                    found.balance_usd = info["total_balance"]
+                        .as_str()
+                        .and_then(|text| text.trim().parse::<f64>().ok())
+                        .map(|usd| usd.max(0.0));
+                }
             }
             found.funded = available;
             if available == Some(false) {
@@ -2347,6 +2513,7 @@ async fn balance(http: &reqwest::Client, base: &str, key: &str, found: &mut Prob
             if let (Some(total), Some(used)) = (total, used) {
                 let left = total - used;
                 found.balance = Some(format!("{left:.2} USD"));
+                found.balance_usd = Some(left.max(0.0));
                 found.funded = Some(left > 0.0);
                 if left <= 0.0 {
                     found.exhausted = Some("OpenRouter credits are used up".to_string());
@@ -2376,6 +2543,9 @@ pub fn apply_probe(ledger: &mut Ledger, engine: &str, probe: &Probe, now: DateTi
     state.proof = Some(probe.proof);
     if probe.balance.is_some() {
         state.balance = probe.balance.clone();
+    }
+    if let Some(usd) = probe.balance_usd {
+        state.note_balance(usd, now);
     }
     if probe.catalog.is_some() {
         state.gateway.clone_from(&probe.catalog);
@@ -2686,11 +2856,15 @@ fn billing(
     let this_week = state.week == iso_week(now);
     ferryman_channel::receipts::EngineBilling {
         host: spec.base_url.as_deref().and_then(url_host),
-        capped: spec.weekly_usd.is_some() || spec.weekly_requests.is_some(),
+        capped: spec.weekly_usd.is_some()
+            || spec.weekly_requests.is_some()
+            || spec.daily_usd.is_some(),
         weekly_requests: spec.weekly_requests,
         week: iso_week(now),
         requests: if this_week { state.requests } else { 0 },
-        spend_usd: if this_week { state.spend_usd } else { 0.0 },
+        // Measured from the balance where it can be: a CLI that wraps an API reports no
+        // cost, and its spending read as nothing at all.
+        spend_usd: state.spent_week(now),
         flag: (spec.paid == Paid::FreeTier)
             .then(|| state.free_tier_flag(now))
             .flatten(),
@@ -2754,6 +2928,7 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            daily_usd: None,
             provider: None,
             route: Vec::new(),
             class: None,
@@ -2832,6 +3007,7 @@ engine.nvidia.weekly_requests = "500"
 engine.deepseek.tier = "build"
 engine.deepseek.paid = "prepaid"
 engine.deepseek.weekly_usd = "5"
+engine.deepseek.daily_usd = "1"
 engine.local.base_url = "http://localhost:1234/v1"
 engine.local.model = "qwen2.5-coder"
 engine.local.tier = "chore"
@@ -2857,6 +3033,8 @@ engine.local.tier = "chore"
         assert_eq!(engines[1].command, "ferryman-cline");
         assert_eq!(engines[1].model.as_deref(), Some("deepseek-v4-pro"));
         assert_eq!(engines[1].weekly_usd, Some(5.0));
+        assert_eq!(engines[1].daily_usd, Some(1.0));
+        assert_eq!(engines[0].daily_usd, None);
         assert_eq!(
             engines[2].paid,
             Paid::Local,
@@ -3049,6 +3227,102 @@ engine.local.tier = "chore"
             ledger.state("deepseek").balance.as_deref(),
             Some("4.20 USD")
         );
+    }
+
+    /// A CLI that wraps a prepaid API reports no cost, so its spending used to read as
+    /// nothing: the balance the probe reads is what the daily budget trusts. Found on
+    /// grouchly, 2026-10-30: 174 DeepSeek requests in a week, $0.00 recorded, and the
+    /// account emptied.
+    #[test]
+    fn the_balance_measures_a_day_of_spending_that_runs_did_not_report() {
+        let morning = Utc.with_ymd_and_hms(2026, 10, 30, 8, 0, 0).unwrap();
+        let mut spec = http("deepseek-flash", Tier::Judge, "https://api.deepseek.com");
+        spec.daily_usd = Some(1.0);
+        let mut ledger = Ledger::default();
+        let read = |ledger: &mut Ledger, usd: f64, at: DateTime<Utc>| {
+            apply_probe(
+                ledger,
+                "deepseek-flash",
+                &Probe {
+                    funded: Some(usd > 0.0),
+                    balance_usd: Some(usd),
+                    ..Probe::default()
+                },
+                at,
+            );
+        };
+        read(&mut ledger, 10.0, morning);
+        // Runs that report nothing count as requests and cost nothing on record.
+        for _ in 0..40 {
+            let state = ledger.entry("deepseek-flash");
+            state.day = utc_day(morning);
+            state.day_requests += 1;
+        }
+        assert!(!matches!(
+            availability(&spec, &ledger.state("deepseek-flash"), morning),
+            Availability::Exhausted { .. }
+        ));
+        read(&mut ledger, 9.40, morning + chrono::Duration::hours(2));
+        let state = ledger.state("deepseek-flash");
+        let at = morning + chrono::Duration::hours(2);
+        assert!((state.spent_today(at) - 0.60).abs() < 1e-9, "{state:?}");
+        assert!(!matches!(
+            availability(&spec, &state, at),
+            Availability::Exhausted { .. }
+        ));
+        // A top-up is not spending: the day's opening balance rises by as much.
+        read(&mut ledger, 29.40, morning + chrono::Duration::hours(3));
+        let at = morning + chrono::Duration::hours(3);
+        assert!((ledger.state("deepseek-flash").spent_today(at) - 0.60).abs() < 1e-9);
+        read(&mut ledger, 28.35, morning + chrono::Duration::hours(4));
+        let at = morning + chrono::Duration::hours(4);
+        let state = ledger.state("deepseek-flash");
+        assert!((state.spent_today(at) - 1.65).abs() < 1e-9, "{state:?}");
+        match availability(&spec, &state, at) {
+            Availability::Exhausted { until, reason } => {
+                assert_eq!(until, Utc.with_ymd_and_hms(2026, 10, 31, 0, 0, 0).unwrap());
+                assert!(reason.contains("daily budget of $1.00"), "{reason}");
+            }
+            other => panic!("over its day's budget, got {other:?}"),
+        }
+        // The next day opens at the last balance read, and the budget is whole again.
+        let tomorrow = Utc.with_ymd_and_hms(2026, 10, 31, 0, 5, 0).unwrap();
+        read(&mut ledger, 28.35, tomorrow);
+        let state = ledger.state("deepseek-flash");
+        assert!(state.spent_today(tomorrow).abs() < 1e-9);
+        assert!(!matches!(
+            availability(&spec, &state, tomorrow),
+            Availability::Exhausted { .. }
+        ));
+        // The week's spending is measured the same way, across the day boundary.
+        assert!(
+            (state.spent_week(tomorrow) - 1.65).abs() < 1e-9,
+            "{state:?}"
+        );
+    }
+
+    #[test]
+    fn reported_costs_count_toward_the_day_when_there_is_no_balance_to_read() {
+        let now = monday_noon();
+        let mut spec = http("paid", Tier::Build, "https://a.example/v1");
+        spec.daily_usd = Some(0.5);
+        let mut state = EngineState {
+            day: utc_day(now),
+            day_requests: 3,
+            day_spend_usd: 0.51,
+            ..EngineState::default()
+        };
+        assert!(matches!(
+            availability(&spec, &state, now),
+            Availability::Exhausted { .. }
+        ));
+        // Yesterday's spending is not today's.
+        state.day = utc_day(now - chrono::Duration::days(1));
+        assert!(!matches!(
+            availability(&spec, &state, now),
+            Availability::Exhausted { .. }
+        ));
+        assert_eq!(state.requests_today(now), 0);
     }
 
     #[test]
