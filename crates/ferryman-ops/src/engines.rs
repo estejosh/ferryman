@@ -697,6 +697,10 @@ pub struct EngineState {
     pub balance_week: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub week_start_balance_usd: Option<f64>,
+    /// The last [`DAYS_KEPT`] finished UTC days: requests and spending, for the daily
+    /// improvement digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub days: Vec<DayFigures>,
     /// Results whose worker-recorded evidence agreed with the claim.
     #[serde(default)]
     pub verified: u64,
@@ -769,6 +773,19 @@ pub struct EngineState {
     pub alerted_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert_question: Option<String>,
+}
+
+/// Finished days kept in [`EngineState::days`].
+pub const DAYS_KEPT: usize = 14;
+
+/// One finished UTC day of one engine.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DayFigures {
+    /// `2026-10-30`.
+    pub day: String,
+    pub requests: u64,
+    /// The larger of what runs reported and what the balance fell by.
+    pub spent_usd: f64,
 }
 
 /// What a probe proved about an engine.
@@ -853,6 +870,41 @@ impl EngineState {
         recorded.max(self.measured_week(now).unwrap_or(0.0))
     }
 
+    /// Keep a finished day's figures, merged with what is kept for it already: the larger
+    /// of each, since the counts and the balance close a day at different moments.
+    fn archive_day(&mut self, day: &str, requests: u64, spent_usd: f64) {
+        if day.is_empty() {
+            return;
+        }
+        match self.days.iter_mut().find(|kept| kept.day == day) {
+            Some(kept) => {
+                kept.requests = kept.requests.max(requests);
+                kept.spent_usd = kept.spent_usd.max(spent_usd);
+            }
+            None => self.days.push(DayFigures {
+                day: day.to_string(),
+                requests,
+                spent_usd,
+            }),
+        }
+        self.days.sort_by(|a, b| a.day.cmp(&b.day));
+        let extra = self.days.len().saturating_sub(DAYS_KEPT);
+        self.days.drain(..extra);
+    }
+
+    /// One day's figures: today's as they stand, or a finished day's as kept.
+    #[must_use]
+    pub fn day_figures(&self, day: &str, now: DateTime<Utc>) -> Option<DayFigures> {
+        if day == utc_day(now) {
+            return Some(DayFigures {
+                day: day.to_string(),
+                requests: self.requests_today(now),
+                spent_usd: self.spent_today(now),
+            });
+        }
+        self.days.iter().find(|kept| kept.day == day).cloned()
+    }
+
     /// Requests counted today.
     #[must_use]
     pub fn requests_today(&self, now: DateTime<Utc>) -> u64 {
@@ -884,6 +936,10 @@ impl EngineState {
                 *start += topped_up;
             }
         } else {
+            if let (Some(start), Some(last)) = (self.day_start_balance_usd, last) {
+                let closed = self.balance_day.clone();
+                self.archive_day(&closed, 0, (start - last).max(0.0));
+            }
             self.balance_day = day;
             self.day_start_balance_usd = Some(opening);
         }
@@ -1047,6 +1103,9 @@ pub fn record_use(agent: &str, engine: &str, cost_usd: f64, now: DateTime<Utc>) 
         state.spend_usd += cost_usd.max(0.0);
         let day = utc_day(now);
         if state.day != day {
+            let (closed, requests, spent) =
+                (state.day.clone(), state.day_requests, state.day_spend_usd);
+            state.archive_day(&closed, requests, spent);
             state.day = day;
             state.day_requests = 0;
             state.day_spend_usd = 0.0;
@@ -3299,6 +3358,9 @@ engine.local.tier = "chore"
             (state.spent_week(tomorrow) - 1.65).abs() < 1e-9,
             "{state:?}"
         );
+        // And the finished day is kept for the digest.
+        let kept = state.day_figures("2026-10-30", tomorrow).unwrap();
+        assert!((kept.spent_usd - 1.65).abs() < 1e-9, "{kept:?}");
     }
 
     #[test]

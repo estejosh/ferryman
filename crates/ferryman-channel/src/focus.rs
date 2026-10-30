@@ -528,6 +528,128 @@ pub fn allocate(projects: &[(String, Tier)], per_project: usize) -> Vec<Share> {
     shares
 }
 
+/// Improvement orders the whole fleet plans in one week, unless `FERRYMAN_IMPROVE_BUDGET`
+/// says otherwise. Before there was a fleet budget every project planned up to five a
+/// week whatever it was worth - nearly two hundred a week across the fleet, most of
+/// them on projects nobody was working on.
+pub const FLEET_BUDGET: usize = 20;
+/// The environment variable that sets [`FLEET_BUDGET`].
+pub const BUDGET_ENV: &str = "FERRYMAN_IMPROVE_BUDGET";
+
+/// The fleet's weekly improvement budget: [`BUDGET_ENV`] when it is a whole number,
+/// otherwise [`FLEET_BUDGET`].
+#[must_use]
+pub fn fleet_budget() -> usize {
+    std::env::var(BUDGET_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<usize>().ok())
+        .unwrap_or(FLEET_BUDGET)
+}
+
+/// One project's case for a share of the fleet's improvement budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Worth {
+    pub project: String,
+    pub tier: Tier,
+    /// What the fleet's own signals say ([`crate::focus_suggest::Signals::score`]): recent
+    /// commits, open and failed orders, what the last gather found, how long it has been
+    /// quiet.
+    pub score: i32,
+    /// Of last week's improvements here that were settled, the share that was accepted
+    /// or done rather than refuted or sent back. `None` with nothing settled.
+    pub landed: Option<f64>,
+    /// The signals, in words.
+    pub reason: String,
+}
+
+impl Worth {
+    /// The weight the budget is split by. Zero for a paused project, and for one whose
+    /// signals give it nothing to improve (quiet, no failures, nothing gathered) unless
+    /// a person made it a focus. Otherwise the tier's weight times the signals' score,
+    /// scaled by how much of what was built here last week landed: a project whose
+    /// improvements all came back refuted gets a quarter of the weight of one whose all
+    /// landed, since spending there buys less.
+    #[must_use]
+    pub fn weight(&self) -> u64 {
+        if self.tier == Tier::Paused || (self.score <= 0 && self.tier != Tier::Focus) {
+            return 0;
+        }
+        let score = u64::try_from(self.score.max(1)).unwrap_or(1);
+        let landed = self.landed.map_or(100, |rate| {
+            25 + (75.0 * rate.clamp(0.0, 1.0)).round() as u64
+        });
+        self.tier.weight() * score * landed
+    }
+}
+
+/// Split the fleet's weekly improvement budget over projects by what each is worth
+/// ([`Worth::weight`]), rather than the same amount to each.
+///
+/// `budget` orders in all; no project more than `cap`. A project worth nothing gets none:
+/// spending a dollar a day well means not spending it on a project nobody is touching.
+/// A focus project gets at least one while the budget lasts. Shares are rounded with the
+/// largest remainders first, and the result is most valuable first. Pure.
+#[must_use]
+pub fn allocate_by_worth(projects: &[Worth], budget: usize, cap: usize) -> Vec<Share> {
+    let mut ranked: Vec<&Worth> = projects.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.weight()
+            .cmp(&a.weight())
+            .then(a.tier.cmp(&b.tier))
+            .then(a.project.cmp(&b.project))
+    });
+    let mut shares: Vec<Share> = ranked
+        .iter()
+        .map(|worth| Share {
+            project: worth.project.clone(),
+            tier: worth.tier,
+            orders: 0,
+        })
+        .collect();
+    let cap = cap.max(1);
+    let total: u64 = ranked.iter().map(|worth| worth.weight()).sum();
+    if total == 0 || budget == 0 {
+        return shares;
+    }
+    let mut left = budget;
+    // A focus project is never left with nothing while there is budget.
+    for (index, worth) in ranked.iter().enumerate() {
+        if left > 0 && worth.tier == Tier::Focus && worth.weight() > 0 {
+            shares[index].orders = 1;
+            left -= 1;
+        }
+    }
+    let mut remainders: Vec<(usize, u64)> = Vec::new();
+    for (index, worth) in ranked.iter().enumerate() {
+        let numerator = budget as u64 * worth.weight();
+        let whole = ((numerator / total) as usize).min(cap);
+        let more = whole.saturating_sub(shares[index].orders).min(left);
+        shares[index].orders += more;
+        left -= more;
+        if worth.weight() > 0 && shares[index].orders < cap {
+            remainders.push((index, numerator % total));
+        }
+    }
+    remainders.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    while left > 0 {
+        let mut gave = false;
+        for (index, _) in &remainders {
+            if left == 0 {
+                break;
+            }
+            if shares[*index].orders < cap {
+                shares[*index].orders += 1;
+                left -= 1;
+                gave = true;
+            }
+        }
+        if !gave {
+            break;
+        }
+    }
+    shares
+}
+
 /// One project as the focus screens show it: its tier, what that comes to this week, and
 /// the width its improvement orders may run at.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -724,6 +846,61 @@ pub fn rollback_notice(channel: &Path, home: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+
+    fn worth(project: &str, tier: Tier, score: i32, landed: Option<f64>) -> Worth {
+        Worth {
+            project: project.into(),
+            tier,
+            score,
+            landed,
+            reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_fleet_budget_goes_where_it_is_worth_most_and_not_to_quiet_projects() {
+        let projects = vec![
+            worth("quiet", Tier::Normal, 0, None),
+            worth("busy", Tier::Normal, 8, Some(1.0)),
+            worth("some", Tier::Normal, 2, None),
+            worth("flops", Tier::Normal, 8, Some(0.0)),
+            worth("asleep", Tier::Paused, 9, None),
+            worth("pinned", Tier::Focus, 0, None),
+        ];
+        let shares = allocate_by_worth(&projects, 10, 5);
+        let got: Vec<(&str, usize)> = shares
+            .iter()
+            .map(|share| (share.project.as_str(), share.orders))
+            .collect();
+        assert_eq!(shares.iter().map(|share| share.orders).sum::<usize>(), 10);
+        let of = |name: &str| got.iter().find(|(p, _)| *p == name).unwrap().1;
+        assert_eq!(of("quiet"), 0, "nothing to improve, nothing spent: {got:?}");
+        assert_eq!(of("asleep"), 0, "{got:?}");
+        assert!(of("pinned") >= 1, "a focus is never left out: {got:?}");
+        assert!(
+            of("busy") > of("flops"),
+            "what lands is worth more: {got:?}"
+        );
+        assert!(of("busy") >= of("some"), "{got:?}");
+        assert!(got.iter().all(|(_, orders)| *orders <= 5), "{got:?}");
+        assert_eq!(got[0].0, "busy", "most valuable first: {got:?}");
+    }
+
+    #[test]
+    fn a_budget_bigger_than_the_caps_is_not_forced_on_anyone() {
+        let projects = vec![
+            worth("a", Tier::Normal, 3, None),
+            worth("b", Tier::Normal, 3, None),
+        ];
+        let shares = allocate_by_worth(&projects, 50, 4);
+        assert!(shares.iter().all(|share| share.orders == 4), "{shares:?}");
+        assert!(
+            allocate_by_worth(&projects, 0, 4)
+                .iter()
+                .all(|s| s.orders == 0)
+        );
+        assert!(allocate_by_worth(&[worth("q", Tier::Background, -2, None)], 5, 5)[0].orders == 0);
+    }
     use super::*;
     use crate::AgentRoute;
 

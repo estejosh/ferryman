@@ -115,13 +115,34 @@ line it prints.
 
 ## What the allocation does
 
-**Budget.** `ferry improve run` plans `per_project` improvement orders (`--max`, five by
-default) for each project that has self-improve on and is not paused. The focus does not
-change that total; it moves it. Each project's share is its weight over the sum of weights,
-rounded by largest remainder, at least one and at most three times `per_project`. With
-everyone in one tier each project gets exactly `per_project`, as before. Five each over a
-focus, a normal and a background project is 11, 3 and 1; a paused project gets none, and
-`improve run` skips it and says why. Projects are visited in claim order, focus first.
+**Budget.** The fleet plans `FERRYMAN_IMPROVE_BUDGET` improvement orders a week in all
+(20 by default), at most `--max` (five by default) for one project. It used to be five for
+every project with self-improve on, nearly two hundred a week across the fleet, most of them
+for projects nobody was working on. Each project's share now follows what it is worth
+(`ferryman_channel::focus::allocate_by_worth`): its tier's weight, times what its own
+signals score (commits in the last 30 days, open and failed orders, what the last gather
+found, minus how long it has been quiet), times how much of what was built there lately
+landed (the mean of its grades over the last two weeks, a non-objective improvement
+counting as zero; or, with no grades, the share of last week's improvement orders accepted
+rather than refuted or sent back). A project worth nothing - quiet, nothing failing,
+nothing found - gets no plan that week. A focus project always gets at least one while the
+budget lasts, and a paused project none. Projects that planned already this week keep what
+they planned, and it comes off the budget. Each project's case is written to
+`improve/<week>/worth.json`. The first improvement of a plan is issued at normal priority,
+the rest at low, so they queue behind everyone's ordinary work.
+
+**Grades.** Once an improvement is accepted or done, an engine other than the one that built
+it grades it: was it an objective improvement (a test that now passes, a bug reproduced and
+fixed, a number that moved), and what was it worth, 0 to 10. The grade is signed into
+`improve/grades/<order>-r<revision>.json`. A failing grade (not objective, or under 5)
+counts as a refuted result against the engine that built it and the engine that planned it,
+on their own machines, so their trust falls and the smart router learns. The next week's
+planner reads the grades and their lessons, and is told to plan only objective
+improvements. At most three are graded per project per pass.
+
+**Digest.** Every day the fleet writes `improve/daily/<day>.md` in the home channel: what
+was built, accepted, sent back or refuted, how each was graded, and what paid engines spent,
+and asks the master to read it (a `digest` notice).
 
 **Width.** The policy's per-role width (how many improvement orders of a role may be claimed
 at once) is scaled by tier: `focus` keeps it, `normal` gets half rounded up, `background`
