@@ -59,7 +59,7 @@ rand = "0.10"
 # pulls a 0.13 of its own either way; one duplicate crate is cheaper than a
 # native build dependency.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.41", features = ["bundled", "chrono"] }
 # The OpenTelemetry crates move as a set, and nothing moves until
 # `tracing-opentelemetry` does: it decides which `opentelemetry` ends up in the
 # graph, and bumping the other three around it only puts two versions of
