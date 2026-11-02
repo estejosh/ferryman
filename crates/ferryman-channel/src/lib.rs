@@ -35,6 +35,7 @@ pub mod fleethome;
 pub mod focus;
 pub mod focus_suggest;
 pub mod gate;
+pub mod grades;
 pub mod handin;
 pub mod head;
 pub mod hold;

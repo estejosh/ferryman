@@ -52,7 +52,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Duration, Utc};
 use ferryman_channel::{
     AgentIdentity, Order, ProjectRoute, Task, TaskState,
-    focus::{Focus, Share, Tier as FocusTier, allocate},
+    focus::{Focus, Share, Tier as FocusTier, Worth, allocate_by_worth},
     trajectory::Trajectory,
 };
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,7 @@ fn tail(text: &str, chars: usize) -> String {
     flat.chars().skip(count.saturating_sub(chars)).collect()
 }
 
-fn task_title(task: &Task) -> String {
+pub(crate) fn task_title(task: &Task) -> String {
     task.order
         .payload
         .get("improvement")
@@ -777,9 +777,13 @@ pub struct PlanFile {
     /// What a judge said about an unreviewed plan, once one has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reviewed_by: Option<String>,
+    /// The agent the planning engine ran as: a failing grade on what it planned counts
+    /// against that engine on that agent's machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_by_agent: Option<String>,
 }
 
-fn read_plan(route: &ProjectRoute, week: &str) -> Option<PlanFile> {
+pub(crate) fn read_plan(route: &ProjectRoute, week: &str) -> Option<PlanFile> {
     fs::read_to_string(week_dir(route, week).join("plan.json"))
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
@@ -829,17 +833,14 @@ pub fn order_id(week: &str, rank: usize) -> String {
     format!("improve-{}-{rank}", week.to_ascii_lowercase())
 }
 
-/// Pull the first JSON object out of whatever an engine printed around it.
-fn extract_json(text: &str) -> Option<Value> {
-    let end = text.rfind('}')?;
-    text.match_indices('{')
-        .map(|(start, _)| start)
-        .filter(|start| *start < end)
-        .find_map(|start| serde_json::from_str::<Value>(&text[start..=end]).ok())
+/// Pull the JSON object that has `key` out of whatever an engine printed around it
+/// ([`crate::agent::json_objects`]): prose, fences, and text with braces after it.
+pub(crate) fn extract_json(text: &str, key: &str) -> Option<Value> {
+    crate::agent::json_object_with(text, key)
 }
 
 fn parse_improvements(text: &str, max: usize) -> Vec<Improvement> {
-    let Some(value) = extract_json(text) else {
+    let Some(value) = extract_json(text, "improvements") else {
         return Vec::new();
     };
     value
@@ -883,6 +884,13 @@ fn plan_prompt(project: &str, evidence: &str, max: usize) -> String {
          and stuck work next week, ranked most valuable first. Each must be small enough \
          for one engine to finish on one branch, and must say how a reviewer will know \
          it is done: tests to add or pass, or checks to run.\n\n\
+         Plan only objective improvements: each must name what will measurably change - \
+         a test that fails now and will pass, a bug reproduced and then fixed, a number \
+         that will move, a failure that can no longer happen. Rewording, renaming, \
+         comments and notes that change nothing measurable are not improvements. A second \
+         engine grades every finished improvement on exactly this, and a failing grade \
+         counts against the engines that planned and built it. Fewer is better than \
+         padded: plan nothing rather than something that is not objective.\n\n\
          If something only the project's owner can answer would change what you plan, \
          add at most two short questions, each with a few answers to choose from; leave \
          \"questions\" out otherwise. Plan anyway: the owner answers on their phone, and \
@@ -896,7 +904,7 @@ fn plan_prompt(project: &str, evidence: &str, max: usize) -> String {
 
 /// The clarifying questions a planner asked, at most two, each with its options.
 fn parse_questions(text: &str) -> Vec<(String, Vec<String>)> {
-    let Some(value) = extract_json(text) else {
+    let Some(value) = extract_json(text, "questions") else {
         return Vec::new();
     };
     value
@@ -1120,7 +1128,9 @@ fn issue_missing(
             touches: Vec::new(),
             needs: None,
             allow_overlap: false,
-            priority: None,
+            // The plan's first choice is worked like any agent's order; the rest wait
+            // behind every person's and agent's normal work.
+            priority: (rank > 1).then_some(ferryman_channel::Priority::Low),
         };
         identity.sign_order(&mut order);
         match ferryman_channel::issue_order(route, &order) {
@@ -1133,7 +1143,10 @@ fn issue_missing(
     Ok(issued)
 }
 
-fn signing_identity(route: &ProjectRoute, config: &AgentConfig) -> Result<AgentIdentity> {
+pub(crate) fn signing_identity(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+) -> Result<AgentIdentity> {
     AgentIdentity::load_existing(&config.agent, &route.attachment)?.with_context(|| {
         format!(
             "no key for '{}' in {}, so nothing could be signed",
@@ -1368,7 +1381,11 @@ fn hold_unbuildable(
 
 /// This agent and machine, when the project's engine policy lets them run its
 /// self-improve work; otherwise why not.
-fn here(route: &ProjectRoute, config: &AgentConfig, policy: &Policy) -> Result<(), String> {
+pub(crate) fn here(
+    route: &ProjectRoute,
+    config: &AgentConfig,
+    policy: &Policy,
+) -> Result<(), String> {
     let machine = ferryman_channel::receipts::machine_label();
     if policy.allows_machine(&config.agent, &machine) {
         Ok(())
@@ -1421,12 +1438,13 @@ pub async fn plan(
     if !evidence_path.is_file() {
         gather(route, now)?;
     }
-    let evidence = planner_evidence(
+    let mut evidence = planner_evidence(
         &fs::read_to_string(&evidence_path)
             .with_context(|| format!("read {}", evidence_path.display()))?,
         &load_claims(route),
         &week,
     );
+    evidence.push_str(&graded_evidence(route, now));
     let max = max.max(1);
     let (policy, _) = ferryman_channel::policy::effective(&route.communications, &route.project_id);
     if let Err(why) = here(route, config, &policy) {
@@ -1498,6 +1516,7 @@ pub async fn plan(
         unreviewed: !judged,
         improvements,
         reviewed_by: None,
+        planned_by_agent: Some(config.agent.clone()),
     };
     // The plan is written before the orders, so an interrupted run re-issues from the
     // same plan rather than asking again and planning something different.
@@ -2118,6 +2137,128 @@ pub fn report(route: &ProjectRoute, at: DateTime<Utc>) -> Result<PathBuf> {
 ///
 /// Each check is a file existence test or a directory read, so a run with nothing due
 /// costs no engine call. Nothing at all while the machine is paused.
+/// What finished improvements were graded in the last four weeks, for the planner.
+fn graded_evidence(route: &ProjectRoute, now: DateTime<Utc>) -> String {
+    let grades = ferryman_channel::grades::since(route, now - Duration::days(28));
+    if grades.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## How earlier improvements were graded\n\nA second engine graded each \
+         finished improvement on whether it objectively improved the project (0-10). Plan \
+         more of what scored well; do not repeat what was not objective.\n\n{}\n",
+        ferryman_channel::grades::for_planner(&grades, 15)
+    )
+}
+
+/// How much of last week's improvement work here landed: from the grades of the last two
+/// weeks when there are any, otherwise the share of last week's settled improvement
+/// orders that were accepted or done rather than refuted or sent back.
+fn landed(route: &ProjectRoute, last_week: &str, now: DateTime<Utc>) -> Option<f64> {
+    let graded = ferryman_channel::grades::since(route, now - Duration::days(14));
+    if let Some(rate) = ferryman_channel::grades::landed_rate(&graded) {
+        return Some(rate);
+    }
+    let plan = read_plan(route, last_week)?;
+    let (mut good, mut bad) = (0usize, 0usize);
+    for id in &plan.orders {
+        let Ok(task) = ferryman_channel::read_task(route, id) else {
+            continue;
+        };
+        match task.state_at(now) {
+            TaskState::Accepted | TaskState::Done => good += 1,
+            TaskState::Refuted { .. } | TaskState::ChangesRequested { .. } => bad += 1,
+            _ => {}
+        }
+    }
+    (good + bad > 0).then(|| good as f64 / (good + bad) as f64)
+}
+
+/// What one project is worth to this week's improvement budget.
+fn worth_of(route: &ProjectRoute, tier: FocusTier, last_week: &str, now: DateTime<Utc>) -> Worth {
+    let (score, reason) = ferryman_channel::focus_suggest::Signals::gather(route, now).score(now);
+    Worth {
+        project: route.project_id.clone(),
+        tier,
+        score,
+        landed: landed(route, last_week, now),
+        reason,
+    }
+}
+
+/// Each project's share of the fleet's improvement budget this week (`budget`, normally
+/// [`ferryman_channel::focus::fleet_budget`]). A project that planned already keeps
+/// what it planned, and that comes off the budget; the rest is split over the projects
+/// still to plan by what each is worth ([`allocate_by_worth`]), at most `max` each. Each
+/// project's case is written to `improve/<week>/worth.json`, so the report can say why
+/// it got what it got. The signals are read only while some project has yet to plan.
+fn shares_by_worth(
+    ordered: &[&(ProjectRoute, AgentConfig)],
+    focus: &Focus,
+    (max, budget): (usize, usize),
+    week: &str,
+    now: DateTime<Utc>,
+) -> BTreeMap<String, Share> {
+    let last_week = engines::iso_week(now - Duration::days(7));
+    let mut shares = BTreeMap::new();
+    let mut spent = 0usize;
+    let mut to_plan: Vec<(&ProjectRoute, FocusTier)> = Vec::new();
+    for (route, _) in ordered {
+        let tier = focus.tier(&route.project_id, now);
+        match read_plan(route, week) {
+            Some(plan) => {
+                spent += plan.orders.len();
+                shares.insert(
+                    route.project_id.clone(),
+                    Share {
+                        project: route.project_id.clone(),
+                        tier,
+                        orders: plan.orders.len(),
+                    },
+                );
+            }
+            None => to_plan.push((route, tier)),
+        }
+    }
+    if to_plan.is_empty() {
+        return shares;
+    }
+    let worths: Vec<Worth> = to_plan
+        .iter()
+        .map(|(route, tier)| worth_of(route, *tier, &last_week, now))
+        .collect();
+    let budget = budget.saturating_sub(spent);
+    for share in allocate_by_worth(&worths, budget, max) {
+        if let (Some((route, _)), Some(worth)) = (
+            to_plan
+                .iter()
+                .find(|(route, _)| route.project_id == share.project),
+            worths.iter().find(|worth| worth.project == share.project),
+        ) {
+            let path = week_dir(route, week).join("worth.json");
+            let record = json!({
+                "week": week,
+                "score": worth.score,
+                "landed": worth.landed,
+                "weight": worth.weight(),
+                "orders": share.orders,
+                "budget_left": budget,
+                "why": worth.reason,
+            });
+            if let Some(parent) = path.parent()
+                && fs::create_dir_all(parent).is_ok()
+            {
+                let _ = fs::write(
+                    &path,
+                    serde_json::to_vec_pretty(&record).unwrap_or_default(),
+                );
+            }
+        }
+        shares.insert(share.project.clone(), share);
+    }
+    shares
+}
+
 pub async fn run(
     targets: &[(ProjectRoute, AgentConfig)],
     max: usize,
@@ -2128,14 +2269,37 @@ pub async fn run(
 }
 
 /// [`run`] under the fleet's [`Focus`]: the projects are worked in focus order, and the
-/// week's budget - `max` improvement orders for each project that is not paused - is split
-/// over them by tier weight ([`ferryman_channel::focus::allocate`]), so focus projects get
-/// the large majority, background a trickle, and a paused project is not gathered for or
-/// planned at all (what it already has in flight is still reviewed and reported). With no
-/// focus set every project is normal and gets `max`, exactly as [`run`].
+/// fleet's week of improvements ([`ferryman_channel::focus::fleet_budget`] orders in all,
+/// at most `max` for one project) is split over them by what each is worth
+/// ([`ferryman_channel::focus::allocate_by_worth`]): its tier, what its own signals say
+/// (recent commits, failed and open orders, what the last gather found, how long it has
+/// been quiet) and how much of what was built there lately was graded an objective
+/// improvement. A project worth nothing - quiet, nothing failing, nothing found - is not
+/// planned for, and a paused project is not even gathered for (what either already has in
+/// flight is still reviewed, graded and reported).
 pub async fn run_focused(
     targets: &[(ProjectRoute, AgentConfig)],
     max: usize,
+    focus: &Focus,
+    now: DateTime<Utc>,
+    report: &dyn Progress,
+) -> Vec<String> {
+    run_budgeted(
+        targets,
+        max,
+        ferryman_channel::focus::fleet_budget(),
+        focus,
+        now,
+        report,
+    )
+    .await
+}
+
+/// [`run_focused`] with the fleet's weekly budget given rather than read.
+pub async fn run_budgeted(
+    targets: &[(ProjectRoute, AgentConfig)],
+    max: usize,
+    budget: usize,
     focus: &Focus,
     now: DateTime<Utc>,
     report: &dyn Progress,
@@ -2179,22 +2343,18 @@ pub async fn run_focused(
         }
         ordered.push(target);
     }
-    // Focus projects first, and the week's budget split over them by tier.
+    // Focus projects first, and the fleet's week of improvements split over them by what
+    // each is worth.
     ordered.sort_by_key(|(route, _)| focus.tier(&route.project_id, now));
-    let tiers: Vec<(String, FocusTier)> = ordered
-        .iter()
-        .map(|(route, _)| (route.project_id.clone(), focus.tier(&route.project_id, now)))
-        .collect();
-    let shares: BTreeMap<String, Share> = allocate(&tiers, max)
-        .into_iter()
-        .map(|share| (share.project.clone(), share))
-        .collect();
+    let shares = shares_by_worth(&ordered, focus, (max, budget), &week, now);
     for (route, config) in ordered {
         let project = &route.project_id;
         let Some(share) = shares.get(project) else {
             continue;
         };
+        // Paused, or given nothing of this week's budget: nothing is planned for it.
         let sleeping = share.tier == FocusTier::Paused;
+        let unbudgeted = share.orders == 0;
         // An engine policy that went back or vanished from the channel: this machine keeps
         // the last one the master signed, and the master is asked once.
         if let Ok(identity) = signing_identity(route, config)
@@ -2215,7 +2375,7 @@ pub async fn run_focused(
                 Err(error) => report.warn(&format!("{project}: gather failed: {error:#}")),
             }
         }
-        if !sleeping && !dir.join("plan.json").is_file() {
+        if !sleeping && !unbudgeted && !dir.join("plan.json").is_file() {
             match plan(route, config, share.orders, now, report).await {
                 Ok(PlanOutcome::Planned {
                     engine,
@@ -2271,12 +2431,27 @@ pub async fn run_focused(
                 Err(error) => report.warn(&format!("{project}: review failed: {error:#}")),
             }
         }
+        // A second engine grades what was finished; failing grades count against the
+        // engines on this machine that planned and built the work.
+        if !sleeping {
+            done.extend(crate::grade::pass(route, config, now, report).await);
+        }
+        match crate::grade::apply(route, config, now) {
+            0 => {}
+            count => done.push(format!(
+                "{project}: {count} failing grade(s) counted against this machine's engines"
+            )),
+        }
         if !week_dir(route, &last_week).join("report.md").is_file() {
             match self::report(route, now - Duration::days(7)) {
                 Ok(_) => done.push(format!("{project}: reported {last_week}")),
                 Err(error) => report.warn(&format!("{project}: report failed: {error:#}")),
             }
         }
+    }
+    // Yesterday across the fleet: what was built, how it was graded, what it cost.
+    if let Some(line) = crate::digest::daily(targets, now) {
+        done.push(line);
     }
     done
 }
@@ -2336,6 +2511,7 @@ mod tests {
             probe_chat: false,
             weekly_requests: None,
             weekly_usd: None,
+            daily_usd: None,
             provider: None,
             route: Vec::new(),
             class: None,
@@ -2416,6 +2592,26 @@ mod tests {
                 &josh
             )
             .unwrap()
+        );
+    }
+
+    /// Give a project something its signals can see: a commit in its checkout this week.
+    fn busy(route: &ProjectRoute) {
+        let dir = &route.workspace;
+        git(dir, &["init", "-q"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "work",
+            ],
         );
     }
 
@@ -2720,6 +2916,7 @@ mod tests {
             let judge = engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"));
             let (route, config) = channel_of(&sub, name, vec![judge]);
             switch_on(&route);
+            busy(&route);
             (route, config)
         };
         let (side, side_config) = make("side");
@@ -2738,10 +2935,10 @@ mod tests {
             ("sleepy", FocusTier::Paused),
         ]);
 
-        // Two a week each, as `--max 2`: 4 orders over the two projects that are not
-        // paused, shared 12 : 1 - the focus project is held to the plan's two, the
-        // background one gets its trickle of one, the paused one nothing.
-        let done = run_focused(&targets, 2, &focus, now, &crate::Silent).await;
+        // At most two a project, as `--max 2`, and three for the fleet: equally busy,
+        // the focus project's weight is twelve times the background one's, so it gets
+        // its two, the background one the one left, the paused one nothing.
+        let done = run_budgeted(&targets, 2, 3, &focus, now, &crate::Silent).await;
         assert_eq!(improvements(&hot).len(), 2, "{done:?}");
         assert_eq!(improvements(&side).len(), 1, "{done:?}");
         assert!(improvements(&sleepy).is_empty(), "{done:?}");
@@ -2763,7 +2960,7 @@ mod tests {
         assert!(position("sleepy: planned").is_none() && position("sleepy: gathered").is_none());
         assert!(
             done.iter()
-                .any(|line| line.contains("[focus: up to 3 this week]")),
+                .any(|line| line.contains("[focus: up to 2 this week]")),
             "{done:?}"
         );
     }
@@ -2778,6 +2975,7 @@ mod tests {
             vec![engine("claude", Tier::Judge, &format!("fake://ok:{PLAN}"))],
         );
         switch_on(&lone);
+        busy(&lone);
         let done = run_focused(
             &[(lone.clone(), config)],
             1,
@@ -2801,6 +2999,7 @@ mod tests {
         let targets = vec![(route.clone(), config)];
         let now = Utc::now();
         switch_on(&route);
+        busy(&route);
 
         let marker = crate::governor::pause_marker().unwrap();
         fs::create_dir_all(marker.parent().unwrap()).unwrap();

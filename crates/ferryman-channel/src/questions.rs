@@ -40,6 +40,9 @@ pub const SUGGESTION: &str = "suggestion";
 /// A timed grant is about to end: renew it or let it end. The question id carries the grant
 /// it is about and the date a renewal would run to; see [`crate::master::ask_renewals`].
 pub const ACCESS: &str = "access";
+/// Yesterday's improvements across the fleet: what was built, how it was graded and what
+/// it cost. A notice; its one button only says it was read.
+pub const DIGEST: &str = "digest";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Question {

@@ -107,6 +107,10 @@ impl Rates {
         }
         let (prompt_per_million, completion_per_million) = match key.as_str() {
             e if e.contains("claude") => (3.0, 15.0),
+            // DeepSeek's list prices at peak hours (api-docs.deepseek.com, 2026-10-30): pro
+            // costs about four times what flash does, so they are not one family here.
+            e if e.contains("deepseek") && e.contains("pro") => (1.32, 3.96),
+            e if e.contains("deepseek") && e.contains("flash") => (0.30, 1.20),
             e if e.contains("deepseek") => (0.27, 1.10),
             e if e.contains("gpt-4o-mini") => (0.15, 0.60),
             e if e.contains("gpt-4o") || e.contains("gpt-4") => (2.50, 10.0),
@@ -322,6 +326,8 @@ fn measured_quality(route: &ProjectRoute, engine_key: &str) -> Option<(f64, usiz
 pub fn published_rates() -> Vec<(&'static str, f64, f64)> {
     vec![
         ("claude (sonnet/opus)", 3.0, 15.0),
+        ("deepseek-v4-pro", 1.32, 3.96),
+        ("deepseek-flash", 0.30, 1.20),
         ("deepseek", 0.27, 1.10),
         ("gpt-4o-mini", 0.15, 0.60),
         ("gpt-4o / gpt-4", 2.50, 10.0),

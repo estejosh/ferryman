@@ -166,6 +166,7 @@ engine.deepseek.key = "secret:DEEPSEEK_API_KEY"
 engine.deepseek.tier = "build"
 engine.deepseek.paid = "prepaid"
 engine.deepseek.weekly_usd = "5"
+engine.deepseek.daily_usd = "1"
 ```
 
 An engine can also be `kind = "http"`: an OpenAI-compatible endpoint asked once per
@@ -185,8 +186,18 @@ suits judging, planning and chores, not building.
 - **Probes**: an engine is `up` only when it has just returned a real completion.
   See "An engine is up only when it answers" below. The worker also reads
   DeepSeek's and OpenRouter's balance endpoints when it has their key.
-- **Budgets**: `weekly_requests` and `weekly_usd` (list prices, from the usage the
-  engine reports) make an engine exhausted until Monday 00:00 UTC once reached.
+- **Budgets**: `weekly_requests` and `weekly_usd` make an engine exhausted until
+  Monday 00:00 UTC once reached; `daily_usd` until the next midnight UTC. Spending is
+  what the engine reports (or list prices for the tokens it reports), and, for a
+  provider whose balance the probe reads (DeepSeek, OpenRouter), what the account's
+  balance fell by, top-ups excluded - whichever is more. A CLI that wraps an API often
+  reports nothing, so the balance is what keeps its budget honest. The balance is the
+  account's, so engines on one key each see the account's whole spending: give each
+  the account's cap (`daily_usd = "1"` on both means one dollar a day between them).
+- **Prices**: `cost_per_mtok_in_usd` and `cost_per_mtok_out_usd` tell the smart
+  router what a prepaid engine costs. Left out, a prepaid engine is priced as a
+  frontier model, and two of them on one provider look equally dear - the router then
+  cannot prefer the cheaper one for work it can do.
 - **Where it shows**: each worker publishes a signed `engines/<agent>.json` beside
   its presence file, with no credentials in it. `ferry engines` shows the whole
   fleet; `ferry mcp serve` has a read-only `list_engines` tool.
