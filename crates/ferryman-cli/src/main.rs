@@ -10,6 +10,7 @@ mod lane;
 mod lanes;
 mod license;
 mod licensor;
+mod mail;
 mod mcp;
 mod mcp_agent;
 mod mcp_client;
@@ -7459,8 +7460,16 @@ async fn team_command(command: TeamCommand) -> Result<()> {
                 println!("paired {device} for invite {id} and shared the folder");
             }
             for (_, accept) in &settled.ready_to_grant {
+                let fingerprint = ferryman_channel::read_agent_roster(&route.communications)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&accept.operator))
+                    .and_then(|a| a.public_key)
+                    .map(|key| ferryman_channel::key_fingerprint(&key))
+                    .unwrap_or_else(|| "not synced yet".to_string());
                 println!(
-                    "{} has joined; open the dashboard as the master to sign their access",
+                    "{} has joined (key {fingerprint}); open the dashboard as the master to sign \
+                     their access",
                     accept.operator
                 );
             }
@@ -8319,6 +8328,18 @@ async fn run_fleet(
     // and synced in the background beside Syncthing for as long as this worker runs.
     let mut live_lane = None;
     let mut last_expiry_pass: Option<std::time::Instant> = None;
+    // The email lane, when `[email]` is set and this machine has its key: the fallback for
+    // peers the iroh lane cannot reach (ADR 0032). The all-projects worker only.
+    let mut mail_lane = match (
+        serving_everywhere,
+        ferryman_channel::ferry::find_root(),
+        &iroh,
+    ) {
+        (true, Some(root), Some(iroh)) => {
+            mail::MailLane::for_worker(&root, iroh.identity().name(), report)
+        }
+        _ => None,
+    };
     if let Some(iroh) = iroh {
         let mut routes: Vec<ferryman_channel::ProjectRoute> = fleet
             .served
@@ -8472,6 +8493,14 @@ async fn run_fleet(
         // cleared once, and shown by `ferry doctor`, the dashboard and the fleet folder.
         if let Some(lane) = live_lane.as_ref() {
             lane.check_health(report);
+        }
+        if let Some(mail) = mail_lane.as_mut() {
+            let routes: Vec<ferryman_channel::ProjectRoute> = fleet
+                .served
+                .iter()
+                .map(|(route, _)| route.clone())
+                .collect();
+            mail.pass(&routes, report).await;
         }
 
         // The projects the fleet is focused on are looked at first, then the rest,
@@ -10088,6 +10117,10 @@ fn operator_command(command: Operator) -> anyhow::Result<()> {
             )?;
             println!("created operator '{}'", identity.name());
             println!("  public key  {}", identity.public_key_hex());
+            println!(
+                "  fingerprint {} (the master sees this beside your name when letting you in)",
+                identity.fingerprint()
+            );
             if this_project_only {
                 println!("  scope       this project only");
             } else {
@@ -11624,6 +11657,10 @@ fn channel(command: Channel) -> Result<()> {
             let path = ferryman_channel::register_agent_key(&route, &agent, &identity)?;
             println!("registered '{}' as {}", agent.name, path.display());
             println!("  public key  {}", identity.public_key_hex());
+            println!(
+                "  fingerprint {} (the master sees this beside your name when letting you in)",
+                identity.fingerprint()
+            );
             println!(
                 "  private key stays in {}",
                 route.attachment.join("keys").display()

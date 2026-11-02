@@ -44,8 +44,12 @@ A mail is one bundle for one recipient agent and one project:
   XChaCha20-Poly1305, with the project id, sender, recipient and bundle id bound in as associated
   data (the construction `secrets` already uses);
 - **signed by the sending agent** with the ed25519 key the roster pins for it;
-- sent as an attachment, with a subject that names nothing but `fm/<bundle id>` and a header
-  naming the recipient agent. AgentMail, and anyone else between, sees only ciphertext.
+- sent as the mail's body: the bundle as JSON, zstd-compressed, hex, in lines of 76 between
+  `FERRYMAN-MAIL v1` and `END` (anything between them that is not hex - a line break or an
+  indent a mail system added - is ignored), with a subject that names nothing but
+  `fm/<bundle id>`. AgentMail, and anyone else between, sees only ciphertext. The body, not an
+  attachment, because AgentMail takes inline content up to 6 MB a request and the body comes
+  back whole from one API call.
 
 The receiver checks, before writing anything: the signature against the roster of THAT channel,
 the sender not revoked, the recipient being itself, the project id, and every file against the
@@ -109,5 +113,16 @@ nothing.
   unchanged.
 - Bundles are capped at AgentMail's attachment size; a bigger backlog goes in several mails, and a
   file over the cap waits for a live lane.
-- New config: `[email]` in `ferry.toml` (`inbox`, `after_minutes`, `notices = [...]`), the
-  machine's key in its secrets file, and `email_only` in a TRANSPORTS record.
+- New config: `[email]` in `ferry.toml` (`inbox`, `after_minutes`, `key` - the name of the
+  variable holding the machine's key, `AGENTMAIL_FERRYMAN_MACHINE_KEY` by default - and
+  `enabled`), the machine's key in the environment or `<root>/secrets/.env`, and the lane's own
+  state in `<machine state>/mail-state.json`.
+
+## Built (2026-11-02)
+
+The first build carries channel files, sealed and signed, to iroh peers the lane has not
+reached for `after_minutes`, and lets them in under the iroh lane's own rules
+(`ferryman_iroh::lane::channel_share`, the one place both lanes take them from). Bundles are at
+most about 1.5 MB of files; a single file bigger than that waits for a live lane. Still to come:
+`email_only` agents (an agent that is never on iroh), hand-ins folders by email, and notices by
+email (section 6).

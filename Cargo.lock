@@ -1659,6 +1659,7 @@ dependencies = [
  "tokio",
  "toml",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
