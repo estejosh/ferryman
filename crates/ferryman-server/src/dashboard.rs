@@ -1190,6 +1190,11 @@ async fn team(
             let revoked =
                 ferryman_channel::master::is_explicitly_revoked(&route, &name).unwrap_or(false);
             let (access_ends, access_lapsed) = access_window(&live, &name, now);
+            let fingerprint = roster
+                .iter()
+                .find(|entry| entry.name.eq_ignore_ascii_case(&name))
+                .and_then(|entry| entry.public_key.as_deref())
+                .map(ferryman_channel::key_fingerprint);
             json!({
                 "name": name,
                 "role": role,
@@ -1198,6 +1203,7 @@ async fn team(
                 "revoked": revoked,
                 "access_ends": access_ends,
                 "access_lapsed": access_lapsed,
+                "fingerprint": fingerprint,
             })
         })
         .collect::<Vec<_>>();
@@ -1211,6 +1217,7 @@ async fn team(
                 "capabilities": agent.capabilities,
                 "owner": Value::Null,
                 "access": "unconfigured",
+                "fingerprint": agent.public_key.as_deref().map(ferryman_channel::key_fingerprint),
             })
         })
         .collect::<Vec<_>>();

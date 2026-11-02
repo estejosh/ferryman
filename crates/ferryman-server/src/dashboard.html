@@ -1883,12 +1883,13 @@ pages.teammates = async () => {
 
     <div class="panel scroll">
       <table class="grid">
-        <thead><tr><th>Person</th><th>Role</th><th>Identity lives</th><th>Can do</th><th>Where</th><th>Access</th>${d.may_grant ? "<th></th>" : ""}</tr></thead>
+        <thead><tr><th>Person</th><th>Key</th><th>Role</th><th>Identity lives</th><th>Can do</th><th>Where</th><th>Access</th>${d.may_grant ? "<th></th>" : ""}</tr></thead>
         <tbody>${(d.teammates || []).map((t) => {
           const g = grants[t.name];
           return `
           <tr>
             <td class="lead">${esc(t.name)} ${t.current ? `<span class="badge accent">you</span>` : ""}</td>
+            <td class="mono" title="The new machine shows the same code when it joins: compare them before giving access">${t.fingerprint ? esc(t.fingerprint) : "&mdash;"}</td>
             <td>${t.role === "owner" ? `<span class="badge good">owner</span>` : esc(t.role)}</td>
             <td>${esc(t.scope)}${t.scope === "channel" ? ` <span class="badge">not on this machine</span>` : ""}</td>
             <td>${g ? `${esc(accessLabel(g))} ${sigBadge(g.signature)}` : `<span class="badge warn">no grant</span>`}</td>

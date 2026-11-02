@@ -50,6 +50,7 @@ pub mod learning;
 pub mod lease;
 pub mod ledger;
 pub mod licensing;
+pub mod maillane;
 pub mod marvin;
 pub mod master;
 pub mod memory;
@@ -2452,6 +2453,12 @@ impl AgentIdentity {
         hex::encode(self.signing.verifying_key().to_bytes())
     }
 
+    /// This key's short fingerprint ([`key_fingerprint`]).
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        key_fingerprint(&self.public_key_hex())
+    }
+
     /// Reconstruct an identity from a raw 32-byte signing seed.
     ///
     /// This is the import half of a password-sealed operator identity: the
@@ -2727,6 +2734,22 @@ fn check_signature(
     } else {
         SignatureCheck::Invalid
     }
+}
+
+/// A public key's short fingerprint, `7F3A-91C2`: the first four bytes of the SHA-256 of
+/// the key, in two groups. Shown where a key is introduced (`ferry channel join` on the new
+/// machine) and where it is let in (the dashboard's team pages, `ferry team pending`), so a
+/// person admitting a key can see it is the one the new machine holds before saying yes.
+/// Eight hex digits are for a person comparing two screens, not a security boundary: the
+/// signature check always uses the whole key. `?` for a key that is not hex.
+#[must_use]
+pub fn key_fingerprint(public_key_hex: &str) -> String {
+    let Ok(bytes) = hex::decode(public_key_hex.trim()) else {
+        return "?".to_string();
+    };
+    let digest = Sha256::digest(&bytes);
+    let hex = hex::encode_upper(&digest[..4]);
+    format!("{}-{}", &hex[..4], &hex[4..])
 }
 
 /// Who issued this order, checkably.
@@ -9734,6 +9757,18 @@ mod serverless_tests {
 
 #[cfg(test)]
 mod identity_tests {
+    #[test]
+    fn a_fingerprint_is_short_stable_and_differs_between_keys() {
+        let one = super::AgentIdentity::from_seed("a", [1; 32]);
+        let two = super::AgentIdentity::from_seed("b", [2; 32]);
+        let print = one.fingerprint();
+        assert_eq!(print.len(), 9);
+        assert_eq!(&print[4..5], "-");
+        assert_eq!(print, super::key_fingerprint(&one.public_key_hex()));
+        assert_ne!(print, two.fingerprint());
+        assert_eq!(super::key_fingerprint("not hex"), "?");
+    }
+
     /// Keep this test binary's machine state out of the developer's home.
     ///
     /// `cfg(test)` is per crate, so a dependent crate's tests link ferryman-channel

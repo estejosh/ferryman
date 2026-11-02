@@ -484,6 +484,18 @@ pub fn read_for_send(channel: &Path, rules: &Rules, path: &str) -> Option<(Entry
     ))
 }
 
+/// The entry a file with these contents and this modification time has: what a lane that
+/// carried the bytes some other way (the email lane, ADR 0032) hands to [`write_received`].
+#[must_use]
+pub fn entry_for(path: &str, mtime_ms: i64, bytes: &[u8]) -> Entry {
+    Entry {
+        path: path.to_owned(),
+        size: bytes.len() as u64,
+        mtime: mtime_ms,
+        hash: blake3::hash(bytes).to_hex().to_string(),
+    }
+}
+
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Let a received file into `channel`. Returns whether it was written.

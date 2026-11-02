@@ -558,38 +558,16 @@ impl Lane {
                 send: !access::machine_is_worker_only(channel, id, &local),
             }];
         }
-        let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
-        let mut channel_rules = fleet_scoped(Rules::for_channel(channel), id);
-        if handins_elsewhere {
-            // `handins/` in the channel is the old layout's; the project's hand-ins are
-            // exchanged as their own share, so an unmigrated peer cannot re-create it here.
-            channel_rules = channel_rules.excluding("handins/");
-        }
-        // A project's data is machine-local wherever it sits (ADR 0026): if it is inside the
-        // channel, it stays out of what is exchanged; if it IS the channel, nothing is.
-        let mut skip_channel = false;
-        match data_spot(channel, id) {
-            Some(DataSpot::Inside(pattern)) => channel_rules = channel_rules.excluding(&pattern),
-            Some(DataSpot::Whole) => skip_channel = true,
-            None => {}
-        }
-        let mut shares = vec![Share {
-            key: id.clone(),
-            dir: channel.clone(),
-            rules: channel_rules
-                .refusing_authors(access::refused_authors(channel, id))
-                .refusing_roster(access::unadmitted_names(channel, id))
-                // A peer whose agents are all Workers writes its hand-ins, never the channel.
-                .refusing_incoming(access::machine_is_worker_only(
-                    channel,
-                    id,
-                    &peer.agents.iter().cloned().collect::<Vec<_>>(),
-                )),
-            send: !access::machine_is_worker_only(channel, id, &local),
-        }];
-        if skip_channel {
-            shares.clear();
-        }
+        let peer_agents: Vec<String> = peer.agents.iter().cloned().collect();
+        let mut shares: Vec<Share> = channel_share(route, &local, &peer_agents)
+            .map(|(rules, send)| Share {
+                key: id.clone(),
+                dir: channel.clone(),
+                rules,
+                send,
+            })
+            .into_iter()
+            .collect();
         let handins = ferry::handins_dir_for(channel, id);
         if !handins.starts_with(channel) {
             // The folder is the project's own and a hand-in is written into it; making it
@@ -1062,6 +1040,41 @@ async fn receive_item(
     let mut bytes = vec![0_u8; usize::try_from(entry.size)?];
     recv.read_exact(&mut bytes).await?;
     Ok(manifest::write_received(channel, rules, &entry, &bytes).unwrap_or(false))
+}
+
+/// The rules a project's channel folder is exchanged under with a peer whose agents are
+/// `peer_agents`, and whether this machine sends from it at all (it does not when every agent
+/// here, `local`, is a Worker). `None` when the channel is the project's data folder and is
+/// never exchanged. The one place both lanes take them from: the iroh lane's exchanges and
+/// the email lane's bundles (ADR 0032) carry and let in exactly the same files.
+#[must_use]
+pub fn channel_share(
+    route: &ProjectRoute,
+    local: &[String],
+    peer_agents: &[String],
+) -> Option<(Rules, bool)> {
+    let channel = &route.communications;
+    let id = &route.project_id;
+    let handins_elsewhere = !ferry::handins_dir_for(channel, id).starts_with(channel);
+    let mut rules = fleet_scoped(Rules::for_channel(channel), id);
+    if handins_elsewhere {
+        // `handins/` in the channel is the old layout's; the project's hand-ins are
+        // exchanged as their own share, so an unmigrated peer cannot re-create it here.
+        rules = rules.excluding("handins/");
+    }
+    // A project's data is machine-local wherever it sits (ADR 0026): if it is inside the
+    // channel, it stays out of what is exchanged; if it IS the channel, nothing is.
+    match data_spot(channel, id) {
+        Some(DataSpot::Inside(pattern)) => rules = rules.excluding(&pattern),
+        Some(DataSpot::Whole) => return None,
+        None => {}
+    }
+    let rules = rules
+        .refusing_authors(access::refused_authors(channel, id))
+        .refusing_roster(access::unadmitted_names(channel, id))
+        // A peer whose agents are all Workers writes its hand-ins, never the channel.
+        .refusing_incoming(access::machine_is_worker_only(channel, id, peer_agents));
+    Some((rules, !access::machine_is_worker_only(channel, id, local)))
 }
 
 /// The fleet channel keeps its top-level `local/` (this machine's own part) to itself, even

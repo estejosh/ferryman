@@ -83,5 +83,7 @@ So:
   Team page). Its signatures stop counting on every machine; every other agent is unaffected,
   because each has its own key.
 - The moment that needs care is admitting a new key: that yes is the master vouching for it.
-  The approval screens are to show a short fingerprint of the new key (`7F3A-91C2`) that the
-  new machine shows too, so the two can be compared before saying yes (planned with ADR 0032).
+  `ferry channel join` prints the new key's short fingerprint (`7F3A-91C2`), and the
+  dashboard's Teammates page and `ferry team pending` show the fingerprint of every key they
+  list: compare the two before giving access. The fingerprint is for a person comparing two
+  screens; the signature check always uses the whole key.
