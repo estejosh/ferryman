@@ -833,17 +833,14 @@ pub fn order_id(week: &str, rank: usize) -> String {
     format!("improve-{}-{rank}", week.to_ascii_lowercase())
 }
 
-/// Pull the first JSON object out of whatever an engine printed around it.
-pub(crate) fn extract_json(text: &str) -> Option<Value> {
-    let end = text.rfind('}')?;
-    text.match_indices('{')
-        .map(|(start, _)| start)
-        .filter(|start| *start < end)
-        .find_map(|start| serde_json::from_str::<Value>(&text[start..=end]).ok())
+/// Pull the JSON object that has `key` out of whatever an engine printed around it
+/// ([`crate::agent::json_objects`]): prose, fences, and text with braces after it.
+pub(crate) fn extract_json(text: &str, key: &str) -> Option<Value> {
+    crate::agent::json_object_with(text, key)
 }
 
 fn parse_improvements(text: &str, max: usize) -> Vec<Improvement> {
-    let Some(value) = extract_json(text) else {
+    let Some(value) = extract_json(text, "improvements") else {
         return Vec::new();
     };
     value
@@ -907,7 +904,7 @@ fn plan_prompt(project: &str, evidence: &str, max: usize) -> String {
 
 /// The clarifying questions a planner asked, at most two, each with its options.
 fn parse_questions(text: &str) -> Vec<(String, Vec<String>)> {
-    let Some(value) = extract_json(text) else {
+    let Some(value) = extract_json(text, "questions") else {
         return Vec::new();
     };
     value

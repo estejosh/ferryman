@@ -902,7 +902,23 @@ impl EngineState {
                 spent_usd: self.spent_today(now),
             });
         }
-        self.days.iter().find(|kept| kept.day == day).cloned()
+        // The counts roll over at the first request of a new day, the balance at the
+        // first probe: until both have, part of a finished day is still in today's
+        // fields. The larger of each, as `archive_day` keeps them.
+        let kept = self.days.iter().find(|kept| kept.day == day).cloned();
+        let live = (self.day == day).then(|| DayFigures {
+            day: day.to_string(),
+            requests: self.day_requests,
+            spent_usd: self.day_spend_usd,
+        });
+        match (kept, live) {
+            (Some(kept), Some(live)) => Some(DayFigures {
+                day: day.to_string(),
+                requests: kept.requests.max(live.requests),
+                spent_usd: kept.spent_usd.max(live.spent_usd),
+            }),
+            (kept, live) => kept.or(live),
+        }
     }
 
     /// Requests counted today.
@@ -3358,9 +3374,11 @@ engine.local.tier = "chore"
             (state.spent_week(tomorrow) - 1.65).abs() < 1e-9,
             "{state:?}"
         );
-        // And the finished day is kept for the digest.
+        // And the finished day is kept for the digest, with the requests of a day whose
+        // counters have not rolled over yet.
         let kept = state.day_figures("2026-10-30", tomorrow).unwrap();
         assert!((kept.spent_usd - 1.65).abs() < 1e-9, "{kept:?}");
+        assert_eq!(kept.requests, 40, "{kept:?}");
     }
 
     #[test]

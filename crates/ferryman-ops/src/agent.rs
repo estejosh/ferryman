@@ -2201,19 +2201,67 @@ struct Verdict {
     reasoning: String,
 }
 
-/// Pull the verdict out of whatever the agent printed.
+/// Every top-level JSON object in what an engine printed, in order.
 ///
-/// Agents wrap JSON in prose and fences no matter how firmly they are asked not to, so
-/// the last balanced object in the output is used. A run that cannot be parsed is an
-/// error rather than a default: defaulting to accept approves unread work, and
-/// defaulting to reject silently burns revisions.
+/// Engines wrap JSON in prose and fences no matter how firmly they are asked not to, put
+/// more text - with braces in it - after it, and a CLI like `ferryman-cline -p` prints a
+/// stream of JSON events with the answer as a string inside the last one. So the answer is
+/// read out of an event stream first ([`engine_answer`]), and then each `{` that starts a
+/// value serde can read is taken, ignoring whatever follows the value. An object inside
+/// one already taken is part of it, not another.
+///
+/// Reading from the first `{` to the last `}` - what this replaced - failed on any reply
+/// with a brace after its JSON: on grouchly, 2026-11-02, every review deepseek-flash
+/// wrote was refused as "trailing characters", and no improvement could be accepted.
+pub(crate) fn json_objects(output: &str) -> Vec<Value> {
+    fn scan(text: &str, found: &mut Vec<Value>) {
+        let mut at = 0;
+        while let Some(offset) = text[at..].find('{') {
+            let start = at + offset;
+            let mut stream =
+                serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>();
+            match stream.next() {
+                Some(Ok(value @ Value::Object(_))) => {
+                    found.push(value);
+                    at = start + stream.byte_offset().max(1);
+                }
+                _ => at = start + 1,
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let answer = engine_answer(output);
+    scan(&answer, &mut found);
+    if answer.trim() != output.trim() {
+        scan(output, &mut found);
+    }
+    found
+}
+
+/// The first object in what an engine printed that has `key`, or else the first object.
+pub(crate) fn json_object_with(output: &str, key: &str) -> Option<Value> {
+    let objects = json_objects(output);
+    objects
+        .iter()
+        .find(|value| value.get(key).is_some())
+        .cloned()
+        .or_else(|| objects.into_iter().next())
+}
+
+/// Pull the verdict out of whatever the agent printed: the last object that carries a
+/// boolean `accept` ([`json_objects`]). A run that cannot be parsed is an error rather
+/// than a default: defaulting to accept approves unread work, and defaulting to reject
+/// silently burns revisions.
 fn parse_verdict(output: &str) -> Result<Verdict> {
-    let start = output.rfind('{').context("no JSON object in the reply")?;
-    let end = output[start..]
-        .rfind('}')
-        .context("no closing brace in the reply")?;
-    let value: Value = serde_json::from_str(&output[start..=start + end])
-        .context("the reply was not the JSON object the prompt asked for")?;
+    let objects = json_objects(output);
+    if objects.is_empty() {
+        bail!("the reply was not the JSON object the prompt asked for: no JSON object in it")
+    }
+    let value = objects
+        .into_iter()
+        .rev()
+        .find(|value| value.get("accept").is_some_and(Value::is_boolean))
+        .context("the reply has no boolean 'accept'")?;
     let accept = value
         .get("accept")
         .and_then(Value::as_bool)
@@ -6796,6 +6844,30 @@ mod tests {
         // accepting instead would approve unread work.
         let error = parse_verdict(r#"{"accept": false, "reasoning": "  "}"#).unwrap_err();
         assert!(error.to_string().contains("no reason"));
+    }
+
+    #[test]
+    fn a_verdict_is_found_with_braces_after_it_and_inside_an_event_stream() {
+        // What deepseek-flash through ferryman-cline printed, 2026-11-02: the verdict,
+        // then more text with braces in it.
+        let verdict = parse_verdict(
+            "{\"accept\": true, \"reasoning\": \"tests pass\"}\nNote: see {docs} for more.",
+        )
+        .unwrap();
+        assert!(verdict.accept);
+        // An event stream whose last event carries the answer as a string.
+        let stream = "{\"ts\":\"1\",\"type\":\"start\"}\n\
+                      {\"ts\":\"2\",\"type\":\"run_result\",\"text\":\"{\\\"accept\\\": false, \
+                      \\\"reasoning\\\": \\\"the test is missing\\\"}\"}";
+        let verdict = parse_verdict(stream).unwrap();
+        assert!(!verdict.accept);
+        assert_eq!(verdict.reasoning, "the test is missing");
+        // A nested object is part of its parent, not a verdict of its own.
+        let verdict = parse_verdict(
+            "{\"accept\": true, \"reasoning\": \"ok\", \"detail\": {\"accept\": false}}",
+        )
+        .unwrap();
+        assert!(verdict.accept);
     }
 
     #[test]

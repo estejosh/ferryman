@@ -208,7 +208,7 @@ pub fn prompt(project: &str, task: &Task, result: &TaskResult, diff: Option<&str
 /// objective scores 0 whatever number it gave.
 #[must_use]
 pub fn parse(answer: &str) -> Option<(bool, u8, String, String)> {
-    let value = improve::extract_json(answer)?;
+    let value = improve::extract_json(answer, "objective")?;
     let objective = value.get("objective")?.as_bool()?;
     let score = value.get("score")?.as_f64()?.round().clamp(0.0, 10.0) as u8;
     let text = |name: &str| {
