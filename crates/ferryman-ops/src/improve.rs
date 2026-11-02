@@ -1169,16 +1169,30 @@ enum Asked {
 /// Ask the engine the policy puts first for planning, falling through engines that are
 /// out of credit or fail - never to one the policy blocks. A judge plans first; with no
 /// judge allowed and up, a builder does and the plan is marked unreviewed.
+/// Engines asked for one plan before the run gives up until the next one: each answer
+/// that cannot be read is paid for, so a planner that keeps answering in prose does not
+/// get to spend the day's budget one engine after another.
+const MAX_PLAN_ENGINES: usize = 3;
+
 async fn ask_best(
     route: &ProjectRoute,
     config: &AgentConfig,
     policy: &Policy,
     prompt: &str,
+    readable: &dyn Fn(&str) -> bool,
     report: &dyn Progress,
 ) -> Asked {
     let machine = ferryman_channel::receipts::machine_label();
     let mut tried = Vec::new();
     loop {
+        if tried.len() >= MAX_PLAN_ENGINES {
+            return Asked::Failed(format!(
+                "{} engine(s) answered without a plan that could be read ({}); the next run \
+                 asks again",
+                tried.len(),
+                tried.join(", ")
+            ));
+        }
         let ledger = engines::Ledger::load(&config.agent);
         let (engine, decision) = match engines::choose_routed(
             &config.engines,
@@ -1204,8 +1218,27 @@ async fn ask_best(
         )
         .await
         {
-            Ok((answer, cost)) => {
+            Ok((answer, cost)) if readable(&answer) => {
                 return Asked::Answered(answer, Box::new(engine), judge, cost, Box::new(decision));
+            }
+            // An answer, but not the one asked for: the next engine is asked in this run
+            // rather than this one again in an hour. Found on grouchly, 2026-11-02:
+            // deepseek-flash answered redaktly's and sem's plans in prose, hour after hour.
+            Ok((_, cost)) => {
+                note_step(
+                    route,
+                    config,
+                    &engines::iso_week(Utc::now()),
+                    "plan",
+                    Some(Role::Plan),
+                    Some(&engine),
+                    Some(cost),
+                    "answered without a plan that could be read",
+                );
+                report.warn(&format!(
+                    "  {}: {} answered without a plan that could be read, trying the next engine",
+                    route.project_id, engine.name
+                ));
             }
             Err(error) => {
                 if let Some(skip) = error.downcast_ref::<engines::Unavailable>() {
@@ -1459,6 +1492,7 @@ pub async fn plan(
         config,
         &policy,
         &plan_prompt(&route.project_id, &evidence, max),
+        &|answer: &str| !parse_improvements(answer, max).is_empty(),
         report,
     )
     .await
@@ -2827,6 +2861,38 @@ mod tests {
             }
         );
         assert_eq!(improvements(&route).len(), 2, "no duplicate orders");
+    }
+
+    #[tokio::test]
+    async fn a_planner_that_answers_in_prose_hands_the_plan_to_the_next_engine() {
+        hermetic();
+        let dir = tempfile::tempdir().unwrap();
+        let (route, config) = channel(
+            dir.path(),
+            vec![
+                engine(
+                    "flash",
+                    Tier::Judge,
+                    "fake://ok:I would improve the tests and the docs.",
+                ),
+                engine("pro", Tier::Judge, &format!("fake://ok:{PLAN}")),
+            ],
+        );
+        let outcome = plan(&route, &config, 2, Utc::now(), &crate::Silent)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&outcome, PlanOutcome::Planned { engine, orders, .. } if engine == "pro" && orders.len() == 2),
+            "the same run asks the next engine: {outcome:?}"
+        );
+        let week = engines::iso_week(Utc::now());
+        assert!(
+            ferryman_channel::policy::read_steps(&route, &week)
+                .iter()
+                .any(|step| step.engine.as_deref() == Some("flash")
+                    && step.outcome.contains("without a plan")),
+            "the unreadable answer is on record against the engine that gave it"
+        );
     }
 
     #[tokio::test]
