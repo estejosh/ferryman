@@ -629,8 +629,7 @@ pub fn push_branch(repo: &Path, remote: &str, branch: &str) -> Result<()> {
 /// and wrong as an automatic step after a task; see [`retire_worktree`].
 pub fn remove_worktree(repo: &Path, branch: &str) -> Result<()> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
-    let parent = repo.parent().context("repo has no parent")?;
-    let dir = parent.join(branch);
+    let dir = worktree_path(repo, branch)?;
     if dir.exists() {
         let status = Command::new("git")
             .args([
@@ -671,8 +670,7 @@ pub fn remove_worktree(repo: &Path, branch: &str) -> Result<()> {
 /// goes only when it holds nothing that was not already reachable from `base`.
 pub fn retire_worktree(repo: &Path, branch: &str, base: &str) -> Result<bool> {
     let repo_dir = repo.to_str().context("repo path is not valid UTF-8")?;
-    let parent = repo.parent().context("repo has no parent")?;
-    let dir = parent.join(branch);
+    let dir = worktree_path(repo, branch)?;
     if dir.exists() {
         let status = Command::new("git")
             .args([
@@ -698,6 +696,24 @@ pub fn retire_worktree(repo: &Path, branch: &str, base: &str) -> Result<bool> {
             .status();
     }
     Ok(kept)
+}
+
+/// Resolve the same legacy-or-central location used by cleanup.  Cleanup used to
+/// look only beside the repository after creation moved into the ferry root's
+/// `work/`, leaving every completed task directory behind there.
+fn worktree_path(repo: &Path, branch: &str) -> Result<PathBuf> {
+    let parent = repo.parent().context("repo has no parent")?;
+    let legacy = parent.join(branch);
+    if legacy.exists() {
+        return Ok(legacy);
+    }
+    if let Some(root) = crate::ferry::find_root_from(repo).or_else(crate::ferry::find_root) {
+        if let Some(work) = root.worktrees_for_repo(repo) {
+            return Ok(work.join(branch));
+        }
+        return Ok(root.work().join(worktree_holder(repo)).join(branch));
+    }
+    Ok(legacy)
 }
 
 /// Whether `branch` carries anything not already reachable from `base`.
