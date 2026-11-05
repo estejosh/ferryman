@@ -1,0 +1,32 @@
+name: Fleet CI Triage
+
+# Detection + reporting only. Never writes code, never opens a PR, never
+# touches any repo other than this one plus filing a plain tracking issue.
+# Runs unattended on a schedule by design.
+
+on:
+  schedule:
+    - cron: "41 13 * * *" # ~06:41 America/El_Salvador, jittered off the hour
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # to commit state/reports back to this repo
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run triage
+        env:
+          FLEET_GH_TOKEN: ${{ secrets.FLEET_GH_TOKEN }}
+        run: node ops/fleet-ci-triage/triage.mjs
+
+      - name: Commit state + report
+        run: |
+          git config user.name "fleet-ci-triage"
+          git config user.email "noreply@users.noreply.github.com"
+          git add ops/fleet-ci-triage/state ops/fleet-ci-triage/reports
+          git diff --cached --quiet || git commit -m "fleet-ci-triage: $(date -u +%F) [skip ci]"
+          git push
