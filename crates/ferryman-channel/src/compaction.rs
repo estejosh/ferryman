@@ -1328,7 +1328,11 @@ mod tests {
     #[test]
     fn a_second_pass_merges_with_the_first_and_loses_nothing() {
         let rig = rig();
-        let now = Utc::now();
+        // A fixed clock: with the real one, messages 44 to 46 days old straddle a month
+        // boundary on some days of the month and land in two monthly archive files.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-03-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         let a = message(&rig, &rig.grouchly, "beastly", 45, true, now);
         let b = message(&rig, &rig.beastly, "grouchly", 44, true, now);
         compact_unchecked(&rig.route, &rig.josh, now, Duration::days(1), false).unwrap();
