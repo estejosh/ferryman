@@ -27,6 +27,7 @@ pub mod engines;
 pub mod eval;
 pub mod fleet;
 pub mod fleethome;
+pub mod gpu;
 pub mod governor;
 pub mod grade;
 pub mod heavy;
