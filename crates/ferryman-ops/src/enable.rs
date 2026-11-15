@@ -214,6 +214,41 @@ fn person_identity_exists() -> bool {
         .unwrap_or(false)
 }
 
+/// Why `workspace` is not a place to enable: the user's home folder (a stray `.git` there
+/// makes it look like a project), or a folder inside a git repository that is not the top
+/// of it. `None` for a repository's top and for a folder under no repository at all.
+#[must_use]
+pub fn not_a_project_top(workspace: &Path) -> Option<String> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" });
+    not_a_project_top_under(workspace, home.as_deref().map(Path::new))
+}
+
+/// [`not_a_project_top`] with the home folder given, so a test need not touch the environment.
+fn not_a_project_top_under(workspace: &Path, home: Option<&Path>) -> Option<String> {
+    if home.is_some_and(|home| crate::attach::same_path(home, workspace)) {
+        return Some(format!(
+            "{} is your home folder, not a project. Run this in a project's own folder, or pass --workspace <folder>.",
+            workspace.display()
+        ));
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let top = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    (!crate::attach::same_path(&top, workspace)).then(|| {
+        format!(
+            "{} is inside the git repository at {} but is not its top, so enabling here would make a channel for a folder that is not a project. Run it in {}, or pass --workspace.",
+            workspace.display(),
+            top.display(),
+            top.display()
+        )
+    })
+}
+
 /// Why making a channel at `communications` for `project` would split it from the one it
 /// already has, or `None` when nothing is in the way.
 ///
@@ -271,6 +306,10 @@ pub fn perform(request: Request) -> Result<Outcome> {
     // Windows canonicalisation yields \\?\X:\... , which then appeared in bridge.toml,
     // in every path in --json, and in the folder path given to Syncthing.
     let workspace = ferryman_channel::real_path(&workspace);
+
+    if let Some(why) = not_a_project_top(&workspace) {
+        bail!("{why}");
+    }
 
     let project = match request.project {
         Some(id) => id,
@@ -774,6 +813,19 @@ fn hermetic_machine() {
 pub(crate) mod tests_support {
     use super::*;
 
+    /// Make `dir` a git repository of its own. `enable` refuses a folder inside another
+    /// repository, and a folder under TEMP can sit inside one (a stray `.git` in the home
+    /// folder does that), so a test that wants an enabled workspace makes the repository.
+    pub(crate) fn own_repo(dir: &Path) {
+        let init = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(init.success());
+    }
+
     /// Enable a project in a fresh temporary directory whose engine is
     /// `command`, and return the workspace path.
     pub(crate) fn enabled_project(command: &str) -> PathBuf {
@@ -793,6 +845,7 @@ pub(crate) mod tests_support {
         // beside the workspace, which must not be a folder other tests share.
         let dir = dir.join("ws");
         fs::create_dir_all(&dir).unwrap();
+        own_repo(&dir);
         hermetic_machine();
         perform(Request {
             workspace: Some(dir.clone()),
@@ -981,7 +1034,18 @@ mod tests {
     /// Outside a git repository there is nothing to protect and nothing to write.
     #[test]
     fn enabling_outside_git_writes_no_gitignore() {
-        let dir = tempdir();
+        let dir = raw_tempdir();
+        let inside_a_repo = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if inside_a_repo {
+            // Nothing to test here: enable refuses a folder inside another repository.
+            eprintln!("skipped: {} is inside a git repository", dir.display());
+            return;
+        }
         enable_in(&dir).unwrap();
         assert!(
             !dir.join(".gitignore").exists(),
@@ -1160,6 +1224,7 @@ mod tests {
         root.adopt("demo", &real, None).unwrap();
         let clone = dir.join("clone");
         fs::create_dir_all(&clone).unwrap();
+        tests_support::own_repo(&clone);
 
         let error = perform(request_in(&clone)).err().expect("refused");
         let said = format!("{error:#}");
@@ -1193,7 +1258,8 @@ mod tests {
         fs::create_dir_all(&real).unwrap();
         root.adopt("demo", &real, None).unwrap();
         let clone = dir.join("clone");
-        fs::create_dir_all(clone.join(".git")).unwrap();
+        fs::create_dir_all(&clone).unwrap();
+        tests_support::own_repo(&clone);
         crate::attach::attach(&root, &clone, Some("demo"), false).unwrap();
 
         // With a bridge.toml the channel is the one it names, so enable has nothing to split.
@@ -1203,6 +1269,39 @@ mod tests {
             "the roster entry went to the filed channel, not a new one"
         );
         assert!(real.join("agents/tester.json").is_file());
+    }
+
+    #[test]
+    fn enable_refuses_the_home_folder_even_when_it_is_a_repository_top() {
+        let dir = tempdir();
+        let said = not_a_project_top_under(&dir, Some(&dir)).expect("refused");
+        assert!(said.contains("home folder"), "{said}");
+        assert!(not_a_project_top_under(&dir, None).is_none());
+    }
+
+    #[test]
+    fn enable_refuses_a_folder_that_is_not_the_top_of_its_repository() {
+        let dir = tempdir();
+        hermetic_machine();
+        let git = |args: &[&str], at: &Path| {
+            assert!(
+                std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(at)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "-q"], &dir);
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let said = format!("{:#}", perform(request_in(&sub)).err().expect("refused"));
+        assert!(said.contains("not its top"), "{said}");
+        assert!(!sub.join(".ferryman").exists(), "nothing was written");
+        // The top itself is fine.
+        perform(request_in(&dir)).unwrap();
     }
 
     #[test]
@@ -1361,7 +1460,14 @@ mod tests {
         }
     }
 
+    /// A workspace that is its own repository's top (see `tests_support::own_repo`).
     fn tempdir() -> PathBuf {
+        let dir = raw_tempdir();
+        tests_support::own_repo(&dir);
+        dir
+    }
+
+    fn raw_tempdir() -> PathBuf {
         // See `agent.rs::unique`: the clock alone does not separate two tests that
         // start in the same tick, and macOS ticks more coarsely than Linux.
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
