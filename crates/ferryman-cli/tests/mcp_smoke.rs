@@ -86,6 +86,7 @@ fn the_server_speaks_json_rpc_over_stdio() {
         [
             "ferry_ask_human",
             "ferry_catchup",
+            "ferry_help",
             "ferry_join",
             "ferry_orders",
             "ferry_primary",

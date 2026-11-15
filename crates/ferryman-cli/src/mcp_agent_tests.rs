@@ -5,6 +5,7 @@ use super::*;
 use crate::mcp::{MAX_LINE_BYTES, Server, handle_line, serve_io};
 use ferryman_channel::release::{ReleaseApproval, write_approval};
 use ferryman_channel::{AgentRoute, Order, Priority};
+use std::collections::BTreeSet;
 
 struct World {
     _dir: tempfile::TempDir,
@@ -145,7 +146,7 @@ fn take_as(w: &World, name: &str) {
 // -- the permission matrix ----------------------------------------------------------------
 
 #[test]
-fn a_worker_reads_but_every_channel_write_is_denied_by_level() {
+fn a_worker_works_an_order_but_cannot_review_ask_or_lead() {
     let w = world();
     issue(&w, "o-w", "something");
     let worker = agent(&w, WORKER);
@@ -154,6 +155,7 @@ fn a_worker_reads_but_every_channel_write_is_denied_by_level() {
     // Reads work.
     for (tool, args) in [
         ("ferry_join", json!({})),
+        ("ferry_help", json!({})),
         ("ferry_catchup", json!({})),
         ("ferry_orders", json!({ "action": "list" })),
         ("ferry_orders", json!({ "action": "show", "id": "o-w" })),
@@ -165,7 +167,7 @@ fn a_worker_reads_but_every_channel_write_is_denied_by_level() {
         ok(&call(&worker, tool, args));
     }
 
-    // Writes are refused with the level named.
+    // The work itself, and talking, are open to every level.
     for (tool, args) in [
         ("ferry_orders", json!({ "action": "claim", "id": "o-w" })),
         (
@@ -177,12 +179,22 @@ fn a_worker_reads_but_every_channel_write_is_denied_by_level() {
             json!({ "action": "submit", "id": "o-w", "ref": "abc123", "note": "done" }),
         ),
         (
+            "ferry_talk",
+            json!({ "action": "post", "to": BOSS, "text": "hello" }),
+        ),
+    ] {
+        ok(&call(&worker, tool, args));
+    }
+
+    // Deciding, asking and leading are not, and the refusal says who to ask.
+    for (tool, args) in [
+        (
             "ferry_orders",
             json!({ "action": "review", "id": "o-w", "verdict": "accept" }),
         ),
         (
-            "ferry_talk",
-            json!({ "action": "post", "to": BOSS, "text": "hello" }),
+            "ferry_orders",
+            json!({ "action": "create", "title": "t", "task": "x" }),
         ),
         (
             "ferry_ask_human",
@@ -198,15 +210,13 @@ fn a_worker_reads_but_every_channel_write_is_denied_by_level() {
 }
 
 #[test]
-fn a_worker_cannot_post_and_is_told_to_hand_in_instead() {
+fn a_worker_can_message_an_agent() {
     let w = world();
-    let result = call(
+    ok(&call(
         &agent(&w, WORKER),
         "ferry_talk",
         json!({ "action": "post", "to": BOSS, "text": "hi" }),
-    );
-    let why = refused(&result, "denied");
-    assert!(why.contains("hand-in"), "{why}");
+    ));
 }
 
 #[test]
@@ -359,7 +369,10 @@ fn no_agent_accepts_an_order_that_needs_approval_even_an_orchestrator() {
             json!({ "action": "review", "id": "o-gate2", "verdict": verdict, "notes": "n" }),
         );
         let reason = refused(&result, "denied");
-        assert!(reason.contains("ferry channel review"), "{reason}");
+        assert!(
+            reason.contains("agents never approve") && reason.contains("ferry_ask_human"),
+            "{reason}"
+        );
     }
 }
 
@@ -385,7 +398,7 @@ fn an_app_with_no_seated_key_is_a_stranger_and_gets_nothing() {
     ] {
         let result = call(&stranger, tool, args.clone());
         assert!(
-            refused(&result, "locked").contains("not a seated agent"),
+            refused(&result, "locked").contains("is not seated on this machine"),
             "{tool} {args}"
         );
     }
@@ -718,7 +731,7 @@ fn asking_refuses_secrets_and_oversize_reasoning() {
             "reasoning": "the token is ghp\u{5f}abcdefghijklmnopqrstuvwxyz0123456789"
         }),
     );
-    assert!(refused(&result, "secret").contains("ferry channel secret"));
+    assert!(refused(&result, "secret").contains("Tell the human"));
     let long = "x ".repeat(700);
     let result = call(
         &member,
@@ -884,7 +897,7 @@ fn posting_refuses_secrets_telegram_strangers_and_work_content() {
             json!({ "action": "post", "to": BOSS, "text": text }),
         );
         assert!(
-            refused(&result, "secret").contains("ferry channel secret"),
+            refused(&result, "secret").contains("Tell the human"),
             "{text}"
         );
     }
@@ -1367,6 +1380,7 @@ fn a_scripted_session_runs_end_to_end_over_json_rpc() {
         [
             "ferry_ask_human",
             "ferry_catchup",
+            "ferry_help",
             "ferry_join",
             "ferry_orders",
             "ferry_primary",
@@ -1445,8 +1459,8 @@ fn a_scripted_session_runs_end_to_end_over_json_rpc() {
 fn the_groups_add_tools_and_read_only_serves_only_the_old_ones() {
     let w = world();
     let core_only = Server::with(w.route.clone(), Some(core_agent(&w, MEMBER)), false);
-    assert_eq!(core_only.tools().len(), 6);
-    // Admin and legacy are opt-in; asked for, they are appended after the core six.
+    assert_eq!(core_only.tools().len(), 7);
+    // Admin and legacy are opt-in; asked for, they are appended after the core seven.
     let admin = Agent::new(w.route.clone(), MEMBER, true).unwrap();
     let with_both = Server::with(w.route.clone(), Some(admin), true);
     let names: Vec<String> = with_both
@@ -1454,7 +1468,7 @@ fn the_groups_add_tools_and_read_only_serves_only_the_old_ones() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names.len(), 6 + 4 + 8);
+    assert_eq!(names.len(), 7 + 4 + 8);
     assert!(
         names.contains(&"ferry_update".to_string()) && names.contains(&"list_ledger".to_string())
     );
@@ -1486,8 +1500,8 @@ fn mcp_budget() {
     let core = core_tools();
     let core_tokens = est_tokens(serde_json::to_string(&core).unwrap().len());
     assert!(
-        core_tokens <= 1500,
-        "core tools/list is {core_tokens} tokens, cap 1500"
+        core_tokens <= 1800,
+        "core tools/list is {core_tokens} tokens, cap 1800"
     );
     let mut per_tool = BTreeMap::new();
     for tool in &core {
@@ -1504,8 +1518,8 @@ fn mcp_budget() {
     // T3: instructions.
     let instructions = est_tokens(INSTRUCTIONS.len());
     assert!(
-        instructions <= 250,
-        "instructions are {instructions} tokens, cap 250"
+        instructions <= 650,
+        "instructions are {instructions} tokens, cap 650"
     );
 
     // T8: byte-stable. Different agent, different time, different project state: the same
@@ -1600,8 +1614,8 @@ fn mcp_budget() {
                 + raw.links.iter().map(|l| l.to_string().len()).sum::<usize>(),
         );
         assert!(
-            size <= 800,
-            "the untruncated {label} catch-up is {size} tokens on the busy fixture, cap 800"
+            size <= 1000,
+            "the untruncated {label} catch-up is {size} tokens on the busy fixture, cap 1000"
         );
         untruncated.insert(label.to_string(), size);
     }
@@ -1612,15 +1626,15 @@ fn mcp_budget() {
     );
     let catchup = tokens(&caught);
     assert!(
-        catchup <= 800,
-        "catch-up is {catchup} tokens on the busy fixture, cap 800"
+        catchup <= 1000,
+        "catch-up is {catchup} tokens on the busy fixture, cap 1000"
     );
     assert!(
         ok(&caught)["open"].as_array().unwrap().len() >= 5,
         "the digest should still say something"
     );
     let detailed = call(&boss, "ferry_catchup", json!({ "detail": true }));
-    assert!(tokens(&detailed) <= 800);
+    assert!(tokens(&detailed) <= 1000);
     assert!(serde_json::to_string(ok(&detailed)).unwrap().len() <= MAX_CHARS);
 
     // Typical responses against their caps.
@@ -1737,7 +1751,7 @@ fn mcp_budget() {
     // the ones that depend on ids and ages may move by a few tokens between runs.
     let snapshot = json!({
         "note": "Estimated tokens at 3.3 characters each. Regenerate with UPDATE_MCP_BUDGET=1 cargo test -p ferryman-cli mcp_budget",
-        "caps": { "core_tools_list": 1500, "admin_tools_list": 700, "instructions": 250, "catchup_busy": 800 },
+        "caps": { "core_tools_list": 1800, "admin_tools_list": 700, "instructions": 650, "catchup_busy": 1000 },
         "core_tools_list": core_tokens,
         "admin_tools_list": admin_tokens,
         "instructions": instructions,
