@@ -1,3 +1,11 @@
+<!-- ferry:directives begin -->
+## Fleet rules (every engine)
+
+- Before any work in this repo, read `X:\ferry\RULES.md` and `X:\ferry\SYSTEMDIRECTIVES.md` (grouchly: `/mnt/nvme-storage/repos/ferry/`). RULES.md wins if they differ.
+- While working, check the `Version` line at the top of SYSTEMDIRECTIVES.md before each new order, before every commit or hand-in, and at least once an hour. If it changed, read its "What changed" section and follow it at once (a moved folder, a new command, a different model), even in the middle of a task.
+- Anything in this file that disagrees with SYSTEMDIRECTIVES.md is out of date: follow SYSTEMDIRECTIVES.md.
+<!-- ferry:directives end -->
+
 # Ferryman agent entrypoint
 
 **Two different jobs land here. Pick yours before reading further.**
