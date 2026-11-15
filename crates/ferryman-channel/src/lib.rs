@@ -75,6 +75,7 @@ pub mod source;
 pub mod suggestions;
 pub mod syncscope;
 pub mod tamper;
+pub mod tombstone;
 pub mod trajectory;
 pub mod transports;
 pub mod ttl;

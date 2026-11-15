@@ -677,9 +677,39 @@ pub fn compact_unchecked(
     grace: Duration,
     dry_run: bool,
 ) -> Result<Report> {
-    compact_with(route, identity, now, grace, dry_run, MAX_PART_BYTES)
+    compact_with_retention(
+        route,
+        identity,
+        now,
+        grace,
+        dry_run,
+        MAX_PART_BYTES,
+        crate::tombstone::DEFAULT_TOMBSTONE_DAYS,
+    )
 }
 
+/// [`compact_unchecked`], with the tombstone retention window named: honoured tombstones
+/// older than `tombstone_days` are dropped and the oldest dropped `deleted_at` recorded.
+pub fn compact_unchecked_retaining(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    now: DateTime<Utc>,
+    grace: Duration,
+    dry_run: bool,
+    tombstone_days: u32,
+) -> Result<Report> {
+    compact_with_retention(
+        route,
+        identity,
+        now,
+        grace,
+        dry_run,
+        MAX_PART_BYTES,
+        tombstone_days,
+    )
+}
+
+#[cfg(test)]
 fn compact_with(
     route: &ProjectRoute,
     identity: &AgentIdentity,
@@ -687,6 +717,26 @@ fn compact_with(
     grace: Duration,
     dry_run: bool,
     part_limit: u64,
+) -> Result<Report> {
+    compact_with_retention(
+        route,
+        identity,
+        now,
+        grace,
+        dry_run,
+        part_limit,
+        crate::tombstone::DEFAULT_TOMBSTONE_DAYS,
+    )
+}
+
+fn compact_with_retention(
+    route: &ProjectRoute,
+    identity: &AgentIdentity,
+    now: DateTime<Utc>,
+    grace: Duration,
+    dry_run: bool,
+    part_limit: u64,
+    tombstone_days: u32,
 ) -> Result<Report> {
     route.validate()?;
     match compactor(route)? {
@@ -838,13 +888,20 @@ fn compact_with(
     }
 
     // 3. Remove originals a record covers, once its grace has run out and the archive
-    //    is seen to hold them.
-    sweep(route, now, grace, dry_run, &mut report);
+    //    is seen to hold them. Each removal also writes a tombstone, signed by the
+    //    compactor (the master or head), so the lane deletes the file on every peer.
+    sweep(route, identity, now, grace, dry_run, &mut report);
+    // 4. Age out honoured tombstones and record how far back the deletions reach, so a
+    //    long-offline peer cannot resurrect anything.
+    if !dry_run {
+        let _ = crate::tombstone::drop_expired(route, tombstone_days)?;
+    }
     Ok(report)
 }
 
 fn sweep(
     route: &ProjectRoute,
+    identity: &AgentIdentity,
     now: DateTime<Utc>,
     grace: Duration,
     dry_run: bool,
@@ -896,12 +953,42 @@ fn sweep(
                     .push((entry.id, "changed since it was archived".into()));
                 continue;
             }
-            if !dry_run
-                && (fs::remove_file(&message_path).is_err()
-                    || (ack_path.is_file() && fs::remove_file(&ack_path).is_err()))
-            {
-                report.kept.push((entry.id, "could not be removed".into()));
-                continue;
+            if !dry_run {
+                // Read before removing: the tombstone names the version being deleted, by
+                // BLAKE3, so a newer write with different contents survives.
+                let message_bytes = fs::read(&message_path).ok();
+                let ack_bytes = ack_path
+                    .is_file()
+                    .then(|| fs::read(&ack_path).ok())
+                    .flatten();
+                if fs::remove_file(&message_path).is_err()
+                    || (ack_path.is_file() && fs::remove_file(&ack_path).is_err())
+                {
+                    report.kept.push((entry.id, "could not be removed".into()));
+                    continue;
+                }
+                if let Some(bytes) = message_bytes {
+                    let content = blake3::hash(&bytes).to_hex().to_string();
+                    let path = format!("messages/{}/{}.json", route.project_id, entry.id);
+                    let _ = crate::tombstone::write(
+                        route,
+                        &path,
+                        Some(&content),
+                        now.timestamp_millis(),
+                        identity,
+                    );
+                }
+                if let Some(bytes) = ack_bytes {
+                    let content = blake3::hash(&bytes).to_hex().to_string();
+                    let path = format!("acknowledgements/{}/{}.json", route.project_id, entry.id);
+                    let _ = crate::tombstone::write(
+                        route,
+                        &path,
+                        Some(&content),
+                        now.timestamp_millis(),
+                        identity,
+                    );
+                }
             }
             report.removed.push(entry.id);
         }
@@ -1197,6 +1284,7 @@ mod tests {
         let mut report = Report::default();
         sweep(
             &rig.route,
+            &rig.josh,
             now + Duration::days(5),
             Duration::days(1),
             false,

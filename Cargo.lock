@@ -1610,6 +1610,7 @@ name = "ferryman-channel"
 version = "0.6.3"
 dependencies = [
  "anyhow",
+ "blake3",
  "chacha20poly1305",
  "chrono",
  "ed25519-dalek",
@@ -1636,6 +1637,7 @@ version = "0.6.3"
 dependencies = [
  "anyhow",
  "axum",
+ "blake3",
  "chacha20poly1305",
  "chrono",
  "clap",

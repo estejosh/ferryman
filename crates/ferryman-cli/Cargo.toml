@@ -16,6 +16,7 @@ hive-rescue = ["dep:ferryman-hive-rescue", "dep:iroh"]
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+blake3 = { version = "1.8", default-features = false, features = ["std"] }
 chrono.workspace = true
 ferryman-channel = { path = "../ferryman-channel" }
 ferryman-iroh = { path = "../ferryman-iroh" }

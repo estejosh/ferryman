@@ -685,3 +685,238 @@ async fn a_project_added_while_the_lane_runs_is_synced_from_then_on() {
         "{\"late\":true}"
     );
 }
+
+#[tokio::test]
+async fn a_delete_on_one_machine_removes_the_file_everywhere_and_stays_gone() {
+    let p = pair().await;
+    let fang = AgentIdentity::load_or_create("fang", &p.a_demo.attachment).unwrap();
+    let text = "{\"signed_by\":\"fang\"}";
+    write(&p.a_demo, "claim.fang.json", text);
+    p.a.round().await;
+    assert!(p.b_demo.communications.join("claim.fang.json").exists());
+
+    // fang deletes its own file: a tombstone for this exact version, then the removal.
+    let content = blake3::hash(text.as_bytes()).to_hex().to_string();
+    ferryman_channel::tombstone::write(
+        &p.a_demo,
+        "claim.fang.json",
+        Some(&content),
+        chrono::Utc::now().timestamp_millis(),
+        &fang,
+    )
+    .unwrap();
+    fs::remove_file(p.a_demo.communications.join("claim.fang.json")).unwrap();
+
+    p.a.round().await;
+    assert!(
+        !p.b_demo.communications.join("claim.fang.json").exists(),
+        "the tombstone removes the file on the peer"
+    );
+
+    // A round the other way does not bring it back.
+    p.b.round().await;
+    assert!(!p.a_demo.communications.join("claim.fang.json").exists());
+    assert!(!p.b_demo.communications.join("claim.fang.json").exists());
+}
+
+#[tokio::test]
+async fn a_delete_is_not_undone_by_a_peer_that_still_has_the_file() {
+    // Three machines share `demo`. A deletes; B learns of it; C, which still has the
+    // file, must not bring it back when B syncs with C.
+    let dir = tempfile::tempdir().unwrap();
+    ferryman_channel::licensing::use_machine_state_dir_per_thread(
+        std::env::temp_dir().join(format!("ferryman-iroh-tests-{}", std::process::id())),
+    );
+    let a_demo = route(&dir.path().join("a"), "demo");
+    let b_demo = route(&dir.path().join("b"), "demo");
+    let c_demo = route(&dir.path().join("c"), "demo");
+    let fang = AgentIdentity::load_or_create("fang", &a_demo.attachment).unwrap();
+    let wisp = AgentIdentity::load_or_create("wisp", &b_demo.attachment).unwrap();
+    let clover = AgentIdentity::load_or_create("clover", &c_demo.attachment).unwrap();
+    let (key_a, key_b, key_c) = (
+        SecretKey::generate(),
+        SecretKey::generate(),
+        SecretKey::generate(),
+    );
+    let lookup = MemoryLookup::new();
+    let a_end = endpoint(key_a.clone(), &lookup).await;
+    let b_end = endpoint(key_b.clone(), &lookup).await;
+    let c_end = endpoint(key_c.clone(), &lookup).await;
+    lookup.add_endpoint_info(addr(&a_end));
+    lookup.add_endpoint_info(addr(&b_end));
+    lookup.add_endpoint_info(addr(&c_end));
+    for route in [&a_demo, &b_demo, &c_demo] {
+        enrol(route, &fang);
+        enrol(route, &wisp);
+        enrol(route, &clover);
+        ferryman_channel::transports::publish(route, &fang, &endpoint_hex(&key_a.public()), None)
+            .unwrap();
+        ferryman_channel::transports::publish(route, &wisp, &endpoint_hex(&key_b.public()), None)
+            .unwrap();
+        ferryman_channel::transports::publish(route, &clover, &endpoint_hex(&key_c.public()), None)
+            .unwrap();
+        write(route, "claim.fang.json", "{\"signed_by\":\"fang\"}");
+    }
+    copy_tree(&a_demo.communications, &b_demo.communications);
+    copy_tree(&a_demo.communications, &c_demo.communications);
+
+    let a = Lane::new(a_end, vec![a_demo.clone()], None, None);
+    let b = Lane::new(b_end, vec![b_demo.clone()], None, None);
+    let c = Lane::new(c_end, vec![c_demo.clone()], None, None);
+    tokio::spawn(Arc::clone(&a).serve());
+    tokio::spawn(Arc::clone(&b).serve());
+    tokio::spawn(Arc::clone(&c).serve());
+
+    // A deletes, then tells B.
+    let content = blake3::hash(b"{\"signed_by\":\"fang\"}")
+        .to_hex()
+        .to_string();
+    ferryman_channel::tombstone::write(
+        &a_demo,
+        "claim.fang.json",
+        Some(&content),
+        chrono::Utc::now().timestamp_millis(),
+        &fang,
+    )
+    .unwrap();
+    fs::remove_file(a_demo.communications.join("claim.fang.json")).unwrap();
+
+    let peer = ferryman_iroh::lane::Peer {
+        projects: ["demo".to_owned()].into(),
+        ..Default::default()
+    };
+    a.sync_peer(b.endpoint().id(), &peer).await.unwrap();
+    assert!(!b_demo.communications.join("claim.fang.json").exists());
+
+    // C still has the file; B's tombstone covers it, so B never takes it back and C
+    // learns the deletion instead.
+    b.sync_peer(c.endpoint().id(), &peer).await.unwrap();
+    assert!(!c_demo.communications.join("claim.fang.json").exists());
+    assert!(!b_demo.communications.join("claim.fang.json").exists());
+}
+
+#[tokio::test]
+async fn a_newer_write_after_the_tombstone_survives() {
+    let p = pair().await;
+    let fang = AgentIdentity::load_or_create("fang", &p.a_demo.attachment).unwrap();
+    write(
+        &p.a_demo,
+        "claim.fang.json",
+        "{\"signed_by\":\"fang\",\"v\":1}",
+    );
+    p.a.round().await;
+
+    // A tombstone for the old version, then a newer write with different contents.
+    let old_hash = blake3::hash(b"{\"signed_by\":\"fang\",\"v\":1}")
+        .to_hex()
+        .to_string();
+    ferryman_channel::tombstone::write(
+        &p.a_demo,
+        "claim.fang.json",
+        Some(&old_hash),
+        chrono::Utc::now().timestamp_millis(),
+        &fang,
+    )
+    .unwrap();
+    write(
+        &p.a_demo,
+        "claim.fang.json",
+        "{\"signed_by\":\"fang\",\"v\":2}",
+    );
+
+    p.a.round().await;
+    assert_eq!(
+        fs::read_to_string(p.b_demo.communications.join("claim.fang.json")).unwrap(),
+        "{\"signed_by\":\"fang\",\"v\":2}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_on_a_lane_channel_converges_and_keeps_the_message_in_the_archive() {
+    let p = pair().await;
+    let josh = AgentIdentity::from_seed("josh", [7u8; 32]);
+    let fang = AgentIdentity::load_or_create("fang", &p.a_demo.attachment).unwrap();
+    let wisp = AgentIdentity::load_or_create("wisp", &p.b_demo.attachment).unwrap();
+    let mut a_agents = Vec::new();
+    for identity in [&fang, &wisp, &josh] {
+        let route = ferryman_channel::AgentRoute {
+            name: identity.name().into(),
+            role: "worker".into(),
+            capabilities: Vec::new(),
+            public_key: Some(identity.public_key_hex()),
+            encryption_key: None,
+        };
+        ferryman_channel::register_agent(&p.a_demo, &route).unwrap();
+        ferryman_channel::register_agent(&p.b_demo, &route).unwrap();
+        a_agents.push(route);
+    }
+    ferryman_channel::master::initialize_master(&p.a_demo, &josh, "josh").unwrap();
+    let mut a_demo = p.a_demo.clone();
+    a_demo.agents = a_agents;
+    let mut b_demo = p.b_demo.clone();
+    b_demo.agents = a_demo.agents.clone();
+    copy_tree(&p.a_demo.communications, &p.b_demo.communications);
+
+    // A message fang wrote to wisp, acknowledged and aged out.
+    let mut message = ferryman_channel::Message::new(
+        "demo",
+        fang.name(),
+        wisp.name(),
+        "inline",
+        serde_json::json!({ "text": "hello" }),
+        false,
+        None,
+    );
+    message.created_at = chrono::Utc::now() - chrono::Duration::days(45);
+    message.acknowledgement_deadline = message.created_at + chrono::Duration::hours(1);
+    fang.sign(&mut message);
+    let live = a_demo
+        .communications
+        .join("messages/demo")
+        .join(format!("{}.json", message.id));
+    fs::create_dir_all(live.parent().unwrap()).unwrap();
+    fs::write(&live, serde_json::to_vec_pretty(&message).unwrap()).unwrap();
+    let ack = ferryman_channel::Acknowledgement {
+        message_id: message.id.clone(),
+        project_id: "demo".into(),
+        recipient: wisp.name().into(),
+        processed_at: message.created_at + chrono::Duration::minutes(5),
+        idempotency_key: message.idempotency_key.clone(),
+    };
+    ferryman_channel::record_acknowledgement(&a_demo, &ack).unwrap();
+    copy_tree(&a_demo.communications, &b_demo.communications);
+
+    // The master compacts A's channel with no grace: archive + tombstone + removal.
+    let report = ferryman_channel::compaction::compact_unchecked_retaining(
+        &a_demo,
+        &josh,
+        chrono::Utc::now(),
+        chrono::Duration::zero(),
+        false,
+        90,
+    )
+    .unwrap();
+    assert!(report.removed.contains(&message.id));
+    assert!(!live.exists());
+    assert!(!ferryman_channel::tombstone::honoured(&a_demo).is_empty());
+
+    // The lane carries the archive and the tombstone to B; B removes its original too.
+    let peer = ferryman_iroh::lane::Peer {
+        projects: ["demo".to_owned()].into(),
+        ..Default::default()
+    };
+    p.a.sync_peer(p.b.endpoint().id(), &peer).await.unwrap();
+    let b_live = b_demo
+        .communications
+        .join("messages/demo")
+        .join(format!("{}.json", message.id));
+    assert!(
+        !b_live.exists(),
+        "the tombstone removes the original on the peer"
+    );
+    let archived = ferryman_channel::compaction::archived_messages(&b_demo);
+    assert!(
+        archived.iter().any(|entry| entry.id == message.id),
+        "the compacted message is present in the archive on the peer"
+    );
+}
