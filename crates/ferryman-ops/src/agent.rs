@@ -1604,6 +1604,19 @@ async fn run_agent(
     for (key, value) in credentials {
         command.env(key, value);
     }
+    // One build at a time on this machine, whatever the engines do (see `buildgate`).
+    match crate::buildgate::shim_dir() {
+        Ok(shims) => {
+            let original = std::env::var_os("PATH");
+            if let Some(path) = crate::buildgate::engine_path(&shims, original.as_ref()) {
+                command.env("PATH", path);
+                if let Some(original) = original {
+                    command.env(crate::buildgate::REAL_PATH, original);
+                }
+            }
+        }
+        Err(error) => tracing::warn!("build gate not set up, builds are not queued: {error:#}"),
+    }
     // The agent CLI, not Ferryman, is what makes a machine unusable: the loop idles at
     // about 5 MB, the thing it starts is measured in hundreds. Below-normal is set at
     // spawn on Windows, where the API is safe to use, so there is no window at full

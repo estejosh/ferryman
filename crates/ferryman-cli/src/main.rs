@@ -4301,6 +4301,10 @@ const COMMAND_STACK: usize = 16 * 1024 * 1024;
 /// the CLI's command surface can keep growing without a platform-specific cliff waiting for
 /// it.
 fn main() -> std::process::ExitCode {
+    // Started as `cargo` from an engine's PATH: the machine's build gate, nothing else.
+    if let Some(tool) = ferryman_ops::buildgate::invoked_as() {
+        return ferryman_ops::buildgate::run_gated(tool);
+    }
     match run_ferry() {
         // A worker that stopped to take an update asked to be started again; by now its
         // locks and its lane are gone, so this process can become the new one (see `restart`).

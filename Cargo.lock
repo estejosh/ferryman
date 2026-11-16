@@ -1741,6 +1741,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "ferryman-channel",
+ "fs2",
  "futures-util",
  "hex",
  "hostname",

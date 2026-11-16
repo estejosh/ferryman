@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+One build at a time per machine, for everything the worker starts. Three engines on three orders each ran `cargo test --workspace` at once and took the machine from the person using it. The worker now puts a folder first on every engine's PATH where `cargo` is ferry under another name: it takes the machine's build slot (a lock in machine state, `build-gate/build.lock`), waits for it if another build has it, runs the real cargo with the same arguments and `CARGO_BUILD_JOBS` at three quarters of the cores unless set, and returns its exit code. A build started inside a gated build goes straight through (docs/BUILD_GATE.md).
+
 Notices go through Ferryman. `ferry notify send --source --subject --state --level info|act|urgent --text` hands the operator's news to Ferryman instead of each tool messaging the operator directly. The all-projects worker delivers it: `info` goes into the day's digest; `act` and `urgent` go to the operator's chat once. A repeat of the same source, subject and state is dropped for 24 hours, and a new state edits the message already sent. Muted sources (`[notices] muted` in `ferry.toml`) go to the digest unless urgent. `ferry notify status` shows what each source handed in and what became of it (docs/NOTIFY.md).
 
 A logged-out engine is the engine's fault, not the order's. A CLI that answers "Failed to authenticate", "invalid api key", "please run /login" or HTTP 401 on either stream is marked down with its own words, and the same order goes to the next engine at once with nothing counted against it. The owner is told the first time, not after three.
