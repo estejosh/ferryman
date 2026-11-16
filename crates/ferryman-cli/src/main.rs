@@ -17,6 +17,7 @@ mod mcp_client;
 mod mcp_http;
 mod mcp_oauth;
 mod mcp_setup;
+mod notify;
 mod restart;
 mod route;
 mod suggest;
@@ -539,6 +540,13 @@ enum Command {
     License {
         #[command(subcommand)]
         command: License,
+    },
+    /// Tell the operator something, through Ferryman: `info` goes into the day's digest,
+    /// `act` and `urgent` to the operator's chat once. Tools use this instead of messaging
+    /// the operator themselves.
+    Notify {
+        #[command(subcommand)]
+        command: notify::NotifyCommand,
     },
     /// Run every project from your phone: one Telegram chat, private or a group, with
     /// buttons for projects, engines, tasks, reviews and self-improve.
@@ -5094,6 +5102,7 @@ async fn run(cli: Cli) -> Result<()> {
             suggest::suggestions(project, command).await?;
         }
         Command::License { command } => license_command(command).await?,
+        Command::Notify { command } => notify::command(command)?,
         Command::Telegram {
             agent,
             comms,
@@ -8420,6 +8429,12 @@ async fn run_fleet(
         }
         _ => None,
     };
+    // Notices tools hand in for the operator: the all-projects worker delivers them.
+    let mut notices_pass = if serving_everywhere {
+        notify::NoticesPass::for_worker(report)
+    } else {
+        None
+    };
     if let Some(iroh) = iroh {
         let mut routes: Vec<ferryman_channel::ProjectRoute> = fleet
             .served
@@ -8581,6 +8596,9 @@ async fn run_fleet(
                 .map(|(route, _)| route.clone())
                 .collect();
             mail.pass(&routes, report).await;
+        }
+        if let Some(notices) = notices_pass.as_mut() {
+            notices.pass(report).await;
         }
 
         // The projects the fleet is focused on are looked at first, then the rest,
