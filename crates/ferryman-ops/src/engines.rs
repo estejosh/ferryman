@@ -1898,6 +1898,39 @@ pub fn quota_reset(text: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     ))
 }
 
+/// The line of `text` that says the engine is not logged in, or `None` when nothing does.
+///
+/// A CLI whose login ran out answers every run within a second with "Failed to
+/// authenticate: OAuth session expired", or "invalid api key", or "please run /login".
+/// That is neither the work's fault nor a wallet's: the engine is down until a person logs
+/// it in again, and retrying the order changes nothing.
+#[must_use]
+pub fn logged_out(text: &str) -> Option<String> {
+    const MARKERS: [&str; 14] = [
+        "failed to authenticate",
+        "authentication_failed",
+        "authentication failed",
+        "authentication required",
+        "oauth session expired",
+        "oauth token has expired",
+        "not logged in",
+        "please run /login",
+        "please log in",
+        "login required",
+        "invalid api key",
+        "invalid x-api-key",
+        "401 unauthorized",
+        "http 401",
+    ];
+    text.lines().map(str::trim).find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
+            .then(|| clip_reason(line))
+    })
+}
+
 /// Claude Code's `usage limit reached|1759000000`.
 fn epoch_reset(t: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     t.match_indices('|').find_map(|(at, _)| {
@@ -3175,6 +3208,20 @@ engine.local.tier = "chore"
             Some(now + chrono::Duration::hours(DEFAULT_EXHAUSTED_HOURS)),
             "no reset given: six hours"
         );
+    }
+
+    #[test]
+    fn a_logged_out_cli_is_recognised_by_its_own_words() {
+        let claude = r#"{"type":"result","is_error":true,"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
+        assert!(
+            logged_out(claude)
+                .unwrap()
+                .contains("OAuth session expired")
+        );
+        assert!(logged_out("progress...\nError: Invalid API key").is_some());
+        assert!(logged_out("HTTP 401 Unauthorized").is_some());
+        assert!(logged_out("3 tests failed\nerror: build failed").is_none());
+        assert!(logged_out("listening on port 4011").is_none());
     }
 
     #[test]

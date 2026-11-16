@@ -18,6 +18,7 @@
 pub mod adversary;
 pub mod agent;
 pub mod attach;
+pub mod buildgate;
 pub mod console;
 pub mod digest;
 pub mod doctor;

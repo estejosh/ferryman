@@ -56,6 +56,7 @@ pub mod master;
 pub mod memory;
 pub mod migration;
 pub mod models;
+pub mod notices;
 pub mod offer;
 pub mod order_files;
 pub mod overlap;
