@@ -892,6 +892,8 @@ pub enum FaultKind {
     Errored,
     /// Nothing answered at its address.
     Unreachable,
+    /// Its login ran out: every run fails at once until a person logs it in again.
+    LoggedOut,
 }
 
 impl FaultKind {
@@ -903,6 +905,7 @@ impl FaultKind {
             Self::NoAnswer => "returned nothing",
             Self::Errored => "errored",
             Self::Unreachable => "was unreachable",
+            Self::LoggedOut => "is logged out",
         }
     }
 }
@@ -966,6 +969,14 @@ fn fault_of(config: &AgentConfig, run: &AgentRun) -> Option<(FaultKind, String)>
         });
     }
     let detail = engine_failure_detail(run);
+    // Said on either stream: Claude puts it in its final JSON on stdout, under event names
+    // on stderr that say nothing.
+    if let Some(line) = crate::engines::logged_out(&format!("{}\n{}", run.stderr, run.stdout)) {
+        return Some((
+            FaultKind::LoggedOut,
+            format!("{line} (log it in again on this machine; until then it gets no work)"),
+        ));
+    }
     if run.timed_out {
         return Some((FaultKind::TimedOut, detail));
     }
@@ -4116,7 +4127,12 @@ fn note_fault(
         &fault.engine,
         (fault.model.as_deref(), id),
         &format!("{}: {}", fault.kind.as_str(), fault.reason),
-        config.engine_alert_after,
+        // A logged-out engine fails every run the same way: say so the first time.
+        if fault.kind == FaultKind::LoggedOut {
+            1
+        } else {
+            config.engine_alert_after
+        },
         now,
     );
     let handed = next.map_or_else(
@@ -10054,6 +10070,22 @@ engine.coder.model = "big-coder"
             ..run(false, "the test hit a timeout", "")
         };
         assert!(fault_of(&config, &spent).is_none());
+        // Logged out: Claude's wrapper prints event names on stderr and the reason in the
+        // final result on stdout. The engine's fault, and the reason is the engine's words.
+        let out = fault_of(
+            &config,
+            &run(
+                false,
+                "Failed to authenticate: OAuth session expired and could not be refreshed",
+                "[claude] system:hook_response\n[claude] system:init\n[claude] assistant text",
+            ),
+        );
+        match out {
+            Some((FaultKind::LoggedOut, reason)) => {
+                assert!(reason.contains("OAuth session expired"), "{reason}");
+            }
+            other => panic!("expected logged out, got {other:?}"),
+        }
     }
 }
 
