@@ -72,7 +72,8 @@ action that tries is refused with that explanation.
 `ferry mcp serve --http` serves MCP over Streamable HTTP (protocol 2025-06-18, one `/mcp`
 endpoint) with its own sign-in, so a cloud app can connect to this machine.
 
-1. Start the server, behind TLS (see below), naming the public address:
+1. Start the server, behind TLS (see below), naming the public address. Without
+   `--as` it serves every live project and each app gets an identity of its own.
 
    ```
    ferry mcp serve --http 127.0.0.1:8787 --public-url https://mcp.example.com
@@ -81,22 +82,49 @@ endpoint) with its own sign-in, so a cloud app can connect to this machine.
    It prints the connector URL, `https://mcp.example.com/mcp`.
 2. Run `ferry mcp pair`. It prints a code that works once, for ten minutes.
 3. In claude.ai, Settings, Connectors, add a custom connector and paste the connector URL.
-4. The sign-in page opens on your server. It shows which host the app will return to, the
-   identity it will get and which projects it will see. Enter the code. The app is then
-   given an identity of its own (`<app>-<machine>`, for example `claude-grouchly`), seated as
-   a **Worker** in every live project here: nothing to seat by hand. Each app that pairs gets
-   its own, and sees only its own seats. Raise one with `ferry access set` like any agent.
-   Orchestrators and the master identity are refused over HTTP.
+4. The sign-in page opens on your server. It shows which host the app will return to and
+   which projects it can be seated in. Enter the code. The page then says it is waiting for
+   you.
+5. Approve it on the machine that runs Ferryman: `ferry mcp apps approve <id>` (the page
+   prints the id), or the dashboard, Teammates, Connected apps. The page continues by
+   itself; if you do nothing it gives up after ten minutes.
 
 To bind every app to one identity you seat yourself, add `--as <name>` (and `--all-projects`);
-that identity keeps the level it already has in each project.
+that identity keeps the level it already has in each project, and the pairing code alone
+lets an app in (there is no per-app approval, since there is no per-app identity).
 
-The server answers only to the host in `--public-url`, refuses request bodies over 1 MiB
-(16 KiB on the login endpoints), and locks the login for ten minutes after five wrong codes.
-Access tokens last 15 minutes; refresh tokens rotate, and replaying an old one revokes the
-grant; a grant ends after 90 days. Tokens are stored only as hashes in the machine state
-directory (`mcp-http/`), never synced. To revoke every connected app, stop the server and
-delete that folder's `oauth.json`.
+### Each app is its own agent
+
+An approved app gets a name (`claude-ai-<owner>`, `chatgpt-<owner>`, where the owner is the
+master), a key of its own, a roster entry and a level the project's master signs. The key
+lives in the server's state directory (`mcp-http/keys/`), not in the machine's keystore and
+not in any project, so deleting it ends the identity. The level is **Worker** (read the
+channel, ask you, write nothing into it) unless you choose **Member**
+(`ferry mcp apps approve <id> --level member`). It is never Orchestrator, and never the
+master. `--project a,b` seats it only in those projects; otherwise it is seated in every
+live project whose master key is on this machine.
+
+An app is approved only when a master-signed grant for its key exists. If the master key is
+not on this machine, nothing is signed: the command prints the path of the app's signed
+request. Copy that file to the machine that holds the master key and run
+`ferry mcp apps approve --request <file>`. When the grant syncs back, the waiting login
+continues without anyone touching this machine.
+
+```
+ferry mcp apps list                 # id, identity, level, state, projects, last used, calls
+ferry mcp apps approve <id>         # Worker; --level member, --project a,b, --request <file>
+ferry mcp apps deny <id>            # refuse a waiting app
+ferry mcp apps revoke <id>          # end it
+```
+
+**Revoking** ends every token of the app at the server's next request (no restart), signs
+its grant down to Worker with a master-signed revocation record beside it, and deletes its
+key. Where the master key is not on this machine the command says which projects still need
+signing; the app is dead here regardless. The dashboard's Connected apps card does the same in a
+click. The app can also end its own session with the standard revocation endpoint
+(`POST /revoke`, RFC 7009, advertised in the metadata); when that was its last session the
+app is revoked as above, so a disconnect leaves no identity behind. Logging in again makes a
+new identity.
 
 **TLS.** `--http` speaks plain HTTP and must sit behind TLS. claude.ai only reaches an
 https URL on a public name. Until the edge with automatic certificates exists, put a

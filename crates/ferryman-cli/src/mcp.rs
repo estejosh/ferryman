@@ -250,6 +250,22 @@ impl Server {
         }
     }
 
+    /// The server one connected app talks to over HTTP: its own identity across every live
+    /// project, Worker and Member seats only, with its key in the app keystore.
+    pub fn for_app(me: &str, source: mcp_agent::RouteSource, keys: PathBuf) -> Result<Self> {
+        let all = AllProjects::new(me, false, true, source)?.with_keys(keys);
+        Ok(Server {
+            route: None,
+            agent: None,
+            all: Some(all),
+            http: true,
+            legacy: false,
+            gateways: Vec::new(),
+            lazy: None,
+            setup_error: None,
+        })
+    }
+
     /// A server for tests and embedding: no external servers connected.
     #[cfg(test)]
     pub fn with(route: ProjectRoute, agent: Option<Agent>, legacy: bool) -> Self {
@@ -263,21 +279,6 @@ impl Server {
             lazy: None,
             setup_error: None,
         }
-    }
-
-    /// The server for one paired app over HTTP: its own identity, every project it is seated
-    /// in, and never an Orchestrator seat.
-    pub fn for_app(name: &str, source: mcp_agent::RouteSource) -> Result<Self> {
-        Ok(Server {
-            route: None,
-            agent: None,
-            all: Some(AllProjects::new(name, false, true, source)?),
-            http: true,
-            legacy: false,
-            gateways: Vec::new(),
-            lazy: None,
-            setup_error: None,
-        })
     }
 
     /// A test server over several projects.

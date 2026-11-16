@@ -11,10 +11,11 @@ use crate::mcp::Server;
 use crate::mcp_agent::{self, AllProjects};
 use crate::mcp_oauth::{self as oauth, CLAUDE_CALLBACK};
 use ferryman_channel::access::{self, Level};
+use ferryman_channel::apps;
 use ferryman_channel::{AgentIdentity, AgentRoute, ProjectRoute};
 
 const APP: &str = "claude-ai";
-const MASTER: &str = "josh";
+const MASTER: &str = "owner";
 const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
 struct Fleet {
@@ -143,7 +144,7 @@ fn all_projects_calls_need_a_project_and_keep_the_per_project_checks() {
     assert_eq!(worker["structuredContent"]["error"], "denied");
     let member = local.call(
         "ferry_talk",
-        &json!({ "project": "beta", "action": "post", "to": "josh", "text": "hello" }),
+        &json!({ "project": "beta", "action": "post", "to": "owner", "text": "hello" }),
     );
     assert_eq!(member["isError"], false, "{member}");
     // The master identity is refused outright.
@@ -334,14 +335,21 @@ fn the_public_url_fixes_the_host_and_the_resource() {
 // -- the HTTP server ---------------------------------------------------------------------
 
 struct Live {
-    _fleet: Fleet,
+    app: Arc<App>,
+    fleet: Fleet,
     base: String,
     cfg: Config,
     http: reqwest::Client,
 }
 
+/// `--as claude-ai`: every app is bound to one identity the owner seated.
 async fn start() -> Live {
     start_as(APP).await
+}
+
+/// No `--as`: every app asks for its own identity and waits for the owner.
+async fn start_apps() -> Live {
+    start_as("").await
 }
 
 /// `agent` empty is `ferry mcp serve --http` with no `--as`: every app makes its own identity.
@@ -358,14 +366,15 @@ async fn start_as(agent: &str) -> Live {
         Arc::new(move || routes.clone()),
     )
     .unwrap();
-    tokio::spawn(serve_listener(listener, app));
+    tokio::spawn(serve_listener(listener, app.clone()));
     let http = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap();
     Live {
-        _fleet: fleet,
+        app,
+        fleet,
         base: format!("http://{addr}"),
         cfg,
         http,
@@ -378,6 +387,18 @@ fn encode(pairs: &[(&str, &str)]) -> String {
         .finish()
 }
 
+/// The query of a redirect `Location`.
+fn query_of(response: &reqwest::Response) -> std::collections::HashMap<String, String> {
+    let location = response.headers()["location"].to_str().unwrap();
+    url::Url::parse(location)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+const LOOPBACK: &str = "http://127.0.0.1:53211/callback";
+
 impl Live {
     async fn form(&self, path: &str, pairs: &[(&str, &str)]) -> reqwest::Response {
         self.http
@@ -389,11 +410,11 @@ impl Live {
             .unwrap()
     }
 
-    async fn register(&self) -> String {
+    async fn register_as(&self, name: &str, redirect: &str) -> String {
         let response = self
             .http
             .post(format!("{}/register", self.base))
-            .json(&json!({ "client_name": "Claude", "redirect_uris": [CLAUDE_CALLBACK], "token_endpoint_auth_method": "none" }))
+            .json(&json!({ "client_name": name, "redirect_uris": [redirect], "token_endpoint_auth_method": "none" }))
             .send()
             .await
             .unwrap();
@@ -402,6 +423,10 @@ impl Live {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    async fn register(&self) -> String {
+        self.register_as("Claude", CLAUDE_CALLBACK).await
     }
 
     fn authorize_pairs<'a>(
@@ -423,8 +448,18 @@ impl Live {
         ]
     }
 
-    /// Run authorize with a fresh pairing code and return the authorization code.
+    /// Pair and take the authorization code: straight away with a fixed identity, or after
+    /// the owner has approved the app when apps make their own.
     async fn authorize(&self, client: &str) -> String {
+        if self.cfg.per_app() {
+            self.authorize_approved(client).await
+        } else {
+            self.authorize_fixed(client).await
+        }
+    }
+
+    /// Run authorize with a fresh pairing code and return the authorization code.
+    async fn authorize_fixed(&self, client: &str) -> String {
         let pairing = oauth::mint_pairing_code(&self.cfg.state_dir, oauth::unix_now()).unwrap();
         let challenge = oauth::s256(VERIFIER);
         let response = self
@@ -442,7 +477,87 @@ impl Live {
         query["code"].clone()
     }
 
+    /// Log in with a fresh pairing code. The app is not given a code: it waits for the
+    /// owner. Returns the wait token and the app's id.
+    async fn login_to(&self, client: &str, redirect: &str) -> (String, String) {
+        let pairing = oauth::mint_pairing_code(&self.cfg.state_dir, oauth::unix_now()).unwrap();
+        let challenge = oauth::s256(VERIFIER);
+        let mut pairs = self.authorize_pairs(client, &challenge, &self.cfg.resource, &pairing);
+        pairs.iter_mut().for_each(|(k, v)| {
+            if *k == "redirect_uri" {
+                *v = redirect;
+            }
+        });
+        let response = self.form("/authorize", &pairs).await;
+        assert_eq!(response.status(), 200);
+        let page = response.text().await.unwrap();
+        assert!(page.contains("Waiting for your approval"), "{page}");
+        assert!(!page.contains("fmcp_code"));
+        let wait = page
+            .split("url=/authorize/wait?w=")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_string();
+        let id = page
+            .split("ferry mcp apps approve ")
+            .nth(1)
+            .unwrap()
+            .split('<')
+            .next()
+            .unwrap()
+            .to_string();
+        (wait, id)
+    }
+
+    async fn login(&self, client: &str) -> (String, String) {
+        self.login_to(client, CLAUDE_CALLBACK).await
+    }
+
+    async fn wait(&self, wait: &str) -> reqwest::Response {
+        self.http
+            .get(format!("{}/authorize/wait?w={wait}", self.base))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// What the owner does at the terminal: sign the app in, here as the master.
+    fn approve(&self, id: &str, level: Level, only: &[String]) -> apps::App {
+        let mut app = apps::find(&self.cfg.state_dir, id).unwrap();
+        apps::approve(
+            &self.cfg.state_dir,
+            &mut app,
+            level,
+            only,
+            &self.fleet.routes,
+            &apps::master_key_here,
+            oauth::unix_now(),
+        )
+        .unwrap();
+        app
+    }
+
+    /// Log in, get approved as a Worker everywhere, and take the authorization code.
+    async fn authorize_approved(&self, client: &str) -> String {
+        let (wait, id) = self.login(client).await;
+        self.approve(&id, Level::Worker, &[]);
+        let response = self.wait(&wait).await;
+        assert_eq!(response.status(), 302);
+        let location = response.headers()["location"].to_str().unwrap();
+        assert!(location.starts_with(CLAUDE_CALLBACK));
+        let query = query_of(&response);
+        assert_eq!(query["state"], "st4te");
+        query["code"].clone()
+    }
+
     async fn tokens(&self, client: &str, code: &str) -> Value {
+        self.tokens_for(client, code, CLAUDE_CALLBACK).await
+    }
+
+    async fn tokens_for(&self, client: &str, code: &str, redirect: &str) -> Value {
         let response = self
             .form(
                 "/token",
@@ -450,7 +565,7 @@ impl Live {
                     ("grant_type", "authorization_code"),
                     ("code", code),
                     ("client_id", client),
-                    ("redirect_uri", CLAUDE_CALLBACK),
+                    ("redirect_uri", redirect),
                     ("code_verifier", VERIFIER),
                     ("resource", &self.cfg.resource),
                 ],
@@ -461,7 +576,7 @@ impl Live {
     }
 
     fn fleet_routes(&self) -> Vec<ProjectRoute> {
-        self._fleet.routes.clone()
+        self.fleet.routes.clone()
     }
 
     async fn rpc(&self, token: Option<&str>, body: Value) -> reqwest::Response {
@@ -470,6 +585,22 @@ impl Live {
             request = request.bearer_auth(token);
         }
         request.send().await.unwrap()
+    }
+
+    async fn call(&self, token: &str, tool: &str, arguments: Value) -> Value {
+        let body = json!({ "jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": { "name": tool, "arguments": arguments } });
+        let reply: Value = self.rpc(Some(token), body).await.json().await.unwrap();
+        reply["result"].clone()
+    }
+
+    async fn ping(&self, token: &str) -> u16 {
+        self.rpc(
+            Some(token),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "ping" }),
+        )
+        .await
+        .status()
+        .as_u16()
     }
 }
 
@@ -874,7 +1005,8 @@ async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_ide
         )
         .await;
     assert_eq!(wrong.status(), 403);
-    let me = mcp_agent::app_name(Some("Claude"));
+    // Named for the app and the project's master, not for this machine.
+    let me = "claude-ai-owner";
     for route in &live.fleet_routes() {
         let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
         assert!(
@@ -909,7 +1041,7 @@ async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_ide
     assert_eq!(data["total"], 3);
     for route in &live.fleet_routes() {
         assert_eq!(
-            access::level_of(&route.communications, &route.project_id, &me),
+            access::level_of(&route.communications, &route.project_id, me),
             Level::Worker
         );
         let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
@@ -918,4 +1050,626 @@ async fn http_pairing_is_still_required_and_a_paired_app_gets_its_own_worker_ide
             access::APP_ROLE
         );
     }
+}
+
+#[tokio::test]
+async fn the_oauth_flow_with_owner_approval_works_end_to_end() {
+    let live = start_apps().await;
+
+    // No token: 401 that points at the resource metadata.
+    let denied = live
+        .rpc(
+            None,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        )
+        .await;
+    assert_eq!(denied.status(), 401);
+    let challenge = denied.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.starts_with("Bearer resource_metadata=\""),
+        "{challenge}"
+    );
+    assert!(challenge.contains("/.well-known/oauth-protected-resource/mcp"));
+
+    // Discovery: the resource is the connector URL, the AS is this origin, PKCE S256 only,
+    // and token revocation is offered.
+    let prm: Value = live
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-protected-resource",
+            live.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(prm["resource"], live.cfg.resource);
+    assert_eq!(prm["authorization_servers"], json!([live.cfg.origin]));
+    let meta: Value = live
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-authorization-server",
+            live.base
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(meta["code_challenge_methods_supported"], json!(["S256"]));
+    assert_eq!(
+        meta["token_endpoint_auth_methods_supported"],
+        json!(["none"])
+    );
+    assert_eq!(
+        meta["registration_endpoint"],
+        format!("{}/register", live.cfg.origin)
+    );
+    assert_eq!(
+        meta["revocation_endpoint"],
+        format!("{}/revoke", live.cfg.origin)
+    );
+
+    // Only the fixed Host is answered.
+    let stray = live
+        .http
+        .get(format!(
+            "{}/.well-known/oauth-authorization-server",
+            live.base
+        ))
+        .header("host", "evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stray.status(), 421);
+
+    // Registration: a foreign redirect is refused, claude.ai's is accepted.
+    let foreign = live
+        .http
+        .post(format!("{}/register", live.base))
+        .json(&json!({ "redirect_uris": ["https://evil.example/cb"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 400);
+    assert_eq!(
+        foreign.json::<Value>().await.unwrap()["error"],
+        "invalid_redirect_uri"
+    );
+    let client = live.register().await;
+
+    // The sign-in page names the redirect host and issues nothing.
+    let challenge = oauth::s256(VERIFIER);
+    let query = encode(&[
+        ("response_type", "code"),
+        ("client_id", &client),
+        ("redirect_uri", CLAUDE_CALLBACK),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("state", "st4te"),
+        ("resource", &live.cfg.resource),
+    ]);
+    let page = live
+        .http
+        .get(format!("{}/authorize?{query}", live.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), 200);
+    let page = page.text().await.unwrap();
+    assert!(
+        page.contains("claude.ai")
+            && page.contains("pairing_code")
+            && page.contains("alpha")
+            && page.contains("Worker")
+            && !page.contains("fmcp_code")
+    );
+
+    // A wrong audience is refused at authorize, with no pairing code needed to learn it.
+    let wrong = live
+        .form(
+            "/authorize",
+            &live.authorize_pairs(&client, &challenge, "https://other.example/mcp", "X"),
+        )
+        .await;
+    assert_eq!(wrong.status(), 302);
+    assert!(
+        wrong.headers()["location"]
+            .to_str()
+            .unwrap()
+            .contains("error=invalid_target")
+    );
+    // A wrong pairing code is refused, and makes no identity.
+    let bad = live
+        .form(
+            "/authorize",
+            &live.authorize_pairs(&client, &challenge, &live.cfg.resource, "AAAAA-AAAAA"),
+        )
+        .await;
+    assert_eq!(bad.status(), 403);
+    assert!(apps::list(&live.cfg.state_dir).is_empty());
+    let code = live.authorize(&client).await;
+
+    // The token endpoint checks PKCE and the audience, then issues.
+    let wrong_verifier = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client),
+                ("redirect_uri", CLAUDE_CALLBACK),
+                ("code_verifier", &"v".repeat(50)),
+            ],
+        )
+        .await;
+    assert_eq!(wrong_verifier.status(), 400);
+    assert_eq!(
+        wrong_verifier.json::<Value>().await.unwrap()["error"],
+        "invalid_grant"
+    );
+    let code = live.authorize(&client).await;
+    let wrong_resource = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client),
+                ("redirect_uri", CLAUDE_CALLBACK),
+                ("code_verifier", VERIFIER),
+                ("resource", "https://other.example/mcp"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        wrong_resource.json::<Value>().await.unwrap()["error"],
+        "invalid_target"
+    );
+    let code = live.authorize(&client).await;
+    let issued = live.tokens(&client, &code).await;
+    assert_eq!(issued["token_type"], "Bearer");
+    // A Worker app is offered read scope only.
+    assert_eq!(issued["scope"], "ferry:read");
+    let access = issued["access_token"].as_str().unwrap().to_string();
+    let refresh = issued["refresh_token"].as_str().unwrap().to_string();
+
+    // The token opens /mcp: initialize negotiates 2025-06-18, tools/list has the project
+    // argument, ferry_join names the app's own identity and its seats.
+    let init = live.rpc(Some(&access), json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } })).await;
+    assert_eq!(init.status(), 200);
+    let init: Value = init.json().await.unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert!(
+        init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("iroh")
+    );
+    let note = live
+        .rpc(
+            Some(&access),
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+    assert_eq!(note.status(), 202);
+    let list: Value = live
+        .rpc(
+            Some(&access),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    let tools = list["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(
+        |t| t["name"] == "ferry_join" && t["inputSchema"]["properties"]["project"].is_object()
+    ));
+    let join = live.call(&access, "ferry_join", json!({})).await;
+    assert_eq!(join["structuredContent"]["agent"], "claude-ai-owner-3");
+    assert_eq!(
+        levels(&join),
+        [
+            pair("alpha", "worker"),
+            pair("beta", "worker"),
+            pair("gamma", "worker")
+        ]
+    );
+
+    // GET is not offered, and a body over the cap is refused.
+    assert_eq!(
+        live.http
+            .get(format!("{}/mcp", live.base))
+            .bearer_auth(&access)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        405
+    );
+    // The server answers 413 without reading the body and closes; on some platforms the
+    // client sees that as a reset while it is still writing, which is a refusal too.
+    let big = live
+        .http
+        .post(format!("{}/mcp", live.base))
+        .bearer_auth(&access)
+        .body(vec![b' '; 2 << 20])
+        .send()
+        .await;
+    match big {
+        Ok(response) => assert_eq!(response.status(), 413),
+        Err(error) => assert!(error.is_request(), "{error}"),
+    }
+
+    // Refresh rotates.
+    let rotated = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &client),
+            ],
+        )
+        .await;
+    assert_eq!(rotated.status(), 200);
+    let rotated: Value = rotated.json().await.unwrap();
+    let (access2, refresh2) = (
+        rotated["access_token"].as_str().unwrap().to_string(),
+        rotated["refresh_token"].as_str().unwrap().to_string(),
+    );
+    assert_ne!(refresh, refresh2);
+    assert_eq!(live.ping(&access2).await, 200);
+
+    // Replaying the spent refresh token is invalid_grant and kills the whole grant.
+    let replay = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &client),
+            ],
+        )
+        .await;
+    assert_eq!(replay.status(), 400);
+    assert_eq!(
+        replay.json::<Value>().await.unwrap()["error"],
+        "invalid_grant"
+    );
+    assert_eq!(live.ping(&access2).await, 401);
+    let dead = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh2),
+                ("client_id", &client),
+            ],
+        )
+        .await;
+    assert_eq!(
+        dead.json::<Value>().await.unwrap()["error"],
+        "invalid_grant"
+    );
+}
+
+#[tokio::test]
+async fn an_app_waits_for_the_owner_and_gets_no_code_until_approved() {
+    let live = start_apps().await;
+    let client = live.register().await;
+    let (wait, id) = live.login(&client).await;
+    // Pending: a request exists, signed by its own key, with nothing granted anywhere.
+    let app = apps::find(&live.cfg.state_dir, &id).unwrap();
+    assert_eq!(
+        (app.state, app.agent.as_str()),
+        (apps::State::Pending, "claude-ai-owner")
+    );
+    for route in &live.fleet.routes {
+        let roster = ferryman_channel::read_agent_roster(&route.communications).unwrap();
+        assert!(!roster.iter().any(|a| a.name == app.agent));
+    }
+    // The page keeps waiting, and says how to approve.
+    for _ in 0..2 {
+        let still = live.wait(&wait).await;
+        assert_eq!(still.status(), 200);
+        let body = still.text().await.unwrap();
+        assert!(body.contains("ferry mcp apps approve") && !body.contains("fmcp_code"));
+    }
+    // Garbage and spent wait tokens lead nowhere.
+    assert_eq!(live.wait("nope").await.status(), 400);
+    // The owner refuses: the app is sent access_denied and holds no key.
+    let mut record = apps::find(&live.cfg.state_dir, &id).unwrap();
+    apps::deny(&live.cfg.state_dir, &mut record, oauth::unix_now()).unwrap();
+    let refused = live.wait(&wait).await;
+    assert_eq!(refused.status(), 302);
+    let query = query_of(&refused);
+    assert_eq!(query["error"], "access_denied");
+    assert_eq!(query["state"], "st4te");
+    assert!(!query.contains_key("code"));
+    assert!(apps::load_key(&live.cfg.state_dir, &app.agent).is_none());
+    assert_eq!(live.wait(&wait).await.status(), 400);
+
+    // Too slow: a login nobody approved in ten minutes is refused, not left open.
+    let (late, id) = live.login(&client).await;
+    live.app.waiting().get_mut(&late).unwrap().created -= apps::PENDING_SECS + 1;
+    let slow = live.wait(&late).await;
+    assert_eq!(slow.status(), 302);
+    assert_eq!(query_of(&slow)["error"], "access_denied");
+    assert_eq!(
+        apps::find(&live.cfg.state_dir, &id).unwrap().state,
+        apps::State::Denied
+    );
+}
+
+#[tokio::test]
+async fn each_app_speaks_as_its_own_identity_with_its_own_level() {
+    let live = start_apps().await;
+    let claude = live.register().await;
+    let chatgpt = live.register_as("ChatGPT", LOOPBACK).await;
+
+    // Claude is approved as a Worker everywhere; ChatGPT as a Member in beta only.
+    let (wait, id) = live.login(&claude).await;
+    live.approve(&id, Level::Worker, &[]);
+    let code = query_of(&live.wait(&wait).await)["code"].clone();
+    let worker = live.tokens(&claude, &code).await;
+    let (wait, id) = live.login_to(&chatgpt, LOOPBACK).await;
+    live.approve(&id, Level::Member, &["beta".to_string()]);
+    let code = query_of(&live.wait(&wait).await)["code"].clone();
+    let member = live.tokens_for(&chatgpt, &code, LOOPBACK).await;
+    assert_eq!(worker["scope"], "ferry:read");
+    assert_eq!(member["scope"], "ferry:read ferry:write");
+    let (worker, member) = (
+        worker["access_token"].as_str().unwrap().to_string(),
+        member["access_token"].as_str().unwrap().to_string(),
+    );
+
+    // Two identities, two names, two keys that are not the machine's.
+    let a = live.call(&worker, "ferry_join", json!({})).await;
+    let b = live.call(&member, "ferry_join", json!({})).await;
+    assert_eq!(a["structuredContent"]["agent"], "claude-ai-owner");
+    assert_eq!(b["structuredContent"]["agent"], "chatgpt-owner");
+    assert_eq!(
+        levels(&a),
+        [
+            pair("alpha", "worker"),
+            pair("beta", "worker"),
+            pair("gamma", "worker")
+        ]
+    );
+    // Only where the master signed it: ChatGPT sees beta and nothing else.
+    assert_eq!(levels(&b), [pair("beta", "member")]);
+    let apps_now = apps::list(&live.cfg.state_dir);
+    assert_eq!(apps_now.len(), 2);
+    assert_ne!(apps_now[0].public_key, apps_now[1].public_key);
+    assert!(
+        apps_now
+            .iter()
+            .all(|a| a.level != Some(Level::Orchestrator))
+    );
+
+    // The levels hold at the tools: the Worker cannot create an order, the Member can post,
+    // signed as itself.
+    let post = |project: &str| json!({ "project": project, "action": "post", "to": "owner", "text": "hello" });
+    let make = json!({ "project": "beta", "action": "create", "title": "something to do" });
+    let refused = live.call(&worker, "ferry_orders", make).await;
+    assert_eq!(refused["isError"], true, "{refused}");
+    assert_eq!(refused["structuredContent"]["error"], "denied");
+    let sent = live.call(&member, "ferry_talk", post("beta")).await;
+    assert_eq!(sent["isError"], false, "{sent}");
+    let elsewhere = live.call(&member, "ferry_talk", post("alpha")).await;
+    assert_eq!(elsewhere["isError"], true);
+    // The app that took a seat in beta is who the ledger names.
+    let beta = &live.fleet.routes[1];
+    let messages = ferryman_channel::list_messages(beta).unwrap_or_default();
+    assert!(
+        messages.iter().any(|m| m.sender == "chatgpt-owner"),
+        "{messages:?}"
+    );
+
+    // Usage is counted per app.
+    let seen = apps_now
+        .iter()
+        .find(|a| a.agent == "chatgpt-owner")
+        .map(|a| apps::usage(&live.cfg.state_dir, &a.id))
+        .unwrap();
+    assert!(seen.calls >= 3 && seen.last_used > 0, "{seen:?}");
+}
+
+#[tokio::test]
+async fn revoking_an_app_ends_every_token_at_once_and_removes_everything() {
+    let live = start_apps().await;
+    let client = live.register().await;
+    let code = live.authorize(&client).await;
+    let first = live.tokens(&client, &code).await;
+    let (access, refresh) = (
+        first["access_token"].as_str().unwrap().to_string(),
+        first["refresh_token"].as_str().unwrap().to_string(),
+    );
+    // A second session of the same login, so there is more than one token to kill.
+    let rotated = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &client),
+            ],
+        )
+        .await
+        .json::<Value>()
+        .await
+        .unwrap();
+    let (access2, refresh2) = (
+        rotated["access_token"].as_str().unwrap().to_string(),
+        rotated["refresh_token"].as_str().unwrap().to_string(),
+    );
+    assert_eq!(live.ping(&access).await, 200);
+    assert_eq!(live.ping(&access2).await, 200);
+    let app = apps::list(&live.cfg.state_dir).remove(0);
+    assert!(apps::load_key(&live.cfg.state_dir, &app.agent).is_some());
+
+    // The owner revokes it from the terminal (the dashboard calls the same function).
+    let mut record = apps::find(&live.cfg.state_dir, &app.id).unwrap();
+    let done = apps::revoke(
+        &live.cfg.state_dir,
+        &mut record,
+        &live.fleet.routes,
+        &apps::master_key_here,
+        oauth::unix_now(),
+    )
+    .unwrap();
+    assert!(done.key_deleted);
+    assert_eq!(done.signed, ["alpha", "beta", "gamma"]);
+
+    // The server needs no restart: every token is dead at its next request.
+    assert_eq!(live.ping(&access).await, 401);
+    assert_eq!(live.ping(&access2).await, 401);
+    let again = live
+        .form(
+            "/token",
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh2),
+                ("client_id", &client),
+            ],
+        )
+        .await;
+    assert_eq!(again.status(), 400);
+    assert_eq!(
+        again.json::<Value>().await.unwrap()["error"],
+        "invalid_grant"
+    );
+    // Key gone, grant signed down, revocation recorded by the master.
+    assert!(apps::load_key(&live.cfg.state_dir, &app.agent).is_none());
+    for route in &live.fleet.routes {
+        assert_eq!(
+            access::level_of(&route.communications, &route.project_id, &app.agent),
+            Level::Worker
+        );
+        assert!(ferryman_channel::master::is_revoked(route, &app.agent).unwrap());
+    }
+    // And it cannot come back by itself: the same login makes a new identity.
+    let (_, id) = live.login(&client).await;
+    assert_ne!(
+        apps::find(&live.cfg.state_dir, &id).unwrap().agent,
+        app.agent
+    );
+}
+
+#[tokio::test]
+async fn the_revoke_endpoint_follows_rfc_7009() {
+    let live = start_apps().await;
+    let client = live.register().await;
+    let other = live.register().await;
+    let code = live.authorize(&client).await;
+    let issued = live.tokens(&client, &code).await;
+    let (access, refresh) = (
+        issued["access_token"].as_str().unwrap().to_string(),
+        issued["refresh_token"].as_str().unwrap().to_string(),
+    );
+    let app = apps::list(&live.cfg.state_dir).remove(0);
+
+    // Missing pieces are invalid_request; another client's token is invalid_client and
+    // survives; an unknown token is a plain 200.
+    let missing = live.form("/revoke", &[("client_id", &client)]).await;
+    assert_eq!(missing.status(), 400);
+    assert_eq!(
+        missing.json::<Value>().await.unwrap()["error"],
+        "invalid_request"
+    );
+    let stolen = live
+        .form("/revoke", &[("token", &refresh), ("client_id", &other)])
+        .await;
+    assert_eq!(stolen.status(), 400);
+    assert_eq!(
+        stolen.json::<Value>().await.unwrap()["error"],
+        "invalid_client"
+    );
+    assert_eq!(live.ping(&access).await, 200);
+    let unknown = live
+        .form(
+            "/revoke",
+            &[("token", "fmcp_rt_nothing"), ("client_id", &client)],
+        )
+        .await;
+    assert_eq!(unknown.status(), 200);
+    assert_eq!(live.ping(&access).await, 200);
+
+    // Revoking the refresh token ends the session, the access token with it, and (it being
+    // the app's only session) the app: its key is deleted and the owner's list says revoked.
+    let ended = live
+        .form(
+            "/revoke",
+            &[
+                ("token", &refresh),
+                ("client_id", &client),
+                ("token_type_hint", "refresh_token"),
+            ],
+        )
+        .await;
+    assert_eq!(ended.status(), 200);
+    assert_eq!(live.ping(&access).await, 401);
+    let after = apps::find(&live.cfg.state_dir, &app.id).unwrap();
+    assert_eq!(after.state, apps::State::Revoked);
+    assert!(apps::load_key(&live.cfg.state_dir, &app.agent).is_none());
+    for route in &live.fleet.routes {
+        assert!(ferryman_channel::master::is_revoked(route, &app.agent).unwrap());
+    }
+    // Revoking again is still a success.
+    let twice = live
+        .form("/revoke", &[("token", &refresh), ("client_id", &client)])
+        .await;
+    assert_eq!(twice.status(), 200);
+}
+
+#[tokio::test]
+async fn without_the_master_key_here_the_app_waits_for_a_grant_signed_elsewhere() {
+    let live = start_apps().await;
+    let client = live.register().await;
+    let (wait, id) = live.login(&client).await;
+    // This machine cannot sign: the approval signs nothing and the request stays signed.
+    let mut app = apps::find(&live.cfg.state_dir, &id).unwrap();
+    let report = apps::approve(
+        &live.cfg.state_dir,
+        &mut app,
+        Level::Worker,
+        &[],
+        &live.fleet.routes,
+        &|_: &ProjectRoute| None,
+        oauth::unix_now(),
+    )
+    .unwrap();
+    assert!(report.signed.is_empty());
+    assert_eq!(live.wait(&wait).await.status(), 200);
+    // The master, on another machine, takes the request and signs the grant, which syncs back.
+    let there = tempfile::tempdir().unwrap();
+    let mut taken =
+        apps::import(there.path(), &apps::request_file(&live.cfg.state_dir, &id)).unwrap();
+    apps::approve(
+        there.path(),
+        &mut taken,
+        Level::Worker,
+        &[],
+        &live.fleet.routes,
+        &apps::master_key_here,
+        oauth::unix_now(),
+    )
+    .unwrap();
+    // The waiting browser now gets its code, with nothing done at this machine's terminal.
+    let released = live.wait(&wait).await;
+    assert_eq!(released.status(), 302);
+    let code = query_of(&released)["code"].clone();
+    let issued = live.tokens(&client, &code).await;
+    assert_eq!(
+        live.ping(issued["access_token"].as_str().unwrap()).await,
+        200
+    );
 }

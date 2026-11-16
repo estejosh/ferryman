@@ -12,6 +12,7 @@
 //! Token rules T1-T10 are enforced by the `mcp_budget` test in `mcp_agent_tests.rs`.
 
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Utc};
@@ -878,6 +879,9 @@ pub struct Agent {
     pub admin: bool,
     /// The guide has been sent with a `ferry_join` already.
     pub guided: std::sync::atomic::AtomicBool,
+    /// The keystore of a connected app (ADR 0031): where this identity's key lives when it
+    /// is not an agent of this machine. `None` for every ordinary agent.
+    pub keys: Option<PathBuf>,
 }
 
 impl Agent {
@@ -897,7 +901,19 @@ impl Agent {
             me,
             admin,
             guided: std::sync::atomic::AtomicBool::new(false),
+            keys: None,
         })
+    }
+
+    /// This identity's key: the attachment's, or else the connected-app keystore.
+    fn key(&self) -> Option<AgentIdentity> {
+        AgentIdentity::load_existing(&self.me, &self.route.attachment)
+            .ok()
+            .flatten()
+            .or_else(|| {
+                let keys = self.keys.as_ref()?;
+                AgentIdentity::load_existing(&self.me, keys).ok().flatten()
+            })
     }
 
     /// Is `--as <name>` an agent this machine actually holds the key for, seated on the
@@ -905,8 +921,7 @@ impl Agent {
     /// this is true every tool but `ferry_join` refuses, and nothing is registered here.
     #[must_use]
     pub fn seated(&self) -> bool {
-        let Ok(Some(identity)) = AgentIdentity::load_existing(&self.me, &self.route.attachment)
-        else {
+        let Some(identity) = self.key() else {
             return false;
         };
         self.route().agents.iter().any(|a| {
@@ -977,9 +992,9 @@ impl Agent {
     }
 
     fn identity(&self) -> Result<AgentIdentity> {
-        match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
-            Ok(Some(identity)) => Ok(identity),
-            _ => Err(refusal(
+        match self.key() {
+            Some(identity) => Ok(identity),
+            None => Err(refusal(
                 "locked",
                 format!(
                     "no usable key for '{}' on this machine. Ask the owner to seat it: dashboard, Agents",
@@ -1255,12 +1270,16 @@ impl Agent {
         let route = self.route();
         let granted = self.seated();
         if !granted {
-            let note = match AgentIdentity::load_existing(&self.me, &self.route.attachment) {
-                Ok(Some(_)) => format!(
+            let note = match self.key() {
+                Some(_) => format!(
                     "'{}' is not seated: it has a key here but is not on this project's roster. Tell the human: ask the owner to seat it in the Ferryman dashboard (Agents)",
                     self.me
                 ),
-                _ => format!(
+                None if self.keys.is_some() => format!(
+                    "'{}' is not seated: this app has no approved key yet. Tell the human: approve it on the machine that runs the server (`ferry mcp apps approve`, or the dashboard, Agents), then reconnect. Until then this app can read nothing and write nothing",
+                    self.me
+                ),
+                None => format!(
                     "'{}' is not seated: it has no key on this machine yet. Restart this server (it seats itself on start), or tell the human to seat it in the Ferryman dashboard (Agents). Until then this app can read nothing and write nothing",
                     self.me
                 ),
@@ -2747,27 +2766,6 @@ pub fn seat_app(route: &ProjectRoute, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The projects `name` is, or would be, seated in, with the level it has or would get (a
-/// Worker). For showing a person what they are connecting before anything is written.
-#[must_use]
-pub fn app_seats(name: &str, source: &RouteSource) -> Vec<(String, Level)> {
-    source()
-        .into_iter()
-        .filter(|route| {
-            let master = ferryman_channel::master::read_master(route).ok().flatten();
-            !master.is_some_and(|m| is_me(&m.master, name))
-        })
-        .map(|route| {
-            let level = match Agent::new(route.clone(), name, false) {
-                Ok(agent) if agent.seated() => agent.level(),
-                _ => Level::Worker,
-            };
-            (route.project_id, level)
-        })
-        .filter(|(_, level)| *level != Level::Orchestrator)
-        .collect()
-}
-
 /// Seat `name` in every project `source` offers. Returns how many it is now seated in.
 pub fn seat_everywhere(name: &str, source: &RouteSource) -> usize {
     source()
@@ -2823,15 +2821,7 @@ pub type RouteSource = std::sync::Arc<dyn Fn() -> Vec<ProjectRoute> + Send + Syn
 /// be read here.
 #[must_use]
 pub fn root_routes() -> Vec<ProjectRoute> {
-    let Some(root) = ferryman_channel::ferry::find_root() else {
-        return Vec::new();
-    };
-    root.read()
-        .projects
-        .iter()
-        .filter(|entry| !entry.is_archived())
-        .filter_map(|entry| entry.route(&root).ok().map(|(route, _)| route))
-        .collect()
+    ferryman_channel::apps::live_routes()
 }
 
 /// One identity across many projects. The per-project checks are the single-project
@@ -2843,6 +2833,8 @@ pub struct AllProjects {
     pub admin: bool,
     /// Served over HTTP to a cloud app: only Worker and Member seats are offered.
     pub remote: bool,
+    /// A connected app's keystore (ADR 0031), when this identity is one.
+    keys: Option<PathBuf>,
     source: RouteSource,
     /// The guide has been sent with a join already.
     guided: std::sync::atomic::AtomicBool,
@@ -2855,9 +2847,23 @@ impl AllProjects {
             me: ferryman_channel::canonical_agent_name(me),
             admin,
             remote,
+            keys: None,
             source,
             guided: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// This identity is a connected app whose key lives in `keys`.
+    #[must_use]
+    pub fn with_keys(mut self, keys: PathBuf) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    fn agent(&self, route: ProjectRoute) -> Result<Agent> {
+        let mut agent = Agent::new(route, &self.me, self.admin)?;
+        agent.keys.clone_from(&self.keys);
+        Ok(agent)
     }
 
     /// The projects this identity is seated in, with its level in each.
@@ -2867,7 +2873,7 @@ impl AllProjects {
             .into_iter()
             .filter_map(|route| {
                 // The master identity is refused here too (Agent::new).
-                let agent = Agent::new(route.clone(), &self.me, self.admin).ok()?;
+                let agent = self.agent(route.clone()).ok()?;
                 if !agent.seated() {
                     return None;
                 }
@@ -2923,7 +2929,7 @@ impl AllProjects {
             return Err(bad(format!("unknown tool: {name}")));
         }
         let (route, _) = self.pick(&open, project.as_deref())?;
-        let agent = Agent::new(route, &self.me, self.admin)?;
+        let agent = self.agent(route)?;
         // The guide goes out once per connection, not once per project.
         if self.guided.load(std::sync::atomic::Ordering::Relaxed) {
             agent
@@ -3046,7 +3052,7 @@ impl AllProjects {
             .and_then(|rest| rest.split('/').next())
             .unwrap_or("");
         let (route, _) = self.pick(&self.open(), Some(project))?;
-        Agent::new(route, &self.me, self.admin)?.read_resource(uri)
+        self.agent(route)?.read_resource(uri)
     }
 }
 
