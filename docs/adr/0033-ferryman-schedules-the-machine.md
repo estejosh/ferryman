@@ -49,12 +49,29 @@ none of them, so the scheduler must work with only Ferryman installed.
    - Long-lived servers are *tenants*: Ferryman starts them when a grant needs them and stops
      them when idle past a timeout.
    - `ferry sched status` prints each lane's grants, queue and current pressure.
+   - **Outside scripts ask first.** A script that starts its own server or job runs it through
+     `ferry run --lane gpu --vram MB -- <cmd>`. Where the script must keep control, the sugar
+     `ferry gpu acquire --vram MB` blocks until granted and `ferry gpu release` hands the grant
+     back. Both are thin wrappers over the same lane queue, not a second path.
+   - **No-kill rule.** A running job is never killed or preempted by the scheduler. A tenant
+     (long-lived server) is stopped only when it is idle. The card is never granted to a second
+     job while the first job's process is alive, whatever its grant says: release is judged by
+     the process, not by the paperwork.
 
 4. **One priority order.** The dispatcher score orders the queue on every machine: focus,
-   unblocks, review first, age, sent-back penalty, pressure. The master can bump an item;
-   nothing else jumps the queue. Open question: `focus_suggest.rs` already has a `score`, but it
-   ranks suggestions, not the queue. The shared dispatcher score has to be written new or pulled
-   out of there. Decide in the first slice.
+   unblocks, review first, age, sent-back penalty, pressure. The score is settled here, so the
+   GPU lane builds on it unchanged:
+   - **Aging.** An item's score rises with its wait time, without a ceiling below the top of the
+     queue, so a waiting item always reaches the front eventually. No item starves, including a
+     big-VRAM job behind many small ones. While such a job is first in line, a smaller job in the
+     same lane starts ahead of it only if it fits in what is free now and does not delay the
+     head job past the aging bound; otherwise the lane holds the resources for the head job.
+   - **Bump.** Only the master may reorder, with `ferry sched bump <id>` (master key required;
+     any other signer is refused). A bump moves one item to the front of its lane and is recorded
+     as a signed entry in the channel (who, item, time, reason). Nothing else jumps the queue.
+   - Open question: `focus_suggest.rs` has a `score`, but it ranks suggestions, not the queue.
+     The shared function is written new or pulled out of there in slice 1; the rules above hold
+     either way.
 
 5. **Generic by construction.** No machine, project, tool or provider name in code, defaults or
    tests. Every new command gets a doc page and tests on Linux and Windows. macOS tests may be
