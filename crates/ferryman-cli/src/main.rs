@@ -5,6 +5,7 @@ mod fleethome;
 mod fleetsetup;
 mod focus;
 mod gitanchor;
+mod gpu;
 mod hive;
 mod lane;
 mod lanes;
@@ -540,6 +541,12 @@ enum Command {
     License {
         #[command(subcommand)]
         command: License,
+    },
+    /// The machine's one line for the GPU: run a command with the card, hand it to a script
+    /// that starts its own server, see who holds it and who waits.
+    Gpu {
+        #[command(subcommand)]
+        command: gpu::GpuCommand,
     },
     /// Tell the operator something, through Ferryman: `info` goes into the day's digest,
     /// `act` and `urgent` to the operator's chat once. Tools use this instead of messaging
@@ -5107,6 +5114,12 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Command::License { command } => license_command(command).await?,
         Command::Notify { command } => notify::command(command)?,
+        Command::Gpu { command } => {
+            let code = gpu::command(command)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Command::Telegram {
             agent,
             comms,
@@ -8491,6 +8504,15 @@ async fn run_fleet(
         }
         _ => None,
     };
+    // The gpu lane is the machine's, so the all-projects worker keeps it turning.
+    let gpu_lane = if serving_everywhere {
+        ferryman_channel::ferry::find_root()
+            .and_then(|root| ferryman_ops::gpu::GpuConfig::load(&root.path).ok())
+            .zip(ferryman_ops::gpu::state_dir())
+            .map(|(config, dir)| ferryman_ops::gpu::Gpu::new(dir, config))
+    } else {
+        None
+    };
     // Notices tools hand in for the operator: the all-projects worker delivers them.
     let mut notices_pass = if serving_everywhere {
         notify::NoticesPass::for_worker(report)
@@ -8661,6 +8683,18 @@ async fn run_fleet(
         }
         if let Some(notices) = notices_pass.as_mut() {
             notices.pass(report).await;
+        }
+        // The gpu lane: stop idle tenant servers and take back grants whose holder is gone,
+        // even when nobody is asking for the card.
+        if let Some(lane) = gpu_lane.as_ref() {
+            match tokio::task::block_in_place(|| lane.step()) {
+                Ok(problems) => {
+                    for problem in problems {
+                        report.warn(&format!("gpu lane: {problem}"));
+                    }
+                }
+                Err(error) => report.warn(&format!("gpu lane: {error:#}")),
+            }
         }
 
         // The projects the fleet is focused on are looked at first, then the rest,
