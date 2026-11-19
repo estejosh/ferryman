@@ -8260,6 +8260,64 @@ fn keep_syncthing_up(report: &impl ferryman_ops::Progress) {
 /// asks again whether the project is still one it may work in.
 /// What an `--all-projects` worker needs to ask, every pass, which projects have become
 /// open to it since it started: the root, where its key and `agent.toml` are, and the
+/// Before the all-projects worker starts: wait while the folders it works from are not
+/// there (a drive that did not mount at boot), saying so plainly once, instead of failing
+/// and being restarted over and over. The operator hears of it through `ferry notify`, and
+/// again when it is back; every machine's iroh lane also raises it on the peers.
+fn wait_for_storage(paths: &[Option<PathBuf>]) {
+    let missing = |paths: &[Option<PathBuf>]| -> Option<PathBuf> {
+        paths.iter().flatten().find(|path| !path.exists()).cloned()
+    };
+    let Some(first) = missing(paths) else {
+        return;
+    };
+    let since = std::time::Instant::now();
+    let tell = |state: &str, text: String| {
+        if let Some(dir) = ferryman_channel::notices::dir() {
+            let _ = ferryman_channel::notices::submit(
+                &dir,
+                &ferryman_channel::notices::Notice {
+                    source: "worker".into(),
+                    subject: "storage".into(),
+                    state: state.into(),
+                    level: ferryman_channel::notices::Level::Urgent,
+                    text,
+                    at: chrono::Utc::now(),
+                },
+            );
+        }
+    };
+    let machine = ferryman_ops::identity::machine_name().unwrap_or_else(|_| "this machine".into());
+    eprintln!(
+        "{} is not there (a drive that did not mount?). The worker waits for it and starts when it is back.",
+        first.display()
+    );
+    tell(
+        "missing",
+        format!(
+            "{machine}: {} is missing, so no project can be worked there. Usually a drive that did not mount at boot.",
+            first.display()
+        ),
+    );
+    let mut last_said = std::time::Instant::now();
+    while let Some(still) = missing(paths) {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        if last_said.elapsed() >= std::time::Duration::from_secs(600) {
+            eprintln!("still waiting for {}", still.display());
+            last_said = std::time::Instant::now();
+        }
+    }
+    let minutes = since.elapsed().as_secs() / 60;
+    eprintln!("{} is back after {minutes} min; starting", first.display());
+    tell(
+        "back",
+        format!(
+            "{machine}: {} is back after {minutes} min; work resumes.",
+            first.display()
+        ),
+    );
+}
+
 /// config it started with (before any project's own rules were laid over it).
 struct Reevaluate {
     root: ferryman_channel::ferry::Root,
@@ -8941,6 +8999,13 @@ async fn agent_command(command: Agent) -> Result<()> {
             all_projects: true,
             allow_second_worker,
         } => {
+            if !dry_run {
+                wait_for_storage(&[
+                    workspace.clone(),
+                    comms.clone(),
+                    ferryman_channel::ferry::recorded_root(),
+                ]);
+            }
             let home = route_for(workspace)?;
             let config = agent::AgentConfig::load(&home.attachment)?;
             let root = match &comms {
@@ -14706,6 +14771,15 @@ mod live_pickup_tests;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_worker_whose_storage_is_there_starts_at_once() {
+        let here = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        super::wait_for_storage(&[Some(here.path().to_path_buf()), None]);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
     use super::{plausible_email, slug_of};
     use std::path::Path;
 

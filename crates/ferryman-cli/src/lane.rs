@@ -688,9 +688,15 @@ impl LiveLane {
                         "iroh lane alert: {} - {}",
                         alert.title, alert.text
                     ));
+                    lane_notice(
+                        &alert.key,
+                        "down",
+                        &format!("{}: {}", alert.title, alert.text),
+                    );
                 }
                 ferryman_channel::lanealerts::Transition::Cleared(alert) => {
                     report.info(&format!("iroh lane recovered: {}", alert.title));
+                    lane_notice(&alert.key, "ok", &format!("{}: working again", alert.title));
                 }
             }
         }
@@ -701,6 +707,26 @@ impl LiveLane {
             post_lane_health(&state.active, report);
         }
     }
+}
+
+/// Hand a lane alert to Ferryman's notices, so the operator hears of a peer that stopped
+/// syncing (machine off, worker stopped, storage missing) once, and of its return as an
+/// edit of the same message. Best effort: the lane never stops over a notice.
+fn lane_notice(key: &str, state: &str, text: &str) {
+    let Some(dir) = ferryman_channel::notices::dir() else {
+        return;
+    };
+    let _ = ferryman_channel::notices::submit(
+        &dir,
+        &ferryman_channel::notices::Notice {
+            source: "iroh-lane".into(),
+            subject: key.into(),
+            state: state.into(),
+            level: ferryman_channel::notices::Level::Act,
+            text: text.into(),
+            at: chrono::Utc::now(),
+        },
+    );
 }
 
 /// How this machine's iroh lane carries one channel.
