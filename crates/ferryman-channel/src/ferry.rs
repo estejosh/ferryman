@@ -1984,7 +1984,27 @@ fn root_pointer() -> Option<PathBuf> {
     crate::licensing::machine_state_dir().map(|dir| dir.join("ferry-root"))
 }
 
+/// The root this machine recorded, whether or not it is there right now (a drive that
+/// did not mount at boot leaves the pointer naming a path that does not exist).
+#[must_use]
+pub fn recorded_root() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(root_pointer()?).ok()?;
+    let path = PathBuf::from(text.trim());
+    (!path.as_os_str().is_empty()).then_some(path)
+}
+
 fn remember_root(path: &Path) {
+    // A root made under the temp folder is a test's, never the machine's. Tests of the
+    // crates that depend on this one link it without cfg(test), so a `cargo test` run on a
+    // fleet machine used to point that machine's root at a deleted temp dir (beastly and
+    // grouchly, 2026-11): `ferry where` then failed everywhere outside the root.
+    // Unless this machine's state is itself a test's (under the temp folder too): then the
+    // pointer is the test's own and remembering is the point.
+    let state_is_a_tests =
+        crate::licensing::machine_state_dir().is_some_and(|dir| is_temporary(&dir));
+    if is_temporary(path) && !state_is_a_tests {
+        return;
+    }
     if let Some(pointer) = root_pointer() {
         if let Some(parent) = pointer.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2042,6 +2062,13 @@ pub fn find_root() -> Option<Root> {
     looks_like_root(&path).then_some(Root { path })
 }
 
+/// Whether a path lies under the system temp folder.
+fn is_temporary(path: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon(path).starts_with(canon(&temp)) || path.starts_with(&temp)
+}
+
 /// Whether a directory is a ferry root.
 ///
 /// The manifest marks one, but the LAYOUT is enough on its own. Deleting `.ferry` was
@@ -2077,6 +2104,12 @@ mod tests {
 
     fn root(dir: &Path) -> Root {
         Root::create_with_layout(&dir.join("ferry"), 1).unwrap()
+    }
+
+    #[test]
+    fn a_root_under_the_temp_folder_is_never_remembered_as_the_machines() {
+        assert!(is_temporary(&std::env::temp_dir().join("x").join("ferry")));
+        assert!(!is_temporary(Path::new("/srv/ferry")));
     }
 
     fn root_v2(dir: &Path) -> Root {
