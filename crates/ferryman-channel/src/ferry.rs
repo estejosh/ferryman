@@ -1984,15 +1984,6 @@ fn root_pointer() -> Option<PathBuf> {
     crate::licensing::machine_state_dir().map(|dir| dir.join("ferry-root"))
 }
 
-/// The root this machine recorded, whether or not it is there right now (a drive that
-/// did not mount at boot leaves the pointer naming a path that does not exist).
-#[must_use]
-pub fn recorded_root() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(root_pointer()?).ok()?;
-    let path = PathBuf::from(text.trim());
-    (!path.as_os_str().is_empty()).then_some(path)
-}
-
 fn remember_root(path: &Path) {
     // A root made under the temp folder is a test's, never the machine's. Tests of the
     // crates that depend on this one link it without cfg(test), so a `cargo test` run on a
