@@ -9000,11 +9000,9 @@ async fn agent_command(command: Agent) -> Result<()> {
             allow_second_worker,
         } => {
             if !dry_run {
-                wait_for_storage(&[
-                    workspace.clone(),
-                    comms.clone(),
-                    ferryman_channel::ferry::recorded_root(),
-                ]);
+                // Only the folders this worker was told to use: the remembered root can be stale
+                // (a test once pointed it at a deleted temp folder, and the worker waited on it).
+                wait_for_storage(&[workspace.clone(), comms.clone()]);
             }
             let home = route_for(workspace)?;
             let config = agent::AgentConfig::load(&home.attachment)?;
