@@ -1576,6 +1576,12 @@ async fn run_agent(
         }
         None => (binary, args),
     };
+    // An order that says it needs the GPU waits in the machine's gpu line and holds the
+    // grant until its run ends (`gpu`).
+    let _gpu_grant = match &heartbeat {
+        Some(beat) => crate::gpu::hold_for_order(&beat.route, &beat.order_id).await?,
+        None => None,
+    };
     for warning in mount_warnings(workspace) {
         tracing::warn!("{warning}");
     }
