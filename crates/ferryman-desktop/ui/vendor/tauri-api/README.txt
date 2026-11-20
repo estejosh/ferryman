@@ -1,0 +1,1 @@
+@tauri-apps/api 2.12.4 (npm), core.js and its one import (tslib.es6.js), unmodified. Vendored because the setup screen has no bundler. License: MIT or Apache-2.0 (LICENSE-MIT here). Update by re-copying these files from the same package version as the tauri crate.

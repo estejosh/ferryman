@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "setup-screen",
+  "description": "The bundled 'no Ferryman found' screen, and only that. The dashboard window is a remote page on a loopback port and is deliberately granted nothing: no capability names it, so it has no IPC.",
+  "windows": ["setup"],
+  "permissions": ["core:default"]
+}
