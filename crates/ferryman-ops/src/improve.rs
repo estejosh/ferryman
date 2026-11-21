@@ -1487,6 +1487,27 @@ pub async fn plan(
         hold(route, config, Role::Plan, &week, &why, report);
         return Ok(PlanOutcome::Held(why));
     }
+    // Self-improve adds nothing while too much already waits for someone to read it. The
+    // verifications above still go out; only new improvements wait. Recorded each run it
+    // stays held, which is one step an hour while it is.
+    let waiting = awaiting_review(route, now);
+    if let Some(why) = held_for_review(waiting, policy.waiting_cap()) {
+        note_step(
+            route,
+            config,
+            &week,
+            "plan",
+            Some(Role::Plan),
+            None,
+            None,
+            &why,
+        );
+        report.warn(&format!(
+            "  {}: {why}; planning nothing new",
+            route.project_id
+        ));
+        return Ok(PlanOutcome::Held(why));
+    }
     let (answer, engine, judged, cost, plan_route) = match ask_best(
         route,
         config,
@@ -1585,6 +1606,23 @@ pub async fn plan(
 }
 
 // --- review -----------------------------------------------------------------------------
+
+/// Hand-ins in this project waiting for someone to review them.
+fn awaiting_review(route: &ProjectRoute, now: DateTime<Utc>) -> usize {
+    ferryman_channel::list_tasks(route)
+        .unwrap_or_default()
+        .iter()
+        .filter(|task| matches!(task.state_at(now), TaskState::AwaitingReview { .. }))
+        .count()
+}
+
+/// Why a plan is held: more hand-ins wait for review than the policy allows. `None` when
+/// the queue is at or under the limit, so the plan goes ahead.
+#[must_use]
+pub fn held_for_review(waiting: usize, cap: usize) -> Option<String> {
+    (waiting > cap)
+        .then(|| format!("held: {waiting} hand-ins waiting for review (the limit is {cap})"))
+}
 
 fn awaiting_improvement_review(route: &ProjectRoute) -> bool {
     ferryman_channel::list_tasks(route)
@@ -2517,6 +2555,13 @@ pub fn hourly_due(now: DateTime<Utc>) -> bool {
 mod tests {
     use super::*;
     use crate::engines::{EngineSpec, Kind, Paid};
+
+    #[test]
+    fn six_waiting_holds_the_plan_and_five_does_not() {
+        assert!(held_for_review(6, 5).is_some_and(|why| why.contains("6 hand-ins")));
+        assert_eq!(held_for_review(5, 5), None);
+        assert_eq!(held_for_review(0, 5), None);
+    }
 
     const PLAN: &str = r#"Here is the plan.
 {"improvements": [

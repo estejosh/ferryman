@@ -50,8 +50,12 @@ pub const ORDERS: &str = "orders";
 pub const REVIEW: &str = "review";
 /// Switch self-improve on or off, and answer the improve loop's questions.
 pub const IMPROVE: &str = "improve";
+/// Give the second key for an improvement whose diff only touches docs, tests or
+/// dependency versions (see [`crate::gate::minor_approval`]). Anything else still needs the
+/// master.
+pub const IMPROVE_MINOR: &str = "improve:minor";
 /// Every scope there is. Nothing outside this list can be delegated.
-pub const SCOPES: &[&str] = &[ORDERS, REVIEW, IMPROVE];
+pub const SCOPES: &[&str] = &[ORDERS, REVIEW, IMPROVE, IMPROVE_MINOR];
 
 const DIR: &str = "delegations";
 

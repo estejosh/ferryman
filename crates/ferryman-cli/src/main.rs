@@ -3169,6 +3169,8 @@ enum ImproveCommand {
     },
     /// Approve an improvement for live - the second key, after the review engine's.
     /// Nothing merges: it becomes "approved, ready to merge", and merging stays yours.
+    /// With `--as <head>`, the head gives the key under its `improve:minor` delegation:
+    /// only for docs, tests and dependency bumps; anything else still needs the master.
     Approve {
         /// The order id, e.g. improve-2026-w40-1.
         id: String,
@@ -3176,6 +3178,9 @@ enum ImproveCommand {
         project: Option<String>,
         #[arg(long, conflicts_with = "project")]
         workspace: Option<PathBuf>,
+        /// The delegate signing the key, in place of the master.
+        #[arg(long = "as", value_name = "HEAD")]
+        signer: Option<String>,
     },
     /// Send an improvement back with what to change.
     SendBack {
@@ -3189,13 +3194,15 @@ enum ImproveCommand {
     },
 }
 
-/// Sign the master's decision on an improvement, as its master.
+/// Sign the master's decision on an improvement, as its master - or, with `signer`, as
+/// that delegate, who may only approve what their delegation covers.
 fn improve_decide(
     id: &str,
     project: Option<String>,
     workspace: Option<PathBuf>,
     accept: bool,
     notes: Option<&str>,
+    signer: Option<&str>,
 ) -> Result<()> {
     let (project, channel, attachment) = improve_project(&ImproveProject {
         project,
@@ -3205,7 +3212,7 @@ fn improve_decide(
     let Some(master) = ferryman_channel::ferry::master_of(&channel)? else {
         bail!("{project} has no master, and only its master approves an improvement for live");
     };
-    let identity = signing_identity_in(&attachment, &master)?;
+    let identity = signing_identity_in(&attachment, signer.unwrap_or(&master))?;
     let route = ferryman_channel::route_for(&channel)?;
     let revision = ferryman_channel::gate::decide(&route, id, accept, notes, &master, &identity)?;
     if accept {
@@ -4114,13 +4121,14 @@ async fn improve_command(command: ImproveCommand) -> Result<()> {
             id,
             project,
             workspace,
-        } => improve_decide(&id, project, workspace, true, None)?,
+            signer,
+        } => improve_decide(&id, project, workspace, true, None, signer.as_deref())?,
         ImproveCommand::SendBack {
             id,
             notes,
             project,
             workspace,
-        } => improve_decide(&id, project, workspace, false, Some(&notes))?,
+        } => improve_decide(&id, project, workspace, false, Some(&notes), None)?,
     }
     Ok(())
 }

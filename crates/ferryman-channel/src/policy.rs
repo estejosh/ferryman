@@ -481,6 +481,11 @@ pub struct Policy {
     /// Left out of the signed JSON when advisory, like `auto_merge` when none.
     #[serde(default, skip_serializing_if = "AdversaryMode::is_advisory")]
     pub adversary: AdversaryMode,
+    /// `improve.max_waiting`: how many hand-ins may wait for review before self-improve
+    /// plans nothing new. Left out of the signed JSON when unset, so a policy signed before
+    /// this existed still verifies; [`Policy::waiting_cap`] gives the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_waiting: Option<usize>,
     /// Selectors the adversary never uses, from the master's [`ADVERSARY_POLICY`]. Part of
     /// the policy as a screen or a command line edits it, never of the `ENGINE_POLICY`
     /// file: [`set_policy_as`] writes it to the master's own file, and anything the
@@ -596,6 +601,7 @@ impl Default for Policy {
             never_applies_to: NeverScope::Background,
             auto_merge: AutoMerge::None,
             adversary: AdversaryMode::Advisory,
+            max_waiting: None,
             adversary_never: Vec::new(),
             adversary_agents: Vec::new(),
             effort: BTreeMap::new(),
@@ -609,7 +615,16 @@ impl Default for Policy {
     }
 }
 
+/// How many hand-ins may wait for review when the policy says nothing.
+pub const DEFAULT_MAX_WAITING: usize = 5;
+
 impl Policy {
+    /// The most hand-ins that may wait for review before self-improve plans nothing new.
+    #[must_use]
+    pub fn waiting_cap(&self) -> usize {
+        self.max_waiting.unwrap_or(DEFAULT_MAX_WAITING)
+    }
+
     /// Refuse a policy with a role, selector or cap that means nothing.
     pub fn check(&self) -> Result<()> {
         self.files.check()?;
@@ -2534,6 +2549,7 @@ impl Policy {
         let known = |selector: &String| !selector.trim().starts_with("class:");
         let mut view = Policy {
             adversary: AdversaryMode::Advisory,
+            max_waiting: None,
             adversary_never: Vec::new(),
             adversary_agents: Vec::new(),
             effort: BTreeMap::new(),

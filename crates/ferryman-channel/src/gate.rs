@@ -29,7 +29,9 @@
 //!
 //! Audit verification orders are not gated: they change nothing and never go live.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use crate::delegation;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
@@ -314,12 +316,156 @@ pub fn master_key(
             review.reviewer
         ));
     }
+    if approval_needs_minor(route, review) {
+        minor_check(route, task, revision).map_err(|why| {
+            format!(
+                "{} gave the second key, and it does not count: {why}",
+                review.signed_by.as_deref().unwrap_or_default()
+            )
+        })?;
+    }
     if crate::verify_review(review, &roster(route)) != SignatureCheck::Valid
         || !crate::review_authority(route, review).allowed()
     {
         return Err(format!("the approval in {master}'s name does not verify"));
     }
     Ok(review.clone())
+}
+
+/// Whether a path is docs, a test, or a lock file: work the head may approve alone under
+/// `improve:minor`. Manifests (Cargo.toml, package.json) are not here by path; they pass
+/// only when every changed line is a version (see [`minor_approval`]).
+#[must_use]
+pub fn is_minor_path(path: &str) -> bool {
+    let path = path.replace('\\', "/").to_ascii_lowercase();
+    let name = path.rsplit('/').next().unwrap_or_default();
+    name.ends_with(".md")
+        || path.starts_with("docs/")
+        || path.contains("/docs/")
+        || path.starts_with("tests/")
+        || path.contains("/tests/")
+        || name.contains("_test")
+        || matches!(
+            name,
+            "cargo.lock" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml"
+        )
+}
+
+/// Whether one changed manifest line only moves a dependency version.
+///
+/// Deliberately strict: a line counts when it says `version`, or when it is a bare
+/// `name = "1.2.3"` / `"name": "^1.2.3"` pair whose value has a dot. Anything else -
+/// features, sections, `edition = "2021"` - is not a version bump.
+fn is_version_line(text: &str) -> bool {
+    let text = text.trim().trim_end_matches(',');
+    if text.to_ascii_lowercase().contains("version") {
+        return true;
+    }
+    let Some((_, value)) = text.split_once('=').or_else(|| text.split_once(':')) else {
+        return false;
+    };
+    let value = value
+        .trim()
+        .trim_matches(|c: char| c == '"' || c == '\'')
+        .trim_start_matches(|c: char| "^~>=< ".contains(c));
+    value.starts_with(|c: char| c.is_ascii_digit())
+        && value.contains('.')
+        && !value.contains(['[', '{'])
+}
+
+/// Whether a manifest's change, between two recorded heads, only moves versions.
+fn dependency_bump_only(workspace: &Path, before: &str, after: &str, file: &str) -> bool {
+    let Ok(output) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["diff", "--unified=0", before, after, "--", file])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let changed: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') && !line.starts_with("+++"))
+                || (line.starts_with('-') && !line.starts_with("---"))
+        })
+        .collect();
+    !changed.is_empty() && changed.iter().all(|line| is_version_line(&line[1..]))
+}
+
+/// Whether the order file says this is an improvement. Read from the file, not through the
+/// task reader, which checks reviews and so asks this question.
+#[must_use]
+pub fn order_is_gated(route: &ProjectRoute, order_id: &str) -> bool {
+    std::fs::read_to_string(crate::task_dir(route, order_id).join("order.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<crate::Order>(&text).ok())
+        .is_some_and(|order| gated(&order.payload))
+}
+
+/// Whether an accepting verdict counts only as the head's second key: signed by someone
+/// other than the master, and not under their full `review` delegation.
+fn approval_needs_minor(route: &ProjectRoute, review: &Review) -> bool {
+    let Some(signer) = review.signed_by.as_deref() else {
+        return false;
+    };
+    review.accepted
+        && !signer.eq_ignore_ascii_case(&review.reviewer)
+        && !delegation::authority(
+            &route.communications,
+            &route.project_id,
+            &review.reviewer,
+            signer,
+            delegation::REVIEW,
+            Utc::now(),
+        )
+        .allowed()
+}
+
+/// Whether the head may give an improvement's second key: the approved revision changes
+/// only docs, tests, lock files, or manifests whose changed lines are all versions.
+///
+/// Refused for anything else: a source file, a `#[cfg(test)]` block inside one, a changed
+/// feature or section, or a diff nothing recorded (the touched list is capped, so a long
+/// one is refused too). The engine key is checked separately, by [`check_acceptance`].
+pub fn minor_check(
+    route: &ProjectRoute,
+    task: &Task,
+    revision: u32,
+) -> std::result::Result<(), String> {
+    let order_id = &task.order.id;
+    let result = task
+        .results
+        .iter()
+        .find(|result| result.revision == revision)
+        .ok_or_else(|| format!("{order_id} r{revision} has no result"))?;
+    let evidence = crate::evidence::of(&task.order.payload, result)
+        .ok_or_else(|| "no evidence was recorded for the result".to_string())?;
+    let (Some(before), Some(after)) = (&evidence.head_before, &evidence.head_after) else {
+        return Err("the diff's heads were not recorded, so it cannot be read".to_string());
+    };
+    if evidence.touched_files.is_empty() || evidence.touched_files.len() >= 200 {
+        return Err("the list of changed files is empty or was cut short".to_string());
+    }
+    for file in &evidence.touched_files {
+        if is_minor_path(file) {
+            continue;
+        }
+        let manifest = file.rsplit(['/', '\\']).next().unwrap_or_default();
+        if matches!(manifest, "Cargo.toml" | "package.json")
+            && dependency_bump_only(&route.workspace, before, after, file)
+        {
+            continue;
+        }
+        return Err(format!(
+            "{file} is not docs, tests, a lock file or a dependency version - only the master approves that"
+        ));
+    }
+    Ok(())
 }
 
 /// Where one improvement stands against the two keys.
@@ -396,6 +542,15 @@ pub fn check_acceptance(route: &ProjectRoute, task: &Task, review: &Review) -> R
              the review engine has; {} may recommend, not accept",
             review.order_id,
             review.reviewer
+        );
+    }
+    if approval_needs_minor(route, review)
+        && let Err(why) = minor_check(route, task, review.revision)
+    {
+        bail!(
+            "{} cannot approve {} for {master}: {why}. Only the master approves that",
+            review.signed_by.as_deref().unwrap_or_default(),
+            review.order_id
         );
     }
     let (policy, _) = crate::policy::effective(&route.communications, &route.project_id);
@@ -954,5 +1109,41 @@ mod tests {
         let task = task(&route, "improve-1");
         assert!(master_key(&route, &task, 1).is_err());
         assert!(!approved_for_live(&route, &task));
+    }
+}
+
+#[cfg(test)]
+mod minor_tests {
+    use super::{is_minor_path, is_version_line};
+
+    #[test]
+    fn only_docs_tests_and_locks_are_minor_by_path() {
+        for path in [
+            "README.md",
+            "docs/IMPROVE_GATE.md",
+            "tests/x.rs",
+            "crates/a/src/foo_test.rs",
+            "Cargo.lock",
+        ] {
+            assert!(is_minor_path(path), "{path} should be minor");
+        }
+        for path in [
+            "crates/a/src/gate.rs",
+            "src/lib.rs",
+            "Cargo.toml",
+            "package.json",
+        ] {
+            assert!(!is_minor_path(path), "{path} must not be minor by path");
+        }
+    }
+
+    #[test]
+    fn a_manifest_line_counts_only_when_it_moves_a_version() {
+        assert!(is_version_line(r#"version = "0.3.1""#));
+        assert!(is_version_line(r#"serde = "1.0.200""#));
+        assert!(is_version_line(r#""react": "^18.2.0","#));
+        assert!(!is_version_line(r#"edition = "2021""#));
+        assert!(!is_version_line(r#"features = ["derive"]"#));
+        assert!(!is_version_line("[dependencies.serde]"));
     }
 }

@@ -2798,14 +2798,28 @@ pub fn verify_order_in(route: &ProjectRoute, order: &Order) -> SignatureCheck {
 /// reviewer themself, or a delegate holding their `review` delegation.
 #[must_use]
 pub fn review_authority(route: &ProjectRoute, review: &Review) -> delegation::Authority {
-    delegation::authority(
-        &route.communications,
-        &route.project_id,
-        &review.reviewer,
-        review.signed_by.as_deref().unwrap_or_default(),
-        delegation::REVIEW,
-        Utc::now(),
-    )
+    let signer = review.signed_by.as_deref().unwrap_or_default();
+    let authority = |scope: &str| {
+        delegation::authority(
+            &route.communications,
+            &route.project_id,
+            &review.reviewer,
+            signer,
+            scope,
+            Utc::now(),
+        )
+    };
+    // An improvement approved by someone other than the master, under a delegation that
+    // holds only `improve:minor`, is the head's second key: its diff is checked where the
+    // task is in hand (`gate::master_key`, `gate::check_acceptance`), not here, because
+    // reading a task checks its reviews through this function.
+    let delegated_improvement = review.accepted
+        && !signer.eq_ignore_ascii_case(&review.reviewer)
+        && gate::order_is_gated(route, &review.order_id);
+    if !delegated_improvement || authority(delegation::REVIEW).allowed() {
+        return authority(delegation::REVIEW);
+    }
+    authority(delegation::IMPROVE_MINOR)
 }
 
 /// Who produced this result, checkably. The fingerprint on a contribution.

@@ -80,6 +80,9 @@ pub enum Action {
         text: String,
         buttons: Vec<Row>,
     },
+    /// Remove a message the bridge posted (an improvement notice, six hours after it was
+    /// settled).
+    Delete { chat: i64, message_id: i64 },
     /// Stop a pressed button spinning, with a short toast.
     Answer { callback_id: String, text: String },
 }
@@ -93,7 +96,17 @@ pub enum Track {
     SendBack { project: String, order: String },
     /// Waiting for an answer in words.
     Answer { project: String, question: String },
+    /// The notice that asks for a second key on an improvement: edited to its outcome once
+    /// the gate has moved on, and cleared six hours after that.
+    Notice {
+        project: String,
+        order: String,
+        revision: u32,
+    },
 }
+
+/// How long a settled improvement notice stays in the chat before the bridge removes it.
+const NOTICE_CLEAR_HOURS: i64 = 6;
 
 /// Who may use the bridge, and where.
 #[derive(Debug, Clone)]
@@ -172,6 +185,9 @@ struct Prompt {
     kind: String,
     project: String,
     id: String,
+    /// When a notice was posted, then when it was settled: the clock for clearing it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<DateTime<Utc>>,
 }
 
 /// What the bridge keeps between restarts, on this machine only.
@@ -1682,6 +1698,7 @@ impl Bridge {
                 kind: "sendback".to_string(),
                 project,
                 id: order,
+                at: None,
             }),
             Track::Answer { project, question } => self.state.prompts.push(Prompt {
                 chat,
@@ -1689,6 +1706,19 @@ impl Bridge {
                 kind: "answer".to_string(),
                 project,
                 id: question,
+                at: None,
+            }),
+            Track::Notice {
+                project,
+                order,
+                revision,
+            } => self.state.prompts.push(Prompt {
+                chat,
+                message_id,
+                kind: "notice".to_string(),
+                project,
+                id: format!("{order}:{revision}"),
+                at: Some(Utc::now()),
             }),
         }
         bound(&mut self.state.prompts);
@@ -1784,11 +1814,70 @@ impl Bridge {
         self.state.watched = kept;
         bound(&mut self.state.watched);
         actions.extend(self.waiting_on_you(now));
+        actions.extend(self.settle_notices(now));
         self.state.seeded = true;
         bound(&mut self.state.posted);
         self.save();
         actions
     }
+    /// The improvement notices: one still open is edited to how its gate ended once the
+    /// gate moves on, and an edited one is removed [`NOTICE_CLEAR_HOURS`] after that.
+    fn settle_notices(&mut self, now: DateTime<Utc>) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut kept = Vec::new();
+        for mut prompt in std::mem::take(&mut self.state.prompts) {
+            let Some(at) = prompt.at else {
+                kept.push(prompt);
+                continue;
+            };
+            match prompt.kind.as_str() {
+                "noticed" => {
+                    if now.signed_duration_since(at) >= chrono::Duration::hours(NOTICE_CLEAR_HOURS)
+                    {
+                        actions.push(Action::Delete {
+                            chat: prompt.chat,
+                            message_id: prompt.message_id,
+                        });
+                    } else {
+                        kept.push(prompt);
+                    }
+                }
+                "notice" => {
+                    let Some((order, revision)) = prompt.id.rsplit_once(':') else {
+                        kept.push(prompt);
+                        continue;
+                    };
+                    let Some(route) = self.route(&prompt.project).cloned() else {
+                        kept.push(prompt);
+                        continue;
+                    };
+                    let revision: u32 = revision.parse().unwrap_or_default();
+                    let open = ferryman_channel::gate::waiting(&route)
+                        .iter()
+                        .any(|w| w.order_id == order && w.revision == revision && w.ready_for_you);
+                    if open {
+                        kept.push(prompt);
+                        continue;
+                    }
+                    let outcome = notice_outcome(&route, order, revision);
+                    actions.push(Action::Edit {
+                        chat: prompt.chat,
+                        message_id: prompt.message_id,
+                        text: format!("{order} r{revision} in {}: {outcome}.", prompt.project),
+                        buttons: Vec::new(),
+                    });
+                    prompt.kind = "noticed".to_string();
+                    prompt.at = Some(now);
+                    kept.push(prompt);
+                }
+                _ => kept.push(prompt),
+            }
+        }
+        self.state.prompts = kept;
+        bound(&mut self.state.prompts);
+        actions
+    }
+
     /// Results waiting on the person, and the improve loop's questions, each put in front
     /// of them once. At first start, results already waiting are noted rather than
     /// replayed; the Tasks view still lists them.
@@ -1863,16 +1952,22 @@ impl Bridge {
                     excerpt(&waiting.title, 200),
                     String::new(),
                 ];
+                let task = ferryman_channel::read_task(&route, &waiting.order_id).ok();
+                // What it changes, in the worker's own words for the revision.
+                if let Some(result) = task
+                    .as_ref()
+                    .and_then(|task| task.results.iter().find(|r| r.revision == waiting.revision))
+                {
+                    lines.push(format!(
+                        "Change: {}",
+                        excerpt(&result_text(&result.payload), 500)
+                    ));
+                }
                 if let Some(stat) = &waiting.diff_stat {
                     lines.push(format!("Diff: {stat}"));
                 }
                 lines.push(format!("Evidence: {}", waiting.evidence));
-                let routed = routing_line(
-                    ferryman_channel::read_task(&route, &waiting.order_id)
-                        .ok()
-                        .as_ref(),
-                    waiting.revision,
-                );
+                let routed = routing_line(task.as_ref(), waiting.revision);
                 if let Some(routed) = routed.strip_prefix('\n') {
                     lines.push(routed.to_string());
                 }
@@ -1904,7 +1999,17 @@ impl Bridge {
                     let data = self.override_data(&route, &waiting.order_id, waiting.revision);
                     buttons.push(vec![button("Override the Block", data)]);
                 }
-                actions.push(send(home, lines.join("\n"), buttons));
+                actions.push(Action::Send {
+                    chat: home,
+                    text: lines.join("\n"),
+                    buttons,
+                    force_reply: false,
+                    track: Some(Track::Notice {
+                        project: project.clone(),
+                        order: waiting.order_id.clone(),
+                        revision: waiting.revision,
+                    }),
+                });
             }
             // What fm merged on its own - low-risk work, after both keys - said once each.
             for merged in ferryman_channel::automerge::merged(&route) {
@@ -2224,6 +2329,33 @@ fn routing_line(task: Option<&ferryman_channel::Task>, revision: u32) -> String 
         .unwrap_or_default()
 }
 
+/// How an improvement's gate ended for one revision, in words for a notice.
+fn notice_outcome(route: &ProjectRoute, order: &str, revision: u32) -> String {
+    let Ok(task) = ferryman_channel::read_task(route, order) else {
+        return "no longer waiting".to_string();
+    };
+    let (policy, _) = policy::effective(&route.communications, &route.project_id);
+    if ferryman_channel::gate::gate(route, &task, &policy).approved() {
+        return "approved, ready to merge".to_string();
+    }
+    match task
+        .reviews
+        .iter()
+        .rev()
+        .find(|review| review.revision == revision)
+    {
+        Some(review) if !review.accepted => format!(
+            "sent back{}",
+            review
+                .notes
+                .as_deref()
+                .map(|notes| format!(": {}", excerpt(notes, 200)))
+                .unwrap_or_default()
+        ),
+        _ => "no longer waiting".to_string(),
+    }
+}
+
 /// The adversary's finding as card lines: the headline, then its worst issues.
 fn finding_lines(finding: &ferryman_channel::adversary::AdversaryFinding) -> Vec<String> {
     finding
@@ -2502,6 +2634,13 @@ async fn perform(http: &Http, bridge: &mut Bridge, actions: Vec<Action>) {
                     other => other.map(|_| ()),
                 }
             }
+            Action::Delete { chat, message_id } => http
+                .call(
+                    "deleteMessage",
+                    &json!({ "chat_id": chat, "message_id": message_id }),
+                )
+                .await
+                .map(|_| ()),
             Action::Answer { callback_id, text } => http
                 .call(
                     "answerCallbackQuery",
@@ -2851,7 +2990,7 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 Action::Send { text, .. } | Action::Edit { text, .. } => Some(text.clone()),
-                Action::Answer { .. } => None,
+                Action::Answer { .. } | Action::Delete { .. } => None,
             })
             .collect()
     }
@@ -2861,7 +3000,7 @@ mod tests {
             .iter()
             .flat_map(|action| match action {
                 Action::Send { buttons, .. } | Action::Edit { buttons, .. } => buttons.concat(),
-                Action::Answer { .. } => Vec::new(),
+                Action::Answer { .. } | Action::Delete { .. } => Vec::new(),
             })
             .collect()
     }
@@ -4275,6 +4414,7 @@ mod tests {
                 Action::Send { text, .. }
                 | Action::Edit { text, .. }
                 | Action::Answer { text, .. } => text.clone(),
+                Action::Delete { .. } => String::new(),
             })
             .collect::<Vec<_>>()
             .join("\n")
