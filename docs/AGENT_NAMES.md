@@ -19,3 +19,18 @@ changes nothing.
 - **Enrolment**: `ferry agent enroll --identity --system --alias --charter [--level --limits]`
   checks the role list and alias uniqueness, then leaves the agent unable to claim until
   `ferry agent approve <identity>` (Josh) appends it to `names.toml`.
+
+## Status
+
+Done and tested: the names file loader, retirement (claim refusal, roster `retired` filter,
+`access show --all`), the charter block at the top of every worker prompt, the deterministic
+worker refusal (`ask:`, `vps:`, kind `plan`) with `refused: <id>` to Charon, enrolment with
+alias and role checks, and `ferry agent approve`.
+
+Not yet wired (the order asked for these; they are the next work):
+- Names in the dashboard, Telegram notices, `ferry work list`, `ferry engines`, and the MCP
+  output (only `ferry access show` and the MCP `to` check use them today).
+- Hiding retired identities in the pickers: `read_agent_roster_visible` exists but no picker
+  calls it yet.
+- Approving an enrolment from Telegram (Approve/Deny buttons) or the dashboard; today only
+  `ferry agent approve <identity>` does it.

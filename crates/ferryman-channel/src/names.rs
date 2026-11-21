@@ -168,16 +168,20 @@ pub fn check_may_claim(agent: &str) -> Result<()> {
     let Some(names) = Names::here() else {
         return Ok(());
     };
+    let pending = fleet_file("pending")
+        .map(|d| d.join(format!("{}.toml", crate::canonical_agent_name(agent))));
+    may_claim(&names, pending.as_deref(), agent)
+}
+
+/// The rule behind `check_may_claim`, with the names and the pending file given.
+pub fn may_claim(names: &Names, pending: Option<&Path>, agent: &str) -> Result<()> {
     if names.is_retired(agent) {
         bail!(
             "{agent} is retired on {} (AGENTS.md) and takes no orders",
             names.retired.date.as_deref().unwrap_or("an earlier date")
         )
     }
-    if fleet_file("pending").is_some_and(|d| {
-        d.join(format!("{}.toml", crate::canonical_agent_name(agent)))
-            .is_file()
-    }) {
+    if pending.is_some_and(Path::is_file) {
         bail!("{agent} is enrolled but Josh has not approved it yet")
     }
     Ok(())
@@ -365,6 +369,31 @@ identities = ["codex-grouchly", "quantly"]
     fn retired_identities_are_flagged() {
         let n = names();
         assert!(n.is_retired("codex-grouchly") && !n.is_retired("ichabod-beastly-swarm"));
+    }
+
+    #[test]
+    fn a_retired_identity_cannot_claim_and_the_message_gives_the_date() {
+        let n = names();
+        let err = may_claim(&n, None, "codex-grouchly")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "codex-grouchly is retired on 2026-11-21 (AGENTS.md) and takes no orders"
+        );
+        assert!(may_claim(&n, None, "ichabod-beastly-swarm").is_ok());
+        assert!(may_claim(&n, None, "stranger").is_ok());
+    }
+
+    #[test]
+    fn an_enrolled_but_unapproved_identity_cannot_claim() {
+        let n = names();
+        let missing = Path::new("no-such-pending-file.toml");
+        assert!(may_claim(&n, Some(missing), "newcomer").is_ok());
+        // A pending file that exists blocks; a file that is always there serves as one.
+        let present = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let err = may_claim(&n, Some(&present), "newcomer").unwrap_err();
+        assert!(err.to_string().contains("not approved"));
     }
 
     #[test]

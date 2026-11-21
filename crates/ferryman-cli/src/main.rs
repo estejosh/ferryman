@@ -7024,22 +7024,32 @@ fn access_command(command: AccessCommand) -> Result<()> {
                     Some(names) => {
                         for a in &names.agents {
                             let label = format!("{} ({})", a.alias, a.system);
+                            // An identity is shown once, under the agent it is (`agent_for`):
+                            // Ash and Ichabod share one identity, and it is Ichabod's row.
+                            let owned = |i: &String| {
+                                names.agent_for(i).is_some_and(|o| o.system == a.system)
+                            };
                             let mine: Vec<_> = a
                                 .identities
                                 .iter()
+                                .filter(|i| owned(*i))
                                 .filter_map(|i| levels.get(i).map(|l| (i, *l)))
                                 .collect();
                             if mine.is_empty() {
-                                println!("  {label:<30} {:<13} not on this channel", a.level);
+                                let shared = a.identities.iter().find(|i| levels.contains_key(*i));
+                                match shared.and_then(|i| names.agent_for(i).map(|o| (i, o))) {
+                                    Some((i, owner)) => println!(
+                                        "  {label:<30} {:<13} shares {i} with {}",
+                                        a.level, owner.alias
+                                    ),
+                                    None => println!(
+                                        "  {label:<30} {:<13} not on this channel",
+                                        a.level
+                                    ),
+                                }
                             }
-                            let several = mine.len() > 1;
                             for (i, level) in mine {
                                 let (source, level) = row(i, level);
-                                let label = if several {
-                                    format!("{label} [{i}]")
-                                } else {
-                                    label.clone()
-                                };
                                 println!("  {label:<30} {level:<13} {source}");
                             }
                         }
