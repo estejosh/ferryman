@@ -56,6 +56,7 @@ pub mod master;
 pub mod memory;
 pub mod migration;
 pub mod models;
+pub mod names;
 pub mod notices;
 pub mod offer;
 pub mod order_files;
@@ -1571,6 +1572,7 @@ pub fn claim_order(route: &ProjectRoute, order_id: &str, agent: &str) -> Result<
     if !is_safe_component(order_id) {
         bail!("order id must be a path-safe identifier")
     }
+    names::check_may_claim(agent)?;
     let claim = Claim {
         order_id: order_id.to_string(),
         agent: agent.to_string(),
@@ -4331,6 +4333,16 @@ fn fold_case_variants(agents: Vec<AgentRoute>) -> Vec<AgentRoute> {
         agent.name = canonical_agent_name(&agent.name);
     }
     folded
+}
+
+/// The roster without retired identities: what pickers and lists show. Retired keys stay
+/// in `read_agent_roster`, because they still verify old signatures.
+pub fn read_agent_roster_visible(communications: &Path) -> Result<Vec<AgentRoute>> {
+    let mut agents = read_agent_roster(communications)?;
+    if let Some(names) = names::Names::here() {
+        agents.retain(|a| !names.is_retired(&a.name));
+    }
+    Ok(agents)
 }
 
 pub fn read_agent_roster(communications: &Path) -> Result<Vec<AgentRoute>> {

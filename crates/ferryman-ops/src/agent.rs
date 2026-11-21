@@ -1904,6 +1904,19 @@ commentary on whether you should submit, no questions.\n\n";
 /// four-thousand-token repo map would cost nothing on a work prompt and throw the entire
 /// shared prefix away on a review prompt, which has no notice.
 fn with_preamble(config: &AgentConfig, rest: String) -> String {
+    // The agent's charter leads every prompt, with the refusal rule. No names file, no block.
+    let rest = match ferryman_channel::names::Names::here().and_then(|n| {
+        n.agent_for(&config.agent)
+            .filter(|a| a.level == "worker")
+            .map(|a| a.charter_block())
+    }) {
+        Some(block) => format!(
+            "{block}
+
+{rest}"
+        ),
+        None => rest,
+    };
     match &config.preamble {
         // Two newlines whatever the file ends with, so a preamble saved with or without
         // a trailing newline produces the same bytes. A prefix cache is a byte
@@ -3137,6 +3150,18 @@ pub async fn work_once(
                 // interface contract the order builds to that the master has not locked,
                 // or another agent already working on the same files. Declined, not
                 // claimed - holding a claim on work nobody is doing would be the lie.
+                // Outside this worker's charter: refuse it, deterministically, and send it
+                // back to Charon. It stays in the queue for whoever may take it.
+                if let Some(why) = ferryman_channel::names::Names::here()
+                    .and_then(|n| n.charter_refusal(&config.agent, &task.order))
+                {
+                    match ferryman_channel::names::refuse(route, &identity, &id, &why) {
+                        Ok(true) => report.info(&format!("  {id}: refused, {why}")),
+                        Ok(false) => {}
+                        Err(error) => report.warn(&format!("  {id}: refused, {why} ({error:#})")),
+                    }
+                    continue;
+                }
                 if let Some(reason) = start_hold(route, &config.agent, &task.order) {
                     match ferryman_channel::hold::record(route, &identity, &id, &reason) {
                         Ok(true) => report.info(&format!("  {id}: holding off, {reason}")),

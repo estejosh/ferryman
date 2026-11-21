@@ -1923,7 +1923,10 @@ impl Agent {
                     .route()
                     .agents
                     .iter()
-                    .any(|a| ferryman_channel::addressed_to(who, &a.name));
+                    .any(|a| ferryman_channel::addressed_to(who, &a.name))
+                    // A retired identity takes no orders.
+                    && !ferryman_channel::names::Names::here()
+                        .is_some_and(|n| n.is_retired(who));
                 if !known {
                     return Err(bad(format!(
                         "nobody called '{who}' is on this project. ferry_join shows who is alive; leave to out for an order open to anyone"

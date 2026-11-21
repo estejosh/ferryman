@@ -2880,6 +2880,46 @@ enum Agent {
         #[arg(long)]
         allow_second_worker: bool,
     },
+    /// Print an agent's charter (`fleet/names.toml`): who it is and what it will not do.
+    Charter {
+        /// An identity name. Defaults to this machine's identity.
+        #[arg(long = "as")]
+        identity: Option<String>,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Refuse an order that is outside your charter and send it back to Charon.
+    ///
+    /// Records the refusal on the order and issues `refused: <order id>` (kind chore) to the
+    /// `ferryman` project. The order stays in the queue.
+    Refuse {
+        order: String,
+        #[arg(long)]
+        why: String,
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Propose a new agent: system name, alias, charter, level. It cannot claim until
+    /// Josh approves it (`ferry agent approve <identity>`).
+    Enroll {
+        #[arg(long)]
+        identity: String,
+        /// `role.place`, the role from the role list in names.toml.
+        #[arg(long)]
+        system: String,
+        /// One word whose story is the job. Never reused, retired ones included.
+        #[arg(long)]
+        alias: String,
+        #[arg(long)]
+        charter: String,
+        #[arg(long, default_value = "worker")]
+        level: String,
+        /// Spend limits, if paid (recorded as a comment for Josh).
+        #[arg(long)]
+        limits: Option<String>,
+    },
+    /// Josh approves an enrolled agent: it joins names.toml and may take orders.
+    Approve { identity: String },
     /// Judge results that are waiting, as far as the config lets you.
     Review {
         #[arg(long)]
@@ -6808,6 +6848,9 @@ enum AccessCommand {
         /// directory, or every project when you are not in one.
         #[arg(long)]
         project: Option<String>,
+        /// Also show retired identities (greyed).
+        #[arg(long)]
+        all: bool,
     },
     /// Set an agent's level. Only the project's master can: it signs the grant.
     Set {
@@ -6928,7 +6971,8 @@ fn access_route(project: &str) -> Result<ferryman_channel::ProjectRoute> {
 fn access_command(command: AccessCommand) -> Result<()> {
     use ferryman_channel::access;
     match command {
-        AccessCommand::Show { project } => {
+        AccessCommand::Show { project, all } => {
+            let names = ferryman_channel::names::Names::here();
             // Showing changes nothing: no filing of the project in the root, no update of
             // what this machine remembers of the master's grants.
             ferryman_channel::known::read_only();
@@ -6964,15 +7008,56 @@ fn access_command(command: AccessCommand) -> Result<()> {
                          Worker has nowhere else to write"
                     }
                 );
-                for (agent, level) in access::levels(channel, &route.project_id) {
-                    let source = if grants.contains_key(&agent) {
+                let levels = access::levels(channel, &route.project_id);
+                let row = |agent: &str, level: access::Level| {
+                    let source = if grants.contains_key(agent) {
                         "granted by the master"
                     } else if level == access::Level::Worker {
                         "not admitted by the master, so a Worker"
                     } else {
                         "default"
                     };
-                    println!("  {agent:<24} {:<13} {source}", level.as_str());
+                    (format!("{source}"), level.as_str())
+                };
+                match &names {
+                    // By alias: every named agent, then (with --all) the retired identities.
+                    Some(names) => {
+                        for a in &names.agents {
+                            let label = format!("{} ({})", a.alias, a.system);
+                            let mine: Vec<_> = a
+                                .identities
+                                .iter()
+                                .filter_map(|i| levels.get(i).map(|l| (i, *l)))
+                                .collect();
+                            if mine.is_empty() {
+                                println!("  {label:<30} {:<13} not on this channel", a.level);
+                            }
+                            let several = mine.len() > 1;
+                            for (i, level) in mine {
+                                let (source, level) = row(i, level);
+                                let label = if several {
+                                    format!("{label} [{i}]")
+                                } else {
+                                    label.clone()
+                                };
+                                println!("  {label:<30} {level:<13} {source}");
+                            }
+                        }
+                        if all {
+                            for (agent, level) in &levels {
+                                if names.is_retired(agent) {
+                                    let (source, level) = row(agent, *level);
+                                    println!("  [2m{agent:<30} {level:<13} retired {source}[0m");
+                                }
+                            }
+                        }
+                    }
+                    None => {
+                        for (agent, level) in levels {
+                            let (source, level) = row(&agent, level);
+                            println!("  {agent:<24} {level:<13} {source}");
+                        }
+                    }
                 }
                 let waiting = access::pending_admission(channel, &route.project_id);
                 if !waiting.is_empty() {
@@ -9332,6 +9417,70 @@ async fn agent_command(command: Agent) -> Result<()> {
                 }
                 tokio::time::sleep(config.poll).await;
             }
+        }
+        Agent::Charter {
+            identity,
+            workspace,
+        } => {
+            let identity = match identity {
+                Some(i) => i,
+                None => {
+                    let route = route_for(workspace)?;
+                    ferryman_ops::identity::resolve(None, &route.attachment)?
+                }
+            };
+            let names = ferryman_channel::names::Names::here()
+                .context("no fleet/names.toml in the ferry root")?;
+            match names.agent_for(&identity) {
+                Some(agent) => println!("{}", agent.charter_block()),
+                None if names.is_retired(&identity) => {
+                    println!(
+                        "{identity} is retired on {} (AGENTS.md)",
+                        names.retired.date.as_deref().unwrap_or("?")
+                    )
+                }
+                None => bail!("{identity} has no charter in names.toml"),
+            }
+        }
+        Agent::Refuse {
+            order,
+            why,
+            workspace,
+        } => {
+            let route = route_for(workspace)?;
+            let me = ferryman_ops::identity::resolve(None, &route.attachment)?;
+            let identity = signing_identity(&route, &me)?;
+            if ferryman_channel::names::refuse(&route, &identity, &order, &why)? {
+                println!("refused {order}; sent to Charon as 'refused: {order}'");
+            } else {
+                println!("already refused {order}");
+            }
+        }
+        Agent::Enroll {
+            identity,
+            system,
+            alias,
+            charter,
+            level,
+            limits,
+        } => {
+            let path = ferryman_channel::names::enroll(
+                &alias,
+                &system,
+                &identity,
+                &level,
+                &charter,
+                limits.as_deref(),
+            )?;
+            println!(
+                "{alias} ({system}) is waiting for Josh: {}
+it cannot claim until: ferry agent approve {identity}",
+                path.display()
+            );
+        }
+        Agent::Approve { identity } => {
+            ferryman_channel::names::approve(&identity)?;
+            println!("approved {identity}");
         }
         Agent::Pending {
             workspace,
